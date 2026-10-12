@@ -2,7 +2,9 @@
 
 #include <ATen/core/Tensor.h>
 
+#include <cstdint>
 #include <optional>
+#include <vector>
 
 // The forward boundary the Engine drives: a scheduler step's prefill and decode
 // groups plus the paged KV lines go in, per-group logits come out. The engine
@@ -34,8 +36,15 @@ struct GroupBatch {
     // int32 [num_seqs, 3], the RoPE position of each key by its view index (see attn_decode_cuda). pos holds each
     // query's position under the same layout.
     at::Tensor rope_layout;
+    // int32 [num_seqs + 1]. When defined, the forward measures attention mass: sequence s's view pages are the rows
+    // [cu_view_pages[s], cu_view_pages[s + 1]) of page_mass, at least as many as its keys fill.
+    at::Tensor cu_view_pages;
+    // fp32 [total_view_pages], zeroed by the caller. The forward sets each view page's mass: the weight the group's
+    // queries gave its keys, as the attention ops scale it, averaged over query heads, then maxed over the page's slots
+    // and over the relevance layers.
+    at::Tensor page_mass;
     // fp32 [num_seqs] in the group's row order: each sequence's attention-mass EMA
-    // gain alpha, which the attention kernels index by sequence. Per session, so one
+    // gain alpha, which the attention kernels index by sequence. Per request, so one
     // batched forward may carry several rates.
     at::Tensor attention_mass_decay;
     // TOKENS: the length the accumulated mass is stated against. <= 0 states it
@@ -82,6 +91,9 @@ struct Model {
     virtual at::Tensor captured_lse(bool is_prefill, int64_t layer) const {
         return {};
     }
+
+    // The layers whose attention mass fills GroupBatch::page_mass. A model that measures no mass ignores them.
+    virtual void set_relevance_layers(const std::vector<int64_t>& layers) {}
 
     virtual ~Model() = default;
 };

@@ -73,13 +73,14 @@ static_assert(pulsar::page_store<memory_store>);
 using test_scheduler = pulsar::scheduler<memory_store>;
 
 // Writes each token's id as its K and its view index as its V. The token after a query is the sum of the K of every
-// key the query attends, mod vocab.
+// key the query attends, mod vocab. A view page's mass is 1 when it holds a key important accepts, else 0.
 class sum_model final : public pulsar::Model {
   public:
     std::size_t forward_count = 0;
     std::vector<token_list> prefill_chunks;
     std::vector<std::int64_t> decode_sizes;
     std::function<void()> on_forward;
+    std::function<bool(std::int64_t)> important = [](std::int64_t) { return false; };
 
     pulsar::StepLogits forward(const pulsar::StepBatch& batch, const pulsar::kv_lines& kv) override {
         forward_count++;
@@ -103,7 +104,7 @@ class sum_model final : public pulsar::Model {
     }
 
   private:
-    static at::Tensor predict(const pulsar::GroupBatch& g, const pulsar::kv_lines& kv) {
+    at::Tensor predict(const pulsar::GroupBatch& g, const pulsar::kv_lines& kv) const {
         std::int64_t n_tokens = g.tokens.size(0);
         std::vector<std::int64_t> sizes{kv.k.size(0), n_tokens, kv.k.size(3), kv.k.size(4)};
         at::Tensor slots = g.slot_mapping.to(at::kLong);
@@ -137,6 +138,21 @@ class sum_model final : public pulsar::Model {
                 }
                 logit[row][sum % vocab] = 1.0f;
             }
+        }
+        if (g.page_mass.defined()) {
+            at::Tensor cu_view_pages = g.cu_view_pages.cpu();
+            at::Tensor page_mass = at::zeros({g.page_mass.size(0)});
+            auto first_page = cu_view_pages.accessor<std::int32_t, 1>();
+            auto mass = page_mass.accessor<float, 1>();
+            for (std::size_t s = 0; s < static_cast<std::size_t>(page_tables.size(0)); s++) {
+                for (std::size_t j = 0; j < static_cast<std::size_t>(key_count[s]); j++) {
+                    std::size_t page = j / shape.page_size;
+                    if (important(static_cast<std::int64_t>(key[page_table[s][page]][j % shape.page_size]))) {
+                        mass[first_page[s] + page] = 1.0f;
+                    }
+                }
+            }
+            g.page_mass.copy_(page_mass);
         }
         return logits.to(g.tokens.device());
     }
@@ -433,7 +449,8 @@ TEST_CASE("a request needing more lines than the cache has ends with oom") {
 TEST_CASE("a request that outgrows the cache alone ends with oom") {
     fixture f(2);
     token_list prompt{1, 2, 3, 4};
-    std::vector<result_stream::taken> results = serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 10}});
+    std::vector<result_stream::taken> results =
+        serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 10, .eviction = {.cycle_tokens = 4}}});
 
     REQUIRE(results[0].tokens == continuation(prompt, 5));
     REQUIRE(ended_error(results[0]) == request_error::oom);
@@ -445,7 +462,8 @@ TEST_CASE("a request that outgrows the free lines waits for them and completes")
     token_list second{5, 6, 7, 8};
     std::vector<result_stream::taken> results = serve_all(
         f.sched,
-        {request{.tokens = first, .max_tokens = 10}, request{.tokens = second, .max_tokens = 10}}
+        {request{.tokens = first, .max_tokens = 10, .eviction = {.cycle_tokens = 4}},
+         request{.tokens = second, .max_tokens = 10, .eviction = {.cycle_tokens = 4}}}
     );
 
     REQUIRE(results[0].tokens == continuation(first, 10));
@@ -456,6 +474,85 @@ TEST_CASE("a request that outgrows the free lines waits for them and completes")
     ));
     // Five steps together; the second then waits for a third line while the first runs its last five steps.
     REQUIRE(f.model.forward_count == 15);
+}
+
+TEST_CASE("a cycle ends every cycle_tokens tokens with the state it reached") {
+    fixture f(16);
+    token_list prompt{1, 2, 3, 4, 5, 6};
+    std::vector<result_stream::taken> results =
+        serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 6, .eviction = {.cycle_tokens = 4}}});
+
+    token_list generated = continuation(prompt, 6);
+    REQUIRE(results[0].tokens == generated);
+    REQUIRE(f.model.prefill_chunks == std::vector<token_list>{{4}, {2}});
+    const std::vector<pulsar::cycle_end>& cycle_ends = results[0].cycle_ends;
+    REQUIRE(cycle_ends.size() == 2);
+    token_list first_pages(prompt.begin(), prompt.begin() + 4);
+    REQUIRE(cycle_ends[0].token_count == 4);
+    REQUIRE((cycle_ends[0].reached.page_hashes == pulsar::make_page_digests(root(), first_pages, shape.page_size)));
+    REQUIRE(cycle_ends[0].reached.tail.empty());
+    token_list forwarded = concat(prompt, token_list(generated.begin(), generated.begin() + 2));
+    REQUIRE(cycle_ends[1].token_count == 8);
+    REQUIRE((cycle_ends[1].reached.page_hashes == pulsar::make_page_digests(root(), forwarded, shape.page_size)));
+    REQUIRE(cycle_ends[1].reached.tail.empty());
+}
+
+TEST_CASE("a cycle's end evicts the pages below the bar outside the sink and working pages") {
+    fixture f(16);
+    f.model.important = [](std::int64_t token) { return token == 7; };
+    token_list prompt{100, 101, 102, 103, 7, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114};
+    std::vector<result_stream::taken> results = serve_all(
+        f.sched,
+        {request{
+            .tokens = prompt,
+            .max_tokens = 2,
+            .eviction = {.n_sink = 1, .n_working = 1, .cycle_tokens = 16, .density_bar = 0.5},
+        }}
+    );
+
+    std::vector<digest> chain = pulsar::make_page_digests(root(), prompt, shape.page_size);
+    token_list kept = concat(token_list(prompt.begin(), prompt.begin() + 8), token_list(prompt.begin() + 12, prompt.end()));
+    std::int64_t first = continuation(prompt, 1)[0];
+    REQUIRE(results[0].tokens == token_list{first, continuation(concat(kept, {first}), 1)[0]});
+    REQUIRE(results[0].cycle_ends.size() == 1);
+    REQUIRE((results[0].cycle_ends[0].reached.page_hashes == std::vector{chain[0], chain[1], chain[3]}));
+    REQUIRE(results[0].cycle_ends[0].reached.tail.empty());
+    REQUIRE(results[0].cycle_ends[0].token_count == 16);
+    pulsar::state end = ended_state(results[0]);
+    REQUIRE((end.page_hashes == std::vector{chain[0], chain[1], chain[3]}));
+    REQUIRE(end.tail == token_list{first});
+}
+
+TEST_CASE("a cycle's end evicts down to max_pages, the oldest first on ties") {
+    fixture f(16);
+    token_list prompt{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    std::vector<result_stream::taken> results = serve_all(
+        f.sched,
+        {request{.tokens = prompt, .max_tokens = 2, .eviction = {.cycle_tokens = 16, .max_pages = 2}}}
+    );
+
+    std::vector<digest> chain = pulsar::make_page_digests(root(), prompt, shape.page_size);
+    token_list kept(prompt.begin() + 8, prompt.end());
+    std::int64_t first = continuation(prompt, 1)[0];
+    REQUIRE(results[0].tokens == token_list{first, continuation(concat(kept, {first}), 1)[0]});
+    REQUIRE((results[0].cycle_ends[0].reached.page_hashes == std::vector{chain[2], chain[3]}));
+}
+
+TEST_CASE("a prompt longer than the cache fits when each cycle evicts down to max_pages") {
+    fixture f(4);
+    token_list prompt(32);
+    std::iota(prompt.begin(), prompt.end(), 1);
+    std::vector<result_stream::taken> results = serve_all(
+        f.sched,
+        {request{.tokens = prompt, .max_tokens = 2, .eviction = {.cycle_tokens = 8, .max_pages = 2}}}
+    );
+
+    token_list last_two_cycles(prompt.begin() + 16, prompt.end());
+    token_list last_cycle(prompt.begin() + 24, prompt.end());
+    std::int64_t first = continuation(last_two_cycles, 1)[0];
+    REQUIRE(results[0].tokens == token_list{first, continuation(concat(last_cycle, {first}), 1)[0]});
+    REQUIRE(results[0].cycle_ends.size() == 4);
+    REQUIRE(ended_state(results[0]).page_hashes.size() == 2);
 }
 
 TEST_CASE("prefill forwards at most the step's prefill tokens") {

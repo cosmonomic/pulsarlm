@@ -66,6 +66,11 @@ Qwen2Model::Qwen2Model(
             }
         );
     }
+    this->relevance_layers = default_relevance_layers(n_layers);
+}
+
+void Qwen2Model::set_relevance_layers(const std::vector<int64_t>& layers) {
+    this->relevance_layers = std::unordered_set<int64_t>(layers.begin(), layers.end());
 }
 
 // Qwen2 block: QKV projection with bias, RoPE + paged attention, SwiGLU MLP.
@@ -82,7 +87,8 @@ at::Tensor Qwen2Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, c
     // The lines store K and V unrotated, as the paged ops' [tokens, n_kv_heads, head_dim].
     k = k.view({ntok, this->n_kv_heads, this->head_dim}).contiguous();
     v = v.view({ntok, this->n_kv_heads, this->head_dim}).contiguous();
-    auto o = paged_attention(q, k, v, kv, layer, g, this->scale, this->rope_theta);
+    auto o =
+        paged_attention(q, k, v, kv, layer, g, this->relevance_layers.contains(layer), this->scale, this->rope_theta);
 
     o = o.reshape({ntok, this->n_heads * this->head_dim});
     x = x + at::linear(o, lw.o_proj_weight);

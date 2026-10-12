@@ -69,6 +69,7 @@ Qwen3Model::Qwen3Model(
             }
         );
     }
+    this->relevance_layers = default_relevance_layers(n_layers);
 }
 
 // Qwen3 block: bias-free QKV projection, per-head QK-Norm before RoPE, then RoPE +
@@ -104,7 +105,9 @@ at::Tensor Qwen3Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, c
     if (this->capture_layers.count(layer)) {
         lse = at::empty({ntok, this->n_heads}, at::device(x.device()).dtype(at::kFloat));
     }
-    auto o = paged_attention(q, k, v, kv, layer, g, this->scale, this->rope_theta, lse);
+    auto o = paged_attention(
+        q, k, v, kv, layer, g, this->relevance_layers.contains(layer), this->scale, this->rope_theta, lse
+    );
     if (lse.defined()) {
         (g.is_prefill() ? this->lse_prefill : this->lse_decode)[layer] = lse;
     }
@@ -147,6 +150,10 @@ StepLogits Qwen3Model::forward(const StepBatch& batch, const kv_lines& kv) {
 
 void Qwen3Model::set_capture_layers(const std::vector<int64_t>& layers) {
     this->capture_layers = std::unordered_set<int64_t>(layers.begin(), layers.end());
+}
+
+void Qwen3Model::set_relevance_layers(const std::vector<int64_t>& layers) {
+    this->relevance_layers = std::unordered_set<int64_t>(layers.begin(), layers.end());
 }
 
 at::Tensor Qwen3Model::captured_q(bool is_prefill, int64_t layer) const {

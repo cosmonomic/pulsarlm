@@ -53,6 +53,20 @@ TEST_CASE("take returns the end once") {
     REQUIRE(!second.end);
 }
 
+TEST_CASE("take returns the cycle ends appended since the last take") {
+    auto [stream, writer] = result_stream::make();
+    pulsar::digest page_hash{.hi = 3, .lo = 4};
+    writer.append(pulsar::cycle_end{.reached = pulsar::state{.page_hashes = {page_hash}, .tail = {1}}, .token_count = 5});
+    result_stream::taken first = stream->take();
+    result_stream::taken second = stream->take();
+
+    REQUIRE(first.cycle_ends.size() == 1);
+    REQUIRE(first.cycle_ends[0].reached.page_hashes == std::vector{page_hash});
+    REQUIRE(first.cycle_ends[0].reached.tail == token_list{1});
+    REQUIRE(first.cycle_ends[0].token_count == 5);
+    REQUIRE(second.cycle_ends.empty());
+}
+
 TEST_CASE("a writer destroyed before ending its stream ends it with loop_exited") {
     std::shared_ptr<result_stream> stream;
     {

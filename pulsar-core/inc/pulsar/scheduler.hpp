@@ -16,6 +16,7 @@
 
 #include "pulsar/digest.hpp"
 #include "pulsar/event_loop.hpp"
+#include "pulsar/eviction.hpp"
 #include "pulsar/kv_cache.hpp"
 #include "pulsar/model/interface.hpp"
 #include "pulsar/result_stream.hpp"
@@ -30,6 +31,7 @@ struct request {
     std::vector<std::int64_t> tokens;
     sampling_params sampling;
     std::optional<std::size_t> max_tokens;
+    eviction_policy eviction;
 };
 
 template <page_store t_store> class scheduler;
@@ -52,6 +54,12 @@ class sequence {
     std::optional<exit_reason> exited;
     // Set once the sequence leaves the running set.
     std::optional<event> exit_event;
+    eviction_policy eviction;
+    // forwarded_count when the eviction cycle began.
+    std::size_t cycle_start = 0;
+    cycle_density density;
+    // The request's tokens the state covers: the initial state's tail, then the request's tokens, then sampled tokens.
+    std::size_t covered_count = 0;
 
     sequence(request r, result_writer& writer, at::Device device);
 
@@ -59,8 +67,17 @@ class sequence {
     bool may_sample() const noexcept;
     // Moves the first count pending tokens to tail, then the pages they complete to page_hashes.
     void advance(std::size_t count, std::size_t page_size, const digest& root);
-    // One line per distinct page hash and one per page of pending tokens. Called with an empty tail.
+    void start_cycle(std::size_t page_size) noexcept;
+    // Whether forwarding token_count more tokens ends the eviction cycle.
+    bool ends_cycle(std::size_t token_count, std::size_t page_size) const noexcept;
+    // The tokens the cycle can still forward: no more than its length allows, nor than the request will forward.
+    std::size_t cycle_tokens_left(std::size_t page_size) const noexcept;
+    // Drops the full pages at the ascending view indices pages, and returns their lines.
+    std::vector<std::uint32_t> remove_pages(std::span<const std::size_t> pages);
+    // One line per distinct page hash and one per page the cycle's tokens fill. Called at the start of a cycle, with
+    // an empty tail.
     std::size_t admission_lines(std::size_t page_size) const;
+    // The lines the sequence lacks to forward every token left in its cycle.
     std::size_t missing_lines(std::size_t page_size) const noexcept;
     // Moves tail back to pending, to be forwarded again into new lines.
     void requeue();
@@ -76,6 +93,10 @@ class batch {
         sequence* seq;
         std::size_t token_count;
         bool samples;
+        bool ends_cycle;
+        // Pinned host fp32, the sequence's cycle density after the step. Defined when the step ends a cycle of a
+        // sequence that can evict.
+        at::Tensor host_density;
     };
 
     // decode_count decode entries first, each forwarding its sequence's only pending token.
@@ -89,8 +110,11 @@ class batch {
     batch(std::span<sequence* const> running, std::size_t page_size, std::size_t prefill_tokens_per_step);
 
     static GroupBatch make_group(std::span<const entry> group, std::size_t page_size, bool prefill);
-    // Queues the inputs' copies, the forward, the sampling and the copy of the sampled tokens to the host on stream.
+    static bool measures_mass(std::span<const entry> group) noexcept;
+    // Queues on stream the inputs' copies, the forward, the sampling, the density updates, and the copies of the
+    // sampled tokens and of the densities that end a cycle to the host.
     void enqueue(Model& model, const kv_lines& kv, cudaStream_t stream);
+    void add_page_mass(std::span<entry> group, const GroupBatch& inputs);
 
     template <page_store> friend class scheduler;
 };
@@ -119,6 +143,7 @@ template <page_store t_store> class scheduler {
     task<batch> build_batch();
     task<void> launch(batch& b);
     task<void> write_back(batch& b);
+    void end_cycle(sequence& seq, const at::Tensor& host_density);
 
   public:
     // root is the digest the page chains of a state with no pages start from. A step forwards every decoding sequence
@@ -132,9 +157,10 @@ template <page_store t_store> class scheduler {
         std::size_t prefill_tokens_per_step
     );
 
-    // Serves r, then ends writer with its final state, which leaves out the last sampled token, or an error. Waits
-    // without holding lines until free lines cover the request. One that cannot fit in the cache ends with oom; one
-    // that outgrows the free lines while running releases its lines and waits again.
+    // Serves r, then ends writer with its final state, which leaves out the last sampled token, or an error. Appends
+    // the state to writer at the end of each eviction cycle. Waits without holding lines until free lines cover the
+    // state's pages and one cycle's tokens. One whose pages and cycle cannot fit in the cache ends with oom; one that
+    // cannot get its next cycle's lines while running releases its lines, waits again and starts a new cycle.
     task<void> submit(request r, result_writer writer);
     // Steps the running sequences until the loop stops.
     task<void> run();
@@ -179,8 +205,11 @@ template <page_store t_store> void scheduler<t_store>::wake(std::optional<event>
 template <page_store t_store> task<void> scheduler<t_store>::submit(request r, result_writer writer) {
     assert(r.initial_state.tail.size() < page_size);
     assert(!r.initial_state.tail.empty() || !r.tokens.empty());
+    assert(r.eviction.n_working >= 1 && r.eviction.cycle_tokens >= 1);
+    assert(r.eviction.attention_mass_decay > 0.0 && r.eviction.attention_mass_decay <= 1.0);
     sequence seq(std::move(r), writer, kv.k.device());
     for (;;) {
+        seq.start_cycle(page_size);
         if (writer.cancelled()) {
             writer.end(std::unexpected(request_error::cancelled));
             co_return;
@@ -324,6 +353,9 @@ template <page_store t_store> task<void> scheduler<t_store>::write_back(batch& b
             seq.exited = exit_reason::cancelled;
             continue;
         }
+        if (e.ends_cycle) {
+            end_cycle(seq, e.host_density);
+        }
         if (std::size_t missing = seq.missing_lines(page_size); missing > 0) {
             std::expected<std::vector<std::uint32_t>, page_error> allocated = cache.allocate(missing);
             if (!allocated) {
@@ -340,6 +372,23 @@ template <page_store t_store> task<void> scheduler<t_store>::write_back(batch& b
             e.seq->exit_event->set();
         }
     }
+}
+
+// The step that last used the evicted lines has completed, so they are released right away.
+template <page_store t_store> void scheduler<t_store>::end_cycle(sequence& seq, const at::Tensor& host_density) {
+    if (host_density.defined()) {
+        std::span<const float> density(host_density.const_data_ptr<float>(), seq.page_hashes.size());
+        std::vector<std::size_t> evicted =
+            pages_to_evict(density, page_size, seq.cycle_start, seq.forwarded_count(page_size), seq.eviction);
+        if (!evicted.empty()) {
+            cache.release(seq.remove_pages(evicted));
+            wake(released);
+        }
+    }
+    seq.writer.append(
+        cycle_end{.reached = state{.page_hashes = seq.page_hashes, .tail = seq.tail}, .token_count = seq.covered_count}
+    );
+    seq.start_cycle(page_size);
 }
 
 }  // namespace pulsar
