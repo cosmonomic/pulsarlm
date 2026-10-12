@@ -18,3 +18,4 @@
 __pycache__/
 .nvim.lua
 .xmake/
+/NOTES.md
