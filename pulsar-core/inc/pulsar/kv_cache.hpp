@@ -64,9 +64,6 @@ class line_pool {
     // Pinned host copies, complete once stream reaches this point. nullopt when pinned host memory runs out.
     std::optional<std::vector<page>> download(std::span<const std::uint32_t> line_ids, cudaStream_t stream) const;
 
-    at::Tensor k_pool(std::size_t layer) const;
-    at::Tensor v_pool(std::size_t layer) const;
-
     template <page_store> friend class kv_cache;
 };
 
@@ -122,8 +119,9 @@ template <page_store t_store> class kv_cache {
     void release(std::span<const std::uint32_t> line_ids) noexcept;
 
     std::size_t free_line_count() const noexcept;
-    at::Tensor k_pool(std::size_t layer) const;
-    at::Tensor v_pool(std::size_t layer) const;
+    // [n_layers, n_lines, page_size, n_kv_heads, head_dim], K unrotated.
+    at::Tensor k_lines() const;
+    at::Tensor v_lines() const;
 };
 
 template <page_store t_store> struct kv_cache<t_store>::line {
@@ -385,12 +383,12 @@ template <page_store t_store> std::size_t kv_cache<t_store>::free_line_count() c
     return free_count;
 }
 
-template <page_store t_store> at::Tensor kv_cache<t_store>::k_pool(std::size_t layer) const {
-    return pool.k_pool(layer);
+template <page_store t_store> at::Tensor kv_cache<t_store>::k_lines() const {
+    return pool.k;
 }
 
-template <page_store t_store> at::Tensor kv_cache<t_store>::v_pool(std::size_t layer) const {
-    return pool.v_pool(layer);
+template <page_store t_store> at::Tensor kv_cache<t_store>::v_lines() const {
+    return pool.v;
 }
 
 }  // namespace pulsar

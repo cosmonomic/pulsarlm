@@ -23,6 +23,10 @@ namespace pulsar {
 
 namespace {
 
+at::Tensor identity_rope_layouts(int64_t num_seqs, at::Device device) {
+    return at::tensor({0, 0, -1}, at::dtype(at::kInt)).to(device).repeat({num_seqs, 1});
+}
+
 // log of the keys each query row attended, the rerank's length reference. [T] fp32.
 at::Tensor log_attended(const std::vector<int64_t>& attended_keys) {
     std::vector<float> out(attended_keys.size());
@@ -646,6 +650,7 @@ std::optional<GroupBatch> Engine::build_prefill(const BatchDescriptor& desc, Acc
     g.page_tables = desc.prefill_page_tables;
     g.cu_seqlens_q = desc.prefill_cu_seqlens_q;
     g.seqlens_k = desc.prefill_seqlens_k;
+    g.rope_layout = identity_rope_layouts(static_cast<int64_t>(pre_ids.size()), this->device);
     g.attention_mass_decay = at::tensor(mass_decay, at::TensorOptions().dtype(at::kFloat)).to(this->device);
     g.mass_length_gain = this->mass_length_gain();
     return g;
@@ -696,6 +701,7 @@ std::optional<GroupBatch> Engine::build_decode(const BatchDescriptor& desc, Acce
     g.slot_mapping = desc.decode_slot_mapping;
     g.page_tables = desc.decode_page_tables;
     g.context_lens = desc.decode_context_lens;
+    g.rope_layout = identity_rope_layouts(static_cast<int64_t>(dec_ids.size()), this->device);
     g.attention_mass_decay = at::tensor(mass_decay, at::TensorOptions().dtype(at::kFloat)).to(this->device);
     g.mass_length_gain = this->mass_length_gain();
     return g;
@@ -755,7 +761,8 @@ std::vector<TokenEvent> Engine::step_once() {
             st.forwarded_tokens += chunk;
         }
     }
-    StepLogits logits = this->model->forward(StepBatch{prefill, decode}, *this->active);
+    StepLogits logits =
+        this->model->forward(StepBatch{prefill, decode}, kv_lines{this->active->k_pool_all(), this->active->v_pool_all()});
     // Append this step's decode-group Q to each decode seq's ring (the rerank's
     // query window); no-op with recall off and on a prefill-only step.
     this->update_q_ring(desc);

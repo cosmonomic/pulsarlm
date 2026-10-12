@@ -135,12 +135,4 @@ line_pool::download(std::span<const std::uint32_t> line_ids, cudaStream_t stream
     return pages;
 }
 
-at::Tensor line_pool::k_pool(std::size_t layer) const {
-    return layer_of(k, layer);
-}
-
-at::Tensor line_pool::v_pool(std::size_t layer) const {
-    return layer_of(v, layer);
-}
-
 }  // namespace pulsar

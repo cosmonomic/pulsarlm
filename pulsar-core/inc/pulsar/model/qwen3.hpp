@@ -26,10 +26,8 @@
 
 namespace pulsar {
 
-struct ActiveBuffer;  // defined in active_buffer.hpp
-
 struct Qwen3Model : Model {
-    // Config scalars + a named-weight dict (HF/Qwen3 naming) already on the pool's
+    // Config scalars + a named-weight dict (HF/Qwen3 naming) already on the lines'
     // device/dtype. The ctor resolves every name to a tensor once into a per-layer
     // struct. lm_head is the untied lm_head.weight when present, else tied to
     // model.embed_tokens.weight.
@@ -46,7 +44,7 @@ struct Qwen3Model : Model {
         c10::Dict<std::string, at::Tensor> weights
     );
 
-    StepLogits forward(const StepBatch& batch, ActiveBuffer& kv) override;
+    StepLogits forward(const StepBatch& batch, const kv_lines& kv) override;
 
     bool supports_capture() const override {
         return true;
@@ -72,7 +70,7 @@ struct Qwen3Model : Model {
         at::Tensor down_proj_weight;
     };
 
-    at::Tensor block(at::Tensor x, int64_t layer, const GroupBatch& g, ActiveBuffer& kv);
+    at::Tensor block(at::Tensor x, int64_t layer, const GroupBatch& g, const kv_lines& kv);
     at::Tensor head(at::Tensor x);
 
     int64_t n_layers;

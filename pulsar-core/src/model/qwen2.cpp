@@ -1,8 +1,7 @@
 #include "pulsar/model/qwen2.hpp"
 
-#include "pulsar/runtime/kv/active_buffer.hpp"  // ActiveBuffer (paged KV pools)
 #include "pulsar/ops.hpp"  // rmsnorm_cuda
-#include "pulsar/model/paged_forward.hpp"  // rope_qk, paged_attention, paged_group_forward
+#include "pulsar/model/paged_forward.hpp"  // rope_q, paged_attention, paged_group_forward
 
 #include <ATen/ATen.h>
 #include <ATen/Functions.h>
@@ -70,7 +69,7 @@ Qwen2Model::Qwen2Model(
 }
 
 // Qwen2 block: QKV projection with bias, RoPE + paged attention, SwiGLU MLP.
-at::Tensor Qwen2Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, ActiveBuffer& kv) {
+at::Tensor Qwen2Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, const kv_lines& kv) {
     const LayerWeights& lw = this->layers[layer];
     const int64_t ntok = x.size(0);
 
@@ -79,8 +78,9 @@ at::Tensor Qwen2Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, A
     auto k = at::linear(h, lw.k_proj_weight, lw.k_proj_bias);
     auto v = at::linear(h, lw.v_proj_weight, lw.v_proj_bias);
 
-    std::tie(q, k) = rope_qk(q, k, g.pos, this->n_heads, this->n_kv_heads, this->head_dim, this->rope_theta);
-    // V is never roped; reshape to the paged ops' [tokens, n_kv_heads, head_dim].
+    q = rope_q(q, g.pos, this->n_heads, this->head_dim, this->rope_theta);
+    // The lines store K and V unrotated, as the paged ops' [tokens, n_kv_heads, head_dim].
+    k = k.view({ntok, this->n_kv_heads, this->head_dim}).contiguous();
     v = v.view({ntok, this->n_kv_heads, this->head_dim}).contiguous();
     auto o = paged_attention(q, k, v, kv, layer, g, this->scale, this->rope_theta);
 
@@ -100,7 +100,7 @@ at::Tensor Qwen2Model::head(at::Tensor x) {
     return at::matmul(x, this->embed_tokens.t());
 }
 
-StepLogits Qwen2Model::forward(const StepBatch& batch, ActiveBuffer& kv) {
+StepLogits Qwen2Model::forward(const StepBatch& batch, const kv_lines& kv) {
     return paged_forward(batch, [&](const GroupBatch& g) {
         return paged_group_forward(
             this->embed_tokens,

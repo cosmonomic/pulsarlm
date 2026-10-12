@@ -1,7 +1,5 @@
 #include "pulsar/model/compiled_model.hpp"
 
-#include "pulsar/runtime/kv/active_buffer.hpp"  // ActiveBuffer (paged KV pools)
-
 #include <ATen/ATen.h>
 #include <ATen/Functions.h>
 #include <c10/cuda/CUDAStream.h>
@@ -79,19 +77,6 @@ at::Tensor pad_page_table_cols(at::Tensor bt, int64_t max_pages) {
     return bt.contiguous();
 }
 
-// Physical pool slots row 0 attends: slot(j) = bt_row0[j / page_size] * page_size
-// + j % page_size, for j in [0, len). len is row 0's context (decode) or its key
-// length seqlens_k[0] (prefill). Same physical set in every layer.
-std::vector<int64_t> row0_attended_slots(const at::Tensor& bt_row0, int64_t len, int64_t page_size) {
-    auto bt_cpu = bt_row0.to(at::kCPU, at::kInt).contiguous();
-    auto a = bt_cpu.accessor<int32_t, 1>();
-    std::vector<int64_t> slots(len);
-    for (int64_t j = 0; j < len; ++j) {
-        slots[j] = static_cast<int64_t>(a[j / page_size]) * page_size + (j % page_size);
-    }
-    return slots;
-}
-
 }  // namespace
 
 CompiledModel::CompiledModel(
@@ -122,17 +107,20 @@ CompiledModel::CompiledModel(
     this->max_pages = num_pages / num_seqs;
 }
 
-void CompiledModel::validate(ActiveBuffer& kv) const {
-    if (kv.num_pages() != this->num_pages || kv.page_size() != this->page_size || kv.n_layers() != this->n_layers) {
+void CompiledModel::validate(const kv_lines& kv) const {
+    const int64_t kv_layers = kv.k.size(0);
+    const int64_t kv_pages = kv.k.size(1);
+    const int64_t kv_page_size = kv.k.size(2);
+    if (kv_pages != this->num_pages || kv_page_size != this->page_size || kv_layers != this->n_layers) {
         TORCH_CHECK(
             false,
-            "allocator dims do not match the compiled graph: got "
+            "KV line dims do not match the compiled graph: got "
             "(n_layers=",
-            kv.n_layers(),
+            kv_layers,
             ", num_pages=",
-            kv.num_pages(),
+            kv_pages,
             ", page_size=",
-            kv.page_size(),
+            kv_page_size,
             "), baked (n_layers=",
             this->n_layers,
             ", num_pages=",
@@ -147,9 +135,7 @@ void CompiledModel::validate(ActiveBuffer& kv) const {
 at::Tensor CompiledModel::run_decode_group(
     torch::inductor::AOTIModelPackageLoader& loader,
     const GroupBatch& g,
-    const at::Tensor& k,
-    const at::Tensor& v,
-    const at::Tensor& mass
+    const kv_lines& kv
 ) {
     TORCH_CHECK(g.context_lens.defined(), "decode group missing context_lens");
     const int64_t R = g.context_lens.numel();
@@ -168,23 +154,7 @@ at::Tensor CompiledModel::run_decode_group(
     at::Tensor slot = g.slot_mapping, context_lens = g.context_lens;
     at::Tensor page_tables = g.page_tables;
 
-    // Snapshot row 0's attended-slot mass before the run; the (1 + pad)x over-count
-    // from the duplicated rows is divided back down afterwards.
-    std::vector<int64_t> slots0;
-    at::Tensor slots0_dev;
-    std::vector<at::Tensor> pre_mass;
     if (pad > 0) {
-        const int64_t ctx0 = g.context_lens[0].item<int32_t>();
-        slots0 = row0_attended_slots(g.page_tables[0], ctx0, this->page_size);
-        slots0_dev = i64_to_dev(slots0, dev);
-        pre_mass.resize(this->n_layers);
-        for (int64_t l = 0; l < this->n_layers; ++l) {
-            pre_mass[l] = mass.select(0, l)
-                              .view({this->num_pages * this->page_size, mass.size(3)})
-                              .index_select(0, slots0_dev)
-                              .clone();
-        }
-
         at::Tensor idx = pad_row_index(R, this->num_seqs, dev);
         tokens = tokens.index_select(0, idx);
         pos = pos.index_select(0, idx);
@@ -194,28 +164,16 @@ at::Tensor CompiledModel::run_decode_group(
     }
     page_tables = pad_page_table_cols(page_tables, this->max_pages);
 
-    // decode: [tokens, pos, slot_mapping, page_tables, context_lens, k, v, mass]
-    std::vector<at::Tensor> inputs{tokens, pos, slot, page_tables, context_lens, k, v, mass};
+    // decode: [tokens, pos, slot_mapping, page_tables, context_lens, k, v]
+    std::vector<at::Tensor> inputs{tokens, pos, slot, page_tables, context_lens, kv.k, kv.v};
     at::Tensor logits = loader.run(inputs, current_stream())[0];
-
-    if (pad > 0) {
-        const double div = static_cast<double>(1 + pad);
-        for (int64_t l = 0; l < this->n_layers; ++l) {
-            auto flat = mass.select(0, l).view({this->num_pages * this->page_size, mass.size(3)});
-            auto post = flat.index_select(0, slots0_dev);
-            auto corrected = pre_mass[l] + (post - pre_mass[l]) / div;
-            flat.index_copy_(0, slots0_dev, corrected);
-        }
-    }
     return logits.narrow(0, 0, R);  // real rows only
 }
 
 at::Tensor CompiledModel::run_prefill_group(
     torch::inductor::AOTIModelPackageLoader& loader,
     const GroupBatch& g,
-    const at::Tensor& k,
-    const at::Tensor& v,
-    const at::Tensor& mass
+    const kv_lines& kv
 ) {
     TORCH_CHECK(g.cu_seqlens_q.defined() && g.seqlens_k.defined(), "prefill group missing cu_seqlens_q/seqlens_k");
     const int64_t R = g.cu_seqlens_q.numel() - 1;
@@ -236,25 +194,10 @@ at::Tensor CompiledModel::run_prefill_group(
     at::Tensor cu = g.cu_seqlens_q, seqlens_k = g.seqlens_k;
     at::Tensor page_tables = g.page_tables;
 
-    std::vector<int64_t> slots0;
-    at::Tensor slots0_dev;
-    std::vector<at::Tensor> pre_mass;
     if (pad > 0) {
         auto cu_cpu = cu.to(at::kCPU, at::kInt).contiguous();
         auto cu_a = cu_cpu.accessor<int32_t, 1>();
         const int64_t total_q0 = cu_a[1] - cu_a[0];  // seq 0's query token count
-        const int64_t sk0 = g.seqlens_k[0].item<int32_t>();  // seq 0's key length
-
-        // Snapshot seq 0's attended key slots' mass (over-counted by the dummies).
-        slots0 = row0_attended_slots(g.page_tables[0], sk0, this->page_size);
-        slots0_dev = i64_to_dev(slots0, dev);
-        pre_mass.resize(this->n_layers);
-        for (int64_t l = 0; l < this->n_layers; ++l) {
-            pre_mass[l] = mass.select(0, l)
-                              .view({this->num_pages * this->page_size, mass.size(3)})
-                              .index_select(0, slots0_dev)
-                              .clone();
-        }
 
         // Query-token index: the real total_q rows, then `pad` copies of seq 0's
         // query rows [0, total_q0). Dummies appended after the real rows keep the
@@ -288,34 +231,20 @@ at::Tensor CompiledModel::run_prefill_group(
     }
     page_tables = pad_page_table_cols(page_tables, this->max_pages);
 
-    // prefill: [tokens, pos, slot_mapping, page_tables, cu_seqlens_q, seqlens_k, k, v, mass]
-    std::vector<at::Tensor> inputs{tokens, pos, slot, page_tables, cu, seqlens_k, k, v, mass};
+    // prefill: [tokens, pos, slot_mapping, page_tables, cu_seqlens_q, seqlens_k, k, v]
+    std::vector<at::Tensor> inputs{tokens, pos, slot, page_tables, cu, seqlens_k, kv.k, kv.v};
     at::Tensor logits = loader.run(inputs, current_stream())[0];
-
-    if (pad > 0) {
-        const double div = static_cast<double>(1 + pad);
-        for (int64_t l = 0; l < this->n_layers; ++l) {
-            auto flat = mass.select(0, l).view({this->num_pages * this->page_size, mass.size(3)});
-            auto post = flat.index_select(0, slots0_dev);
-            auto corrected = pre_mass[l] + (post - pre_mass[l]) / div;
-            flat.index_copy_(0, slots0_dev, corrected);
-        }
-    }
     return logits.narrow(0, 0, total_q);  // real query rows only
 }
 
-StepLogits CompiledModel::forward(const StepBatch& batch, ActiveBuffer& kv) {
+StepLogits CompiledModel::forward(const StepBatch& batch, const kv_lines& kv) {
     this->validate(kv);
-    // Fetch the stacked pools once; the graphs mutate them in place.
-    at::Tensor k = kv.k_pool_all();
-    at::Tensor v = kv.v_pool_all();
-    at::Tensor mass = kv.mass_pool_all();
     StepLogits out;
     if (batch.prefill.has_value()) {
-        out.prefill = this->run_prefill_group(this->prefill_loader, *batch.prefill, k, v, mass);
+        out.prefill = this->run_prefill_group(this->prefill_loader, *batch.prefill, kv);
     }
     if (batch.decode.has_value()) {
-        out.decode = this->run_decode_group(this->decode_loader, *batch.decode, k, v, mass);
+        out.decode = this->run_decode_group(this->decode_loader, *batch.decode, kv);
     }
     return out;
 }

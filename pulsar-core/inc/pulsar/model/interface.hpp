@@ -5,18 +5,22 @@
 #include <optional>
 
 // The forward boundary the Engine drives: a scheduler step's prefill and decode
-// groups plus the paged KV pools go in, per-group logits come out. The engine
+// groups plus the paged KV lines go in, per-group logits come out. The engine
 // depends only on this interface; the concrete model (CompiledModel, Qwen2Model)
 // is opaque to it.
 
 namespace pulsar {
 
-struct ActiveBuffer;  // owns the paged KV pools; defined in active_buffer.hpp
+// [n_layers, n_lines, page_size, n_kv_heads, head_dim] each. K is stored unrotated.
+struct kv_lines {
+    at::Tensor k;
+    at::Tensor v;
+};
 
 // One scheduler group's query tokens + KV placement + attention descriptor.
 // tokens/pos are the group's tokens and their pos,
 // concatenated across the group's sequences; slot_mapping/page_tables place
-// them into the pools. The group kind is distinguished by which descriptor is
+// them into the lines. The group kind is distinguished by which descriptor is
 // defined: a prefill group carries cu_seqlens_q/seqlens_k, a decode group
 // carries context_lens. The other descriptor(s) are left undefined.
 struct GroupBatch {
@@ -27,6 +31,9 @@ struct GroupBatch {
     at::Tensor cu_seqlens_q;  // int32 [num_seqs + 1], defined iff prefill
     at::Tensor seqlens_k;  // int32 [num_seqs],     defined iff prefill
     at::Tensor context_lens;  // int32 [num_seqs],     defined iff decode
+    // int32 [num_seqs, 3], the RoPE position of each key by its view index (see attn_decode_cuda). pos holds each
+    // query's position under the same layout.
+    at::Tensor rope_layout;
     // fp32 [num_seqs] in the group's row order: each sequence's attention-mass EMA
     // gain alpha, which the attention kernels index by sequence. Per session, so one
     // batched forward may carry several rates.
@@ -55,7 +62,7 @@ struct StepLogits {
 
 // tokens + KV + batch -> logits.
 struct Model {
-    virtual StepLogits forward(const StepBatch& batch, ActiveBuffer& kv) = 0;
+    virtual StepLogits forward(const StepBatch& batch, const kv_lines& kv) = 0;
 
     // Pre-RoPE query capture for QK-attention recall. set_capture_layers names the
     // attention layers whose pre-RoPE Q the next forward should stash; after a

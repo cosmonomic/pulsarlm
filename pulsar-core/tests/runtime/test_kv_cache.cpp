@@ -108,20 +108,13 @@ page host_page(float value) {
 }
 
 void fill_line(memory_kv_cache& kv, std::uint32_t line_id, float value) {
-    for (std::size_t layer = 0; layer < shape.n_layers; layer++) {
-        kv.k_pool(layer).select(0, line_id).fill_(value);
-        kv.v_pool(layer).select(0, line_id).fill_(-value);
-    }
+    kv.k_lines().select(1, line_id).fill_(value);
+    kv.v_lines().select(1, line_id).fill_(-value);
 }
 
 bool line_filled_with(memory_kv_cache& kv, std::uint32_t line_id, float value) {
-    for (std::size_t layer = 0; layer < shape.n_layers; layer++) {
-        if (!kv.k_pool(layer).select(0, line_id).eq(value).all().item<bool>() ||
-            !kv.v_pool(layer).select(0, line_id).eq(-value).all().item<bool>()) {
-            return false;
-        }
-    }
-    return true;
+    return kv.k_lines().select(1, line_id).eq(value).all().item<bool>() &&
+           kv.v_lines().select(1, line_id).eq(-value).all().item<bool>();
 }
 
 template <typename t> task<void> store_result(task<t> work, std::optional<t>* result) {

@@ -23,10 +23,8 @@
 
 namespace pulsar {
 
-struct ActiveBuffer;  // defined in active_buffer.hpp
-
 struct Qwen2Model : Model {
-    // Config scalars + a named-weight dict (HF/Qwen2 naming) already on the pool's
+    // Config scalars + a named-weight dict (HF/Qwen2 naming) already on the lines'
     // device/dtype. The ctor resolves every name to a tensor once into a per-layer
     // struct. lm_head is tied to model.embed_tokens.weight.
     Qwen2Model(
@@ -42,9 +40,9 @@ struct Qwen2Model : Model {
         c10::Dict<std::string, at::Tensor> weights
     );
 
-    // Run the present groups over the pools `kv`; per-group logits in the weight
+    // Run the present groups over the lines `kv`; per-group logits in the weight
     // dtype (fp32 or bf16).
-    StepLogits forward(const StepBatch& batch, ActiveBuffer& kv) override;
+    StepLogits forward(const StepBatch& batch, const kv_lines& kv) override;
 
   private:
     // One decoder layer's tensors, resolved from the weight dict at construction.
@@ -64,8 +62,8 @@ struct Qwen2Model : Model {
         at::Tensor down_proj_weight;
     };
 
-    // One Qwen2 decoder block over layer `layer`'s paged KV pool.
-    at::Tensor block(at::Tensor x, int64_t layer, const GroupBatch& g, ActiveBuffer& kv);
+    // One Qwen2 decoder block over layer `layer`'s KV lines.
+    at::Tensor block(at::Tensor x, int64_t layer, const GroupBatch& g, const kv_lines& kv);
     // Final RMSNorm + tied-embedding lm_head; logits in the weight dtype.
     at::Tensor head(at::Tensor x);
 

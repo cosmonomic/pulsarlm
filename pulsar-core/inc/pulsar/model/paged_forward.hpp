@@ -6,7 +6,6 @@
 
 #include <cstdint>
 #include <functional>
-#include <utility>
 
 // Model-agnostic primitives of the paged transformer forward, shared by every
 // native `*Model`. The per-layer arithmetic (norm placement, projection bias, MLP
@@ -14,33 +13,22 @@
 
 namespace pulsar {
 
-struct ActiveBuffer;  // defined in active_buffer.hpp
+// Apply RoPE (rotate_half over head_dim) to a group's q, the projection output
+// [ntok, n_q_heads * head_dim]; returns it roped and reshaped to
+// [ntok, n_q_heads, head_dim], ready for paged attention.
+at::Tensor rope_q(const at::Tensor& q, const at::Tensor& pos, int64_t n_q_heads, int64_t head_dim, double theta);
 
-// Apply RoPE (rotate_half over head_dim) to a group's q and k. Inputs are the
-// projection outputs, [ntok, n_q_heads * head_dim] and [ntok, n_kv_heads *
-// head_dim]; returns them roped and reshaped to [ntok, n_q_heads, head_dim] /
-// [ntok, n_kv_heads, head_dim], ready for write_kv + paged attention.
-std::pair<at::Tensor, at::Tensor> rope_qk(
-    const at::Tensor& q,
-    const at::Tensor& k,
-    const at::Tensor& pos,
-    int64_t n_q_heads,
-    int64_t n_kv_heads,
-    int64_t head_dim,
-    double theta
-);
-
-// write_kv the group's new K/V into layer `layer`'s pool, then run the group's
+// write_kv the group's new K/V into layer `layer`'s lines, then run the group's
 // paged attention (prefill vs decode by g.is_prefill()) and return o
-// [ntok, n_q_heads, head_dim]. q/k/v are already projected and (q,k) roped in the
-// group's [ntok, heads, head_dim] layout.
+// [ntok, n_q_heads, head_dim]. q/k/v are already projected and q roped in the
+// group's [ntok, heads, head_dim] layout; k is unrotated.
 // lse_capture, when defined, receives this group's per-(query row, query head)
 // logsumexp -- the softmax denominator the attention used. fp32 [ntok, n_q_heads].
 at::Tensor paged_attention(
     const at::Tensor& q,
     const at::Tensor& k,
     const at::Tensor& v,
-    ActiveBuffer& kv,
+    const kv_lines& kv,
     int64_t layer,
     const GroupBatch& g,
     double scale,

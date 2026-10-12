@@ -1,8 +1,7 @@
 #include "pulsar/model/qwen3.hpp"
 
-#include "pulsar/runtime/kv/active_buffer.hpp"  // ActiveBuffer (paged KV pools)
 #include "pulsar/ops.hpp"  // rmsnorm_cuda
-#include "pulsar/model/paged_forward.hpp"  // rope_qk, paged_attention, paged_group_forward
+#include "pulsar/model/paged_forward.hpp"  // rope_q, paged_attention, paged_group_forward
 
 #include <ATen/ATen.h>
 #include <ATen/Functions.h>
@@ -74,7 +73,7 @@ Qwen3Model::Qwen3Model(
 
 // Qwen3 block: bias-free QKV projection, per-head QK-Norm before RoPE, then RoPE +
 // paged attention and a SwiGLU MLP.
-at::Tensor Qwen3Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, ActiveBuffer& kv) {
+at::Tensor Qwen3Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, const kv_lines& kv) {
     const LayerWeights& lw = this->layers[layer];
     const int64_t ntok = x.size(0);
 
@@ -84,11 +83,11 @@ at::Tensor Qwen3Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, A
     auto v = at::linear(h, lw.v_proj_weight);
 
     // QK-Norm: per-head RMSNorm over head_dim, before RoPE. Reshape so the last
-    // axis is the per-head vector, then flatten back for rope_qk.
+    // axis is the per-head vector, then flatten q back for rope_q. The lines store K
+    // unrotated, as the paged ops' [tokens, n_kv_heads, head_dim].
     q = rmsnorm_cuda(q.view({ntok, this->n_heads, this->head_dim}), lw.q_norm_weight, this->rms_eps)
             .view({ntok, this->n_heads * this->head_dim});
-    k = rmsnorm_cuda(k.view({ntok, this->n_kv_heads, this->head_dim}), lw.k_norm_weight, this->rms_eps)
-            .view({ntok, this->n_kv_heads * this->head_dim});
+    k = rmsnorm_cuda(k.view({ntok, this->n_kv_heads, this->head_dim}), lw.k_norm_weight, this->rms_eps);
 
     // Stash the post-QK-Norm, pre-RoPE Q for QK-attention recall.
     // [ntok, n_heads, head_dim] in the group's token order.
@@ -97,7 +96,7 @@ at::Tensor Qwen3Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, A
         (g.is_prefill() ? this->cap_prefill : this->cap_decode)[layer] = q_pre;
     }
 
-    std::tie(q, k) = rope_qk(q, k, g.pos, this->n_heads, this->n_kv_heads, this->head_dim, this->rope_theta);
+    q = rope_q(q, g.pos, this->n_heads, this->head_dim, this->rope_theta);
     v = v.view({ntok, this->n_kv_heads, this->head_dim}).contiguous();
     // Capture the softmax denominator on the same layers as Q: the recall score needs
     // the denominator the attention actually used, not one rebuilt over a subset.
@@ -128,7 +127,7 @@ at::Tensor Qwen3Model::head(at::Tensor x) {
     return at::matmul(x, w.t());
 }
 
-StepLogits Qwen3Model::forward(const StepBatch& batch, ActiveBuffer& kv) {
+StepLogits Qwen3Model::forward(const StepBatch& batch, const kv_lines& kv) {
     // Fresh capture each forward: clear both groups' stashes; block() refills the
     // configured layers.
     this->lse_prefill.clear();
