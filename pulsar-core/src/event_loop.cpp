@@ -1,6 +1,5 @@
 #include "pulsar/event_loop.hpp"
 
-#include <c10/util/Exception.h>
 #include <cuda_runtime_api.h>
 
 #include <cassert>
@@ -8,8 +7,9 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <utility>
-#include <vector>
 
 namespace pulsar {
 
@@ -18,6 +18,12 @@ namespace {
 thread_local event_loop* running = nullptr;
 
 using cuda_resolver = external_task<cudaError_t>::resolver;
+
+void check_cuda(cudaError_t status) {
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string("synchronize: ") + cudaGetErrorString(status));
+    }
+}
 
 void CUDART_CB resolve_synchronized(cudaStream_t, cudaError_t status, void* resolver) {
     std::unique_ptr<cuda_resolver> owned(static_cast<cuda_resolver*>(resolver));
@@ -31,7 +37,7 @@ void CUDART_CB resolve_synchronized(cudaStream_t, cudaError_t status, void* reso
 event::~event() {
     assert(waiters == nullptr || event_loop::current() == nullptr);
     for (awaiter* waiter = waiters; waiter != nullptr; waiter = waiter->next) {
-        waiter->handle = {};
+        waiter->linked = false;
     }
 }
 
@@ -39,14 +45,18 @@ void event::set() noexcept {
     event_loop* loop = event_loop::current();
     assert(loop != nullptr);
     is_set = true;
-    for (awaiter* waiter = std::exchange(waiters, nullptr); waiter != nullptr; waiter = waiter->next) {
-        loop->schedule(std::exchange(waiter->handle, {}));
+    awaiter* waiter = std::exchange(waiters, nullptr);
+    while (waiter != nullptr) {
+        awaiter* following = waiter->next;
+        waiter->linked = false;
+        loop->schedule(waiter->scheduled);
+        waiter = following;
     }
 }
 
 // A frame destroyed while awaiting, after a panic or with its loop, unlinks its awaiter.
 event::awaiter::~awaiter() {
-    if (!handle) {
+    if (!linked) {
         return;
     }
     awaiter** link = &target.waiters;
@@ -57,7 +67,8 @@ event::awaiter::~awaiter() {
 }
 
 void event::awaiter::await_suspend(std::coroutine_handle<> awaiting) noexcept {
-    handle = awaiting;
+    scheduled.handle = awaiting;
+    linked = true;
     next = std::exchange(target.waiters, this);
 }
 
@@ -71,7 +82,8 @@ event_loop::~event_loop() {
     decltype(root_tasks) remaining;
     {
         std::lock_guard lock(mutex);
-        ready.clear();
+        ready_front = nullptr;
+        ready_back = nullptr;
         remaining.swap(root_tasks);
     }
 }
@@ -91,9 +103,19 @@ void event_loop::destroy_completed_root_task() noexcept {
     }
 }
 
-void event_loop::schedule(std::coroutine_handle<> handle) {
+void event_loop::push_ready(ready_node& node) noexcept {
+    node.next = nullptr;
+    if (ready_back == nullptr) {
+        ready_front = &node;
+    } else {
+        ready_back->next = &node;
+    }
+    ready_back = &node;
+}
+
+void event_loop::schedule(ready_node& node) noexcept {
     std::lock_guard lock(mutex);
-    ready.push_back(handle);
+    push_ready(node);
     wake.notify_one();
 }
 
@@ -101,34 +123,34 @@ void event_loop::spawn(task<void> root_task) {
     assert(root_task.handle);
     std::coroutine_handle<> handle = root_task.handle;
     std::lock_guard lock(mutex);
-    root_tasks.emplace(handle, std::move(root_task));
-    ready.push_back(handle);
+    auto [it, inserted] = root_tasks.try_emplace(handle, spawned_task{std::move(root_task), {.handle = handle}});
+    push_ready(it->second.scheduled);
     wake.notify_one();
 }
 
 std::exception_ptr event_loop::run() {
     assert(running == nullptr);
     running = this;
-    std::vector<std::coroutine_handle<>> resuming;
     while (exception == nullptr) {
+        ready_node* resuming;
         {
             std::unique_lock lock(mutex);
-            wake.wait(lock, [this] { return stopping || !ready.empty(); });
+            wake.wait(lock, [this] { return stopping || ready_front != nullptr; });
             if (stopping) {
                 break;
             }
-            resuming.swap(ready);
+            resuming = std::exchange(ready_front, nullptr);
+            ready_back = nullptr;
         }
-        for (std::coroutine_handle<> handle : resuming) {
+        // A node lives in its coroutine's frame, which resuming can destroy, so next is read first.
+        while (resuming != nullptr && exception == nullptr) {
+            std::coroutine_handle<> handle = resuming->handle;
+            resuming = resuming->next;
             handle.resume();
             if (completed_root_task) {
                 destroy_completed_root_task();
             }
-            if (exception != nullptr) {
-                break;
-            }
         }
-        resuming.clear();
     }
     running = nullptr;
     return exception;
@@ -143,11 +165,9 @@ void event_loop::stop() noexcept {
 task<void> synchronize(cudaStream_t stream) {
     auto [done, resolver] = external_task<cudaError_t>::make();
     auto owned = std::make_unique<cuda_resolver>(std::move(resolver));
-    cudaError_t enqueued = cudaStreamAddCallback(stream, resolve_synchronized, owned.get(), 0);
-    TORCH_CHECK(enqueued == cudaSuccess, "synchronize: ", cudaGetErrorString(enqueued));
+    check_cuda(cudaStreamAddCallback(stream, resolve_synchronized, owned.get(), 0));
     owned.release();
-    cudaError_t status = co_await std::move(done);
-    TORCH_CHECK(status == cudaSuccess, "synchronize: ", cudaGetErrorString(status));
+    check_cuda(co_await std::move(done));
 }
 
 }  // namespace pulsar

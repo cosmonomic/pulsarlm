@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string_view>
+#include <vector>
 
 namespace pulsar {
 
@@ -25,5 +27,13 @@ struct digest_hash {
 // little-endian. Every service computing digests must match this encoding and the hash chosen at build time.
 digest make_digest(std::span<const std::byte> seed) noexcept;
 digest make_digest(const digest& parent, std::span<const std::int64_t> tokens) noexcept;
+
+// The digest of each full page of tokens, chained from parent: the first page from parent, each next page from the
+// page before it. tokens start at a page boundary; the partial tail page is not hashed.
+std::vector<digest>
+make_page_digests(const digest& parent, std::span<const std::int64_t> tokens, std::size_t page_size);
+
+// The hash chosen at build time: "sha256" or "blake3".
+std::string_view digest_function() noexcept;
 
 }  // namespace pulsar

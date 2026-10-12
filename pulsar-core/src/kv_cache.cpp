@@ -6,16 +6,32 @@
 #include <c10/util/Exception.h>
 #include <cuda_runtime_api.h>
 
+#include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace pulsar {
 
+static_assert(std::endian::native == std::endian::little);
+
 namespace {
+
+void append_u64(std::vector<std::byte>& seed, std::uint64_t value) {
+    auto bytes = std::bit_cast<std::array<std::byte, sizeof(value)>>(value);
+    seed.insert(seed.end(), bytes.begin(), bytes.end());
+}
+
+void append_string(std::vector<std::byte>& seed, std::string_view value) {
+    append_u64(seed, value.size());
+    auto bytes = std::as_bytes(std::span(value));
+    seed.insert(seed.end(), bytes.begin(), bytes.end());
+}
 
 at::Tensor make_lines(const page_shape& shape, std::size_t n_lines, at::Device device) {
     TORCH_CHECK(n_lines < std::numeric_limits<std::uint32_t>::max(), "kv_cache: too many lines: ", n_lines);
@@ -64,6 +80,18 @@ at::Tensor download_line(const at::Tensor& lines, std::uint32_t line_id) {
 }
 
 }  // namespace
+
+digest make_root_digest(std::string_view model, const page_shape& shape) {
+    std::vector<std::byte> seed;
+    append_string(seed, digest_function());
+    append_string(seed, model);
+    append_string(seed, c10::toString(shape.dtype));
+    append_u64(seed, shape.n_layers);
+    append_u64(seed, shape.page_size);
+    append_u64(seed, shape.n_kv_heads);
+    append_u64(seed, shape.head_dim);
+    return make_digest(seed);
+}
 
 line_pool::line_pool(const page_shape& shape, std::size_t n_lines, at::Device device)
 : k(make_lines(shape, n_lines, device)),

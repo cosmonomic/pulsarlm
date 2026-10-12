@@ -40,6 +40,10 @@ class hasher {
 
 }  // namespace
 
+std::string_view digest_function() noexcept {
+    return "blake3";
+}
+
 digest make_digest(std::span<const std::byte> seed) noexcept {
     hasher h("pulsar root digest");
     h.update(seed.data(), seed.size());

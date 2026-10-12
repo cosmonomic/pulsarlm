@@ -11,6 +11,7 @@
 #include <limits>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -33,6 +34,12 @@ struct page_shape {
     std::size_t head_dim;
     at::ScalarType dtype;
 };
+
+// The digest that the page chains of an engine start from. model names the model and its weights version; with shape
+// and digest_function it covers everything that changes a page's KV or how tokens split into pages. The seed is
+// digest_function, model and the dtype name, each as an 8-byte little-endian length then its bytes, then n_layers,
+// page_size, n_kv_heads and head_dim, each as 8 little-endian bytes.
+digest make_root_digest(std::string_view model, const page_shape& shape);
 
 // fetch returns the pages in the order of hashes, nullopt for those it does not have. put takes ownership of host
 // pages and their hashes, matched by index, and returns without waiting for the write.

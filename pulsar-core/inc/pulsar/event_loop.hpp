@@ -1,5 +1,9 @@
 #pragma once
 
+#ifdef __CUDACC__
+#error "event_loop.hpp holds coroutine types; keep it out of .cu files"
+#endif
+
 #include <cuda_runtime_api.h>
 
 #include <cassert>
@@ -9,38 +13,14 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <variant>
-#include <vector>
 
 namespace pulsar {
 
 class event_loop;
-
-namespace detail {
-
-template <typename t> class task_result {
-    std::optional<t> value;
-
-  public:
-    void return_value(t returned) {
-        value.emplace(std::move(returned));
-    }
-
-    t take() {
-        return std::move(*value);
-    }
-};
-
-template <> class task_result<void> {
-  public:
-    void return_void() noexcept {}
-
-    void take() noexcept {}
-};
-
-}  // namespace detail
 
 // Starts when awaited and resumes its awaiter when it completes. Awaiting consumes the task: await a prvalue or
 // std::move(t). An exception escaping the coroutine panics event_loop::current().
@@ -49,6 +29,8 @@ template <typename t> class [[nodiscard]] task {
     class promise_type;
 
   private:
+    class value_result;
+    class void_result;
     class awaiter;
 
     std::coroutine_handle<promise_type> handle;
@@ -126,11 +108,23 @@ template <typename value_type> class external_task<value_type>::resolver {
 };
 
 class event_loop {
+    // A coroutine linked into the ready queue, so scheduling it does not allocate.
+    struct ready_node {
+        std::coroutine_handle<> handle;
+        ready_node* next = nullptr;
+    };
+
+    struct spawned_task {
+        task<void> owned;
+        ready_node scheduled;
+    };
+
     std::mutex mutex;
     std::condition_variable wake;
-    std::vector<std::coroutine_handle<>> ready;
+    ready_node* ready_front = nullptr;
+    ready_node* ready_back = nullptr;
     bool stopping = false;
-    std::unordered_map<std::coroutine_handle<>, task<void>> root_tasks;
+    std::unordered_map<std::coroutine_handle<>, spawned_task> root_tasks;
     // Written and read on the loop thread only.
     std::exception_ptr exception;
     // A root task's final suspend returns to run, so one resume completes at most one root task.
@@ -138,8 +132,13 @@ class event_loop {
 
     void panic(std::exception_ptr thrown) noexcept;
     void destroy_completed_root_task() noexcept;
+    void push_ready(ready_node& node) noexcept;
+    // Safe to call from any thread. node stays linked until its coroutine is resumed or the loop is destroyed.
+    void schedule(ready_node& node) noexcept;
 
     template <typename> friend class task;
+    template <typename> friend class external_task;
+    friend class event;
 
   public:
     // The loop running on the calling thread, null outside run.
@@ -148,8 +147,6 @@ class event_loop {
     // Destroys the remaining root tasks without resuming them.
     ~event_loop();
 
-    // Safe to call from any thread.
-    void schedule(std::coroutine_handle<> handle);
     // Safe to call from any thread.
     void spawn(task<void> root_task);
     // Resumes scheduled coroutines on the calling thread until stop, or until a task panics. Returns the panic's
@@ -163,7 +160,28 @@ class event_loop {
 // cudaLaunchHostFunc also runs after a CUDA error; an error panics.
 task<void> synchronize(cudaStream_t stream);
 
-template <typename t> class task<t>::promise_type : public detail::task_result<t> {
+template <typename t> class task<t>::value_result {
+    std::optional<t> value;
+
+  public:
+    void return_value(t returned) {
+        value.emplace(std::move(returned));
+    }
+
+    t take() {
+        return std::move(*value);
+    }
+};
+
+template <typename t> class task<t>::void_result {
+  public:
+    void return_void() noexcept {}
+
+    void take() noexcept {}
+};
+
+template <typename t>
+class task<t>::promise_type : public std::conditional_t<std::is_void_v<t>, void_result, value_result> {
     struct final_awaiter;
 
     std::coroutine_handle<> continuation;
@@ -273,9 +291,9 @@ template <typename t> typename task<t>::awaiter task<t>::operator co_await() && 
 
 class event::awaiter {
     event& target;
-    // Null when not linked into target.
-    std::coroutine_handle<> handle;
+    event_loop::ready_node scheduled;
     awaiter* next = nullptr;
+    bool linked = false;
 
     friend class event;
 
@@ -303,7 +321,8 @@ inline event::awaiter event::operator co_await() noexcept {
 template <typename value_type> struct external_task<value_type>::state {
     std::mutex mutex;
     std::optional<value_type> value;
-    std::coroutine_handle<> waiting;
+    // Its handle is null until awaited.
+    event_loop::ready_node waiting;
     event_loop* loop = nullptr;
     bool alive = true;
 
@@ -315,7 +334,7 @@ template <typename value_type> struct external_task<value_type>::state {
         }
         assert(!value);
         value.emplace(std::move(resolved));
-        if (waiting) {
+        if (waiting.handle) {
             loop->schedule(waiting);
         }
     }
@@ -342,7 +361,7 @@ template <typename value_type> class external_task<value_type>::awaiter {
         if (awaited.value) {
             return false;
         }
-        awaited.waiting = awaiting;
+        awaited.waiting.handle = awaiting;
         awaited.loop = event_loop::current();
         return true;
     }
