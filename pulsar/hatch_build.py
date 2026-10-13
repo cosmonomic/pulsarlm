@@ -1,5 +1,6 @@
 import json
 import subprocess
+import sysconfig
 from pathlib import Path
 
 import torch.utils
@@ -22,6 +23,7 @@ class CustomBuildHook(BuildHookInterface):
                 "release",
                 "--tests=n",
                 f"--torch_cmake_prefix={torch.utils.cmake_prefix_path}",
+                f"--python_include={sysconfig.get_paths()['include']}",
             ],
             check=True,
         )

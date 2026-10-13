@@ -5,9 +5,6 @@
 #include <optional>
 #include <tuple>
 
-// Kernel entry points. Each is registered as a torch custom op in
-// pulsar/ext/ops.cpp, callable from C++ and from Python.
-
 namespace pulsar {
 
 // RMSNorm. Stateless.

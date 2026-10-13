@@ -1,9 +1,12 @@
-"""torch.classes.pulsar.Engine, the TorchBind runtime (pulsar/ext/engine.cpp).
+"""The engine binding (pulsar/ext/module.cpp); engine.pyi types it."""
 
-pulsar_core.so is loaded when pulsar.core is imported; see engine.pyi (same
-module name, paired stub) for Engine's typed method signatures.
-"""
+from pulsar.core import pulsar_core
 
-import torch
-
-Engine = torch.classes.pulsar.Engine
+CycleEnd = pulsar_core.CycleEnd
+Engine = pulsar_core.Engine
+EvictionPolicy = pulsar_core.EvictionPolicy
+ModelConfig = pulsar_core.ModelConfig
+Request = pulsar_core.Request
+RequestError = pulsar_core.RequestError
+SamplingParams = pulsar_core.SamplingParams
+State = pulsar_core.State
