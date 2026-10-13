@@ -7,6 +7,7 @@
 
 #include <cassert>
 #include <cstddef>
+#include <algorithm>
 #include <cstdint>
 #include <expected>
 #include <optional>
@@ -25,7 +26,7 @@
 namespace pulsar {
 
 // The tail of initial_state is forwarded again, then tokens; together they hold at least one token. Without
-// max_tokens, the request samples until the engine's eos token.
+// max_tokens, the request samples until one of the engine's stop tokens.
 struct request {
     state initial_state;
     std::vector<std::int64_t> tokens;
@@ -137,7 +138,7 @@ template <page_store t_store> class scheduler {
     std::size_t page_size;
     std::size_t n_lines;
     digest root;
-    std::int64_t eos_id;
+    std::vector<std::int64_t> stop_ids;
     std::size_t prefill_tokens_per_step;
     std::vector<sequence*> running;
     // Set when a sequence joins the running set.
@@ -163,7 +164,7 @@ template <page_store t_store> class scheduler {
         kv_cache<t_store>&& cache,
         cudaStream_t stream,
         digest root,
-        std::int64_t eos_id,
+        std::vector<std::int64_t>&& stop_ids,
         std::size_t prefill_tokens_per_step
     );
 
@@ -182,7 +183,7 @@ scheduler<t_store>::scheduler(
     kv_cache<t_store>&& cache,
     cudaStream_t stream,
     digest root,
-    std::int64_t eos_id,
+    std::vector<std::int64_t>&& stop_ids,
     std::size_t prefill_tokens_per_step
 )
 : model(model),
@@ -192,7 +193,7 @@ scheduler<t_store>::scheduler(
   page_size(static_cast<std::size_t>(kv.k.size(2))),
   n_lines(static_cast<std::size_t>(kv.k.size(1))),
   root(root),
-  eos_id(eos_id),
+  stop_ids(std::move(stop_ids)),
   prefill_tokens_per_step(prefill_tokens_per_step) {
     assert(prefill_tokens_per_step > 0);
 }
@@ -325,7 +326,7 @@ template <page_store t_store> task<void> scheduler<t_store>::launch(batch& b) {
     co_await synchronize(stream);
 }
 
-// A sequence ends with oom when the put of its new pages fails, as a state names only pages the store has.
+// A sequence ends with oom when the sync of its new pages fails, as a state names only pages the store has.
 template <page_store t_store> task<void> scheduler<t_store>::write_back(batch& b) {
     std::vector<digest> new_hashes;
     std::vector<std::uint32_t> new_lines;
@@ -349,7 +350,7 @@ template <page_store t_store> task<void> scheduler<t_store>::write_back(batch& b
             seq.writer.append(token);
             seq.generated++;
             seq.pending.push_back(token);
-            if (token == eos_id || !seq.may_sample()) {
+            if (std::ranges::contains(stop_ids, token) || !seq.may_sample()) {
                 seq.exited = exit_reason::finished;
             }
         } else if (seq.pending.empty()) {
@@ -358,7 +359,7 @@ template <page_store t_store> task<void> scheduler<t_store>::write_back(batch& b
     }
 
     if (!new_hashes.empty()) {
-        std::expected<void, page_error> stored = co_await cache.put(new_hashes, new_lines, stream);
+        std::expected<void, page_error> stored = co_await cache.sync(new_hashes, new_lines, stream);
         if (!stored) {
             for (sequence* seq : putting) {
                 seq->exited = exit_reason::oom;

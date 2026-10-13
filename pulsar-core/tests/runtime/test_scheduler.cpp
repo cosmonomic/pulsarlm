@@ -74,7 +74,6 @@ result_writer make_writer(const std::shared_ptr<request_results>& recorded) {
 constexpr pulsar::page_shape shape{.n_layers = 2, .page_size = 4, .n_kv_heads = 1, .head_dim = 2, .dtype = at::kFloat};
 constexpr std::int64_t vocab = 1000;
 // sum_model predicts tokens below vocab only.
-constexpr std::int64_t unreachable_eos = vocab;
 
 struct store_contents {
     std::unordered_map<digest, page, digest_hash> pages;
@@ -209,7 +208,7 @@ struct fixture {
     explicit fixture(
         std::size_t n_lines,
         std::size_t prefill_tokens_per_step = 64,
-        std::int64_t eos_id = unreachable_eos,
+        std::vector<std::int64_t> stop_ids = {},
         memory_store backing = {}
     )
     : store(backing.contents),
@@ -218,7 +217,7 @@ struct fixture {
           pulsar::kv_cache<memory_store>(shape, n_lines, at::Device(at::kCUDA, 0), std::move(backing)),
           compute_stream(),
           root(),
-          eos_id,
+          std::move(stop_ids),
           prefill_tokens_per_step
       ) {}
 };
@@ -381,7 +380,7 @@ TEST_CASE("a request continues from pages another cache fetches from the store")
     request_results first = serve_all(first_engine.sched, {request{.tokens = prompt, .max_tokens = 5}})[0];
     pulsar::state first_end = ended_state(first);
 
-    fixture second_engine(16, 64, unreachable_eos, memory_store{.contents = first_engine.store});
+    fixture second_engine(16, 64, {}, memory_store{.contents = first_engine.store});
     request_results second = serve_all(
         second_engine.sched,
         {request{.initial_state = first_end, .tokens = concat({first.tokens.back()}, user), .max_tokens = 4}}
@@ -402,11 +401,11 @@ TEST_CASE("a state page missing from the store ends the request with miss") {
     REQUIRE(f.model.forward_count == 0);
 }
 
-TEST_CASE("the eos token ends the request after it is emitted") {
+TEST_CASE("a stop token ends the request after it is emitted") {
     token_list prompt{1, 2, 3};
     token_list free_run = continuation(prompt, 4);
     REQUIRE(free_run == token_list{6, 12, 24, 48});
-    fixture f(16, 64, 24);
+    fixture f(16, 64, {48, 24});
     std::vector<request_results> results = serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 10}});
 
     REQUIRE(results[0].tokens == token_list{6, 12, 24});

@@ -139,7 +139,7 @@ pulsar::engine_config config(std::size_t n_lines) {
         .shape = shape,
         .n_lines = n_lines,
         .device = at::Device(at::kCUDA, 0),
-        .eos_id = static_cast<std::int64_t>(vocab),
+        .stop_ids = {},
         .vocab_size = vocab,
         .prefill_tokens_per_step = 64,
     };

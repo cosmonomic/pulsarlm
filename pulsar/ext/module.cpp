@@ -39,7 +39,7 @@ std::unique_ptr<python_engine> make_engine(
     at::ScalarType kv_dtype,
     std::size_t n_lines,
     at::Device device,
-    std::int64_t eos_id,
+    std::vector<std::int64_t> stop_ids,
     std::size_t prefill_tokens_per_step
 ) {
     engine_config config{
@@ -53,7 +53,7 @@ std::unique_ptr<python_engine> make_engine(
         },
         n_lines,
         device,
-        eos_id,
+        std::move(stop_ids),
         static_cast<std::size_t>(model.vocab_size),
         prefill_tokens_per_step,
     };
@@ -192,7 +192,7 @@ PYBIND11_MODULE(pulsar_core, m) {
             "kv_dtype"_a,
             "n_lines"_a,
             "device"_a,
-            "eos_id"_a,
+            "stop_ids"_a,
             "prefill_tokens_per_step"_a
         )
         .def(
@@ -204,6 +204,13 @@ PYBIND11_MODULE(pulsar_core, m) {
             "sampling"_a = sampling_params{},
             "max_tokens"_a = py::none(),
             "eviction"_a = eviction_policy{}
+        )
+        .def(
+            "page_digests",
+            [](const python_engine& e, const std::vector<std::int64_t>& tokens) {
+                return to_bytes_list(e.page_digests(tokens));
+            },
+            "tokens"_a
         )
         .def("fileno", &python_engine::fileno)
         .def("clear_wake", &python_engine::clear_wake)

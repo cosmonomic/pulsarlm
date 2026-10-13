@@ -93,7 +93,7 @@ class FailingStore(MemoryStore):
         raise ConnectionError("store unreachable")
 
 
-def make_engine(store: MemoryStore, eos_id: int = -1) -> Engine:
+def make_engine(store: MemoryStore) -> Engine:
     return Engine(
         store,
         MODEL,
@@ -103,7 +103,7 @@ def make_engine(store: MemoryStore, eos_id: int = -1) -> Engine:
         kv_dtype=DTYPE,
         n_lines=64,
         device=DEVICE,
-        eos_id=eos_id,
+        stop_ids=[],
         prefill_tokens_per_step=64,
     )
 
@@ -145,6 +145,18 @@ def test_generates_max_tokens_and_ends_with_a_state():
         forwarded = len(PROMPT) + len(tokens) - 1
         assert len(end.page_hashes) * PAGE_SIZE + len(end.tail) == forwarded
         assert all(h in store.pages for h in end.page_hashes)
+
+    asyncio.run(main())
+
+
+def test_page_digests_are_the_page_hashes_of_the_end_state():
+    async def main():
+        engine = make_engine(MemoryStore(asyncio.get_running_loop()))
+        tokens, _, end = await run(engine, engine.submit(State(), PROMPT, max_tokens=8))
+
+        assert isinstance(end, State)
+        assert engine.page_digests(PROMPT + tokens[:-1]) == end.page_hashes
+        assert engine.page_digests(PROMPT[: PAGE_SIZE - 1]) == []
 
     asyncio.run(main())
 

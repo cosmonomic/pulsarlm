@@ -106,17 +106,18 @@ template <page_store t_store> class kv_cache {
     // miss when the store does not have a page.
     task<std::expected<std::vector<std::uint32_t>, page_error>>
     get(const std::vector<digest>& hashes, cudaStream_t stream);
-    // Gives count empty lines, held until release. get does not find their pages until they are put, and releasing a
-    // line before it is put drops its page.
+    // Gives count empty lines, held until release. get does not find their pages until they are synced, and releasing
+    // a line before it is synced drops its page.
     std::expected<std::vector<std::uint32_t>, page_error> allocate(std::size_t count);
     // Gives count unmapped lines holding a copy of the page at the held line_id, held until release.
     std::expected<std::vector<std::uint32_t>, page_error>
     clone(std::uint32_t line_id, std::size_t count, cudaStream_t stream);
-    // Caches the full page at each held line under the hash at the same index, and puts a host copy of each into the
-    // store. A hash already cached at another line leaves its line unmapped. Completes once the copies are handed to
-    // the store. Fails with oom, caching nothing, when the host copies cannot be allocated.
+    // Names the full page at each held, unmapped line by the hash at the same index and hands a host copy of each
+    // distinct page to the store, also when another line caches its hash: the store may have dropped that page. A hash
+    // already cached at another line leaves its line unmapped. Completes once the copies are handed to the store. Fails
+    // with oom, caching nothing, when the host copies cannot be allocated.
     task<std::expected<void, page_error>>
-    put(const std::vector<digest>& hashes, const std::vector<std::uint32_t>& line_ids, cudaStream_t stream);
+    sync(const std::vector<digest>& hashes, const std::vector<std::uint32_t>& line_ids, cudaStream_t stream);
     void release(std::span<const std::uint32_t> line_ids) noexcept;
 
     std::size_t free_line_count() const noexcept;
@@ -187,7 +188,7 @@ template <page_store t_store> void kv_cache<t_store>::unlink_free(std::uint32_t 
     free_count--;
 }
 
-// A line keeps its hash unmapped when another line cached that hash before its fetch or put completed.
+// A line keeps its hash unmapped when another line cached that hash before its fetch or sync completed.
 template <page_store t_store> bool kv_cache<t_store>::is_mapped(std::uint32_t line_id) const noexcept {
     const std::optional<digest>& hash = lines[line_id].hash;
     if (!hash) {
@@ -326,35 +327,35 @@ kv_cache<t_store>::clone(std::uint32_t line_id, std::size_t count, cudaStream_t 
 
 template <page_store t_store>
 task<std::expected<void, page_error>>
-kv_cache<t_store>::put(
+kv_cache<t_store>::sync(
     const std::vector<digest>& hashes,
     const std::vector<std::uint32_t>& line_ids,
     cudaStream_t stream
 ) {
     assert(hashes.size() == line_ids.size());
-    std::vector<digest> new_hashes;
-    std::vector<std::uint32_t> new_lines;
+    std::vector<digest> distinct_hashes;
+    std::vector<std::uint32_t> distinct_lines;
     std::unordered_set<digest, digest_hash> seen;
     for (std::size_t i = 0; i < hashes.size(); i++) {
         assert(lines[line_ids[i]].ref > 0 && !lines[line_ids[i]].hash);
-        if (!digest_to_line_id.contains(hashes[i]) && seen.insert(hashes[i]).second) {
-            new_hashes.push_back(hashes[i]);
-            new_lines.push_back(line_ids[i]);
+        if (seen.insert(hashes[i]).second) {
+            distinct_hashes.push_back(hashes[i]);
+            distinct_lines.push_back(line_ids[i]);
         }
     }
-    if (new_hashes.empty()) {
+    if (distinct_hashes.empty()) {
         co_return {};
     }
 
-    std::optional<std::vector<page>> host_pages = pool.copy_to_host(new_lines, stream);
+    std::optional<std::vector<page>> host_pages = pool.copy_to_host(distinct_lines, stream);
     if (!host_pages) {
         co_return std::unexpected(page_error::oom);
     }
-    for (std::size_t j = 0; j < new_hashes.size(); j++) {
-        assign_hash(new_lines[j], new_hashes[j]);
+    for (std::size_t j = 0; j < distinct_hashes.size(); j++) {
+        assign_hash(distinct_lines[j], distinct_hashes[j]);
     }
     co_await synchronize(stream);
-    store.put(std::move(new_hashes), std::move(*host_pages));
+    store.put(std::move(distinct_hashes), std::move(*host_pages));
     co_return {};
 }
 

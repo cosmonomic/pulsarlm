@@ -113,7 +113,7 @@ class Engine:
         kv_dtype: torch.dtype,
         n_lines: int,
         device: torch.device,
-        eos_id: int,
+        stop_ids: list[int],
         prefill_tokens_per_step: int,
     ) -> None: ...
     def submit(
@@ -126,6 +126,9 @@ class Engine:
         eviction: EvictionPolicy = ...,
     ) -> Request:
         """Raises ValueError for a request the engine cannot serve."""
+    def page_digests(self, tokens: list[int]) -> list[bytes]:
+        """The hashes of the full pages of a token history from its start: the page
+        hashes a state reaching that history ends with."""
     def fileno(self) -> int:
         """An eventfd that becomes readable when a request has results to take."""
     def clear_wake(self) -> None:

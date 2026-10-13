@@ -11,9 +11,11 @@
 #include <latch>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "pulsar/event_loop.hpp"
 #include "pulsar/kv_cache.hpp"
@@ -30,7 +32,7 @@ struct engine_config {
     page_shape shape;
     std::size_t n_lines;
     at::Device device;
-    std::int64_t eos_id;
+    std::vector<std::int64_t> stop_ids;
     std::size_t vocab_size;
     std::size_t prefill_tokens_per_step;
 };
@@ -48,6 +50,7 @@ template <page_store t_store> class engine {
     cudaStream_t stream;
     std::size_t page_size;
     std::size_t vocab_size;
+    digest root;
     scheduler<t_store> sched;
     mutable std::mutex mutex;
     // Set while the loop runs.
@@ -68,6 +71,9 @@ template <page_store t_store> class engine {
     void submit(request&& r, std::unique_ptr<request_callbacks> callbacks);
     // The exception that panicked the loop; null while the loop runs or when it was stopped.
     std::exception_ptr exception() const;
+    // The digests of the full pages of a token history from its start, the page hashes a state reaching it would end
+    // with.
+    std::vector<digest> page_digests(std::span<const std::int64_t> tokens) const;
 };
 
 template <page_store t_store>
@@ -77,12 +83,13 @@ engine<t_store>::engine(std::unique_ptr<Model> model, const engine_config& confi
   stream(c10::cuda::getStreamFromPool(false, config.device.index()).stream()),
   page_size(config.shape.page_size),
   vocab_size(config.vocab_size),
+  root(make_root_digest(config.model_name, config.shape)),
   sched(
       *this->model,
       kv_cache<t_store>(config.shape, config.n_lines, config.device, std::move(store)),
       stream,
-      make_root_digest(config.model_name, config.shape),
-      config.eos_id,
+      root,
+      std::vector<std::int64_t>(config.stop_ids),
       config.prefill_tokens_per_step
   ) {
     std::latch started(1);
@@ -135,6 +142,11 @@ template <page_store t_store> void engine<t_store>::submit(request&& r, std::uni
 template <page_store t_store> std::exception_ptr engine<t_store>::exception() const {
     std::lock_guard lock(mutex);
     return loop_exception;
+}
+
+template <page_store t_store>
+std::vector<digest> engine<t_store>::page_digests(std::span<const std::int64_t> tokens) const {
+    return make_page_digests(root, tokens, page_size);
 }
 
 }  // namespace pulsar

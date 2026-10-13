@@ -98,6 +98,10 @@ request_handle python_engine::submit(
     return request_handle(std::move(buffer));
 }
 
+std::vector<digest> python_engine::page_digests(const std::vector<std::int64_t>& tokens) const {
+    return served->page_digests(tokens);
+}
+
 int python_engine::fileno() const noexcept {
     return wake->fileno();
 }

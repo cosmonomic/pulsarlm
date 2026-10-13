@@ -72,6 +72,7 @@ class python_engine {
         std::optional<std::size_t> max_tokens,
         const eviction_policy& eviction
     );
+    std::vector<digest> page_digests(const std::vector<std::int64_t>& tokens) const;
     int fileno() const noexcept;
     void clear_wake() noexcept;
     // The message of the exception that panicked the loop; nullopt while the loop runs or when it was stopped.

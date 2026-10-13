@@ -144,22 +144,22 @@ task<void> open_gate(std::shared_ptr<store_state> store) {
     co_return;
 }
 
-task<void> put_filled_line(memory_kv_cache* kv, digest hash, float value, std::uint32_t* put_line) {
+task<void> sync_filled_line(memory_kv_cache* kv, digest hash, float value, std::uint32_t* synced_line) {
     line_ids allocated = kv->allocate(1).value();
     fill_line(*kv, allocated.front(), value);
-    std::expected<void, page_error> put_result = co_await kv->put({hash}, allocated, compute_stream());
-    REQUIRE(put_result.has_value());
-    *put_line = allocated.front();
+    std::expected<void, page_error> sync_result = co_await kv->sync({hash}, allocated, compute_stream());
+    REQUIRE(sync_result.has_value());
+    *synced_line = allocated.front();
 }
 
 lines_result run_get(memory_kv_cache& kv, std::vector<digest> hashes) {
     return run_to_completion(kv.get(std::move(hashes), compute_stream()));
 }
 
-void put_page(memory_kv_cache& kv, digest hash, float value) {
+void sync_page(memory_kv_cache& kv, digest hash, float value) {
     line_ids allocated = kv.allocate(1).value();
     fill_line(kv, allocated.front(), value);
-    REQUIRE(run_to_completion(kv.put({hash}, allocated, compute_stream())).has_value());
+    REQUIRE(run_to_completion(kv.sync({hash}, allocated, compute_stream())).has_value());
     kv.release(allocated);
 }
 
@@ -182,9 +182,9 @@ TEST_CASE("allocate fails with oom holding nothing when lines run out") {
     require_all_free(fixture.kv, 4);
 }
 
-TEST_CASE("put stores host copies and get finds the page without fetching") {
+TEST_CASE("sync stores host copies and get finds the page without fetching") {
     cache_fixture fixture(4);
-    put_page(fixture.kv, hash_of(1), 3.0f);
+    sync_page(fixture.kv, hash_of(1), 3.0f);
     REQUIRE(fixture.store->puts == 1);
     REQUIRE(fixture.store->pages.at(hash_of(1)).k.eq(3.0f).all().item<bool>());
     REQUIRE(fixture.store->pages.at(hash_of(1)).v.eq(-3.0f).all().item<bool>());
@@ -198,8 +198,8 @@ TEST_CASE("put stores host copies and get finds the page without fetching") {
 
 TEST_CASE("an evicted page is fetched back from the store") {
     cache_fixture fixture(2);
-    put_page(fixture.kv, hash_of(1), 1.0f);
-    put_page(fixture.kv, hash_of(2), 2.0f);
+    sync_page(fixture.kv, hash_of(1), 1.0f);
+    sync_page(fixture.kv, hash_of(2), 2.0f);
     line_ids evicting = fixture.kv.allocate(2).value();
     fill_line(fixture.kv, evicting[0], 0.0f);
     fill_line(fixture.kv, evicting[1], 0.0f);
@@ -215,8 +215,8 @@ TEST_CASE("an evicted page is fetched back from the store") {
 
 TEST_CASE("free lines are reused least recently released first") {
     cache_fixture fixture(2);
-    put_page(fixture.kv, hash_of(1), 1.0f);
-    put_page(fixture.kv, hash_of(2), 2.0f);
+    sync_page(fixture.kv, hash_of(1), 1.0f);
+    sync_page(fixture.kv, hash_of(2), 2.0f);
     line_ids evicting = fixture.kv.allocate(1).value();
     fixture.kv.release(evicting);
 
@@ -234,7 +234,7 @@ TEST_CASE("a page the store does not have fails with miss holding nothing") {
 
 TEST_CASE("the oom check does not count the free line of a resident page the get holds") {
     cache_fixture fixture(1);
-    put_page(fixture.kv, hash_of(1), 1.0f);
+    sync_page(fixture.kv, hash_of(1), 1.0f);
     fixture.store->pages.emplace(hash_of(2), host_page(2.0f));
 
     REQUIRE(run_get(fixture.kv, {hash_of(1), hash_of(2)}) == oom);
@@ -292,7 +292,7 @@ TEST_CASE("a get sharing a fetch that misses fails with miss and frees the line"
     require_all_free(fixture.kv, 2);
 }
 
-TEST_CASE("a fetch finishing after put cached its hash leaves the fetched line unmapped") {
+TEST_CASE("a fetch finishing after sync cached its hash leaves the fetched line unmapped") {
     memory_store backing;
     backing.state->gated = true;
     cache_fixture fixture(2, std::move(backing));
@@ -300,24 +300,24 @@ TEST_CASE("a fetch finishing after put cached its hash leaves the fetched line u
 
     lines_result fetched;
     std::size_t remaining = 1;
-    std::uint32_t put_line = 0;
+    std::uint32_t synced_line = 0;
     {
         event_loop loop;
         loop.spawn(get_into(&fixture.kv, {hash_of(5)}, &fetched, &remaining));
-        loop.spawn(put_filled_line(&fixture.kv, hash_of(5), 6.0f, &put_line));
+        loop.spawn(sync_filled_line(&fixture.kv, hash_of(5), 6.0f, &synced_line));
         loop.spawn(open_gate(fixture.store));
         REQUIRE(loop.run() == nullptr);
     }
     REQUIRE(fetched.has_value());
-    REQUIRE(fetched->front() != put_line);
+    REQUIRE(fetched->front() != synced_line);
     REQUIRE(line_filled_with(fixture.kv, fetched->front(), 5.0f));
     fixture.kv.release(*fetched);
-    fixture.kv.release(line_ids{put_line});
+    fixture.kv.release(line_ids{synced_line});
 
     lines_result found = run_get(fixture.kv, {hash_of(5)});
     REQUIRE(found.has_value());
-    REQUIRE(found->front() == put_line);
-    REQUIRE(line_filled_with(fixture.kv, put_line, 6.0f));
+    REQUIRE(found->front() == synced_line);
+    REQUIRE(line_filled_with(fixture.kv, synced_line, 6.0f));
     fixture.kv.release(*found);
     REQUIRE(fixture.kv.allocate(1) == lines_result(line_ids{fetched->front()}));
 }
@@ -336,13 +336,15 @@ TEST_CASE("clone copies a held page into unmapped held lines") {
     require_all_free(fixture.kv, 3);
 }
 
-TEST_CASE("putting a hash already cached leaves the line unmapped and stores nothing") {
+TEST_CASE("syncing a hash already cached leaves the line unmapped and still stores the page") {
     cache_fixture fixture(3);
-    put_page(fixture.kv, hash_of(1), 1.0f);
+    sync_page(fixture.kv, hash_of(1), 1.0f);
+    fixture.store->pages.clear();
     line_ids duplicate = fixture.kv.allocate(1).value();
     fill_line(fixture.kv, duplicate.front(), 1.0f);
-    REQUIRE(run_to_completion(fixture.kv.put({hash_of(1)}, duplicate, compute_stream())).has_value());
-    REQUIRE(fixture.store->puts == 1);
+    REQUIRE(run_to_completion(fixture.kv.sync({hash_of(1)}, duplicate, compute_stream())).has_value());
+    REQUIRE(fixture.store->puts == 2);
+    REQUIRE(fixture.store->pages.contains(hash_of(1)));
     fixture.kv.release(duplicate);
 
     line_ids reused = fixture.kv.allocate(1).value();
