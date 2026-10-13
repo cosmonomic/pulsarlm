@@ -98,7 +98,7 @@ def load(
     stop_ids: list[int] = [IM_END], n_lines: int = 64, embedding_scale: float = 1.0
 ) -> ServerState:
     tokenizer = word_tokenizer()
-    store = LocalStore(PAGE_SIZE, capacity=64)
+    store = LocalStore(PAGE_SIZE, capacity_bytes=64 * LINE_BYTES)
     engine = Engine(
         store,
         MODEL,
@@ -107,6 +107,7 @@ def load(
         page_size=PAGE_SIZE,
         kv_dtype=DTYPE,
         kv_cache_gib=n_lines * LINE_BYTES / 2**30,
+        staging_gib=4 * LINE_BYTES / 2**30,
         device=DEVICE,
         stop_ids=stop_ids,
         prefill_tokens_per_step=64,

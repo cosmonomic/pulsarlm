@@ -42,27 +42,23 @@ constexpr std::size_t vocab = 100;
 constexpr auto end_timeout = std::chrono::seconds(30);
 
 // Drops puts. A fetch never completes; it counts down fetch_started.
-struct stalling_store {
+struct stalling_store final : pulsarlm::page_store {
     std::shared_ptr<std::latch> fetch_started = std::make_shared<std::latch>(1);
 
-    task<std::vector<std::optional<page>>> fetch(std::span<const digest>) {
+    task<std::vector<std::optional<page>>> fetch(std::span<const digest>) override {
         auto [never, resolver] = pulsarlm::external_task<>::make();
         fetch_started->count_down();
         co_await std::move(never);
         co_return {};
     }
 
-    void put(std::vector<digest>&&, std::vector<page>&&) {}
+    void put(std::vector<digest>&&, std::vector<page>&&) override {}
 };
-
-static_assert(pulsarlm::page_store<stalling_store>);
-
-using test_engine = pulsarlm::engine<stalling_store>;
 
 // Predicts each token's successor, mod vocab.
 class successor_model final : public pulsarlm::Model {
   public:
-    pulsarlm::StepLogits forward(const pulsarlm::StepBatch& batch, const pulsarlm::kv_lines&) override {
+    pulsarlm::StepLogits forward(const pulsarlm::StepBatch& batch, const pulsarlm::kv&) override {
         pulsarlm::StepLogits logits;
         if (batch.prefill) {
             logits.prefill = predict(*batch.prefill);
@@ -81,7 +77,7 @@ class successor_model final : public pulsarlm::Model {
 
 class failing_model final : public pulsarlm::Model {
   public:
-    pulsarlm::StepLogits forward(const pulsarlm::StepBatch&, const pulsarlm::kv_lines&) override {
+    pulsarlm::StepLogits forward(const pulsarlm::StepBatch&, const pulsarlm::kv&) override {
         throw std::runtime_error("forward failed");
     }
 };
@@ -139,6 +135,7 @@ pulsarlm::engine_config config(std::size_t n_lines) {
         .model_name = "successor",
         .shape = shape,
         .kv_cache_bytes = n_lines * pulsarlm::line_bytes(shape),
+        .staging_bytes = 2 * pulsarlm::line_bytes(shape),
         .device = at::Device(at::kCUDA, 0),
         .stop_ids = {},
         .vocab_size = vocab,
@@ -159,7 +156,7 @@ TEST_CASE("the KV cache takes the whole lines that fit in its size") {
 }
 
 TEST_CASE("a submitted request passes its tokens and its end state to its callbacks") {
-    test_engine e(std::make_unique<successor_model>(), config(16), stalling_store{});
+    pulsarlm::engine e(std::make_unique<successor_model>(), config(16), std::make_unique<stalling_store>());
     auto recorded = std::make_shared<request_results>();
     e.submit(request{.tokens = {1, 2, 3}, .max_tokens = 4}, record_into(recorded));
     wait_for_end(*recorded);
@@ -174,7 +171,7 @@ TEST_CASE("a submitted request passes its tokens and its end state to its callba
 }
 
 TEST_CASE("submit rejects an invalid request without calling its callbacks") {
-    test_engine e(std::make_unique<successor_model>(), config(16), stalling_store{});
+    pulsarlm::engine e(std::make_unique<successor_model>(), config(16), std::make_unique<stalling_store>());
     auto recorded = std::make_shared<request_results>();
 
     REQUIRE_THROWS_AS(e.submit(request{}, record_into(recorded)), std::invalid_argument);
@@ -212,9 +209,9 @@ TEST_CASE("submit rejects an invalid request without calling its callbacks") {
 }
 
 TEST_CASE("destroying the engine ends the requests it serves with loop_exited") {
-    stalling_store store;
-    std::shared_ptr<std::latch> fetch_started = store.fetch_started;
-    std::optional<test_engine> e;
+    auto store = std::make_unique<stalling_store>();
+    std::shared_ptr<std::latch> fetch_started = store->fetch_started;
+    std::optional<pulsarlm::engine> e;
     e.emplace(std::make_unique<successor_model>(), config(16), std::move(store));
     auto recorded = std::make_shared<request_results>();
     e->submit(
@@ -228,7 +225,7 @@ TEST_CASE("destroying the engine ends the requests it serves with loop_exited") 
 }
 
 TEST_CASE("a panic ends the requests with loop_exited and leaves its exception") {
-    test_engine e(std::make_unique<failing_model>(), config(16), stalling_store{});
+    pulsarlm::engine e(std::make_unique<failing_model>(), config(16), std::make_unique<stalling_store>());
     auto recorded = std::make_shared<request_results>();
     e.submit(request{.tokens = {1, 2, 3}, .max_tokens = 1}, record_into(recorded));
     wait_for_end(*recorded);

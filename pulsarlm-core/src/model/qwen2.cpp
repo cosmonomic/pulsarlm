@@ -74,7 +74,7 @@ void Qwen2Model::set_relevance_layers(const std::vector<int64_t>& layers) {
 }
 
 // Qwen2 block: QKV projection with bias, RoPE + paged attention, SwiGLU MLP.
-at::Tensor Qwen2Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, const kv_lines& kv) {
+at::Tensor Qwen2Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, const kv& kv) {
     const LayerWeights& lw = this->layers[layer];
     const int64_t ntok = x.size(0);
 
@@ -106,7 +106,7 @@ at::Tensor Qwen2Model::head(at::Tensor x) {
     return at::matmul(x, this->embed_tokens.t());
 }
 
-StepLogits Qwen2Model::forward(const StepBatch& batch, const kv_lines& kv) {
+StepLogits Qwen2Model::forward(const StepBatch& batch, const kv& kv) {
     return paged_forward(batch, [&](const GroupBatch& g) {
         return paged_group_forward(
             this->embed_tokens,

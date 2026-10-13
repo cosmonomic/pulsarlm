@@ -26,7 +26,7 @@ at::Tensor paged_attention(
     const at::Tensor& q,
     const at::Tensor& k,
     const at::Tensor& v,
-    const kv_lines& kv,
+    const kv& kv,
     int64_t layer,
     const GroupBatch& g,
     bool relevance_layer,

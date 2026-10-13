@@ -71,7 +71,7 @@ def random_weights() -> dict[str, torch.Tensor]:
 
 class CountingStore(LocalStore):
     def __init__(self) -> None:
-        super().__init__(PAGE_SIZE, capacity=64)
+        super().__init__(PAGE_SIZE, capacity_bytes=64 * LINE_BYTES)
         self.fetched: list[bytes] = []
 
     def fetch(self, hashes: list[bytes]):
@@ -89,6 +89,7 @@ def make_engine(store: LocalStore) -> AsyncEngine:
             page_size=PAGE_SIZE,
             kv_dtype=DTYPE,
             kv_cache_gib=64 * LINE_BYTES / 2**30,
+            staging_gib=4 * LINE_BYTES / 2**30,
             device=DEVICE,
             stop_ids=[],
             prefill_tokens_per_step=64,

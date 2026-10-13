@@ -182,7 +182,7 @@ void check_against_dense(at::ScalarType dtype, double tolerance) {
     pulsarlm::Qwen3Model
         model(n_layers, n_heads, n_kv_heads, head_dim, hidden, intermediate, vocab, rope_theta, rms_eps, w.named);
     model.set_relevance_layers(relevance_layers);
-    pulsarlm::kv_lines kv{
+    pulsarlm::kv kv{
         .k = at::zeros({n_layers, n_lines, page_size, n_kv_heads, head_dim}, cuda(dtype)),
         .v = at::zeros({n_layers, n_lines, page_size, n_kv_heads, head_dim}, cuda(dtype)),
     };

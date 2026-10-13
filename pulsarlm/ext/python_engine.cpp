@@ -14,8 +14,6 @@ namespace pulsarlm {
 
 namespace py = pybind11;
 
-template class engine<python_store>;
-
 std::unique_ptr<Model>
 make_model(const model_config& config, const std::unordered_map<std::string, at::Tensor>& weights) {
     c10::Dict<std::string, at::Tensor> weight_dict;
@@ -73,9 +71,13 @@ void request_handle::cancel() noexcept {
     buffer->cancel();
 }
 
-python_engine::python_engine(std::unique_ptr<Model> model, const engine_config& config, python_store&& store)
+python_engine::python_engine(
+    std::unique_ptr<Model> model,
+    const engine_config& config,
+    std::unique_ptr<page_store>&& store
+)
 : wake(std::make_shared<wake_fd>()),
-  served(std::make_unique<engine<python_store>>(std::move(model), config, std::move(store))) {}
+  served(std::make_unique<engine>(std::move(model), config, std::move(store))) {}
 
 python_engine::~python_engine() {
     py::gil_scoped_release nogil;

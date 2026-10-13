@@ -81,10 +81,10 @@ struct store_contents {
     std::vector<std::vector<digest>> fetches;
 };
 
-struct memory_store {
+struct memory_store final : pulsarlm::page_store {
     std::shared_ptr<store_contents> contents = std::make_shared<store_contents>();
 
-    task<std::vector<std::optional<page>>> fetch(std::span<const digest> hashes) {
+    task<std::vector<std::optional<page>>> fetch(std::span<const digest> hashes) override {
         std::shared_ptr<store_contents> shared = contents;
         std::vector<digest> requested(hashes.begin(), hashes.end());
         shared->fetches.push_back(requested);
@@ -96,16 +96,12 @@ struct memory_store {
         co_return found;
     }
 
-    void put(std::vector<digest>&& keys, std::vector<page>&& pages) {
+    void put(std::vector<digest>&& keys, std::vector<page>&& pages) override {
         for (std::size_t i = 0; i < keys.size(); i++) {
             contents->pages.insert_or_assign(keys[i], std::move(pages[i]));
         }
     }
 };
-
-static_assert(pulsarlm::page_store<memory_store>);
-
-using test_scheduler = pulsarlm::scheduler<memory_store>;
 
 // Writes each token's id as its K and its view index as its V. The token after a query is the sum of the K of every
 // key the query attends, mod vocab. A view page's mass is 1 when it holds a key important accepts, else 0.
@@ -117,7 +113,7 @@ class sum_model final : public pulsarlm::Model {
     std::function<void()> on_forward;
     std::function<bool(std::int64_t)> important = [](std::int64_t) { return false; };
 
-    pulsarlm::StepLogits forward(const pulsarlm::StepBatch& batch, const pulsarlm::kv_lines& kv) override {
+    pulsarlm::StepLogits forward(const pulsarlm::StepBatch& batch, const pulsarlm::kv& kv) override {
         forward_count++;
         if (on_forward) {
             on_forward();
@@ -139,7 +135,7 @@ class sum_model final : public pulsarlm::Model {
     }
 
   private:
-    at::Tensor predict(const pulsarlm::GroupBatch& g, const pulsarlm::kv_lines& kv) const {
+    at::Tensor predict(const pulsarlm::GroupBatch& g, const pulsarlm::kv& kv) const {
         std::int64_t n_tokens = g.tokens.size(0);
         std::vector<std::int64_t> sizes{kv.k.size(0), n_tokens, kv.k.size(3), kv.k.size(4)};
         at::Tensor slots = g.slot_mapping.to(at::kLong);
@@ -204,7 +200,7 @@ digest root() {
 struct fixture {
     std::shared_ptr<store_contents> store;
     sum_model model;
-    test_scheduler sched;
+    pulsarlm::scheduler sched;
 
     explicit fixture(
         std::size_t n_lines,
@@ -215,7 +211,13 @@ struct fixture {
     : store(backing.contents),
       sched(
           model,
-          pulsarlm::kv_cache<memory_store>(shape, n_lines, at::Device(at::kCUDA, 0), std::move(backing)),
+          pulsarlm::kv_cache(
+              shape,
+              n_lines,
+              2,
+              at::Device(at::kCUDA, 0),
+              std::make_unique<memory_store>(std::move(backing))
+          ),
           compute_stream(),
           root(),
           std::move(stop_ids),
@@ -276,14 +278,14 @@ submission make_submission(request r) {
     return submission{.r = std::move(r), .recorded = recorded, .writer = make_writer(recorded)};
 }
 
-task<void> serve(test_scheduler& sched, request r, result_writer writer, std::size_t& remaining) {
+task<void> serve(pulsarlm::scheduler& sched, request r, result_writer writer, std::size_t& remaining) {
     co_await sched.submit(std::move(r), std::move(writer));
     if (--remaining == 0) {
         event_loop::current()->stop();
     }
 }
 
-std::vector<request_results> serve_submissions(test_scheduler& sched, std::vector<submission> submissions) {
+std::vector<request_results> serve_submissions(pulsarlm::scheduler& sched, std::vector<submission> submissions) {
     std::size_t remaining = submissions.size();
     event_loop loop;
     loop.spawn(sched.run());
@@ -298,7 +300,7 @@ std::vector<request_results> serve_submissions(test_scheduler& sched, std::vecto
     return results;
 }
 
-std::vector<request_results> serve_all(test_scheduler& sched, std::vector<request> requests) {
+std::vector<request_results> serve_all(pulsarlm::scheduler& sched, std::vector<request> requests) {
     std::vector<submission> submissions;
     for (request& r : requests) {
         submissions.push_back(make_submission(std::move(r)));
@@ -307,7 +309,7 @@ std::vector<request_results> serve_all(test_scheduler& sched, std::vector<reques
 }
 
 task<void> serve_then(
-    test_scheduler& sched,
+    pulsarlm::scheduler& sched,
     request first,
     std::function<request(const request_results&)> next,
     std::vector<request_results>& results
@@ -323,7 +325,7 @@ task<void> serve_then(
 
 // Serves first, then the request next makes from first's result.
 std::vector<request_results>
-serve_in_turn(test_scheduler& sched, request first, std::function<request(const request_results&)> next) {
+serve_in_turn(pulsarlm::scheduler& sched, request first, std::function<request(const request_results&)> next) {
     std::vector<request_results> results;
     event_loop loop;
     loop.spawn(sched.run());
@@ -381,7 +383,9 @@ TEST_CASE("a request continues from pages another cache fetches from the store")
     request_results first = serve_all(first_engine.sched, {request{.tokens = prompt, .max_tokens = 5}})[0];
     pulsarlm::state first_end = ended_state(first);
 
-    fixture second_engine(16, 64, {}, memory_store{.contents = first_engine.store});
+    memory_store shared_store;
+    shared_store.contents = first_engine.store;
+    fixture second_engine(16, 64, {}, shared_store);
     request_results second = serve_all(
         second_engine.sched,
         {request{.initial_state = first_end, .tokens = concat({first.tokens.back()}, user), .max_tokens = 4}}

@@ -1,8 +1,6 @@
 #pragma once
 
 #include <c10/core/Device.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime_api.h>
 
 #include <cstddef>
@@ -14,7 +12,6 @@
 #include <span>
 #include <string>
 #include <thread>
-#include <utility>
 #include <vector>
 
 #include "pulsarlm/event_loop.hpp"
@@ -26,12 +23,13 @@
 namespace pulsarlm {
 
 // model_name names the model and its weights version; with shape it makes the root digest. The KV cache takes as many
-// lines as fit in kv_cache_bytes. A step forwards every decoding sequence and at most prefill_tokens_per_step tokens of
-// the others.
+// lines as fit in kv_cache_bytes, and its pinned staging buffer as many pages as fit in staging_bytes. A step forwards
+// every decoding sequence and at most prefill_tokens_per_step tokens of the others.
 struct engine_config {
     std::string model_name;
     page_shape shape;
     std::size_t kv_cache_bytes;
+    std::size_t staging_bytes;
     at::Device device;
     std::vector<std::int64_t> stop_ids;
     std::size_t vocab_size;
@@ -44,18 +42,20 @@ void validate(const request& r, std::size_t page_size, std::size_t vocab_size);
 
 // The lines that fit in config's KV cache size. Throws std::invalid_argument when not one does.
 std::size_t line_count(const engine_config& config);
+// The pages that fit in config's staging size. Throws std::invalid_argument when not one does.
+std::size_t staging_page_count(const engine_config& config);
 
 // Serves requests on a loop thread it owns. Once the loop exits, after a panic or on destruction, the requests it was
 // serving end with loop_exited and the engine is shut down: calling submit after a request ended with loop_exited is
 // undefined.
-template <page_store t_store> class engine {
+class engine {
     std::unique_ptr<Model> model;
     at::Device device;
     cudaStream_t stream;
     std::size_t page_size;
     std::size_t vocab_size;
     digest root;
-    scheduler<t_store> sched;
+    scheduler sched;
     mutable std::mutex mutex;
     // Set while the loop runs.
     event_loop* loop = nullptr;
@@ -65,7 +65,7 @@ template <page_store t_store> class engine {
     void run_loop(std::latch& started);
 
   public:
-    engine(std::unique_ptr<Model> model, const engine_config& config, t_store&& store);
+    engine(std::unique_ptr<Model> model, const engine_config& config, std::unique_ptr<page_store>&& store);
     engine(const engine&) = delete;
     engine& operator=(const engine&) = delete;
     ~engine();
@@ -79,78 +79,5 @@ template <page_store t_store> class engine {
     // with.
     std::vector<digest> page_digests(std::span<const std::int64_t> tokens) const;
 };
-
-template <page_store t_store>
-engine<t_store>::engine(std::unique_ptr<Model> model, const engine_config& config, t_store&& store)
-: model(std::move(model)),
-  device(config.device),
-  stream(c10::cuda::getStreamFromPool(false, config.device.index()).stream()),
-  page_size(config.shape.page_size),
-  vocab_size(config.vocab_size),
-  root(make_root_digest(config.model_name, config.shape)),
-  sched(
-      *this->model,
-      kv_cache<t_store>(config.shape, line_count(config), config.device, std::move(store)),
-      stream,
-      root,
-      std::vector<std::int64_t>(config.stop_ids),
-      config.prefill_tokens_per_step
-  ) {
-    std::latch started(1);
-    loop_thread = std::thread([this, &started] { run_loop(started); });
-    started.wait();
-}
-
-template <page_store t_store> engine<t_store>::~engine() {
-    {
-        std::lock_guard lock(mutex);
-        if (loop != nullptr) {
-            loop->stop();
-        }
-    }
-    loop_thread.join();
-}
-
-// The loop's frames hold staging buffers the stream may still use, so they are destroyed after it finishes. Their
-// writers end their callbacks with loop_exited after loop_exception is set.
-template <page_store t_store> void engine<t_store>::run_loop(std::latch& started) {
-    c10::cuda::CUDAGuard device_guard(device);
-    {
-        event_loop running;
-        running.spawn(sched.run());
-        {
-            std::lock_guard lock(mutex);
-            loop = &running;
-        }
-        started.count_down();
-        std::exception_ptr thrown = running.run();
-        cudaStreamSynchronize(stream);
-        {
-            std::lock_guard lock(mutex);
-            loop_exception = std::move(thrown);
-            loop = nullptr;
-        }
-    }
-}
-
-// A submit racing the loop's exit finds loop null; its writer then ends the callbacks with loop_exited.
-template <page_store t_store> void engine<t_store>::submit(request&& r, std::unique_ptr<request_callbacks> callbacks) {
-    validate(r, page_size, vocab_size);
-    result_writer writer(std::move(callbacks));
-    std::lock_guard lock(mutex);
-    if (loop != nullptr) {
-        loop->spawn(sched.submit(std::move(r), std::move(writer)));
-    }
-}
-
-template <page_store t_store> std::exception_ptr engine<t_store>::exception() const {
-    std::lock_guard lock(mutex);
-    return loop_exception;
-}
-
-template <page_store t_store>
-std::vector<digest> engine<t_store>::page_digests(std::span<const std::int64_t> tokens) const {
-    return make_page_digests(root, tokens, page_size);
-}
 
 }  // namespace pulsarlm

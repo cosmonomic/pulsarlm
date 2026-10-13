@@ -14,7 +14,7 @@
 namespace pulsarlm {
 
 // [n_layers, n_lines, page_size, n_kv_heads, head_dim] each. K is stored unrotated.
-struct kv_lines {
+struct kv {
     at::Tensor k;
     at::Tensor v;
 };
@@ -71,7 +71,7 @@ struct StepLogits {
 
 // tokens + KV + batch -> logits.
 struct Model {
-    virtual StepLogits forward(const StepBatch& batch, const kv_lines& kv) = 0;
+    virtual StepLogits forward(const StepBatch& batch, const kv& kv) = 0;
 
     // Pre-RoPE query capture for QK-attention recall. set_capture_layers names the
     // attention layers whose pre-RoPE Q the next forward should stash; after a

@@ -45,10 +45,10 @@ struct store_state {
     std::vector<external_task<>::resolver> gates;
 };
 
-struct memory_store {
+struct memory_store final : pulsarlm::page_store {
     std::shared_ptr<store_state> state = std::make_shared<store_state>();
 
-    task<std::vector<std::optional<page>>> fetch(std::span<const digest> hashes) {
+    task<std::vector<std::optional<page>>> fetch(std::span<const digest> hashes) override {
         std::shared_ptr<store_state> shared = state;
         std::vector<digest> requested(hashes.begin(), hashes.end());
         shared->fetches.push_back(requested);
@@ -65,7 +65,7 @@ struct memory_store {
         co_return found;
     }
 
-    void put(std::vector<digest>&& keys, std::vector<page>&& pages) {
+    void put(std::vector<digest>&& keys, std::vector<page>&& pages) override {
         state->puts++;
         for (std::size_t i = 0; i < keys.size(); i++) {
             state->pages.insert_or_assign(keys[i], std::move(pages[i]));
@@ -73,21 +73,21 @@ struct memory_store {
     }
 };
 
-static_assert(pulsarlm::page_store<memory_store>);
-
-using memory_kv_cache = pulsarlm::kv_cache<memory_store>;
-
 cudaStream_t compute_stream() {
     return c10::cuda::getCurrentCUDAStream().stream();
 }
 
 struct cache_fixture {
     std::shared_ptr<store_state> store;
-    memory_kv_cache kv;
+    pulsarlm::kv_cache kv;
 
-    explicit cache_fixture(std::size_t n_lines, memory_store backing = {})
+    explicit cache_fixture(std::size_t n_lines, memory_store backing = {}, std::size_t staging_pages = 2)
     : store(backing.state),
-      kv(shape, n_lines, at::Device(at::kCUDA, 0), std::move(backing)) {}
+      kv(shape,
+         n_lines,
+         staging_pages,
+         at::Device(at::kCUDA, 0),
+         std::make_unique<memory_store>(std::move(backing))) {}
 };
 
 digest hash_of(std::uint64_t n) {
@@ -108,14 +108,14 @@ page host_page(float value) {
     return page{.k = page_tensor(value), .v = page_tensor(-value)};
 }
 
-void fill_line(memory_kv_cache& kv, std::uint32_t line_id, float value) {
-    kv.k_lines().select(1, line_id).fill_(value);
-    kv.v_lines().select(1, line_id).fill_(-value);
+void fill_line(pulsarlm::kv_cache& kv, std::uint32_t line_id, float value) {
+    kv.tensors().k.select(1, line_id).fill_(value);
+    kv.tensors().v.select(1, line_id).fill_(-value);
 }
 
-bool line_filled_with(memory_kv_cache& kv, std::uint32_t line_id, float value) {
-    return kv.k_lines().select(1, line_id).eq(value).all().item<bool>() &&
-           kv.v_lines().select(1, line_id).eq(-value).all().item<bool>();
+bool line_filled_with(pulsarlm::kv_cache& kv, std::uint32_t line_id, float value) {
+    return kv.tensors().k.select(1, line_id).eq(value).all().item<bool>() &&
+        kv.tensors().v.select(1, line_id).eq(-value).all().item<bool>();
 }
 
 template <typename t> task<void> store_result(task<t> work, std::optional<t>* result) {
@@ -132,7 +132,7 @@ template <typename t> t run_to_completion(task<t> work) {
     return std::move(*result);
 }
 
-task<void> get_into(memory_kv_cache* kv, std::vector<digest> hashes, lines_result* result, std::size_t* remaining) {
+task<void> get_into(pulsarlm::kv_cache* kv, std::vector<digest> hashes, lines_result* result, std::size_t* remaining) {
     *result = co_await kv->get(std::move(hashes), compute_stream());
     if (--*remaining == 0) {
         event_loop::current()->stop();
@@ -145,7 +145,7 @@ task<void> open_gate(std::shared_ptr<store_state> store) {
     co_return;
 }
 
-task<void> sync_filled_line(memory_kv_cache* kv, digest hash, float value, std::uint32_t* synced_line) {
+task<void> sync_filled_line(pulsarlm::kv_cache* kv, digest hash, float value, std::uint32_t* synced_line) {
     line_ids allocated = kv->allocate(1).value();
     fill_line(*kv, allocated.front(), value);
     std::expected<void, page_error> sync_result = co_await kv->sync({hash}, allocated, compute_stream());
@@ -153,18 +153,31 @@ task<void> sync_filled_line(memory_kv_cache* kv, digest hash, float value, std::
     *synced_line = allocated.front();
 }
 
-lines_result run_get(memory_kv_cache& kv, std::vector<digest> hashes) {
+task<void> sync_into(
+    pulsarlm::kv_cache* kv,
+    std::vector<digest> hashes,
+    line_ids synced,
+    std::expected<void, page_error>* result,
+    std::size_t* remaining
+) {
+    *result = co_await kv->sync(hashes, synced, compute_stream());
+    if (--*remaining == 0) {
+        event_loop::current()->stop();
+    }
+}
+
+lines_result run_get(pulsarlm::kv_cache& kv, std::vector<digest> hashes) {
     return run_to_completion(kv.get(std::move(hashes), compute_stream()));
 }
 
-void sync_page(memory_kv_cache& kv, digest hash, float value) {
+void sync_page(pulsarlm::kv_cache& kv, digest hash, float value) {
     line_ids allocated = kv.allocate(1).value();
     fill_line(kv, allocated.front(), value);
     REQUIRE(run_to_completion(kv.sync({hash}, allocated, compute_stream())).has_value());
     kv.release(allocated);
 }
 
-void require_all_free(memory_kv_cache& kv, std::size_t n_lines) {
+void require_all_free(pulsarlm::kv_cache& kv, std::size_t n_lines) {
     REQUIRE(kv.free_line_count() == n_lines);
     lines_result all = kv.allocate(n_lines);
     REQUIRE(all.has_value());
@@ -355,4 +368,65 @@ TEST_CASE("syncing a hash already cached leaves the line unmapped and still stor
     REQUIRE(got.has_value());
     REQUIRE(got->front() != duplicate.front());
     fixture.kv.release(*got);
+}
+
+TEST_CASE("sync hands the store pageable copies, a staging buffer's worth at a time") {
+    cache_fixture fixture(4, {}, 1);
+    line_ids synced = fixture.kv.allocate(3).value();
+    for (std::size_t j = 0; j < synced.size(); j++) {
+        fill_line(fixture.kv, synced[j], static_cast<float>(j + 1));
+    }
+    std::vector<digest> hashes{hash_of(1), hash_of(2), hash_of(3)};
+    REQUIRE(run_to_completion(fixture.kv.sync(hashes, synced, compute_stream())).has_value());
+
+    for (std::size_t j = 0; j < hashes.size(); j++) {
+        const page& stored = fixture.store->pages.at(hashes[j]);
+        REQUIRE(stored.k.eq(static_cast<float>(j + 1)).all().item<bool>());
+        REQUIRE(stored.v.eq(-static_cast<float>(j + 1)).all().item<bool>());
+        REQUIRE(!stored.k.is_pinned());
+    }
+    fixture.kv.release(synced);
+}
+
+TEST_CASE("get copies the fetched pages a staging buffer's worth at a time") {
+    cache_fixture fixture(4, {}, 1);
+    for (std::uint64_t n = 1; n <= 3; n++) {
+        fixture.store->pages.emplace(hash_of(n), host_page(static_cast<float>(n)));
+    }
+    lines_result got = run_get(fixture.kv, {hash_of(1), hash_of(2), hash_of(3)});
+    REQUIRE(got.has_value());
+    for (std::size_t j = 0; j < got->size(); j++) {
+        REQUIRE(line_filled_with(fixture.kv, (*got)[j], static_cast<float>(j + 1)));
+    }
+    fixture.kv.release(*got);
+}
+
+TEST_CASE("a get and a sync take turns on the staging buffer") {
+    cache_fixture fixture(6, {}, 1);
+    for (std::uint64_t n = 1; n <= 3; n++) {
+        fixture.store->pages.emplace(hash_of(n), host_page(static_cast<float>(n)));
+    }
+    line_ids synced = fixture.kv.allocate(2).value();
+    fill_line(fixture.kv, synced[0], 4.0f);
+    fill_line(fixture.kv, synced[1], 5.0f);
+
+    lines_result got;
+    std::expected<void, page_error> sync_result;
+    std::size_t remaining = 2;
+    {
+        event_loop loop;
+        loop.spawn(get_into(&fixture.kv, {hash_of(1), hash_of(2), hash_of(3)}, &got, &remaining));
+        loop.spawn(sync_into(&fixture.kv, {hash_of(4), hash_of(5)}, synced, &sync_result, &remaining));
+        REQUIRE(loop.run() == nullptr);
+    }
+
+    REQUIRE(got.has_value());
+    for (std::size_t j = 0; j < got->size(); j++) {
+        REQUIRE(line_filled_with(fixture.kv, (*got)[j], static_cast<float>(j + 1)));
+    }
+    REQUIRE(sync_result.has_value());
+    REQUIRE(fixture.store->pages.at(hash_of(4)).k.eq(4.0f).all().item<bool>());
+    REQUIRE(fixture.store->pages.at(hash_of(5)).k.eq(5.0f).all().item<bool>());
+    fixture.kv.release(*got);
+    fixture.kv.release(synced);
 }

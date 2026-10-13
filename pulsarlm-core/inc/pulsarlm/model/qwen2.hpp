@@ -43,7 +43,7 @@ struct Qwen2Model : Model {
 
     // Run the present groups over the lines `kv`; per-group logits in the weight
     // dtype (fp32 or bf16).
-    StepLogits forward(const StepBatch& batch, const kv_lines& kv) override;
+    StepLogits forward(const StepBatch& batch, const kv& kv) override;
 
     void set_relevance_layers(const std::vector<int64_t>& layers) override;
 
@@ -66,7 +66,7 @@ struct Qwen2Model : Model {
     };
 
     // One Qwen2 decoder block over layer `layer`'s KV lines.
-    at::Tensor block(at::Tensor x, int64_t layer, const GroupBatch& g, const kv_lines& kv);
+    at::Tensor block(at::Tensor x, int64_t layer, const GroupBatch& g, const kv& kv);
     // Final RMSNorm + tied-embedding lm_head; logits in the weight dtype.
     at::Tensor head(at::Tensor x);
 

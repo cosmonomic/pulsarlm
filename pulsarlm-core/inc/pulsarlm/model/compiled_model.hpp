@@ -33,24 +33,16 @@ struct CompiledModel : Model {
         int64_t page_size
     );
 
-    StepLogits forward(const StepBatch& batch, const kv_lines& kv) override;
+    StepLogits forward(const StepBatch& batch, const kv& kv) override;
 
   private:
     // Guard the runtime lines against the graph's baked shapes.
-    void validate(const kv_lines& kv) const;
+    void validate(const kv& kv) const;
     // Pad the group to the baked num_seqs / [num_seqs, max_pages] page table,
     // run the graph, and return logits for the real rows only (decode: the first
     // R rows; prefill: the first total_q query rows).
-    at::Tensor run_decode_group(
-        torch::inductor::AOTIModelPackageLoader& loader,
-        const GroupBatch& g,
-        const kv_lines& kv
-    );
-    at::Tensor run_prefill_group(
-        torch::inductor::AOTIModelPackageLoader& loader,
-        const GroupBatch& g,
-        const kv_lines& kv
-    );
+    at::Tensor run_decode_group(torch::inductor::AOTIModelPackageLoader& loader, const GroupBatch& g, const kv& kv);
+    at::Tensor run_prefill_group(torch::inductor::AOTIModelPackageLoader& loader, const GroupBatch& g, const kv& kv);
 
     torch::inductor::AOTIModelPackageLoader decode_loader;
     torch::inductor::AOTIModelPackageLoader prefill_loader;

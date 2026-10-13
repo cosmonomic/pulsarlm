@@ -24,8 +24,9 @@ class Settings:
     device: str
     dtype: torch.dtype
     kv_cache_gib: float
+    staging_gib: float
     prefill_tokens_per_step: int
-    stored_states: int
+    store_gib: float
     cycle_tokens: int
     n_working: int
     evict_tau: float
@@ -54,7 +55,7 @@ def load_server_state(settings: Settings) -> ServerState:
     )
     cfg = model.config
     stops = stop_ids(model.tokenizer, cfg.eos_ids)
-    store = LocalStore(_PAGE_SIZE, settings.stored_states)
+    store = LocalStore(_PAGE_SIZE, int(settings.store_gib * 2**30))
     engine = Engine(
         store,
         ModelConfig(
@@ -75,6 +76,7 @@ def load_server_state(settings: Settings) -> ServerState:
         page_size=_PAGE_SIZE,
         kv_dtype=settings.dtype,
         kv_cache_gib=settings.kv_cache_gib,
+        staging_gib=settings.staging_gib,
         device=torch.device(settings.device),
         stop_ids=stops,
         prefill_tokens_per_step=settings.prefill_tokens_per_step,

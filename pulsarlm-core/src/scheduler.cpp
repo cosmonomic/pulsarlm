@@ -8,6 +8,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <optional>
 #include <span>
 #include <utility>
@@ -284,7 +285,7 @@ void batch::set_step_mass(std::span<entry> group, const GroupBatch& inputs) {
     }
 }
 
-void batch::enqueue(Model& model, const kv_lines& kv, cudaStream_t stream) {
+void batch::enqueue(Model& model, const kv& kv, cudaStream_t stream) {
     at::Device device = kv.k.device();
     c10::cuda::CUDAStreamGuard guard(c10::cuda::getStreamFromExternal(stream, device.index()));
     StepBatch on_device;
@@ -326,6 +327,242 @@ void batch::enqueue(Model& model, const kv_lines& kv, cudaStream_t stream) {
     at::Tensor tokens = sample(at::stack(rows), params, generators);
     sampled = pinned({static_cast<std::int64_t>(rows.size())}, at::kLong);
     sampled.copy_(tokens, /*non_blocking=*/true);
+}
+
+scheduler::scheduler(
+    Model& model,
+    kv_cache&& cache,
+    cudaStream_t stream,
+    digest root,
+    std::vector<std::int64_t>&& stop_ids,
+    std::size_t prefill_tokens_per_step
+)
+: model(model),
+  cache(std::move(cache)),
+  stream(stream),
+  page_size(static_cast<std::size_t>(this->cache.tensors().k.size(2))),
+  n_lines(static_cast<std::size_t>(this->cache.tensors().k.size(1))),
+  root(root),
+  stop_ids(std::move(stop_ids)),
+  prefill_tokens_per_step(prefill_tokens_per_step) {
+    assert(prefill_tokens_per_step > 0);
+}
+
+event& scheduler::next(std::optional<event>& waited) {
+    if (!waited) {
+        waited.emplace();
+    }
+    return *waited;
+}
+
+// The awaiters a set event scheduled no longer refer to it, so it is destroyed right away.
+void scheduler::wake(std::optional<event>& waited) noexcept {
+    if (waited) {
+        waited->set();
+        waited.reset();
+    }
+}
+
+task<void> scheduler::submit(request r, result_writer writer) {
+    assert(r.initial_state.tail.size() < page_size);
+    assert(!r.initial_state.tail.empty() || !r.tokens.empty());
+    assert(r.eviction.n_working >= 1 && r.eviction.cycle_tokens >= 1);
+    assert(r.eviction.attention_mass_decay > 0.0 && r.eviction.attention_mass_decay <= 1.0);
+    sequence seq(std::move(r), writer, cache.tensors().k.device());
+    for (;;) {
+        seq.start_cycle(page_size);
+        if (writer.cancelled()) {
+            writer.end(std::unexpected(request_error::cancelled));
+            co_return;
+        }
+        std::size_t needed = seq.lines_needed(page_size);
+        if (needed > n_lines) {
+            writer.end(std::unexpected(request_error::oom));
+            co_return;
+        }
+        // Taking lines without enough free ones can fail after get took some, and releasing them wakes the other
+        // waiters into the same failure.
+        if (needed > cache.free_line_count()) {
+            co_await next(released);
+            continue;
+        }
+        std::expected<std::vector<std::uint32_t>, page_error> taken = co_await take_lines(
+            seq.page_hashes,
+            seq.cycle_lines(page_size)
+        );
+        if (!taken) {
+            if (taken.error() == page_error::miss) {
+                writer.end(std::unexpected(request_error::miss));
+                co_return;
+            }
+            co_await next(released);
+            continue;
+        }
+        seq.lines = std::move(*taken);
+
+        seq.exited.reset();
+        seq.exit_event.emplace();
+        running.push_back(&seq);
+        wake(idle);
+        co_await *seq.exit_event;
+        cache.release(seq.lines);
+        seq.lines.clear();
+        wake(released);
+
+        switch (*seq.exited) {
+        case exit_reason::requeued:
+            seq.requeue();
+            continue;
+        case exit_reason::finished:
+            writer.end(state{.page_hashes = std::move(seq.page_hashes), .tail = std::move(seq.tail)});
+            co_return;
+        case exit_reason::cancelled:
+            writer.end(std::unexpected(request_error::cancelled));
+            co_return;
+        case exit_reason::oom:
+            writer.end(std::unexpected(request_error::oom));
+            co_return;
+        }
+    }
+}
+
+task<std::expected<std::vector<std::uint32_t>, page_error>>
+scheduler::take_lines(const std::vector<digest>& page_hashes, std::size_t line_count) {
+    std::vector<std::uint32_t> lines;
+    if (!page_hashes.empty()) {
+        std::expected<std::vector<std::uint32_t>, page_error> got = co_await cache.get(page_hashes, stream);
+        if (!got) {
+            if (got.error() == page_error::miss) {
+                wake(released);
+            }
+            co_return std::unexpected(got.error());
+        }
+        lines = std::move(*got);
+    }
+    std::expected<std::vector<std::uint32_t>, page_error> allocated = cache.allocate(line_count);
+    if (!allocated) {
+        cache.release(lines);
+        wake(released);
+        co_return std::unexpected(allocated.error());
+    }
+    lines.insert(lines.end(), allocated->begin(), allocated->end());
+    co_return lines;
+}
+
+task<void> scheduler::run() {
+    for (;;) {
+        batch b = co_await build_batch();
+        co_await launch(b);
+        co_await write_back(b);
+    }
+}
+
+task<batch> scheduler::build_batch() {
+    while (running.empty()) {
+        co_await next(idle);
+    }
+    co_return batch(running, page_size, prefill_tokens_per_step);
+}
+
+task<void> scheduler::launch(batch& b) {
+    b.enqueue(model, cache.tensors(), stream);
+    for (batch::entry& e : b.entries) {
+        if (e.step_mass.defined()) {
+            e.seq->add_step_mass(e.step_mass, e.token_count, stream);
+            if (e.ends_cycle) {
+                e.host_density = e.seq->density_on_host(stream);
+            }
+        }
+    }
+    co_await synchronize(stream);
+}
+
+// A sequence ends with oom when the sync of its new pages fails, as a state names only pages the store has.
+task<void> scheduler::write_back(batch& b) {
+    std::vector<digest> new_hashes;
+    std::vector<std::uint32_t> new_lines;
+    std::vector<sequence*> putting;
+    const std::int64_t* next_sampled = b.sampled.defined() ? b.sampled.const_data_ptr<std::int64_t>() : nullptr;
+    for (const batch::entry& e : b.entries) {
+        sequence& seq = *e.seq;
+        std::size_t first_new_page = seq.page_hashes.size();
+        seq.advance(e.token_count, page_size, root);
+        if (seq.page_hashes.size() > first_new_page) {
+            new_hashes.insert(new_hashes.end(), seq.page_hashes.begin() + first_new_page, seq.page_hashes.end());
+            new_lines.insert(
+                new_lines.end(),
+                seq.lines.begin() + first_new_page,
+                seq.lines.begin() + seq.page_hashes.size()
+            );
+            putting.push_back(&seq);
+        }
+        if (e.samples) {
+            std::int64_t token = *next_sampled++;
+            seq.writer.append(token);
+            seq.generated++;
+            seq.pending.push_back(token);
+            if (std::ranges::contains(stop_ids, token) || !seq.may_sample()) {
+                seq.exited = exit_reason::finished;
+            }
+        } else if (seq.pending.empty()) {
+            seq.exited = exit_reason::finished;
+        }
+    }
+
+    if (!new_hashes.empty()) {
+        std::expected<void, page_error> stored = co_await cache.sync(new_hashes, new_lines, stream);
+        if (!stored) {
+            for (sequence* seq : putting) {
+                seq->exited = exit_reason::oom;
+            }
+        }
+    }
+
+    for (const batch::entry& e : b.entries) {
+        sequence& seq = *e.seq;
+        if (seq.exited) {
+            continue;
+        }
+        if (seq.writer.cancelled()) {
+            seq.exited = exit_reason::cancelled;
+            continue;
+        }
+        if (e.ends_cycle) {
+            end_cycle(seq, e.host_density);
+        }
+        if (std::size_t missing = seq.missing_lines(page_size); missing > 0) {
+            std::expected<std::vector<std::uint32_t>, page_error> allocated = cache.allocate(missing);
+            if (!allocated) {
+                seq.exited = exit_reason::requeued;
+                continue;
+            }
+            seq.lines.insert(seq.lines.end(), allocated->begin(), allocated->end());
+        }
+    }
+
+    std::erase_if(running, [](const sequence* seq) { return seq->exited.has_value(); });
+    for (const batch::entry& e : b.entries) {
+        if (e.seq->exited) {
+            e.seq->exit_event->set();
+        }
+    }
+}
+
+// The step that last used the evicted lines has completed, so they are released right away.
+void scheduler::end_cycle(sequence& seq, const at::Tensor& host_density) {
+    if (host_density.defined()) {
+        std::span<const float> density(host_density.const_data_ptr<float>(), seq.page_hashes.size());
+        std::vector<std::size_t>
+            evicted = pages_to_evict(density, page_size, seq.cycle_start, seq.forwarded_count(page_size), seq.eviction);
+        if (!evicted.empty()) {
+            cache.release(seq.remove_pages(evicted));
+            wake(released);
+        }
+    }
+    seq.writer.append(
+        cycle_end{.reached = state{.page_hashes = seq.page_hashes, .tail = seq.tail}, .token_count = seq.covered_count}
+    );
+    seq.start_cycle(page_size);
 }
 
 }  // namespace pulsarlm

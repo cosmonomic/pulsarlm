@@ -15,6 +15,7 @@
 
 #include "digest_bytes.hpp"
 #include "python_engine.hpp"
+#include "python_store.hpp"
 
 namespace py = pybind11;
 
@@ -39,12 +40,13 @@ std::unique_ptr<python_engine> make_engine(
     std::size_t page_size,
     at::ScalarType kv_dtype,
     double kv_cache_gib,
+    double staging_gib,
     at::Device device,
     std::vector<std::int64_t> stop_ids,
     std::size_t prefill_tokens_per_step
 ) {
-    if (!(kv_cache_gib > 0.0)) {
-        throw std::invalid_argument("kv_cache_gib must be positive");
+    if (!(kv_cache_gib > 0.0) || !(staging_gib > 0.0)) {
+        throw std::invalid_argument("kv_cache_gib and staging_gib must be positive");
     }
     engine_config config{
         model_name,
@@ -56,12 +58,13 @@ std::unique_ptr<python_engine> make_engine(
             kv_dtype,
         },
         static_cast<std::size_t>(kv_cache_gib * (1ull << 30)),
+        static_cast<std::size_t>(staging_gib * (1ull << 30)),
         device,
         std::move(stop_ids),
         static_cast<std::size_t>(model.vocab_size),
         prefill_tokens_per_step,
     };
-    python_store adapter(std::move(store));
+    auto adapter = std::make_unique<python_store>(std::move(store));
     py::gil_scoped_release nogil;
     return std::make_unique<python_engine>(make_model(model, weights), config, std::move(adapter));
 }
@@ -195,6 +198,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "page_size"_a,
             "kv_dtype"_a,
             "kv_cache_gib"_a,
+            "staging_gib"_a,
             "device"_a,
             "stop_ids"_a,
             "prefill_tokens_per_step"_a

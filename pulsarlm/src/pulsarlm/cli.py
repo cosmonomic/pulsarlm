@@ -46,6 +46,14 @@ def serve(
             "--kv_cache_gib", help="KV cache size in GiB.", rich_help_panel="Memory"
         ),
     ] = 8.0,
+    staging_gib: Annotated[
+        float,
+        typer.Option(
+            "--staging_gib",
+            help="Pinned host buffer for transfers between the KV cache and the store, in GiB.",
+            rich_help_panel="Memory",
+        ),
+    ] = 0.25,
     prefill_tokens_per_step: Annotated[
         int,
         typer.Option(
@@ -54,14 +62,14 @@ def serve(
             rich_help_panel="Memory",
         ),
     ] = 256,
-    stored_states: Annotated[
-        int,
+    store_gib: Annotated[
+        float,
         typer.Option(
-            "--stored_states",
-            help="States the local store keeps.",
+            "--store_gib",
+            help="Host memory the local store keeps pages in, in GiB.",
             rich_help_panel="Memory",
         ),
-    ] = 4096,
+    ] = 8.0,
     cycle_tokens: Annotated[
         int,
         typer.Option(
@@ -107,8 +115,9 @@ def serve(
             device=device,
             dtype=dtype,
             kv_cache_gib=kv_cache_gib,
+            staging_gib=staging_gib,
             prefill_tokens_per_step=prefill_tokens_per_step,
-            stored_states=stored_states,
+            store_gib=store_gib,
             cycle_tokens=cycle_tokens,
             n_working=n_working,
             evict_tau=evict_tau,

@@ -107,7 +107,7 @@ CompiledModel::CompiledModel(
     this->max_pages = num_pages / num_seqs;
 }
 
-void CompiledModel::validate(const kv_lines& kv) const {
+void CompiledModel::validate(const kv& kv) const {
     const int64_t kv_layers = kv.k.size(0);
     const int64_t kv_pages = kv.k.size(1);
     const int64_t kv_page_size = kv.k.size(2);
@@ -132,11 +132,8 @@ void CompiledModel::validate(const kv_lines& kv) const {
     }
 }
 
-at::Tensor CompiledModel::run_decode_group(
-    torch::inductor::AOTIModelPackageLoader& loader,
-    const GroupBatch& g,
-    const kv_lines& kv
-) {
+at::Tensor
+CompiledModel::run_decode_group(torch::inductor::AOTIModelPackageLoader& loader, const GroupBatch& g, const kv& kv) {
     TORCH_CHECK(g.context_lens.defined(), "decode group missing context_lens");
     const int64_t R = g.context_lens.numel();
     TORCH_CHECK(
@@ -170,11 +167,8 @@ at::Tensor CompiledModel::run_decode_group(
     return logits.narrow(0, 0, R);  // real rows only
 }
 
-at::Tensor CompiledModel::run_prefill_group(
-    torch::inductor::AOTIModelPackageLoader& loader,
-    const GroupBatch& g,
-    const kv_lines& kv
-) {
+at::Tensor
+CompiledModel::run_prefill_group(torch::inductor::AOTIModelPackageLoader& loader, const GroupBatch& g, const kv& kv) {
     TORCH_CHECK(g.cu_seqlens_q.defined() && g.seqlens_k.defined(), "prefill group missing cu_seqlens_q/seqlens_k");
     const int64_t R = g.cu_seqlens_q.numel() - 1;
     TORCH_CHECK(
@@ -237,7 +231,7 @@ at::Tensor CompiledModel::run_prefill_group(
     return logits.narrow(0, 0, total_q);  // real query rows only
 }
 
-StepLogits CompiledModel::forward(const StepBatch& batch, const kv_lines& kv) {
+StepLogits CompiledModel::forward(const StepBatch& batch, const kv& kv) {
     this->validate(kv);
     StepLogits out;
     if (batch.prefill.has_value()) {

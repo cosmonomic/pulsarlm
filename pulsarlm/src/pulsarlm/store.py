@@ -27,6 +27,11 @@ def state_key(state: State) -> StateKey:
     return last_page, tuple(state.tail)
 
 
+def page_bytes(page: Page) -> int:
+    k, v = page
+    return k.nbytes + v.nbytes
+
+
 @dataclass
 class StoredPage:
     page: Page
@@ -41,13 +46,17 @@ class LocalStore:
     fetch and put run on the engine's loop thread, the rest on the server's, so a
     lock guards everything. A page is deleted once no stored state references it,
     no lease pins it, and every lease open when it was last put has closed: a
-    request references the pages it puts only once its state arrives.
+    request references the pages it puts only once its state arrives. While the
+    pages take more than capacity_bytes, the least recently used states are
+    dropped, down to the newest one; pages that cannot be deleted yet can keep
+    the store above its capacity.
     """
 
-    def __init__(self, page_size: int, capacity: int) -> None:
+    def __init__(self, page_size: int, capacity_bytes: int) -> None:
         self._lock = threading.Lock()
         self._page_size = page_size
-        self._capacity = capacity
+        self._capacity_bytes = capacity_bytes
+        self._page_bytes = 0
         self._pages: dict[bytes, StoredPage] = {}
         self._states: OrderedDict[StateKey, State] = OrderedDict()
         self._tails: dict[bytes, set[tuple[int, ...]]] = {}
@@ -74,6 +83,7 @@ class LocalStore:
                     stored.last_put = now
                 else:
                     self._pages[h] = StoredPage(page, now)
+                    self._page_bytes += page_bytes(page)
                     self._unreferenced.add(h)
 
     @contextmanager
@@ -97,7 +107,7 @@ class LocalStore:
                 del self._open_leases[opened]
                 for h in state.page_hashes:
                     self._pages[h].pins -= 1
-                self._delete_unused_pages()
+                self._fit()
 
     def write(self, state: State) -> None:
         """Makes state findable. Its pages are in the store: the engine puts them
@@ -111,14 +121,7 @@ class LocalStore:
             else:
                 self._tails.setdefault(key[0], set()).add(key[1])
             self._states[key] = state
-            while len(self._states) > self._capacity:
-                (last_page, tail), evicted = self._states.popitem(last=False)
-                tails = self._tails[last_page]
-                tails.remove(tail)
-                if not tails:
-                    del self._tails[last_page]
-                self._dereference_all(evicted)
-            self._delete_unused_pages()
+            self._fit()
 
     def __len__(self) -> int:
         with self._lock:
@@ -127,6 +130,11 @@ class LocalStore:
     def page_count(self) -> int:
         with self._lock:
             return len(self._pages)
+
+    def byte_count(self) -> int:
+        """The bytes the stored pages take."""
+        with self._lock:
+            return self._page_bytes
 
     def _find(self, prompt: list[int], page_digests: list[bytes]) -> tuple[State, int]:
         for page_count in range(len(page_digests), -1, -1):
@@ -160,6 +168,17 @@ class LocalStore:
             if stored.references == 0:
                 self._unreferenced.add(h)
 
+    def _fit(self) -> None:
+        self._delete_unused_pages()
+        while self._page_bytes > self._capacity_bytes and len(self._states) > 1:
+            (last_page, tail), dropped = self._states.popitem(last=False)
+            tails = self._tails[last_page]
+            tails.remove(tail)
+            if not tails:
+                del self._tails[last_page]
+            self._dereference_all(dropped)
+            self._delete_unused_pages()
+
     def _delete_unused_pages(self) -> None:
         oldest_lease = next(iter(self._open_leases), math.inf)
         unused = [
@@ -168,5 +187,5 @@ class LocalStore:
             if self._pages[h].pins == 0 and self._pages[h].last_put < oldest_lease
         ]
         for h in unused:
-            del self._pages[h]
+            self._page_bytes -= page_bytes(self._pages.pop(h).page)
         self._unreferenced.difference_update(unused)

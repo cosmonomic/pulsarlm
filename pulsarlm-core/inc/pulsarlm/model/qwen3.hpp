@@ -44,7 +44,7 @@ struct Qwen3Model : Model {
         c10::Dict<std::string, at::Tensor> weights
     );
 
-    StepLogits forward(const StepBatch& batch, const kv_lines& kv) override;
+    StepLogits forward(const StepBatch& batch, const kv& kv) override;
 
     bool supports_capture() const override {
         return true;
@@ -71,7 +71,7 @@ struct Qwen3Model : Model {
         at::Tensor down_proj_weight;
     };
 
-    at::Tensor block(at::Tensor x, int64_t layer, const GroupBatch& g, const kv_lines& kv);
+    at::Tensor block(at::Tensor x, int64_t layer, const GroupBatch& g, const kv& kv);
     at::Tensor head(at::Tensor x);
 
     int64_t n_layers;

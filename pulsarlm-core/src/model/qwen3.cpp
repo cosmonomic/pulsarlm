@@ -74,7 +74,7 @@ Qwen3Model::Qwen3Model(
 
 // Qwen3 block: bias-free QKV projection, per-head QK-Norm before RoPE, then RoPE +
 // paged attention and a SwiGLU MLP.
-at::Tensor Qwen3Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, const kv_lines& kv) {
+at::Tensor Qwen3Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, const kv& kv) {
     const LayerWeights& lw = this->layers[layer];
     const int64_t ntok = x.size(0);
 
@@ -130,7 +130,7 @@ at::Tensor Qwen3Model::head(at::Tensor x) {
     return at::matmul(x, w.t());
 }
 
-StepLogits Qwen3Model::forward(const StepBatch& batch, const kv_lines& kv) {
+StepLogits Qwen3Model::forward(const StepBatch& batch, const kv& kv) {
     // Fresh capture each forward: clear both groups' stashes; block() refills the
     // configured layers.
     this->lse_prefill.clear();

@@ -18,7 +18,7 @@ namespace pulsarlm {
 // A page is its (k, v) host tensors. Both return without waiting for the store. A fetch whose call raises, or whose
 // future fails, is cancelled, is dropped unfinished or yields a malformed result, misses every page it asked for. An
 // exception raised by put is reported through sys.unraisablehook.
-class python_store {
+class python_store final : public page_store {
     pybind11::object hooks;
 
     void
@@ -26,12 +26,12 @@ class python_store {
 
   public:
     explicit python_store(pybind11::object&& hooks) noexcept;
-    python_store(python_store&&) noexcept = default;
-    python_store& operator=(python_store&&) = delete;
-    ~python_store();
+    python_store(const python_store&) = delete;
+    python_store& operator=(const python_store&) = delete;
+    ~python_store() override;
 
-    task<std::vector<std::optional<page>>> fetch(std::span<const digest> hashes);
-    void put(std::vector<digest>&& hashes, std::vector<page>&& pages);
+    task<std::vector<std::optional<page>>> fetch(std::span<const digest> hashes) override;
+    void put(std::vector<digest>&& hashes, std::vector<page>&& pages) override;
 };
 
 }  // namespace pulsarlm

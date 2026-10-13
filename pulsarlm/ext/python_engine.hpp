@@ -13,7 +13,6 @@
 #include "pulsarlm/engine.hpp"
 #include "pulsarlm/eviction.hpp"
 #include "pulsarlm/sampling.hpp"
-#include "python_store.hpp"
 #include "request_buffer.hpp"
 #include "wake_fd.hpp"
 
@@ -57,10 +56,10 @@ class request_handle {
 // loop thread releases the GIL first.
 class python_engine {
     std::shared_ptr<wake_fd> wake;
-    std::unique_ptr<engine<python_store>> served;
+    std::unique_ptr<engine> served;
 
   public:
-    python_engine(std::unique_ptr<Model> model, const engine_config& config, python_store&& store);
+    python_engine(std::unique_ptr<Model> model, const engine_config& config, std::unique_ptr<page_store>&& store);
     python_engine(const python_engine&) = delete;
     python_engine& operator=(const python_engine&) = delete;
     ~python_engine();

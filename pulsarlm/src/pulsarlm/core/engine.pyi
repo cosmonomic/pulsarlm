@@ -10,7 +10,8 @@ type Page = tuple[Tensor, Tensor]
 class PageStore(Protocol):
     """Called on the engine's loop thread with the GIL held; both return without
     waiting for the store. A page is its (k, v) host tensors, each
-    [n_layers, page_size, n_kv_heads, head_dim]. A fetch whose call raises, or whose
+    [n_layers, page_size, n_kv_heads, head_dim], in pageable memory the store
+    owns. A fetch whose call raises, or whose
     future fails, is cancelled, is dropped unfinished or yields a malformed result,
     misses every page it asked for. An exception raised by put goes to
     sys.unraisablehook.
@@ -112,6 +113,7 @@ class Engine:
         page_size: int,
         kv_dtype: torch.dtype,
         kv_cache_gib: float,
+        staging_gib: float,
         device: torch.device,
         stop_ids: list[int],
         prefill_tokens_per_step: int,
