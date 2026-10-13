@@ -52,10 +52,6 @@ TORCH_LIBRARY(pulsar, m) {
         "int group_size) -> Tensor"
     );
     m.def("rope(Tensor x, Tensor pos, float theta) -> Tensor");
-    m.def(
-        "reposition_kv(Tensor(a!) k_pool, Tensor slots, Tensor old_positions, "
-        "Tensor new_positions, float theta) -> ()"
-    );
 }
 
 TORCH_LIBRARY_IMPL(pulsar, CUDA, m) {
@@ -70,5 +66,4 @@ TORCH_LIBRARY_IMPL(pulsar, CUDA, m) {
     m.impl("repack_w4a16", TORCH_FN(pulsar::repack_w4a16_cuda));
     m.impl("gemm_w4a16_marlin", TORCH_FN(pulsar::gemm_w4a16_marlin_cuda));
     m.impl("rope", TORCH_FN(pulsar::rope_cuda));
-    m.impl("reposition_kv", TORCH_FN(pulsar::reposition_kv_cuda));
 }

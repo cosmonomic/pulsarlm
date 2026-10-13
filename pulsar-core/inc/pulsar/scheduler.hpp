@@ -19,7 +19,7 @@
 #include "pulsar/eviction.hpp"
 #include "pulsar/kv_cache.hpp"
 #include "pulsar/model/interface.hpp"
-#include "pulsar/result_stream.hpp"
+#include "pulsar/request_callbacks.hpp"
 #include "pulsar/sampling.hpp"
 
 namespace pulsar {
@@ -61,7 +61,7 @@ class sequence {
     // The request's tokens the state covers: the initial state's tail, then the request's tokens, then sampled tokens.
     std::size_t covered_count = 0;
 
-    sequence(request r, result_writer& writer, at::Device device);
+    sequence(request&& r, result_writer& writer, at::Device device);
 
     std::size_t forwarded_count(std::size_t page_size) const noexcept;
     bool may_sample() const noexcept;
@@ -74,9 +74,14 @@ class sequence {
     std::size_t cycle_tokens_left(std::size_t page_size) const noexcept;
     // Drops the full pages at the ascending view indices pages, and returns their lines.
     std::vector<std::uint32_t> remove_pages(std::span<const std::size_t> pages);
-    // One line per distinct page hash and one per page the cycle's tokens fill. Called at the start of a cycle, with
-    // an empty tail.
-    std::size_t admission_lines(std::size_t page_size) const;
+    // One line per page the cycle's tokens fill. Called at the start of a cycle, with an empty tail.
+    std::size_t cycle_lines(std::size_t page_size) const noexcept;
+    // The lines the sequence needs to run its cycle: one per page, and the cycle's lines.
+    std::size_t lines_needed(std::size_t page_size) const noexcept;
+    // Queue on stream: ages the cycle density by token_count tokens and adds step_mass.
+    void add_step_mass(const at::Tensor& step_mass, std::size_t token_count, cudaStream_t stream);
+    // A pinned host copy of the cycle density, complete once stream reaches this point.
+    at::Tensor density_on_host(cudaStream_t stream) const;
     // The lines the sequence lacks to forward every token left in its cycle.
     std::size_t missing_lines(std::size_t page_size) const noexcept;
     // Moves tail back to pending, to be forwarded again into new lines.
@@ -94,8 +99,11 @@ class batch {
         std::size_t token_count;
         bool samples;
         bool ends_cycle;
-        // Pinned host fp32, the sequence's cycle density after the step. Defined when the step ends a cycle of a
-        // sequence that can evict.
+        // fp32 [view pages] on the device, the attention mass the step gave each of the sequence's view pages.
+        // Defined when the sequence can evict.
+        at::Tensor step_mass;
+        // Pinned host fp32, the sequence's cycle density after the step. Set by the scheduler when the step ends a
+        // cycle of a sequence that can evict.
         at::Tensor host_density;
     };
 
@@ -111,10 +119,10 @@ class batch {
 
     static GroupBatch make_group(std::span<const entry> group, std::size_t page_size, bool prefill);
     static bool measures_mass(std::span<const entry> group) noexcept;
-    // Queues on stream the inputs' copies, the forward, the sampling, the density updates, and the copies of the
-    // sampled tokens and of the densities that end a cycle to the host.
+    // Queues on stream the inputs' copies, the forward, the sampling and the copy of the sampled tokens to the host,
+    // and sets each entry's step_mass.
     void enqueue(Model& model, const kv_lines& kv, cudaStream_t stream);
-    void add_page_mass(std::span<entry> group, const GroupBatch& inputs);
+    static void set_step_mass(std::span<entry> group, const GroupBatch& inputs);
 
     template <page_store> friend class scheduler;
 };
@@ -139,7 +147,9 @@ template <page_store t_store> class scheduler {
 
     static event& next(std::optional<event>& waited);
     static void wake(std::optional<event>& waited) noexcept;
-    task<std::expected<void, page_error>> admit(sequence& seq);
+    // Lines for page_hashes, in their order, then line_count empty lines. Holds nothing on failure.
+    task<std::expected<std::vector<std::uint32_t>, page_error>>
+    take_lines(const std::vector<digest>& page_hashes, std::size_t line_count);
     task<batch> build_batch();
     task<void> launch(batch& b);
     task<void> write_back(batch& b);
@@ -150,7 +160,7 @@ template <page_store t_store> class scheduler {
     // and at most prefill_tokens_per_step tokens of the others.
     scheduler(
         Model& model,
-        kv_cache<t_store> cache,
+        kv_cache<t_store>&& cache,
         cudaStream_t stream,
         digest root,
         std::int64_t eos_id,
@@ -169,7 +179,7 @@ template <page_store t_store> class scheduler {
 template <page_store t_store>
 scheduler<t_store>::scheduler(
     Model& model,
-    kv_cache<t_store> cache,
+    kv_cache<t_store>&& cache,
     cudaStream_t stream,
     digest root,
     std::int64_t eos_id,
@@ -214,26 +224,28 @@ template <page_store t_store> task<void> scheduler<t_store>::submit(request r, r
             writer.end(std::unexpected(request_error::cancelled));
             co_return;
         }
-        std::size_t needed = seq.admission_lines(page_size);
+        std::size_t needed = seq.lines_needed(page_size);
         if (needed > n_lines) {
             writer.end(std::unexpected(request_error::oom));
             co_return;
         }
-        // Admitting without enough free lines can fail after get took lines, and releasing them wakes the other
+        // Taking lines without enough free ones can fail after get took some, and releasing them wakes the other
         // waiters into the same failure.
         if (needed > cache.free_line_count()) {
             co_await next(released);
             continue;
         }
-        std::expected<void, page_error> admitted = co_await admit(seq);
-        if (!admitted) {
-            if (admitted.error() == page_error::miss) {
+        std::expected<std::vector<std::uint32_t>, page_error> taken =
+            co_await take_lines(seq.page_hashes, seq.cycle_lines(page_size));
+        if (!taken) {
+            if (taken.error() == page_error::miss) {
                 writer.end(std::unexpected(request_error::miss));
                 co_return;
             }
             co_await next(released);
             continue;
         }
+        seq.lines = std::move(*taken);
 
         seq.exited.reset();
         seq.exit_event.emplace();
@@ -261,26 +273,28 @@ template <page_store t_store> task<void> scheduler<t_store>::submit(request r, r
     }
 }
 
-template <page_store t_store> task<std::expected<void, page_error>> scheduler<t_store>::admit(sequence& seq) {
-    if (!seq.page_hashes.empty()) {
-        std::expected<std::vector<std::uint32_t>, page_error> got = co_await cache.get(seq.page_hashes, stream);
+template <page_store t_store>
+task<std::expected<std::vector<std::uint32_t>, page_error>>
+scheduler<t_store>::take_lines(const std::vector<digest>& page_hashes, std::size_t line_count) {
+    std::vector<std::uint32_t> lines;
+    if (!page_hashes.empty()) {
+        std::expected<std::vector<std::uint32_t>, page_error> got = co_await cache.get(page_hashes, stream);
         if (!got) {
             if (got.error() == page_error::miss) {
                 wake(released);
             }
             co_return std::unexpected(got.error());
         }
-        seq.lines = std::move(*got);
+        lines = std::move(*got);
     }
-    std::expected<std::vector<std::uint32_t>, page_error> allocated = cache.allocate(seq.missing_lines(page_size));
+    std::expected<std::vector<std::uint32_t>, page_error> allocated = cache.allocate(line_count);
     if (!allocated) {
-        cache.release(seq.lines);
-        seq.lines.clear();
+        cache.release(lines);
         wake(released);
         co_return std::unexpected(allocated.error());
     }
-    seq.lines.insert(seq.lines.end(), allocated->begin(), allocated->end());
-    co_return {};
+    lines.insert(lines.end(), allocated->begin(), allocated->end());
+    co_return lines;
 }
 
 template <page_store t_store> task<void> scheduler<t_store>::run() {
@@ -300,6 +314,14 @@ template <page_store t_store> task<batch> scheduler<t_store>::build_batch() {
 
 template <page_store t_store> task<void> scheduler<t_store>::launch(batch& b) {
     b.enqueue(model, kv, stream);
+    for (batch::entry& e : b.entries) {
+        if (e.step_mass.defined()) {
+            e.seq->add_step_mass(e.step_mass, e.token_count, stream);
+            if (e.ends_cycle) {
+                e.host_density = e.seq->density_on_host(stream);
+            }
+        }
+    }
     co_await synchronize(stream);
 }
 
@@ -336,7 +358,7 @@ template <page_store t_store> task<void> scheduler<t_store>::write_back(batch& b
     }
 
     if (!new_hashes.empty()) {
-        std::expected<void, page_error> stored = co_await cache.put(std::move(new_hashes), std::move(new_lines), stream);
+        std::expected<void, page_error> stored = co_await cache.put(new_hashes, new_lines, stream);
         if (!stored) {
             for (sequence* seq : putting) {
                 seq->exited = exit_reason::oom;

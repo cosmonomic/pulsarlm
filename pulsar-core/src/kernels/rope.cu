@@ -1,5 +1,5 @@
 #include "pulsar/ops.hpp"
-#include "rope_common.cuh"
+#include "pulsar/rope.hpp"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -17,12 +17,44 @@
 // in fp64 (see rope_sincos), the rotation runs in fp32, and the result is cast
 // back to x's dtype on store.
 //
-// pos is int64 [seq] and may be arbitrary / non-contiguous, which lets
-// the same op re-RoPE a cache under a recompacted pos layout. One block
-// handles one (head, row) pair; threads stride over the h frequency pairs.
+// pos is int64 [seq] and may be arbitrary / non-contiguous. One block handles one
+// (head, row) pair; threads stride over the h frequency pairs.
 
 namespace pulsar {
 namespace {
+
+// cos/sin of a RoPE angle given in QUADRANTS (the angle divided by pi/2), rounded
+// to fp32.
+//
+// The argument arrives in fp64 and the whole-quadrant part is removed there: that
+// subtraction is exact, so only the remainder, bounded by half a quadrant, is
+// rounded to fp32. Rounding the unreduced angle instead would scale the rounding
+// error by the angle's magnitude, which reaches the trained context length.
+__device__ __forceinline__ void rope_sincos(double quadrants, float& cos_out, float& sin_out) {
+    const double whole = nearbyint(quadrants);
+    const float reduced = static_cast<float>(quadrants - whole) * 1.57079632679489662f;
+
+    float sine, cosine;
+    sincosf(reduced, &sine, &cosine);
+    switch (static_cast<int>(static_cast<long long>(whole)) & 3) {
+    case 0:
+        cos_out = cosine;
+        sin_out = sine;
+        break;
+    case 1:
+        cos_out = -sine;
+        sin_out = cosine;
+        break;
+    case 2:
+        cos_out = -cosine;
+        sin_out = -sine;
+        break;
+    default:
+        cos_out = sine;
+        sin_out = -cosine;
+        break;
+    }
+}
 
 template <typename scalar_t>
 __global__ void rope_kernel(

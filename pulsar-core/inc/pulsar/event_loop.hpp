@@ -47,6 +47,7 @@ template <typename t> class [[nodiscard]] task {
     ~task();
 
     awaiter operator co_await() && noexcept;
+    awaiter operator co_await() & = delete;
 };
 
 // Once set, schedules every coroutine awaiting it on event_loop::current(); awaiting it after does not suspend. Set and
@@ -104,7 +105,7 @@ template <typename value_type> class external_task<value_type>::resolver {
     friend class external_task;
 
   public:
-    void resolve(value_type value = {}) const;
+    void resolve(value_type&& value = {}) const;
 };
 
 class event_loop {
@@ -164,7 +165,7 @@ template <typename t> class task<t>::value_result {
     std::optional<t> value;
 
   public:
-    void return_value(t returned) {
+    void return_value(t&& returned) {
         value.emplace(std::move(returned));
     }
 
@@ -326,8 +327,9 @@ template <typename value_type> struct external_task<value_type>::state {
     event_loop* loop = nullptr;
     bool alive = true;
 
-    // resolved is destroyed after the lock is released, so its destructor never runs under the lock.
-    void set_value(value_type resolved) {
+    // A dropped value is destroyed by the caller after the lock is released, so its destructor never runs under the
+    // lock.
+    void set_value(value_type&& resolved) {
         std::lock_guard lock(mutex);
         if (!alive) {
             return;
@@ -416,8 +418,8 @@ template <typename value_type>
 external_task<value_type>::resolver::resolver(shared_state shared) noexcept
 : shared(std::move(shared)) {}
 
-template <typename value_type> void external_task<value_type>::resolver::resolve(value_type value) const {
-    shared->set_value(std::move(value));
+template <typename value_type> void external_task<value_type>::resolver::resolve(value_type&& value) const {
+    shared->set_value(value_type(std::move(value)));
 }
 
 }  // namespace pulsar

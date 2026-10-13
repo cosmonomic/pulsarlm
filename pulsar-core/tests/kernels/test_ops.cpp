@@ -71,7 +71,7 @@ at::Tensor zero_mass(int64_t num_pages) {
     return at::zeros({num_pages, kPageSize, 1}, at::device(at::kCUDA).dtype(at::kFloat));
 }
 
-// Per-page max mass. ActiveBuffer::evict ranks pages by this value.
+// Per-page max mass.
 double page_mass(const at::Tensor& mass, int64_t page) {
     return mass.select(0, page).max().item<double>();
 }

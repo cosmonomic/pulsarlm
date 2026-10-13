@@ -2,7 +2,7 @@
 #include "pulsar/event_loop.hpp"
 #include "pulsar/kv_cache.hpp"
 #include "pulsar/model/interface.hpp"
-#include "pulsar/result_stream.hpp"
+#include "pulsar/request_callbacks.hpp"
 #include "pulsar/scheduler.hpp"
 
 #include <ATen/ATen.h>
@@ -13,6 +13,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <memory>
 #include <numeric>
@@ -30,11 +31,45 @@ using pulsar::event_loop;
 using pulsar::page;
 using pulsar::request;
 using pulsar::request_error;
-using pulsar::result_stream;
 using pulsar::result_writer;
 using pulsar::task;
 
 using token_list = std::vector<std::int64_t>;
+
+struct request_results {
+    token_list tokens;
+    std::vector<pulsar::cycle_end> cycle_ends;
+    std::optional<std::expected<pulsar::state, request_error>> end;
+    bool cancelled = false;
+};
+
+class recording_callbacks final : public pulsar::request_callbacks {
+    std::shared_ptr<request_results> recorded;
+
+  public:
+    explicit recording_callbacks(std::shared_ptr<request_results> recorded)
+    : recorded(std::move(recorded)) {}
+
+    void on_token(std::int64_t token) noexcept override {
+        recorded->tokens.push_back(token);
+    }
+
+    void on_cycle_end(pulsar::cycle_end&& ended) noexcept override {
+        recorded->cycle_ends.push_back(std::move(ended));
+    }
+
+    void on_end(std::expected<pulsar::state, request_error>&& result) noexcept override {
+        recorded->end.emplace(std::move(result));
+    }
+
+    bool cancelled() const noexcept override {
+        return recorded->cancelled;
+    }
+};
+
+result_writer make_writer(const std::shared_ptr<request_results>& recorded) {
+    return result_writer(std::make_unique<recording_callbacks>(recorded));
+}
 
 constexpr pulsar::page_shape shape{.n_layers = 2, .page_size = 4, .n_kv_heads = 1, .head_dim = 2, .dtype = at::kFloat};
 constexpr std::int64_t vocab = 1000;
@@ -61,7 +96,7 @@ struct memory_store {
         co_return found;
     }
 
-    void put(std::vector<digest> keys, std::vector<page> pages) {
+    void put(std::vector<digest>&& keys, std::vector<page>&& pages) {
         for (std::size_t i = 0; i < keys.size(); i++) {
             contents->pages.insert_or_assign(keys[i], std::move(pages[i]));
         }
@@ -209,13 +244,13 @@ token_list continuation(token_list context, std::size_t count) {
     return generated;
 }
 
-pulsar::state ended_state(const result_stream::taken& result) {
+pulsar::state ended_state(const request_results& result) {
     REQUIRE(result.end.has_value());
     REQUIRE(result.end->has_value());
     return **result.end;
 }
 
-request_error ended_error(const result_stream::taken& result) {
+request_error ended_error(const request_results& result) {
     REQUIRE(result.end.has_value());
     REQUIRE(!result.end->has_value());
     return result.end->error();
@@ -232,13 +267,13 @@ bool page_holds(const page& p, const token_list& tokens, std::size_t first_index
 
 struct submission {
     request r;
-    std::shared_ptr<result_stream> stream;
+    std::shared_ptr<request_results> recorded;
     result_writer writer;
 };
 
 submission make_submission(request r) {
-    std::pair<std::shared_ptr<result_stream>, result_writer> made = result_stream::make();
-    return submission{.r = std::move(r), .stream = made.first, .writer = std::move(made.second)};
+    auto recorded = std::make_shared<request_results>();
+    return submission{.r = std::move(r), .recorded = recorded, .writer = make_writer(recorded)};
 }
 
 task<void> serve(test_scheduler& sched, request r, result_writer writer, std::size_t& remaining) {
@@ -248,7 +283,7 @@ task<void> serve(test_scheduler& sched, request r, result_writer writer, std::si
     }
 }
 
-std::vector<result_stream::taken> serve_submissions(test_scheduler& sched, std::vector<submission> submissions) {
+std::vector<request_results> serve_submissions(test_scheduler& sched, std::vector<submission> submissions) {
     std::size_t remaining = submissions.size();
     event_loop loop;
     loop.spawn(sched.run());
@@ -256,14 +291,14 @@ std::vector<result_stream::taken> serve_submissions(test_scheduler& sched, std::
         loop.spawn(serve(sched, std::move(s.r), std::move(s.writer), remaining));
     }
     REQUIRE(loop.run() == nullptr);
-    std::vector<result_stream::taken> results;
+    std::vector<request_results> results;
     for (submission& s : submissions) {
-        results.push_back(s.stream->take());
+        results.push_back(*s.recorded);
     }
     return results;
 }
 
-std::vector<result_stream::taken> serve_all(test_scheduler& sched, std::vector<request> requests) {
+std::vector<request_results> serve_all(test_scheduler& sched, std::vector<request> requests) {
     std::vector<submission> submissions;
     for (request& r : requests) {
         submissions.push_back(make_submission(std::move(r)));
@@ -274,22 +309,22 @@ std::vector<result_stream::taken> serve_all(test_scheduler& sched, std::vector<r
 task<void> serve_then(
     test_scheduler& sched,
     request first,
-    std::function<request(const result_stream::taken&)> next,
-    std::vector<result_stream::taken>& results
+    std::function<request(const request_results&)> next,
+    std::vector<request_results>& results
 ) {
-    std::pair<std::shared_ptr<result_stream>, result_writer> first_stream = result_stream::make();
-    co_await sched.submit(std::move(first), std::move(first_stream.second));
-    results.push_back(first_stream.first->take());
-    std::pair<std::shared_ptr<result_stream>, result_writer> second_stream = result_stream::make();
-    co_await sched.submit(next(results.front()), std::move(second_stream.second));
-    results.push_back(second_stream.first->take());
+    auto first_results = std::make_shared<request_results>();
+    co_await sched.submit(std::move(first), make_writer(first_results));
+    results.push_back(*first_results);
+    auto second_results = std::make_shared<request_results>();
+    co_await sched.submit(next(results.front()), make_writer(second_results));
+    results.push_back(*second_results);
     event_loop::current()->stop();
 }
 
 // Serves first, then the request next makes from first's result.
-std::vector<result_stream::taken>
-serve_in_turn(test_scheduler& sched, request first, std::function<request(const result_stream::taken&)> next) {
-    std::vector<result_stream::taken> results;
+std::vector<request_results>
+serve_in_turn(test_scheduler& sched, request first, std::function<request(const request_results&)> next) {
+    std::vector<request_results> results;
     event_loop loop;
     loop.spawn(sched.run());
     loop.spawn(serve_then(sched, std::move(first), std::move(next), results));
@@ -300,7 +335,7 @@ serve_in_turn(test_scheduler& sched, request first, std::function<request(const 
 TEST_CASE("a request from an empty state prefills, decodes and ends with its state") {
     fixture f(16);
     token_list prompt{1, 2, 3, 4, 5, 6};
-    std::vector<result_stream::taken> results = serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 5}});
+    std::vector<request_results> results = serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 5}});
 
     token_list generated = continuation(prompt, 5);
     REQUIRE(results[0].tokens == generated);
@@ -321,8 +356,8 @@ TEST_CASE("a request continues from the end state of another in the same cache")
     fixture f(16);
     token_list prompt{1, 2, 3, 4, 5, 6};
     token_list user{7, 8};
-    std::vector<result_stream::taken> results =
-        serve_in_turn(f.sched, request{.tokens = prompt, .max_tokens = 5}, [&](const result_stream::taken& first) {
+    std::vector<request_results> results =
+        serve_in_turn(f.sched, request{.tokens = prompt, .max_tokens = 5}, [&](const request_results& first) {
             return request{
                 .initial_state = ended_state(first),
                 .tokens = concat({first.tokens.back()}, user),
@@ -343,11 +378,11 @@ TEST_CASE("a request continues from pages another cache fetches from the store")
     fixture first_engine(16);
     token_list prompt{1, 2, 3, 4, 5, 6};
     token_list user{7, 8};
-    result_stream::taken first = serve_all(first_engine.sched, {request{.tokens = prompt, .max_tokens = 5}})[0];
+    request_results first = serve_all(first_engine.sched, {request{.tokens = prompt, .max_tokens = 5}})[0];
     pulsar::state first_end = ended_state(first);
 
     fixture second_engine(16, 64, unreachable_eos, memory_store{.contents = first_engine.store});
-    result_stream::taken second = serve_all(
+    request_results second = serve_all(
         second_engine.sched,
         {request{.initial_state = first_end, .tokens = concat({first.tokens.back()}, user), .max_tokens = 4}}
     )[0];
@@ -359,7 +394,7 @@ TEST_CASE("a request continues from pages another cache fetches from the store")
 TEST_CASE("a state page missing from the store ends the request with miss") {
     fixture f(16);
     pulsar::state unknown{.page_hashes = {digest{.hi = 1, .lo = 2}}};
-    std::vector<result_stream::taken> results =
+    std::vector<request_results> results =
         serve_all(f.sched, {request{.initial_state = unknown, .tokens = {3}, .max_tokens = 1}});
 
     REQUIRE(results[0].tokens.empty());
@@ -372,7 +407,7 @@ TEST_CASE("the eos token ends the request after it is emitted") {
     token_list free_run = continuation(prompt, 4);
     REQUIRE(free_run == token_list{6, 12, 24, 48});
     fixture f(16, 64, 24);
-    std::vector<result_stream::taken> results = serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 10}});
+    std::vector<request_results> results = serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 10}});
 
     REQUIRE(results[0].tokens == token_list{6, 12, 24});
     pulsar::state end = ended_state(results[0]);
@@ -383,7 +418,7 @@ TEST_CASE("the eos token ends the request after it is emitted") {
 TEST_CASE("max_tokens 0 forwards the tokens and ends with their state") {
     fixture f(16);
     token_list prompt{1, 2, 3, 4, 5, 6, 7, 8, 9};
-    std::vector<result_stream::taken> results = serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 0}});
+    std::vector<request_results> results = serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 0}});
 
     REQUIRE(results[0].tokens.empty());
     pulsar::state end = ended_state(results[0]);
@@ -392,13 +427,13 @@ TEST_CASE("max_tokens 0 forwards the tokens and ends with their state") {
     REQUIRE(f.store->pages.size() == 2);
 }
 
-TEST_CASE("a request cancelled before it is admitted ends with cancelled") {
+TEST_CASE("a request cancelled before it runs ends with cancelled") {
     fixture f(16);
     submission s = make_submission(request{.tokens = {1, 2, 3}, .max_tokens = 10});
-    s.stream->cancel();
+    s.recorded->cancelled = true;
     std::vector<submission> submissions;
     submissions.push_back(std::move(s));
-    std::vector<result_stream::taken> results = serve_submissions(f.sched, std::move(submissions));
+    std::vector<request_results> results = serve_submissions(f.sched, std::move(submissions));
 
     REQUIRE(results[0].tokens.empty());
     REQUIRE(ended_error(results[0]) == request_error::cancelled);
@@ -409,14 +444,14 @@ TEST_CASE("a request cancelled while decoding ends with cancelled after its step
     fixture f(16);
     token_list prompt{1, 2, 3};
     submission s = make_submission(request{.tokens = prompt, .max_tokens = 10});
-    f.model.on_forward = [&f, stream = s.stream] {
+    f.model.on_forward = [&f, recorded = s.recorded] {
         if (f.model.forward_count == 3) {
-            stream->cancel();
+            recorded->cancelled = true;
         }
     };
     std::vector<submission> submissions;
     submissions.push_back(std::move(s));
-    std::vector<result_stream::taken> results = serve_submissions(f.sched, std::move(submissions));
+    std::vector<request_results> results = serve_submissions(f.sched, std::move(submissions));
 
     REQUIRE(results[0].tokens == continuation(prompt, 3));
     REQUIRE(ended_error(results[0]) == request_error::cancelled);
@@ -426,7 +461,7 @@ TEST_CASE("a request waits for the lines another request releases") {
     fixture f(3);
     token_list first{1, 2, 3, 4, 5};
     token_list second{6, 7, 8, 9, 10};
-    std::vector<result_stream::taken> results = serve_all(
+    std::vector<request_results> results = serve_all(
         f.sched,
         {request{.tokens = first, .max_tokens = 3}, request{.tokens = second, .max_tokens = 3}}
     );
@@ -438,7 +473,7 @@ TEST_CASE("a request waits for the lines another request releases") {
 
 TEST_CASE("a request needing more lines than the cache has ends with oom") {
     fixture f(2);
-    std::vector<result_stream::taken> results =
+    std::vector<request_results> results =
         serve_all(f.sched, {request{.tokens = token_list(12, 1), .max_tokens = 1}});
 
     REQUIRE(results[0].tokens.empty());
@@ -449,7 +484,7 @@ TEST_CASE("a request needing more lines than the cache has ends with oom") {
 TEST_CASE("a request that outgrows the cache alone ends with oom") {
     fixture f(2);
     token_list prompt{1, 2, 3, 4};
-    std::vector<result_stream::taken> results =
+    std::vector<request_results> results =
         serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 10, .eviction = {.cycle_tokens = 4}}});
 
     REQUIRE(results[0].tokens == continuation(prompt, 5));
@@ -460,7 +495,7 @@ TEST_CASE("a request that outgrows the free lines waits for them and completes")
     fixture f(5);
     token_list first{1, 2, 3, 4};
     token_list second{5, 6, 7, 8};
-    std::vector<result_stream::taken> results = serve_all(
+    std::vector<request_results> results = serve_all(
         f.sched,
         {request{.tokens = first, .max_tokens = 10, .eviction = {.cycle_tokens = 4}},
          request{.tokens = second, .max_tokens = 10, .eviction = {.cycle_tokens = 4}}}
@@ -479,7 +514,7 @@ TEST_CASE("a request that outgrows the free lines waits for them and completes")
 TEST_CASE("a cycle ends every cycle_tokens tokens with the state it reached") {
     fixture f(16);
     token_list prompt{1, 2, 3, 4, 5, 6};
-    std::vector<result_stream::taken> results =
+    std::vector<request_results> results =
         serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 6, .eviction = {.cycle_tokens = 4}}});
 
     token_list generated = continuation(prompt, 6);
@@ -501,7 +536,7 @@ TEST_CASE("a cycle's end evicts the pages below the bar outside the sink and wor
     fixture f(16);
     f.model.important = [](std::int64_t token) { return token == 7; };
     token_list prompt{100, 101, 102, 103, 7, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114};
-    std::vector<result_stream::taken> results = serve_all(
+    std::vector<request_results> results = serve_all(
         f.sched,
         {request{
             .tokens = prompt,
@@ -526,7 +561,7 @@ TEST_CASE("a cycle's end evicts the pages below the bar outside the sink and wor
 TEST_CASE("a cycle's end evicts down to max_pages, the oldest first on ties") {
     fixture f(16);
     token_list prompt{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
-    std::vector<result_stream::taken> results = serve_all(
+    std::vector<request_results> results = serve_all(
         f.sched,
         {request{.tokens = prompt, .max_tokens = 2, .eviction = {.cycle_tokens = 16, .max_pages = 2}}}
     );
@@ -542,7 +577,7 @@ TEST_CASE("a prompt longer than the cache fits when each cycle evicts down to ma
     fixture f(4);
     token_list prompt(32);
     std::iota(prompt.begin(), prompt.end(), 1);
-    std::vector<result_stream::taken> results = serve_all(
+    std::vector<request_results> results = serve_all(
         f.sched,
         {request{.tokens = prompt, .max_tokens = 2, .eviction = {.cycle_tokens = 8, .max_pages = 2}}}
     );
@@ -558,7 +593,7 @@ TEST_CASE("a prompt longer than the cache fits when each cycle evicts down to ma
 TEST_CASE("prefill forwards at most the step's prefill tokens") {
     fixture f(16, 4);
     token_list prompt{1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
-    std::vector<result_stream::taken> results = serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 2}});
+    std::vector<request_results> results = serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 2}});
 
     REQUIRE(results[0].tokens == continuation(prompt, 2));
     REQUIRE(f.model.prefill_chunks == std::vector<token_list>{{4}, {4}, {2}});
@@ -569,7 +604,7 @@ TEST_CASE("running requests are forwarded in one step") {
     fixture f(16);
     token_list first{1, 2, 3};
     token_list second{4, 5, 6};
-    std::vector<result_stream::taken> results = serve_all(
+    std::vector<request_results> results = serve_all(
         f.sched,
         {request{.tokens = first, .max_tokens = 3}, request{.tokens = second, .max_tokens = 3}}
     );

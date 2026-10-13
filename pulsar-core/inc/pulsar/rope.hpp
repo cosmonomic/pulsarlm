@@ -4,10 +4,9 @@
 
 #include <cstdint>
 
-// Host-side RoPE angle arithmetic, shared by the CUDA kernels (rope.cu and
-// reposition.cu, through rope_common.cuh, and the paged attention kernels, through
-// pulsar/kernels/attn_params.cuh) and by the ATen rotation the recall scorer applies
-// (recall.cpp). Every table derives from the same theta^(-2j/head_dim) frequencies.
+// Host-side RoPE angle arithmetic, shared by the CUDA kernels (rope.cu, and the paged
+// attention kernels through pulsar/kernels/attn_params.cuh) and by rope_rotate. Every
+// table derives from the same theta^(-2j/head_dim) frequencies.
 
 namespace pulsar {
 

@@ -196,22 +196,4 @@ at::Tensor gemm_w4a16_marlin_cuda(
 // Returns the rotated x, same shape and dtype.
 at::Tensor rope_cuda(const at::Tensor& x, const at::Tensor& pos, double theta);
 
-// Reposition already-RoPE'd keys in a paged KV pool by rotating each by its delta
-// angle:  reposition(rope(raw, p_old), p_old -> p_new) == rope(raw, p_new).
-// Same HF/Qwen2 rotate_half convention as rope_cuda; K only (V is untouched).
-//   k_pool        [num_pages, page_size, n_kv_heads, head_dim]  (ONE layer;
-//                 mutated in place, contiguous)
-//   slots         int32 [M]; physical slot of each key in the flattened
-//                 [num_pages*page_size] first two dims.
-//   old_positions int32 [M]; the pos each key is currently roped at.
-//   new_positions int32 [M]; the pos to rotate each key to.
-//   theta         RoPE base (must match the base used to rope the keys).
-void reposition_kv_cuda(
-    const at::Tensor& k_pool,
-    const at::Tensor& slots,
-    const at::Tensor& old_positions,
-    const at::Tensor& new_positions,
-    double theta
-);
-
 }  // namespace pulsar

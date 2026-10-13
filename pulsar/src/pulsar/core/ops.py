@@ -15,17 +15,6 @@ def _rope_fake(x: torch.Tensor, pos: torch.Tensor, theta: float) -> torch.Tensor
     return torch.empty_like(x)
 
 
-def _reposition_kv_fake(
-    k_pool: torch.Tensor,
-    slots: torch.Tensor,
-    old_positions: torch.Tensor,
-    new_positions: torch.Tensor,
-    theta: float,
-) -> None:
-    # k_pool is mutated in place (Tensor(a!)); the op returns None.
-    return None
-
-
 def _write_kv_fake(
     k_pool: torch.Tensor,
     v_pool: torch.Tensor,
@@ -175,7 +164,6 @@ def _register_fakes() -> None:
     fakes = {
         "pulsar::rmsnorm": _rmsnorm_fake,
         "pulsar::rope": _rope_fake,
-        "pulsar::reposition_kv": _reposition_kv_fake,
         "pulsar::write_kv": _write_kv_fake,
         "pulsar::attn_decode": _attn_decode_fake,
         # The _scalar ops are the validation seam (scalar oracle), registered here
@@ -461,34 +449,3 @@ def rope(x: torch.Tensor, pos: torch.Tensor, theta: float) -> torch.Tensor:
         The rotated x, same shape and dtype.
     """
     return torch.ops.pulsar.rope(x, pos, theta)
-
-
-def reposition_kv(
-    k_pool: torch.Tensor,
-    slots: torch.Tensor,
-    old_positions: torch.Tensor,
-    new_positions: torch.Tensor,
-    theta: float,
-) -> None:
-    """Reposition already-RoPE'd keys in a paged KV pool, HF/Qwen2 convention.
-
-    The pool stores roped keys. Moving a key to a new pos is one extra
-    rotation by the delta angle, so
-    reposition(rope(raw, p_old), p_old -> p_new) == rope(raw, p_new). RoPE
-    applies to K only; there is no V variant. The delta angle is formed in fp64
-    and the rotation runs in fp32, matching rope.
-
-    Args:
-        k_pool: One layer's key pool, [num_pages, page_size, n_kv_heads,
-            head_dim], contiguous. Mutated in place.
-        slots: int32 [M]. Physical slot of each key, indexing the flattened
-            [num_pages*page_size] first two dims (slot = page*page_size +
-            offset).
-        old_positions: int32 [M]. The pos each key is currently roped at.
-        new_positions: int32 [M]. The pos to rotate each key to.
-        theta: RoPE base (must match the base the keys were roped with).
-
-    Returns:
-        None. k_pool is updated in place.
-    """
-    torch.ops.pulsar.reposition_kv(k_pool, slots, old_positions, new_positions, theta)

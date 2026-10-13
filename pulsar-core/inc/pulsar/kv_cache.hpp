@@ -59,10 +59,10 @@ class line_pool {
 
     line_pool(const page_shape& shape, std::size_t n_lines, at::Device device);
 
-    void upload(std::uint32_t line_id, const page& source, cudaStream_t stream);
+    void copy_from_host(std::uint32_t line_id, const page& source, cudaStream_t stream);
     void clone(std::uint32_t source, std::span<const std::uint32_t> targets, cudaStream_t stream);
     // Pinned host copies, complete once stream reaches this point. nullopt when pinned host memory runs out.
-    std::optional<std::vector<page>> download(std::span<const std::uint32_t> line_ids, cudaStream_t stream) const;
+    std::optional<std::vector<page>> copy_to_host(std::span<const std::uint32_t> line_ids, cudaStream_t stream) const;
 
     template <page_store> friend class kv_cache;
 };
@@ -95,16 +95,17 @@ template <page_store t_store> class kv_cache {
     void assign_hash(std::uint32_t line_id, const digest& hash);
 
   public:
-    kv_cache(const page_shape& shape, std::size_t n_lines, at::Device device, t_store store);
+    kv_cache(const page_shape& shape, std::size_t n_lines, at::Device device, t_store&& store);
 
     // Copies run on stream. Callers release lines only after the GPU work using them completes. get, allocate and
     // clone never wait for lines. A line is free when it is not held; free lines are reused least recently released
     // first and their pages dropped. Without enough free lines the call fails with oom. A failed call holds nothing.
 
-    // Gives every page a line in the order of hashes, fetching the pages that are not resident from the store, and
-    // holds the lines until release. A page another get is fetching shares that line and fetch. Fails with miss when
-    // the store does not have a page.
-    task<std::expected<std::vector<std::uint32_t>, page_error>> get(std::vector<digest> hashes, cudaStream_t stream);
+    // hashes are distinct. Gives every page a line in their order, fetching the pages that are not resident from the
+    // store, and holds the lines until release. A page another get is fetching shares that line and fetch. Fails with
+    // miss when the store does not have a page.
+    task<std::expected<std::vector<std::uint32_t>, page_error>>
+    get(const std::vector<digest>& hashes, cudaStream_t stream);
     // Gives count empty lines, held until release. get does not find their pages until they are put, and releasing a
     // line before it is put drops its page.
     std::expected<std::vector<std::uint32_t>, page_error> allocate(std::size_t count);
@@ -115,7 +116,7 @@ template <page_store t_store> class kv_cache {
     // store. A hash already cached at another line leaves its line unmapped. Completes once the copies are handed to
     // the store. Fails with oom, caching nothing, when the host copies cannot be allocated.
     task<std::expected<void, page_error>>
-    put(std::vector<digest> hashes, std::vector<std::uint32_t> line_ids, cudaStream_t stream);
+    put(const std::vector<digest>& hashes, const std::vector<std::uint32_t>& line_ids, cudaStream_t stream);
     void release(std::span<const std::uint32_t> line_ids) noexcept;
 
     std::size_t free_line_count() const noexcept;
@@ -138,7 +139,7 @@ template <page_store t_store> struct kv_cache<t_store>::fetch {
 };
 
 template <page_store t_store>
-kv_cache<t_store>::kv_cache(const page_shape& shape, std::size_t n_lines, at::Device device, t_store store)
+kv_cache<t_store>::kv_cache(const page_shape& shape, std::size_t n_lines, at::Device device, t_store&& store)
 : pool(shape, n_lines, device),
   lines(n_lines),
   store(std::move(store)) {
@@ -222,14 +223,10 @@ template <page_store t_store> void kv_cache<t_store>::assign_hash(std::uint32_t 
 
 template <page_store t_store>
 task<std::expected<std::vector<std::uint32_t>, page_error>>
-kv_cache<t_store>::get(std::vector<digest> hashes, cudaStream_t stream) {
+kv_cache<t_store>::get(const std::vector<digest>& hashes, cudaStream_t stream) {
     std::size_t lines_needed = 0;
     std::size_t free_resident_count = 0;
-    std::unordered_set<digest, digest_hash> seen;
     for (const digest& hash : hashes) {
-        if (!seen.insert(hash).second) {
-            continue;
-        }
         if (auto it = digest_to_line_id.find(hash); it != digest_to_line_id.end()) {
             free_resident_count += lines[it->second].ref == 0;
         } else if (!fetching.contains(hash)) {
@@ -260,12 +257,6 @@ kv_cache<t_store>::get(std::vector<digest> hashes, cudaStream_t stream) {
     std::vector<digest> fetch_hashes;
     std::vector<std::uint32_t> fetch_lines;
     for (std::size_t i : to_fetch) {
-        if (auto it = fetching.find(hashes[i]); it != fetching.end()) {
-            line_ids[i] = it->second.line_id;
-            hold(line_ids[i]);
-            joined.push_back(i);
-            continue;
-        }
         line_ids[i] = take_free_line();
         fetching.try_emplace(hashes[i], line_ids[i]);
         fetch_hashes.push_back(hashes[i]);
@@ -275,14 +266,14 @@ kv_cache<t_store>::get(std::vector<digest> hashes, cudaStream_t stream) {
     if (!fetch_hashes.empty()) {
         std::vector<std::optional<page>> pages = co_await store.fetch(fetch_hashes);
         assert(pages.size() == fetch_hashes.size());
-        bool uploaded = false;
+        bool copied = false;
         for (std::size_t j = 0; j < pages.size(); j++) {
             if (pages[j]) {
-                pool.upload(fetch_lines[j], *pages[j], stream);
-                uploaded = true;
+                pool.copy_from_host(fetch_lines[j], *pages[j], stream);
+                copied = true;
             }
         }
-        if (uploaded) {
+        if (copied) {
             co_await synchronize(stream);
         }
         for (std::size_t j = 0; j < pages.size(); j++) {
@@ -335,7 +326,11 @@ kv_cache<t_store>::clone(std::uint32_t line_id, std::size_t count, cudaStream_t 
 
 template <page_store t_store>
 task<std::expected<void, page_error>>
-kv_cache<t_store>::put(std::vector<digest> hashes, std::vector<std::uint32_t> line_ids, cudaStream_t stream) {
+kv_cache<t_store>::put(
+    const std::vector<digest>& hashes,
+    const std::vector<std::uint32_t>& line_ids,
+    cudaStream_t stream
+) {
     assert(hashes.size() == line_ids.size());
     std::vector<digest> new_hashes;
     std::vector<std::uint32_t> new_lines;
@@ -351,7 +346,7 @@ kv_cache<t_store>::put(std::vector<digest> hashes, std::vector<std::uint32_t> li
         co_return {};
     }
 
-    std::optional<std::vector<page>> host_pages = pool.download(new_lines, stream);
+    std::optional<std::vector<page>> host_pages = pool.copy_to_host(new_lines, stream);
     if (!host_pages) {
         co_return std::unexpected(page_error::oom);
     }

@@ -70,7 +70,7 @@ void check_page(const at::Tensor& lines, std::uint32_t line_id, const at::Tensor
     TORCH_CHECK(source.dtype() == target.dtype(), "kv_cache: page is ", source.dtype(), ", line is ", target.dtype());
 }
 
-at::Tensor download_line(const at::Tensor& lines, std::uint32_t line_id) {
+at::Tensor copy_line_to_host(const at::Tensor& lines, std::uint32_t line_id) {
     at::Tensor source = lines.select(1, static_cast<std::int64_t>(line_id));
     at::Tensor host = at::empty(source.sizes(), source.options().device(at::kCPU).pinned_memory(true));
     for (std::size_t layer = 0; layer < static_cast<std::size_t>(lines.size(0)); layer++) {
@@ -97,7 +97,7 @@ line_pool::line_pool(const page_shape& shape, std::size_t n_lines, at::Device de
 : k(make_lines(shape, n_lines, device)),
   v(make_lines(shape, n_lines, device)) {}
 
-void line_pool::upload(std::uint32_t line_id, const page& source, cudaStream_t stream) {
+void line_pool::copy_from_host(std::uint32_t line_id, const page& source, cudaStream_t stream) {
     check_page(k, line_id, source.k);
     check_page(v, line_id, source.v);
     auto guard = guard_stream(k, stream);
@@ -118,13 +118,13 @@ void line_pool::clone(std::uint32_t source, std::span<const std::uint32_t> targe
 // A failed pinned allocation throws AcceleratorError with cudaErrorMemoryAllocation. Host tensors dropped while their
 // copies are in flight stay reserved by the caching host allocator until the copies end.
 std::optional<std::vector<page>>
-line_pool::download(std::span<const std::uint32_t> line_ids, cudaStream_t stream) const {
+line_pool::copy_to_host(std::span<const std::uint32_t> line_ids, cudaStream_t stream) const {
     auto guard = guard_stream(k, stream);
     std::vector<page> pages;
     pages.reserve(line_ids.size());
     try {
         for (std::uint32_t line_id : line_ids) {
-            pages.push_back(page{.k = download_line(k, line_id), .v = download_line(v, line_id)});
+            pages.push_back(page{.k = copy_line_to_host(k, line_id), .v = copy_line_to_host(v, line_id)});
         }
     } catch (const c10::AcceleratorError& error) {
         if (error.get_error_code() != cudaErrorMemoryAllocation) {

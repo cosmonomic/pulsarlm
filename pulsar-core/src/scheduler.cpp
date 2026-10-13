@@ -10,7 +10,6 @@
 #include <cstdint>
 #include <optional>
 #include <span>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -55,7 +54,7 @@ GroupBatch to_device(const GroupBatch& host, at::Device device) {
 
 }  // namespace
 
-sequence::sequence(request r, result_writer& writer, at::Device device)
+sequence::sequence(request&& r, result_writer& writer, at::Device device)
 : writer(writer),
   sampling(r.sampling),
   generator(make_sampling_generator(device, r.sampling.seed)),
@@ -129,10 +128,26 @@ std::vector<std::uint32_t> sequence::remove_pages(std::span<const std::size_t> p
     return removed;
 }
 
-std::size_t sequence::admission_lines(std::size_t page_size) const {
+std::size_t sequence::cycle_lines(std::size_t page_size) const noexcept {
     assert(tail.empty());
-    std::unordered_set<digest, digest_hash> distinct(page_hashes.begin(), page_hashes.end());
-    return distinct.size() + ceil_div(cycle_tokens_left(page_size), page_size);
+    return ceil_div(cycle_tokens_left(page_size), page_size);
+}
+
+std::size_t sequence::lines_needed(std::size_t page_size) const noexcept {
+    return page_hashes.size() + cycle_lines(page_size);
+}
+
+void sequence::add_step_mass(const at::Tensor& step_mass, std::size_t token_count, cudaStream_t stream) {
+    c10::cuda::CUDAStreamGuard guard(c10::cuda::getStreamFromExternal(stream, step_mass.device().index()));
+    density.add(step_mass, token_count, eviction.attention_mass_decay);
+}
+
+at::Tensor sequence::density_on_host(cudaStream_t stream) const {
+    const at::Tensor& on_device = density.by_page();
+    c10::cuda::CUDAStreamGuard guard(c10::cuda::getStreamFromExternal(stream, on_device.device().index()));
+    at::Tensor host = pinned(on_device.sizes(), at::kFloat);
+    host.copy_(on_device, /*non_blocking=*/true);
+    return host;
 }
 
 std::size_t sequence::missing_lines(std::size_t page_size) const noexcept {
@@ -257,18 +272,13 @@ bool batch::measures_mass(std::span<const entry> group) noexcept {
     return std::ranges::any_of(group, [](const entry& e) { return e.seq->eviction.can_evict(); });
 }
 
-void batch::add_page_mass(std::span<entry> group, const GroupBatch& inputs) {
+void batch::set_step_mass(std::span<entry> group, const GroupBatch& inputs) {
     std::int64_t first_page = 0;
     for (entry& e : group) {
-        sequence& seq = *e.seq;
+        const sequence& seq = *e.seq;
         auto pages = static_cast<std::int64_t>(seq.lines.size());
         if (seq.eviction.can_evict()) {
-            at::Tensor step_mass = inputs.page_mass.narrow(0, first_page, pages);
-            seq.density.add(step_mass, e.token_count, seq.eviction.attention_mass_decay);
-            if (e.ends_cycle) {
-                e.host_density = pinned({pages}, at::kFloat);
-                e.host_density.copy_(seq.density.by_page(), /*non_blocking=*/true);
-            }
+            e.step_mass = inputs.page_mass.narrow(0, first_page, pages);
         }
         first_page += pages;
     }
@@ -287,10 +297,10 @@ void batch::enqueue(Model& model, const kv_lines& kv, cudaStream_t stream) {
     StepLogits logits = model.forward(on_device, kv);
     std::span<entry> all(entries);
     if (on_device.decode && on_device.decode->cu_view_pages.defined()) {
-        add_page_mass(all.first(decode_count), *on_device.decode);
+        set_step_mass(all.first(decode_count), *on_device.decode);
     }
     if (on_device.prefill && on_device.prefill->cu_view_pages.defined()) {
-        add_page_mass(all.subspan(decode_count), *on_device.prefill);
+        set_step_mass(all.subspan(decode_count), *on_device.prefill);
     }
 
     std::vector<at::Tensor> rows;

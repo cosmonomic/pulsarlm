@@ -27,7 +27,7 @@ void check_cuda(cudaError_t status) {
 
 void CUDART_CB resolve_synchronized(cudaStream_t, cudaError_t status, void* resolver) {
     std::unique_ptr<cuda_resolver> owned(static_cast<cuda_resolver*>(resolver));
-    owned->resolve(status);
+    owned->resolve(std::move(status));
 }
 
 }  // namespace

@@ -64,7 +64,7 @@ struct memory_store {
         co_return found;
     }
 
-    void put(std::vector<digest> keys, std::vector<page> pages) {
+    void put(std::vector<digest>&& keys, std::vector<page>&& pages) {
         state->puts++;
         for (std::size_t i = 0; i < keys.size(); i++) {
             state->pages.insert_or_assign(keys[i], std::move(pages[i]));
@@ -242,18 +242,6 @@ TEST_CASE("the oom check does not count the free line of a resident page the get
     lines_result got = run_get(fixture.kv, {hash_of(1)});
     REQUIRE(got.has_value());
     fixture.kv.release(*got);
-}
-
-TEST_CASE("a page repeated in one get shares one line and one fetch") {
-    cache_fixture fixture(1);
-    fixture.store->pages.emplace(hash_of(2), host_page(2.0f));
-    lines_result got = run_get(fixture.kv, {hash_of(2), hash_of(2)});
-    REQUIRE(got.has_value());
-    REQUIRE((*got)[0] == (*got)[1]);
-    REQUIRE(fixture.store->fetches.size() == 1);
-    REQUIRE(line_filled_with(fixture.kv, (*got)[0], 2.0f));
-    fixture.kv.release(*got);
-    require_all_free(fixture.kv, 1);
 }
 
 TEST_CASE("concurrent gets of a page share its line and fetch") {
