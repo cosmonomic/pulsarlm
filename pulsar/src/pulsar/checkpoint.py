@@ -21,6 +21,7 @@ class PulsarModelLoadingError(RuntimeError):
 
 @dataclass
 class PulsarModelConfig:
+    architecture: str
     vocab_size: int
     hidden_size: int
     intermediate_size: int
@@ -30,13 +31,14 @@ class PulsarModelConfig:
     head_dim: int
     rope_theta: float
     rms_norm_eps: float
-    eos_id: int
+    eos_ids: list[int]
     max_position_embeddings: int = 0
 
     @classmethod
     def from_dict(cls, raw: dict) -> Self:
         n_attention_heads = raw["num_attention_heads"]
         return cls(
+            architecture=raw["model_type"],
             vocab_size=raw["vocab_size"],
             hidden_size=raw["hidden_size"],
             intermediate_size=raw["intermediate_size"],
@@ -46,7 +48,9 @@ class PulsarModelConfig:
             head_dim=raw.get("head_dim") or raw["hidden_size"] // n_attention_heads,
             rope_theta=raw["rope_theta"],
             rms_norm_eps=raw["rms_norm_eps"],
-            eos_id=raw["eos_token_id"],
+            eos_ids=eos_ids
+            if isinstance(eos_ids := raw["eos_token_id"], list)
+            else [eos_ids],
             max_position_embeddings=raw.get("max_position_embeddings", 0),
         )
 

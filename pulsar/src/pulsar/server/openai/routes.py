@@ -1,45 +1,23 @@
-# TODO: refactor. the openai api endpoint should
-# map conversation history to a session_id,
-# see pulsar.conversation
-#
-# we naively don't fork / cache prefixes.
-# we keep a tree of history digests
-# where digest(message_t, message_{t-1}..message_0) = combine(message_t, digest(message_{t-2}..message_0))
-# for a history of messages t=0..N.
-# Note that history can have the same prefix messages.
-# We store a mapping digest to list[session_id].
-# For requests, we compute the digest of messages t-1 to 0
-# and check in the mapping if there is a session there;
-# if yes, continue the session.
-# if no, walk up the tree until we find a conversation, then fork it (and adding to the list of session_ids at that digest mapping entry)
-# Meaning that sessions are continued only if its incremented with a single turn,
-# otherwise it is forked and prefilled until up to date.
-#
-# This also means that user's agent might be using a session A for some turns,
-# and due to forking, ends up using session B at a later time. But this is fine,
-# since forking should make it so that A and B are indistinguishable.
-# Thus session is not shown to the user.
-# The native API users will get token that maps to the most recent digest of the conversation,
-# which is used to retrieve a session that can fulfill the user's request.
-import functools
-import sys
 import time
 import uuid
-from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
-from typing import Literal, Annotated
+import json
+import math
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import aclosing
+from dataclasses import dataclass
+from typing import Annotated, Literal
 
-from fastapi import HTTPException, Request, Depends
+from fastapi import Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRouter
+from tokenizers import Tokenizer
+from tokenizers.decoders import DecodeStream
 
-from pulsar.conversation import (
-    ChatMLConversation,
-    ConversationStore,
-    StoredConversation,
-    TruncatedError,
-)
-from pulsar.server.dependencies import Pulsar
+from pulsar.async_engine import AsyncEngine, EngineStopped
+from pulsar.chat import encode_prompt
+from pulsar.completion import CompletionError, complete
+from pulsar.core.engine import EvictionPolicy, RequestError, SamplingParams
+from pulsar.store import LocalStore
 from pulsar.server.openai.schema import (
     ChatCompletionChoice,
     ChatCompletionChunk,
@@ -53,27 +31,34 @@ from pulsar.server.openai.schema import (
     Usage,
 )
 
+type FinishReason = Literal["stop", "length"]
+
 
 @dataclass
 class ServerState:
-    pulsar: Pulsar
+    engine: AsyncEngine
+    store: LocalStore
+    tokenizer: Tokenizer
     model_id: str
-    max_sessions: int
-    conversations: ConversationStore = field(init=False)
+    page_size: int
+    stop_ids: list[int]
+    eviction: EvictionPolicy
 
-    def __post_init__(self) -> None:
-        self.conversations = ConversationStore(
-            self.model_id,
-            self.max_sessions,
-            functools.partial(
-                ChatMLConversation.from_new_session,
-                self.pulsar.tokenizer,
-                self.pulsar.create_session,
-            ),
+    def eviction_for(self, system_tokens: int) -> EvictionPolicy:
+        """The default policy, sinking the pages the system message touches."""
+        return EvictionPolicy(
+            n_sink=math.ceil(system_tokens / self.page_size),
+            n_working=self.eviction.n_working,
+            cycle_tokens=self.eviction.cycle_tokens,
+            max_pages=self.eviction.max_pages,
+            density_bar=self.eviction.density_bar,
+            attention_mass_decay=self.eviction.attention_mass_decay,
         )
+
 
 def get_server_state(request: Request) -> ServerState:
     return request.app.state.server_state
+
 
 type State = Annotated[ServerState, Depends(get_server_state)]
 
@@ -89,93 +74,107 @@ async def list_models(state: State) -> ModelList:
 @router.post("/chat/completions")
 async def create_chat_completion(body: ChatCompletionRequest, state: State):
     if body.model != state.model_id:
-        raise HTTPException(404, f"model {body.model!r} not found, only {state.model_id} is loaded")
+        raise HTTPException(
+            404, f"model {body.model!r} not found, only {state.model_id} is loaded"
+        )
     if not body.messages:
         raise HTTPException(422, "messages must be non-empty")
 
-    conversation, prompt_tokens = await _prefill(state, body.messages)
-    max_tokens = sys.maxsize if body.max_tokens is None else body.max_tokens
-
+    prompt, system_tokens = encode_prompt(
+        state.tokenizer, [(m.role, m.content) for m in body.messages]
+    )
+    tokens = complete(
+        state.engine,
+        state.store,
+        prompt,
+        sampling=SamplingParams(
+            temperature=body.temperature, top_p=body.top_p, seed=body.seed
+        ),
+        max_tokens=body.max_tokens,
+        eviction=state.eviction_for(system_tokens),
+    )
     if body.stream:
-        return await _stream_completion(body, conversation, max_tokens)
+        return _stream_completion(body, state, tokens)
+    return await _full_completion(body, state, tokens, len(prompt))
 
-    return await _full_completion(body, conversation, max_tokens, prompt_tokens)
+
+class _Reply:
+    """Decodes sampled tokens until a stop token."""
+
+    def __init__(self, state: ServerState, max_tokens: int | None) -> None:
+        self._tokenizer = state.tokenizer
+        self._stop_ids = state.stop_ids
+        self._max_tokens = max_tokens
+        self._decoder = DecodeStream(skip_special_tokens=False)
+        self.token_count = 0
+        self.finish_reason: FinishReason | None = None
+
+    def step(self, token: int) -> str:
+        self.token_count += 1
+        if token in self._stop_ids:
+            self.finish_reason = "stop"
+            return ""
+        if self.token_count == self._max_tokens:
+            self.finish_reason = "length"
+        return self._decoder.step(self._tokenizer, token) or ""
 
 
-async def _prefill(
-    state: ServerState, messages: list[ChatMessage]
-) -> tuple[StoredConversation, int]:
-    *prefix, last = messages
+async def _texts(reply: _Reply, tokens: AsyncGenerator[int]) -> AsyncIterator[str]:
+    async with aclosing(tokens):
+        async for token in tokens:
+            yield reply.step(token)
 
-    with state.conversations.claim_by_history(
-        (m.role, m.content) for m in prefix
-    ) as claimed:
-        if claimed is not None:
-            conversation = claimed
-            prompt_tokens = 0
-            rest = [last]
-            for m in rest:
-                prompt_tokens += await conversation.send(m.role, m.content)
-            return conversation, prompt_tokens
-        else:
-            first, *rest = messages
-            if first.role == "system":
-                system_prompt = first.content
-            else:
-                system_prompt = ""
-                rest = messages
-            async with state.conversations.create(system_prompt) as (
-                prompt_tokens,
-                conversation,
-            ):
-                for m in rest:
-                    prompt_tokens += await conversation.send(m.role, m.content)
-                return conversation, prompt_tokens
+
+def _http_error(error: EngineStopped | CompletionError) -> HTTPException:
+    if isinstance(error, EngineStopped):
+        return HTTPException(503, f"engine stopped: {error}")
+    if isinstance(error, CompletionError) and error.error == RequestError.OOM:
+        return HTTPException(503, "the request does not fit in the KV cache")
+    return HTTPException(500, f"request failed: {error}")
 
 
 async def _full_completion(
     body: ChatCompletionRequest,
-    conversation: StoredConversation,
-    max_tokens: int,
+    state: ServerState,
+    tokens: AsyncGenerator[int],
     prompt_tokens: int,
 ) -> ChatCompletionResponse:
-    parts: list[str] = []
-    finish_reason: Literal["stop", "length"] = "stop"
+    reply = _Reply(state, body.max_tokens)
     try:
-        async for text in conversation.recv(max_tokens):
-            parts.append(text)
-    except TruncatedError:
-        finish_reason = "length"
-
-    completion_tokens = len(parts)
-    reply = ChatMessage(role="assistant", content="".join(parts))
+        content = "".join([text async for text in _texts(reply, tokens)])
+    except (EngineStopped, CompletionError) as error:
+        raise _http_error(error) from error
 
     return ChatCompletionResponse(
         id=f"chatcmpl-{uuid.uuid4().hex}",
         created=int(time.time()),
         model=body.model,
         choices=[
-            ChatCompletionChoice(index=0, message=reply, finish_reason=finish_reason)
+            ChatCompletionChoice(
+                index=0,
+                message=ChatMessage(role="assistant", content=content),
+                finish_reason=reply.finish_reason or "stop",
+            )
         ],
         usage=Usage(
             prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
+            completion_tokens=reply.token_count,
+            total_tokens=prompt_tokens + reply.token_count,
         ),
     )
 
 
-async def _stream_completion(
+def _stream_completion(
     body: ChatCompletionRequest,
-    conversation: StoredConversation,
-    max_tokens: int,
+    state: ServerState,
+    tokens: AsyncGenerator[int],
 ) -> StreamingResponse:
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
+    reply = _Reply(state, body.max_tokens)
 
     def chunk(
-        delta: ChatCompletionChunkDelta,
-        finish_reason: Literal["stop", "length"] | None = None,
+        delta: ChatCompletionChunkDelta, finish_reason: FinishReason | None = None
     ) -> str:
         payload = ChatCompletionChunk(
             id=completion_id,
@@ -189,16 +188,15 @@ async def _stream_completion(
 
     async def events() -> AsyncIterator[str]:
         yield chunk(ChatCompletionChunkDelta(role="assistant"))
-
-        finish_reason: Literal["stop", "length"] = "stop"
         try:
-            async for text in conversation.recv(max_tokens):
+            async for text in _texts(reply, tokens):
                 if text:
                     yield chunk(ChatCompletionChunkDelta(content=text))
-        except TruncatedError:
-            finish_reason = "length"
-
-        yield chunk(ChatCompletionChunkDelta(), finish_reason)
+        except (EngineStopped, CompletionError) as error:
+            failure = _http_error(error)
+            yield f"data: {json.dumps({'error': {'message': failure.detail, 'code': failure.status_code}})}\n\n"
+        else:
+            yield chunk(ChatCompletionChunkDelta(), reply.finish_reason or "stop")
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(events(), media_type="text/event-stream")

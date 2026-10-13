@@ -1,3 +1,3 @@
-from pulsar.server.app import app
+from pulsar.server.app import app, create_app
 
-__all__ = ["app", "build_app", "create_app"]
+__all__ = ["app", "create_app"]

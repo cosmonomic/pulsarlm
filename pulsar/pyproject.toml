@@ -10,6 +10,7 @@ dependencies = [
     "safetensors>=0.8.0",
     "tokenizers>=0.23.1",
     "torch==2.14.0",
+    "uvicorn>=0.54.0",
     "xdg-base-dirs>=6.0.2",
 ]
 
