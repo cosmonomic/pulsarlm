@@ -2,6 +2,7 @@
 name = "pulsarlm"
 version = "0.0.0"
 description = "LLM inference engine with unbounded context."
+license = "Apache-2.0"
 # Pinned to 3.13: PyTorch has no CUDA wheels for Python 3.14 yet.
 requires-python = ">=3.13,<3.14"
 dependencies = [
