@@ -1,11 +1,11 @@
 [tool.uv.workspace]
-members = ["pulsar"]
+members = ["pulsarlm"]
 
 [dependency-groups]
-dev = ["pulsar", "pytest", "ruff", "ty"]
+dev = ["pulsarlm", "pytest", "ruff", "ty"]
 
 [tool.uv.sources]
-pulsar = { workspace = true }
+pulsarlm = { workspace = true }
 
 [tool.pytest.ini_options]
-testpaths = ["pulsar/tests"]
+testpaths = ["pulsarlm/tests"]

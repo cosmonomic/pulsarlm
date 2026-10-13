@@ -4,12 +4,12 @@ requires-python = "==3.13.*"
 
 [manifest]
 members = [
-    "pulsar",
+    "pulsarlm",
 ]
 
 [manifest.dependency-groups]
 dev = [
-    { name = "pulsar", editable = "pulsar" },
+    { name = "pulsarlm", editable = "pulsarlm" },
     { name = "pytest" },
     { name = "ruff" },
     { name = "ty" },
@@ -565,9 +565,9 @@ wheels = [
 ]
 
 [[package]]
-name = "pulsar"
+name = "pulsarlm"
 version = "0.0.0"
-source = { editable = "pulsar" }
+source = { editable = "pulsarlm" }
 dependencies = [
     { name = "fastapi" },
     { name = "huggingface-hub" },

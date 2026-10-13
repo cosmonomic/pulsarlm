@@ -1,4 +1,4 @@
-# Cosmonomic / Pulsar
+# Cosmonomic / PulsarLM
 
 An unbounded LLM inference engine.
 

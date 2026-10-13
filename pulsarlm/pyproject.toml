@@ -1,0 +1,59 @@
+[project]
+name = "pulsarlm"
+version = "0.0.0"
+description = "LLM inference engine with unbounded context."
+# Pinned to 3.13: PyTorch has no CUDA wheels for Python 3.14 yet.
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "fastapi>=0.115",
+    "huggingface-hub>=1.24.0",
+    "numpy>=2.5.1",
+    "safetensors>=0.8.0",
+    "tokenizers>=0.23.1",
+    "torch==2.14.0",
+    "typer>=0.27.3",
+    "uvicorn>=0.54.0",
+    "xdg-base-dirs>=6.0.2",
+]
+
+[project.scripts]
+pulsarlm = "pulsarlm.cli:app"
+
+[dependency-groups]
+dev = [
+    "hatchling",
+]
+
+[build-system]
+requires = ["hatchling", "editables", "torch==2.14.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pulsarlm"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+
+[tool.hatch.build.targets.sdist.force-include]
+"../pulsarlm-core/xmake.lua" = "pulsarlm-core/xmake.lua"
+"../pulsarlm-core/inc" = "pulsarlm-core/inc"
+"../pulsarlm-core/src" = "pulsarlm-core/src"
+"../pulsarlm-core/tests" = "pulsarlm-core/tests"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu132" }
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
+
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "hatch_build.py" },
+    { file = "xmake.lua" },
+    { file = "ext/**" },
+    { file = "../pulsarlm-core/xmake.lua" },
+    { file = "../pulsarlm-core/inc/**" },
+    { file = "../pulsarlm-core/src/**" },
+]

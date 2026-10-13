@@ -1,3 +1,3 @@
-set_project("pulsar")
+set_project("pulsarlm")
 
-includes("pulsar-core", "pulsar")
+includes("pulsarlm-core", "pulsarlm")

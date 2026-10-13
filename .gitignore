@@ -5,8 +5,8 @@
 /scratch/
 /tmp/
 
-/pulsar/build/
-/pulsar-core/build/
+/pulsarlm/build/
+/pulsarlm-core/build/
 
 /.pytest_cache/
 /.ruff_cache/
