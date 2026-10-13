@@ -6,13 +6,18 @@ description = "LLM inference engine with unbounded context."
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "fastapi>=0.115",
+    "huggingface-hub>=1.24.0",
     "numpy>=2.5.1",
     "safetensors>=0.8.0",
     "tokenizers>=0.23.1",
     "torch==2.14.0",
+    "typer>=0.27.3",
     "uvicorn>=0.54.0",
     "xdg-base-dirs>=6.0.2",
 ]
+
+[project.scripts]
+pulsar = "pulsar.cli:app"
 
 [dependency-groups]
 dev = [

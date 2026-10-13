@@ -61,7 +61,10 @@ class PulsarModel(NamedTuple):
     tokenizer: Tokenizer
 
 
-def iter_data_paths() -> Generator[Path]:
+def iter_data_paths(data_dir: Path | None = None) -> Generator[Path]:
+    if data_dir is not None:
+        yield data_dir.expanduser()
+
     if path := os.environ.get("PULSAR_DATA_DIR"):
         yield Path(path).expanduser()
 
@@ -71,17 +74,17 @@ def iter_data_paths() -> Generator[Path]:
         yield path / "pulsar"
 
 
-def model_path(model: str) -> Path:
+def model_path(model: str, data_dir: Path | None = None) -> Path:
     filename = f"{model}.pulsar"
-    for data_path in iter_data_paths():
+    for data_path in iter_data_paths(data_dir):
         if (path := (data_path / filename)).exists():
             return path
 
     raise PulsarModelLoadingError(f"model {model} not found")
 
 
-def new_model_path(model: str) -> Path:
-    return next(iter_data_paths()) / f"{model}.pulsar"
+def new_model_path(model: str, data_dir: Path | None = None) -> Path:
+    return next(iter_data_paths(data_dir)) / f"{model}.pulsar"
 
 
 def load_config(path: zipfile.Path) -> PulsarModelConfig:

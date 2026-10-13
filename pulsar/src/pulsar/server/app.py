@@ -1,7 +1,7 @@
-import os
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 from fastapi import FastAPI
@@ -14,48 +14,22 @@ from pulsar.server.openai import ServerState
 from pulsar.server.openai import router as openai_router
 from pulsar.store import LocalStore
 
-_DTYPES = {
-    "float32": torch.float32,
-    "float16": torch.float16,
-    "bfloat16": torch.bfloat16,
-}
 _PAGE_SIZE = 16  # the tensor-core paged attention kernel requires 16 or 32
 
 
 @dataclass
 class Settings:
     model: str
-    device: str = "cuda"
-    dtype: torch.dtype = torch.bfloat16
-    kv_cache_gib: float = 8.0
-    prefill_tokens_per_step: int = 256
-    stored_states: int = 4096
-    cycle_tokens: int = 512
-    n_working: int = 4
-    evict_tau: float = 0.3
-    max_pages: int | None = None
-
-    @classmethod
-    def from_env(cls, model: str) -> "Settings":
-        max_pages = os.environ.get("PULSAR_MAX_PAGES")
-        return cls(
-            model=model,
-            device=os.environ.get("PULSAR_DEVICE", cls.device),
-            dtype=_DTYPES[os.environ.get("PULSAR_DTYPE", "bfloat16")],
-            kv_cache_gib=float(os.environ.get("PULSAR_KV_CACHE_GIB", cls.kv_cache_gib)),
-            prefill_tokens_per_step=int(
-                os.environ.get(
-                    "PULSAR_PREFILL_TOKENS_PER_STEP", cls.prefill_tokens_per_step
-                )
-            ),
-            stored_states=int(
-                os.environ.get("PULSAR_STORED_STATES", cls.stored_states)
-            ),
-            cycle_tokens=int(os.environ.get("PULSAR_CYCLE_TOKENS", cls.cycle_tokens)),
-            n_working=int(os.environ.get("PULSAR_N_WORKING", cls.n_working)),
-            evict_tau=float(os.environ.get("PULSAR_EVICT_TAU", cls.evict_tau)),
-            max_pages=int(max_pages) if max_pages else None,
-        )
+    model_path: Path
+    device: str
+    dtype: torch.dtype
+    kv_cache_gib: float
+    prefill_tokens_per_step: int
+    stored_states: int
+    cycle_tokens: int
+    n_working: int
+    evict_tau: float
+    max_pages: int | None
 
 
 def trained_view_pages(max_positions: int, cycle_tokens: int) -> int | None:
@@ -74,7 +48,7 @@ def relevance_layers(n_layers: int) -> list[int]:
 
 def load_server_state(settings: Settings) -> ServerState:
     model = checkpoint.load(
-        checkpoint.model_path(settings.model),
+        settings.model_path,
         device=torch.device(settings.device),
         dtype=settings.dtype,
     )
