@@ -1,8 +1,11 @@
 #pragma once
 
 #include "pulsarlm/kernels/attn_params.cuh"
+#include "pulsarlm/rope.hpp"
 
 #include <ATen/core/Tensor.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
 #include <c10/util/Exception.h>
 
 #include <cuda_runtime.h>
@@ -29,6 +32,7 @@ struct PagedAttnBatch {
     at::Tensor seqlens_k;
     at::Tensor rope_layout;
     at::Tensor rope_turns;
+    at::Tensor k_norm_weight;
     at::Tensor mass;
     at::Tensor cu_view_pages;
     at::Tensor mass_decay;
@@ -36,6 +40,7 @@ struct PagedAttnBatch {
     at::Tensor lse;
     double mass_length_gain;
     double scale;
+    int64_t sliding_window;
     int64_t num_seqs;
     int64_t total_q;
     int64_t n_q_heads;
@@ -55,6 +60,7 @@ struct PagedAttnBatch {
             static_cast<const int32_t*>(data(this->seqlens_k)),
             static_cast<const int32_t*>(data(this->rope_layout)),
             static_cast<const uint64_t*>(data(this->rope_turns)),
+            static_cast<const float*>(data(this->k_norm_weight)),
             static_cast<float*>(data(this->mass)),
             static_cast<const int32_t*>(data(this->cu_view_pages)),
             static_cast<const float*>(data(this->mass_decay)),
@@ -68,11 +74,13 @@ struct PagedAttnBatch {
             static_cast<int>(this->max_pages),
             static_cast<int>(this->n_q_heads / this->n_kv_heads),
             this->mass.defined() ? static_cast<int>(this->mass.size(0)) : 0,
+            static_cast<int>(this->sliding_window),
             static_cast<float>(this->scale),
         };
     }
 
-    // fp16/bf16 with a (page_size, head_dim) the tensor-core kernels are compiled for.
+    // fp16/bf16 with a (page_size, head_dim) the tensor-core kernels are compiled for. A kernel also needs its shared
+    // memory to fit, see fits_shared_memory.
     bool tensor_core_eligible() const;
 };
 
@@ -87,8 +95,10 @@ PagedAttnBatch paged_attn_batch(
     const std::optional<at::Tensor>& cu_seqlens_q,
     const at::Tensor& seqlens_k,
     const at::Tensor& rope_layout,
-    double rope_theta,
+    const rope_parameters& rope,
     double scale,
+    std::optional<int64_t> sliding_window,
+    const std::optional<at::Tensor>& k_norm_weight,
     const std::optional<at::Tensor>& mass,
     const std::optional<at::Tensor>& cu_view_pages,
     const std::optional<at::Tensor>& attention_mass_decay,
@@ -102,7 +112,22 @@ void launch_attn_scalar(const PagedAttnBatch& batch, cudaStream_t stream);
 
 // Upper bound on head_dim; sizes the scalar kernels' per-thread output
 // accumulator, which lives in local memory.
-constexpr int kMaxHeadDim = 256;
+constexpr int kMaxHeadDim = 512;
+
+// Whether a CTA of the current device can opt in to bytes of dynamic shared memory.
+inline bool fits_shared_memory(size_t bytes) {
+    return bytes <= at::cuda::getCurrentDeviceProperties()->sharedMemPerBlockOptin;
+}
+
+// Lets kernel launch with bytes of dynamic shared memory on the current device. bytes must fit, see
+// fits_shared_memory.
+template <typename Kernel> void allow_shared_memory(Kernel kernel, size_t bytes) {
+    if (bytes > kDefaultSharedMemory) {
+        C10_CUDA_CHECK(
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes))
+        );
+    }
+}
 
 // CTA width of the scalar kernels. Power of two: block_reduce_* requires it.
 constexpr int kThreads = 128;
@@ -168,8 +193,18 @@ template <typename Fn> void dispatch_page_head(const char* op, int64_t page_size
             fn(page_tag, std::integral_constant<int, 64>{});
         } else if (head_dim == 128) {
             fn(page_tag, std::integral_constant<int, 128>{});
+        } else if (head_dim == 256) {
+            fn(page_tag, std::integral_constant<int, 256>{});
+        } else if (head_dim == 512) {
+            fn(page_tag, std::integral_constant<int, 512>{});
         } else {
-            TORCH_CHECK(false, op, ": unsupported head_dim ", head_dim, " (tensor-core path compiled for 64 and 128)");
+            TORCH_CHECK(
+                false,
+                op,
+                ": unsupported head_dim ",
+                head_dim,
+                " (tensor-core path compiled for 64, 128, 256 and 512)"
+            );
         }
     });
 }

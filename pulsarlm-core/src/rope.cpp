@@ -25,16 +25,25 @@ int64_t fixed_point_turns_per_position(long double frequency) {
     return std::bit_cast<int64_t>(static_cast<uint64_t>(fixed_point));
 }
 
-// Device table of head_dim/2 entries, entry j = per_frequency(theta^(-2j/head_dim)),
-// built once per (theta, head_dim, device) and never freed; the reference stays valid
-// for the process.
+long double rope_frequency(const rope_parameters& rope, int64_t head_dim, int64_t pair) {
+    const auto rotated_pairs = static_cast<int64_t>(std::floor(rope.partial_rotary_factor * head_dim / 2));
+    if (pair >= rotated_pairs) {
+        return 0.0L;
+    }
+    const long double exponent = -2.0L * static_cast<long double>(pair) / static_cast<long double>(head_dim);
+    return std::pow(static_cast<long double>(rope.theta), exponent);
+}
+
+// Device table of head_dim/2 entries, entry j = per_frequency(rope_frequency(rope, head_dim, j)), built once per
+// (rope, head_dim, device) and never freed; the reference stays valid for the process.
 template <typename Element, Element (*per_frequency)(long double)>
-const at::Tensor& rope_frequency_table(double theta, int64_t head_dim, at::Device device, at::ScalarType dtype) {
-    using Key = std::tuple<double, int64_t, int8_t>;
+const at::Tensor&
+rope_frequency_table(const rope_parameters& rope, int64_t head_dim, at::Device device, at::ScalarType dtype) {
+    using Key = std::tuple<double, double, int64_t, int8_t>;
     static std::mutex guard;
     static auto* cache = new std::map<Key, at::Tensor>();
 
-    const Key key{theta, head_dim, device.index()};
+    const Key key{rope.theta, rope.partial_rotary_factor, head_dim, device.index()};
     const std::lock_guard<std::mutex> lock(guard);
     if (const auto found = cache->find(key); found != cache->end()) {
         return found->second;
@@ -43,8 +52,7 @@ const at::Tensor& rope_frequency_table(double theta, int64_t head_dim, at::Devic
     const int64_t pairs = head_dim / 2;
     std::vector<Element> entries(pairs);
     for (int64_t j = 0; j < pairs; ++j) {
-        const long double exponent = -2.0L * static_cast<long double>(j) / static_cast<long double>(head_dim);
-        entries[j] = per_frequency(std::pow(static_cast<long double>(theta), exponent));
+        entries[j] = per_frequency(rope_frequency(rope, head_dim, j));
     }
     auto tensor = at::tensor(entries, at::dtype(dtype)).to(device);
     return cache->emplace(key, std::move(tensor)).first->second;
@@ -52,19 +60,19 @@ const at::Tensor& rope_frequency_table(double theta, int64_t head_dim, at::Devic
 
 }  // namespace
 
-const at::Tensor& rope_quadrants_per_position(double theta, int64_t head_dim, at::Device device) {
-    return rope_frequency_table<double, quadrants_per_position>(theta, head_dim, device, at::kDouble);
+const at::Tensor& rope_quadrants_per_position(const rope_parameters& rope, int64_t head_dim, at::Device device) {
+    return rope_frequency_table<double, quadrants_per_position>(rope, head_dim, device, at::kDouble);
 }
 
-const at::Tensor& rope_turns_per_position(double theta, int64_t head_dim, at::Device device) {
-    return rope_frequency_table<int64_t, fixed_point_turns_per_position>(theta, head_dim, device, at::kLong);
+const at::Tensor& rope_turns_per_position(const rope_parameters& rope, int64_t head_dim, at::Device device) {
+    return rope_frequency_table<int64_t, fixed_point_turns_per_position>(rope, head_dim, device, at::kLong);
 }
 
-at::Tensor rope_rotate(const at::Tensor& x, const at::Tensor& position, double theta) {
+at::Tensor rope_rotate(const at::Tensor& x, const at::Tensor& position, const rope_parameters& rope) {
     constexpr double quadrant_radians = 1.57079632679489661923;
     const int64_t head_dim = x.size(-1), half = head_dim / 2;
     at::Tensor angle = position.to(at::kDouble).unsqueeze(-1) *
-        rope_quadrants_per_position(theta, head_dim, x.device()) * quadrant_radians;
+        rope_quadrants_per_position(rope, head_dim, x.device()) * quadrant_radians;
     at::Tensor cs = at::cos(angle).to(at::kFloat);
     at::Tensor sn = at::sin(angle).to(at::kFloat);
     at::Tensor first = x.slice(-1, 0, half), second = x.slice(-1, half, head_dim);

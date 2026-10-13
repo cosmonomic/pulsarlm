@@ -9,11 +9,11 @@
 
 // Rotary position embedding (RoPE), HF/Qwen2 "rotate_half" convention.
 //
-// For head_dim = 2h and inv_freq[j] = theta^(-2j/head_dim), each row s at
-// pos p = pos[s] is rotated by angle a = p * inv_freq[j]:
+// For head_dim = 2h and inv_freq[j] the frequencies rope_parameters states, each row
+// s at pos p = pos[s] is rotated by angle a = p * inv_freq[j]:
 //   out[j]   = x[j]   * cos(a) - x[j+h] * sin(a)
 //   out[j+h] = x[j+h] * cos(a) + x[j]   * sin(a)
-// The full head_dim is rotated (no partial-rotary fraction). The angle is formed
+// A pair of frequency 0 comes out unchanged: cos 0 and sin 0 are exact. The angle is formed
 // in fp64 (see rope_sincos), the rotation runs in fp32, and the result is cast
 // back to x's dtype on store.
 //
@@ -85,7 +85,7 @@ __global__ void rope_kernel(
 
 }  // namespace
 
-at::Tensor rope_cuda(const at::Tensor& x, const at::Tensor& pos, double theta) {
+at::Tensor rope_cuda(const at::Tensor& x, const at::Tensor& pos, const rope_parameters& rope) {
     TORCH_CHECK(x.is_cuda() && pos.is_cuda(), "rope: inputs must be CUDA tensors");
     TORCH_CHECK(x.dim() == 3, "rope: x must be 3-D [n_heads, seq, head_dim]");
     TORCH_CHECK(pos.dim() == 1, "rope: pos must be 1-D [seq]");
@@ -101,7 +101,7 @@ at::Tensor rope_cuda(const at::Tensor& x, const at::Tensor& pos, double theta) {
     auto xc = x.contiguous();
     auto pc = pos.contiguous();
     auto out = at::empty_like(xc);
-    const auto& quadrants_per_position = rope_quadrants_per_position(theta, head_dim, xc.device());
+    const auto& quadrants_per_position = rope_quadrants_per_position(rope, head_dim, xc.device());
 
     const int64_t blocks = n_heads * seq;
     const int threads = static_cast<int>(std::min<int64_t>(256, head_dim / 2));

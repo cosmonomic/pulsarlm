@@ -97,7 +97,7 @@ at::Tensor Qwen3Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, c
         (g.is_prefill() ? this->cap_prefill : this->cap_decode)[layer] = q_pre;
     }
 
-    q = rope_q(q, g.pos, this->n_heads, this->head_dim, this->rope_theta);
+    q = rope_q(q, g.pos, this->n_heads, this->head_dim, {.theta = this->rope_theta});
     v = v.view({ntok, this->n_kv_heads, this->head_dim}).contiguous();
     // Capture the softmax denominator on the same layers as Q: the recall score needs
     // the denominator the attention actually used, not one rebuilt over a subset.
@@ -106,7 +106,16 @@ at::Tensor Qwen3Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, c
         lse = at::empty({ntok, this->n_heads}, at::device(x.device()).dtype(at::kFloat));
     }
     auto o = paged_attention(
-        q, k, v, kv, layer, g, this->relevance_layers.contains(layer), this->scale, this->rope_theta, lse
+        q,
+        k,
+        v,
+        kv,
+        layer,
+        g,
+        this->relevance_layers.contains(layer),
+        this->scale,
+        {.theta = this->rope_theta},
+        lse
     );
     if (lse.defined()) {
         (g.is_prefill() ? this->lse_prefill : this->lse_decode)[layer] = lse;

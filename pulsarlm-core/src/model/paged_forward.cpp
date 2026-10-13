@@ -6,11 +6,17 @@
 
 namespace pulsarlm {
 
-at::Tensor rope_q(const at::Tensor& q_in, const at::Tensor& pos, int64_t n_q_heads, int64_t head_dim, double theta) {
+at::Tensor rope_q(
+    const at::Tensor& q_in,
+    const at::Tensor& pos,
+    int64_t n_q_heads,
+    int64_t head_dim,
+    const rope_parameters& rope
+) {
     const int64_t ntok = q_in.size(0);
     // rope_cuda requires [heads, seq, head_dim].
     auto q = q_in.view({ntok, n_q_heads, head_dim}).transpose(0, 1).contiguous();
-    q = rope_cuda(q, pos, theta);
+    q = rope_cuda(q, pos, rope);
     return q.transpose(0, 1).contiguous();  // transpose to paged layout [ntok, n_q_heads, head_dim]
 }
 
@@ -31,7 +37,7 @@ at::Tensor paged_attention(
     const GroupBatch& g,
     bool relevance_layer,
     double scale,
-    double rope_theta,
+    const rope_parameters& rope,
     const at::Tensor& lse_capture
 ) {
     auto k_pool = kv.k.select(0, layer);
@@ -52,8 +58,10 @@ at::Tensor paged_attention(
                                         g.cu_seqlens_q,
                                         g.seqlens_k,
                                         g.rope_layout,
-                                        rope_theta,
+                                        rope,
                                         scale,
+                                        std::nullopt,
+                                        std::nullopt,
                                         mass,
                                         cu_view_pages,
                                         mass_decay,
@@ -67,8 +75,10 @@ at::Tensor paged_attention(
                                         g.page_tables,
                                         g.context_lens,
                                         g.rope_layout,
-                                        rope_theta,
+                                        rope,
                                         scale,
+                                        std::nullopt,
+                                        std::nullopt,
                                         mass,
                                         cu_view_pages,
                                         mass_decay,

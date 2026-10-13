@@ -103,8 +103,10 @@ at::Tensor prefill(
         cu_seqlens_q,
         seqlens_k,
         identity_layout(seqlens_k.size(0)),
-        kTheta,
+        pulsarlm::rope_parameters{.theta = kTheta},
         kScale,
+        std::nullopt,
+        std::nullopt,
         mass,
         row_view_pages(page_tables),
         decay,
@@ -132,8 +134,10 @@ at::Tensor decode(
         page_tables,
         context_lens,
         identity_layout(context_lens.size(0)),
-        kTheta,
+        pulsarlm::rope_parameters{.theta = kTheta},
         kScale,
+        std::nullopt,
+        std::nullopt,
         mass,
         row_view_pages(page_tables),
         decay,
@@ -269,8 +273,10 @@ TEST_CASE("prefill mass takes the caller's length gain", "[ops][cuda]") {
             cu_seqlens_q,
             seqlens_k,
             identity_layout(1),
-            kTheta,
+            pulsarlm::rope_parameters{.theta = kTheta},
             kScale,
+            std::nullopt,
+            std::nullopt,
             implied,
             row_view_pages(page_tables),
             alpha
@@ -348,8 +354,10 @@ TEST_CASE("decode mass takes the caller's length gain", "[ops][cuda]") {
             page_tables,
             context_lens,
             identity_layout(2),
-            kTheta,
+            pulsarlm::rope_parameters{.theta = kTheta},
             kScale,
+            std::nullopt,
+            std::nullopt,
             implied,
             row_view_pages(page_tables),
             alpha
@@ -566,7 +574,7 @@ void reference_view(
         positions[j] = view.position(j);
     }
     auto pos = at::tensor(positions, at::dtype(at::kLong)).to(at::kCUDA).view({-1, 1});
-    k = pulsarlm::rope_rotate(k, pos, kTheta).to(k_pool.scalar_type()).to(at::kFloat);
+    k = pulsarlm::rope_rotate(k, pos, {.theta = kTheta}).to(k_pool.scalar_type()).to(at::kFloat);
 
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t p = view.ctx - rows + r;
@@ -650,8 +658,10 @@ TEST_CASE("views sharing a line rotate and accumulate apart", "[ops][cuda]") {
             cu_seqlens_q,
             seqlens_k,
             rope_layout,
-            kTheta,
+            pulsarlm::rope_parameters{.theta = kTheta},
             kScale,
+            std::nullopt,
+            std::nullopt,
             mass,
             cu_view_pages,
             decay
@@ -668,8 +678,10 @@ TEST_CASE("views sharing a line rotate and accumulate apart", "[ops][cuda]") {
                 page_tables,
                 seqlens_k,
                 rope_layout,
-                kTheta,
+                pulsarlm::rope_parameters{.theta = kTheta},
                 kScale,
+                std::nullopt,
+                std::nullopt,
                 dec_mass,
                 cu_view_pages,
                 decay,
@@ -709,7 +721,12 @@ TEST_CASE("ATen rope_rotate matches the rope kernel", "[ops][cuda]") {
     const double tol = 1e-5;
     auto worst = [](const at::Tensor& a, const at::Tensor& b) { return (a - b).abs().max().item<double>(); };
 
-    CHECK(worst(pulsarlm::rope_rotate(x, pos.view({1, -1}), theta), pulsarlm::rope_cuda(x, pos, theta)) < tol);
+    CHECK(
+        worst(
+            pulsarlm::rope_rotate(x, pos.view({1, -1}), {.theta = theta}),
+            pulsarlm::rope_cuda(x, pos, {.theta = theta})
+        ) < tol
+    );
 
     // The scorer's second rotation is a DELTA over already-roped keys, one scalar angle
     // for the whole tensor. Rotations compose, so stored + delta must land on scored.
@@ -718,8 +735,263 @@ TEST_CASE("ATen rope_rotate matches the rope kernel", "[ops][cuda]") {
     auto delta = at::scalar_tensor(static_cast<double>(scored - stored), at::device(at::kCUDA).dtype(at::kDouble));
     CHECK(
         worst(
-            pulsarlm::rope_rotate(pulsarlm::rope_cuda(x, stored_pos, theta), delta, theta),
-            pulsarlm::rope_cuda(x, at::full_like(stored_pos, scored), theta)
+            pulsarlm::rope_rotate(pulsarlm::rope_cuda(x, stored_pos, {.theta = theta}), delta, {.theta = theta}),
+            pulsarlm::rope_cuda(x, at::full_like(stored_pos, scored), {.theta = theta})
         ) < tol
     );
+}
+
+namespace {
+
+// One sequence of the reference sweep: view index j lives at lines[j / page_size], and the last seq_q view indices are
+// prefill queries.
+struct WindowedView {
+    std::vector<int32_t> lines;
+    int64_t ctx;
+    int64_t seq_q;
+};
+
+int64_t first_attended(int64_t query, std::optional<int64_t> window) {
+    return window ? std::max<int64_t>(0, query - *window + 1) : 0;
+}
+
+// The view's keys as the kernels stage them: scaled by k_norm_weight in fp32, rotated to their view index, rounded to
+// the pool dtype.
+at::Tensor reference_keys(
+    const WindowedView& view,
+    const at::Tensor& k_pool,
+    const pulsarlm::rope_parameters& rope,
+    const std::optional<at::Tensor>& k_norm_weight
+) {
+    const int64_t n_kv = k_pool.size(2), head_dim = k_pool.size(3);
+    std::vector<int32_t> readable(view.lines);
+    for (auto& line : readable) {
+        line = std::max<int32_t>(line, 0) % static_cast<int32_t>(k_pool.size(0));
+    }
+    auto lines = at::tensor(readable, at::dtype(at::kLong)).to(at::kCUDA);
+    auto k = k_pool.index_select(0, lines).view({-1, n_kv, head_dim}).slice(0, 0, view.ctx).to(at::kFloat);
+    if (k_norm_weight) {
+        k = k * k_norm_weight->to(at::kFloat);
+    }
+    auto pos = at::arange(view.ctx, at::device(at::kCUDA).dtype(at::kLong)).view({-1, 1});
+    return pulsarlm::rope_rotate(k, pos, rope).to(k_pool.scalar_type()).to(at::kFloat);
+}
+
+// Attention of the query rows at view indices [ctx - rows, ctx) over their windows, with alpha-graded, length-gained
+// mass added into the view's own rows.
+void reference_windowed(
+    const WindowedView& view,
+    const at::Tensor& keys,
+    const at::Tensor& v_pool,
+    const at::Tensor& q,
+    int64_t rows,
+    int64_t q_offset,
+    std::optional<int64_t> window,
+    double scale,
+    double alpha,
+    at::Tensor& o,
+    at::Tensor& mass_rows
+) {
+    const int64_t n_kv = v_pool.size(2), head_dim = v_pool.size(3);
+    const int64_t group = q.size(1) / n_kv;
+    std::vector<int32_t> readable(view.lines);
+    for (auto& line : readable) {
+        line = std::max<int32_t>(line, 0) % static_cast<int32_t>(v_pool.size(0));
+    }
+    auto lines = at::tensor(readable, at::dtype(at::kLong)).to(at::kCUDA);
+    auto v = v_pool.index_select(0, lines).view({-1, n_kv, head_dim}).slice(0, 0, view.ctx).to(at::kFloat);
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t p = view.ctx - rows + r;
+        const int64_t first = first_attended(p, window);
+        const double graded = alpha * std::pow(1.0 - alpha, static_cast<double>(rows - 1 - r)) * (p + 1 - first);
+        for (int64_t h = 0; h < q.size(1); ++h) {
+            const int64_t g = h / group;
+            auto k = keys.slice(0, first, p + 1).select(1, g);
+            auto values = v.slice(0, first, p + 1).select(1, g);
+            auto w = at::softmax(at::mv(k, q[q_offset + r][h].to(at::kFloat)) * scale, 0);
+            o[q_offset + r][h] = at::mv(values.t(), w);
+            mass_rows.slice(0, first, p + 1).select(1, h).add_(w * graded);
+        }
+    }
+}
+
+}  // namespace
+
+// Every head dim and page size the tensor-core kernels are compiled for, with and without a sliding window, partial
+// RoPE and K scaled on read, against the dense reference. Page table entries before the first query's window hold
+// lines past the pool, so a kernel reading one faults.
+TEST_CASE(
+    "attention matches the dense reference across head dims, windows, partial RoPE and scaled keys",
+    "[ops][cuda]"
+) {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const int64_t n_q = 4, n_kv = 2;
+    const double alpha = 0.25;
+    const int32_t unreadable = 1 << 20;
+
+    for (int64_t head_dim : {64, 128, 256, 512}) {
+        for (int64_t page_size : {16, 32}) {
+            for (std::optional<int64_t> window : {std::optional<int64_t>{}, std::optional<int64_t>{21}}) {
+                for (double factor : {1.0, 0.25}) {
+                    for (bool scaled_keys : {false, true}) {
+                        const pulsarlm::rope_parameters rope{.theta = 1e4, .partial_rotary_factor = factor};
+                        const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
+                        const int64_t num_lines = 6, max_pages = 4;
+                        std::vector<WindowedView> views = {
+                            WindowedView{{0, 3, 5, 1}, 3 * page_size + 5, 24},
+                            WindowedView{{2, 4}, page_size + 3, 4},
+                        };
+                        std::vector<int32_t> tables(views.size() * max_pages, 0), seqlens, cu_q{0}, cu_view;
+                        for (size_t s = 0; s < views.size(); ++s) {
+                            const int64_t first_page = first_attended(views[s].ctx - views[s].seq_q, window) /
+                                page_size;
+                            for (int64_t b = 0; b < first_page; ++b) {
+                                views[s].lines[b] = unreadable;
+                            }
+                            std::copy(views[s].lines.begin(), views[s].lines.end(), tables.begin() + s * max_pages);
+                            seqlens.push_back(static_cast<int32_t>(views[s].ctx));
+                            cu_q.push_back(cu_q.back() + static_cast<int32_t>(views[s].seq_q));
+                            cu_view.push_back(static_cast<int32_t>(s * max_pages));
+                        }
+                        cu_view.push_back(static_cast<int32_t>(views.size() * max_pages));
+                        auto page_tables = int32_cuda(tables).view({static_cast<int64_t>(views.size()), max_pages});
+                        auto rope_layout = identity_layout(static_cast<int64_t>(views.size()));
+                        auto seqlens_k = int32_cuda(seqlens);
+                        auto cu_seqlens_q = int32_cuda(cu_q);
+                        auto cu_view_pages = int32_cuda(cu_view);
+                        auto decay = mass_decay({static_cast<float>(alpha), static_cast<float>(alpha)});
+                        auto new_mass = [&] {
+                            return at::zeros(
+                                {static_cast<int64_t>(views.size()) * max_pages, page_size, n_q},
+                                at::device(at::kCUDA).dtype(at::kFloat)
+                            );
+                        };
+
+                        for (auto dt : {at::kFloat, at::kBFloat16}) {
+                            INFO(
+                                "head_dim " << head_dim << " page_size " << page_size << " window "
+                                            << window.value_or(0) << " factor " << factor << " scaled_keys "
+                                            << scaled_keys << " dtype " << dt
+                            );
+                            at::manual_seed(11);
+                            auto opts = at::device(at::kCUDA).dtype(dt);
+                            auto k_pool = at::randn({num_lines, page_size, n_kv, head_dim}, opts);
+                            auto v_pool = at::randn({num_lines, page_size, n_kv, head_dim}, opts);
+                            std::optional<at::Tensor> k_norm_weight;
+                            if (scaled_keys) {
+                                k_norm_weight = at::rand({head_dim}, at::device(at::kCUDA).dtype(at::kFloat)) + 0.5;
+                            }
+                            const double o_tol = dt == at::kFloat ? 1e-4 : 2e-2;
+                            auto q_pre = at::randn({cu_q.back(), n_q, head_dim}, opts);
+                            auto q_dec = at::randn({static_cast<int64_t>(views.size()), n_q, head_dim}, opts);
+
+                            auto f32 = at::device(at::kCUDA).dtype(at::kFloat);
+                            auto o_pre = at::zeros({cu_q.back(), n_q, head_dim}, f32);
+                            auto o_dec = at::zeros({static_cast<int64_t>(views.size()), n_q, head_dim}, f32);
+                            auto mass_pre = new_mass();
+                            auto mass_dec = new_mass();
+                            for (size_t s = 0; s < views.size(); ++s) {
+                                auto keys = reference_keys(views[s], k_pool, rope, k_norm_weight);
+                                auto rows = [&](at::Tensor& mass) {
+                                    return mass.slice(0, s * max_pages, (s + 1) * max_pages).view({-1, n_q});
+                                };
+                                auto pre_rows = rows(mass_pre);
+                                reference_windowed(
+                                    views[s],
+                                    keys,
+                                    v_pool,
+                                    q_pre,
+                                    views[s].seq_q,
+                                    cu_q[s],
+                                    window,
+                                    scale,
+                                    alpha,
+                                    o_pre,
+                                    pre_rows
+                                );
+                                auto dec_rows = rows(mass_dec);
+                                reference_windowed(
+                                    views[s],
+                                    keys,
+                                    v_pool,
+                                    q_dec,
+                                    1,
+                                    static_cast<int64_t>(s),
+                                    window,
+                                    scale,
+                                    alpha,
+                                    o_dec,
+                                    dec_rows
+                                );
+                            }
+
+                            auto mass = new_mass();
+                            auto o = pulsarlm::attn_prefill_cuda(
+                                q_pre,
+                                k_pool,
+                                v_pool,
+                                page_tables,
+                                cu_seqlens_q,
+                                seqlens_k,
+                                rope_layout,
+                                rope,
+                                scale,
+                                window,
+                                k_norm_weight,
+                                mass,
+                                cu_view_pages,
+                                decay
+                            );
+                            CHECK(at::allclose(o.to(at::kFloat), o_pre, o_tol, o_tol));
+                            CHECK(at::allclose(mass, mass_pre, 1e-3, 1e-3));
+
+                            for (int64_t num_splits : {0, 1, 2}) {
+                                auto dec_mass = new_mass();
+                                auto dec_o = pulsarlm::attn_decode_cuda(
+                                    q_dec,
+                                    k_pool,
+                                    v_pool,
+                                    page_tables,
+                                    seqlens_k,
+                                    rope_layout,
+                                    rope,
+                                    scale,
+                                    window,
+                                    k_norm_weight,
+                                    dec_mass,
+                                    cu_view_pages,
+                                    decay,
+                                    0.0,
+                                    std::nullopt,
+                                    num_splits
+                                );
+                                CHECK(at::allclose(dec_o.to(at::kFloat), o_dec, o_tol, o_tol));
+                                CHECK(at::allclose(dec_mass, mass_dec, 1e-3, 1e-3));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Proportional RoPE leaves every pair past the rotated ones untouched, bit for bit.
+TEST_CASE("partial RoPE passes the unrotated pairs through", "[ops][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const int64_t head_dim = 512, half = head_dim / 2, rotated = 64;
+    const pulsarlm::rope_parameters rope{.theta = 1e6, .partial_rotary_factor = 0.25};
+    auto x = at::randn({2, 5, head_dim}, at::device(at::kCUDA).dtype(at::kBFloat16));
+    auto pos = at::tensor(std::vector<int64_t>{0, 1, 7, 4096, 100000}, at::device(at::kCUDA).dtype(at::kLong));
+    auto rotated_x = pulsarlm::rope_cuda(x, pos, rope);
+    for (int64_t start : {rotated, half + rotated}) {
+        CHECK(
+            at::equal(rotated_x.slice(-1, start, start + half - rotated), x.slice(-1, start, start + half - rotated))
+        );
+    }
+    CHECK(!at::equal(rotated_x.slice(-1, 0, rotated), x.slice(-1, 0, rotated)));
 }

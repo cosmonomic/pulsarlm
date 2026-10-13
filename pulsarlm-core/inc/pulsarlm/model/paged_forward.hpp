@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pulsarlm/model/interface.hpp"  // GroupBatch, StepBatch, StepLogits
+#include "pulsarlm/rope.hpp"
 
 #include <ATen/core/Tensor.h>
 
@@ -17,7 +18,8 @@ namespace pulsarlm {
 // Apply RoPE (rotate_half over head_dim) to a group's q, the projection output
 // [ntok, n_q_heads * head_dim]; returns it roped and reshaped to
 // [ntok, n_q_heads, head_dim], ready for paged attention.
-at::Tensor rope_q(const at::Tensor& q, const at::Tensor& pos, int64_t n_q_heads, int64_t head_dim, double theta);
+at::Tensor
+rope_q(const at::Tensor& q, const at::Tensor& pos, int64_t n_q_heads, int64_t head_dim, const rope_parameters& rope);
 
 // [3 * n_layers / 4, n_layers).
 std::unordered_set<int64_t> default_relevance_layers(int64_t n_layers);
@@ -38,7 +40,7 @@ at::Tensor paged_attention(
     const GroupBatch& g,
     bool relevance_layer,
     double scale,
-    double rope_theta,
+    const rope_parameters& rope,
     const at::Tensor& lse_capture = {}
 );
 

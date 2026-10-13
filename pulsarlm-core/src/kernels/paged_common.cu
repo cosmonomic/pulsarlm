@@ -15,8 +15,8 @@ namespace pulsarlm {
 namespace attn {
 namespace {
 
-// One CTA per (query token, query head). Threads stride over the causal key range
-// [0, p] running independent online softmaxes, combined with the flash rescale; a
+// One CTA per (query token, query head). Threads stride over the key range
+// [first_key, p] running independent online softmaxes, combined with the flash rescale; a
 // second streaming pass recomputes each normalized weight and adds it into the mass.
 template <typename scalar_t, int PAGE_SIZE> __global__ void attn_scalar_kernel(const PagedAttnParams<scalar_t> p) {
     const int tid = threadIdx.x;
@@ -44,7 +44,8 @@ template <typename scalar_t, int PAGE_SIZE> __global__ void attn_scalar_kernel(c
     const int seq_q = p.cu_seqlens_q ? p.cu_seqlens_q[s + 1] - q0 : 1;
     const int ctx_len = p.seqlens_k[s];
     const int query_pos = ctx_len - seq_q + (qtok - q0);
-    const int key_count = query_pos + 1;
+    const int first = first_key(p, query_pos);
+    const int key_count = query_pos + 1 - first;
     const KeyLayout layout = key_layout(p.rope_layout, s);
     const int32_t* seq_table = p.page_tables + static_cast<int64_t>(s) * p.max_pages;
 
@@ -69,14 +70,10 @@ template <typename scalar_t, int PAGE_SIZE> __global__ void attn_scalar_kernel(c
         const int pos = layout.position(j);
         float sc = 0.0f;
         for (int i = 0; i < half; ++i) {
-            float cos_a, sin_a;
+            float cos_a, sin_a, lo, hi;
             rope_sincos_turns(pos, p.rope_turns[i], cos_a, sin_a);
-            const auto k = rope_rotate<scalar_t>(
-                static_cast<float>(krow[i]),
-                static_cast<float>(krow[i + half]),
-                cos_a,
-                sin_a
-            );
+            stored_key_pair(p, krow, i, half, lo, hi);
+            const auto k = rope_rotate<scalar_t>(lo, hi, cos_a, sin_a);
             sc += qsh[i] * static_cast<float>(k.lo) + qsh[i + half] * static_cast<float>(k.hi);
         }
         return sc * p.scale;
@@ -88,7 +85,7 @@ template <typename scalar_t, int PAGE_SIZE> __global__ void attn_scalar_kernel(c
     for (int d = 0; d < head_dim; ++d) {
         acc[d] = 0.0f;
     }
-    for (int j = tid; j < key_count; j += kThreads) {
+    for (int j = first + tid; j <= query_pos; j += kThreads) {
         const int64_t offset = key_offset(j);
         const float sc = score(j, offset);
         const float new_m = fmaxf(m, sc);
@@ -135,7 +132,7 @@ template <typename scalar_t, int PAGE_SIZE> __global__ void attn_scalar_kernel(c
     const float attended_len = p.mass_length_gain > 0.0f ? p.mass_length_gain : static_cast<float>(key_count);
     const float mass_weight = mass_decay * graded * attended_len;
     float* mass = seq_mass(p, s, ctx_len, PAGE_SIZE);
-    for (int j = tid; j < key_count; j += kThreads) {
+    for (int j = first + tid; j <= query_pos; j += kThreads) {
         const float pw = __expf(score(j, key_offset(j)) - M) * inv_denom;
         atomicAdd(&mass[static_cast<int64_t>(j) * p.n_q_heads + h], mass_weight * pw);
     }
@@ -145,7 +142,9 @@ template <typename scalar_t, int PAGE_SIZE> __global__ void attn_scalar_kernel(c
 
 bool PagedAttnBatch::tensor_core_eligible() const {
     const auto dt = this->q.scalar_type();
-    return (dt == at::kHalf || dt == at::kBFloat16) && (this->head_dim == 64 || this->head_dim == 128) &&
+    const bool compiled_head_dim = this->head_dim == 64 || this->head_dim == 128 || this->head_dim == 256 ||
+        this->head_dim == 512;
+    return (dt == at::kHalf || dt == at::kBFloat16) && compiled_head_dim &&
         (this->page_size == 16 || this->page_size == 32);
 }
 
@@ -158,8 +157,10 @@ PagedAttnBatch paged_attn_batch(
     const std::optional<at::Tensor>& cu_seqlens_q,
     const at::Tensor& seqlens_k,
     const at::Tensor& rope_layout,
-    double rope_theta,
+    const rope_parameters& rope,
     double scale,
+    std::optional<int64_t> sliding_window,
+    const std::optional<at::Tensor>& k_norm_weight,
     const std::optional<at::Tensor>& mass,
     const std::optional<at::Tensor>& cu_view_pages,
     const std::optional<at::Tensor>& attention_mass_decay,
@@ -197,6 +198,8 @@ PagedAttnBatch paged_attn_batch(
     b.num_seqs = seqlens_k.size(0);
     b.scale = scale;
     b.mass_length_gain = mass_length_gain;
+    TORCH_CHECK(!sliding_window || *sliding_window >= 1, op, ": sliding_window must be at least 1");
+    b.sliding_window = sliding_window.value_or(0);
 
     TORCH_CHECK(k_pool.size(3) == b.head_dim, op, ": pool head_dim must match q");
     TORCH_CHECK(b.head_dim % 2 == 0 && b.head_dim <= kMaxHeadDim, op, ": head_dim must be even and <= ", kMaxHeadDim);
@@ -261,6 +264,14 @@ PagedAttnBatch paged_attn_batch(
         b.cu_view_pages = cu_view_pages->contiguous();
         b.mass_decay = attention_mass_decay->contiguous();
     }
+    if (k_norm_weight.has_value()) {
+        TORCH_CHECK(
+            on_cuda(*k_norm_weight) && k_norm_weight->dim() == 1 && k_norm_weight->size(0) == b.head_dim,
+            op,
+            ": k_norm_weight must be a CUDA tensor of [head_dim]"
+        );
+        b.k_norm_weight = k_norm_weight->to(at::kFloat).contiguous();
+    }
     if (lse_capture.has_value()) {
         TORCH_CHECK(
             on_cuda(*lse_capture) && lse_capture->scalar_type() == at::kFloat && lse_capture->is_contiguous() &&
@@ -277,7 +288,7 @@ PagedAttnBatch paged_attn_batch(
     b.page_tables = page_tables.contiguous();
     b.seqlens_k = seqlens_k.contiguous();
     b.rope_layout = rope_layout.contiguous();
-    b.rope_turns = rope_turns_per_position(rope_theta, b.head_dim, q.device());
+    b.rope_turns = rope_turns_per_position(rope, b.head_dim, q.device());
     b.o = at::empty_like(b.q);
     return b;
 }

@@ -15,13 +15,15 @@
 // sequence's view, for a ragged (varlen) batch. Sequence i's queries
 // q[cu_seqlens_q[i] : cu_seqlens_q[i+1]] sit at view indices [ctx_start_i,
 // seqlens_k[i]) with ctx_start_i = seqlens_k[i] - seq_q_i, and the query at view
-// index p attends keys [0, p]. The tensor-core kernel is in paged_prefill.cuh.
+// index p attends keys [0, p], or the window of them sliding_window leaves. The
+// tensor-core kernel is in paged_prefill.cuh.
 
 namespace pulsarlm {
 namespace {
 
 // Copy every key of each sequence's view into rotated_k, rotated to its view
-// position: sequence s's view page b lands at page s * max_pages + b. One CTA per
+// position: sequence s's view page b lands at page s * max_pages + b. A page wholly
+// before the window of the sequence's first query is left unwritten. One CTA per
 // (sequence, view page); threads stride over the page's (key, kv head, frequency
 // pair) triples. The attention kernel stages a key once per (query tile, query head),
 // so rotating there would repeat each rotation that many times.
@@ -30,8 +32,10 @@ __global__ void
 rotate_view_keys_kernel(const attn::PagedAttnParams<scalar_t> p, int page_size, scalar_t* __restrict__ rotated_k) {
     const int s = blockIdx.x / p.max_pages;
     const int view_page = blockIdx.x % p.max_pages;
-    const int keys = min(page_size, p.seqlens_k[s] - view_page * page_size);
-    if (keys <= 0) {
+    const int ctx_len = p.seqlens_k[s];
+    const int keys = min(page_size, ctx_len - view_page * page_size);
+    const int first_query = ctx_len - (p.cu_seqlens_q[s + 1] - p.cu_seqlens_q[s]);
+    if (keys <= 0 || (view_page + 1) * page_size <= attn::first_key(p, first_query)) {
         return;
     }
     const int half = p.head_dim / 2;
@@ -46,14 +50,10 @@ rotate_view_keys_kernel(const attn::PagedAttnParams<scalar_t> p, int page_size, 
         const int head = (i % pairs_per_key) / half;
         const int pair = i % half;
         const int64_t row = (static_cast<int64_t>(off) * p.n_kv_heads + head) * p.head_dim;
-        float cos_a, sin_a;
+        float cos_a, sin_a, lo, hi;
         attn::rope_sincos_turns(layout.position(view_page * page_size + off), p.rope_turns[pair], cos_a, sin_a);
-        const auto k = attn::rope_rotate<scalar_t>(
-            static_cast<float>(src[row + pair]),
-            static_cast<float>(src[row + pair + half]),
-            cos_a,
-            sin_a
-        );
+        attn::stored_key_pair(p, src + row, pair, half, lo, hi);
+        const auto k = attn::rope_rotate<scalar_t>(lo, hi, cos_a, sin_a);
         dst[row + pair] = k.lo;
         dst[row + pair + half] = k.hi;
     }
@@ -95,14 +95,12 @@ template <typename scalar_t, bool BF16> void launch_tc_prefill(const attn::Paged
         attn::dispatch_attn_tuning([&](auto row_tag) {
             constexpr attn::AttnTuning kTuning = attn::kAttnTuningTable[decltype(row_tag)::value];
             constexpr int NWARPS = kTuning.prefill_warps;
-            attn::attn_prefill_tc_kernel<
-                scalar_t,
-                BS,
-                HD,
-                BF16,
-                NWARPS,
-                attn::prefill_key_pages<scalar_t, BS, HD, kTuning.prefill_key_pages>(),
-                kTuning.prefill_ctas_per_sm><<<static_cast<int>(grid), NWARPS * 32, 0, stream>>>(
+            constexpr int KEY_PAGES = attn::prefill_key_pages<scalar_t, BS, HD, kTuning.prefill_key_pages>();
+            constexpr size_t smem = attn::prefill_tile_bytes<scalar_t, BS, HD, KEY_PAGES>();
+            const auto kernel = attn::
+                attn_prefill_tc_kernel<scalar_t, BS, HD, BF16, NWARPS, KEY_PAGES, kTuning.prefill_ctas_per_sm>;
+            attn::allow_shared_memory(kernel, smem);
+            kernel<<<static_cast<int>(grid), NWARPS * 32, smem, stream>>>(
                 params,
                 rotated_k.data_ptr<scalar_t>(),
                 tile_seq_dev.data_ptr<int32_t>(),
@@ -117,7 +115,22 @@ at::Tensor paged_prefill(const attn::PagedAttnBatch& b, bool force_scalar) {
         return b.o;
     }
     auto stream = at::cuda::getCurrentCUDAStream();
-    if (force_scalar || !b.tensor_core_eligible()) {
+    bool tensor_core = !force_scalar && b.tensor_core_eligible();
+    if (tensor_core) {
+        attn::dispatch_page_head("attn_prefill", b.page_size, b.head_dim, [&](auto bs_tag, auto hd_tag) {
+            constexpr int BS = decltype(bs_tag)::value;
+            constexpr int HD = decltype(hd_tag)::value;
+            attn::dispatch_attn_tuning([&](auto row_tag) {
+                constexpr int KEY_PAGES = attn::prefill_key_pages<
+                    at::Half,
+                    BS,
+                    HD,
+                    attn::kAttnTuningTable[decltype(row_tag)::value].prefill_key_pages>();
+                tensor_core = attn::fits_shared_memory(attn::prefill_smem_bytes<at::Half, BS, HD, KEY_PAGES>());
+            });
+        });
+    }
+    if (!tensor_core) {
         attn::launch_attn_scalar(b, stream);
         return b.o;
     }
@@ -138,8 +151,10 @@ at::Tensor attn_prefill_cuda(
     const at::Tensor& cu_seqlens_q,
     const at::Tensor& seqlens_k,
     const at::Tensor& rope_layout,
-    double rope_theta,
+    const rope_parameters& rope,
     double scale,
+    std::optional<int64_t> sliding_window,
+    const std::optional<at::Tensor>& k_norm_weight,
     const std::optional<at::Tensor>& mass,
     const std::optional<at::Tensor>& cu_view_pages,
     const std::optional<at::Tensor>& attention_mass_decay,
@@ -155,8 +170,10 @@ at::Tensor attn_prefill_cuda(
         cu_seqlens_q,
         seqlens_k,
         rope_layout,
-        rope_theta,
+        rope,
         scale,
+        sliding_window,
+        k_norm_weight,
         mass,
         cu_view_pages,
         attention_mass_decay,
@@ -174,8 +191,10 @@ at::Tensor attn_prefill_scalar_cuda(
     const at::Tensor& cu_seqlens_q,
     const at::Tensor& seqlens_k,
     const at::Tensor& rope_layout,
-    double rope_theta,
+    const rope_parameters& rope,
     double scale,
+    std::optional<int64_t> sliding_window,
+    const std::optional<at::Tensor>& k_norm_weight,
     const std::optional<at::Tensor>& mass,
     const std::optional<at::Tensor>& cu_view_pages,
     const std::optional<at::Tensor>& attention_mass_decay,
@@ -191,8 +210,10 @@ at::Tensor attn_prefill_scalar_cuda(
         cu_seqlens_q,
         seqlens_k,
         rope_layout,
-        rope_theta,
+        rope,
         scale,
+        sliding_window,
+        k_norm_weight,
         mass,
         cu_view_pages,
         attention_mass_decay,

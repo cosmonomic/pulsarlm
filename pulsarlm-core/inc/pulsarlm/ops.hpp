@@ -2,6 +2,9 @@
 
 #include <ATen/core/Tensor.h>
 
+#include "pulsarlm/rope.hpp"
+
+#include <cstdint>
 #include <optional>
 #include <tuple>
 
@@ -29,8 +32,11 @@ void write_kv_cuda(
 // (page_tables[s][j / page_size], j % page_size). A line may appear in several views.
 //
 // The pool holds UNROTATED keys. The op rotates key j of sequence s to the RoPE
-// position rope_layout[s] gives index j, in the HF/Qwen2 rotate_half convention over
-// the full head_dim with base rope_theta. rope_layout is int32 [num_seqs, 3] holding
+// position rope_layout[s] gives index j, in the HF/Qwen2 rotate_half convention with
+// the frequencies rope states. k_norm_weight, when given, is fp32 [head_dim]: the op
+// multiplies each stored key by it before rotating, so a pool holding normalized
+// vectors serves as both V and K = k_norm(x) (Gemma 4's K=V layers pass one tensor as
+// both pools). rope_layout is int32 [num_seqs, 3] holding
 // {n_sink, working_lo, short_offset}:
 //   j < n_sink                 -> j
 //   n_sink <= j < working_lo   -> short_offset
@@ -38,6 +44,11 @@ void write_kv_cuda(
 // so {0, 0, -1} is the identity and a compacted layout collapses the distant region
 // [n_sink, working_lo) onto short_offset. Queries arrive ALREADY rotated, by the
 // caller, to the same layout's position of their own view index.
+//
+// sliding_window, when given, limits the query at view index p to the keys
+// [max(0, p - sliding_window + 1), p]. The op reads no page table entry whose page lies
+// wholly before the window of the sequence's first query, so those entries may hold any
+// value.
 //
 // mass, when given, receives each attended key's normalized softmax weight, added into
 // the QUERY head's own column (no sum over the group), at the key's VIEW row:
@@ -50,7 +61,8 @@ void write_kv_cuda(
 //                        received weight is scaled by (1.0 accumulates the raw weight)
 //   mass_length_gain     TOKENS. Each query's weight is rescaled by the length its
 //                        share is stated against, so uniform attention over exactly
-//                        that length stores 1. <= 0 takes the keys that query attended,
+//                        that length stores 1. <= 0 takes the keys that query attended
+//                        (its window's keys under sliding_window),
 //                        which only the op can read. A caller wanting another CONSTANT
 //                        length passes 1 and multiplies once afterwards: the mass sums
 //                        over query tokens, so a constant commutes with it.
@@ -61,9 +73,10 @@ void write_kv_cuda(
 // scale * q.k over the keys that row attended, fp32 contiguous [total_q, n_q_heads]:
 // the softmax denominator the attention used, so exp(logit - lse) is a key's weight.
 
-// Decode: one query per sequence (q [num_seqs, n_q_heads, head_dim]) attending its
-// whole view, keys [0, context_lens[s]). num_splits > 0 forces the split (flash-decode)
-// path with that many splits, 1 included; 0 picks the split count from occupancy.
+// Decode: one query per sequence (q [num_seqs, n_q_heads, head_dim]) at view index
+// context_lens[s] - 1, attending keys [0, context_lens[s]) or its window of them.
+// num_splits > 0 forces the split (flash-decode) path with that many splits, 1
+// included; 0 picks the split count from occupancy.
 // Returns o [num_seqs, n_q_heads, head_dim].
 at::Tensor attn_decode_cuda(
     const at::Tensor& q,
@@ -72,8 +85,10 @@ at::Tensor attn_decode_cuda(
     const at::Tensor& page_tables,
     const at::Tensor& context_lens,
     const at::Tensor& rope_layout,
-    double rope_theta,
+    const rope_parameters& rope,
     double scale,
+    std::optional<int64_t> sliding_window,
+    const std::optional<at::Tensor>& k_norm_weight,
     const std::optional<at::Tensor>& mass = std::nullopt,
     const std::optional<at::Tensor>& cu_view_pages = std::nullopt,
     const std::optional<at::Tensor>& attention_mass_decay = std::nullopt,
@@ -91,8 +106,10 @@ at::Tensor attn_decode_scalar_cuda(
     const at::Tensor& page_tables,
     const at::Tensor& context_lens,
     const at::Tensor& rope_layout,
-    double rope_theta,
+    const rope_parameters& rope,
     double scale,
+    std::optional<int64_t> sliding_window,
+    const std::optional<at::Tensor>& k_norm_weight,
     const std::optional<at::Tensor>& mass = std::nullopt,
     const std::optional<at::Tensor>& cu_view_pages = std::nullopt,
     const std::optional<at::Tensor>& attention_mass_decay = std::nullopt,
@@ -103,7 +120,7 @@ at::Tensor attn_decode_scalar_cuda(
 // Prefill: a ragged batch of query chunks, causal over each view. Sequence i's queries
 // are q[cu_seqlens_q[i] : cu_seqlens_q[i+1]] (q [total_q, n_q_heads, head_dim]) at view
 // indices [ctx_start_i, seqlens_k[i]) with ctx_start_i = seqlens_k[i] - seq_q_i, and
-// the query at view index p attends keys [0, p]. The mass is the within-chunk EMA: the
+// the query at view index p attends keys [0, p] or its window of them. The mass is the within-chunk EMA: the
 // query at offset o from its chunk's end contributes alpha * (1 - alpha)^o times its
 // weight. Returns o [total_q, n_q_heads, head_dim].
 at::Tensor attn_prefill_cuda(
@@ -114,8 +131,10 @@ at::Tensor attn_prefill_cuda(
     const at::Tensor& cu_seqlens_q,
     const at::Tensor& seqlens_k,
     const at::Tensor& rope_layout,
-    double rope_theta,
+    const rope_parameters& rope,
     double scale,
+    std::optional<int64_t> sliding_window,
+    const std::optional<at::Tensor>& k_norm_weight,
     const std::optional<at::Tensor>& mass = std::nullopt,
     const std::optional<at::Tensor>& cu_view_pages = std::nullopt,
     const std::optional<at::Tensor>& attention_mass_decay = std::nullopt,
@@ -133,8 +152,10 @@ at::Tensor attn_prefill_scalar_cuda(
     const at::Tensor& cu_seqlens_q,
     const at::Tensor& seqlens_k,
     const at::Tensor& rope_layout,
-    double rope_theta,
+    const rope_parameters& rope,
     double scale,
+    std::optional<int64_t> sliding_window,
+    const std::optional<at::Tensor>& k_norm_weight,
     const std::optional<at::Tensor>& mass = std::nullopt,
     const std::optional<at::Tensor>& cu_view_pages = std::nullopt,
     const std::optional<at::Tensor>& attention_mass_decay = std::nullopt,
@@ -185,12 +206,11 @@ at::Tensor gemm_w4a16_marlin_cuda(
     int64_t group_size
 );
 
-// Rotary position embedding (RoPE), HF/Qwen2 "rotate_half" convention over the
-// full head_dim. Stateless.
+// Rotary position embedding (RoPE), HF/Qwen2 "rotate_half" convention with the
+// frequencies rope states. Stateless.
 //   x         [n_heads, seq, head_dim]  (head_dim even)
 //   pos [seq]  int64; pos of each row (may be arbitrary / non-contiguous).
-//   theta     RoPE base (e.g. 1000000 for Qwen2.5, 10000 default).
 // Returns the rotated x, same shape and dtype.
-at::Tensor rope_cuda(const at::Tensor& x, const at::Tensor& pos, double theta);
+at::Tensor rope_cuda(const at::Tensor& x, const at::Tensor& pos, const rope_parameters& rope);
 
 }  // namespace pulsarlm

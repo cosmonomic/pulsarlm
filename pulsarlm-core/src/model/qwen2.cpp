@@ -83,12 +83,21 @@ at::Tensor Qwen2Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, c
     auto k = at::linear(h, lw.k_proj_weight, lw.k_proj_bias);
     auto v = at::linear(h, lw.v_proj_weight, lw.v_proj_bias);
 
-    q = rope_q(q, g.pos, this->n_heads, this->head_dim, this->rope_theta);
+    q = rope_q(q, g.pos, this->n_heads, this->head_dim, {.theta = this->rope_theta});
     // The lines store K and V unrotated, as the paged ops' [tokens, n_kv_heads, head_dim].
     k = k.view({ntok, this->n_kv_heads, this->head_dim}).contiguous();
     v = v.view({ntok, this->n_kv_heads, this->head_dim}).contiguous();
-    auto o =
-        paged_attention(q, k, v, kv, layer, g, this->relevance_layers.contains(layer), this->scale, this->rope_theta);
+    auto o = paged_attention(
+        q,
+        k,
+        v,
+        kv,
+        layer,
+        g,
+        this->relevance_layers.contains(layer),
+        this->scale,
+        {.theta = this->rope_theta}
+    );
 
     o = o.reshape({ntok, this->n_heads * this->head_dim});
     x = x + at::linear(o, lw.o_proj_weight);
