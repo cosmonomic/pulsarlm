@@ -20,6 +20,16 @@ void check_tokens(std::span<const std::int64_t> tokens, std::size_t vocab_size) 
 
 }  // namespace
 
+std::size_t line_count(const engine_config& config) {
+    std::size_t bytes = line_bytes(config.shape);
+    if (config.kv_cache_bytes < bytes) {
+        throw std::invalid_argument(
+            std::format("a KV cache of {} bytes holds no line; a line takes {} bytes", config.kv_cache_bytes, bytes)
+        );
+    }
+    return config.kv_cache_bytes / bytes;
+}
+
 void validate(const request& r, std::size_t page_size, std::size_t vocab_size) {
     if (r.initial_state.tail.size() >= page_size) {
         throw std::invalid_argument(std::format(

@@ -61,7 +61,7 @@ class EvictionPolicy:
     n_working: int
     cycle_tokens: int
     max_pages: int | None
-    density_bar: float
+    evict_tau: float
     attention_mass_decay: float
     def __init__(
         self,
@@ -70,7 +70,7 @@ class EvictionPolicy:
         n_working: int = 1,
         cycle_tokens: int = 512,
         max_pages: int | None = None,
-        density_bar: float = 0.0,
+        evict_tau: float = 0.0,
         attention_mass_decay: float = 1.0 / 512,
     ) -> None: ...
 
@@ -111,7 +111,7 @@ class Engine:
         model_name: str,
         page_size: int,
         kv_dtype: torch.dtype,
-        n_lines: int,
+        kv_cache_gib: float,
         device: torch.device,
         stop_ids: list[int],
         prefill_tokens_per_step: int,

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -37,11 +38,14 @@ std::unique_ptr<python_engine> make_engine(
     const std::string& model_name,
     std::size_t page_size,
     at::ScalarType kv_dtype,
-    std::size_t n_lines,
+    double kv_cache_gib,
     at::Device device,
     std::vector<std::int64_t> stop_ids,
     std::size_t prefill_tokens_per_step
 ) {
+    if (!(kv_cache_gib > 0.0)) {
+        throw std::invalid_argument("kv_cache_gib must be positive");
+    }
     engine_config config{
         model_name,
         page_shape{
@@ -51,7 +55,7 @@ std::unique_ptr<python_engine> make_engine(
             static_cast<std::size_t>(model.head_dim),
             kv_dtype,
         },
-        n_lines,
+        static_cast<std::size_t>(kv_cache_gib * (1ull << 30)),
         device,
         std::move(stop_ids),
         static_cast<std::size_t>(model.vocab_size),
@@ -118,23 +122,23 @@ PYBIND11_MODULE(pulsar_core, m) {
                         std::size_t n_working,
                         std::size_t cycle_tokens,
                         std::optional<std::size_t> max_pages,
-                        double density_bar,
+                        double evict_tau,
                         double attention_mass_decay) {
-                return eviction_policy{n_sink, n_working, cycle_tokens, max_pages, density_bar, attention_mass_decay};
+                return eviction_policy{n_sink, n_working, cycle_tokens, max_pages, evict_tau, attention_mass_decay};
             }),
             py::kw_only(),
             "n_sink"_a = eviction_policy{}.n_sink,
             "n_working"_a = eviction_policy{}.n_working,
             "cycle_tokens"_a = eviction_policy{}.cycle_tokens,
             "max_pages"_a = eviction_policy{}.max_pages,
-            "density_bar"_a = eviction_policy{}.density_bar,
+            "evict_tau"_a = eviction_policy{}.evict_tau,
             "attention_mass_decay"_a = eviction_policy{}.attention_mass_decay
         )
         .def_readwrite("n_sink", &eviction_policy::n_sink)
         .def_readwrite("n_working", &eviction_policy::n_working)
         .def_readwrite("cycle_tokens", &eviction_policy::cycle_tokens)
         .def_readwrite("max_pages", &eviction_policy::max_pages)
-        .def_readwrite("density_bar", &eviction_policy::density_bar)
+        .def_readwrite("evict_tau", &eviction_policy::evict_tau)
         .def_readwrite("attention_mass_decay", &eviction_policy::attention_mass_decay);
 
     py::class_<model_config>(m, "ModelConfig")
@@ -190,7 +194,7 @@ PYBIND11_MODULE(pulsar_core, m) {
             "model_name"_a,
             "page_size"_a,
             "kv_dtype"_a,
-            "n_lines"_a,
+            "kv_cache_gib"_a,
             "device"_a,
             "stop_ids"_a,
             "prefill_tokens_per_step"_a

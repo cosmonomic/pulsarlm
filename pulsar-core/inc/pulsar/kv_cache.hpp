@@ -35,6 +35,9 @@ struct page_shape {
     at::ScalarType dtype;
 };
 
+// The device bytes of one line: its K and V in every layer.
+std::size_t line_bytes(const page_shape& shape);
+
 // The digest that the page chains of an engine start from. model names the model and its weights version; with shape
 // and digest_function it covers everything that changes a page's KV or how tokens split into pages. The seed is
 // digest_function, model and the dtype name, each as an 8-byte little-endian length then its bytes, then n_layers,

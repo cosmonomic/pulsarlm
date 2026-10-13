@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <span>
 #include <tuple>
 #include <vector>
@@ -13,7 +14,17 @@
 namespace pulsar {
 
 bool eviction_policy::can_evict() const noexcept {
-    return density_bar > 0.0 || max_pages.has_value();
+    return evict_tau > 0.0 || max_pages.has_value();
+}
+
+double evict_bar_from_tau(double tau) noexcept {
+    if (tau <= 0.0) {
+        return 0.0;
+    }
+    if (tau >= 1.0) {
+        return std::numeric_limits<double>::infinity();
+    }
+    return tau / (1.0 - tau);
 }
 
 void cycle_density::add(const at::Tensor& step_mass, std::size_t token_count, double attention_mass_decay) {
@@ -51,6 +62,7 @@ std::vector<std::size_t> pages_to_evict(
         std::size_t page;
         double density;
     };
+    double bar = evict_bar_from_tau(policy.evict_tau);
     std::vector<candidate> kept;
     std::vector<std::size_t> evicted;
     for (std::size_t page = policy.n_sink; page < page_count - policy.n_working; page++) {
@@ -59,7 +71,7 @@ std::vector<std::size_t> pages_to_evict(
         double weight =
             1.0 - std::pow(1.0 - policy.attention_mass_decay, static_cast<double>(forwarded_count - first_query));
         double corrected = density[page] / weight;
-        if (corrected < policy.density_bar) {
+        if (corrected < bar) {
             evicted.push_back(page);
         } else {
             kept.push_back(candidate{.page = page, .density = corrected});

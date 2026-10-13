@@ -81,6 +81,10 @@ at::Tensor copy_line_to_host(const at::Tensor& lines, std::uint32_t line_id) {
 
 }  // namespace
 
+std::size_t line_bytes(const page_shape& shape) {
+    return 2 * shape.n_layers * shape.page_size * shape.n_kv_heads * shape.head_dim * c10::elementSize(shape.dtype);
+}
+
 digest make_root_digest(std::string_view model, const page_shape& shape) {
     std::vector<std::byte> seed;
     append_string(seed, digest_function());

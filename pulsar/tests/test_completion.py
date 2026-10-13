@@ -20,6 +20,7 @@ VOCAB_SIZE = 512
 PAGE_SIZE = 16
 DEVICE = torch.device("cuda", 0)
 DTYPE = torch.bfloat16
+LINE_BYTES = 2 * N_LAYERS * PAGE_SIZE * N_KV_HEADS * HEAD_DIM * DTYPE.itemsize
 
 MODEL = ModelConfig(
     architecture="qwen3",
@@ -87,7 +88,7 @@ def make_engine(store: LocalStore) -> AsyncEngine:
             model_name="random-qwen3",
             page_size=PAGE_SIZE,
             kv_dtype=DTYPE,
-            n_lines=64,
+            kv_cache_gib=64 * LINE_BYTES / 2**30,
             device=DEVICE,
             stop_ids=[],
             prefill_tokens_per_step=64,

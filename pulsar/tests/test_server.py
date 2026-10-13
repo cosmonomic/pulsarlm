@@ -11,6 +11,7 @@ from pulsar.async_engine import AsyncEngine
 from pulsar.chat import encode_prompt
 from pulsar.core.engine import Engine, EvictionPolicy, ModelConfig
 from pulsar.server import create_app
+from pulsar.server.app import trained_view_pages
 from pulsar.server.openai import ServerState
 from pulsar.server.openai.schema import ChatMessage
 from pulsar.store import LocalStore
@@ -25,6 +26,7 @@ VOCAB_SIZE = 512
 PAGE_SIZE = 16
 DEVICE = torch.device("cuda", 0)
 DTYPE = torch.bfloat16
+LINE_BYTES = 2 * N_LAYERS * PAGE_SIZE * N_KV_HEADS * HEAD_DIM * DTYPE.itemsize
 MODEL_ID = "random-qwen3"
 SPECIAL_TOKENS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>"]
 ROLES = ["system", "user", "assistant"]
@@ -104,7 +106,7 @@ def load(
         model_name=MODEL_ID,
         page_size=PAGE_SIZE,
         kv_dtype=DTYPE,
-        n_lines=n_lines,
+        kv_cache_gib=n_lines * LINE_BYTES / 2**30,
         device=DEVICE,
         stop_ids=stop_ids,
         prefill_tokens_per_step=64,
@@ -237,6 +239,14 @@ def test_an_error_after_a_stream_started_is_an_error_event():
     assert events[-1] == "data: [DONE]"
     error = json.loads(events[-2].removeprefix("data: "))["error"]
     assert error["code"] == 503
+
+
+def test_the_view_cap_keeps_positions_within_the_trained_context():
+    pages = trained_view_pages(40960, cycle_tokens=512)
+    assert pages is not None
+    assert pages * PAGE_SIZE + (PAGE_SIZE - 1) + 512 <= 40960
+    assert (pages + 1) * PAGE_SIZE + (PAGE_SIZE - 1) + 512 > 40960
+    assert trained_view_pages(0, cycle_tokens=512) is None
 
 
 def test_an_unknown_model_is_not_found(client):

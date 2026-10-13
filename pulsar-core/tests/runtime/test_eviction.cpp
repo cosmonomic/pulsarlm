@@ -29,14 +29,24 @@ TEST_CASE("the defaults evict nothing") {
     REQUIRE(evicted(std::vector<float>(8, 0.0f), eviction_policy{}).empty());
 }
 
+TEST_CASE("the bar is tau / (1 - tau), from nothing at 0 to everything at 1") {
+    REQUIRE(pulsar::evict_bar_from_tau(0.0) == 0.0);
+    REQUIRE(pulsar::evict_bar_from_tau(0.5) == 1.0);
+    REQUIRE(pulsar::evict_bar_from_tau(0.75) == 3.0);
+    REQUIRE(std::isinf(pulsar::evict_bar_from_tau(1.0)));
+
+    eviction_policy everything{.n_working = 1, .evict_tau = 1.0, .attention_mass_decay = 1.0};
+    REQUIRE(evicted(std::vector<float>(4, 1e9f), everything) == page_list{0, 1, 2});
+}
+
 TEST_CASE("pages below the bar are evicted outside the sink and working pages") {
-    eviction_policy policy{.n_sink = 2, .n_working = 3, .density_bar = 0.5, .attention_mass_decay = 1.0};
+    eviction_policy policy{.n_sink = 2, .n_working = 3, .evict_tau = 0.4, .attention_mass_decay = 1.0};
     REQUIRE(evicted(std::vector<float>(8, 0.0f), policy) == page_list{2, 3, 4});
     REQUIRE(evicted({0.0f, 0.0f, 0.0f, 0.7f, 0.2f, 0.0f, 0.0f, 0.0f}, policy) == page_list{2, 4});
 }
 
 TEST_CASE("a view no longer than the protected pages evicts nothing") {
-    eviction_policy policy{.n_sink = 2, .n_working = 3, .density_bar = 0.5, .attention_mass_decay = 1.0};
+    eviction_policy policy{.n_sink = 2, .n_working = 3, .evict_tau = 0.4, .attention_mass_decay = 1.0};
     REQUIRE(evicted(std::vector<float>(5, 0.0f), policy).empty());
 }
 
@@ -46,13 +56,13 @@ TEST_CASE("the cap evicts the lowest-density pages, the oldest first on ties") {
 }
 
 TEST_CASE("the cap counts the pages the bar evicted") {
-    eviction_policy policy{.n_working = 1, .max_pages = 5, .density_bar = 0.15, .attention_mass_decay = 1.0};
+    eviction_policy policy{.n_working = 1, .max_pages = 5, .evict_tau = 0.125, .attention_mass_decay = 1.0};
     REQUIRE(evicted({0.3f, 0.1f, 0.2f, 0.1f, 0.5f, 0.4f, 0.25f, 0.0f}, policy) == page_list{1, 2, 3});
 }
 
 TEST_CASE("a page's density is compared by the weight of the queries after its first key") {
     // Twelve queries at view indices [12, 24): pages 0 to 3 saw all of them, page 4 the last eight.
-    eviction_policy policy{.n_working = 1, .density_bar = 0.9, .attention_mass_decay = 0.1};
+    eviction_policy policy{.n_working = 1, .evict_tau = 0.47, .attention_mass_decay = 0.1};
     auto weight = [](double queries) { return 1.0 - std::pow(0.9, queries); };
     std::vector<float> density(6, static_cast<float>(0.95 * weight(12)));
     density[4] = static_cast<float>(0.95 * weight(8));

@@ -23,6 +23,7 @@ VOCAB_SIZE = 512
 PAGE_SIZE = 16
 DEVICE = torch.device("cuda", 0)
 DTYPE = torch.bfloat16
+LINE_BYTES = 2 * N_LAYERS * PAGE_SIZE * N_KV_HEADS * HEAD_DIM * DTYPE.itemsize
 
 MODEL = ModelConfig(
     architecture="qwen3",
@@ -101,7 +102,7 @@ def make_engine(store: MemoryStore) -> Engine:
         model_name="random-qwen3",
         page_size=PAGE_SIZE,
         kv_dtype=DTYPE,
-        n_lines=64,
+        kv_cache_gib=64 * LINE_BYTES / 2**30,
         device=DEVICE,
         stop_ids=[],
         prefill_tokens_per_step=64,
@@ -229,6 +230,26 @@ def test_submit_rejects_a_token_outside_the_vocabulary():
             engine.submit(State(), [VOCAB_SIZE])
 
     asyncio.run(main())
+
+
+@pytest.mark.parametrize(
+    ("kv_cache_gib", "message"),
+    [(0.0, "must be positive"), (LINE_BYTES / 2 / 2**30, "holds no line")],
+)
+def test_a_kv_cache_without_a_line_is_rejected(kv_cache_gib: float, message: str):
+    with pytest.raises(ValueError, match=message):
+        Engine(
+            MemoryStore(asyncio.new_event_loop()),
+            MODEL,
+            random_weights(),
+            model_name="random-qwen3",
+            page_size=PAGE_SIZE,
+            kv_dtype=DTYPE,
+            kv_cache_gib=kv_cache_gib,
+            device=DEVICE,
+            stop_ids=[],
+            prefill_tokens_per_step=64,
+        )
 
 
 def test_a_digest_is_16_bytes():

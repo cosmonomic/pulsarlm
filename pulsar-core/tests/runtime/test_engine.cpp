@@ -137,7 +137,7 @@ pulsar::engine_config config(std::size_t n_lines) {
     return pulsar::engine_config{
         .model_name = "successor",
         .shape = shape,
-        .n_lines = n_lines,
+        .kv_cache_bytes = n_lines * pulsar::line_bytes(shape),
         .device = at::Device(at::kCUDA, 0),
         .stop_ids = {},
         .vocab_size = vocab,
@@ -147,6 +147,14 @@ pulsar::engine_config config(std::size_t n_lines) {
 
 bool ended_with(const request_results& recorded, request_error error) {
     return recorded.end && !recorded.end->has_value() && recorded.end->error() == error;
+}
+
+TEST_CASE("the KV cache takes the whole lines that fit in its size") {
+    pulsar::engine_config sized = config(16);
+    sized.kv_cache_bytes += pulsar::line_bytes(shape) - 1;
+    REQUIRE(pulsar::line_count(sized) == 16);
+    sized.kv_cache_bytes = pulsar::line_bytes(shape) - 1;
+    REQUIRE_THROWS_AS(pulsar::line_count(sized), std::invalid_argument);
 }
 
 TEST_CASE("a submitted request passes its tokens and its end state to its callbacks") {

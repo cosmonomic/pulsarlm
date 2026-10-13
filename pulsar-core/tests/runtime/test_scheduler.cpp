@@ -540,7 +540,7 @@ TEST_CASE("a cycle's end evicts the pages below the bar outside the sink and wor
         {request{
             .tokens = prompt,
             .max_tokens = 2,
-            .eviction = {.n_sink = 1, .n_working = 1, .cycle_tokens = 16, .density_bar = 0.5},
+            .eviction = {.n_sink = 1, .n_working = 1, .cycle_tokens = 16, .evict_tau = 0.4},
         }}
     );
 

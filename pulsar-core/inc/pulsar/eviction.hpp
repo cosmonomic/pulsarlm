@@ -10,19 +10,23 @@
 namespace pulsar {
 
 // Page counts are full pages of a state. A cycle ends once cycle_tokens tokens were forwarded since it began. Its end
-// evicts the full pages outside the first n_sink and the last n_working whose density is below density_bar, a multiple
-// of uniform attention, then the lowest-density ones until at most max_pages remain. attention_mass_decay is the
-// density EMA's rate per token. The defaults evict nothing.
+// evicts the full pages outside the first n_sink and the last n_working whose density is below the bar evict_tau sets,
+// then the lowest-density ones until at most max_pages remain. attention_mass_decay is the density EMA's rate per
+// token. The defaults evict nothing.
 struct eviction_policy {
     std::size_t n_sink = 0;
     std::size_t n_working = 1;
     std::size_t cycle_tokens = 512;
     std::optional<std::size_t> max_pages;
-    double density_bar = 0.0;
+    double evict_tau = 0.0;
     double attention_mass_decay = 1.0 / 512;
 
     bool can_evict() const noexcept;
 };
+
+// The density bar, a multiple of uniform attention: tau / (1 - tau), so tau 0.5 is parity with uniform. tau <= 0 bars
+// nothing and tau >= 1 bars everything.
+double evict_bar_from_tau(double tau) noexcept;
 
 // The density of a view's pages over one eviction cycle: per page, an EMA of the attention mass its keys received,
 // starting from zero.

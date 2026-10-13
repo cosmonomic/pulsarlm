@@ -25,12 +25,13 @@
 
 namespace pulsar {
 
-// model_name names the model and its weights version; with shape it makes the root digest. A step forwards every
-// decoding sequence and at most prefill_tokens_per_step tokens of the others.
+// model_name names the model and its weights version; with shape it makes the root digest. The KV cache takes as many
+// lines as fit in kv_cache_bytes. A step forwards every decoding sequence and at most prefill_tokens_per_step tokens of
+// the others.
 struct engine_config {
     std::string model_name;
     page_shape shape;
-    std::size_t n_lines;
+    std::size_t kv_cache_bytes;
     at::Device device;
     std::vector<std::int64_t> stop_ids;
     std::size_t vocab_size;
@@ -40,6 +41,9 @@ struct engine_config {
 // Throws std::invalid_argument when r breaks a precondition of scheduler::submit or holds a token outside
 // [0, vocab_size).
 void validate(const request& r, std::size_t page_size, std::size_t vocab_size);
+
+// The lines that fit in config's KV cache size. Throws std::invalid_argument when not one does.
+std::size_t line_count(const engine_config& config);
 
 // Serves requests on a loop thread it owns. Once the loop exits, after a panic or on destruction, the requests it was
 // serving end with loop_exited and the engine is shut down: calling submit after a request ended with loop_exited is
@@ -86,7 +90,7 @@ engine<t_store>::engine(std::unique_ptr<Model> model, const engine_config& confi
   root(make_root_digest(config.model_name, config.shape)),
   sched(
       *this->model,
-      kv_cache<t_store>(config.shape, config.n_lines, config.device, std::move(store)),
+      kv_cache<t_store>(config.shape, line_count(config), config.device, std::move(store)),
       stream,
       root,
       std::vector<std::int64_t>(config.stop_ids),

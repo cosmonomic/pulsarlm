@@ -27,24 +27,22 @@ class Settings:
     model: str
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
-    n_lines: int = 2048
+    kv_cache_gib: float = 8.0
     prefill_tokens_per_step: int = 256
     stored_states: int = 4096
     cycle_tokens: int = 512
     n_working: int = 4
+    evict_tau: float = 0.3
     max_pages: int | None = None
 
     @classmethod
-    def from_env(cls) -> "Settings":
-        model = os.environ.get("PULSAR_MODEL")
-        if not model:
-            raise RuntimeError("PULSAR_MODEL must be set")
+    def from_env(cls, model: str) -> "Settings":
         max_pages = os.environ.get("PULSAR_MAX_PAGES")
         return cls(
             model=model,
             device=os.environ.get("PULSAR_DEVICE", cls.device),
             dtype=_DTYPES[os.environ.get("PULSAR_DTYPE", "bfloat16")],
-            n_lines=int(os.environ.get("PULSAR_N_LINES", cls.n_lines)),
+            kv_cache_gib=float(os.environ.get("PULSAR_KV_CACHE_GIB", cls.kv_cache_gib)),
             prefill_tokens_per_step=int(
                 os.environ.get(
                     "PULSAR_PREFILL_TOKENS_PER_STEP", cls.prefill_tokens_per_step
@@ -55,8 +53,18 @@ class Settings:
             ),
             cycle_tokens=int(os.environ.get("PULSAR_CYCLE_TOKENS", cls.cycle_tokens)),
             n_working=int(os.environ.get("PULSAR_N_WORKING", cls.n_working)),
+            evict_tau=float(os.environ.get("PULSAR_EVICT_TAU", cls.evict_tau)),
             max_pages=int(max_pages) if max_pages else None,
         )
+
+
+def trained_view_pages(max_positions: int, cycle_tokens: int) -> int | None:
+    """The most full pages a view keeps at a cycle's end so that, with a partial tail
+    page and the next cycle's tokens, its positions stay within the model's trained
+    context. None when the config states no limit."""
+    if max_positions <= 0:
+        return None
+    return max(1, (max_positions - cycle_tokens - (_PAGE_SIZE - 1)) // _PAGE_SIZE)
 
 
 def relevance_layers(n_layers: int) -> list[int]:
@@ -92,7 +100,7 @@ def load_server_state(settings: Settings) -> ServerState:
         model_name=settings.model,
         page_size=_PAGE_SIZE,
         kv_dtype=settings.dtype,
-        n_lines=settings.n_lines,
+        kv_cache_gib=settings.kv_cache_gib,
         device=torch.device(settings.device),
         stop_ids=stops,
         prefill_tokens_per_step=settings.prefill_tokens_per_step,
@@ -107,7 +115,9 @@ def load_server_state(settings: Settings) -> ServerState:
         eviction=EvictionPolicy(
             n_working=settings.n_working,
             cycle_tokens=settings.cycle_tokens,
-            max_pages=settings.max_pages,
+            max_pages=settings.max_pages
+            or trained_view_pages(cfg.max_position_embeddings, settings.cycle_tokens),
+            evict_tau=settings.evict_tau,
         ),
     )
 
@@ -127,6 +137,3 @@ def create_app(load: Callable[[], ServerState]) -> FastAPI:
     app = FastAPI(lifespan=lifespan)
     app.include_router(openai_router, prefix="/api/openai/v1")
     return app
-
-
-app = create_app(lambda: load_server_state(Settings.from_env()))
