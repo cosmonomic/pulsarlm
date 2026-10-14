@@ -66,10 +66,6 @@ class hasher {
 
 }  // namespace
 
-std::string_view digest_function() noexcept {
-    return "sha256";
-}
-
 digest make_digest(std::span<const std::byte> seed) noexcept {
     hasher h("pulsarlm root digest");
     h.update(seed.data(), seed.size());

@@ -69,8 +69,7 @@ class event {
     awaiter operator co_await() noexcept;
 };
 
-// Resolved from outside the loop (a CUDA callback, a Python callback), possibly before it is awaited. Awaiting
-// consumes it, as with task. Await it on the loop thread; resolving schedules the awaiter on that loop.
+// task with a resolve callback that can set the result outside the event loop.
 template <typename value_type = std::monostate> class [[nodiscard]] external_task {
     struct state;
     using shared_state = std::shared_ptr<state>;

@@ -39,6 +39,7 @@ target("pulsarlm_core")
     else
         add_packages("openssl3")
     end
+    add_defines("PULSARLM_DIGEST_FUNCTION=\"$(digest)\"", {public = true})
     if has_config("prof") then
         add_defines("PULSARLM_PROF", {public = true})
     end

@@ -8,11 +8,6 @@
 #include <span>
 #include <vector>
 
-// The forward boundary the Engine drives: a scheduler step's prefill and decode
-// groups plus the paged KV lines go in, per-group logits come out. The engine
-// depends only on this interface; the concrete model (Qwen2Model, Qwen3Model) is
-// opaque to it.
-
 namespace pulsarlm {
 
 // With values_only, one tensor serves as both K and V. A layer with a sliding window attends only its last
