@@ -40,9 +40,10 @@ class ChatTemplate:
         environment = ImmutableSandboxedEnvironment(
             trim_blocks=True, lstrip_blocks=True, extensions=[loopcontrols]
         )
-        environment.globals["raise_exception"] = raise_exception
-        environment.globals["strftime_now"] = strftime_now
-        self._template = environment.from_string(source)
+        self._template = environment.from_string(
+            source,
+            globals={"raise_exception": raise_exception, "strftime_now": strftime_now},
+        )
         self._special_tokens = {
             name: special_token(tokenizer_config.get(name)) for name in SPECIAL_TOKENS
         }
