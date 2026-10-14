@@ -28,6 +28,12 @@ class DType(StrEnum):
     bfloat16 = "bfloat16"
 
 
+def _positive(value: float) -> float:
+    if value <= 0.0:
+        raise typer.BadParameter(f"{value} is not positive.")
+    return value
+
+
 @app.callback()
 def main() -> None:
     pass
@@ -150,7 +156,21 @@ def chat(
             help="A system message opening the conversation; its pages are the sink.",
         ),
     ] = None,
-    temperature: Annotated[float, typer.Option(help="Sampling temperature.")] = 1.0,
+    temperature: Annotated[
+        float,
+        typer.Option(
+            min=0.0, max=2.0, help="Sampling temperature; 0 takes the argmax."
+        ),
+    ] = 1.0,
+    top_p: Annotated[
+        float,
+        typer.Option(
+            "--top_p",
+            max=1.0,
+            callback=_positive,
+            help="Samples from the smallest set of tokens whose probability reaches top_p.",
+        ),
+    ] = 1.0,
     reasoning_effort: Annotated[
         ReasoningEffort,
         typer.Option(
@@ -262,6 +282,7 @@ def chat(
             ),
             system=system,
             temperature=temperature,
+            top_p=top_p,
             reasoning_effort=reasoning_effort.value,
             show_thinking=show_thinking,
         )

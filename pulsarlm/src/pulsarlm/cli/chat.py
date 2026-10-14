@@ -29,6 +29,7 @@ def new_chat(
     *,
     system: str | None,
     temperature: float,
+    top_p: float,
     reasoning_effort: ReasoningEffort | None,
     show_thinking: bool,
 ) -> None:
@@ -93,7 +94,7 @@ def new_chat(
                         async_engine,
                         store,
                         prompt,
-                        sampling=SamplingParams(temperature=temperature),
+                        sampling=SamplingParams(temperature=temperature, top_p=top_p),
                         max_tokens=None,
                         eviction=eviction,
                     ):
