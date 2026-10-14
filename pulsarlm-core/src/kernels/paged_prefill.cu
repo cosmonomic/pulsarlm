@@ -91,30 +91,23 @@ template <typename scalar_t, bool BF16> void launch_tc_prefill(const attn::Paged
     });
 }
 
-at::Tensor paged_prefill(const attn::PagedAttnBatch& b, bool force_scalar) {
+at::Tensor paged_prefill(const attn::PagedAttnBatch& b) {
     if (b.total_q == 0 || b.num_seqs == 0) {
         return b.o;
     }
     auto stream = at::cuda::getCurrentCUDAStream();
-    bool tensor_core = !force_scalar && b.tensor_core_eligible();
-    if (tensor_core) {
-        attn::dispatch_page_head("attn_prefill", b.page_size, b.head_dim, [&](auto bs_tag, auto hd_tag) {
-            constexpr int BS = decltype(bs_tag)::value;
-            constexpr int HD = decltype(hd_tag)::value;
-            attn::dispatch_attn_tuning([&](auto row_tag) {
-                constexpr int KEY_PAGES = attn::prefill_key_pages<
-                    at::Half,
-                    BS,
-                    HD,
-                    attn::kAttnTuningTable[decltype(row_tag)::value].prefill_key_pages>();
-                tensor_core = attn::fits_shared_memory(attn::prefill_smem_bytes<at::Half, BS, HD, KEY_PAGES>());
-            });
-        });
-    }
-    if (!tensor_core) {
+    if (b.q.scalar_type() == at::kFloat) {
         attn::launch_attn_scalar(b, stream);
         return b.o;
     }
+    std::optional<std::string> unsupported = attention_unsupported_reason(
+        b.q.scalar_type(),
+        b.page_size,
+        b.head_dim,
+        b.n_q_heads,
+        b.n_kv_heads
+    );
+    TORCH_CHECK(!unsupported, "attn_prefill: ", *unsupported);
     attn::dispatch_tensor_core_dtype(b.q.scalar_type(), [&](auto type_tag, auto bf16_tag) {
         using scalar_t = typename decltype(type_tag)::type;
         launch_tc_prefill<scalar_t, decltype(bf16_tag)::value>(b, stream);
@@ -123,6 +116,23 @@ at::Tensor paged_prefill(const attn::PagedAttnBatch& b, bool force_scalar) {
 }
 
 }  // namespace
+
+bool attn::prefill_fits(int64_t page_size, int64_t head_dim) {
+    bool fits = false;
+    attn::dispatch_page_head("attn_prefill", page_size, head_dim, [&](auto bs_tag, auto hd_tag) {
+        constexpr int BS = decltype(bs_tag)::value;
+        constexpr int HD = decltype(hd_tag)::value;
+        attn::dispatch_attn_tuning([&](auto row_tag) {
+            constexpr int KEY_PAGES = attn::prefill_key_pages<
+                at::Half,
+                BS,
+                HD,
+                attn::kAttnTuningTable[decltype(row_tag)::value].prefill_key_pages>();
+            fits = attn::fits_shared_memory(attn::prefill_smem_bytes<at::Half, BS, HD, KEY_PAGES>());
+        });
+    });
+    return fits;
+}
 
 at::Tensor attn_prefill_cuda(
     const at::Tensor& q,
@@ -161,47 +171,7 @@ at::Tensor attn_prefill_cuda(
         mass_length_gain,
         lse_capture
     );
-    return paged_prefill(batch, /*force_scalar=*/false);
-}
-
-at::Tensor attn_prefill_scalar_cuda(
-    const at::Tensor& q,
-    const at::Tensor& k_pool,
-    const at::Tensor& v_pool,
-    const at::Tensor& page_tables,
-    const at::Tensor& cu_seqlens_q,
-    const at::Tensor& seqlens_k,
-    const at::Tensor& rope_layout,
-    const rope_parameters& rope,
-    double scale,
-    std::optional<int64_t> sliding_window,
-    const std::optional<at::Tensor>& k_norm_weight,
-    const std::optional<at::Tensor>& mass,
-    const std::optional<at::Tensor>& cu_view_pages,
-    const std::optional<at::Tensor>& attention_mass_decay,
-    double mass_length_gain,
-    const std::optional<at::Tensor>& lse_capture
-) {
-    const auto batch = attn::paged_attn_batch(
-        "attn_prefill_scalar",
-        q,
-        k_pool,
-        v_pool,
-        page_tables,
-        cu_seqlens_q,
-        seqlens_k,
-        rope_layout,
-        rope,
-        scale,
-        sliding_window,
-        k_norm_weight,
-        mass,
-        cu_view_pages,
-        attention_mass_decay,
-        mass_length_gain,
-        lse_capture
-    );
-    return paged_prefill(batch, /*force_scalar=*/true);
+    return paged_prefill(batch);
 }
 
 }  // namespace pulsarlm

@@ -1,5 +1,6 @@
 #include "attn_common.cuh"
 
+#include "pulsarlm/ops.hpp"
 #include "pulsarlm/rope.hpp"
 
 #include <ATen/ATen.h>
@@ -7,8 +8,11 @@
 
 #include <math_constants.h>
 
-// The argument contract both paged attention ops share, and the scalar kernel both
-// fall back to. Decode is the case of one query per sequence at the context's last
+#include <optional>
+#include <string>
+
+// The argument contract both paged attention ops share, and the scalar kernel float32
+// runs on. Decode is the case of one query per sequence at the context's last
 // position, so one kernel serves both.
 
 namespace pulsarlm {
@@ -139,14 +143,6 @@ template <typename scalar_t, int PAGE_SIZE> __global__ void attn_scalar_kernel(c
 }
 
 }  // namespace
-
-bool PagedAttnBatch::tensor_core_eligible() const {
-    const auto dt = this->q.scalar_type();
-    const bool compiled_head_dim = this->head_dim == 64 || this->head_dim == 128 || this->head_dim == 256 ||
-        this->head_dim == 512;
-    return (dt == at::kHalf || dt == at::kBFloat16) && compiled_head_dim &&
-        (this->page_size == 16 || this->page_size == 32);
-}
 
 void check_pools(const char* op, const at::Tensor& k_pool, const at::Tensor& v_pool) {
     TORCH_CHECK(
@@ -324,4 +320,32 @@ void launch_attn_scalar(const PagedAttnBatch& batch, cudaStream_t stream) {
 }
 
 }  // namespace attn
+std::optional<std::string> attention_unsupported_reason(
+    at::ScalarType dtype,
+    int64_t page_size,
+    int64_t head_dim,
+    int64_t n_q_heads,
+    int64_t n_kv_heads
+) {
+    if (dtype == at::kFloat) {
+        return std::nullopt;
+    }
+    if (dtype != at::kHalf && dtype != at::kBFloat16) {
+        return c10::str("dtype ", c10::toString(dtype), " is not float32, float16 or bfloat16");
+    }
+    if (head_dim != 64 && head_dim != 128 && head_dim != 256 && head_dim != 512) {
+        return c10::str("head dim ", head_dim, " is not 64, 128, 256 or 512");
+    }
+    if (page_size != 16 && page_size != 32) {
+        return c10::str("page size ", page_size, " is not 16 or 32");
+    }
+    if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0 || n_q_heads / n_kv_heads > 16) {
+        return c10::str(n_q_heads, " query heads over ", n_kv_heads, " KV heads is not a group of at most 16");
+    }
+    if (!attn::decode_fits(page_size, head_dim) || !attn::prefill_fits(page_size, head_dim)) {
+        return c10::str("page size ", page_size, " and head dim ", head_dim, " exceed the device's shared memory");
+    }
+    return std::nullopt;
+}
+
 }  // namespace pulsarlm

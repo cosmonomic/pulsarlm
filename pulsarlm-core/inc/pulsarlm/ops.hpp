@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
 #include <tuple>
 
 namespace pulsarlm {
@@ -46,6 +47,16 @@ void copy_segments_cuda(const at::Tensor& device, const at::Tensor& host, const 
 // index i with probability softmax(x / T)_i; a row with T <= 0 takes argmax(x). temperatures is fp32 [rows]; draws is
 // int64 [2, rows], each row's seed and draw count, of which the noise is a function.
 at::Tensor gumbel_race_cuda(const at::Tensor& scores, const at::Tensor& temperatures, const at::Tensor& draws);
+
+// Why the attention ops cannot run layers of this shape in dtype, or nullopt when they can: float16 and bfloat16 run
+// on the tensor-core kernels only, float32 on the scalar kernel.
+std::optional<std::string> attention_unsupported_reason(
+    at::ScalarType dtype,
+    int64_t page_size,
+    int64_t head_dim,
+    int64_t n_q_heads,
+    int64_t n_kv_heads
+);
 
 // Paged attention over a batch of sequences, each a VIEW: an ordered list of lines
 // (page_size-key pages) of the shared pool. Key index j of sequence s lives at
@@ -116,26 +127,6 @@ at::Tensor attn_decode_cuda(
     int64_t num_splits = 0
 );
 
-// attn_decode on the scalar kernel alone: the reference the tensor-core path is
-// checked against.
-at::Tensor attn_decode_scalar_cuda(
-    const at::Tensor& q,
-    const at::Tensor& k_pool,
-    const at::Tensor& v_pool,
-    const at::Tensor& page_tables,
-    const at::Tensor& context_lens,
-    const at::Tensor& rope_layout,
-    const rope_parameters& rope,
-    double scale,
-    std::optional<int64_t> sliding_window,
-    const std::optional<at::Tensor>& k_norm_weight,
-    const std::optional<at::Tensor>& mass = std::nullopt,
-    const std::optional<at::Tensor>& cu_view_pages = std::nullopt,
-    const std::optional<at::Tensor>& attention_mass_decay = std::nullopt,
-    double mass_length_gain = 0.0,
-    const std::optional<at::Tensor>& lse_capture = std::nullopt
-);
-
 // Prefill: a ragged batch of query chunks, causal over each view. Sequence i's queries
 // are q[cu_seqlens_q[i] : cu_seqlens_q[i+1]] (q [total_q, n_q_heads, head_dim]) at view
 // indices [ctx_start_i, seqlens_k[i]) with ctx_start_i = seqlens_k[i] - seq_q_i, and
@@ -143,27 +134,6 @@ at::Tensor attn_decode_scalar_cuda(
 // query at offset o from its chunk's end contributes alpha * (1 - alpha)^o times its
 // weight. Returns o [total_q, n_q_heads, head_dim].
 at::Tensor attn_prefill_cuda(
-    const at::Tensor& q,
-    const at::Tensor& k_pool,
-    const at::Tensor& v_pool,
-    const at::Tensor& page_tables,
-    const at::Tensor& cu_seqlens_q,
-    const at::Tensor& seqlens_k,
-    const at::Tensor& rope_layout,
-    const rope_parameters& rope,
-    double scale,
-    std::optional<int64_t> sliding_window,
-    const std::optional<at::Tensor>& k_norm_weight,
-    const std::optional<at::Tensor>& mass = std::nullopt,
-    const std::optional<at::Tensor>& cu_view_pages = std::nullopt,
-    const std::optional<at::Tensor>& attention_mass_decay = std::nullopt,
-    double mass_length_gain = 0.0,
-    const std::optional<at::Tensor>& lse_capture = std::nullopt
-);
-
-// attn_prefill on the scalar kernel alone: the reference the tensor-core path is
-// checked against.
-at::Tensor attn_prefill_scalar_cuda(
     const at::Tensor& q,
     const at::Tensor& k_pool,
     const at::Tensor& v_pool,

@@ -1,5 +1,7 @@
 #include "pulsarlm/engine.hpp"
 
+#include "pulsarlm/ops.hpp"
+
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 
@@ -10,8 +12,10 @@
 #include <latch>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -40,11 +44,13 @@ void check_kv_cache(const engine_config& config, std::span<const page_shape> sha
         carved_end = ceil_div(carved_end, bytes) * bytes + bytes;
     }
     if (config.kv_cache_bytes < carved_end) {
-        throw std::invalid_argument(std::format(
-            "a KV cache of {} bytes holds no line of every KV layer; a line of each takes {} bytes",
-            config.kv_cache_bytes,
-            carved_end
-        ));
+        throw std::invalid_argument(
+            std::format(
+                "a KV cache of {} bytes holds no line of every KV layer; a line of each takes {} bytes",
+                config.kv_cache_bytes,
+                carved_end
+            )
+        );
     }
 }
 
@@ -52,17 +58,35 @@ void check_staging(const engine_config& config, std::span<const page_shape> shap
     for (std::size_t layer = 0; layer < shapes.size(); layer++) {
         std::size_t bytes = line_bytes(shapes[layer]);
         if (config.staging_bytes < bytes) {
-            throw std::invalid_argument(std::format(
-                "a staging buffer of {} bytes holds no page of KV layer {}; a page takes {} bytes",
-                config.staging_bytes,
-                layer,
-                bytes
-            ));
+            throw std::invalid_argument(
+                std::format(
+                    "a staging buffer of {} bytes holds no page of KV layer {}; a page takes {} bytes",
+                    config.staging_bytes,
+                    layer,
+                    bytes
+                )
+            );
+        }
+    }
+}
+
+void check_attention(const engine_config& config, std::span<const kv_layer> layers) {
+    for (std::size_t layer = 0; layer < layers.size(); layer++) {
+        std::optional<std::string> unsupported = attention_unsupported_reason(
+            config.kv_dtype,
+            static_cast<std::int64_t>(config.page_size),
+            static_cast<std::int64_t>(layers[layer].head_dim),
+            static_cast<std::int64_t>(layers[layer].n_q_heads),
+            static_cast<std::int64_t>(layers[layer].n_kv_heads)
+        );
+        if (unsupported) {
+            throw std::invalid_argument(std::format("KV layer {} cannot run attention: {}", layer, *unsupported));
         }
     }
 }
 
 kv_cache make_cache(const engine_config& config, std::span<const kv_layer> layers, page_store& store) {
+    check_attention(config, layers);
     std::vector<page_shape> shapes = page_shapes(config, layers);
     check_kv_cache(config, shapes);
     check_staging(config, shapes);
@@ -74,25 +98,29 @@ kv_cache make_cache(const engine_config& config, std::span<const kv_layer> layer
 std::vector<page_shape> page_shapes(const engine_config& config, std::span<const kv_layer> layers) {
     std::vector<page_shape> shapes;
     for (const kv_layer& layer : layers) {
-        shapes.push_back(page_shape{
-            .n_layers = 1,
-            .page_size = config.page_size,
-            .n_kv_heads = layer.n_kv_heads,
-            .head_dim = layer.head_dim,
-            .dtype = config.kv_dtype,
-            .values_only = layer.values_only,
-        });
+        shapes.push_back(
+            page_shape{
+                .n_layers = 1,
+                .page_size = config.page_size,
+                .n_kv_heads = layer.n_kv_heads,
+                .head_dim = layer.head_dim,
+                .dtype = config.kv_dtype,
+                .values_only = layer.values_only,
+            }
+        );
     }
     return shapes;
 }
 
 void validate(const request& r, std::size_t page_size, std::size_t vocab_size) {
     if (r.initial_state.tail.size() >= page_size) {
-        throw std::invalid_argument(std::format(
-            "the initial state's tail holds {} tokens; it must be shorter than a page ({})",
-            r.initial_state.tail.size(),
-            page_size
-        ));
+        throw std::invalid_argument(
+            std::format(
+                "the initial state's tail holds {} tokens; it must be shorter than a page ({})",
+                r.initial_state.tail.size(),
+                page_size
+            )
+        );
     }
     if (r.initial_state.tail.empty() && r.tokens.empty()) {
         throw std::invalid_argument("the request has no token to forward");

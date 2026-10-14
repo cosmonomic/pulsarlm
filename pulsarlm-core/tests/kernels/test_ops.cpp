@@ -5,6 +5,7 @@
 #include <c10/cuda/CUDAFunctions.h>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <algorithm>
 #include <array>
@@ -988,6 +989,36 @@ TEST_CASE("partial RoPE passes the unrotated pairs through", "[ops][cuda]") {
         );
     }
     CHECK(!at::equal(rotated_x.slice(-1, 0, rotated), x.slice(-1, 0, rotated)));
+}
+
+TEST_CASE("bfloat16 attention of a shape the tensor-core kernels lack fails instead of running", "[ops][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    REQUIRE(pulsarlm::attention_unsupported_reason(at::kFloat, 8, 32, 4, 1) == std::nullopt);
+    REQUIRE(pulsarlm::attention_unsupported_reason(at::kBFloat16, 16, 128, 32, 8) == std::nullopt);
+    REQUIRE(pulsarlm::attention_unsupported_reason(at::kBFloat16, 16, 96, 32, 8).has_value());
+    REQUIRE(pulsarlm::attention_unsupported_reason(at::kBFloat16, 8, 128, 32, 8).has_value());
+    REQUIRE(pulsarlm::attention_unsupported_reason(at::kBFloat16, 16, 128, 32, 1).has_value());
+
+    auto opts = at::device(at::kCUDA).dtype(at::kBFloat16);
+    auto pool = at::zeros({2, kPageSize, 1, 32}, opts);
+    auto q = at::randn({1, 4, 32}, opts);
+    REQUIRE_THROWS_WITH(
+        pulsarlm::attn_decode_cuda(
+            q,
+            pool,
+            pool,
+            int32_cuda({0}).view({1, 1}),
+            int32_cuda({4}),
+            identity_layout(1),
+            pulsarlm::rope_parameters{.theta = kTheta},
+            kScale,
+            std::nullopt,
+            std::nullopt
+        ),
+        Catch::Matchers::ContainsSubstring("head dim 32")
+    );
 }
 
 TEST_CASE("write_kv places each token at its view index through the page table", "[ops][cuda]") {

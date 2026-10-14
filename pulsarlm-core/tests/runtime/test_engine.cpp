@@ -179,6 +179,15 @@ TEST_CASE("an engine whose staging buffer holds no page is rejected") {
     );
 }
 
+TEST_CASE("an engine whose bfloat16 attention the kernels cannot run is rejected") {
+    pulsarlm::engine_config bfloat16 = config(16);
+    bfloat16.kv_dtype = at::kBFloat16;
+    REQUIRE_THROWS_AS(
+        pulsarlm::engine(std::make_unique<successor_model>(), bfloat16, std::make_unique<stalling_store>()),
+        std::invalid_argument
+    );
+}
+
 TEST_CASE("a submitted request passes its tokens and its end state to its callbacks") {
     pulsarlm::engine e(std::make_unique<successor_model>(), config(16), std::make_unique<stalling_store>());
     auto recorded = std::make_shared<request_results>();

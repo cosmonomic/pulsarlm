@@ -34,18 +34,18 @@ Qwen3Model::Qwen3Model(
     double rms_eps,
     c10::Dict<std::string, at::Tensor> weights
 )
-    : n_layers(n_layers),
-      n_heads(n_heads),
-      n_kv_heads(n_kv_heads),
-      head_dim(head_dim),
-      hidden(hidden),
-      intermediate(intermediate),
-      vocab(vocab),
-      rope_theta(rope_theta),
-      rms_eps(rms_eps),
-      scale(1.0 / std::sqrt(static_cast<double>(head_dim))),
-      embed_tokens(need(weights, "model.embed_tokens.weight")),
-      norm_weight(need(weights, "model.norm.weight")) {
+: n_layers(n_layers),
+  n_heads(n_heads),
+  n_kv_heads(n_kv_heads),
+  head_dim(head_dim),
+  hidden(hidden),
+  intermediate(intermediate),
+  vocab(vocab),
+  rope_theta(rope_theta),
+  rms_eps(rms_eps),
+  scale(1.0 / std::sqrt(static_cast<double>(head_dim))),
+  embed_tokens(need(weights, "model.embed_tokens.weight")),
+  norm_weight(need(weights, "model.norm.weight")) {
     // Untied lm_head when the checkpoint ships one, else tied to the token embedding.
     if (weights.contains("lm_head.weight")) {
         this->lm_head = weights.at("lm_head.weight");
@@ -146,7 +146,8 @@ std::vector<kv_layer> Qwen3Model::kv_layers() const {
         this->n_layers,
         kv_layer{
             .n_kv_heads = static_cast<std::size_t>(this->n_kv_heads),
-            .head_dim = static_cast<std::size_t>(this->head_dim)
+            .head_dim = static_cast<std::size_t>(this->head_dim),
+            .n_q_heads = static_cast<std::size_t>(this->n_heads)
         }
     );
 }

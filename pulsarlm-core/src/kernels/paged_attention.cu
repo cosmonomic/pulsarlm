@@ -633,25 +633,38 @@ void launch_tc_decode(const attn::PagedAttnBatch& b, int64_t forced_splits, cuda
     }
 }
 
-at::Tensor paged_decode(const attn::PagedAttnBatch& b, bool force_scalar, int64_t num_splits) {
+}  // namespace
+
+bool attn::decode_fits(int64_t page_size, int64_t head_dim) {
+    bool fits = false;
+    attn::dispatch_page_head("attn_decode", page_size, head_dim, [&](auto bs_tag, auto hd_tag) {
+        fits = attn::fits_shared_memory(
+            DecodeTiles<at::Half, decltype(bs_tag)::value, decltype(hd_tag)::value>::bytes()
+        );
+    });
+    return fits;
+}
+
+namespace {
+
+at::Tensor paged_decode(const attn::PagedAttnBatch& b, int64_t num_splits) {
     TORCH_CHECK(num_splits >= 0, "attn_decode: num_splits must be >= 0");
     if (b.num_seqs == 0) {
         return b.o;
     }
     auto stream = at::cuda::getCurrentCUDAStream();
-    // The group's query heads share the 16 MMA rows of one tile.
-    bool tensor_core = !force_scalar && b.tensor_core_eligible() && b.n_q_heads / b.n_kv_heads <= 16;
-    if (tensor_core) {
-        attn::dispatch_page_head("attn_decode", b.page_size, b.head_dim, [&](auto bs_tag, auto hd_tag) {
-            constexpr int BS = decltype(bs_tag)::value;
-            constexpr int HD = decltype(hd_tag)::value;
-            tensor_core = attn::fits_shared_memory(DecodeTiles<at::Half, BS, HD>::bytes());
-        });
-    }
-    if (!tensor_core) {
+    if (b.q.scalar_type() == at::kFloat) {
         attn::launch_attn_scalar(b, stream);
         return b.o;
     }
+    std::optional<std::string> unsupported = attention_unsupported_reason(
+        b.q.scalar_type(),
+        b.page_size,
+        b.head_dim,
+        b.n_q_heads,
+        b.n_kv_heads
+    );
+    TORCH_CHECK(!unsupported, "attn_decode: ", *unsupported);
     attn::dispatch_tensor_core_dtype(b.q.scalar_type(), [&](auto type_tag, auto bf16_tag) {
         using scalar_t = typename decltype(type_tag)::type;
         launch_tc_decode<scalar_t, decltype(bf16_tag)::value>(b, num_splits, stream);
@@ -778,46 +791,7 @@ at::Tensor attn_decode_cuda(
         mass_length_gain,
         lse_capture
     );
-    return paged_decode(batch, /*force_scalar=*/false, num_splits);
-}
-
-at::Tensor attn_decode_scalar_cuda(
-    const at::Tensor& q,
-    const at::Tensor& k_pool,
-    const at::Tensor& v_pool,
-    const at::Tensor& page_tables,
-    const at::Tensor& context_lens,
-    const at::Tensor& rope_layout,
-    const rope_parameters& rope,
-    double scale,
-    std::optional<int64_t> sliding_window,
-    const std::optional<at::Tensor>& k_norm_weight,
-    const std::optional<at::Tensor>& mass,
-    const std::optional<at::Tensor>& cu_view_pages,
-    const std::optional<at::Tensor>& attention_mass_decay,
-    double mass_length_gain,
-    const std::optional<at::Tensor>& lse_capture
-) {
-    const auto batch = attn::paged_attn_batch(
-        "attn_decode_scalar",
-        q,
-        k_pool,
-        v_pool,
-        page_tables,
-        std::nullopt,
-        context_lens,
-        rope_layout,
-        rope,
-        scale,
-        sliding_window,
-        k_norm_weight,
-        mass,
-        cu_view_pages,
-        attention_mass_decay,
-        mass_length_gain,
-        lse_capture
-    );
-    return paged_decode(batch, /*force_scalar=*/true, 0);
+    return paged_decode(batch, num_splits);
 }
 
 }  // namespace pulsarlm

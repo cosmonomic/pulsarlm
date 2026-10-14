@@ -79,11 +79,11 @@ struct PagedAttnBatch {
             static_cast<float>(this->scale),
         };
     }
-
-    // fp16/bf16 with a (page_size, head_dim) the tensor-core kernels are compiled for. Whether a kernel's shared memory
-    // fits is checked apart, by fits_shared_memory.
-    bool tensor_core_eligible() const;
 };
+
+// Whether the decode and prefill kernels' tiles for a compiled page size and head dim fit in shared memory.
+bool decode_fits(int64_t page_size, int64_t head_dim);
+bool prefill_fits(int64_t page_size, int64_t head_dim);
 
 // k_pool and v_pool are [num_pages, page_size, n_kv_heads, head_dim] with one stride, each page packed and 16-byte
 // aligned; pages may be any number of elements apart.

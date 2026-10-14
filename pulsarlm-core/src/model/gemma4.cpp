@@ -59,6 +59,7 @@ Gemma4Model::Gemma4Model(gemma4_config config, const c10::Dict<std::string, at::
                 kv_layer{
                     .n_kv_heads = static_cast<std::size_t>(full ? c.global_n_kv_heads : c.n_kv_heads),
                     .head_dim = static_cast<std::size_t>(full ? c.global_head_dim : c.head_dim),
+                    .n_q_heads = static_cast<std::size_t>(c.n_heads),
                     .values_only = full && c.attention_k_eq_v,
                     .sliding_window = full ? std::nullopt
                                            : std::optional<std::size_t>(static_cast<std::size_t>(c.sliding_window)),

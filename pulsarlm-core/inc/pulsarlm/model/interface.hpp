@@ -15,6 +15,8 @@ namespace pulsarlm {
 struct kv_layer {
     std::size_t n_kv_heads;
     std::size_t head_dim;
+    // The query heads of each attention layer reading this KV layer.
+    std::size_t n_q_heads = 0;
     bool values_only = false;
     std::optional<std::size_t> sliding_window;
 };
