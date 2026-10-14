@@ -377,6 +377,7 @@ def run(
     view_pages: int = 256,
     n_working: int = 64,
     kv_cache_gib: float | None = None,
+    store_gib: float = 4.0,
     concurrency: int = 4,
     reasoning_effort: str = "medium",
     port: int = 18090,
@@ -417,6 +418,7 @@ def run(
             ]
         if kv_cache_gib is not None:
             server_args += ["--kv_cache_gib", str(kv_cache_gib)]
+        server_args += ["--store_gib", str(store_gib)]
         with server(model, out / name, port, server_args) as base_url:
             asyncio.run(
                 run_setting(
