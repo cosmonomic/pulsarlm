@@ -1,4 +1,5 @@
-"""The page store and state cache of one server, in host RAM (NOTES.md section 7)."""
+"""The page store and state cache of one server, in host RAM and optionally a file
+(NOTES.md section 7)."""
 
 import math
 import threading
@@ -8,13 +9,11 @@ from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import count
+from pathlib import Path
 
-from torch import Tensor
 
 from pulsarlm.core.engine import State
-
-type Page = tuple[Tensor, Tensor]
-type StateKey = tuple[bytes, tuple[int, ...]]
+from pulsarlm.store_file import Page, StateKey, StoreFile
 
 NO_PAGES = b""
 
@@ -34,7 +33,8 @@ def page_bytes(page: Page) -> int:
 
 @dataclass
 class StoredPage:
-    page: Page
+    page: Page | None
+    nbytes: int
     last_put: int
     references: int = 0
     pins: int = 0
@@ -56,9 +56,14 @@ class LocalStore:
     pages take more than capacity_bytes, the least recently used states are
     dropped, down to the newest one; pages that cannot be deleted yet can keep
     the store above its capacity.
+
+    With a path, the file holds a copy of every page and state, read at
+    construction; a page only in the file is read into RAM when fetched.
     """
 
-    def __init__(self, page_size: int, capacity_bytes: int = 16 * 2**30) -> None:
+    def __init__(
+        self, page_size: int, capacity_bytes: int = 16 * 2**30, path: Path | None = None
+    ) -> None:
         self._lock = threading.Lock()
         self._page_size = page_size
         self._capacity_bytes = capacity_bytes
@@ -70,6 +75,31 @@ class LocalStore:
         self._clock = count()
         # Insertion order is opening order, so the first is the oldest open lease.
         self._open_leases: dict[int, None] = {}
+        self._file = None if path is None else StoreFile(path)
+        if self._file is not None:
+            self._load(self._file)
+
+    def _load(self, file: StoreFile) -> None:
+        sizes, saved = file.load()
+        for h, nbytes in sizes.items():
+            # Older than every lease, so a page no state references is deleted.
+            self._pages[h] = StoredPage(None, nbytes, last_put=-1)
+            self._page_bytes += nbytes
+        self._unreferenced.update(sizes)
+        incomplete = []
+        last_used = -1
+        for key, state, page_keys, used in saved:
+            last_used = used
+            if not all(h in self._pages for h in page_keys):
+                incomplete.append(key)
+                continue
+            for h in page_keys:
+                self._reference(h)
+            self._tails.setdefault(key[0], set()).add(key[1])
+            self._states[key] = StoredState(state, page_keys)
+        self._clock = count(last_used + 1)
+        file.delete(incomplete, [])
+        self._fit()
 
     def fetch(self, hashes: list[bytes]) -> Future[list[Page | None]]:
         with self._lock:
@@ -77,20 +107,48 @@ class LocalStore:
                 stored.page if (stored := self._pages.get(h)) is not None else None
                 for h in hashes
             ]
+            in_file = [
+                i
+                for i, h in enumerate(hashes)
+                if (stored := self._pages.get(h)) is not None and stored.page is None
+            ]
         future: Future[list[Page | None]] = Future()
-        future.set_result(pages)
+        if self._file is None or not in_file:
+            future.set_result(pages)
+            return future
+
+        def keep(read: Future[list[Page | None]]) -> None:
+            try:
+                loaded = read.result()
+            except Exception as error:
+                future.set_exception(error)
+                return
+            with self._lock:
+                for i, page in zip(in_file, loaded, strict=True):
+                    pages[i] = page
+                    stored = self._pages.get(hashes[i])
+                    if page is not None and stored is not None and stored.page is None:
+                        stored.page = page
+            future.set_result(pages)
+
+        self._file.read([hashes[i] for i in in_file]).add_done_callback(keep)
         return future
 
     def put(self, hashes: list[bytes], pages: list[Page]) -> None:
         with self._lock:
             now = next(self._clock)
+            new = []
             for h, page in zip(hashes, pages, strict=True):
                 if (stored := self._pages.get(h)) is not None:
                     stored.last_put = now
                 else:
-                    self._pages[h] = StoredPage(page, now)
-                    self._page_bytes += page_bytes(page)
+                    nbytes = page_bytes(page)
+                    self._pages[h] = StoredPage(page, nbytes, now)
+                    self._page_bytes += nbytes
                     self._unreferenced.add(h)
+                    new.append((h, page, nbytes))
+            if self._file is not None and new:
+                self._file.put(new)
 
     @contextmanager
     def lease(
@@ -128,6 +186,8 @@ class LocalStore:
             else:
                 self._tails.setdefault(key[0], set()).add(key[1])
             self._states[key] = StoredState(state, page_keys)
+            if self._file is not None:
+                self._file.write(key, state, page_keys, next(self._clock))
             self._fit()
 
     def __len__(self) -> int:
@@ -161,6 +221,8 @@ class LocalStore:
             if longest is not None:
                 key = (last_page, longest)
                 self._states.move_to_end(key)
+                if self._file is not None:
+                    self._file.touch(key, next(self._clock))
                 return self._states[key], start + len(longest)
         return StoredState(State(), []), 0
 
@@ -178,17 +240,22 @@ class LocalStore:
                 self._unreferenced.add(h)
 
     def _fit(self) -> None:
-        self._delete_unused_pages()
+        deleted_states: list[StateKey] = []
+        deleted_pages = self._delete_unused_pages()
         while self._page_bytes > self._capacity_bytes and len(self._states) > 1:
-            (last_page, tail), dropped = self._states.popitem(last=False)
+            key, dropped = self._states.popitem(last=False)
+            last_page, tail = key
             tails = self._tails[last_page]
             tails.remove(tail)
             if not tails:
                 del self._tails[last_page]
             self._dereference_all(dropped)
-            self._delete_unused_pages()
+            deleted_states.append(key)
+            deleted_pages += self._delete_unused_pages()
+        if self._file is not None and (deleted_states or deleted_pages):
+            self._file.delete(deleted_states, deleted_pages)
 
-    def _delete_unused_pages(self) -> None:
+    def _delete_unused_pages(self) -> list[bytes]:
         oldest_lease = next(iter(self._open_leases), math.inf)
         unused = [
             h
@@ -196,5 +263,6 @@ class LocalStore:
             if self._pages[h].pins == 0 and self._pages[h].last_put < oldest_lease
         ]
         for h in unused:
-            self._page_bytes -= page_bytes(self._pages.pop(h).page)
+            self._page_bytes -= self._pages.pop(h).nbytes
         self._unreferenced.difference_update(unused)
+        return unused

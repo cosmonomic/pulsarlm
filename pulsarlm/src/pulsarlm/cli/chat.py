@@ -36,19 +36,24 @@ def new_chat(
     """Reads user turns until end of input or an interrupt. Raises
     PulsarLMModelLoadingError when no data path holds the model, EngineStopped
     when the engine's loop exited."""
+    path = checkpoint.model_path(settings.model, settings.data_dir)
     loaded = checkpoint.load(
-        checkpoint.model_path(settings.model, settings.data_dir),
+        path,
         device=torch.device(settings.device),
         dtype=getattr(torch, settings.dtype),
     )
     cfg = loaded.config
     stops = stop_ids(loaded.tokenizer, cfg.eos_ids)
-    store = LocalStore(PAGE_SIZE, int(settings.store_gib * 2**30))
+    store = LocalStore(
+        PAGE_SIZE,
+        int(settings.store_gib * 2**30),
+        checkpoint.store_path(settings.data_dir),
+    )
     engine = Engine(
         store,
         engine_model(cfg),
         loaded.weights,
-        model_name=settings.model,
+        model_name=f"{settings.model}@{checkpoint.weights_version(path)}",
         page_size=PAGE_SIZE,
         kv_dtype=getattr(torch, settings.dtype),
         kv_cache_gib=settings.kv_cache_gib,

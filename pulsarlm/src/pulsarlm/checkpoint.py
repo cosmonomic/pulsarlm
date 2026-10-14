@@ -90,6 +90,18 @@ def new_model_path(model: str, data_dir: Path | None = None) -> Path:
     return next(iter_data_paths(data_dir)) / f"{model}.pulsarlm"
 
 
+def store_path(data_dir: Path | None = None) -> Path:
+    return next(iter_data_paths(data_dir)) / "store.sqlite"
+
+
+def weights_version(path: Path) -> str:
+    with zipfile.ZipFile(path, mode="r") as archive:
+        members = sorted(
+            (info.filename, info.CRC, info.file_size) for info in archive.infolist()
+        )
+    return hashlib.sha256(json.dumps(members).encode()).hexdigest()[:16]
+
+
 def load_config(path: zipfile.Path) -> PulsarLMModelConfig:
     with (path / "config.json").open("r") as f:
         raw = json.load(f)

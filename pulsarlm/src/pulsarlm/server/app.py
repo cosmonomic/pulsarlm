@@ -25,12 +25,16 @@ def load_server_state(settings: Settings, path: Path) -> ServerState:
     )
     cfg = model.config
     stops = stop_ids(model.tokenizer, cfg.eos_ids)
-    store = LocalStore(PAGE_SIZE, int(settings.store_gib * 2**30))
+    store = LocalStore(
+        PAGE_SIZE,
+        int(settings.store_gib * 2**30),
+        checkpoint.store_path(settings.data_dir),
+    )
     engine = Engine(
         store,
         engine_model(cfg),
         model.weights,
-        model_name=settings.model,
+        model_name=f"{settings.model}@{checkpoint.weights_version(path)}",
         page_size=PAGE_SIZE,
         kv_dtype=getattr(torch, settings.dtype),
         kv_cache_gib=settings.kv_cache_gib,

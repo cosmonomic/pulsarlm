@@ -91,7 +91,7 @@ def serve(
         float,
         typer.Option(
             "--store_gib",
-            help="Host memory the local store keeps pages in, in GiB.",
+            help="Pages the store keeps in host memory and in store.sqlite under the data directory, in GiB.",
             rich_help_panel="Memory",
         ),
     ] = 16.0,
@@ -233,7 +233,7 @@ def chat(
         float,
         typer.Option(
             "--store_gib",
-            help="Host memory the local store keeps pages in, in GiB.",
+            help="Pages the store keeps in host memory and in store.sqlite under the data directory, in GiB.",
             rich_help_panel="Memory",
         ),
     ] = 16.0,

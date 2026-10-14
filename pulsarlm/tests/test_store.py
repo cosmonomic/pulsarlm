@@ -1,11 +1,18 @@
 """LocalStore with digests chained in Python, as Engine.page_digests chains them."""
 
 import hashlib
+import sqlite3
+import subprocess
+import sys
+import textwrap
+from contextlib import closing
+from pathlib import Path
 
 import torch
 
 from pulsarlm.core.engine import State
 from pulsarlm.store import LocalStore
+from pulsarlm.store_file import StoreInUseError
 
 PAGE_SIZE = 4
 # page() makes a page of two one-element float32 tensors.
@@ -185,3 +192,167 @@ def test_a_page_keeping_one_tensor_counts_its_bytes_once():
     v = torch.full((1,), 1.0, dtype=torch.float32)
     store.put(page_digests(HISTORY[:4]), [(v, v)])
     assert store.byte_count() == PAGE_BYTES // 2
+
+
+def in_another_process(path: Path, script: str) -> subprocess.CompletedProcess[str]:
+    """Runs script with this file's helpers, store_path set to path, and LocalStore
+    imported; the process exits once its store wrote everything."""
+    prelude = f"""
+        import sys
+        sys.path.insert(0, {str(Path(__file__).parent)!r})
+        from pathlib import Path
+        from test_store import *
+        store_path = Path({str(path)!r})
+    """
+    return subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(prelude) + textwrap.dedent(script)],
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_states_and_pages_survive_a_restart(tmp_path: Path):
+    path = tmp_path / "store.sqlite"
+    wrote = in_another_process(
+        path,
+        """
+        store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=store_path)
+        run_request(store, HISTORY, HISTORY[:9])
+        """,
+    )
+    assert wrote.returncode == 0, wrote.stderr
+
+    store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=path)
+    assert len(store) == 1
+    assert store.byte_count() == 2 * PAGE_BYTES
+    with store.lease(HISTORY, page_digests(HISTORY)) as (state, covered):
+        assert covered == 9
+        assert state.page_hashes == page_digests(HISTORY[:8])
+        assert state.tail == [HISTORY[8]]
+        fetched = store.fetch(state.page_hashes[1:]).result()[0]
+        assert fetched is not None
+        k, v = fetched
+        assert k.tolist() == [1.0] and v.tolist() == [-1.0]
+
+
+def test_a_page_keeping_one_tensor_is_read_back_as_one(tmp_path: Path):
+    path = tmp_path / "store.sqlite"
+    wrote = in_another_process(
+        path,
+        """
+        store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=store_path)
+        v = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3)
+        with store.lease(HISTORY, page_digests(HISTORY)):
+            store.put(page_digests(HISTORY[:4]), [(v, v)])
+            write(store, reached(HISTORY[:5]))
+        """,
+    )
+    assert wrote.returncode == 0, wrote.stderr
+
+    store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=path)
+    fetched = store.fetch(page_digests(HISTORY[:4])).result()[0]
+    assert fetched is not None
+    k, v = fetched
+    assert k is v
+    assert v.dtype == torch.bfloat16
+    assert v.tolist() == [[0, 1, 2], [3, 4, 5]]
+
+
+def test_a_second_process_cannot_open_the_store(tmp_path: Path):
+    path = tmp_path / "store.sqlite"
+    LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=path)
+    opened = in_another_process(
+        path, "LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=store_path)"
+    )
+    assert opened.returncode != 0
+    assert StoreInUseError.__name__ in opened.stderr
+
+
+def test_a_restart_deletes_pages_no_state_references(tmp_path: Path):
+    path = tmp_path / "store.sqlite"
+    wrote = in_another_process(
+        path,
+        """
+        store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=store_path)
+        with store.lease(HISTORY, page_digests(HISTORY)):
+            put_pages(store, HISTORY)
+        """,
+    )
+    assert wrote.returncode == 0, wrote.stderr
+
+    store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=path)
+    assert store.page_count() == 0
+    assert store.byte_count() == 0
+
+
+def test_a_restart_drops_a_state_missing_a_page(tmp_path: Path):
+    path = tmp_path / "store.sqlite"
+    wrote = in_another_process(
+        path,
+        """
+        store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=store_path)
+        run_request(store, HISTORY, HISTORY[:9])
+        """,
+    )
+    assert wrote.returncode == 0, wrote.stderr
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute(
+            "DELETE FROM pages WHERE key = ?", (page_digests(HISTORY)[0],)
+        )
+
+    store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=path)
+    assert len(store) == 0
+    assert store.page_count() == 0
+
+
+def test_recency_survives_a_restart(tmp_path: Path):
+    path = tmp_path / "store.sqlite"
+    wrote = in_another_process(
+        path,
+        """
+        store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=store_path)
+        used, unused = ([base + t for t in HISTORY[:8]] for base in (10, 20))
+        run_request(store, used, used)
+        run_request(store, unused, unused)
+        with store.lease(used + [1], page_digests(used + [1])):
+            pass
+        """,
+    )
+    assert wrote.returncode == 0, wrote.stderr
+
+    store = LocalStore(PAGE_SIZE, capacity_bytes=2 * PAGE_BYTES, path=path)
+    used = [10 + t for t in HISTORY[:8]]
+    assert len(store) == 1
+    with store.lease(used + [1], page_digests(used + [1])) as (_, covered):
+        assert covered == len(used)
+
+
+def test_a_smaller_capacity_after_a_restart_deletes_states_from_the_file(
+    tmp_path: Path,
+):
+    path = tmp_path / "store.sqlite"
+    wrote = in_another_process(
+        path,
+        """
+        store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=store_path)
+        first, second = ([base + t for t in HISTORY[:8]] for base in (10, 20))
+        run_request(store, first, first)
+        run_request(store, second, second)
+        """,
+    )
+    assert wrote.returncode == 0, wrote.stderr
+    shrunk = in_another_process(
+        path,
+        """
+        store = LocalStore(PAGE_SIZE, capacity_bytes=PAGE_BYTES, path=store_path)
+        assert len(store) == 1
+        """,
+    )
+    assert shrunk.returncode == 0, shrunk.stderr
+
+    store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=path)
+    second = [20 + t for t in HISTORY[:8]]
+    assert len(store) == 1
+    assert store.byte_count() == 2 * PAGE_BYTES
+    with store.lease(second + [1], page_digests(second + [1])) as (_, covered):
+        assert covered == len(second)
