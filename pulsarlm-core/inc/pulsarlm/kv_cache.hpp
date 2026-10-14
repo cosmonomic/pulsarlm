@@ -20,7 +20,8 @@
 
 namespace pulsarlm {
 
-// A page of a values_only shape holds one tensor, as both k and v.
+// A page of a values_only shape holds one tensor, as both k and v. The cache's pages and lines lay a page out head
+// first, [n_kv_heads, k then v, page_size, head_dim], and k and v view it.
 struct page {
     at::Tensor k;  // [n_layers, page_size, n_kv_heads, head_dim]
     at::Tensor v;
@@ -77,7 +78,7 @@ class kv_cache {
         std::uint32_t next_free = no_line;
     };
 
-    // lines is indexed by line id: line i covers pool bytes [i line_bytes, (i + 1) line_bytes), K then V. Ids whose
+    // lines is indexed by line id: line i covers pool bytes [i line_bytes, (i + 1) line_bytes). Ids whose
     // bytes another class carved hold no line of this class.
     struct size_class {
         std::size_t line_bytes;
@@ -112,12 +113,6 @@ class kv_cache {
         std::uint32_t line_id;
     };
 
-    // A page's room in the staging buffer: K then V from byte offset, as in a line.
-    struct staging_page {
-        std::size_t offset;
-        page views;
-    };
-
     at::Tensor pool;
     // The pool bytes below it are carved into lines.
     std::size_t bump = 0;
@@ -145,15 +140,15 @@ class kv_cache {
     std::vector<std::size_t> free_counts() const;
     task<void> hold_staging();
     void release_staging() noexcept;
-    // Room in the staging buffer for a page of layer past its first used bytes, which then cover it too. nullopt when
-    // the page does not fit.
-    std::optional<staging_page> staging_slot(std::size_t layer, std::size_t& used) const;
+    // The byte offset of room in the staging buffer for a page of layer, laid out as a line, past its first used bytes,
+    // which then cover it too. nullopt when the page does not fit.
+    std::optional<std::size_t> staging_offset(std::size_t layer, std::size_t& used) const;
     std::size_t line_offset(std::size_t layer, std::uint32_t line_id) const noexcept;
     // The transfers go through the staging buffer as many pages at a time as it holds, and complete once the stream has
     // finished them.
     task<void> copy_from_host(std::span<const layer_line> targets, std::span<const page> pages, cudaStream_t stream);
     task<void> copy_to_host(std::span<const layer_line> sources, std::span<page> pages, cudaStream_t stream);
-    // Pageable host pages, one shaped like each line of sources. nullopt when host memory runs out.
+    // Pageable host pages laid out as lines, one for each line of sources. nullopt when host memory runs out.
     std::optional<std::vector<page>> allocate_host_pages(std::span<const layer_line> sources) const;
     void release_all(std::span<const std::vector<std::uint32_t>> line_ids) noexcept;
 

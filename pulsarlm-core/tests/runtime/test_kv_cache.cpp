@@ -564,6 +564,16 @@ TEST_CASE("a page missing in one layer fails the get with miss holding nothing i
     REQUIRE(fixture.kv.free_count() == 2);
 }
 
+TEST_CASE("a line holds each head's K then V together") {
+    cache_fixture fixture(2);
+    const pulsarlm::kv& lines = fixture.kv.tensors(0);
+    auto head_block = static_cast<std::int64_t>(2 * shape.page_size * shape.head_dim);
+    REQUIRE(lines.k.stride(2) == head_block);
+    REQUIRE(lines.k.stride(1) == static_cast<std::int64_t>(shape.head_dim));
+    REQUIRE(lines.k.stride(0) == head_block * static_cast<std::int64_t>(shape.n_kv_heads));
+    REQUIRE(lines.v.data_ptr<float>() - lines.k.data_ptr<float>() == head_block / 2);
+}
+
 TEST_CASE("allocate fails with oom holding nothing when the layers together run out") {
     cache_fixture fixture(2, {}, 2, {shape, shape});
     REQUIRE((fixture.kv.allocate(3) == layer_lines_result(std::unexpected(page_error::oom))));

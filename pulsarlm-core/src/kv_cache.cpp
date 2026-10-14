@@ -12,6 +12,7 @@
 #include <array>
 #include <bit>
 #include <cassert>
+#include <cstring>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -77,15 +78,47 @@ at::Tensor make_pool(std::span<const page_shape> shapes, std::size_t pool_bytes,
     return at::empty({static_cast<std::int64_t>(pool_bytes)}, at::TensorOptions().dtype(at::kByte).device(device));
 }
 
-kv pool_views(const at::Tensor& pool, const page_shape& shape) {
-    std::size_t n_lines = static_cast<std::size_t>(pool.numel()) / line_bytes(shape);
+std::vector<std::int64_t> line_strides(const page_shape& shape) {
+    auto tensor_elements = static_cast<std::int64_t>(shape.page_size * shape.head_dim);
+    auto head_elements = static_cast<std::int64_t>(tensor_count(shape)) * tensor_elements;
+    return {
+        head_elements * static_cast<std::int64_t>(shape.n_kv_heads),
+        static_cast<std::int64_t>(shape.head_dim),
+        head_elements,
+        1,
+    };
+}
+
+// count lines from element first of elements (1-D, in the shape's dtype), each [n_kv_heads, k then v, page_size,
+// head_dim], as K and V views of [count, page_size, n_kv_heads, head_dim].
+page line_views(const at::Tensor& elements, const page_shape& shape, std::size_t count, std::size_t first) {
     std::vector<std::int64_t> sizes = page_sizes(shape);
-    sizes.front() = static_cast<std::int64_t>(tensor_count(shape));
-    sizes.insert(sizes.begin(), static_cast<std::int64_t>(n_lines));
-    at::Tensor
-        lines = pool.narrow(0, 0, static_cast<std::int64_t>(n_lines * line_bytes(shape))).view(shape.dtype).view(sizes);
-    at::Tensor k = lines.select(1, 0);
-    return kv{.k = k, .v = shape.values_only ? k : lines.select(1, 1)};
+    sizes.front() = static_cast<std::int64_t>(count);
+    std::vector<std::int64_t> strides = line_strides(shape);
+    std::int64_t k_first = elements.storage_offset() + static_cast<std::int64_t>(first);
+    at::Tensor k = elements.as_strided(sizes, strides, k_first);
+    auto v_first = k_first + static_cast<std::int64_t>(shape.page_size * shape.head_dim);
+    return page{.k = k, .v = shape.values_only ? k : elements.as_strided(sizes, strides, v_first)};
+}
+
+// Whether candidate is laid out as a line of shape, so its bytes copy as one block from k's first element.
+bool in_line_layout(const page& candidate, const page_shape& shape) {
+    std::vector<std::int64_t> strides = line_strides(shape);
+    auto v_from_k = static_cast<const std::byte*>(candidate.v.data_ptr()) -
+        static_cast<const std::byte*>(candidate.k.data_ptr());
+    auto expected_v_from_k = shape.values_only ? 0 : static_cast<std::ptrdiff_t>(tensor_bytes(shape));
+    return candidate.k.strides() == at::IntArrayRef(strides) && candidate.v.strides() == at::IntArrayRef(strides) &&
+        v_from_k == expected_v_from_k;
+}
+
+kv pool_views(const at::Tensor& pool, const page_shape& shape) {
+    page lines = line_views(
+        pool.view(shape.dtype),
+        shape,
+        static_cast<std::size_t>(pool.numel()) / line_bytes(shape),
+        0
+    );
+    return kv{.k = lines.k, .v = lines.v};
 }
 
 c10::cuda::CUDAStreamGuard guard_stream(const at::Tensor& lines, cudaStream_t stream) {
@@ -352,25 +385,14 @@ void kv_cache::release_staging() noexcept {
     }
 }
 
-// A slot starts at a multiple of 16 bytes, which lets the copy move 16-byte vectors.
-std::optional<kv_cache::staging_page> kv_cache::staging_slot(std::size_t layer, std::size_t& used) const {
-    const page_shape& shape = layers[layer].shape;
+// A page's room starts at a multiple of 16 bytes, which lets the copy move 16-byte vectors.
+std::optional<std::size_t> kv_cache::staging_offset(std::size_t layer, std::size_t& used) const {
     std::size_t first = ceil_div(used, 16) * 16;
-    if (first + line_bytes(shape) > static_cast<std::size_t>(staging.numel())) {
+    if (first + line_bytes(layers[layer].shape) > static_cast<std::size_t>(staging.numel())) {
         return std::nullopt;
     }
-    std::vector<std::int64_t> sizes = page_sizes(shape);
-    auto tensor_at = [&](std::size_t offset) {
-        return staging.narrow(0, static_cast<std::int64_t>(offset), static_cast<std::int64_t>(tensor_bytes(shape)))
-            .view(shape.dtype)
-            .view(sizes);
-    };
-    at::Tensor k = tensor_at(first);
-    used = first + line_bytes(shape);
-    return staging_page{
-        .offset = first,
-        .views = page{.k = k, .v = shape.values_only ? k : tensor_at(first + tensor_bytes(shape))},
-    };
+    used = first + line_bytes(layers[layer].shape);
+    return first;
 }
 
 std::size_t kv_cache::line_offset(std::size_t layer, std::uint32_t line_id) const noexcept {
@@ -389,19 +411,24 @@ kv_cache::copy_from_host(std::span<const layer_line> targets, std::span<const pa
         std::size_t end = first;
         for (; end < targets.size(); end++) {
             auto [layer, line_id] = targets[end];
-            std::optional<staging_page> slot = staging_slot(layer, used);
-            if (!slot) {
+            std::optional<std::size_t> offset = staging_offset(layer, used);
+            if (!offset) {
                 break;
             }
             const page_shape& shape = layers[layer].shape;
             const page& source = pages[end];
             check_page(shape, source.v);
-            slot->views.v.copy_(source.v);
-            if (!shape.values_only) {
-                check_page(shape, source.k);
-                slot->views.k.copy_(source.k);
+            check_page(shape, source.k);
+            if (in_line_layout(source, shape)) {
+                std::memcpy(staging.data_ptr<std::uint8_t>() + *offset, source.k.data_ptr(), line_bytes(shape));
+            } else {
+                page slot = line_views(staging.view(shape.dtype), shape, 1, *offset / c10::elementSize(shape.dtype));
+                slot.v.copy_(source.v);
+                if (!shape.values_only) {
+                    slot.k.copy_(source.k);
+                }
             }
-            append_segment(segments, line_offset(layer, line_id), slot->offset, line_bytes(shape));
+            append_segment(segments, line_offset(layer, line_id), *offset, line_bytes(shape));
         }
         at::Tensor pinned_segments = pinned_int64(segments);
         {
@@ -419,16 +446,16 @@ task<void> kv_cache::copy_to_host(std::span<const layer_line> sources, std::span
     std::size_t first = 0;
     while (first < sources.size()) {
         std::vector<std::int64_t> segments;
-        std::vector<page> slots;
+        std::vector<std::size_t> offsets;
         std::size_t used = 0;
-        while (first + slots.size() < sources.size()) {
-            auto [layer, line_id] = sources[first + slots.size()];
-            std::optional<staging_page> slot = staging_slot(layer, used);
-            if (!slot) {
+        while (first + offsets.size() < sources.size()) {
+            auto [layer, line_id] = sources[first + offsets.size()];
+            std::optional<std::size_t> offset = staging_offset(layer, used);
+            if (!offset) {
                 break;
             }
-            append_segment(segments, line_offset(layer, line_id), slot->offset, line_bytes(layers[layer].shape));
-            slots.push_back(std::move(slot->views));
+            append_segment(segments, line_offset(layer, line_id), *offset, line_bytes(layers[layer].shape));
+            offsets.push_back(*offset);
         }
         at::Tensor pinned_segments = pinned_int64(segments);
         {
@@ -436,14 +463,14 @@ task<void> kv_cache::copy_to_host(std::span<const layer_line> sources, std::span
             copy_segments_cuda(pool, staging, pinned_segments, /*to_host=*/true);
         }
         co_await synchronize(stream);
-        for (std::size_t j = 0; j < slots.size(); j++) {
-            page& target = pages[first + j];
-            target.v.copy_(slots[j].v);
-            if (!layers[sources[first + j].layer].shape.values_only) {
-                target.k.copy_(slots[j].k);
-            }
+        for (std::size_t j = 0; j < offsets.size(); j++) {
+            std::memcpy(
+                pages[first + j].k.data_ptr(),
+                staging.data_ptr<std::uint8_t>() + offsets[j],
+                line_bytes(layers[sources[first + j].layer].shape)
+            );
         }
-        first += slots.size();
+        first += offsets.size();
     }
     release_staging();
 }
@@ -455,9 +482,8 @@ std::optional<std::vector<page>> kv_cache::allocate_host_pages(std::span<const l
     try {
         for (const layer_line& source : sources) {
             const page_shape& shape = layers[source.layer].shape;
-            at::TensorOptions options = at::TensorOptions().dtype(shape.dtype);
-            at::Tensor v = at::empty(page_sizes(shape), options);
-            pages.push_back(page{.k = shape.values_only ? v : at::empty(page_sizes(shape), options), .v = v});
+            auto elements = static_cast<std::int64_t>(line_bytes(shape) / c10::elementSize(shape.dtype));
+            pages.push_back(line_views(at::empty({elements}, at::TensorOptions().dtype(shape.dtype)), shape, 1, 0));
         }
     } catch (const c10::OutOfMemoryError&) {
         return std::nullopt;
