@@ -591,7 +591,7 @@ TEST_CASE("a request cancelled while decoding ends with cancelled after its step
     REQUIRE(ended_error(results[0]) == request_error::cancelled);
 }
 
-TEST_CASE("a request waits for the lines another request releases") {
+TEST_CASE("a request that finds too few free lines ends with oom without waiting") {
     fixture f(3);
     token_list first{1, 2, 3, 4, 5};
     token_list second{6, 7, 8, 9, 10};
@@ -601,8 +601,9 @@ TEST_CASE("a request waits for the lines another request releases") {
     );
 
     REQUIRE(results[0].tokens == continuation(first, 3));
-    REQUIRE(results[1].tokens == continuation(second, 3));
-    REQUIRE(f.model.forward_count == 6);
+    REQUIRE(results[1].tokens.empty());
+    REQUIRE(ended_error(results[1]) == request_error::oom);
+    REQUIRE(f.model.forward_count == 3);
 }
 
 TEST_CASE("a request needing more lines than the cache has ends with oom") {
@@ -626,7 +627,7 @@ TEST_CASE("a request that outgrows the cache alone ends with oom") {
     REQUIRE(ended_error(results[0]) == request_error::oom);
 }
 
-TEST_CASE("a request that outgrows the free lines waits for them and completes") {
+TEST_CASE("a running request that finds too few free lines for its next cycle ends with oom") {
     fixture f(5);
     token_list first{1, 2, 3, 4};
     token_list second{5, 6, 7, 8};
@@ -637,13 +638,9 @@ TEST_CASE("a request that outgrows the free lines waits for them and completes")
     );
 
     REQUIRE(results[0].tokens == continuation(first, 10));
-    REQUIRE(results[1].tokens == continuation(second, 10));
-    REQUIRE(
-        (ended_state(results[1]).page_hashes ==
-         pulsarlm::make_page_digests(root(), concat(second, without_last(results[1].tokens)), page_size))
-    );
-    // Five steps together; the second then waits for a third line while the first runs its last five steps.
-    REQUIRE(f.model.forward_count == 15);
+    REQUIRE(results[1].tokens == continuation(second, 5));
+    REQUIRE(ended_error(results[1]) == request_error::oom);
+    REQUIRE(f.model.forward_count == 10);
 }
 
 TEST_CASE("a cycle ends every cycle_tokens tokens with the state it reached") {
@@ -761,8 +758,7 @@ const std::vector<pulsarlm::kv_layer> full_and_sliding{
 };
 
 // Each request holds at most 7 full-attention lines and 3 sliding lines at a time: the window's page and a cycle's 2
-// pages. The pool holds those 20 lines; holding passed pages too, one request would requeue and the two would not share
-// every step.
+// pages. The pool holds those 20 lines; holding passed pages too, one request would end with oom.
 TEST_CASE("a sliding layer holds only the pages its window reaches") {
     std::size_t line_bytes = pulsarlm::line_bytes(page_shapes(full_and_sliding).front());
     fixture f(0, 64, {}, {}, full_and_sliding, 20 * line_bytes);

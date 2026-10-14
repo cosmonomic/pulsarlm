@@ -82,7 +82,6 @@ class kv_cache {
     struct size_class {
         std::size_t line_bytes;
         std::vector<cache_line> lines;
-        std::size_t line_count = 0;
         // Free lines in reuse order: unmapped lines first, then mapped lines least recently released first.
         std::uint32_t free_front = no_line;
         std::uint32_t free_back = no_line;
@@ -189,10 +188,8 @@ class kv_cache {
     );
     void release(std::size_t layer, std::span<const std::uint32_t> line_ids) noexcept;
 
-    // Whether counts[layer] new lines in each layer could be taken with no line held.
-    bool fits(std::span<const std::size_t> counts) const;
-    // Whether counts[layer] new lines in each layer can be taken from the lines free now.
-    bool fits_free(std::span<const std::size_t> counts) const;
+    // The largest count for which allocate(count) succeeds now.
+    std::size_t free_count() const;
     std::size_t layer_count() const noexcept;
     // [n_lines, page_size, n_kv_heads, head_dim] views of the pool, indexed by line id, lines line_bytes apart.
     const kv& tensors(std::size_t layer) const noexcept;

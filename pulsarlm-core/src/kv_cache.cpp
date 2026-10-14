@@ -272,7 +272,6 @@ std::uint32_t kv_cache::take_free_line(std::size_t layer) noexcept {
         if (taken_from.lines.size() <= line_id) {
             taken_from.lines.resize(line_id + 1);
         }
-        taken_from.line_count++;
         bump = first + taken_from.line_bytes;
     }
     cache_line& taken = taken_from.lines[line_id];
@@ -556,7 +555,7 @@ kv_cache::get(std::span<const std::span<const digest>> hashes, cudaStream_t stre
 
 std::expected<std::vector<std::vector<std::uint32_t>>, page_error> kv_cache::allocate(std::size_t count) {
     std::vector<std::size_t> counts(layers.size(), count);
-    if (!fits_free(counts)) {
+    if (!covers(counts, free_counts())) {
         return std::unexpected(page_error::oom);
     }
     std::vector<std::vector<std::uint32_t>> line_ids;
@@ -572,7 +571,7 @@ kv_cache::clone(std::size_t layer, std::uint32_t line_id, std::size_t count, cud
     assert(line(layer, line_id).ref > 0);
     std::vector<std::size_t> counts(layers.size(), 0);
     counts[layer] = count;
-    if (!fits_free(counts)) {
+    if (!covers(counts, free_counts())) {
         return std::unexpected(page_error::oom);
     }
     std::vector<std::uint32_t> copies = take_free_lines(layer, count);
@@ -648,17 +647,21 @@ void kv_cache::release(std::size_t layer, std::span<const std::uint32_t> line_id
     }
 }
 
-bool kv_cache::fits(std::span<const std::size_t> counts) const {
-    std::vector<std::size_t> lines;
-    lines.reserve(classes.size());
+std::size_t kv_cache::free_count() const {
+    std::size_t low = 0;
+    std::size_t high = std::numeric_limits<std::size_t>::max();
     for (const size_class& c : classes) {
-        lines.push_back(c.line_count);
+        high = std::min(high, c.free_count + (pool_bytes() - bump) / c.line_bytes);
     }
-    return covers(counts, std::move(lines));
-}
-
-bool kv_cache::fits_free(std::span<const std::size_t> counts) const {
-    return covers(counts, free_counts());
+    while (low < high) {
+        std::size_t count = high - (high - low) / 2;
+        if (covers(std::vector<std::size_t>(layers.size(), count), free_counts())) {
+            low = count;
+        } else {
+            high = count - 1;
+        }
+    }
+    return low;
 }
 
 std::size_t kv_cache::layer_count() const noexcept {

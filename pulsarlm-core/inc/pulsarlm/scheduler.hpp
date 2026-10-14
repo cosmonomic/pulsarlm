@@ -39,7 +39,7 @@ class scheduler;
 // A request being served. Its tokens move from pending to tail as steps forward them, and the pages the tail fills
 // move to page_hashes.
 class sequence {
-    enum class exit_reason { finished, requeued, cancelled, oom };
+    enum class exit_reason { finished, cancelled, oom };
 
     static constexpr std::uint32_t no_line = std::numeric_limits<std::uint32_t>::max();
 
@@ -91,8 +91,6 @@ class sequence {
     at::Tensor density_on_host(cudaStream_t stream) const;
     // The lines the sequence lacks in each KV layer to forward every token left in its cycle.
     std::size_t missing_lines(std::size_t page_size) const noexcept;
-    // Moves tail back to pending, to be forwarded again into new lines.
-    void requeue();
 
     friend class scheduler;
     friend class batch;
@@ -153,16 +151,11 @@ class scheduler {
     std::vector<sequence*> running;
     // Set when a sequence joins the running set.
     std::optional<event> idle;
-    // Set when lines are released.
-    std::optional<event> released;
 
     static event& next(std::optional<event>& waited);
     static void wake(std::optional<event>& waited) noexcept;
     // The view page of the first key KV layer layer reads for a query at view index query.
     std::size_t first_held_page(std::size_t layer, std::size_t query) const noexcept;
-    // The lines of KV layer layer the sequence needs to run its cycle: one per page from its first held page, and the
-    // cycle's lines.
-    std::size_t lines_needed(const sequence& seq, std::size_t layer) const noexcept;
     // Per KV layer, lines for the page_hashes from its first held page for a query at their end, in their order, then
     // line_count empty lines. Holds nothing on failure.
     task<std::expected<void, page_error>> take_lines(sequence& seq, std::size_t line_count);
@@ -188,9 +181,9 @@ class scheduler {
     );
 
     // Serves r, then ends writer with its final state, which leaves out the last sampled token, or an error. Appends
-    // the state to writer at the end of each eviction cycle. Waits without holding lines until free lines cover the
-    // state's pages and one cycle's tokens. One whose pages and cycle cannot fit in the cache ends with oom; one that
-    // cannot get its next cycle's lines while running releases its lines, waits again and starts a new cycle.
+    // the state to writer at the end of each eviction cycle. Ends with oom, never waiting, when the free lines do not
+    // cover the state's pages and one cycle's tokens at the start, or the next cycle's tokens while running; the
+    // caller resubmits.
     task<void> submit(request r, result_writer writer);
     // Steps the running sequences until the loop stops.
     task<void> run();

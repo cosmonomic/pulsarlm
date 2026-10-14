@@ -194,12 +194,6 @@ std::size_t sequence::missing_lines(std::size_t page_size) const noexcept {
     return covering > view_page_count() ? covering - view_page_count() : 0;
 }
 
-void sequence::requeue() {
-    covered_count -= tail.size();
-    pending.insert(pending.begin(), tail.begin(), tail.end());
-    tail.clear();
-}
-
 batch::batch(std::span<sequence* const> running, std::size_t page_size, std::size_t prefill_tokens_per_step) {
     for (sequence* seq : running) {
         assert(!seq->pending.empty());
@@ -422,11 +416,6 @@ std::size_t scheduler::first_held_page(std::size_t layer, std::size_t query) con
     return (query + 1 - *window) / page_size;
 }
 
-std::size_t scheduler::lines_needed(const sequence& seq, std::size_t layer) const noexcept {
-    std::size_t pages = seq.page_hashes.size();
-    return pages - first_held_page(layer, pages * page_size) + seq.cycle_lines(page_size);
-}
-
 task<void> scheduler::submit(request r, result_writer writer) {
     assert(r.initial_state.tail.size() < page_size);
     assert(!r.initial_state.tail.empty() || !r.tokens.empty());
@@ -434,59 +423,34 @@ task<void> scheduler::submit(request r, result_writer writer) {
     assert(r.eviction.attention_mass_decay > 0.0 && r.eviction.attention_mass_decay <= 1.0);
     r.eviction.n_working = std::max(r.eviction.n_working, window_pages);
     sequence seq(std::move(r), writer, cache.layer_count(), cache.tensors(0).k.device());
-    for (;;) {
-        seq.start_cycle(page_size);
-        if (writer.cancelled()) {
-            writer.end(std::unexpected(request_error::cancelled));
-            co_return;
-        }
-        std::vector<std::size_t> needed(cache.layer_count());
-        for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
-            needed[layer] = lines_needed(seq, layer);
-        }
-        if (!cache.fits(needed)) {
-            writer.end(std::unexpected(request_error::oom));
-            co_return;
-        }
-        // Taking lines without enough free ones can fail after get took some, and releasing them wakes the other
-        // waiters into the same failure.
-        if (!cache.fits_free(needed)) {
-            co_await next(released);
-            continue;
-        }
-        std::expected<void, page_error> taken = co_await take_lines(seq, seq.cycle_lines(page_size));
-        if (!taken) {
-            if (taken.error() == page_error::miss) {
-                writer.end(std::unexpected(request_error::miss));
-                co_return;
-            }
-            co_await next(released);
-            continue;
-        }
-        seq.upload_table(0, stream);
+    seq.start_cycle(page_size);
+    if (writer.cancelled()) {
+        writer.end(std::unexpected(request_error::cancelled));
+        co_return;
+    }
+    std::expected<void, page_error> taken = co_await take_lines(seq, seq.cycle_lines(page_size));
+    if (!taken) {
+        writer.end(std::unexpected(taken.error() == page_error::miss ? request_error::miss : request_error::oom));
+        co_return;
+    }
+    seq.upload_table(0, stream);
 
-        seq.exited.reset();
-        seq.exit_event.emplace();
-        running.push_back(&seq);
-        wake(idle);
-        co_await *seq.exit_event;
-        release_lines(seq);
-        wake(released);
+    seq.exit_event.emplace();
+    running.push_back(&seq);
+    wake(idle);
+    co_await *seq.exit_event;
+    release_lines(seq);
 
-        switch (*seq.exited) {
-        case exit_reason::requeued:
-            seq.requeue();
-            continue;
-        case exit_reason::finished:
-            writer.end(state{.page_hashes = std::move(seq.page_hashes), .tail = std::move(seq.tail)});
-            co_return;
-        case exit_reason::cancelled:
-            writer.end(std::unexpected(request_error::cancelled));
-            co_return;
-        case exit_reason::oom:
-            writer.end(std::unexpected(request_error::oom));
-            co_return;
-        }
+    switch (*seq.exited) {
+    case exit_reason::finished:
+        writer.end(state{.page_hashes = std::move(seq.page_hashes), .tail = std::move(seq.tail)});
+        co_return;
+    case exit_reason::cancelled:
+        writer.end(std::unexpected(request_error::cancelled));
+        co_return;
+    case exit_reason::oom:
+        writer.end(std::unexpected(request_error::oom));
+        co_return;
     }
 }
 
@@ -501,7 +465,6 @@ task<std::expected<void, page_error>> scheduler::take_lines(sequence& seq, std::
     // A get failing with miss releases the lines it held while it fetched.
     std::expected<std::vector<std::vector<std::uint32_t>>, page_error> got = co_await cache.get(held, stream);
     if (!got) {
-        wake(released);
         co_return std::unexpected(got.error());
     }
     std::expected<std::vector<std::vector<std::uint32_t>>, page_error> allocated = cache.allocate(line_count);
@@ -509,7 +472,6 @@ task<std::expected<void, page_error>> scheduler::take_lines(sequence& seq, std::
         for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
             cache.release(layer, (*got)[layer]);
         }
-        wake(released);
         co_return std::unexpected(allocated.error());
     }
     for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
@@ -543,7 +505,6 @@ void scheduler::release_passed_lines(sequence& seq) {
         cache.release(layer, std::span(layer_lines).subspan(seq.first_held[layer], first - seq.first_held[layer]));
         std::fill(layer_lines.begin() + seq.first_held[layer], layer_lines.begin() + first, sequence::no_line);
         seq.first_held[layer] = first;
-        wake(released);
     }
 }
 
@@ -636,7 +597,7 @@ task<void> scheduler::write_back(batch& b) {
             std::size_t first_new_page = seq.view_page_count();
             std::expected<std::vector<std::vector<std::uint32_t>>, page_error> allocated = cache.allocate(missing);
             if (!allocated) {
-                seq.exited = exit_reason::requeued;
+                seq.exited = exit_reason::oom;
                 continue;
             }
             for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
@@ -666,7 +627,6 @@ void scheduler::end_cycle(sequence& seq, const at::Tensor& host_density) {
                 cache.release(layer, removed[layer]);
             }
             seq.upload_table(0, stream);
-            wake(released);
         }
     }
     seq.writer.append(
