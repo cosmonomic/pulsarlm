@@ -66,7 +66,7 @@ pulsarlm serve gemma-4-e2b-it
 
 ## Requirements
 
-- Linux on x86_64, glibc >= 2.34 (Ubuntu 22.04+, Debian 12+, RHEL 9+)
+- Linux, x86_64 or aarch64, glibc >= 2.34 (Ubuntu 22.04+, Debian 12+, RHEL 9+)
 - NVIDIA GPU with compute capability >= 8.0 (Ampere or newer)
 - NVIDIA driver >= 580 (CUDA 13)
 - Python 3.13
@@ -90,5 +90,5 @@ uv sync
 ## Disclaimer
 
 This project has only been tested on x86_64 with an RTX 5090.
-Wheels for other GPUs are built but untested.
+Wheels for other GPUs and for aarch64 are built but untested.
 
