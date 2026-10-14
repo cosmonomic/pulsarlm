@@ -111,52 +111,11 @@ __device__ __forceinline__ void tile_qkt(const scalar_t* sQ, const scalar_t* sK,
     }
 }
 
-// PV over the loaded tile: sO[m][d] += sum_n sP[m][n] * sV[n][d]. The DSLAB
-// 16-wide dim slabs are striped across the CTA's warps (disjoint sO columns).
-template <typename scalar_t, int KEY_TILE, int HEAD_DIM, bool BF16>
-__device__ __forceinline__ void tile_pv(const scalar_t* sP, const scalar_t* sV, float* sO, int warp, int nwarps) {
-    constexpr int KC = KEY_TILE / 16;
-    constexpr int DSLAB = HEAD_DIM / 16;
-
-    const int lane = threadIdx.x & 31;
-    const int gid = lane >> 2, tg = lane & 3;
-    const int quad = lane >> 3, rin = lane & 7;
-    const int arow = (quad & 1) * 8 + rin, acol = (quad >> 1) * 8;
-
-    uint32_t pa[KC][4];
-#pragma unroll
-    for (int kc = 0; kc < KC; ++kc) {
-        mma::ldmatrix_x4(pa[kc], &sP[arow * KEY_TILE + kc * 16 + acol]);
-    }
-
-    for (int ds = warp; ds < DSLAB; ds += nwarps) {
-        float of0[4] = {0, 0, 0, 0}, of1[4] = {0, 0, 0, 0};
-#pragma unroll
-        for (int kc = 0; kc < KC; ++kc) {
-            uint32_t vb[4];
-            mma::ldmatrix_x4_trans(vb, &sV[(kc * 16 + arow) * HEAD_DIM + ds * 16 + acol]);
-            uint32_t b0[2] = {vb[0], vb[1]};  // dims ds*16+0..7
-            uint32_t b1[2] = {vb[2], vb[3]};  // dims ds*16+8..15
-            mma::mma_m16n8k16<BF16>(of0, pa[kc], b0, of0);
-            mma::mma_m16n8k16<BF16>(of1, pa[kc], b1, of1);
-        }
-        const int cb = ds * 16;
-        sO[(gid)*HEAD_DIM + cb + tg * 2 + 0] += of0[0];
-        sO[(gid)*HEAD_DIM + cb + tg * 2 + 1] += of0[1];
-        sO[(gid + 8) * HEAD_DIM + cb + tg * 2 + 0] += of0[2];
-        sO[(gid + 8) * HEAD_DIM + cb + tg * 2 + 1] += of0[3];
-        sO[(gid)*HEAD_DIM + cb + 8 + tg * 2 + 0] += of1[0];
-        sO[(gid)*HEAD_DIM + cb + 8 + tg * 2 + 1] += of1[1];
-        sO[(gid + 8) * HEAD_DIM + cb + 8 + tg * 2 + 0] += of1[2];
-        sO[(gid + 8) * HEAD_DIM + cb + 8 + tg * 2 + 1] += of1[3];
-    }
-}
-
-// PV over the loaded tile with the running output held in registers instead of a
-// shared tile: out = out * row_rescale[row] + sum_n sP[m][n] * sV[n][d]. Warp w
-// owns dim slabs w, w + NWARPS, ...; `out` holds kPvSlabAccums entries per slab,
-// slabs in ascending ds. Entry i of the slab at column base cb = ds*16 is, for
-// gid = lane>>2 and tg = lane&3, the (row, col) of the output tile
+// PV over the loaded tile with the running output held in registers:
+// out = out * row_rescale[row] + sum_n sP[m][n] * sV[n][d]. Warp w owns dim slabs
+// w, w + NWARPS, ...; `out` holds kPvSlabAccums entries per slab, slabs in
+// ascending ds. Entry i of the slab at column base cb = ds*16 is, for gid = lane>>2
+// and tg = lane&3, the (row, col) of the output tile
 //   0:(gid, cb+tg*2)      1:(gid, cb+tg*2+1)
 //   2:(gid+8, cb+tg*2)    3:(gid+8, cb+tg*2+1)
 //   4:(gid, cb+8+tg*2)    5:(gid, cb+8+tg*2+1)
@@ -216,6 +175,29 @@ tile_pv_registers(const scalar_t* sP, const scalar_t* sV, const float* row_resca
         acc[5] = __fadd_rn(__fmul_rn(acc[5], rescale_low), of1[1]);
         acc[6] = __fadd_rn(__fmul_rn(acc[6], rescale_high), of1[2]);
         acc[7] = __fadd_rn(__fmul_rn(acc[7], rescale_high), of1[3]);
+    }
+}
+
+template <int HEAD_DIM, int NWARPS, typename Fn>
+__device__ __forceinline__ void for_each_pv_register(const float* out, int warp, Fn&& fn) {
+    const int lane = threadIdx.x & 31;
+    const int gid = lane >> 2, tg = lane & 3;
+#pragma unroll
+    for (int slab = 0; slab < pv_slabs_per_warp<HEAD_DIM, NWARPS>(); ++slab) {
+        const int ds = warp + slab * NWARPS;
+        if (ds >= HEAD_DIM / 16) {
+            break;
+        }
+        const int cb = ds * 16;
+        const float* acc = out + slab * kPvSlabAccums;
+        fn(gid, cb + tg * 2 + 0, acc[0]);
+        fn(gid, cb + tg * 2 + 1, acc[1]);
+        fn(gid + 8, cb + tg * 2 + 0, acc[2]);
+        fn(gid + 8, cb + tg * 2 + 1, acc[3]);
+        fn(gid, cb + 8 + tg * 2 + 0, acc[4]);
+        fn(gid, cb + 8 + tg * 2 + 1, acc[5]);
+        fn(gid + 8, cb + 8 + tg * 2 + 0, acc[6]);
+        fn(gid + 8, cb + 8 + tg * 2 + 1, acc[7]);
     }
 }
 

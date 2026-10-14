@@ -279,32 +279,15 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
 
     // Normalize + write o, each lane over the accumulators it owns.
     {
-        const int gid = lane >> 2, tg = lane & 3;
-        // A row past tile_rows has Lrow 0, and store() never reads its reciprocal.
+        const int gid = lane >> 2;
+        // A row past tile_rows has Lrow 0, and its reciprocal is never read.
         const float inv_low = 1.0f / Lrow[gid], inv_high = 1.0f / Lrow[gid + 8];
-        auto store = [&](int row, int col, float value, float inv_denom) {
+        attn::for_each_pv_register<HEAD_DIM, NWARPS>(out_acc, warp, [&](int row, int col, float value) {
             if (row < tile_rows) {
                 p.o[(static_cast<int64_t>(q_global_base + row) * p.n_q_heads + h) * HEAD_DIM +
-                    col] = static_cast<scalar_t>(value * inv_denom);
+                    col] = static_cast<scalar_t>(value * (row < 8 ? inv_low : inv_high));
             }
-        };
-#pragma unroll
-        for (int slab = 0; slab < kSlabs; ++slab) {
-            const int ds = warp + slab * NWARPS;
-            if (ds >= HEAD_DIM / 16) {
-                break;
-            }
-            const int cb = ds * 16;
-            const float* acc = out_acc + slab * attn::kPvSlabAccums;
-            store(gid, cb + tg * 2 + 0, acc[0], inv_low);
-            store(gid, cb + tg * 2 + 1, acc[1], inv_low);
-            store(gid + 8, cb + tg * 2 + 0, acc[2], inv_high);
-            store(gid + 8, cb + tg * 2 + 1, acc[3], inv_high);
-            store(gid, cb + 8 + tg * 2 + 0, acc[4], inv_low);
-            store(gid, cb + 8 + tg * 2 + 1, acc[5], inv_low);
-            store(gid + 8, cb + 8 + tg * 2 + 0, acc[6], inv_high);
-            store(gid + 8, cb + 8 + tg * 2 + 1, acc[7], inv_high);
-        }
+        });
     }
 
     // Stash LSE for the mass pass.
