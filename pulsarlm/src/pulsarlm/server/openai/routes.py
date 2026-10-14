@@ -1,7 +1,7 @@
-import time
-import uuid
 import json
 import math
+import time
+import uuid
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import aclosing
 from dataclasses import dataclass
@@ -14,10 +14,9 @@ from tokenizers import Tokenizer
 from tokenizers.decoders import DecodeStream
 
 from pulsarlm.async_engine import AsyncEngine, EngineStopped
-from pulsarlm.chat import encode_prompt
+from pulsarlm.chat import ChatTemplate, encode_prompt
 from pulsarlm.completion import CompletionError, complete
 from pulsarlm.core.engine import EvictionPolicy, RequestError, SamplingParams
-from pulsarlm.store import LocalStore
 from pulsarlm.server.openai.schema import (
     ChatCompletionChoice,
     ChatCompletionChunk,
@@ -30,6 +29,7 @@ from pulsarlm.server.openai.schema import (
     ModelList,
     Usage,
 )
+from pulsarlm.store import LocalStore
 
 type FinishReason = Literal["stop", "length"]
 
@@ -39,6 +39,7 @@ class ServerState:
     engine: AsyncEngine
     store: LocalStore
     tokenizer: Tokenizer
+    chat_template: ChatTemplate
     model_id: str
     page_size: int
     stop_ids: list[int]
@@ -81,7 +82,9 @@ async def create_chat_completion(body: ChatCompletionRequest, state: State):
         raise HTTPException(422, "messages must be non-empty")
 
     prompt, system_tokens = encode_prompt(
-        state.tokenizer, [(m.role, m.content) for m in body.messages]
+        state.tokenizer,
+        state.chat_template,
+        [(m.role, m.content) for m in body.messages],
     )
     tokens = complete(
         state.engine,

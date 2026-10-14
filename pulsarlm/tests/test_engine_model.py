@@ -1,0 +1,108 @@
+import pytest
+
+from pulsarlm.checkpoint import PulsarLMModelConfig, PulsarLMModelLoadingError
+from pulsarlm.core.engine import Gemma4Config, ModelConfig
+from pulsarlm.engine_model import engine_model
+
+ROPE = {
+    "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+    "full_attention": {
+        "rope_type": "proportional",
+        "partial_rotary_factor": 0.25,
+        "rope_theta": 1000000.0,
+    },
+}
+
+
+def gemma4(model_type: str, **text) -> PulsarLMModelConfig:
+    base = {
+        "vocab_size": 262144,
+        "hidden_size": 1536,
+        "num_hidden_layers": 12,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 1,
+        "head_dim": 256,
+        "global_head_dim": 512,
+        "sliding_window": 512,
+        "rope_parameters": ROPE,
+        "rms_norm_eps": 1e-6,
+        "final_logit_softcapping": 30.0,
+        "max_position_embeddings": 131072,
+    }
+    return PulsarLMModelConfig.from_dict(
+        {
+            "model_type": model_type,
+            "eos_token_id": [1, 106],
+            "text_config": base | text,
+        }
+    )
+
+
+def test_a_gemma4_checkpoint_maps_its_text_config():
+    cfg = gemma4("gemma4", num_kv_shared_layers=4, hidden_size_per_layer_input=256)
+    model = engine_model(cfg)
+
+    assert isinstance(model, Gemma4Config)
+    assert cfg.n_layers == 12 and cfg.max_position_embeddings == 131072
+    assert model.layer_types == (["sliding_attention"] * 5 + ["full_attention"]) * 2
+    assert model.global_n_kv_heads == 1
+    assert model.hidden_size_per_layer_input == 256
+    assert model.full_rope.partial_rotary_factor == 0.25
+    assert model.full_rope.theta == 1e6
+    assert model.sliding_rope.theta == 1e4
+    assert model.relevance_layers == [11]
+
+
+def test_k_eq_v_takes_the_global_kv_heads_and_the_last_layer_is_full():
+    model = engine_model(
+        gemma4(
+            "gemma4_unified",
+            attention_k_eq_v=True,
+            num_global_key_value_heads=2,
+            layer_types=["sliding_attention"] * 12,
+        )
+    )
+
+    assert isinstance(model, Gemma4Config)
+    assert model.global_n_kv_heads == 2
+    assert model.layer_types[-1] == "full_attention"
+    assert model.hidden_size_per_layer_input == 0
+
+
+def test_global_kv_heads_apply_only_with_k_eq_v():
+    model = engine_model(gemma4("gemma4", num_global_key_value_heads=4))
+    assert isinstance(model, Gemma4Config)
+    assert model.global_n_kv_heads == 1
+
+
+def test_an_unsupported_gemma4_config_is_rejected():
+    with pytest.raises(PulsarLMModelLoadingError):
+        engine_model(gemma4("gemma4", use_bidirectional_attention="all"))
+    scaled = ROPE | {"full_attention": ROPE["full_attention"] | {"factor": 8.0}}
+    with pytest.raises(PulsarLMModelLoadingError):
+        engine_model(gemma4("gemma4", rope_parameters=scaled))
+
+
+def test_a_qwen3_checkpoint_measures_mass_on_its_top_quarter():
+    cfg = PulsarLMModelConfig.from_dict(
+        {
+            "model_type": "qwen3",
+            "eos_token_id": 151645,
+            "vocab_size": 151936,
+            "hidden_size": 4096,
+            "intermediate_size": 12288,
+            "num_hidden_layers": 36,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "rope_theta": 1000000,
+            "rms_norm_eps": 1e-6,
+        }
+    )
+    assert cfg.eos_ids == [151645]
+    assert isinstance(engine_model(cfg), ModelConfig)
+
+
+def test_an_unknown_architecture_is_rejected():
+    with pytest.raises(PulsarLMModelLoadingError, match="unsupported architecture"):
+        PulsarLMModelConfig.from_dict({"model_type": "llama", "eos_token_id": 2})

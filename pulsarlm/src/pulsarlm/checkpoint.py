@@ -11,6 +11,8 @@ from typing import NamedTuple, Self
 import safetensors
 import torch
 from tokenizers import Tokenizer
+
+from pulsarlm.chat import ChatTemplate
 from torch import Tensor
 from xdg_base_dirs import xdg_cache_home, xdg_data_dirs, xdg_data_home
 
@@ -19,46 +21,47 @@ class PulsarLMModelLoadingError(RuntimeError):
     pass
 
 
+QWEN = ("qwen2", "qwen3")
+GEMMA4 = ("gemma4", "gemma4_unified")
+ARCHITECTURES = QWEN + GEMMA4
+
+
 @dataclass
 class PulsarLMModelConfig:
     architecture: str
-    vocab_size: int
-    hidden_size: int
-    intermediate_size: int
-    n_layers: int
-    n_heads: int
-    n_kv_heads: int
-    head_dim: int
-    rope_theta: float
-    rms_norm_eps: float
+    text: dict
     eos_ids: list[int]
-    max_position_embeddings: int = 0
 
     @classmethod
     def from_dict(cls, raw: dict) -> Self:
-        n_attention_heads = raw["num_attention_heads"]
+        architecture = raw["model_type"]
+        if architecture not in ARCHITECTURES:
+            raise PulsarLMModelLoadingError(f"unsupported architecture {architecture}")
+        eos = raw["eos_token_id"]
         return cls(
-            architecture=raw["model_type"],
-            vocab_size=raw["vocab_size"],
-            hidden_size=raw["hidden_size"],
-            intermediate_size=raw["intermediate_size"],
-            n_layers=raw["num_hidden_layers"],
-            n_heads=n_attention_heads,
-            n_kv_heads=raw["num_key_value_heads"],
-            head_dim=raw.get("head_dim") or raw["hidden_size"] // n_attention_heads,
-            rope_theta=raw["rope_theta"],
-            rms_norm_eps=raw["rms_norm_eps"],
-            eos_ids=eos_ids
-            if isinstance(eos_ids := raw["eos_token_id"], list)
-            else [eos_ids],
-            max_position_embeddings=raw.get("max_position_embeddings", 0),
+            architecture=architecture,
+            text=raw["text_config"] if architecture in GEMMA4 else raw,
+            eos_ids=eos if isinstance(eos, list) else [eos],
         )
+
+    @property
+    def vocab_size(self) -> int:
+        return self.text["vocab_size"]
+
+    @property
+    def n_layers(self) -> int:
+        return self.text["num_hidden_layers"]
+
+    @property
+    def max_position_embeddings(self) -> int:
+        return self.text.get("max_position_embeddings", 0)
 
 
 class PulsarLMModel(NamedTuple):
     config: PulsarLMModelConfig
     weights: dict[str, Tensor]
     tokenizer: Tokenizer
+    chat_template: ChatTemplate
 
 
 def iter_data_paths(data_dir: Path | None = None) -> Generator[Path]:
@@ -96,6 +99,17 @@ def load_config(path: zipfile.Path) -> PulsarLMModelConfig:
 def load_tokenizer(path: zipfile.Path) -> Tokenizer:
     raw = (path / "tokenizer.json").read_text(encoding="utf-8")
     return Tokenizer.from_str(raw)
+
+
+def load_chat_template(path: zipfile.Path) -> ChatTemplate:
+    template = path / "chat_template.jinja"
+    if not template.exists():
+        raise PulsarLMModelLoadingError(
+            "the archive has no chat template; pack it again with pulsarlm download"
+            " or pulsarlm migrate"
+        )
+    tokenizer_config = json.loads((path / "tokenizer_config.json").read_text())
+    return ChatTemplate(template.read_text(encoding="utf-8"), tokenizer_config)
 
 
 def get_shard_cache_dir(archive_path: Path) -> Path:
@@ -160,6 +174,12 @@ def load(
 
         config = load_config(archive_path)
         tokenizer = load_tokenizer(archive_path)
+        chat_template = load_chat_template(archive_path)
         weights = load_weights(archive, device=device, dtype=dtype)
 
-    return PulsarLMModel(config=config, weights=weights, tokenizer=tokenizer)
+    return PulsarLMModel(
+        config=config,
+        weights=weights,
+        tokenizer=tokenizer,
+        chat_template=chat_template,
+    )

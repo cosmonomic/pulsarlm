@@ -92,9 +92,46 @@ class ModelConfig:
         relevance_layers: list[int],
     ) -> None: ...
 
-class Request:
-    """Dropping it cancels the request."""
+class RopeParameters:
+    """The first floor(partial_rotary_factor * head_dim / 2) rotate_half pairs
+    rotate; the others pass through."""
 
+    theta: float
+    partial_rotary_factor: float
+    def __init__(self, *, theta: float, partial_rotary_factor: float = 1.0) -> None: ...
+
+class Gemma4Config:
+    layer_types: list[str]
+    global_n_kv_heads: int
+    hidden_size_per_layer_input: int
+    sliding_rope: RopeParameters
+    full_rope: RopeParameters
+    relevance_layers: list[int]
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        hidden_size: int,
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        global_n_kv_heads: int,
+        global_head_dim: int,
+        attention_k_eq_v: bool,
+        layer_types: list[str],
+        sliding_window: int,
+        sliding_rope: RopeParameters,
+        full_rope: RopeParameters,
+        rms_norm_eps: float,
+        final_logit_softcapping: float | None,
+        num_kv_shared_layers: int,
+        hidden_size_per_layer_input: int,
+        enable_moe_block: bool,
+        top_k_experts: int,
+        relevance_layers: list[int],
+    ) -> None: ...
+
+class Request:
     def take(
         self,
     ) -> tuple[list[int], list[CycleEnd], State | RequestError | None]:
@@ -106,7 +143,7 @@ class Engine:
     def __init__(
         self,
         store: PageStore,
-        model: ModelConfig,
+        model: ModelConfig | Gemma4Config,
         weights: dict[str, Tensor],
         *,
         model_name: str,

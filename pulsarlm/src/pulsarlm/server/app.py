@@ -9,7 +9,8 @@ from fastapi import FastAPI
 from pulsarlm import checkpoint
 from pulsarlm.async_engine import AsyncEngine
 from pulsarlm.chat import stop_ids
-from pulsarlm.core.engine import Engine, EvictionPolicy, ModelConfig
+from pulsarlm.core.engine import Engine, EvictionPolicy
+from pulsarlm.engine_model import engine_model
 from pulsarlm.server.openai import ServerState
 from pulsarlm.server.openai import router as openai_router
 from pulsarlm.store import LocalStore
@@ -42,11 +43,6 @@ def trained_view_pages(max_positions: int, cycle_tokens: int) -> int | None:
     return max(1, (max_positions - cycle_tokens - (_PAGE_SIZE - 1)) // _PAGE_SIZE)
 
 
-def relevance_layers(n_layers: int) -> list[int]:
-    """The top quarter of the layers."""
-    return list(range(n_layers - max(1, n_layers // 4), n_layers))
-
-
 def load_server_state(settings: Settings) -> ServerState:
     model = checkpoint.load(
         settings.model_path,
@@ -58,19 +54,7 @@ def load_server_state(settings: Settings) -> ServerState:
     store = LocalStore(_PAGE_SIZE, int(settings.store_gib * 2**30))
     engine = Engine(
         store,
-        ModelConfig(
-            architecture=cfg.architecture,
-            n_layers=cfg.n_layers,
-            n_heads=cfg.n_heads,
-            n_kv_heads=cfg.n_kv_heads,
-            head_dim=cfg.head_dim,
-            hidden=cfg.hidden_size,
-            intermediate=cfg.intermediate_size,
-            vocab_size=cfg.vocab_size,
-            rope_theta=float(cfg.rope_theta),
-            rms_eps=float(cfg.rms_norm_eps),
-            relevance_layers=relevance_layers(cfg.n_layers),
-        ),
+        engine_model(cfg),
         model.weights,
         model_name=settings.model,
         page_size=_PAGE_SIZE,
@@ -86,6 +70,7 @@ def load_server_state(settings: Settings) -> ServerState:
         engine=AsyncEngine(engine),
         store=store,
         tokenizer=model.tokenizer,
+        chat_template=model.chat_template,
         model_id=settings.model,
         page_size=_PAGE_SIZE,
         stop_ids=stops,

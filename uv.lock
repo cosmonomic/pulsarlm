@@ -571,6 +571,7 @@ source = { editable = "pulsarlm" }
 dependencies = [
     { name = "fastapi" },
     { name = "huggingface-hub" },
+    { name = "jinja2" },
     { name = "numpy" },
     { name = "safetensors" },
     { name = "tokenizers" },
@@ -589,6 +590,7 @@ dev = [
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
     { name = "huggingface-hub", specifier = ">=1.24.0" },
+    { name = "jinja2", specifier = ">=3.1.6" },
     { name = "numpy", specifier = ">=2.5.1" },
     { name = "safetensors", specifier = ">=0.8.0" },
     { name = "tokenizers", specifier = ">=0.23.1" },

@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from tokenizers import Tokenizer, models, pre_tokenizers
 
 from pulsarlm.async_engine import AsyncEngine
-from pulsarlm.chat import encode_prompt
+from pulsarlm.chat import ChatTemplate, encode_prompt
 from pulsarlm.core.engine import Engine, EvictionPolicy, ModelConfig
 from pulsarlm.server import create_app
 from pulsarlm.server.app import trained_view_pages
@@ -89,6 +89,10 @@ def word_tokenizer() -> Tokenizer:
     return tokenizer
 
 
+CHATML = (
+    "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n"
+    "{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+)
 IM_END = SPECIAL_TOKENS.index("<|im_end|>")
 # The random model samples "assistant" first.
 FIRST_SAMPLED = len(SPECIAL_TOKENS) + ROLES.index("assistant")
@@ -117,6 +121,7 @@ def load(
         engine=AsyncEngine(engine),
         store=store,
         tokenizer=tokenizer,
+        chat_template=ChatTemplate(CHATML, {}),
         model_id=MODEL_ID,
         page_size=PAGE_SIZE,
         stop_ids=stop_ids,
@@ -133,7 +138,9 @@ MESSAGES = [
 
 def encode(state: ServerState, messages: list[dict[str, str]]) -> list[int]:
     parsed = [ChatMessage.model_validate(m) for m in messages]
-    prompt, _ = encode_prompt(state.tokenizer, [(m.role, m.content) for m in parsed])
+    prompt, _ = encode_prompt(
+        state.tokenizer, state.chat_template, [(m.role, m.content) for m in parsed]
+    )
     return prompt
 
 

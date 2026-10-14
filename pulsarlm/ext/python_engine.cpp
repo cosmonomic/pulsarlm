@@ -14,12 +14,20 @@ namespace pulsarlm {
 
 namespace py = pybind11;
 
-std::unique_ptr<Model>
-make_model(const model_config& config, const std::unordered_map<std::string, at::Tensor>& weights) {
+std::unique_ptr<Model> make_model(
+    const std::variant<model_config, gemma4_model_config>& any_config,
+    const std::unordered_map<std::string, at::Tensor>& weights
+) {
     c10::Dict<std::string, at::Tensor> weight_dict;
     for (const auto& [name, tensor] : weights) {
         weight_dict.insert(name, tensor);
     }
+    if (const auto* gemma = std::get_if<gemma4_model_config>(&any_config)) {
+        auto model = std::make_unique<Gemma4Model>(gemma->text, weight_dict);
+        model->set_relevance_layers(gemma->relevance_layers);
+        return model;
+    }
+    const model_config& config = std::get<model_config>(any_config);
     std::unique_ptr<Model> model;
     if (config.architecture == "qwen2") {
         model = std::make_unique<Qwen2Model>(
