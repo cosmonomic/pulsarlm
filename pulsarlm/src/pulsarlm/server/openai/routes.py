@@ -5,7 +5,7 @@ import uuid
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import aclosing
 from dataclasses import dataclass
-from typing import Annotated, Literal
+from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -13,7 +13,7 @@ from fastapi.routing import APIRouter
 from tokenizers import Tokenizer
 
 from pulsarlm.async_engine import AsyncEngine, EngineStopped
-from pulsarlm.chat import ChatTemplate, encode_prompt
+from pulsarlm.chat import ChatTemplate, Message, encode_prompt
 from pulsarlm.completion import CompletionError, complete
 from pulsarlm.core.engine import EvictionPolicy, RequestError, SamplingParams
 from pulsarlm.server.openai.schema import (
@@ -24,14 +24,17 @@ from pulsarlm.server.openai.schema import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatMessage,
+    DeltaToolCall,
+    FinishReason,
+    FunctionCall,
+    MessageToolCall,
     ModelCard,
     ModelList,
     Usage,
 )
-from pulsarlm.reply import Part, ReplyDecoder
+from pulsarlm.reply import Part, ReplyDecoder, tool_call_marker
 from pulsarlm.store import LocalStore
-
-type FinishReason = Literal["stop", "length"]
+from pulsarlm.tools import ToolCallError, parse_tool_call
 
 
 @dataclass
@@ -83,12 +86,22 @@ async def create_chat_completion(body: ChatCompletionRequest, state: State):
         )
     if not body.messages:
         raise HTTPException(422, "messages must be non-empty")
+    tools = (
+        [tool.model_dump() for tool in body.tools]
+        if body.tools and body.tool_choice == "auto"
+        else None
+    )
+    if tools is not None and tool_call_marker(state.tokenizer) is None:
+        raise HTTPException(
+            400, f"{state.model_id} has no tool call syntax pulsarlm parses"
+        )
 
     prompt, system_tokens = encode_prompt(
         state.tokenizer,
         state.chat_template,
-        [(m.role, m.content) for m in body.messages],
+        template_messages(body.messages),
         reasoning_effort=body.reasoning_effort,
+        tools=tools,
     )
     tokens = complete(
         state.engine,
@@ -100,18 +113,58 @@ async def create_chat_completion(body: ChatCompletionRequest, state: State):
         max_tokens=body.max_tokens,
         eviction=state.eviction_for(system_tokens),
     )
+    reply = _Reply(state, body.max_tokens, prompt, tool_calls=tools is not None)
     if body.stream:
-        return _stream_completion(body, state, tokens)
-    return await _full_completion(body, state, tokens, len(prompt))
+        return _stream_completion(body, reply, tokens)
+    return await _full_completion(body, reply, tokens, len(prompt))
+
+
+def template_messages(messages: list[ChatMessage]) -> list[Message]:
+    """Decodes tool call arguments, which chat templates take as mappings."""
+    rendered = []
+    for m in messages:
+        message: Message = {"role": m.role, "content": m.content or ""}
+        if m.reasoning is not None:
+            message["reasoning"] = message["reasoning_content"] = m.reasoning
+        if m.tool_calls:
+            try:
+                message["tool_calls"] = [
+                    {
+                        "id": call.id,
+                        "type": call.type,
+                        "function": {
+                            "name": call.function.name,
+                            "arguments": json.loads(call.function.arguments),
+                        },
+                    }
+                    for call in m.tool_calls
+                ]
+            except json.JSONDecodeError as error:
+                raise HTTPException(
+                    422, f"tool call arguments are not JSON: {error}"
+                ) from error
+        if m.tool_call_id is not None:
+            message["tool_call_id"] = m.tool_call_id
+        rendered.append(message)
+    return rendered
 
 
 class _Reply:
     """Decodes sampled tokens until a stop token."""
 
-    def __init__(self, state: ServerState, max_tokens: int | None) -> None:
+    def __init__(
+        self,
+        state: ServerState,
+        max_tokens: int | None,
+        prompt: list[int],
+        *,
+        tool_calls: bool,
+    ) -> None:
         self._stop_ids = state.stop_ids
         self._max_tokens = max_tokens
-        self._decoder = ReplyDecoder(state.tokenizer, state.stop_ids)
+        self._decoder = ReplyDecoder(
+            state.tokenizer, state.stop_ids, tool_calls=tool_calls, prompt=prompt
+        )
         self.token_count = 0
         self.finish_reason: FinishReason | None = None
 
@@ -122,6 +175,34 @@ class _Reply:
         elif self.token_count == self._max_tokens:
             self.finish_reason = "length"
         return self._decoder.step(token)
+
+    def tool_calls(self) -> tuple[list[MessageToolCall], str]:
+        """The tool calls, and the text of those that do not parse."""
+        marker = self._decoder.tool_call_marker
+        if marker is None:
+            return [], ""
+        calls: list[MessageToolCall] = []
+        unparsed: list[str] = []
+        for body in self._decoder.tool_call_bodies:
+            try:
+                call = parse_tool_call(marker.syntax, body)
+            except ToolCallError:
+                unparsed.append(marker.opening + body + marker.closing)
+                continue
+            calls.append(
+                MessageToolCall(
+                    id=f"call_{uuid.uuid4().hex[:24]}",
+                    function=FunctionCall(
+                        name=call.name, arguments=json.dumps(call.arguments)
+                    ),
+                )
+            )
+        return calls, "".join(unparsed)
+
+    def final_finish_reason(self, calls: list[MessageToolCall]) -> FinishReason:
+        if self.finish_reason in (None, "stop") and calls:
+            return "tool_calls"
+        return self.finish_reason or "stop"
 
 
 async def _texts(
@@ -142,17 +223,18 @@ def _http_error(error: EngineStopped | CompletionError) -> HTTPException:
 
 async def _full_completion(
     body: ChatCompletionRequest,
-    state: ServerState,
+    reply: _Reply,
     tokens: AsyncGenerator[int],
     prompt_tokens: int,
 ) -> ChatCompletionResponse:
-    reply = _Reply(state, body.max_tokens)
     texts: dict[Part, list[str]] = {"reasoning": [], "content": []}
     try:
         async for part, text in _texts(reply, tokens):
             texts[part].append(text)
     except (EngineStopped, CompletionError) as error:
         raise _http_error(error) from error
+    calls, unparsed = reply.tool_calls()
+    content = "".join(texts["content"]) + unparsed
 
     return ChatCompletionResponse(
         id=f"chatcmpl-{uuid.uuid4().hex}",
@@ -163,10 +245,11 @@ async def _full_completion(
                 index=0,
                 message=ChatMessage(
                     role="assistant",
-                    content="".join(texts["content"]),
+                    content=content or (None if calls else ""),
                     reasoning="".join(texts["reasoning"]) or None,
+                    tool_calls=calls or None,
                 ),
-                finish_reason=reply.finish_reason or "stop",
+                finish_reason=reply.final_finish_reason(calls),
             )
         ],
         usage=Usage(
@@ -179,12 +262,11 @@ async def _full_completion(
 
 def _stream_completion(
     body: ChatCompletionRequest,
-    state: ServerState,
+    reply: _Reply,
     tokens: AsyncGenerator[int],
 ) -> StreamingResponse:
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
-    reply = _Reply(state, body.max_tokens)
 
     def chunk(
         delta: ChatCompletionChunkDelta, finish_reason: FinishReason | None = None
@@ -209,7 +291,19 @@ def _stream_completion(
             failure = _http_error(error)
             yield f"data: {json.dumps({'error': {'message': failure.detail, 'code': failure.status_code}})}\n\n"
         else:
-            yield chunk(ChatCompletionChunkDelta(), reply.finish_reason or "stop")
+            calls, unparsed = reply.tool_calls()
+            if unparsed:
+                yield chunk(ChatCompletionChunkDelta(content=unparsed))
+            if calls:
+                yield chunk(
+                    ChatCompletionChunkDelta(
+                        tool_calls=[
+                            DeltaToolCall(index=i, **call.model_dump())
+                            for i, call in enumerate(calls)
+                        ]
+                    )
+                )
+            yield chunk(ChatCompletionChunkDelta(), reply.final_finish_reason(calls))
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(events(), media_type="text/event-stream")

@@ -24,7 +24,9 @@ def tokenizer() -> Tokenizer:
 
 def test_the_template_takes_the_tokenizer_configs_special_tokens():
     template = ChatTemplate(TURNS, {"bos_token": {"content": "<bos>"}})
-    rendered = template.render([("user", " a ")], add_generation_prompt=True)
+    rendered = template.render(
+        [{"role": "user", "content": " a "}], add_generation_prompt=True
+    )
     assert rendered == "<bos><|turn>user\na<turn|>\n<|turn>model\n"
 
 
@@ -32,7 +34,9 @@ def test_the_system_message_counts_the_tokens_it_renders_to():
     tok = tokenizer()
     template = ChatTemplate(TURNS, {"bos_token": "<bos>"})
     ids, system_tokens = encode_prompt(
-        tok, template, [("system", "a b"), ("user", "c")]
+        tok,
+        template,
+        [{"role": "system", "content": "a b"}, {"role": "user", "content": "c"}],
     )
     assert system_tokens == len(tok.encode("<bos><|turn>system\na b<turn|>\n").ids)
     assert ids[0] == SPECIAL.index("<bos>")
@@ -41,7 +45,9 @@ def test_the_system_message_counts_the_tokens_it_renders_to():
 
 def test_a_prompt_without_a_system_message_sinks_nothing():
     _, system_tokens = encode_prompt(
-        tokenizer(), ChatTemplate(TURNS, {"bos_token": "<bos>"}), [("user", "a")]
+        tokenizer(),
+        ChatTemplate(TURNS, {"bos_token": "<bos>"}),
+        [{"role": "user", "content": "a"}],
     )
     assert system_tokens == 0
 

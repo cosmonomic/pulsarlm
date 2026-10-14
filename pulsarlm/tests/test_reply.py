@@ -4,6 +4,7 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from pulsarlm.reply import ReplyDecoder
 
 SPECIAL = ["<think>", "</think>", "<|channel>", "<channel|>", "<eos>"]
+SPECIAL += ["<tool_call>", "</tool_call>"]
 WORDS = SPECIAL + ["thought", "a", "b", "c", "\n", " "]
 
 
@@ -17,9 +18,10 @@ def tokenizer() -> Tokenizer:
     return tok
 
 
-def decode(words: list[str]) -> list[tuple[str, str]]:
-    tok = tokenizer()
-    decoder = ReplyDecoder(tok, [WORDS.index("<eos>")])
+def decode(
+    words: list[str], decoder: ReplyDecoder | None = None
+) -> list[tuple[str, str]]:
+    decoder = decoder or ReplyDecoder(tokenizer(), [WORDS.index("<eos>")])
     parts = [decoder.step(WORDS.index(word)) for word in words]
     return [(part, text) for part, text in parts if text]
 
@@ -53,3 +55,39 @@ def test_a_reply_without_a_think_block_is_content():
         ("content", " "),
         ("content", "b"),
     ]
+
+
+def test_tool_call_bodies_are_collected_and_not_content():
+    decoder = ReplyDecoder(tokenizer(), [WORDS.index("<eos>")], tool_calls=True)
+    words = ["a", "<tool_call>", "b", " ", "c", "</tool_call>", "<tool_call>", "a"]
+    assert decode(words + ["</tool_call>", "<eos>"], decoder) == [("content", "a")]
+    assert decoder.tool_call_marker is not None
+    assert decoder.tool_call_marker.syntax == "json"
+    assert decoder.tool_call_bodies == ["b c", "a"]
+
+
+def test_without_tool_calls_the_markers_are_content():
+    decoder = ReplyDecoder(tokenizer(), [WORDS.index("<eos>")])
+    assert "".join(text for _, text in decode(["<tool_call>", "b"], decoder)) == (
+        "<tool_call>b"
+    )
+    assert decoder.tool_call_bodies == []
+
+
+@pytest.mark.parametrize("label", [[], ["thought"], ["thought", "\n"]])
+def test_a_prompt_ending_inside_a_think_block_starts_the_reply_in_it(label):
+    tok = tokenizer()
+    prompt = [WORDS.index(w) for w in ["a", "<|channel>", *label]]
+    decoder = ReplyDecoder(tok, [WORDS.index("<eos>")], prompt=prompt)
+    rest = ["thought", "\n"][len(label) :]
+    assert decode([*rest, "a", "<channel|>", "b"], decoder) == [
+        ("reasoning", "a"),
+        ("content", "b"),
+    ]
+
+
+def test_a_prompt_with_a_closed_think_block_starts_the_reply_in_content():
+    tok = tokenizer()
+    prompt = [WORDS.index(w) for w in ["<|channel>", "thought", "\n", "<channel|>"]]
+    decoder = ReplyDecoder(tok, [WORDS.index("<eos>")], prompt=prompt)
+    assert decode(["a"], decoder) == [("content", "a")]

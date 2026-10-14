@@ -2,13 +2,13 @@
 transformers renders them."""
 
 from datetime import datetime
-from typing import Literal, NoReturn
+from typing import Any, Literal, NoReturn
 
 from jinja2.ext import loopcontrols
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from tokenizers import Tokenizer
 
-type Role = Literal["system", "user", "assistant"]
+type Message = dict[str, Any]
 type ReasoningEffort = Literal["none", "minimal", "low", "medium", "high"]
 
 END_OF_TEXT = "<|endoftext|>"
@@ -50,10 +50,11 @@ class ChatTemplate:
 
     def render(
         self,
-        messages: list[tuple[Role, str]],
+        messages: list[Message],
         *,
         add_generation_prompt: bool,
         reasoning_effort: ReasoningEffort | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> str:
         """reasoning_effort None leaves reasoning_effort and enable_thinking
         undefined, so the template's own defaults apply."""
@@ -66,7 +67,8 @@ class ChatTemplate:
             }
         )
         return self._template.render(
-            messages=[{"role": role, "content": content} for role, content in messages],
+            messages=messages,
+            tools=tools,
             add_generation_prompt=add_generation_prompt,
             **thinking,
             **self._special_tokens,
@@ -76,19 +78,26 @@ class ChatTemplate:
 def encode_prompt(
     tokenizer: Tokenizer,
     template: ChatTemplate,
-    messages: list[tuple[Role, str]],
+    messages: list[Message],
     *,
     reasoning_effort: ReasoningEffort | None = None,
+    tools: list[dict[str, Any]] | None = None,
 ) -> tuple[list[int], int]:
     """The tokens of the messages and the opening of the assistant's reply, and
-    how many of them the leading system message takes."""
+    how many of them the leading system message and the tools take."""
     prompt = template.render(
-        messages, add_generation_prompt=True, reasoning_effort=reasoning_effort
+        messages,
+        add_generation_prompt=True,
+        reasoning_effort=reasoning_effort,
+        tools=tools,
     )
     ids = tokenizer.encode(prompt, add_special_tokens=False).ids
-    if messages and messages[0][0] == "system":
+    if messages and messages[0]["role"] == "system":
         system = template.render(
-            messages[:1], add_generation_prompt=False, reasoning_effort=reasoning_effort
+            messages[:1],
+            add_generation_prompt=False,
+            reasoning_effort=reasoning_effort,
+            tools=tools,
         )
         return ids, len(tokenizer.encode(system, add_special_tokens=False).ids)
     return ids, 0

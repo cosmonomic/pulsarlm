@@ -9,7 +9,7 @@ import typer
 
 from pulsarlm import checkpoint
 from pulsarlm.async_engine import AsyncEngine, EngineStopped
-from pulsarlm.chat import ReasoningEffort, Role, encode_prompt, stop_ids
+from pulsarlm.chat import Message, ReasoningEffort, encode_prompt, stop_ids
 from pulsarlm.checkpoint import PulsarLMModelLoadingError
 from pulsarlm.completion import CompletionError, complete
 from pulsarlm.core.engine import Engine, EvictionPolicy, SamplingParams
@@ -69,7 +69,7 @@ def new_chat(
         or trained_view_pages(cfg.max_position_embeddings, settings.cycle_tokens),
         evict_tau=settings.evict_tau,
     )
-    messages: list[tuple[Role, str]] = [("system", system)] if system else []
+    messages: list[Message] = [{"role": "system", "content": system}] if system else []
 
     async def converse() -> None:
         async_engine = AsyncEngine(engine)
@@ -82,7 +82,7 @@ def new_chat(
                     return
                 if not line:
                     continue
-                messages.append(("user", line))
+                messages.append({"role": "user", "content": line})
                 prompt, system_tokens = encode_prompt(
                     loaded.tokenizer,
                     loaded.chat_template,
@@ -91,7 +91,7 @@ def new_chat(
                 )
                 if system:
                     eviction.n_sink = math.ceil(system_tokens / PAGE_SIZE)
-                decoder = ReplyDecoder(loaded.tokenizer, stops)
+                decoder = ReplyDecoder(loaded.tokenizer, stops, prompt=prompt)
                 answer = []
                 reasoning_shown = False
                 try:
@@ -119,7 +119,7 @@ def new_chat(
                     messages.pop()
                     continue
                 print()
-                messages.append(("assistant", "".join(answer)))
+                messages.append({"role": "assistant", "content": "".join(answer)})
         finally:
             async_engine.close()
 

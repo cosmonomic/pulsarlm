@@ -14,6 +14,7 @@ from pulsarlm.core.engine import Engine, EvictionPolicy, ModelConfig, RopeParame
 from pulsarlm.server import create_app
 from pulsarlm.paging import trained_view_pages
 from pulsarlm.server.openai import ServerState
+from pulsarlm.server.openai.routes import template_messages
 from pulsarlm.server.openai.schema import ChatMessage
 from pulsarlm.store import LocalStore
 
@@ -140,7 +141,7 @@ MESSAGES = [
 def encode(state: ServerState, messages: list[dict[str, str]]) -> list[int]:
     parsed = [ChatMessage.model_validate(m) for m in messages]
     prompt, _ = encode_prompt(
-        state.tokenizer, state.chat_template, [(m.role, m.content) for m in parsed]
+        state.tokenizer, state.chat_template, template_messages(parsed)
     )
     return prompt
 
@@ -207,7 +208,8 @@ def test_a_follow_up_continues_from_a_stored_state(client):
 
 
 def test_a_reply_ending_at_any_stop_token_leaves_its_end_state_findable():
-    with api_client(lambda: load([IM_END, FIRST_SAMPLED])) as client:
+    app = create_app(lambda: load([IM_END, FIRST_SAMPLED]))
+    with TestClient(app, base_url=BASE_URL) as client:
         first = post(client, messages=MESSAGES, max_tokens=4).json()
         assert first["choices"][0]["finish_reason"] == "stop"
         assert first["usage"]["completion_tokens"] == 1
@@ -216,7 +218,7 @@ def test_a_reply_ending_at_any_stop_token_leaves_its_end_state_findable():
             {"role": "assistant", "content": ""},
             {"role": "user", "content": "w11"},
         ]
-        state = client.app.state.server_state
+        state = app.state.server_state
         prompt = encode(state, follow_up)
         with state.store.lease(prompt, state.engine.page_digests(prompt)) as (
             _,
