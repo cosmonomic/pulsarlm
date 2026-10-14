@@ -372,6 +372,8 @@ def run(
     variants: Annotated[list[str], typer.Option()] = list(VARIANTS),
     lengths: Annotated[list[int], typer.Option()] = [8192, 16384, 32768],
     items: int = 10,
+    shard: int = 0,
+    shards: int = 1,
     seed: int = 0,
     max_read_lines: int = 100,
     view_pages: int = 256,
@@ -383,17 +385,21 @@ def run(
     port: int = 18090,
 ) -> None:
     """Runs every item in every setting and appends the results to
-    out/results.jsonl, skipping items already there."""
+    out/results.jsonl, skipping items already there. With shards, runs only
+    the items whose index is shard modulo shards, so the shards together cover
+    every item and each covers every variant and length."""
     unknown = set(settings) - set(SETTINGS) | set(variants) - set(VARIANTS)
     if unknown:
         raise typer.BadParameter(f"unknown settings or variants: {sorted(unknown)}")
+    if not 0 <= shard < shards:
+        raise typer.BadParameter("shard must be in [0, shards)")
     tokenizer = load_tokenizer(model)
     words = Words()
     all_items = [
         make_item(v, n, i, seed=seed, words=words, tokenizer=tokenizer)
         for v in variants
         for n in lengths
-        for i in range(items)
+        for i in range(shard, items, shards)
     ]
     out.mkdir(parents=True, exist_ok=True)
     results = out / "results.jsonl"
