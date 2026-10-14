@@ -489,7 +489,7 @@ SERIES_LABELS = {
 @app.command()
 def plot(
     results: Path = Path("bench/results/niah/results.jsonl"),
-    out: Path = Path("bench/results/niah/niah.svg"),
+    out: Path = Path("bench/niah.svg"),
 ) -> None:
     """Prints accuracy, tool calls and generated tokens per setting and length,
     and plots accuracy against haystack length."""
