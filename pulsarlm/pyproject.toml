@@ -1,6 +1,6 @@
 [project]
 name = "pulsarlm"
-dynamic = ["version"]
+dynamic = ["version", "readme"]
 description = "LLM inference engine with unbounded context."
 license = "Apache-2.0"
 # Pinned to 3.13: PyTorch has no CUDA wheels for Python 3.14 yet.
@@ -34,12 +34,15 @@ build-backend = "hatchling.build"
 source = "vcs"
 raw-options = { root = ".." }
 
+[tool.hatch.metadata.hooks.custom]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/pulsarlm"]
 
 [tool.hatch.build.targets.wheel.hooks.custom]
 
 [tool.hatch.build.targets.sdist.force-include]
+"../README.md" = "README.md"
 "../pulsarlm-core/xmake.lua" = "pulsarlm-core/xmake.lua"
 "../pulsarlm-core/inc" = "pulsarlm-core/inc"
 "../pulsarlm-core/src" = "pulsarlm-core/src"

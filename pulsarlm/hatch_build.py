@@ -5,8 +5,21 @@ from pathlib import Path
 
 import torch.utils
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
+from hatchling.metadata.plugin.interface import MetadataHookInterface
 
 TARGET = "pulsarlm"
+
+
+class CustomMetadataHook(MetadataHookInterface):
+    def update(self, metadata):
+        root = Path(self.root)
+        readme = root / "README.md"
+        if not readme.is_file():
+            readme = root.parent / "README.md"
+        metadata["readme"] = {
+            "content-type": "text/markdown",
+            "text": readme.read_text(),
+        }
 
 
 class CustomBuildHook(BuildHookInterface):
