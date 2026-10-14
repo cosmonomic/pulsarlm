@@ -166,25 +166,28 @@ class sum_model final : public pulsarlm::Model {
         for (std::size_t layer = 0; layer < lines.size(); layer++) {
             tables.push_back(all_tables[static_cast<std::int64_t>(layer)]);
             auto table = tables.back().accessor<std::int32_t, 2>();
-            std::vector<std::int64_t> slots;
+            std::vector<std::int64_t> line_ids;
+            std::vector<std::int64_t> offsets;
             for (std::size_t s = 0; s < n_seqs; s++) {
                 for (auto row = static_cast<std::size_t>(query_start[s]);
                      row < static_cast<std::size_t>(query_start[s + 1]);
                      row++) {
                     std::size_t index = static_cast<std::size_t>(key_count[s]) - (query_start[s + 1] - row);
-                    slots.push_back(table[s][index / page_size] * page_size + index % page_size);
+                    line_ids.push_back(table[s][index / page_size]);
+                    offsets.push_back(static_cast<std::int64_t>(index % page_size));
                 }
             }
-            at::Tensor slot = at::tensor(slots).to(g.tokens.device());
+            c10::List<std::optional<at::Tensor>> written{
+                at::tensor(line_ids).to(g.tokens.device()),
+                at::tensor(offsets).to(g.tokens.device()),
+            };
             const pulsarlm::kv& layer_lines = lines[layer];
-            layer_lines.k.flatten(0, 1).select(1, 0).index_copy_(
-                0,
-                slot,
+            layer_lines.k.select(2, 0).index_put_(
+                written,
                 g.tokens.to(at::kFloat).view({n_tokens, 1}).expand({n_tokens, 2})
             );
-            layer_lines.v.flatten(0, 1).select(1, 0).index_copy_(
-                0,
-                slot,
+            layer_lines.v.select(2, 0).index_put_(
+                written,
                 g.pos.to(at::kFloat).view({n_tokens, 1}).expand({n_tokens, 2})
             );
             keys.push_back(layer_lines.k.select(2, 0).select(2, 0).cpu());
@@ -248,14 +251,16 @@ cudaStream_t compute_stream() {
 std::vector<pulsarlm::page_shape> page_shapes(const std::vector<pulsarlm::kv_layer>& layers) {
     std::vector<pulsarlm::page_shape> shapes;
     for (const pulsarlm::kv_layer& layer : layers) {
-        shapes.push_back(pulsarlm::page_shape{
-            .n_layers = 1,
-            .page_size = page_size,
-            .n_kv_heads = layer.n_kv_heads,
-            .head_dim = layer.head_dim,
-            .dtype = at::kFloat,
-            .values_only = layer.values_only,
-        });
+        shapes.push_back(
+            pulsarlm::page_shape{
+                .n_layers = 1,
+                .page_size = page_size,
+                .n_kv_heads = layer.n_kv_heads,
+                .head_dim = layer.head_dim,
+                .dtype = at::kFloat,
+                .values_only = layer.values_only,
+            }
+        );
     }
     return shapes;
 }
@@ -278,13 +283,7 @@ pulsarlm::kv_cache make_cache(
         staging_bytes = std::max(staging_bytes, 2 * pulsarlm::line_bytes(shape));
         lines_bytes += n_lines * pulsarlm::line_bytes(shape);
     }
-    return pulsarlm::kv_cache(
-        shapes,
-        pool_bytes.value_or(lines_bytes),
-        staging_bytes,
-        at::Device(at::kCUDA, 0),
-        store
-    );
+    return pulsarlm::kv_cache(shapes, pool_bytes.value_or(lines_bytes), staging_bytes, at::Device(at::kCUDA, 0), store);
 }
 
 struct fixture {
@@ -483,21 +482,24 @@ TEST_CASE("a request continues from the end state of another in the same cache")
     fixture f(16);
     token_list prompt{1, 2, 3, 4, 5, 6};
     token_list user{7, 8};
-    std::vector<request_results> results =
-        serve_in_turn(f.sched, request{.tokens = prompt, .max_tokens = 5}, [&](const request_results& first) {
+    std::vector<request_results> results = serve_in_turn(
+        f.sched,
+        request{.tokens = prompt, .max_tokens = 5},
+        [&](const request_results& first) {
             return request{
                 .initial_state = ended_state(first),
                 .tokens = concat({first.tokens.back()}, user),
                 .max_tokens = 4
             };
-        });
+        }
+    );
 
     token_list context = concat(concat(prompt, results[0].tokens), user);
     REQUIRE(results[1].tokens == continuation(context, 4));
-    REQUIRE((
-        ended_state(results[1]).page_hashes ==
-        pulsarlm::make_page_digests(root(), concat(context, without_last(results[1].tokens)), page_size)
-    ));
+    REQUIRE(
+        (ended_state(results[1]).page_hashes ==
+         pulsarlm::make_page_digests(root(), concat(context, without_last(results[1].tokens)), page_size))
+    );
     REQUIRE(f.store->fetches.empty());
 }
 
@@ -524,8 +526,10 @@ TEST_CASE("a request continues from pages another cache fetches from the store")
 TEST_CASE("a state page missing from the store ends the request with miss") {
     fixture f(16);
     pulsarlm::state unknown{.page_hashes = {digest{.hi = 1, .lo = 2}}};
-    std::vector<request_results> results =
-        serve_all(f.sched, {request{.initial_state = unknown, .tokens = {3}, .max_tokens = 1}});
+    std::vector<request_results> results = serve_all(
+        f.sched,
+        {request{.initial_state = unknown, .tokens = {3}, .max_tokens = 1}}
+    );
 
     REQUIRE(results[0].tokens.empty());
     REQUIRE(ended_error(results[0]) == request_error::miss);
@@ -603,8 +607,7 @@ TEST_CASE("a request waits for the lines another request releases") {
 
 TEST_CASE("a request needing more lines than the cache has ends with oom") {
     fixture f(2);
-    std::vector<request_results> results =
-        serve_all(f.sched, {request{.tokens = token_list(12, 1), .max_tokens = 1}});
+    std::vector<request_results> results = serve_all(f.sched, {request{.tokens = token_list(12, 1), .max_tokens = 1}});
 
     REQUIRE(results[0].tokens.empty());
     REQUIRE(ended_error(results[0]) == request_error::oom);
@@ -614,8 +617,10 @@ TEST_CASE("a request needing more lines than the cache has ends with oom") {
 TEST_CASE("a request that outgrows the cache alone ends with oom") {
     fixture f(2);
     token_list prompt{1, 2, 3, 4};
-    std::vector<request_results> results =
-        serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 10, .eviction = {.cycle_tokens = 4}}});
+    std::vector<request_results> results = serve_all(
+        f.sched,
+        {request{.tokens = prompt, .max_tokens = 10, .eviction = {.cycle_tokens = 4}}}
+    );
 
     REQUIRE(results[0].tokens == continuation(prompt, 5));
     REQUIRE(ended_error(results[0]) == request_error::oom);
@@ -633,10 +638,10 @@ TEST_CASE("a request that outgrows the free lines waits for them and completes")
 
     REQUIRE(results[0].tokens == continuation(first, 10));
     REQUIRE(results[1].tokens == continuation(second, 10));
-    REQUIRE((
-        ended_state(results[1]).page_hashes ==
-        pulsarlm::make_page_digests(root(), concat(second, without_last(results[1].tokens)), page_size)
-    ));
+    REQUIRE(
+        (ended_state(results[1]).page_hashes ==
+         pulsarlm::make_page_digests(root(), concat(second, without_last(results[1].tokens)), page_size))
+    );
     // Five steps together; the second then waits for a third line while the first runs its last five steps.
     REQUIRE(f.model.forward_count == 15);
 }
@@ -644,8 +649,10 @@ TEST_CASE("a request that outgrows the free lines waits for them and completes")
 TEST_CASE("a cycle ends every cycle_tokens tokens with the state it reached") {
     fixture f(16);
     token_list prompt{1, 2, 3, 4, 5, 6};
-    std::vector<request_results> results =
-        serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 6, .eviction = {.cycle_tokens = 4}}});
+    std::vector<request_results> results = serve_all(
+        f.sched,
+        {request{.tokens = prompt, .max_tokens = 6, .eviction = {.cycle_tokens = 4}}}
+    );
 
     token_list generated = continuation(prompt, 6);
     REQUIRE(results[0].tokens == generated);
@@ -676,7 +683,10 @@ TEST_CASE("a cycle's end evicts the pages below the bar outside the sink and wor
     );
 
     std::vector<digest> chain = pulsarlm::make_page_digests(root(), prompt, page_size);
-    token_list kept = concat(token_list(prompt.begin(), prompt.begin() + 8), token_list(prompt.begin() + 12, prompt.end()));
+    token_list kept = concat(
+        token_list(prompt.begin(), prompt.begin() + 8),
+        token_list(prompt.begin() + 12, prompt.end())
+    );
     std::int64_t first = continuation(prompt, 1)[0];
     REQUIRE(results[0].tokens == token_list{first, continuation(concat(kept, {first}), 1)[0]});
     REQUIRE(results[0].cycle_ends.size() == 1);

@@ -57,7 +57,8 @@ __global__ void write_kv_kernel(
     int num_seqs,
     int max_pages,
     int n_kv_heads,
-    int head_dim
+    int head_dim,
+    int64_t page_stride
 ) {
     const int t = blockIdx.x;
     int s = t;
@@ -78,7 +79,7 @@ __global__ void write_kv_kernel(
     const int line = page_tables[static_cast<int64_t>(s) * max_pages + index / PAGE_SIZE];
 
     const int64_t n = static_cast<int64_t>(n_kv_heads) * head_dim;
-    const int64_t dst = (static_cast<int64_t>(line) * PAGE_SIZE + index % PAGE_SIZE) * n;
+    const int64_t dst = static_cast<int64_t>(line) * page_stride + (index % PAGE_SIZE) * n;
     const int64_t src = static_cast<int64_t>(t) * n;
 
     for (int64_t e = threadIdx.x; e < n; e += blockDim.x) {
@@ -195,7 +196,7 @@ __device__ __forceinline__ void tc_attend_tiles(
         if (before_window >= PAGE_SIZE) {
             continue;
         }
-        const int64_t line_base = (static_cast<int64_t>(seq_table[t]) * PAGE_SIZE * p.n_kv_heads + g) * HEAD_DIM;
+        const int64_t line_base = static_cast<int64_t>(seq_table[t]) * p.page_stride + g * HEAD_DIM;
         for (int i = tid; i < PAGE_SIZE * HALF; i += NWARPS * 32) {
             const int off = i / HALF;
             scalar_t lo = static_cast<scalar_t>(0), hi = static_cast<scalar_t>(0);
@@ -627,14 +628,7 @@ void write_kv_cuda(
             k_new.scalar_type() == v_new.scalar_type(),
         "write_kv: k_pool, v_pool, k_new, v_new must share a dtype"
     );
-    TORCH_CHECK(
-        k_pool.dim() == 4 && k_pool.sizes() == v_pool.sizes(),
-        "write_kv: pools must be 4-D [num_lines, page_size, n_kv_heads, head_dim] of one shape"
-    );
-    TORCH_CHECK(
-        k_pool.is_contiguous() && v_pool.is_contiguous(),
-        "write_kv: pools must be contiguous (mutated in place)"
-    );
+    attn::check_pools("write_kv", k_pool, v_pool);
     const int64_t page_size = k_pool.size(1);
     const int64_t n_kv_heads = k_pool.size(2);
     const int64_t head_dim = k_pool.size(3);
@@ -688,7 +682,8 @@ void write_kv_cuda(
                 static_cast<int>(num_seqs),
                 static_cast<int>(tables.size(1)),
                 static_cast<int>(n_kv_heads),
-                static_cast<int>(head_dim)
+                static_cast<int>(head_dim),
+                k_pool.stride(0)
             );
         });
     });

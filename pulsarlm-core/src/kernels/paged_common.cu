@@ -63,7 +63,7 @@ template <typename scalar_t, int PAGE_SIZE> __global__ void attn_scalar_kernel(c
 
     auto key_offset = [&](int j) {
         const int line = seq_table[j / PAGE_SIZE];
-        return ((static_cast<int64_t>(line) * PAGE_SIZE + j % PAGE_SIZE) * p.n_kv_heads + g) * head_dim;
+        return static_cast<int64_t>(line) * p.page_stride + (j % PAGE_SIZE * p.n_kv_heads + g) * head_dim;
     };
     auto score = [&](int j, int64_t offset) {
         const scalar_t* krow = p.k_pool + offset;
@@ -148,6 +148,26 @@ bool PagedAttnBatch::tensor_core_eligible() const {
         (this->page_size == 16 || this->page_size == 32);
 }
 
+void check_pools(const char* op, const at::Tensor& k_pool, const at::Tensor& v_pool) {
+    TORCH_CHECK(
+        k_pool.dim() == 4 && k_pool.sizes() == v_pool.sizes() && k_pool.strides() == v_pool.strides(),
+        op,
+        ": k_pool and v_pool must be 4-D [num_pages, page_size, n_kv_heads, head_dim] of one shape and stride"
+    );
+    TORCH_CHECK(
+        k_pool.stride(3) == 1 && k_pool.stride(2) == k_pool.size(3) &&
+            k_pool.stride(1) == k_pool.size(2) * k_pool.size(3),
+        op,
+        ": each pool page must be packed"
+    );
+    auto aligned = [](const at::Tensor& pool) { return reinterpret_cast<std::uintptr_t>(pool.data_ptr()) % 16 == 0; };
+    TORCH_CHECK(
+        aligned(k_pool) && aligned(v_pool) && k_pool.stride(0) * k_pool.element_size() % 16 == 0,
+        op,
+        ": pool pages must start at multiples of 16 bytes"
+    );
+}
+
 PagedAttnBatch paged_attn_batch(
     const char* op,
     const at::Tensor& q,
@@ -182,12 +202,7 @@ PagedAttnBatch paged_attn_batch(
         ": q, k_pool, v_pool must share a dtype"
     );
     TORCH_CHECK(q.dim() == 3, op, ": q must be 3-D [total_q, n_q_heads, head_dim]");
-    TORCH_CHECK(
-        k_pool.dim() == 4 && k_pool.sizes() == v_pool.sizes(),
-        op,
-        ": k_pool and v_pool must be 4-D [num_lines, page_size, n_kv_heads, head_dim] of one shape"
-    );
-    TORCH_CHECK(k_pool.is_contiguous() && v_pool.is_contiguous(), op, ": pools must be contiguous");
+    check_pools(op, k_pool, v_pool);
 
     PagedAttnBatch b;
     b.total_q = q.size(0);

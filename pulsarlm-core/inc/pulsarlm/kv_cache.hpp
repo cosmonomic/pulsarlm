@@ -60,7 +60,6 @@ class page_store {
     virtual void put(std::vector<digest>&& hashes, std::vector<page>&& pages) = 0;
 };
 
-
 enum class page_error { miss, oom };
 
 // The lines of every KV layer, in one device pool of bytes. A line holds one page of one layer. The layers whose lines
@@ -68,30 +67,30 @@ enum class page_error { miss, oom };
 // shared by every class. A layer's page is stored under store_key(page, layer).
 class kv_cache {
   private:
-    static constexpr std::uint32_t no_slot = std::numeric_limits<std::uint32_t>::max();
+    static constexpr std::uint32_t no_line = std::numeric_limits<std::uint32_t>::max();
 
     struct cache_line {
         std::optional<digest> hash;
         std::size_t layer = 0;
         std::uint32_t ref = 0;
-        std::uint32_t previous_free = no_slot;
-        std::uint32_t next_free = no_slot;
+        std::uint32_t previous_free = no_line;
+        std::uint32_t next_free = no_line;
     };
 
-    // lines is indexed by slot: the line at slot i covers pool bytes [i line_bytes, (i + 1) line_bytes). Slots whose
+    // lines is indexed by line id: line i covers pool bytes [i line_bytes, (i + 1) line_bytes), K then V. Ids whose
     // bytes another class carved hold no line of this class.
     struct size_class {
         std::size_t line_bytes;
         std::vector<cache_line> lines;
         std::size_t line_count = 0;
         // Free lines in reuse order: unmapped lines first, then mapped lines least recently released first.
-        std::uint32_t free_front = no_slot;
-        std::uint32_t free_back = no_slot;
+        std::uint32_t free_front = no_line;
+        std::uint32_t free_back = no_line;
         std::size_t free_count = 0;
 
-        void link_free_front(std::uint32_t slot) noexcept;
-        void link_free_back(std::uint32_t slot) noexcept;
-        void unlink_free(std::uint32_t slot) noexcept;
+        void link_free_front(std::uint32_t line_id) noexcept;
+        void link_free_back(std::uint32_t line_id) noexcept;
+        void unlink_free(std::uint32_t line_id) noexcept;
     };
 
     // done is set when the fetch completes. The page arrived when its line's hash then equals its digest.
@@ -100,12 +99,9 @@ class kv_cache {
         event done;
     };
 
-    // A line id indexes the layer's tensors, whose lines are page_bytes apart: the line at slot i of the layer's class
-    // has id i line_bytes / page_bytes, with its K at that id in k and its V at that id in v, page_bytes further.
     struct cache_layer {
         page_shape shape;
         std::size_t size_class;
-        std::size_t page_bytes;
         kv device_kv;
         std::unordered_map<digest, std::uint32_t, digest_hash> digest_to_line_id;
         // Pages a get is fetching into a line, not yet in digest_to_line_id.
@@ -131,8 +127,6 @@ class kv_cache {
     std::unique_ptr<event> staging_released;
 
     std::size_t pool_bytes() const noexcept;
-    std::uint32_t slot_of(std::size_t layer, std::uint32_t line_id) const noexcept;
-    std::uint32_t line_id_of(std::size_t layer, std::uint32_t slot) const noexcept;
     cache_line& line(std::size_t layer, std::uint32_t line_id) noexcept;
     const cache_line& line(std::size_t layer, std::uint32_t line_id) const noexcept;
     bool is_mapped(std::size_t layer, std::uint32_t line_id) const noexcept;
@@ -200,7 +194,7 @@ class kv_cache {
     // Whether counts[layer] new lines in each layer can be taken from the lines free now.
     bool fits_free(std::span<const std::size_t> counts) const;
     std::size_t layer_count() const noexcept;
-    // [n_lines, page_size, n_kv_heads, head_dim] views of the pool.
+    // [n_lines, page_size, n_kv_heads, head_dim] views of the pool, indexed by line id, lines line_bytes apart.
     const kv& tensors(std::size_t layer) const noexcept;
 };
 

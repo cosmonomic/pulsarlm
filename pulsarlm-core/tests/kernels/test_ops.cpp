@@ -871,8 +871,9 @@ TEST_CASE(
                             );
                             at::manual_seed(11);
                             auto opts = at::device(at::kCUDA).dtype(dt);
-                            auto k_pool = at::randn({num_lines, page_size, n_kv, head_dim}, opts);
-                            auto v_pool = at::randn({num_lines, page_size, n_kv, head_dim}, opts);
+                            auto lines = at::randn({num_lines, 2, page_size, n_kv, head_dim}, opts);
+                            auto k_pool = lines.select(1, 0);
+                            auto v_pool = lines.select(1, 1);
                             std::optional<at::Tensor> k_norm_weight;
                             if (scaled_keys) {
                                 k_norm_weight = at::rand({head_dim}, at::device(at::kCUDA).dtype(at::kFloat)) + 0.5;
@@ -1013,6 +1014,14 @@ TEST_CASE("write_kv places each token at its view index through the page table",
     }
     CHECK(at::equal(k_pool[4][1], k_new[6]));
     CHECK(at::equal(k_pool[4][2], k_new[7]));
+
+    auto lines = at::zeros({num_lines, 2, kPageSize, n_kv, head_dim}, opts);
+    pulsarlm::write_kv_cuda(lines.select(1, 0), lines.select(1, 1), k_new, v_new, page_tables, cu_seqlens_q, seqlens_k);
+    CHECK(at::equal(lines[3][0][14], k_new[0]));
+    CHECK(at::equal(lines[3][1][14], v_new[0]));
+    CHECK(at::equal(lines[4][0][2], k_new[7]));
+    CHECK(at::equal(lines[4][1][2], v_new[7]));
+    CHECK(lines.select(1, 1)[3][13].abs().sum().item<float>() == 0.0f);
 
     auto pool = at::zeros({num_lines, kPageSize, n_kv, head_dim}, opts);
     auto decode_tokens = at::randn({2, n_kv, head_dim}, opts);

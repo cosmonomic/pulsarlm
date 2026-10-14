@@ -51,8 +51,12 @@ std::vector<std::int64_t> page_sizes(const page_shape& shape) {
     };
 }
 
-std::size_t page_bytes(const page_shape& shape) {
-    return line_bytes(shape) / (shape.values_only ? 1 : 2);
+std::size_t tensor_count(const page_shape& shape) {
+    return shape.values_only ? 1 : 2;
+}
+
+std::size_t tensor_bytes(const page_shape& shape) {
+    return line_bytes(shape) / tensor_count(shape);
 }
 
 at::Tensor make_pool(std::span<const page_shape> shapes, std::size_t pool_bytes, at::Device device) {
@@ -68,25 +72,18 @@ at::Tensor make_pool(std::span<const page_shape> shapes, std::size_t pool_bytes,
             " bytes"
         );
     }
-    return at::empty(
-        {static_cast<std::int64_t>(pool_bytes)},
-        at::TensorOptions().dtype(at::kByte).device(device)
-    );
+    return at::empty({static_cast<std::int64_t>(pool_bytes)}, at::TensorOptions().dtype(at::kByte).device(device));
 }
 
-// A K and V layer's V view starts page_bytes into the pool, so both views hold one line fewer than fit in the pool.
 kv pool_views(const at::Tensor& pool, const page_shape& shape) {
-    std::size_t bytes = page_bytes(shape);
-    std::size_t n_lines = static_cast<std::size_t>(pool.numel()) / bytes - (shape.values_only ? 0 : 1);
+    std::size_t n_lines = static_cast<std::size_t>(pool.numel()) / line_bytes(shape);
     std::vector<std::int64_t> sizes = page_sizes(shape);
-    sizes.front() = static_cast<std::int64_t>(n_lines);
-    auto view_from = [&](std::size_t first_byte) {
-        return pool.narrow(0, static_cast<std::int64_t>(first_byte), static_cast<std::int64_t>(n_lines * bytes))
-            .view(shape.dtype)
-            .view(sizes);
-    };
-    at::Tensor k = view_from(0);
-    return kv{.k = k, .v = shape.values_only ? k : view_from(bytes)};
+    sizes.front() = static_cast<std::int64_t>(tensor_count(shape));
+    sizes.insert(sizes.begin(), static_cast<std::int64_t>(n_lines));
+    at::Tensor
+        lines = pool.narrow(0, 0, static_cast<std::int64_t>(n_lines * line_bytes(shape))).view(shape.dtype).view(sizes);
+    at::Tensor k = lines.select(1, 0);
+    return kv{.k = k, .v = shape.values_only ? k : lines.select(1, 1)};
 }
 
 c10::cuda::CUDAStreamGuard guard_stream(const at::Tensor& lines, cudaStream_t stream) {
@@ -160,38 +157,38 @@ digest store_key(const digest& page, std::size_t layer) {
     return make_digest(seed);
 }
 
-void kv_cache::size_class::link_free_front(std::uint32_t slot) noexcept {
-    lines[slot].previous_free = no_slot;
-    lines[slot].next_free = free_front;
-    if (free_front == no_slot) {
-        free_back = slot;
+void kv_cache::size_class::link_free_front(std::uint32_t line_id) noexcept {
+    lines[line_id].previous_free = no_line;
+    lines[line_id].next_free = free_front;
+    if (free_front == no_line) {
+        free_back = line_id;
     } else {
-        lines[free_front].previous_free = slot;
+        lines[free_front].previous_free = line_id;
     }
-    free_front = slot;
+    free_front = line_id;
     free_count++;
 }
 
-void kv_cache::size_class::link_free_back(std::uint32_t slot) noexcept {
-    lines[slot].previous_free = free_back;
-    lines[slot].next_free = no_slot;
-    if (free_back == no_slot) {
-        free_front = slot;
+void kv_cache::size_class::link_free_back(std::uint32_t line_id) noexcept {
+    lines[line_id].previous_free = free_back;
+    lines[line_id].next_free = no_line;
+    if (free_back == no_line) {
+        free_front = line_id;
     } else {
-        lines[free_back].next_free = slot;
+        lines[free_back].next_free = line_id;
     }
-    free_back = slot;
+    free_back = line_id;
     free_count++;
 }
 
-void kv_cache::size_class::unlink_free(std::uint32_t slot) noexcept {
-    cache_line& unlinked = lines[slot];
-    if (unlinked.previous_free == no_slot) {
+void kv_cache::size_class::unlink_free(std::uint32_t line_id) noexcept {
+    cache_line& unlinked = lines[line_id];
+    if (unlinked.previous_free == no_line) {
         free_front = unlinked.next_free;
     } else {
         lines[unlinked.previous_free].next_free = unlinked.next_free;
     }
-    if (unlinked.next_free == no_slot) {
+    if (unlinked.next_free == no_line) {
         free_back = unlinked.previous_free;
     } else {
         lines[unlinked.next_free].previous_free = unlinked.previous_free;
@@ -221,7 +218,6 @@ kv_cache::kv_cache(
             cache_layer{
                 .shape = shape,
                 .size_class = class_index,
-                .page_bytes = page_bytes(shape),
                 .device_kv = pool_views(pool, shape),
             }
         );
@@ -232,22 +228,12 @@ std::size_t kv_cache::pool_bytes() const noexcept {
     return static_cast<std::size_t>(pool.numel());
 }
 
-std::uint32_t kv_cache::slot_of(std::size_t layer, std::uint32_t line_id) const noexcept {
-    const cache_layer& owner = layers[layer];
-    return static_cast<std::uint32_t>(line_id * owner.page_bytes / classes[owner.size_class].line_bytes);
-}
-
-std::uint32_t kv_cache::line_id_of(std::size_t layer, std::uint32_t slot) const noexcept {
-    const cache_layer& owner = layers[layer];
-    return static_cast<std::uint32_t>(slot * classes[owner.size_class].line_bytes / owner.page_bytes);
-}
-
 kv_cache::cache_line& kv_cache::line(std::size_t layer, std::uint32_t line_id) noexcept {
-    return classes[layers[layer].size_class].lines[slot_of(layer, line_id)];
+    return classes[layers[layer].size_class].lines[line_id];
 }
 
 const kv_cache::cache_line& kv_cache::line(std::size_t layer, std::uint32_t line_id) const noexcept {
-    return classes[layers[layer].size_class].lines[slot_of(layer, line_id)];
+    return classes[layers[layer].size_class].lines[line_id];
 }
 
 // A line keeps its hash unmapped when another line cached that hash before its fetch or sync completed.
@@ -264,7 +250,7 @@ bool kv_cache::is_mapped(std::size_t layer, std::uint32_t line_id) const noexcep
 void kv_cache::hold(std::size_t layer, std::uint32_t line_id) noexcept {
     cache_line& held = line(layer, line_id);
     if (held.ref == 0) {
-        classes[layers[layer].size_class].unlink_free(slot_of(layer, line_id));
+        classes[layers[layer].size_class].unlink_free(line_id);
     }
     held.ref++;
 }
@@ -272,29 +258,28 @@ void kv_cache::hold(std::size_t layer, std::uint32_t line_id) noexcept {
 // Reusing a mapped line drops its page from the layer that cached it, which may be another layer of the class.
 std::uint32_t kv_cache::take_free_line(std::size_t layer) noexcept {
     size_class& taken_from = classes[layers[layer].size_class];
-    std::uint32_t slot = taken_from.free_front;
-    if (slot != no_slot) {
-        taken_from.unlink_free(slot);
-        const cache_line& reused = taken_from.lines[slot];
-        std::uint32_t reused_id = line_id_of(reused.layer, slot);
-        if (is_mapped(reused.layer, reused_id)) {
+    std::uint32_t line_id = taken_from.free_front;
+    if (line_id != no_line) {
+        taken_from.unlink_free(line_id);
+        const cache_line& reused = taken_from.lines[line_id];
+        if (is_mapped(reused.layer, line_id)) {
             layers[reused.layer].digest_to_line_id.erase(*reused.hash);
         }
     } else {
         std::size_t first = ceil_div(bump, taken_from.line_bytes) * taken_from.line_bytes;
         assert(first + taken_from.line_bytes <= pool_bytes());
-        slot = static_cast<std::uint32_t>(first / taken_from.line_bytes);
-        if (taken_from.lines.size() <= slot) {
-            taken_from.lines.resize(slot + 1);
+        line_id = static_cast<std::uint32_t>(first / taken_from.line_bytes);
+        if (taken_from.lines.size() <= line_id) {
+            taken_from.lines.resize(line_id + 1);
         }
         taken_from.line_count++;
         bump = first + taken_from.line_bytes;
     }
-    cache_line& taken = taken_from.lines[slot];
+    cache_line& taken = taken_from.lines[line_id];
     taken.hash.reset();
     taken.layer = layer;
     taken.ref = 1;
-    return line_id_of(layer, slot);
+    return line_id;
 }
 
 std::vector<std::uint32_t> kv_cache::take_free_lines(std::size_t layer, std::size_t count) noexcept {
@@ -362,20 +347,19 @@ void kv_cache::release_staging() noexcept {
 std::optional<page> kv_cache::staging_slot(std::size_t layer, std::size_t& used) const {
     const page_shape& shape = layers[layer].shape;
     std::size_t element_bytes = c10::elementSize(shape.dtype);
-    std::size_t tensor_bytes = page_bytes(shape);
     std::size_t first = ceil_div(used, element_bytes) * element_bytes;
     if (first + line_bytes(shape) > static_cast<std::size_t>(staging.numel())) {
         return std::nullopt;
     }
     std::vector<std::int64_t> sizes = page_sizes(shape);
     auto tensor_at = [&](std::size_t offset) {
-        return staging.narrow(0, static_cast<std::int64_t>(offset), static_cast<std::int64_t>(tensor_bytes))
+        return staging.narrow(0, static_cast<std::int64_t>(offset), static_cast<std::int64_t>(tensor_bytes(shape)))
             .view(shape.dtype)
             .view(sizes);
     };
     at::Tensor v = tensor_at(first);
     used = first + line_bytes(shape);
-    return page{.k = shape.values_only ? v : tensor_at(first + tensor_bytes), .v = v};
+    return page{.k = shape.values_only ? v : tensor_at(first + tensor_bytes(shape)), .v = v};
 }
 
 // Slots are reused only after the stream finished the copies out of them. The staging buffer holds a page of any
@@ -656,10 +640,10 @@ void kv_cache::release(std::size_t layer, std::span<const std::uint32_t> line_id
             continue;
         }
         if (is_mapped(layer, line_id)) {
-            owner.link_free_back(slot_of(layer, line_id));
+            owner.link_free_back(line_id);
         } else {
             released.hash.reset();
-            owner.link_free_front(slot_of(layer, line_id));
+            owner.link_free_front(line_id);
         }
     }
 }

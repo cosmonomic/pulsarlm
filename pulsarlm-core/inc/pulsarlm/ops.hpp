@@ -14,8 +14,9 @@ namespace pulsarlm {
 // RMSNorm. Stateless.
 at::Tensor rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, double eps);
 
-// Scatter a batch's new K/V rows into paged pools. k_pool/v_pool are [num_lines,
-// page_size, n_kv_heads, head_dim] and may be one tensor; k_new/v_new are
+// Scatter a batch's new K/V rows into paged pools. k_pool/v_pool are [num_pages,
+// page_size, n_kv_heads, head_dim] of one stride, each page packed and 16-byte aligned
+// with pages any number of elements apart, and may be one tensor; k_new/v_new are
 // [num_new_tokens, n_kv_heads, head_dim]. The tokens sit at view indices as the queries
 // of attn_prefill (with cu_seqlens_q) or attn_decode (without), and the token at view
 // index j of sequence s goes to line page_tables[s][j / page_size], offset
@@ -39,6 +40,7 @@ at::Tensor gather_page_tables_cuda(std::span<const at::Tensor> tables, int64_t n
 // Paged attention over a batch of sequences, each a VIEW: an ordered list of lines
 // (page_size-key pages) of the shared pool. Key index j of sequence s lives at
 // (page_tables[s][j / page_size], j % page_size). A line may appear in several views.
+// k_pool and v_pool are laid out as write_kv_cuda's.
 //
 // The pool holds UNROTATED keys. The op rotates key j of sequence s to the RoPE
 // position rope_layout[s] gives index j, in the HF/Qwen2 rotate_half convention with

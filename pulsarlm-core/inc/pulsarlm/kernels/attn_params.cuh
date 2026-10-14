@@ -23,8 +23,9 @@ constexpr size_t kSharedMemoryWithoutOptIn = 48 * 1024;
 
 template <typename scalar_t> struct PagedAttnParams {
     const scalar_t* q;  // [total_q, n_q_heads, head_dim], rotated
-    const scalar_t* k_pool;  // [num_lines, page_size, n_kv_heads, head_dim], unrotated
-    const scalar_t* v_pool;  // [num_lines, page_size, n_kv_heads, head_dim]
+    const scalar_t* k_pool;  // [num_pages, page_size, n_kv_heads, head_dim], unrotated
+    const scalar_t* v_pool;  // [num_pages, page_size, n_kv_heads, head_dim]
+    int64_t page_stride;  // elements from one pool page to the next, in k_pool and v_pool alike
     const int32_t* page_tables;  // [num_seqs, max_pages]
     const int32_t* cu_seqlens_q;  // [num_seqs + 1]; null when each sequence has one query
     const int32_t* seqlens_k;  // [num_seqs]
