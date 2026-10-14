@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -44,7 +45,8 @@ struct Qwen3Model : Model {
         c10::Dict<std::string, at::Tensor> weights
     );
 
-    StepLogits forward(const StepBatch& batch, const kv& kv) override;
+    std::vector<kv_layer> kv_layers() const override;
+    StepLogits forward(const StepBatch& batch, std::span<const kv> lines) override;
 
     bool supports_capture() const override {
         return true;
@@ -71,7 +73,7 @@ struct Qwen3Model : Model {
         at::Tensor down_proj_weight;
     };
 
-    at::Tensor block(at::Tensor x, int64_t layer, const GroupBatch& g, const kv& kv);
+    at::Tensor block(at::Tensor x, int64_t layer, const GroupBatch& g, std::span<const kv> lines);
     at::Tensor head(at::Tensor x);
 
     int64_t n_layers;

@@ -100,19 +100,53 @@ at::Tensor slot(const at::Tensor& staging, std::size_t index) {
 }  // namespace
 
 std::size_t line_bytes(const page_shape& shape) {
-    return 2 * shape.n_layers * shape.page_size * shape.n_kv_heads * shape.head_dim * c10::elementSize(shape.dtype);
+    std::size_t tensors = shape.values_only ? 1 : 2;
+    return tensors * shape.n_layers * shape.page_size * shape.n_kv_heads * shape.head_dim *
+        c10::elementSize(shape.dtype);
 }
 
-digest make_root_digest(std::string_view model, const page_shape& shape) {
+digest make_root_digest(std::string_view model, std::span<const page_shape> shapes) {
     std::vector<std::byte> seed;
     append_string(seed, digest_function());
     append_string(seed, model);
-    append_string(seed, c10::toString(shape.dtype));
-    append_u64(seed, shape.n_layers);
-    append_u64(seed, shape.page_size);
-    append_u64(seed, shape.n_kv_heads);
-    append_u64(seed, shape.head_dim);
+    append_u64(seed, shapes.size());
+    for (const page_shape& shape : shapes) {
+        append_string(seed, c10::toString(shape.dtype));
+        append_u64(seed, shape.n_layers);
+        append_u64(seed, shape.page_size);
+        append_u64(seed, shape.n_kv_heads);
+        append_u64(seed, shape.head_dim);
+        append_u64(seed, shape.values_only);
+    }
     return make_digest(seed);
+}
+
+digest store_key(const digest& page, std::size_t layer) {
+    std::vector<std::byte> seed;
+    append_u64(seed, page.hi);
+    append_u64(seed, page.lo);
+    append_u64(seed, layer);
+    return make_digest(seed);
+}
+
+layer_store::layer_store(page_store& store, std::size_t layer) noexcept
+: store(store),
+  layer(layer) {}
+
+task<std::vector<std::optional<page>>> layer_store::fetch(std::span<const digest> hashes) {
+    std::vector<digest> keys;
+    keys.reserve(hashes.size());
+    for (const digest& hash : hashes) {
+        keys.push_back(store_key(hash, layer));
+    }
+    co_return co_await store.fetch(keys);
+}
+
+void layer_store::put(std::vector<digest>&& hashes, std::vector<page>&& pages) {
+    for (digest& hash : hashes) {
+        hash = store_key(hash, layer);
+    }
+    store.put(std::move(hashes), std::move(pages));
 }
 
 task<void> kv_cache::hold_staging() {
@@ -146,12 +180,14 @@ kv_cache::copy_from_host(std::span<const std::uint32_t> line_ids, std::span<cons
             for (std::size_t j = 0; j < count; j++) {
                 std::uint32_t line_id = line_ids[first + j];
                 const page& source = pages[first + j];
-                check_page(device_kv.k, line_id, source.k);
                 check_page(device_kv.v, line_id, source.v);
-                slot(staging.k, j).copy_(source.k);
                 slot(staging.v, j).copy_(source.v);
-                copy_into_line(device_kv.k, line_id, slot(staging.k, j));
                 copy_into_line(device_kv.v, line_id, slot(staging.v, j));
+                if (!values_only) {
+                    check_page(device_kv.k, line_id, source.k);
+                    slot(staging.k, j).copy_(source.k);
+                    copy_into_line(device_kv.k, line_id, slot(staging.k, j));
+                }
             }
         }
         co_await synchronize(stream);
@@ -167,14 +203,18 @@ task<void> kv_cache::copy_to_host(std::span<const std::uint32_t> line_ids, std::
         {
             auto guard = guard_stream(device_kv.k, stream);
             for (std::size_t j = 0; j < count; j++) {
-                copy_out_of_line(device_kv.k, line_ids[first + j], slot(staging.k, j));
                 copy_out_of_line(device_kv.v, line_ids[first + j], slot(staging.v, j));
+                if (!values_only) {
+                    copy_out_of_line(device_kv.k, line_ids[first + j], slot(staging.k, j));
+                }
             }
         }
         co_await synchronize(stream);
         for (std::size_t j = 0; j < count; j++) {
-            pages[first + j].k.copy_(slot(staging.k, j));
             pages[first + j].v.copy_(slot(staging.v, j));
+            if (!values_only) {
+                pages[first + j].k.copy_(slot(staging.k, j));
+            }
         }
     }
     release_staging();
@@ -185,8 +225,10 @@ void kv_cache::copy_line(std::uint32_t source, std::span<const std::uint32_t> ta
     at::Tensor k_source = device_kv.k.select(1, static_cast<std::int64_t>(source));
     at::Tensor v_source = device_kv.v.select(1, static_cast<std::int64_t>(source));
     for (std::uint32_t target : targets) {
-        copy_into_line(device_kv.k, target, k_source);
         copy_into_line(device_kv.v, target, v_source);
+        if (!values_only) {
+            copy_into_line(device_kv.k, target, k_source);
+        }
     }
 }
 
@@ -198,7 +240,8 @@ std::optional<std::vector<page>> kv_cache::allocate_host_pages(std::size_t count
     pages.reserve(count);
     try {
         for (std::size_t i = 0; i < count; i++) {
-            pages.push_back(page{.k = at::empty(line.sizes(), options), .v = at::empty(line.sizes(), options)});
+            at::Tensor v = at::empty(line.sizes(), options);
+            pages.push_back(page{.k = values_only ? v : at::empty(line.sizes(), options), .v = v});
         }
     } catch (const c10::OutOfMemoryError&) {
         return std::nullopt;
@@ -211,12 +254,17 @@ kv_cache::kv_cache(
     std::size_t n_lines,
     std::size_t staging_pages,
     at::Device device,
-    std::unique_ptr<page_store>&& store
+    page_store& store
 )
-: device_kv{.k = make_lines(shape, n_lines, device), .v = make_lines(shape, n_lines, device)},
+: values_only(shape.values_only),
+  device_kv{.k = make_lines(shape, n_lines, device), .v = device_kv.k},
   lines(n_lines),
-  store(std::move(store)),
-  staging{.k = make_staging(shape, staging_pages), .v = make_staging(shape, staging_pages)} {
+  store(&store),
+  staging{.k = make_staging(shape, staging_pages), .v = staging.k} {
+    if (!values_only) {
+        device_kv.v = make_lines(shape, n_lines, device);
+        staging.v = make_staging(shape, staging_pages);
+    }
     for (std::uint32_t line_id = 0; line_id < n_lines; line_id++) {
         link_free_back(line_id);
     }
@@ -437,6 +485,10 @@ void kv_cache::release(std::span<const std::uint32_t> line_ids) noexcept {
             link_free_front(line_id);
         }
     }
+}
+
+std::size_t kv_cache::line_count() const noexcept {
+    return lines.size();
 }
 
 std::size_t kv_cache::free_line_count() const noexcept {

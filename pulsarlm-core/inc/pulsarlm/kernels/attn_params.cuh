@@ -19,8 +19,7 @@
 namespace pulsarlm {
 namespace attn {
 
-// Shared memory a CTA may use without opting in.
-constexpr size_t kDefaultSharedMemory = 48 * 1024;
+constexpr size_t kSharedMemoryWithoutOptIn = 48 * 1024;
 
 template <typename scalar_t> struct PagedAttnParams {
     const scalar_t* q;  // [total_q, n_q_heads, head_dim], rotated
@@ -31,7 +30,7 @@ template <typename scalar_t> struct PagedAttnParams {
     const int32_t* seqlens_k;  // [num_seqs]
     const int32_t* rope_layout;  // [num_seqs, 3], see KeyLayout
     const uint64_t* rope_turns;  // [head_dim / 2], see rope_turns_per_position
-    const float* k_norm_weight;  // [head_dim]; null leaves stored keys unscaled
+    const float* k_norm_weight;  // [head_dim] or null
     float* mass;  // [total_view_pages, page_size, n_q_heads]; null skips the mass pass
     const int32_t* cu_view_pages;  // [num_seqs + 1]
     const float* mass_decay;  // [num_seqs]
@@ -45,19 +44,16 @@ template <typename scalar_t> struct PagedAttnParams {
     int max_pages;
     int group;
     int total_view_pages;
-    // 0 lets every query attend all its causal keys.
-    int sliding_window;
+    int sliding_window;  // 0 when there is no window
     float scale;
 };
 
-// The first key the query at view index query_index attends.
 template <typename scalar_t>
 __device__ __forceinline__ int first_key(const PagedAttnParams<scalar_t>& p, int query_index) {
     return p.sliding_window > 0 ? max(0, query_index - p.sliding_window + 1) : 0;
 }
 
-// A stored key's frequency pair (k[pair], k[pair + head_dim/2]) as the rotation takes it: scaled by k_norm_weight when
-// given.
+// k[pair] and k[pair + half], each times its k_norm_weight entry when there is one.
 template <typename scalar_t>
 __device__ __forceinline__ void
 stored_key_pair(const PagedAttnParams<scalar_t>& p, const scalar_t* key, int pair, int half, float& lo, float& hi) {

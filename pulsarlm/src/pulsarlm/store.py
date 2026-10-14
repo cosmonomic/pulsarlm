@@ -29,7 +29,7 @@ def state_key(state: State) -> StateKey:
 
 def page_bytes(page: Page) -> int:
     k, v = page
-    return k.nbytes + v.nbytes
+    return v.nbytes if k is v else k.nbytes + v.nbytes
 
 
 @dataclass
@@ -38,6 +38,12 @@ class StoredPage:
     last_put: int
     references: int = 0
     pins: int = 0
+
+
+@dataclass
+class StoredState:
+    state: State
+    page_keys: list[bytes]
 
 
 class LocalStore:
@@ -58,7 +64,7 @@ class LocalStore:
         self._capacity_bytes = capacity_bytes
         self._page_bytes = 0
         self._pages: dict[bytes, StoredPage] = {}
-        self._states: OrderedDict[StateKey, State] = OrderedDict()
+        self._states: OrderedDict[StateKey, StoredState] = OrderedDict()
         self._tails: dict[bytes, set[tuple[int, ...]]] = {}
         self._unreferenced: set[bytes] = set()
         self._clock = count()
@@ -95,32 +101,33 @@ class LocalStore:
         page_digests are prompt's full page hashes. The state's pages stay pinned,
         and pages put meanwhile stay, until the lease closes."""
         with self._lock:
-            state, covered = self._find(prompt, page_digests)
+            found, covered = self._find(prompt, page_digests)
             opened = next(self._clock)
             self._open_leases[opened] = None
-            for h in state.page_hashes:
+            for h in found.page_keys:
                 self._pages[h].pins += 1
         try:
-            yield state, covered
+            yield found.state, covered
         finally:
             with self._lock:
                 del self._open_leases[opened]
-                for h in state.page_hashes:
+                for h in found.page_keys:
                     self._pages[h].pins -= 1
                 self._fit()
 
-    def write(self, state: State) -> None:
-        """Makes state findable. Its pages are in the store: the engine puts them
-        before it reports the state, and the writer's lease keeps them."""
+    def write(self, state: State, page_keys: list[bytes]) -> None:
+        """Makes state findable. page_keys are the keys of the pages a request
+        resuming from it reads, all in the store: the engine puts them before it
+        reports the state, and the writer's lease keeps them."""
         key = state_key(state)
         with self._lock:
-            for h in state.page_hashes:
+            for h in page_keys:
                 self._reference(h)
             if (replaced := self._states.pop(key, None)) is not None:
                 self._dereference_all(replaced)
             else:
                 self._tails.setdefault(key[0], set()).add(key[1])
-            self._states[key] = state
+            self._states[key] = StoredState(state, page_keys)
             self._fit()
 
     def __len__(self) -> int:
@@ -136,7 +143,9 @@ class LocalStore:
         with self._lock:
             return self._page_bytes
 
-    def _find(self, prompt: list[int], page_digests: list[bytes]) -> tuple[State, int]:
+    def _find(
+        self, prompt: list[int], page_digests: list[bytes]
+    ) -> tuple[StoredState, int]:
         for page_count in range(len(page_digests), -1, -1):
             last_page = page_digests[page_count - 1] if page_count else NO_PAGES
             start = page_count * self._page_size
@@ -153,7 +162,7 @@ class LocalStore:
                 key = (last_page, longest)
                 self._states.move_to_end(key)
                 return self._states[key], start + len(longest)
-        return State(), 0
+        return StoredState(State(), []), 0
 
     def _reference(self, h: bytes) -> None:
         stored = self._pages[h]
@@ -161,11 +170,11 @@ class LocalStore:
             self._unreferenced.discard(h)
         stored.references += 1
 
-    def _dereference_all(self, state: State) -> None:
-        for h in state.page_hashes:
-            stored = self._pages[h]
-            stored.references -= 1
-            if stored.references == 0:
+    def _dereference_all(self, dropped: StoredState) -> None:
+        for h in dropped.page_keys:
+            page = self._pages[h]
+            page.references -= 1
+            if page.references == 0:
                 self._unreferenced.add(h)
 
     def _fit(self) -> None:

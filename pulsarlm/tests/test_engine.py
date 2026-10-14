@@ -104,6 +104,7 @@ def make_engine(store: MemoryStore) -> Engine:
         kv_dtype=DTYPE,
         kv_cache_gib=64 * LINE_BYTES / 2**30,
         staging_gib=4 * LINE_BYTES / 2**30,
+        max_position_embeddings=4096,
         device=DEVICE,
         stop_ids=[],
         prefill_tokens_per_step=64,
@@ -146,7 +147,7 @@ def test_generates_max_tokens_and_ends_with_a_state():
         assert isinstance(end, State)
         forwarded = len(PROMPT) + len(tokens) - 1
         assert len(end.page_hashes) * PAGE_SIZE + len(end.tail) == forwarded
-        assert all(h in store.pages for h in end.page_hashes)
+        assert all(k in store.pages for k in engine.page_keys(end))
 
     asyncio.run(main())
 
@@ -182,7 +183,7 @@ def test_another_engine_continues_a_state_from_the_store():
             second, second.submit(reached, follow_up, max_tokens=8)
         )
 
-        assert store.fetched == reached.page_hashes
+        assert store.fetched == second.page_keys(reached)
         assert continued == expected
         assert isinstance(end, State)
 
@@ -254,6 +255,7 @@ def test_a_cache_or_staging_buffer_without_a_page_is_rejected(
             kv_dtype=DTYPE,
             kv_cache_gib=kv_cache_gib,
             staging_gib=staging_gib,
+            max_position_embeddings=4096,
             device=DEVICE,
             stop_ids=[],
             prefill_tokens_per_step=64,

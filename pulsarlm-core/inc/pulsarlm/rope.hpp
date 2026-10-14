@@ -11,8 +11,7 @@
 namespace pulsarlm {
 
 // The first floor(partial_rotary_factor * head_dim / 2) rotate_half pairs rotate, pair j at the inverse frequency
-// theta^(-2j/head_dim); the other pairs have frequency 0 and pass through unrotated. A factor of 1 rotates every pair;
-// below 1 it is Hugging Face's "proportional" RoPE.
+// theta^(-2j/head_dim); the other pairs have frequency 0 and pass through unrotated.
 struct rope_parameters {
     double theta;
     double partial_rotary_factor = 1.0;

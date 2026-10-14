@@ -42,26 +42,42 @@ using attn::KeyLayout;
 using attn::kThreads;
 using attn::PagedAttnParams;
 
-// Scatter new K/V rows into the pool. Token t (slot = slot_mapping[t]) writes
-// into k_pool[slot/PAGE_SIZE, slot%PAGE_SIZE, :, :]. One block per token; the
-// n_kv_heads*head_dim elements are strided across the block's threads.
+// One block per token; the n_kv_heads*head_dim elements are strided across the
+// block's threads. The pools may be one tensor.
 template <typename scalar_t, int PAGE_SIZE>
 __global__ void write_kv_kernel(
-    scalar_t* __restrict__ k_pool,
-    scalar_t* __restrict__ v_pool,
+    scalar_t* k_pool,
+    scalar_t* v_pool,
     const scalar_t* __restrict__ k_new,
     const scalar_t* __restrict__ v_new,
-    const int32_t* __restrict__ slot_mapping,
+    const int32_t* __restrict__ page_tables,
+    const int32_t* __restrict__ cu_seqlens_q,
+    const int32_t* __restrict__ seqlens_k,
+    int num_seqs,
+    int max_pages,
     int n_kv_heads,
     int head_dim
 ) {
     const int t = blockIdx.x;
-    const int slot = slot_mapping[t];
-    const int page = slot / PAGE_SIZE;
-    const int offset = slot % PAGE_SIZE;
+    int s = t;
+    int index = seqlens_k[t] - 1;
+    if (cu_seqlens_q) {
+        int lo = 0, hi = num_seqs;
+        while (hi - lo > 1) {
+            const int mid = (lo + hi) >> 1;
+            if (cu_seqlens_q[mid] <= t) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        s = lo;
+        index = seqlens_k[s] - (cu_seqlens_q[s + 1] - t);
+    }
+    const int line = page_tables[static_cast<int64_t>(s) * max_pages + index / PAGE_SIZE];
 
     const int64_t n = static_cast<int64_t>(n_kv_heads) * head_dim;
-    const int64_t dst = ((static_cast<int64_t>(page) * PAGE_SIZE + offset) * n_kv_heads) * head_dim;
+    const int64_t dst = (static_cast<int64_t>(line) * PAGE_SIZE + index % PAGE_SIZE) * n;
     const int64_t src = static_cast<int64_t>(t) * n;
 
     for (int64_t e = threadIdx.x; e < n; e += blockDim.x) {
@@ -70,9 +86,8 @@ __global__ void write_kv_kernel(
     }
 }
 
-// The shared tiles of one decode CTA, carved from its dynamic shared memory. Every
-// tile's size is a multiple of 16 bytes, so each starts 16-byte aligned, as ldmatrix
-// requires.
+// Every tile size is a multiple of 16 bytes, which keeps each tile 16-byte aligned for
+// ldmatrix.
 template <typename scalar_t, int PAGE_SIZE, int HEAD_DIM> struct DecodeTiles {
     scalar_t* sQ;  // [16, HEAD_DIM]
     scalar_t* sK;  // [PAGE_SIZE, HEAD_DIM]
@@ -104,8 +119,7 @@ template <typename scalar_t, int PAGE_SIZE, int HEAD_DIM> struct DecodeTiles {
     }
 };
 
-// The view pages W consecutive keys can touch.
-int64_t window_pages(int64_t sliding_window, int64_t page_size) {
+int64_t window_page_span(int64_t sliding_window, int64_t page_size) {
     return (sliding_window - 1 + page_size - 1) / page_size + 1;
 }
 
@@ -132,7 +146,7 @@ begin_group(const PagedAttnParams<scalar_t>& p, int s, int g, scalar_t* sQ, floa
 }
 
 // Online-softmax attention over view tiles [t_start, t_end) for one (seq s, kv head
-// g), keys from index first on. Tiles wholly before first are skipped unread.
+// g), keys from index first on. Tiles wholly before first are not read.
 // Accumulates the RAW, UNNORMALIZED state in shared memory: sO (sum of
 // exp(scale*q.k - Mrow)*V per query row), Mrow (running row max), Lrow (running
 // denominator); the caller owns normalization and LSE. When seq_scores is non-null,
@@ -176,16 +190,15 @@ __device__ __forceinline__ void tc_attend_tiles(
         if (valid <= 0) {
             break;
         }
-        // Offsets below skipped precede the window: they are staged as zeros and masked.
-        const int skipped = max(0, first - tile_base);
-        if (skipped >= PAGE_SIZE) {
+        const int before_window = max(0, first - tile_base);
+        if (before_window >= PAGE_SIZE) {
             continue;
         }
         const int64_t line_base = (static_cast<int64_t>(seq_table[t]) * PAGE_SIZE * p.n_kv_heads + g) * HEAD_DIM;
         for (int i = tid; i < PAGE_SIZE * HALF; i += NWARPS * 32) {
             const int off = i / HALF;
             scalar_t lo = static_cast<scalar_t>(0), hi = static_cast<scalar_t>(0);
-            if (off >= skipped && off < valid) {
+            if (off >= before_window && off < valid) {
                 float cos_a, sin_a, k_lo, k_hi;
                 attn::rope_sincos_turns(layout.position(tile_base + off), turns, cos_a, sin_a);
                 attn::stored_key_pair(p, p.k_pool + line_base + off * stride_slot, pair, HALF, k_lo, k_hi);
@@ -198,8 +211,8 @@ __device__ __forceinline__ void tc_attend_tiles(
         }
         for (int i = tid; i < PAGE_SIZE * HEAD_DIM; i += NWARPS * 32) {
             const int off = i / HEAD_DIM, d = i % HEAD_DIM;
-            sV[i] = off >= skipped && off < valid ? p.v_pool[line_base + off * stride_slot + d]
-                                                  : static_cast<scalar_t>(0);
+            sV[i] = off >= before_window && off < valid ? p.v_pool[line_base + off * stride_slot + d]
+                                                        : static_cast<scalar_t>(0);
         }
         __syncthreads();
 
@@ -212,7 +225,7 @@ __device__ __forceinline__ void tc_attend_tiles(
             float tmax = -CUDART_INF_F;
 #pragma unroll
             for (int c = 0; c < PAGE_SIZE; ++c) {
-                if (c >= skipped && c < valid) {
+                if (c >= before_window && c < valid) {
                     tmax = fmaxf(tmax, p.scale * sS[m * PAGE_SIZE + c]);
                 }
             }
@@ -222,7 +235,7 @@ __device__ __forceinline__ void tc_attend_tiles(
 #pragma unroll
             for (int c = 0; c < PAGE_SIZE; ++c) {
                 float pw = 0.0f;
-                if (c >= skipped && c < valid) {
+                if (c >= before_window && c < valid) {
                     const float ssc = p.scale * sS[m * PAGE_SIZE + c];
                     pw = __expf(ssc - newM);
                     if (seq_scores && m < p.group) {
@@ -361,7 +374,6 @@ __global__ void __launch_bounds__(NWARPS * 32) paged_decode_split_kernel(
 
     begin_group<scalar_t, HEAD_DIM, NWARPS>(p, s, g, tiles.sQ, tiles.sO, tiles.Mrow, tiles.Lrow);
     __syncthreads();
-    // The splits share the tiles from the window's first on.
     const int t_start = first / PAGE_SIZE + split * tiles_per_split;
     tc_attend_tiles<scalar_t, PAGE_SIZE, HEAD_DIM, BF16, NWARPS>(
         p,
@@ -487,11 +499,11 @@ void launch_tc_decode(const attn::PagedAttnBatch& b, int64_t forced_splits, cuda
     const int64_t stride_head = kv_capacity * group;
     const int64_t stride_seq = b.n_kv_heads * stride_head;
 
-    // The view pages one query's keys can span.
-    const int64_t key_pages = b.sliding_window > 0 ? std::min(b.max_pages, window_pages(b.sliding_window, b.page_size))
-                                                   : b.max_pages;
+    const int64_t attended_pages = b.sliding_window > 0
+        ? std::min(b.max_pages, window_page_span(b.sliding_window, b.page_size))
+        : b.max_pages;
     const int nsplits = forced_splits > 0 ? static_cast<int>(forced_splits)
-                                          : auto_splits(b.num_seqs, b.n_kv_heads, key_pages);
+                                          : auto_splits(b.num_seqs, b.n_kv_heads, attended_pages);
     const bool split = forced_splits > 0 || nsplits > 1;
 
     if (!split) {
@@ -514,7 +526,7 @@ void launch_tc_decode(const attn::PagedAttnBatch& b, int64_t forced_splits, cuda
         return;
     }
 
-    const int tiles_per_split = static_cast<int>((key_pages + nsplits - 1) / nsplits);
+    const int tiles_per_split = static_cast<int>((attended_pages + nsplits - 1) / nsplits);
     auto o_partial = at::empty({b.num_seqs, b.n_kv_heads, nsplits, group, b.head_dim}, fopts);
     auto m_partial = at::empty({b.num_seqs, b.n_kv_heads, nsplits, group}, fopts);
     auto l_partial = at::empty({b.num_seqs, b.n_kv_heads, nsplits, group}, fopts);
@@ -597,10 +609,13 @@ void write_kv_cuda(
     const at::Tensor& v_pool,
     const at::Tensor& k_new,
     const at::Tensor& v_new,
-    const at::Tensor& slot_mapping
+    const at::Tensor& page_tables,
+    const std::optional<at::Tensor>& cu_seqlens_q,
+    const at::Tensor& seqlens_k
 ) {
     TORCH_CHECK(
-        k_pool.is_cuda() && v_pool.is_cuda() && k_new.is_cuda() && v_new.is_cuda() && slot_mapping.is_cuda(),
+        k_pool.is_cuda() && v_pool.is_cuda() && k_new.is_cuda() && v_new.is_cuda() && page_tables.is_cuda() &&
+            seqlens_k.is_cuda() && (!cu_seqlens_q || cu_seqlens_q->is_cuda()),
         "write_kv: all inputs must be CUDA tensors"
     );
     TORCH_CHECK(
@@ -608,49 +623,49 @@ void write_kv_cuda(
             k_new.scalar_type() == v_new.scalar_type(),
         "write_kv: k_pool, v_pool, k_new, v_new must share a dtype"
     );
-    TORCH_CHECK(slot_mapping.scalar_type() == at::kInt, "write_kv: slot_mapping must be int32");
     TORCH_CHECK(
-        k_pool.dim() == 4 && v_pool.dim() == 4,
-        "write_kv: pools must be 4-D [num_pages, page_size, n_kv_heads, head_dim]"
-    );
-    TORCH_CHECK(
-        k_new.dim() == 3 && v_new.dim() == 3,
-        "write_kv: k_new, v_new must be 3-D [num_new_tokens, n_kv_heads, head_dim]"
+        k_pool.dim() == 4 && k_pool.sizes() == v_pool.sizes(),
+        "write_kv: pools must be 4-D [num_lines, page_size, n_kv_heads, head_dim] of one shape"
     );
     TORCH_CHECK(
         k_pool.is_contiguous() && v_pool.is_contiguous(),
         "write_kv: pools must be contiguous (mutated in place)"
     );
-
     const int64_t page_size = k_pool.size(1);
     const int64_t n_kv_heads = k_pool.size(2);
     const int64_t head_dim = k_pool.size(3);
     const int64_t num_new_tokens = k_new.size(0);
-
     TORCH_CHECK(
-        v_pool.size(1) == page_size && v_pool.size(2) == n_kv_heads && v_pool.size(3) == head_dim,
-        "write_kv: v_pool must match k_pool shape"
+        k_new.dim() == 3 && k_new.sizes() == v_new.sizes() && k_new.size(1) == n_kv_heads && k_new.size(2) == head_dim,
+        "write_kv: k_new, v_new must be [num_new_tokens, n_kv_heads, head_dim] of the pool's heads"
     );
     TORCH_CHECK(
-        k_new.size(1) == n_kv_heads && k_new.size(2) == head_dim,
-        "write_kv: k_new heads/head_dim must match the pool"
+        page_tables.scalar_type() == at::kInt && page_tables.dim() == 2,
+        "write_kv: page_tables must be int32 [num_seqs, max_pages]"
     );
+    const int64_t num_seqs = page_tables.size(0);
     TORCH_CHECK(
-        v_new.size(0) == num_new_tokens && v_new.size(1) == n_kv_heads && v_new.size(2) == head_dim,
-        "write_kv: v_new must match k_new shape"
+        seqlens_k.scalar_type() == at::kInt && seqlens_k.dim() == 1 && seqlens_k.size(0) == num_seqs,
+        "write_kv: seqlens_k must be int32 [num_seqs]"
     );
-    TORCH_CHECK(
-        slot_mapping.dim() == 1 && slot_mapping.size(0) == num_new_tokens,
-        "write_kv: slot_mapping must be 1-D [num_new_tokens]"
-    );
-
+    if (cu_seqlens_q) {
+        TORCH_CHECK(
+            cu_seqlens_q->scalar_type() == at::kInt && cu_seqlens_q->dim() == 1 &&
+                cu_seqlens_q->size(0) == num_seqs + 1,
+            "write_kv: cu_seqlens_q must be int32 [num_seqs + 1]"
+        );
+    } else {
+        TORCH_CHECK(num_new_tokens == num_seqs, "write_kv: one new token per sequence without cu_seqlens_q");
+    }
     if (num_new_tokens == 0) {
         return;
     }
 
     auto kn = k_new.contiguous();
     auto vn = v_new.contiguous();
-    auto sm = slot_mapping.contiguous();
+    auto tables = page_tables.contiguous();
+    auto seqlens = seqlens_k.contiguous();
+    auto cu = cu_seqlens_q ? cu_seqlens_q->contiguous() : at::Tensor();
 
     const int threads = static_cast<int>(std::min<int64_t>(256, n_kv_heads * head_dim));
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -663,7 +678,11 @@ void write_kv_cuda(
                 v_pool.data_ptr<scalar_t>(),
                 kn.data_ptr<scalar_t>(),
                 vn.data_ptr<scalar_t>(),
-                sm.data_ptr<int32_t>(),
+                tables.data_ptr<int32_t>(),
+                cu.defined() ? cu.data_ptr<int32_t>() : nullptr,
+                seqlens.data_ptr<int32_t>(),
+                static_cast<int>(num_seqs),
+                static_cast<int>(tables.size(1)),
                 static_cast<int>(n_kv_heads),
                 static_cast<int>(head_dim)
             );

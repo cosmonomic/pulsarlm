@@ -4,7 +4,6 @@
 #include "pulsarlm/profiling.hpp"
 #include "pulsarlm/rope.hpp"
 
-#include "pulsarlm/model/compiled_model.hpp"
 #include "pulsarlm/model/interface.hpp"
 #include "pulsarlm/model/paged_forward.hpp"
 #include "pulsarlm/model/qwen2.hpp"

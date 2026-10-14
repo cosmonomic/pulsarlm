@@ -36,6 +36,10 @@ def page(value: float) -> tuple[torch.Tensor, torch.Tensor]:
     )
 
 
+def write(store: LocalStore, state: State) -> None:
+    store.write(state, state.page_hashes)
+
+
 def put_pages(store: LocalStore, history: list[int]) -> None:
     hashes = page_digests(history)
     store.put(hashes, [page(i) for i in range(len(hashes))])
@@ -46,7 +50,7 @@ def run_request(store: LocalStore, prompt: list[int], *states: list[int]) -> Non
     with store.lease(prompt, page_digests(prompt)):
         for history in states:
             put_pages(store, history)
-            store.write(reached(history))
+            write(store, reached(history))
 
 
 def stored(store: LocalStore, h: bytes) -> bool:
@@ -91,7 +95,7 @@ def test_a_state_with_evicted_pages_is_found_by_its_last_page():
     history = HISTORY[:13]
     with store.lease(history, page_digests(history)):
         put_pages(store, history)
-        store.write(reached(history, evicted={1}))
+        write(store, reached(history, evicted={1}))
     with store.lease(HISTORY, page_digests(HISTORY)) as (state, covered):
         assert covered == 13
         assert len(state.page_hashes) == 2
@@ -144,7 +148,7 @@ def test_a_page_put_again_during_a_later_lease_stays_for_it():
         put_pages(store, first)
         run_request(store, [7] * 5, [7] * 5)
         assert all(stored(store, h) for h in page_digests(first))
-        store.write(reached(first))
+        write(store, reached(first))
     assert all(stored(store, h) for h in page_digests(first))
 
 
@@ -174,3 +178,10 @@ def test_the_newest_state_stays_above_the_capacity():
     run_request(store, HISTORY, HISTORY[:9])
     assert len(store) == 1
     assert store.byte_count() == 2 * PAGE_BYTES
+
+
+def test_a_page_keeping_one_tensor_counts_its_bytes_once():
+    store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY)
+    v = torch.full((1,), 1.0, dtype=torch.float32)
+    store.put(page_digests(HISTORY[:4]), [(v, v)])
+    assert store.byte_count() == PAGE_BYTES // 2

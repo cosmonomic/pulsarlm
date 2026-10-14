@@ -36,8 +36,8 @@ using pulsarlm::task;
 
 using token_list = std::vector<std::int64_t>;
 
-constexpr pulsarlm::page_shape
-    shape{.n_layers = 1, .page_size = 4, .n_kv_heads = 1, .head_dim = 2, .dtype = at::kFloat};
+constexpr std::size_t page_size = 4;
+const std::vector<pulsarlm::kv_layer> one_layer{pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2}};
 constexpr std::size_t vocab = 100;
 constexpr auto end_timeout = std::chrono::seconds(30);
 
@@ -58,7 +58,11 @@ struct stalling_store final : pulsarlm::page_store {
 // Predicts each token's successor, mod vocab.
 class successor_model final : public pulsarlm::Model {
   public:
-    pulsarlm::StepLogits forward(const pulsarlm::StepBatch& batch, const pulsarlm::kv&) override {
+    std::vector<pulsarlm::kv_layer> kv_layers() const override {
+        return one_layer;
+    }
+
+    pulsarlm::StepLogits forward(const pulsarlm::StepBatch& batch, std::span<const pulsarlm::kv>) override {
         pulsarlm::StepLogits logits;
         if (batch.prefill) {
             logits.prefill = predict(*batch.prefill);
@@ -77,7 +81,11 @@ class successor_model final : public pulsarlm::Model {
 
 class failing_model final : public pulsarlm::Model {
   public:
-    pulsarlm::StepLogits forward(const pulsarlm::StepBatch&, const pulsarlm::kv&) override {
+    std::vector<pulsarlm::kv_layer> kv_layers() const override {
+        return one_layer;
+    }
+
+    pulsarlm::StepLogits forward(const pulsarlm::StepBatch&, std::span<const pulsarlm::kv>) override {
         throw std::runtime_error("forward failed");
     }
 };
@@ -126,16 +134,15 @@ void wait_for_end(request_results& recorded) {
     REQUIRE(recorded.ended.wait_for(lock, end_timeout, [&] { return recorded.end.has_value(); }));
 }
 
-digest root() {
-    return pulsarlm::make_root_digest("successor", shape);
-}
-
 pulsarlm::engine_config config(std::size_t n_lines) {
+    std::size_t line_bytes = 2 * page_size * 2 * sizeof(float);
     return pulsarlm::engine_config{
         .model_name = "successor",
-        .shape = shape,
-        .kv_cache_bytes = n_lines * pulsarlm::line_bytes(shape),
-        .staging_bytes = 2 * pulsarlm::line_bytes(shape),
+        .page_size = page_size,
+        .kv_dtype = at::kFloat,
+        .kv_cache_bytes = n_lines * line_bytes,
+        .staging_bytes = 2 * line_bytes,
+        .max_position_embeddings = 64,
         .device = at::Device(at::kCUDA, 0),
         .stop_ids = {},
         .vocab_size = vocab,
@@ -147,12 +154,31 @@ bool ended_with(const request_results& recorded, request_error error) {
     return recorded.end && !recorded.end->has_value() && recorded.end->error() == error;
 }
 
+digest root() {
+    return pulsarlm::make_root_digest("successor", pulsarlm::page_shapes(config(16), one_layer));
+}
+
 TEST_CASE("the KV cache takes the whole lines that fit in its size") {
     pulsarlm::engine_config sized = config(16);
-    sized.kv_cache_bytes += pulsarlm::line_bytes(shape) - 1;
-    REQUIRE(pulsarlm::line_count(sized) == 16);
-    sized.kv_cache_bytes = pulsarlm::line_bytes(shape) - 1;
-    REQUIRE_THROWS_AS(pulsarlm::line_count(sized), std::invalid_argument);
+    std::size_t line_bytes = pulsarlm::line_bytes(pulsarlm::page_shapes(sized, one_layer)[0]);
+    sized.kv_cache_bytes += line_bytes - 1;
+    REQUIRE(pulsarlm::line_counts(sized, one_layer) == std::vector<std::size_t>{16});
+    sized.kv_cache_bytes = line_bytes - 1;
+    REQUIRE_THROWS_AS(pulsarlm::line_counts(sized, one_layer), std::invalid_argument);
+}
+
+// Per request, the full layer takes 64 / 4 = 16 lines of 64 bytes and the sliding one 5 / 4 + 1 = 3 lines of 128
+// bytes (2 heads), together 1408 bytes.
+TEST_CASE("the KV layers share the cache as requests at the trained context use it") {
+    std::vector<pulsarlm::kv_layer> layers{
+        pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2},
+        pulsarlm::kv_layer{.n_kv_heads = 2, .head_dim = 2, .sliding_window = 5},
+    };
+    pulsarlm::engine_config sized = config(16);
+    sized.kv_cache_bytes = 10 * 1408 + 100;
+    REQUIRE(pulsarlm::line_counts(sized, layers) == std::vector<std::size_t>{161, 30});
+    sized.staging_bytes = 2 * 128 + 1;
+    REQUIRE(pulsarlm::staging_page_counts(sized, layers) == std::vector<std::size_t>{2, 1});
 }
 
 TEST_CASE("a submitted request passes its tokens and its end state to its callbacks") {
@@ -164,7 +190,7 @@ TEST_CASE("a submitted request passes its tokens and its end state to its callba
     REQUIRE(recorded->tokens == token_list{4, 5, 6, 7});
     REQUIRE(recorded->end->has_value());
     REQUIRE((
-        (*recorded->end)->page_hashes == pulsarlm::make_page_digests(root(), token_list{1, 2, 3, 4}, shape.page_size)
+        (*recorded->end)->page_hashes == pulsarlm::make_page_digests(root(), token_list{1, 2, 3, 4}, page_size)
     ));
     REQUIRE((*recorded->end)->tail == token_list{5, 6});
     REQUIRE(e.exception() == nullptr);

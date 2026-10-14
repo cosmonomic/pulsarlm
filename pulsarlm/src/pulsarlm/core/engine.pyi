@@ -9,9 +9,9 @@ type Page = tuple[Tensor, Tensor]
 
 class PageStore(Protocol):
     """Called on the engine's loop thread with the GIL held; both return without
-    waiting for the store. A page is its (k, v) host tensors, each
-    [n_layers, page_size, n_kv_heads, head_dim], in pageable memory the store
-    owns. A fetch whose call raises, or whose
+    waiting for the store. A page is one KV layer's (k, v) host tensors, each
+    [1, page_size, n_kv_heads, head_dim], in pageable memory the store owns; k is
+    v for a layer keeping one tensor. A fetch whose call raises, or whose
     future fails, is cancelled, is dropped unfinished or yields a malformed result,
     misses every page it asked for. An exception raised by put goes to
     sys.unraisablehook.
@@ -114,6 +114,7 @@ class Engine:
         kv_dtype: torch.dtype,
         kv_cache_gib: float,
         staging_gib: float,
+        max_position_embeddings: int,
         device: torch.device,
         stop_ids: list[int],
         prefill_tokens_per_step: int,
@@ -131,6 +132,8 @@ class Engine:
     def page_digests(self, tokens: list[int]) -> list[bytes]:
         """The hashes of the full pages of a token history from its start: the page
         hashes a state reaching that history ends with."""
+    def page_keys(self, state: State) -> list[bytes]:
+        """The store keys of the pages a request resuming from state reads."""
     def fileno(self) -> int:
         """An eventfd that becomes readable when a request has results to take."""
     def clear_wake(self) -> None:

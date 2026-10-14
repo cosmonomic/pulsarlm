@@ -149,16 +149,11 @@ at::Tensor dense_page_mass(const dense_output& dense, std::int64_t first, std::i
 
 // A step of the single sequence forwarding the tokens at positions [first, last).
 pulsarlm::GroupBatch step(const at::Tensor& tokens, std::int64_t first, std::int64_t last, bool prefill) {
-    std::vector<std::int32_t> slots;
-    for (std::int64_t p = first; p < last; p++) {
-        slots.push_back(view_lines[p / page_size] * page_size + static_cast<std::int32_t>(p % page_size));
-    }
     auto key_count = int32_cuda({static_cast<std::int32_t>(last)});
     pulsarlm::GroupBatch g{
         .tokens = tokens.narrow(0, first, last - first),
         .pos = at::arange(first, last, cuda(at::kLong)),
-        .slot_mapping = int32_cuda(slots),
-        .page_tables = int32_cuda(view_lines).view({1, -1}),
+        .page_tables = int32_cuda(view_lines).view({1, 1, -1}).expand({n_layers, 1, -1}).contiguous(),
         .rope_layout = int32_cuda({0, 0, -1}).view({1, 3}),
         .cu_view_pages = int32_cuda({0, static_cast<std::int32_t>(view_lines.size())}),
         .page_mass = at::zeros({static_cast<std::int64_t>(view_lines.size())}, cuda(at::kFloat)),
@@ -182,10 +177,13 @@ void check_against_dense(at::ScalarType dtype, double tolerance) {
     pulsarlm::Qwen3Model
         model(n_layers, n_heads, n_kv_heads, head_dim, hidden, intermediate, vocab, rope_theta, rms_eps, w.named);
     model.set_relevance_layers(relevance_layers);
-    pulsarlm::kv kv{
-        .k = at::zeros({n_layers, n_lines, page_size, n_kv_heads, head_dim}, cuda(dtype)),
-        .v = at::zeros({n_layers, n_lines, page_size, n_kv_heads, head_dim}, cuda(dtype)),
-    };
+    std::vector<pulsarlm::kv> kv;
+    for (std::int64_t layer = 0; layer < n_layers; layer++) {
+        kv.push_back(pulsarlm::kv{
+            .k = at::zeros({n_lines, page_size, n_kv_heads, head_dim}, cuda(dtype)),
+            .v = at::zeros({n_lines, page_size, n_kv_heads, head_dim}, cuda(dtype)),
+        });
+    }
 
     const std::int64_t n_tokens = 40;
     auto tokens = at::randint(vocab, {n_tokens}, cuda(at::kLong));
@@ -211,7 +209,7 @@ void check_against_dense(at::ScalarType dtype, double tolerance) {
 
     auto lines = at::tensor(std::vector<std::int64_t>(view_lines.begin(), view_lines.end())).to(at::kCUDA);
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
-        auto stored = kv.k.select(0, layer).index_select(0, lines).view({-1, n_kv_heads, head_dim});
+        auto stored = kv[layer].k.index_select(0, lines).view({-1, n_kv_heads, head_dim});
         CHECK(max_relative_error(stored.narrow(0, 0, n_tokens), dense.unrotated_k[layer]) < tolerance);
     }
 }

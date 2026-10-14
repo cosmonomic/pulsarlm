@@ -13,7 +13,7 @@
 // s at pos p = pos[s] is rotated by angle a = p * inv_freq[j]:
 //   out[j]   = x[j]   * cos(a) - x[j+h] * sin(a)
 //   out[j+h] = x[j+h] * cos(a) + x[j]   * sin(a)
-// A pair of frequency 0 comes out unchanged: cos 0 and sin 0 are exact. The angle is formed
+// cos 0 and sin 0 are exact, so a pair of frequency 0 comes out unchanged. The angle is formed
 // in fp64 (see rope_sincos), the rotation runs in fp32, and the result is cast
 // back to x's dtype on store.
 //

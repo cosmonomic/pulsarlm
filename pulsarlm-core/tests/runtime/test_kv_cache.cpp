@@ -78,16 +78,19 @@ cudaStream_t compute_stream() {
 }
 
 struct cache_fixture {
+    memory_store backing;
     std::shared_ptr<store_state> store;
     pulsarlm::kv_cache kv;
 
-    explicit cache_fixture(std::size_t n_lines, memory_store backing = {}, std::size_t staging_pages = 2)
-    : store(backing.state),
-      kv(shape,
-         n_lines,
-         staging_pages,
-         at::Device(at::kCUDA, 0),
-         std::make_unique<memory_store>(std::move(backing))) {}
+    explicit cache_fixture(
+        std::size_t n_lines,
+        memory_store backing_store = {},
+        std::size_t staging_pages = 2,
+        const pulsarlm::page_shape& page = shape
+    )
+    : backing(std::move(backing_store)),
+      store(backing.state),
+      kv(page, n_lines, staging_pages, at::Device(at::kCUDA, 0), backing) {}
 };
 
 digest hash_of(std::uint64_t n) {
@@ -429,4 +432,48 @@ TEST_CASE("a get and a sync take turns on the staging buffer") {
     REQUIRE(fixture.store->pages.at(hash_of(5)).k.eq(5.0f).all().item<bool>());
     fixture.kv.release(*got);
     fixture.kv.release(synced);
+}
+
+TEST_CASE("a values_only cache keeps and stores one tensor as both k and v") {
+    pulsarlm::page_shape values_only = shape;
+    values_only.values_only = true;
+    REQUIRE(pulsarlm::line_bytes(values_only) * 2 == pulsarlm::line_bytes(shape));
+    cache_fixture fixture(2, {}, 2, values_only);
+    REQUIRE(fixture.kv.tensors().k.is_same(fixture.kv.tensors().v));
+
+    line_ids allocated = fixture.kv.allocate(1).value();
+    fixture.kv.tensors().v.select(1, allocated.front()).fill_(5.0f);
+    REQUIRE(run_to_completion(fixture.kv.sync({hash_of(1)}, allocated, compute_stream())).has_value());
+    fixture.kv.release(allocated);
+    const page& stored = fixture.store->pages.at(hash_of(1));
+    REQUIRE(stored.k.is_same(stored.v));
+    REQUIRE(stored.v.eq(5.0f).all().item<bool>());
+
+    line_ids evicting = fixture.kv.allocate(2).value();
+    fixture.kv.tensors().v.select(1, evicting[0]).fill_(0.0f);
+    fixture.kv.tensors().v.select(1, evicting[1]).fill_(0.0f);
+    fixture.kv.release(evicting);
+    lines_result got = run_get(fixture.kv, {hash_of(1)});
+    REQUIRE(got.has_value());
+    REQUIRE(fixture.store->fetches.size() == 1);
+    REQUIRE(fixture.kv.tensors().v.select(1, got->front()).eq(5.0f).all().item<bool>());
+    fixture.kv.release(*got);
+}
+
+TEST_CASE("a layer_store keeps each layer's pages under its own key") {
+    memory_store backing;
+    pulsarlm::layer_store first(backing, 0);
+    pulsarlm::layer_store second(backing, 1);
+    REQUIRE(pulsarlm::store_key(hash_of(1), 0) != pulsarlm::store_key(hash_of(1), 1));
+
+    first.put({hash_of(1)}, {host_page(1.0f)});
+    second.put({hash_of(1)}, {host_page(2.0f)});
+    REQUIRE(backing.state->pages.at(pulsarlm::store_key(hash_of(1), 0)).k.eq(1.0f).all().item<bool>());
+    REQUIRE(backing.state->pages.at(pulsarlm::store_key(hash_of(1), 1)).k.eq(2.0f).all().item<bool>());
+
+    std::vector<digest> wanted{hash_of(1), hash_of(2)};
+    std::vector<std::optional<page>> fetched = run_to_completion(second.fetch(wanted));
+    REQUIRE(fetched[0].has_value());
+    REQUIRE(fetched[0]->k.eq(2.0f).all().item<bool>());
+    REQUIRE(!fetched[1].has_value());
 }

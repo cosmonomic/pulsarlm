@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -39,9 +40,13 @@ TEST_CASE("page digests of fewer tokens than a page are empty") {
     REQUIRE(pulsarlm::make_page_digests(parent, {}, 4).empty());
 }
 
-TEST_CASE("the root digest changes with the model and every field of the page shape") {
-    digest root = pulsarlm::make_root_digest("qwen3-8b@1", shape);
-    REQUIRE(root == pulsarlm::make_root_digest("qwen3-8b@1", shape));
+digest root_of(std::string_view model, std::vector<pulsarlm::page_shape> shapes) {
+    return pulsarlm::make_root_digest(model, shapes);
+}
+
+TEST_CASE("the root digest changes with the model and every field of every page shape") {
+    digest root = root_of("qwen3-8b@1", {shape, shape});
+    REQUIRE(root == root_of("qwen3-8b@1", {shape, shape}));
 
     pulsarlm::page_shape other_page_size = shape;
     other_page_size.page_size = 8;
@@ -53,14 +58,18 @@ TEST_CASE("the root digest changes with the model and every field of the page sh
     other_heads.n_kv_heads = 4;
     pulsarlm::page_shape other_head_dim = shape;
     other_head_dim.head_dim = 16;
+    pulsarlm::page_shape values_only = shape;
+    values_only.values_only = true;
 
     std::vector<digest> others{
-        pulsarlm::make_root_digest("qwen3-8b@2", shape),
-        pulsarlm::make_root_digest("qwen3-8b@1", other_page_size),
-        pulsarlm::make_root_digest("qwen3-8b@1", other_dtype),
-        pulsarlm::make_root_digest("qwen3-8b@1", other_layers),
-        pulsarlm::make_root_digest("qwen3-8b@1", other_heads),
-        pulsarlm::make_root_digest("qwen3-8b@1", other_head_dim),
+        root_of("qwen3-8b@2", {shape, shape}),
+        root_of("qwen3-8b@1", {shape}),
+        root_of("qwen3-8b@1", {shape, other_page_size}),
+        root_of("qwen3-8b@1", {shape, other_dtype}),
+        root_of("qwen3-8b@1", {shape, other_layers}),
+        root_of("qwen3-8b@1", {other_heads, shape}),
+        root_of("qwen3-8b@1", {shape, other_head_dim}),
+        root_of("qwen3-8b@1", {shape, values_only}),
     };
     for (const digest& other : others) {
         REQUIRE(other != root);

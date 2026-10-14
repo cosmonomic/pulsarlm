@@ -12,15 +12,14 @@
 // Tensor-core prefill attention. Flash-attention-style: one CTA per (query-tile,
 // q head); a query tile is up to 16 query tokens of ONE q head, occupying MMA
 // rows 0..tile_rows-1 (rows tile_rows..15 are zero-padded and discarded). The
-// key range, causal and cut to each row's sliding window when there is one, is
-// streamed KEY_PAGES pages (KEY_PAGES * PAGE_SIZE keys) at a time: keys from
-// rotated_k, the views' keys already rotated to their positions by
+// causal key range is streamed KEY_PAGES pages (KEY_PAGES * PAGE_SIZE keys) at a
+// time: keys from rotated_k, the views' keys already rotated to their positions by
 // rotate_view_keys_kernel (kernels/paged_prefill.cu), and values from the pool
-// through the page table. Pages wholly before the window of the tile's first row
-// are neither read nor staged. The causal and window masks are applied per (query
-// row, key) in the online softmax. A second streaming pass recomputes QKᵀ and
-// atomicAdds the per-key mass (summed over this tile's query rows attending the
-// key, all for the ONE q head) into
+// through the page table. The causal and sliding-window masks are applied per
+// (query row, key) in the online softmax; pages before the window of the tile's
+// first row are not read. A second streaming pass recomputes QKᵀ and atomicAdds
+// the per-key mass (summed over this tile's query rows attending the key, all for
+// the ONE q head) into
 // this q head's own column of the key's mass row. The QKᵀ/PV tiles live in
 // attn_tiles.cuh; the op wrapper and the argument shapes are in
 // kernels/paged_prefill.cu.
@@ -35,8 +34,7 @@
 namespace pulsarlm {
 namespace attn {
 
-// Bytes of the tiles one CTA of attn_prefill_tc_kernel carves from its dynamic shared memory: sQ, sK, sV, sP, then sS.
-// Each tile's size is a multiple of 16 bytes, so each starts 16-byte aligned, as ldmatrix requires.
+// sQ, sK, sV, sP, then sS. Every size is a multiple of 16 bytes, which keeps each tile 16-byte aligned for ldmatrix.
 template <typename scalar_t, int PAGE_SIZE, int HEAD_DIM, int KEY_PAGES> constexpr size_t prefill_tile_bytes() {
     constexpr size_t key_tile = static_cast<size_t>(PAGE_SIZE) * KEY_PAGES;
     return sizeof(scalar_t) * (16 * HEAD_DIM + 2 * key_tile * HEAD_DIM + 16 * key_tile) +
@@ -90,7 +88,6 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
     // Context pos of MMA row m is ctx_start + qbase + m; the tile's highest.
     const int max_p = ctx_start + qbase + tile_rows - 1;
     const int n_key_tiles = max_p / KEY_TILE + 1;  // tiles covering keys [0, max_p]
-    // The tile's first row attends from tile_first_key on, every later row from there or later.
     const int tile_first_key = first_key(p, ctx_start + qbase);
     const int first_key_tile = tile_first_key / KEY_TILE;
 
@@ -184,7 +181,6 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
 #pragma unroll
             for (int kp = 0; kp < KEY_PAGES; ++kp) {
                 const int page_base = t * KEY_TILE + kp * PAGE_SIZE;
-                // A page before the window is zero-filled.
                 const int valid = page_base + PAGE_SIZE > tile_first_key ? min(PAGE_SIZE, ctx_len - page_base) : 0;
                 const int64_t slot0 = (static_cast<int64_t>(pages[kp]) * PAGE_SIZE) * p.n_kv_heads + g;
                 for (int c = tid; c < kPageChunks; c += NWARPS * 32) {
@@ -207,7 +203,6 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
     // after the QKᵀ that frees its tile, V right after that PV. Two groups are in
     // flight at every wait, oldest first, so both waits leave one outstanding.
     int tile_lines[KEY_PAGES], next_lines[KEY_PAGES], tile_keys[KEY_PAGES], next_keys[KEY_PAGES];
-    // A key enters row m's softmax when it lies in [qfirst[m], qpos[m]].
     auto attends = [&](int m, int key) { return key >= qfirst[m] && key <= qpos[m]; };
 
     load_pages(first_key_tile, tile_lines, tile_keys);
@@ -241,8 +236,7 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
             }
             if (sweep_lane == 0 && sweep_row < tile_rows) {
                 const float newM = fmaxf(Mrow[sweep_row], tmax);
-                // 0 when Mrow == -inf. A row whose window starts past this tile has seen no key yet, and keeps its
-                // empty output.
+                // 0 when Mrow == -inf; 1 for a row whose window starts after this tile.
                 row_rescale[sweep_row] = newM == -CUDART_INF_F ? 1.0f : __expf(Mrow[sweep_row] - newM);
                 Mrow[sweep_row] = newM;
             }
@@ -367,15 +361,15 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
     }
 }
 
-// Shared bytes one CTA of attn_prefill_tc_kernel needs at this tile shape: its tiles and its per-row arrays.
+// Dynamic and static shared bytes of one CTA of attn_prefill_tc_kernel.
 template <typename scalar_t, int PAGE_SIZE, int HEAD_DIM, int KEY_PAGES> constexpr size_t prefill_smem_bytes() {
     return prefill_tile_bytes<scalar_t, PAGE_SIZE, HEAD_DIM, KEY_PAGES>() + sizeof(float) * 5 * 16 +
         sizeof(int) * 2 * 16;
 }
 
-// KEY_PAGES, except for a shape whose CTA would need more than the default shared memory.
+// KEY_PAGES, unless the CTA would then need to opt in to more shared memory.
 template <typename scalar_t, int PAGE_SIZE, int HEAD_DIM, int KEY_PAGES> constexpr int prefill_key_pages() {
-    return prefill_smem_bytes<scalar_t, PAGE_SIZE, HEAD_DIM, KEY_PAGES>() <= kDefaultSharedMemory ? KEY_PAGES : 1;
+    return prefill_smem_bytes<scalar_t, PAGE_SIZE, HEAD_DIM, KEY_PAGES>() <= kSharedMemoryWithoutOptIn ? KEY_PAGES : 1;
 }
 
 }  // namespace attn

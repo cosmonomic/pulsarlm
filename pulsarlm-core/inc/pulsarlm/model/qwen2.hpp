@@ -7,12 +7,12 @@
 #include <ATen/core/Dict.h>
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <unordered_set>
 #include <vector>
 
-// Qwen2.5 transformer forward in C++ over the pulsarlm CUDA ops: the native (non-.pt2)
-// counterpart of CompiledModel.
+// Qwen2.5 transformer forward in C++ over the pulsarlm CUDA ops.
 //
 // The model-agnostic parts (RoPE, write_kv + attention dispatch, the embed ->
 // per-layer -> head skeleton, the prefill/decode two-pass) live in paged_forward.hpp.
@@ -43,7 +43,8 @@ struct Qwen2Model : Model {
 
     // Run the present groups over the lines `kv`; per-group logits in the weight
     // dtype (fp32 or bf16).
-    StepLogits forward(const StepBatch& batch, const kv& kv) override;
+    std::vector<kv_layer> kv_layers() const override;
+    StepLogits forward(const StepBatch& batch, std::span<const kv> lines) override;
 
     void set_relevance_layers(const std::vector<int64_t>& layers) override;
 
@@ -66,7 +67,7 @@ struct Qwen2Model : Model {
     };
 
     // One Qwen2 decoder block over layer `layer`'s KV lines.
-    at::Tensor block(at::Tensor x, int64_t layer, const GroupBatch& g, const kv& kv);
+    at::Tensor block(at::Tensor x, int64_t layer, const GroupBatch& g, std::span<const kv> lines);
     // Final RMSNorm + tied-embedding lm_head; logits in the weight dtype.
     at::Tensor head(at::Tensor x);
 

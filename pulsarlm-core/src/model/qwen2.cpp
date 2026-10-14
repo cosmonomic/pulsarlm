@@ -74,7 +74,7 @@ void Qwen2Model::set_relevance_layers(const std::vector<int64_t>& layers) {
 }
 
 // Qwen2 block: QKV projection with bias, RoPE + paged attention, SwiGLU MLP.
-at::Tensor Qwen2Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, const kv& kv) {
+at::Tensor Qwen2Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, std::span<const kv> lines) {
     const LayerWeights& lw = this->layers[layer];
     const int64_t ntok = x.size(0);
 
@@ -91,8 +91,8 @@ at::Tensor Qwen2Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, c
         q,
         k,
         v,
-        kv,
-        layer,
+        lines[layer],
+        static_cast<std::size_t>(layer),
         g,
         this->relevance_layers.contains(layer),
         this->scale,
@@ -115,13 +115,23 @@ at::Tensor Qwen2Model::head(at::Tensor x) {
     return at::matmul(x, this->embed_tokens.t());
 }
 
-StepLogits Qwen2Model::forward(const StepBatch& batch, const kv& kv) {
+std::vector<kv_layer> Qwen2Model::kv_layers() const {
+    return std::vector<kv_layer>(
+        this->n_layers,
+        kv_layer{
+            .n_kv_heads = static_cast<std::size_t>(this->n_kv_heads),
+            .head_dim = static_cast<std::size_t>(this->head_dim)
+        }
+    );
+}
+
+StepLogits Qwen2Model::forward(const StepBatch& batch, std::span<const kv> lines) {
     return paged_forward(batch, [&](const GroupBatch& g) {
         return paged_group_forward(
             this->embed_tokens,
             g,
             this->n_layers,
-            [&](at::Tensor x, int64_t layer) { return this->block(x, layer, g, kv); },
+            [&](at::Tensor x, int64_t layer) { return this->block(x, layer, g, lines); },
             [&](at::Tensor x) { return this->head(x); }
         );
     });

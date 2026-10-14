@@ -38,11 +38,11 @@ async def complete(
             while True:
                 tokens, cycle_ends, end = await stream.take()
                 for cycle_end in cycle_ends:
-                    store.write(cycle_end.reached)
+                    store.write(cycle_end.reached, engine.page_keys(cycle_end.reached))
                 for token in tokens:
                     yield token
                 if isinstance(end, State):
-                    store.write(end)
+                    store.write(end, engine.page_keys(end))
                     return
                 if end is not None:
                     raise CompletionError(end)

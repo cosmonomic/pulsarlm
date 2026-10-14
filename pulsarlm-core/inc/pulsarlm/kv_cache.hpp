@@ -20,27 +20,35 @@
 
 namespace pulsarlm {
 
+// A page of a values_only shape holds one tensor, as both k and v.
 struct page {
     at::Tensor k;  // [n_layers, page_size, n_kv_heads, head_dim]
     at::Tensor v;
 };
 
+// With values_only, one tensor per layer serves as both K and V.
 struct page_shape {
     std::size_t n_layers;
     std::size_t page_size;
     std::size_t n_kv_heads;
     std::size_t head_dim;
     at::ScalarType dtype;
+    bool values_only = false;
 };
 
-// The device bytes of one line: its K and V in every layer.
+// The device bytes of one line: its K and V in every layer, or its one tensor for values_only.
 std::size_t line_bytes(const page_shape& shape);
 
-// The digest that the page chains of an engine start from. model names the model and its weights version; with shape
-// and digest_function it covers everything that changes a page's KV or how tokens split into pages. The seed is
-// digest_function, model and the dtype name, each as an 8-byte little-endian length then its bytes, then n_layers,
-// page_size, n_kv_heads and head_dim, each as 8 little-endian bytes.
-digest make_root_digest(std::string_view model, const page_shape& shape);
+// The digest that the page chains of an engine start from. model names the model and its weights version; with the
+// page shape of every KV layer's cache (in KV layer order) and digest_function it covers everything that changes a
+// page's KV or how tokens split into pages. The seed is digest_function and model, each as an 8-byte little-endian
+// length then its bytes, then the shape count as 8 little-endian bytes, then per shape the dtype name as a length and
+// its bytes, followed by n_layers, page_size, n_kv_heads, head_dim and values_only, each as 8 little-endian bytes.
+digest make_root_digest(std::string_view model, std::span<const page_shape> shapes);
+
+// The key of KV layer layer's page in the store: the digest of the page's digest bytes followed by layer as 8
+// little-endian bytes.
+digest store_key(const digest& page, std::size_t layer);
 
 class page_store {
   public:
@@ -50,6 +58,18 @@ class page_store {
     virtual task<std::vector<std::optional<page>>> fetch(std::span<const digest> hashes) = 0;
     // Takes host pages and their hashes, matched by index, and returns without waiting for the write.
     virtual void put(std::vector<digest>&& hashes, std::vector<page>&& pages) = 0;
+};
+
+// Stores the pages of one KV layer in another store, under store_key.
+class layer_store : public page_store {
+    page_store& store;
+    std::size_t layer;
+
+  public:
+    layer_store(page_store& store, std::size_t layer) noexcept;
+
+    task<std::vector<std::optional<page>>> fetch(std::span<const digest> hashes) override;
+    void put(std::vector<digest>&& hashes, std::vector<page>&& pages) override;
 };
 
 enum class page_error { miss, oom };
@@ -71,6 +91,7 @@ class kv_cache {
         event done;
     };
 
+    bool values_only;
     kv device_kv;
     // Indexed by line.
     std::vector<cache_line> lines;
@@ -81,7 +102,7 @@ class kv_cache {
     std::unordered_map<digest, std::uint32_t, digest_hash> digest_to_line_id;
     // Pages a get is fetching into a line, not yet in digest_to_line_id.
     std::unordered_map<digest, fetch, digest_hash> fetching;
-    std::unique_ptr<page_store> store;
+    page_store* store;
     // Pinned host memory every transfer goes through, [staging_pages, n_layers, page_size, n_kv_heads, head_dim] each:
     // each slot has a page's layout. One transfer holds it at a time.
     page staging;
@@ -107,13 +128,14 @@ class kv_cache {
     std::optional<std::vector<page>> allocate_host_pages(std::size_t count) const;
 
   public:
-    // staging_pages is at least 1.
+    // staging_pages is at least 1. store outlives the cache. For a values_only shape, tensors() gives one tensor as
+    // both k and v.
     kv_cache(
         const page_shape& shape,
         std::size_t n_lines,
         std::size_t staging_pages,
         at::Device device,
-        std::unique_ptr<page_store>&& store
+        page_store& store
     );
 
     // Copies run on stream. Callers release lines only after the GPU work using them completes. get, allocate and
@@ -139,6 +161,7 @@ class kv_cache {
     sync(const std::vector<digest>& hashes, const std::vector<std::uint32_t>& line_ids, cudaStream_t stream);
     void release(std::span<const std::uint32_t> line_ids) noexcept;
 
+    std::size_t line_count() const noexcept;
     std::size_t free_line_count() const noexcept;
     const kv& tensors() const noexcept;
 };

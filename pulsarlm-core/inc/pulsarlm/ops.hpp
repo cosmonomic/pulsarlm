@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <tuple>
 
 namespace pulsarlm {
@@ -13,19 +14,27 @@ namespace pulsarlm {
 // RMSNorm. Stateless.
 at::Tensor rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, double eps);
 
-// Scatter new K/V rows into a paged pool. k_pool/v_pool are
-// [num_pages, page_size, n_kv_heads, head_dim]; k_new/v_new are
-// [num_new_tokens, n_kv_heads, head_dim]. Token t writes into
-// k_pool[slot/page_size, slot%page_size, :, :] with slot = slot_mapping[t]
-// (int32 [num_new_tokens]). Mutates k_pool/v_pool in place. Keys are stored as given:
-// the attention ops expect them UNROTATED.
+// Scatter a batch's new K/V rows into paged pools. k_pool/v_pool are [num_lines,
+// page_size, n_kv_heads, head_dim] and may be one tensor; k_new/v_new are
+// [num_new_tokens, n_kv_heads, head_dim]. The tokens sit at view indices as the queries
+// of attn_prefill (with cu_seqlens_q) or attn_decode (without), and the token at view
+// index j of sequence s goes to line page_tables[s][j / page_size], offset
+// j % page_size. Keys are stored as given; the attention ops take them UNROTATED.
 void write_kv_cuda(
     const at::Tensor& k_pool,
     const at::Tensor& v_pool,
     const at::Tensor& k_new,
     const at::Tensor& v_new,
-    const at::Tensor& slot_mapping
+    const at::Tensor& page_tables,
+    const std::optional<at::Tensor>& cu_seqlens_q,
+    const at::Tensor& seqlens_k
 );
+
+// int32 [n_layers, tables.size(), width]; row s of each layer holds the first width
+// entries of that layer's row of tables[s], a contiguous int32 [n_layers, capacity]
+// device tensor, and zeros past capacity. The tables must stay alive until the stream
+// has run the gather.
+at::Tensor gather_page_tables_cuda(std::span<const at::Tensor> tables, int64_t n_layers, int64_t width);
 
 // Paged attention over a batch of sequences, each a VIEW: an ordered list of lines
 // (page_size-key pages) of the shared pool. Key index j of sequence s lives at
@@ -33,10 +42,8 @@ void write_kv_cuda(
 //
 // The pool holds UNROTATED keys. The op rotates key j of sequence s to the RoPE
 // position rope_layout[s] gives index j, in the HF/Qwen2 rotate_half convention with
-// the frequencies rope states. k_norm_weight, when given, is fp32 [head_dim]: the op
-// multiplies each stored key by it before rotating, so a pool holding normalized
-// vectors serves as both V and K = k_norm(x) (Gemma 4's K=V layers pass one tensor as
-// both pools). rope_layout is int32 [num_seqs, 3] holding
+// the frequencies rope states. k_norm_weight, when given, is fp32 [head_dim] and
+// multiplies each stored key before rotation. rope_layout is int32 [num_seqs, 3] holding
 // {n_sink, working_lo, short_offset}:
 //   j < n_sink                 -> j
 //   n_sink <= j < working_lo   -> short_offset

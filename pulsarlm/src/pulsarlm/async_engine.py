@@ -84,6 +84,9 @@ class AsyncEngine:
     def page_digests(self, tokens: list[int]) -> list[bytes]:
         return self._engine.page_digests(tokens)
 
+    def page_keys(self, state: State) -> list[bytes]:
+        return self._engine.page_keys(state)
+
     def close(self) -> None:
         self._loop.remove_reader(self._engine.fileno())
 

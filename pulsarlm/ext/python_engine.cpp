@@ -104,6 +104,10 @@ std::vector<digest> python_engine::page_digests(const std::vector<std::int64_t>&
     return served->page_digests(tokens);
 }
 
+std::vector<digest> python_engine::page_keys(const state& s) const {
+    return served->page_keys(s);
+}
+
 int python_engine::fileno() const noexcept {
     return wake->fileno();
 }

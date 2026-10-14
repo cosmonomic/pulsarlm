@@ -79,8 +79,8 @@ struct PagedAttnBatch {
         };
     }
 
-    // fp16/bf16 with a (page_size, head_dim) the tensor-core kernels are compiled for. A kernel also needs its shared
-    // memory to fit, see fits_shared_memory.
+    // fp16/bf16 with a (page_size, head_dim) the tensor-core kernels are compiled for. Whether a kernel's shared memory
+    // fits is checked apart, by fits_shared_memory.
     bool tensor_core_eligible() const;
 };
 
@@ -114,15 +114,13 @@ void launch_attn_scalar(const PagedAttnBatch& batch, cudaStream_t stream);
 // accumulator, which lives in local memory.
 constexpr int kMaxHeadDim = 512;
 
-// Whether a CTA of the current device can opt in to bytes of dynamic shared memory.
 inline bool fits_shared_memory(size_t bytes) {
     return bytes <= at::cuda::getCurrentDeviceProperties()->sharedMemPerBlockOptin;
 }
 
-// Lets kernel launch with bytes of dynamic shared memory on the current device. bytes must fit, see
-// fits_shared_memory.
+// bytes must pass fits_shared_memory.
 template <typename Kernel> void allow_shared_memory(Kernel kernel, size_t bytes) {
-    if (bytes > kDefaultSharedMemory) {
+    if (bytes > kSharedMemoryWithoutOptIn) {
         C10_CUDA_CHECK(
             cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes))
         );

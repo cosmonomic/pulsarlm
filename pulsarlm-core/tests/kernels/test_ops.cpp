@@ -743,8 +743,6 @@ TEST_CASE("ATen rope_rotate matches the rope kernel", "[ops][cuda]") {
 
 namespace {
 
-// One sequence of the reference sweep: view index j lives at lines[j / page_size], and the last seq_q view indices are
-// prefill queries.
 struct WindowedView {
     std::vector<int32_t> lines;
     int64_t ctx;
@@ -777,8 +775,6 @@ at::Tensor reference_keys(
     return pulsarlm::rope_rotate(k, pos, rope).to(k_pool.scalar_type()).to(at::kFloat);
 }
 
-// Attention of the query rows at view indices [ctx - rows, ctx) over their windows, with alpha-graded, length-gained
-// mass added into the view's own rows.
 void reference_windowed(
     const WindowedView& view,
     const at::Tensor& keys,
@@ -817,9 +813,7 @@ void reference_windowed(
 
 }  // namespace
 
-// Every head dim and page size the tensor-core kernels are compiled for, with and without a sliding window, partial
-// RoPE and K scaled on read, against the dense reference. Page table entries before the first query's window hold
-// lines past the pool, so a kernel reading one faults.
+// Page table entries before the first query's window hold lines past the pool, so a kernel reading one faults.
 TEST_CASE(
     "attention matches the dense reference across head dims, windows, partial RoPE and scaled keys",
     "[ops][cuda]"
@@ -978,7 +972,6 @@ TEST_CASE(
     }
 }
 
-// Proportional RoPE leaves every pair past the rotated ones untouched, bit for bit.
 TEST_CASE("partial RoPE passes the unrotated pairs through", "[ops][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
@@ -994,4 +987,49 @@ TEST_CASE("partial RoPE passes the unrotated pairs through", "[ops][cuda]") {
         );
     }
     CHECK(!at::equal(rotated_x.slice(-1, 0, rotated), x.slice(-1, 0, rotated)));
+}
+
+TEST_CASE("write_kv places each token at its view index through the page table", "[ops][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const int64_t num_lines = 5, n_kv = 2, head_dim = 64;
+    auto opts = at::device(at::kCUDA).dtype(at::kFloat);
+    auto page_tables = int32_cuda({3, 1, 0, 4, 2, 0}).view({2, 3});
+    // Sequence 0 forwards view indices [14, 20), sequence 1 [1, 3).
+    auto seqlens_k = int32_cuda({20, 3});
+    auto cu_seqlens_q = int32_cuda({0, 6, 8});
+    auto k_new = at::randn({8, n_kv, head_dim}, opts);
+    auto v_new = at::randn({8, n_kv, head_dim}, opts);
+
+    auto k_pool = at::zeros({num_lines, kPageSize, n_kv, head_dim}, opts);
+    auto v_pool = at::zeros({num_lines, kPageSize, n_kv, head_dim}, opts);
+    pulsarlm::write_kv_cuda(k_pool, v_pool, k_new, v_new, page_tables, cu_seqlens_q, seqlens_k);
+    for (int64_t t = 0; t < 6; ++t) {
+        const int64_t index = 14 + t;
+        const int64_t line = index < kPageSize ? 3 : 1;
+        CHECK(at::equal(k_pool[line][index % kPageSize], k_new[t]));
+        CHECK(at::equal(v_pool[line][index % kPageSize], v_new[t]));
+    }
+    CHECK(at::equal(k_pool[4][1], k_new[6]));
+    CHECK(at::equal(k_pool[4][2], k_new[7]));
+
+    auto pool = at::zeros({num_lines, kPageSize, n_kv, head_dim}, opts);
+    auto decode_tokens = at::randn({2, n_kv, head_dim}, opts);
+    pulsarlm::write_kv_cuda(pool, pool, decode_tokens, decode_tokens, page_tables, std::nullopt, seqlens_k);
+    CHECK(at::equal(pool[1][3], decode_tokens[0]));
+    CHECK(at::equal(pool[4][2], decode_tokens[1]));
+}
+
+TEST_CASE("gather_page_tables lays each table's rows side by side, zero past its capacity", "[ops][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    std::vector<at::Tensor> tables{
+        int32_cuda({1, 2, 3, 4, 5, 6}).view({2, 3}),
+        int32_cuda({7, 8, 9, 10}).view({2, 2}),
+    };
+    auto gathered = pulsarlm::gather_page_tables_cuda(tables, 2, 3).cpu();
+    auto expected = at::tensor(std::vector<int32_t>{1, 2, 3, 7, 8, 0, 4, 5, 6, 9, 10, 0}).view({2, 2, 3});
+    CHECK(at::equal(gathered, expected));
 }

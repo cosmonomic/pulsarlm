@@ -108,6 +108,7 @@ def load(
         kv_dtype=DTYPE,
         kv_cache_gib=n_lines * LINE_BYTES / 2**30,
         staging_gib=4 * LINE_BYTES / 2**30,
+        max_position_embeddings=4096,
         device=DEVICE,
         stop_ids=stop_ids,
         prefill_tokens_per_step=64,

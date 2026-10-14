@@ -22,14 +22,16 @@
 
 namespace pulsarlm {
 
-// model_name names the model and its weights version; with shape it makes the root digest. The KV cache takes as many
-// lines as fit in kv_cache_bytes, and its pinned staging buffer as many pages as fit in staging_bytes. A step forwards
-// every decoding sequence and at most prefill_tokens_per_step tokens of the others.
+// model_name names the model and its weights version; with the KV layers' page shapes it makes the root digest. The KV
+// layers' lines share kv_cache_bytes as line_counts states, and their pinned staging buffers share staging_bytes
+// equally. A step forwards every decoding sequence and at most prefill_tokens_per_step tokens of the others.
 struct engine_config {
     std::string model_name;
-    page_shape shape;
+    std::size_t page_size;
+    at::ScalarType kv_dtype;
     std::size_t kv_cache_bytes;
     std::size_t staging_bytes;
+    std::size_t max_position_embeddings;
     at::Device device;
     std::vector<std::int64_t> stop_ids;
     std::size_t vocab_size;
@@ -40,10 +42,15 @@ struct engine_config {
 // [0, vocab_size).
 void validate(const request& r, std::size_t page_size, std::size_t vocab_size);
 
-// The lines that fit in config's KV cache size. Throws std::invalid_argument when not one does.
-std::size_t line_count(const engine_config& config);
-// The pages that fit in config's staging size. Throws std::invalid_argument when not one does.
-std::size_t staging_page_count(const engine_config& config);
+// The page shape of each KV layer's cache, one layer each.
+std::vector<page_shape> page_shapes(const engine_config& config, std::span<const kv_layer> layers);
+// The lines of each KV layer. Every layer holds lines for the same number of requests: a full-attention layer
+// ceil(max_position_embeddings / page_size) per request, a sliding one ceil(sliding_window / page_size) + 1. Throws
+// std::invalid_argument when a layer gets none.
+std::vector<std::size_t> line_counts(const engine_config& config, std::span<const kv_layer> layers);
+// The pages each KV layer's staging buffer holds in its equal share of staging_bytes. Throws std::invalid_argument
+// when one holds none.
+std::vector<std::size_t> staging_page_counts(const engine_config& config, std::span<const kv_layer> layers);
 
 // Serves requests on a loop thread it owns. Once the loop exits, after a panic or on destruction, the requests it was
 // serving end with loop_exited and the engine is shut down: calling submit after a request ended with loop_exited is
@@ -55,6 +62,8 @@ class engine {
     std::size_t page_size;
     std::size_t vocab_size;
     digest root;
+    std::unique_ptr<page_store> store;
+    std::vector<std::unique_ptr<layer_store>> layer_stores;
     scheduler sched;
     mutable std::mutex mutex;
     // Set while the loop runs.
@@ -78,6 +87,9 @@ class engine {
     // The digests of the full pages of a token history from its start, the page hashes a state reaching it would end
     // with.
     std::vector<digest> page_digests(std::span<const std::int64_t> tokens) const;
+    // The store keys of the pages a request resuming from s reads, see scheduler::page_keys. Safe to call from any
+    // thread.
+    std::vector<digest> page_keys(const state& s) const;
 };
 
 }  // namespace pulsarlm

@@ -90,6 +90,7 @@ def make_engine(store: LocalStore) -> AsyncEngine:
             kv_dtype=DTYPE,
             kv_cache_gib=64 * LINE_BYTES / 2**30,
             staging_gib=4 * LINE_BYTES / 2**30,
+            max_position_embeddings=4096,
             device=DEVICE,
             stop_ids=[],
             prefill_tokens_per_step=64,
@@ -157,10 +158,10 @@ def test_another_engine_fetches_the_state_pages_from_the_store():
 
         second = make_engine(store)
         with store.lease(follow_up, second.page_digests(follow_up)) as (state, _):
-            hashes = state.page_hashes
-        assert len(hashes) == 2
+            assert len(state.page_hashes) == 2
+            keys = second.page_keys(state)
         assert len(await collect(second, store, follow_up)) == 8
-        assert store.fetched == hashes
+        assert store.fetched == keys
 
     asyncio.run(main())
 

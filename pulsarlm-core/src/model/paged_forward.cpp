@@ -32,17 +32,27 @@ at::Tensor paged_attention(
     const at::Tensor& q,
     const at::Tensor& k,
     const at::Tensor& v,
-    const kv& kv,
-    int64_t layer,
+    const kv& lines,
+    std::size_t kv_layer,
     const GroupBatch& g,
     bool relevance_layer,
     double scale,
     const rope_parameters& rope,
     const at::Tensor& lse_capture
 ) {
-    auto k_pool = kv.k.select(0, layer);
-    auto v_pool = kv.v.select(0, layer);
-    write_kv_cuda(k_pool, v_pool, k, v, g.slot_mapping);
+    const at::Tensor& k_pool = lines.k;
+    const at::Tensor& v_pool = lines.v;
+    at::Tensor page_tables = g.page_tables.select(0, static_cast<int64_t>(kv_layer));
+    const at::Tensor& seqlens_k = g.is_prefill() ? g.seqlens_k : g.context_lens;
+    write_kv_cuda(
+        k_pool,
+        v_pool,
+        k,
+        v,
+        page_tables,
+        g.is_prefill() ? std::optional<at::Tensor>(g.cu_seqlens_q) : std::nullopt,
+        seqlens_k
+    );
     const auto lse = lse_capture.defined() ? std::optional<at::Tensor>(lse_capture) : std::nullopt;
     std::optional<at::Tensor> mass, cu_view_pages, mass_decay;
     if (relevance_layer && g.cu_view_pages.defined()) {
@@ -54,7 +64,7 @@ at::Tensor paged_attention(
                                         q,
                                         k_pool,
                                         v_pool,
-                                        g.page_tables,
+                                        page_tables,
                                         g.cu_seqlens_q,
                                         g.seqlens_k,
                                         g.rope_layout,
@@ -72,7 +82,7 @@ at::Tensor paged_attention(
                                         q,
                                         k_pool,
                                         v_pool,
-                                        g.page_tables,
+                                        page_tables,
                                         g.context_lens,
                                         g.rope_layout,
                                         rope,

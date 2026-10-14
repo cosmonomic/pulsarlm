@@ -2,33 +2,47 @@
 
 #include <ATen/core/Tensor.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <vector>
 
 // The forward boundary the Engine drives: a scheduler step's prefill and decode
 // groups plus the paged KV lines go in, per-group logits come out. The engine
-// depends only on this interface; the concrete model (CompiledModel, Qwen2Model)
-// is opaque to it.
+// depends only on this interface; the concrete model (Qwen2Model, Qwen3Model) is
+// opaque to it.
 
 namespace pulsarlm {
 
-// [n_layers, n_lines, page_size, n_kv_heads, head_dim] each. K is stored unrotated.
+// With values_only, one tensor serves as both K and V. A layer with a sliding window attends only its last
+// sliding_window keys.
+struct kv_layer {
+    std::size_t n_kv_heads;
+    std::size_t head_dim;
+    bool values_only = false;
+    std::optional<std::size_t> sliding_window;
+};
+
+// One KV layer's lines, [n_lines, page_size, n_kv_heads, head_dim] each; k and v are one tensor for a values_only
+// layer. K is stored unrotated.
 struct kv {
     at::Tensor k;
     at::Tensor v;
 };
 
 // One scheduler group's query tokens + KV placement + attention descriptor.
-// tokens/pos are the group's tokens and their pos,
-// concatenated across the group's sequences; slot_mapping/page_tables place
-// them into the lines. The group kind is distinguished by which descriptor is
-// defined: a prefill group carries cu_seqlens_q/seqlens_k, a decode group
-// carries context_lens. The other descriptor(s) are left undefined.
+// tokens/pos are the group's tokens and their pos, concatenated across the group's
+// sequences. Each KV layer's page_tables row s lists the lines of sequence s's view
+// pages; a new token is written into its view page's line, at its view index. The
+// group kind is distinguished by which descriptor is defined: a prefill group carries
+// cu_seqlens_q/seqlens_k, a decode group carries context_lens. The other
+// descriptor(s) are left undefined.
 struct GroupBatch {
     at::Tensor tokens;
     at::Tensor pos;
-    at::Tensor slot_mapping;
+    // int32 [n_kv_layers, num_seqs, max_pages]. A sliding layer's entries before the window of the sequence's first
+    // query hold no line.
     at::Tensor page_tables;
     at::Tensor cu_seqlens_q;  // int32 [num_seqs + 1], defined iff prefill
     at::Tensor seqlens_k;  // int32 [num_seqs],     defined iff prefill
@@ -71,7 +85,11 @@ struct StepLogits {
 
 // tokens + KV + batch -> logits.
 struct Model {
-    virtual StepLogits forward(const StepBatch& batch, const kv& kv) = 0;
+    // The layers that keep KV, in the order forward takes their lines. A layer reading another layer's KV is not one.
+    virtual std::vector<kv_layer> kv_layers() const = 0;
+
+    // lines holds one kv per entry of kv_layers().
+    virtual StepLogits forward(const StepBatch& batch, std::span<const kv> lines) = 0;
 
     // Pre-RoPE query capture for QK-attention recall. set_capture_layers names the
     // attention layers whose pre-RoPE Q the next forward should stash; after a

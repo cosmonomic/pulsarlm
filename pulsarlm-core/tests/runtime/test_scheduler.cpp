@@ -71,10 +71,14 @@ result_writer make_writer(const std::shared_ptr<request_results>& recorded) {
     return result_writer(std::make_unique<recording_callbacks>(recorded));
 }
 
-constexpr pulsarlm::page_shape
-    shape{.n_layers = 2, .page_size = 4, .n_kv_heads = 1, .head_dim = 2, .dtype = at::kFloat};
+constexpr std::size_t page_size = 4;
 constexpr std::int64_t vocab = 1000;
 // sum_model predicts tokens below vocab only.
+
+const std::vector<pulsarlm::kv_layer> two_full_layers{
+    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2},
+    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2},
+};
 
 struct store_contents {
     std::unordered_map<digest, page, digest_hash> pages;
@@ -103,17 +107,23 @@ struct memory_store final : pulsarlm::page_store {
     }
 };
 
-// Writes each token's id as its K and its view index as its V. The token after a query is the sum of the K of every
-// key the query attends, mod vocab. A view page's mass is 1 when it holds a key important accepts, else 0.
+// Writes each token's id as its K and its view index as its V in every KV layer. The token after a query is the sum of
+// the layer 0 K of every key the query attends, mod vocab. A view page's mass is 1 when it holds a key important
+// accepts, else 0. Every key a sliding layer reads must equal layer 0's key at its view index.
 class sum_model final : public pulsarlm::Model {
   public:
+    std::vector<pulsarlm::kv_layer> layers = two_full_layers;
     std::size_t forward_count = 0;
     std::vector<token_list> prefill_chunks;
     std::vector<std::int64_t> decode_sizes;
     std::function<void()> on_forward;
     std::function<bool(std::int64_t)> important = [](std::int64_t) { return false; };
 
-    pulsarlm::StepLogits forward(const pulsarlm::StepBatch& batch, const pulsarlm::kv& kv) override {
+    std::vector<pulsarlm::kv_layer> kv_layers() const override {
+        return layers;
+    }
+
+    pulsarlm::StepLogits forward(const pulsarlm::StepBatch& batch, std::span<const pulsarlm::kv> lines) override {
         forward_count++;
         if (on_forward) {
             on_forward();
@@ -125,39 +135,63 @@ class sum_model final : public pulsarlm::Model {
             for (std::size_t s = 0; s < prefill_chunks.back().size(); s++) {
                 prefill_chunks.back()[s] = starts[s + 1].item<std::int64_t>() - starts[s].item<std::int64_t>();
             }
-            logits.prefill = predict(*batch.prefill, kv);
+            logits.prefill = predict(*batch.prefill, lines);
         }
         if (batch.decode) {
             decode_sizes.push_back(batch.decode->tokens.size(0));
-            logits.decode = predict(*batch.decode, kv);
+            logits.decode = predict(*batch.decode, lines);
         }
         return logits;
     }
 
   private:
-    at::Tensor predict(const pulsarlm::GroupBatch& g, const pulsarlm::kv& kv) const {
+    at::Tensor predict(const pulsarlm::GroupBatch& g, std::span<const pulsarlm::kv> lines) const {
         std::int64_t n_tokens = g.tokens.size(0);
-        std::vector<std::int64_t> sizes{kv.k.size(0), n_tokens, kv.k.size(3), kv.k.size(4)};
-        at::Tensor slots = g.slot_mapping.to(at::kLong);
-        kv.k.flatten(1, 2).index_copy_(1, slots, g.tokens.to(at::kFloat).view({1, n_tokens, 1, 1}).expand(sizes));
-        kv.v.flatten(1, 2).index_copy_(1, slots, g.pos.to(at::kFloat).view({1, n_tokens, 1, 1}).expand(sizes));
-
-        at::Tensor keys = kv.k.select(0, 0).select(2, 0).select(2, 0).cpu();
         at::Tensor positions = g.pos.cpu();
-        at::Tensor page_tables = g.page_tables.cpu();
+        at::Tensor all_tables = g.page_tables.cpu();
         at::Tensor rope_layouts = g.rope_layout.cpu();
         at::Tensor key_counts = (g.is_prefill() ? g.seqlens_k : g.context_lens).cpu();
-        at::Tensor query_starts = g.is_prefill() ? g.cu_seqlens_q.cpu() : at::arange(page_tables.size(0) + 1, at::kInt);
-        at::Tensor logits = at::zeros({n_tokens, vocab});
-
-        auto key = keys.accessor<float, 2>();
+        at::Tensor query_starts = g.is_prefill() ? g.cu_seqlens_q.cpu() : at::arange(all_tables.size(1) + 1, at::kInt);
         auto position = positions.accessor<std::int64_t, 1>();
-        auto page_table = page_tables.accessor<std::int32_t, 2>();
         auto rope_layout = rope_layouts.accessor<std::int32_t, 2>();
         auto key_count = key_counts.accessor<std::int32_t, 1>();
         auto query_start = query_starts.accessor<std::int32_t, 1>();
+        std::size_t n_seqs = static_cast<std::size_t>(all_tables.size(1));
+
+        std::vector<at::Tensor> keys;
+        std::vector<at::Tensor> tables;
+        for (std::size_t layer = 0; layer < lines.size(); layer++) {
+            tables.push_back(all_tables[static_cast<std::int64_t>(layer)]);
+            auto table = tables.back().accessor<std::int32_t, 2>();
+            std::vector<std::int64_t> slots;
+            for (std::size_t s = 0; s < n_seqs; s++) {
+                for (auto row = static_cast<std::size_t>(query_start[s]);
+                     row < static_cast<std::size_t>(query_start[s + 1]);
+                     row++) {
+                    std::size_t index = static_cast<std::size_t>(key_count[s]) - (query_start[s + 1] - row);
+                    slots.push_back(table[s][index / page_size] * page_size + index % page_size);
+                }
+            }
+            at::Tensor slot = at::tensor(slots).to(g.tokens.device());
+            const pulsarlm::kv& layer_lines = lines[layer];
+            layer_lines.k.flatten(0, 1).select(1, 0).index_copy_(
+                0,
+                slot,
+                g.tokens.to(at::kFloat).view({n_tokens, 1}).expand({n_tokens, 2})
+            );
+            layer_lines.v.flatten(0, 1).select(1, 0).index_copy_(
+                0,
+                slot,
+                g.pos.to(at::kFloat).view({n_tokens, 1}).expand({n_tokens, 2})
+            );
+            keys.push_back(layer_lines.k.select(2, 0).select(2, 0).cpu());
+        }
+
+        at::Tensor logits = at::zeros({n_tokens, vocab});
         auto logit = logits.accessor<float, 2>();
-        for (std::size_t s = 0; s < static_cast<std::size_t>(page_tables.size(0)); s++) {
+        auto key = keys[0].accessor<float, 2>();
+        auto table = tables[0].accessor<std::int32_t, 2>();
+        for (std::size_t s = 0; s < n_seqs; s++) {
             REQUIRE((rope_layout[s][0] == 0 && rope_layout[s][1] == 0 && rope_layout[s][2] == -1));
             auto end_row = static_cast<std::size_t>(query_start[s + 1]);
             for (auto row = static_cast<std::size_t>(query_start[s]); row < end_row; row++) {
@@ -165,9 +199,24 @@ class sum_model final : public pulsarlm::Model {
                 REQUIRE(position[row] == static_cast<std::int64_t>(view_index));
                 std::int64_t sum = 0;
                 for (std::size_t j = 0; j <= view_index; j++) {
-                    sum += static_cast<std::int64_t>(key[page_table[s][j / shape.page_size]][j % shape.page_size]);
+                    sum += static_cast<std::int64_t>(key[table[s][j / page_size]][j % page_size]);
                 }
                 logit[row][sum % vocab] = 1.0f;
+                for (std::size_t layer = 1; layer < lines.size(); layer++) {
+                    std::optional<std::size_t> window = layers[layer].sliding_window;
+                    if (!window) {
+                        continue;
+                    }
+                    auto window_key = keys[layer].accessor<float, 2>();
+                    auto window_table = tables[layer].accessor<std::int32_t, 2>();
+                    std::size_t first = view_index + 1 > *window ? view_index + 1 - *window : 0;
+                    for (std::size_t j = first; j <= view_index; j++) {
+                        REQUIRE(
+                            window_key[window_table[s][j / page_size]][j % page_size] ==
+                            key[table[s][j / page_size]][j % page_size]
+                        );
+                    }
+                }
             }
         }
         if (g.page_mass.defined()) {
@@ -175,10 +224,10 @@ class sum_model final : public pulsarlm::Model {
             at::Tensor page_mass = at::zeros({g.page_mass.size(0)});
             auto first_page = cu_view_pages.accessor<std::int32_t, 1>();
             auto mass = page_mass.accessor<float, 1>();
-            for (std::size_t s = 0; s < static_cast<std::size_t>(page_tables.size(0)); s++) {
+            for (std::size_t s = 0; s < n_seqs; s++) {
                 for (std::size_t j = 0; j < static_cast<std::size_t>(key_count[s]); j++) {
-                    std::size_t page = j / shape.page_size;
-                    if (important(static_cast<std::int64_t>(key[page_table[s][page]][j % shape.page_size]))) {
+                    std::size_t page = j / page_size;
+                    if (important(static_cast<std::int64_t>(key[table[s][page]][j % page_size]))) {
                         mass[first_page[s] + page] = 1.0f;
                     }
                 }
@@ -193,37 +242,97 @@ cudaStream_t compute_stream() {
     return c10::cuda::getCurrentCUDAStream().stream();
 }
 
+std::vector<pulsarlm::page_shape> page_shapes(const std::vector<pulsarlm::kv_layer>& layers) {
+    std::vector<pulsarlm::page_shape> shapes;
+    for (const pulsarlm::kv_layer& layer : layers) {
+        shapes.push_back(pulsarlm::page_shape{
+            .n_layers = 1,
+            .page_size = page_size,
+            .n_kv_heads = layer.n_kv_heads,
+            .head_dim = layer.head_dim,
+            .dtype = at::kFloat,
+            .values_only = layer.values_only,
+        });
+    }
+    return shapes;
+}
+
 digest root() {
-    return pulsarlm::make_root_digest("sum-model", shape);
+    return pulsarlm::make_root_digest("sum-model", page_shapes(two_full_layers));
+}
+
+std::vector<pulsarlm::kv_cache> make_caches(
+    const std::vector<pulsarlm::kv_layer>& layers,
+    const std::vector<std::size_t>& line_counts,
+    std::vector<std::unique_ptr<pulsarlm::layer_store>>& stores
+) {
+    std::vector<pulsarlm::page_shape> shapes = page_shapes(layers);
+    std::vector<pulsarlm::kv_cache> caches;
+    for (std::size_t layer = 0; layer < layers.size(); layer++) {
+        caches.emplace_back(shapes[layer], line_counts[layer], 2, at::Device(at::kCUDA, 0), *stores[layer]);
+    }
+    return caches;
 }
 
 struct fixture {
+    memory_store backing;
     std::shared_ptr<store_contents> store;
+    std::vector<std::unique_ptr<pulsarlm::layer_store>> layer_stores;
     sum_model model;
     pulsarlm::scheduler sched;
 
+    // Every KV layer holds n_lines lines unless line_counts gives one count per layer.
     explicit fixture(
         std::size_t n_lines,
         std::size_t prefill_tokens_per_step = 64,
         std::vector<std::int64_t> stop_ids = {},
-        memory_store backing = {}
+        memory_store backing_store = {},
+        std::vector<pulsarlm::kv_layer> layers = two_full_layers,
+        std::vector<std::size_t> line_counts = {}
     )
-    : store(backing.contents),
+    : backing(std::move(backing_store)),
+      store(backing.contents),
+      layer_stores(make_layer_stores(backing, layers.size())),
+      model(with_layers(std::move(layers))),
       sched(
           model,
-          pulsarlm::kv_cache(
-              shape,
-              n_lines,
-              2,
-              at::Device(at::kCUDA, 0),
-              std::make_unique<memory_store>(std::move(backing))
+          make_caches(
+              model.layers,
+              line_counts.empty() ? std::vector<std::size_t>(model.layers.size(), n_lines) : line_counts,
+              layer_stores
           ),
           compute_stream(),
           root(),
           std::move(stop_ids),
           prefill_tokens_per_step
       ) {}
+
+    static std::vector<std::unique_ptr<pulsarlm::layer_store>> make_layer_stores(memory_store& store, std::size_t n) {
+        std::vector<std::unique_ptr<pulsarlm::layer_store>> stores;
+        for (std::size_t layer = 0; layer < n; layer++) {
+            stores.push_back(std::make_unique<pulsarlm::layer_store>(store, layer));
+        }
+        return stores;
+    }
+
+    static sum_model with_layers(std::vector<pulsarlm::kv_layer> layers) {
+        sum_model m;
+        m.layers = std::move(layers);
+        return m;
+    }
+
+    const page& stored(const digest& hash, std::size_t layer) const {
+        return store->pages.at(pulsarlm::store_key(hash, layer));
+    }
 };
+
+std::vector<digest> keys_of(const std::vector<digest>& hashes, std::size_t layer) {
+    std::vector<digest> keys;
+    for (const digest& hash : hashes) {
+        keys.push_back(pulsarlm::store_key(hash, layer));
+    }
+    return keys;
+}
 
 token_list concat(token_list front, const token_list& back) {
     front.insert(front.end(), back.begin(), back.end());
@@ -343,14 +452,15 @@ TEST_CASE("a request from an empty state prefills, decodes and ends with its sta
     REQUIRE(results[0].tokens == generated);
     pulsarlm::state end = ended_state(results[0]);
     token_list forwarded = concat(prompt, without_last(generated));
-    std::size_t full_tokens = forwarded.size() - forwarded.size() % shape.page_size;
-    REQUIRE((end.page_hashes == pulsarlm::make_page_digests(root(), forwarded, shape.page_size)));
+    std::size_t full_tokens = forwarded.size() - forwarded.size() % page_size;
+    REQUIRE((end.page_hashes == pulsarlm::make_page_digests(root(), forwarded, page_size)));
     REQUIRE(end.tail == token_list(forwarded.begin() + full_tokens, forwarded.end()));
     REQUIRE(end.page_hashes.size() == 2);
     for (std::size_t i = 0; i < end.page_hashes.size(); i++) {
-        std::size_t first_index = i * shape.page_size;
-        token_list page_tokens(forwarded.begin() + first_index, forwarded.begin() + first_index + shape.page_size);
-        REQUIRE(page_holds(f.store->pages.at(end.page_hashes[i]), page_tokens, first_index));
+        std::size_t first_index = i * page_size;
+        token_list page_tokens(forwarded.begin() + first_index, forwarded.begin() + first_index + page_size);
+        REQUIRE(page_holds(f.stored(end.page_hashes[i], 0), page_tokens, first_index));
+        REQUIRE(page_holds(f.stored(end.page_hashes[i], 1), page_tokens, first_index));
     }
 }
 
@@ -371,7 +481,7 @@ TEST_CASE("a request continues from the end state of another in the same cache")
     REQUIRE(results[1].tokens == continuation(context, 4));
     REQUIRE((
         ended_state(results[1]).page_hashes ==
-        pulsarlm::make_page_digests(root(), concat(context, without_last(results[1].tokens)), shape.page_size)
+        pulsarlm::make_page_digests(root(), concat(context, without_last(results[1].tokens)), page_size)
     ));
     REQUIRE(f.store->fetches.empty());
 }
@@ -392,7 +502,10 @@ TEST_CASE("a request continues from pages another cache fetches from the store")
     )[0];
 
     REQUIRE(second.tokens == continuation(concat(concat(prompt, first.tokens), user), 4));
-    REQUIRE((first_engine.store->fetches == std::vector<std::vector<digest>>{first_end.page_hashes}));
+    REQUIRE((
+        first_engine.store->fetches ==
+        std::vector<std::vector<digest>>{keys_of(first_end.page_hashes, 0), keys_of(first_end.page_hashes, 1)}
+    ));
 }
 
 TEST_CASE("a state page missing from the store ends the request with miss") {
@@ -415,7 +528,7 @@ TEST_CASE("a stop token ends the request after it is emitted") {
 
     REQUIRE(results[0].tokens == token_list{6, 12, 24});
     pulsarlm::state end = ended_state(results[0]);
-    REQUIRE((end.page_hashes == pulsarlm::make_page_digests(root(), token_list{1, 2, 3, 6}, shape.page_size)));
+    REQUIRE((end.page_hashes == pulsarlm::make_page_digests(root(), token_list{1, 2, 3, 6}, page_size)));
     REQUIRE(end.tail == token_list{12});
 }
 
@@ -426,9 +539,9 @@ TEST_CASE("max_tokens 0 forwards the tokens and ends with their state") {
 
     REQUIRE(results[0].tokens.empty());
     pulsarlm::state end = ended_state(results[0]);
-    REQUIRE((end.page_hashes == pulsarlm::make_page_digests(root(), prompt, shape.page_size)));
+    REQUIRE((end.page_hashes == pulsarlm::make_page_digests(root(), prompt, page_size)));
     REQUIRE(end.tail == token_list{9});
-    REQUIRE(f.store->pages.size() == 2);
+    REQUIRE(f.store->pages.size() == 4);
 }
 
 TEST_CASE("a request cancelled before it runs ends with cancelled") {
@@ -509,7 +622,7 @@ TEST_CASE("a request that outgrows the free lines waits for them and completes")
     REQUIRE(results[1].tokens == continuation(second, 10));
     REQUIRE((
         ended_state(results[1]).page_hashes ==
-        pulsarlm::make_page_digests(root(), concat(second, without_last(results[1].tokens)), shape.page_size)
+        pulsarlm::make_page_digests(root(), concat(second, without_last(results[1].tokens)), page_size)
     ));
     // Five steps together; the second then waits for a third line while the first runs its last five steps.
     REQUIRE(f.model.forward_count == 15);
@@ -528,11 +641,11 @@ TEST_CASE("a cycle ends every cycle_tokens tokens with the state it reached") {
     REQUIRE(cycle_ends.size() == 2);
     token_list first_pages(prompt.begin(), prompt.begin() + 4);
     REQUIRE(cycle_ends[0].token_count == 4);
-    REQUIRE((cycle_ends[0].reached.page_hashes == pulsarlm::make_page_digests(root(), first_pages, shape.page_size)));
+    REQUIRE((cycle_ends[0].reached.page_hashes == pulsarlm::make_page_digests(root(), first_pages, page_size)));
     REQUIRE(cycle_ends[0].reached.tail.empty());
     token_list forwarded = concat(prompt, token_list(generated.begin(), generated.begin() + 2));
     REQUIRE(cycle_ends[1].token_count == 8);
-    REQUIRE((cycle_ends[1].reached.page_hashes == pulsarlm::make_page_digests(root(), forwarded, shape.page_size)));
+    REQUIRE((cycle_ends[1].reached.page_hashes == pulsarlm::make_page_digests(root(), forwarded, page_size)));
     REQUIRE(cycle_ends[1].reached.tail.empty());
 }
 
@@ -549,7 +662,7 @@ TEST_CASE("a cycle's end evicts the pages below the bar outside the sink and wor
         }}
     );
 
-    std::vector<digest> chain = pulsarlm::make_page_digests(root(), prompt, shape.page_size);
+    std::vector<digest> chain = pulsarlm::make_page_digests(root(), prompt, page_size);
     token_list kept = concat(token_list(prompt.begin(), prompt.begin() + 8), token_list(prompt.begin() + 12, prompt.end()));
     std::int64_t first = continuation(prompt, 1)[0];
     REQUIRE(results[0].tokens == token_list{first, continuation(concat(kept, {first}), 1)[0]});
@@ -570,7 +683,7 @@ TEST_CASE("a cycle's end evicts down to max_pages, the oldest first on ties") {
         {request{.tokens = prompt, .max_tokens = 2, .eviction = {.cycle_tokens = 16, .max_pages = 2}}}
     );
 
-    std::vector<digest> chain = pulsarlm::make_page_digests(root(), prompt, shape.page_size);
+    std::vector<digest> chain = pulsarlm::make_page_digests(root(), prompt, page_size);
     token_list kept(prompt.begin() + 8, prompt.end());
     std::int64_t first = continuation(prompt, 1)[0];
     REQUIRE(results[0].tokens == token_list{first, continuation(concat(kept, {first}), 1)[0]});
@@ -617,6 +730,93 @@ TEST_CASE("running requests are forwarded in one step") {
     REQUIRE(results[1].tokens == continuation(second, 3));
     REQUIRE(f.model.prefill_chunks == std::vector<token_list>{{3, 3}});
     REQUIRE(f.model.decode_sizes == std::vector<std::int64_t>{2, 2});
+}
+
+const std::vector<pulsarlm::kv_layer> full_and_sliding{
+    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2},
+    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .sliding_window = 5},
+};
+
+// Each request holds at most 3 sliding lines at a time: its window's page and a cycle's 2 pages. Holding passed pages
+// too, one of them would requeue and the two would not share every step.
+TEST_CASE("a sliding layer holds only the pages its window reaches") {
+    fixture f(32, 64, {}, {}, full_and_sliding, {32, 6});
+    token_list first(20);
+    std::iota(first.begin(), first.end(), 1);
+    token_list second(20);
+    std::iota(second.begin(), second.end(), 100);
+    std::vector<request_results> results = serve_all(
+        f.sched,
+        {request{.tokens = first, .max_tokens = 6, .eviction = {.cycle_tokens = 8}},
+         request{.tokens = second, .max_tokens = 6, .eviction = {.cycle_tokens = 8}}}
+    );
+
+    REQUIRE(results[0].tokens == continuation(first, 6));
+    REQUIRE(results[1].tokens == continuation(second, 6));
+    REQUIRE(f.model.prefill_chunks == std::vector<token_list>{{8, 8}, {8, 8}, {4, 4}});
+    REQUIRE(f.model.decode_sizes == std::vector<std::int64_t>(5, 2));
+    pulsarlm::state end = ended_state(results[0]);
+    token_list forwarded = concat(first, without_last(results[0].tokens));
+    REQUIRE((end.page_hashes == pulsarlm::make_page_digests(root(), forwarded, page_size)));
+    for (std::size_t i = 0; i < end.page_hashes.size(); i++) {
+        token_list page_tokens(forwarded.begin() + i * page_size, forwarded.begin() + (i + 1) * page_size);
+        REQUIRE(page_holds(f.stored(end.page_hashes[i], 1), page_tokens, i * page_size));
+    }
+}
+
+TEST_CASE("page_keys names every full-attention page and the pages a sliding window reaches") {
+    fixture f(16, 64, {}, {}, full_and_sliding);
+    token_list history(26);
+    std::iota(history.begin(), history.end(), 1);
+    std::vector<digest> hashes = pulsarlm::make_page_digests(root(), history, page_size);
+    REQUIRE(hashes.size() == 6);
+
+    std::vector<digest> keys = f.sched.page_keys(pulsarlm::state{.page_hashes = hashes, .tail = {25, 26}});
+    std::vector<digest> expected = keys_of(hashes, 0);
+    std::vector<digest> window_keys = keys_of({hashes[5]}, 1);
+    expected.insert(expected.end(), window_keys.begin(), window_keys.end());
+    REQUIRE((keys == expected));
+}
+
+TEST_CASE("a request resumed on another cache fetches only the window's pages of a sliding layer") {
+    fixture first_engine(16, 64, {}, {}, full_and_sliding);
+    token_list prompt(20);
+    std::iota(prompt.begin(), prompt.end(), 1);
+    request_results first = serve_all(first_engine.sched, {request{.tokens = prompt, .max_tokens = 3}})[0];
+    pulsarlm::state first_end = ended_state(first);
+    REQUIRE(first_end.page_hashes.size() == 5);
+
+    memory_store shared_store;
+    shared_store.contents = first_engine.store;
+    fixture second_engine(16, 64, {}, shared_store, full_and_sliding);
+    token_list user{7, 8};
+    request_results second = serve_all(
+        second_engine.sched,
+        {request{.initial_state = first_end, .tokens = concat({first.tokens.back()}, user), .max_tokens = 4}}
+    )[0];
+
+    REQUIRE(second.tokens == continuation(concat(concat(prompt, first.tokens), user), 4));
+    REQUIRE((
+        first_engine.store->fetches ==
+        std::vector<std::vector<digest>>{keys_of(first_end.page_hashes, 0), keys_of({first_end.page_hashes[4]}, 1)}
+    ));
+}
+
+TEST_CASE("eviction keeps the pages a sliding window reaches whatever n_working asks") {
+    std::vector<pulsarlm::kv_layer> layers{
+        pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2},
+        pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .sliding_window = 9},
+    };
+    fixture f(16, 64, {}, {}, layers);
+    token_list prompt(16);
+    std::iota(prompt.begin(), prompt.end(), 1);
+    std::vector<request_results> results = serve_all(
+        f.sched,
+        {request{.tokens = prompt, .max_tokens = 2, .eviction = {.n_working = 1, .cycle_tokens = 16, .max_pages = 1}}}
+    );
+
+    std::vector<digest> chain = pulsarlm::make_page_digests(root(), prompt, page_size);
+    REQUIRE((results[0].cycle_ends[0].reached.page_hashes == std::vector{chain[2], chain[3]}));
 }
 
 }  // namespace
