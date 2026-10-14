@@ -58,7 +58,7 @@ class LocalStore:
     the store above its capacity.
     """
 
-    def __init__(self, page_size: int, capacity_bytes: int) -> None:
+    def __init__(self, page_size: int, capacity_bytes: int = 16 * 2**30) -> None:
         self._lock = threading.Lock()
         self._page_size = page_size
         self._capacity_bytes = capacity_bytes

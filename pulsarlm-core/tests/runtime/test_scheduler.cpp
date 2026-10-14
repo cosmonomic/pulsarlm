@@ -701,7 +701,11 @@ TEST_CASE("a cycle's end evicts down to max_pages, the oldest first on ties") {
     token_list prompt{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
     std::vector<request_results> results = serve_all(
         f.sched,
-        {request{.tokens = prompt, .max_tokens = 2, .eviction = {.cycle_tokens = 16, .max_pages = 2}}}
+        {request{
+            .tokens = prompt,
+            .max_tokens = 2,
+            .eviction = {.n_sink = 0, .n_working = 1, .cycle_tokens = 16, .max_pages = 2}
+        }}
     );
 
     std::vector<digest> chain = pulsarlm::make_page_digests(root(), prompt, page_size);
@@ -717,7 +721,11 @@ TEST_CASE("a prompt longer than the cache fits when each cycle evicts down to ma
     std::iota(prompt.begin(), prompt.end(), 1);
     std::vector<request_results> results = serve_all(
         f.sched,
-        {request{.tokens = prompt, .max_tokens = 2, .eviction = {.cycle_tokens = 8, .max_pages = 2}}}
+        {request{
+            .tokens = prompt,
+            .max_tokens = 2,
+            .eviction = {.n_sink = 0, .n_working = 1, .cycle_tokens = 8, .max_pages = 2}
+        }}
     );
 
     token_list last_two_cycles(prompt.begin() + 16, prompt.end());
@@ -853,7 +861,11 @@ TEST_CASE("eviction keeps the pages a sliding window reaches whatever n_working 
     std::iota(prompt.begin(), prompt.end(), 1);
     std::vector<request_results> results = serve_all(
         f.sched,
-        {request{.tokens = prompt, .max_tokens = 2, .eviction = {.n_working = 1, .cycle_tokens = 16, .max_pages = 1}}}
+        {request{
+            .tokens = prompt,
+            .max_tokens = 2,
+            .eviction = {.n_sink = 0, .n_working = 1, .cycle_tokens = 16, .max_pages = 1}
+        }}
     );
 
     std::vector<digest> chain = pulsarlm::make_page_digests(root(), prompt, page_size);

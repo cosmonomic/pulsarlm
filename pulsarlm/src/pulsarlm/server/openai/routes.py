@@ -46,9 +46,12 @@ class ServerState:
     eviction: EvictionPolicy
 
     def eviction_for(self, system_tokens: int) -> EvictionPolicy:
-        """The default policy, sinking the pages the system message touches."""
+        """The default policy, sinking the pages the system message touches, if
+        there is one."""
         return EvictionPolicy(
-            n_sink=math.ceil(system_tokens / self.page_size),
+            n_sink=math.ceil(system_tokens / self.page_size)
+            if system_tokens
+            else self.eviction.n_sink,
             n_working=self.eviction.n_working,
             cycle_tokens=self.eviction.cycle_tokens,
             max_pages=self.eviction.max_pages,

@@ -313,7 +313,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "model_name"_a,
             "page_size"_a,
             "kv_dtype"_a,
-            "kv_cache_gib"_a,
+            "kv_cache_gib"_a = 4.0,
             "staging_gib"_a,
             "device"_a,
             "stop_ids"_a,

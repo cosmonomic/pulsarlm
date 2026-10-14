@@ -55,7 +55,7 @@ def serve(
         typer.Option(
             "--kv_cache_gib", help="KV cache size in GiB.", rich_help_panel="Memory"
         ),
-    ] = 8.0,
+    ] = 4.0,
     staging_gib: Annotated[
         float,
         typer.Option(
@@ -79,7 +79,7 @@ def serve(
             help="Host memory the local store keeps pages in, in GiB.",
             rich_help_panel="Memory",
         ),
-    ] = 8.0,
+    ] = 16.0,
     cycle_tokens: Annotated[
         int,
         typer.Option(
@@ -95,7 +95,7 @@ def serve(
             help="Newest pages eviction never touches.",
             rich_help_panel="Eviction",
         ),
-    ] = 4,
+    ] = 512,
     evict_tau: Annotated[
         float,
         typer.Option(
@@ -183,7 +183,7 @@ def chat(
         typer.Option(
             "--kv_cache_gib", help="KV cache size in GiB.", rich_help_panel="Memory"
         ),
-    ] = 8.0,
+    ] = 4.0,
     staging_gib: Annotated[
         float,
         typer.Option(
@@ -207,7 +207,7 @@ def chat(
             help="Host memory the local store keeps pages in, in GiB.",
             rich_help_panel="Memory",
         ),
-    ] = 8.0,
+    ] = 16.0,
     cycle_tokens: Annotated[
         int,
         typer.Option(
@@ -223,7 +223,7 @@ def chat(
             help="Newest pages eviction never touches.",
             rich_help_panel="Eviction",
         ),
-    ] = 4,
+    ] = 512,
     evict_tau: Annotated[
         float,
         typer.Option(

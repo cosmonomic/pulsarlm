@@ -14,8 +14,8 @@ namespace pulsarlm {
 // then the lowest-density ones until at most max_pages remain. attention_mass_decay is the density EMA's rate per
 // token. The defaults evict nothing.
 struct eviction_policy {
-    std::size_t n_sink = 0;
-    std::size_t n_working = 1;
+    std::size_t n_sink = 64;
+    std::size_t n_working = 512;
     std::size_t cycle_tokens = 512;
     std::optional<std::size_t> max_pages;
     double evict_tau = 0.0;
