@@ -248,7 +248,7 @@ async def run_item(
                     model=model,
                     messages=messages,
                     tools=[READ_TOOL],
-                    temperature=0.3,
+                    temperature=1.0,
                     top_p=0.95,
                     seed=item.seed,
                     max_tokens=4096,
