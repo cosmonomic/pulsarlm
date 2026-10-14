@@ -142,7 +142,6 @@ pulsarlm::engine_config config(std::size_t n_lines) {
         .kv_dtype = at::kFloat,
         .kv_cache_bytes = n_lines * line_bytes,
         .staging_bytes = 2 * line_bytes,
-        .max_position_embeddings = 64,
         .device = at::Device(at::kCUDA, 0),
         .stop_ids = {},
         .vocab_size = vocab,
@@ -158,25 +157,13 @@ digest root() {
     return pulsarlm::make_root_digest("successor", pulsarlm::page_shapes(config(16), one_layer));
 }
 
-TEST_CASE("the KV cache takes the whole lines that fit in its size") {
+TEST_CASE("an engine whose KV cache holds no line is rejected") {
     pulsarlm::engine_config sized = config(16);
-    std::size_t line_bytes = pulsarlm::line_bytes(pulsarlm::page_shapes(sized, one_layer)[0]);
-    sized.kv_cache_bytes += line_bytes - 1;
-    REQUIRE(pulsarlm::line_counts(sized, one_layer) == std::vector<std::size_t>{16});
-    sized.kv_cache_bytes = line_bytes - 1;
-    REQUIRE_THROWS_AS(pulsarlm::line_counts(sized, one_layer), std::invalid_argument);
-}
-
-// Per request, the full layer takes 64 / 4 = 16 lines of 64 bytes and the sliding one 5 / 4 + 1 = 3 lines of 128
-// bytes (2 heads), together 1408 bytes.
-TEST_CASE("the KV layers share the cache as requests at the trained context use it") {
-    std::vector<pulsarlm::kv_layer> layers{
-        pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2},
-        pulsarlm::kv_layer{.n_kv_heads = 2, .head_dim = 2, .sliding_window = 5},
-    };
-    pulsarlm::engine_config sized = config(16);
-    sized.kv_cache_bytes = 10 * 1408 + 100;
-    REQUIRE(pulsarlm::line_counts(sized, layers) == std::vector<std::size_t>{161, 30});
+    sized.kv_cache_bytes = pulsarlm::line_bytes(pulsarlm::page_shapes(sized, one_layer)[0]) - 1;
+    REQUIRE_THROWS_AS(
+        pulsarlm::engine(std::make_unique<successor_model>(), sized, std::make_unique<stalling_store>()),
+        std::invalid_argument
+    );
 }
 
 TEST_CASE("an engine whose staging buffer holds no page is rejected") {

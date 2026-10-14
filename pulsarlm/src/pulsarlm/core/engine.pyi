@@ -151,7 +151,6 @@ class Engine:
         kv_dtype: torch.dtype,
         kv_cache_gib: float,
         staging_gib: float,
-        max_position_embeddings: int,
         device: torch.device,
         stop_ids: list[int],
         prefill_tokens_per_step: int,

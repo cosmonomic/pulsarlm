@@ -61,7 +61,6 @@ def load_server_state(settings: Settings) -> ServerState:
         kv_dtype=settings.dtype,
         kv_cache_gib=settings.kv_cache_gib,
         staging_gib=settings.staging_gib,
-        max_position_embeddings=cfg.max_position_embeddings,
         device=torch.device(settings.device),
         stop_ids=stops,
         prefill_tokens_per_step=settings.prefill_tokens_per_step,

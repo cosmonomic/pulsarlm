@@ -264,17 +264,27 @@ digest root() {
     return pulsarlm::make_root_digest("sum-model", page_shapes(two_full_layers));
 }
 
+// A pool of pool_bytes, or with room for n_lines lines of every layer.
 pulsarlm::kv_cache make_cache(
     const std::vector<pulsarlm::kv_layer>& layers,
-    const std::vector<std::size_t>& line_counts,
+    std::size_t n_lines,
+    std::optional<std::size_t> pool_bytes,
     pulsarlm::page_store& store
 ) {
     std::vector<pulsarlm::page_shape> shapes = page_shapes(layers);
     std::size_t staging_bytes = 0;
+    std::size_t lines_bytes = 0;
     for (const pulsarlm::page_shape& shape : shapes) {
         staging_bytes = std::max(staging_bytes, 2 * pulsarlm::line_bytes(shape));
+        lines_bytes += n_lines * pulsarlm::line_bytes(shape);
     }
-    return pulsarlm::kv_cache(shapes, line_counts, staging_bytes, at::Device(at::kCUDA, 0), store);
+    return pulsarlm::kv_cache(
+        shapes,
+        pool_bytes.value_or(lines_bytes),
+        staging_bytes,
+        at::Device(at::kCUDA, 0),
+        store
+    );
 }
 
 struct fixture {
@@ -283,25 +293,21 @@ struct fixture {
     sum_model model;
     pulsarlm::scheduler sched;
 
-    // Every KV layer holds n_lines lines unless line_counts gives one count per layer.
+    // The pool has room for n_lines lines of every KV layer unless pool_bytes sizes it.
     explicit fixture(
         std::size_t n_lines,
         std::size_t prefill_tokens_per_step = 64,
         std::vector<std::int64_t> stop_ids = {},
         memory_store backing_store = {},
         std::vector<pulsarlm::kv_layer> layers = two_full_layers,
-        std::vector<std::size_t> line_counts = {}
+        std::optional<std::size_t> pool_bytes = std::nullopt
     )
     : backing(std::move(backing_store)),
       store(backing.contents),
       model(with_layers(std::move(layers))),
       sched(
           model,
-          make_cache(
-              model.layers,
-              line_counts.empty() ? std::vector<std::size_t>(model.layers.size(), n_lines) : line_counts,
-              backing
-          ),
+          make_cache(model.layers, n_lines, pool_bytes, backing),
           compute_stream(),
           root(),
           std::move(stop_ids),
@@ -744,10 +750,12 @@ const std::vector<pulsarlm::kv_layer> full_and_sliding{
     pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .sliding_window = 5},
 };
 
-// Each request holds at most 3 sliding lines at a time: its window's page and a cycle's 2 pages. Holding passed pages
-// too, one of them would requeue and the two would not share every step.
+// Each request holds at most 7 full-attention lines and 3 sliding lines at a time: the window's page and a cycle's 2
+// pages. The pool holds those 20 lines; holding passed pages too, one request would requeue and the two would not share
+// every step.
 TEST_CASE("a sliding layer holds only the pages its window reaches") {
-    fixture f(32, 64, {}, {}, full_and_sliding, {32, 6});
+    std::size_t line_bytes = pulsarlm::line_bytes(page_shapes(full_and_sliding).front());
+    fixture f(0, 64, {}, {}, full_and_sliding, 20 * line_bytes);
     token_list first(20);
     std::iota(first.begin(), first.end(), 1);
     token_list second(20);
@@ -769,6 +777,27 @@ TEST_CASE("a sliding layer holds only the pages its window reaches") {
         token_list page_tokens(forwarded.begin() + i * page_size, forwarded.begin() + (i + 1) * page_size);
         REQUIRE(page_holds(f.stored(end.page_hashes[i], 1), page_tokens, i * page_size));
     }
+}
+
+const std::vector<pulsarlm::kv_layer> full_and_wide_sliding{
+    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2},
+    pulsarlm::kv_layer{.n_kv_heads = 2, .head_dim = 2, .sliding_window = 5},
+};
+
+// The request peaks at 8 full-attention lines of 64 bytes and 5 sliding lines of 128 bytes: the window's page and a
+// 16-token cycle's 4 pages. A split sizing the sliding layer for ceil(5 / 4) + 1 lines per request would not serve it.
+TEST_CASE("the pool gives each line size the lines its layers need") {
+    token_list prompt(16);
+    std::iota(prompt.begin(), prompt.end(), 1);
+    auto serve_in = [&](std::size_t pool_bytes) {
+        fixture f(0, 64, {}, {}, full_and_wide_sliding, pool_bytes);
+        return serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 16, .eviction = {.cycle_tokens = 16}}})[0];
+    };
+
+    request_results served = serve_in(8 * 64 + 5 * 128);
+    REQUIRE(served.tokens == continuation(prompt, 16));
+    REQUIRE(ended_state(served).page_hashes.size() == 7);
+    REQUIRE(ended_error(serve_in(7 * 64 + 5 * 128)) == request_error::oom);
 }
 
 TEST_CASE("page_keys names every full-attention page and the pages a sliding window reaches") {

@@ -32,11 +32,20 @@ std::size_t ceil_div(std::size_t n, std::size_t d) {
     return (n + d - 1) / d;
 }
 
-std::size_t lines_per_request(const engine_config& config, const kv_layer& layer) {
-    if (layer.sliding_window) {
-        return ceil_div(*layer.sliding_window, config.page_size) + 1;
+// Lines are carved one after another, each at a multiple of its size.
+void check_kv_cache(const engine_config& config, std::span<const page_shape> shapes) {
+    std::size_t carved_end = 0;
+    for (const page_shape& shape : shapes) {
+        std::size_t bytes = line_bytes(shape);
+        carved_end = ceil_div(carved_end, bytes) * bytes + bytes;
     }
-    return std::max<std::size_t>(1, ceil_div(config.max_position_embeddings, config.page_size));
+    if (config.kv_cache_bytes < carved_end) {
+        throw std::invalid_argument(std::format(
+            "a KV cache of {} bytes holds no line of every KV layer; a line of each takes {} bytes",
+            config.kv_cache_bytes,
+            carved_end
+        ));
+    }
 }
 
 void check_staging(const engine_config& config, std::span<const page_shape> shapes) {
@@ -55,9 +64,9 @@ void check_staging(const engine_config& config, std::span<const page_shape> shap
 
 kv_cache make_cache(const engine_config& config, std::span<const kv_layer> layers, page_store& store) {
     std::vector<page_shape> shapes = page_shapes(config, layers);
-    std::vector<std::size_t> lines = line_counts(config, layers);
+    check_kv_cache(config, shapes);
     check_staging(config, shapes);
-    return kv_cache(shapes, lines, config.staging_bytes, config.device, store);
+    return kv_cache(shapes, config.kv_cache_bytes, config.staging_bytes, config.device, store);
 }
 
 }  // namespace
@@ -75,29 +84,6 @@ std::vector<page_shape> page_shapes(const engine_config& config, std::span<const
         });
     }
     return shapes;
-}
-
-std::vector<std::size_t> line_counts(const engine_config& config, std::span<const kv_layer> layers) {
-    std::vector<page_shape> shapes = page_shapes(config, layers);
-    std::size_t request_bytes = 0;
-    for (std::size_t layer = 0; layer < layers.size(); layer++) {
-        request_bytes += lines_per_request(config, layers[layer]) * line_bytes(shapes[layer]);
-    }
-    std::vector<std::size_t> counts;
-    for (std::size_t layer = 0; layer < layers.size(); layer++) {
-        std::size_t count = config.kv_cache_bytes / request_bytes * lines_per_request(config, layers[layer]) +
-            config.kv_cache_bytes % request_bytes * lines_per_request(config, layers[layer]) / request_bytes;
-        if (count == 0) {
-            throw std::invalid_argument(std::format(
-                "a KV cache of {} bytes holds no line of KV layer {}; a request takes {} bytes",
-                config.kv_cache_bytes,
-                layer,
-                request_bytes
-            ));
-        }
-        counts.push_back(count);
-    }
-    return counts;
 }
 
 void validate(const request& r, std::size_t page_size, std::size_t vocab_size) {

@@ -33,7 +33,7 @@ using lines_result = std::expected<line_ids, page_error>;
 using layer_lines_result = std::expected<std::vector<line_ids>, page_error>;
 
 constexpr pulsarlm::page_shape
-    shape{.n_layers = 2, .page_size = 4, .n_kv_heads = 2, .head_dim = 8, .dtype = at::kFloat};
+    shape{.n_layers = 1, .page_size = 4, .n_kv_heads = 2, .head_dim = 8, .dtype = at::kFloat};
 
 const lines_result oom = std::unexpected(page_error::oom);
 const lines_result miss = std::unexpected(page_error::miss);
@@ -78,13 +78,21 @@ cudaStream_t compute_stream() {
     return c10::cuda::getCurrentCUDAStream().stream();
 }
 
+std::size_t lines_bytes(const std::vector<pulsarlm::page_shape>& shapes) {
+    std::size_t bytes = 0;
+    for (const pulsarlm::page_shape& layer_shape : shapes) {
+        bytes += pulsarlm::line_bytes(layer_shape);
+    }
+    return bytes;
+}
+
 struct cache_fixture {
     memory_store backing;
     std::shared_ptr<store_state> store;
     pulsarlm::kv_cache kv;
 
-    // One layer of shape unless shapes gives one per layer, each with n_lines lines. The staging buffer holds
-    // staging_pages pages of shape.
+    // One layer of shape unless shapes gives one per layer. The pool has room for n_lines lines of every layer, and the
+    // staging buffer for staging_pages pages of shape.
     explicit cache_fixture(
         std::size_t n_lines,
         memory_store backing_store = {},
@@ -94,7 +102,7 @@ struct cache_fixture {
     : backing(std::move(backing_store)),
       store(backing.state),
       kv(shapes,
-         std::vector<std::size_t>(shapes.size(), n_lines),
+         n_lines * lines_bytes(shapes),
          staging_pages * pulsarlm::line_bytes(shape),
          at::Device(at::kCUDA, 0),
          backing) {}
@@ -123,13 +131,13 @@ page host_page(float value) {
 }
 
 void fill_line(pulsarlm::kv_cache& kv, std::uint32_t line_id, float value, std::size_t layer = 0) {
-    kv.tensors(layer).k.select(1, line_id).fill_(value);
-    kv.tensors(layer).v.select(1, line_id).fill_(-value);
+    kv.tensors(layer).k.select(0, line_id).fill_(value);
+    kv.tensors(layer).v.select(0, line_id).fill_(-value);
 }
 
 bool line_filled_with(pulsarlm::kv_cache& kv, std::uint32_t line_id, float value, std::size_t layer = 0) {
-    return kv.tensors(layer).k.select(1, line_id).eq(value).all().item<bool>() &&
-        kv.tensors(layer).v.select(1, line_id).eq(-value).all().item<bool>();
+    return kv.tensors(layer).k.select(0, line_id).eq(value).all().item<bool>() &&
+        kv.tensors(layer).v.select(0, line_id).eq(-value).all().item<bool>();
 }
 
 lines_result only_layer(layer_lines_result result) {
@@ -220,8 +228,23 @@ void sync_page(pulsarlm::kv_cache& kv, digest hash, float value) {
     release(kv, allocated);
 }
 
+// A size class takes its free lines before carving new ones; carving count lines first makes them all free.
+void carve(pulsarlm::kv_cache& kv, std::size_t count) {
+    line_ids carved = allocate(kv, count).value();
+    release(kv, carved);
+}
+
+// The lines a one-layer cache can take now.
+std::size_t free_lines(const pulsarlm::kv_cache& kv) {
+    std::size_t count = 0;
+    while (kv.fits_free(std::vector<std::size_t>{count + 1})) {
+        count++;
+    }
+    return count;
+}
+
 void require_all_free(pulsarlm::kv_cache& kv, std::size_t n_lines) {
-    REQUIRE(kv.free_line_count(0) == n_lines);
+    REQUIRE(free_lines(kv) == n_lines);
     lines_result all = allocate(kv, n_lines);
     REQUIRE(all.has_value());
     release(kv, *all);
@@ -233,7 +256,7 @@ TEST_CASE("allocate fails with oom holding nothing when lines run out") {
     cache_fixture fixture(4);
     REQUIRE(allocate(fixture.kv, 5) == oom);
     line_ids held = allocate(fixture.kv, 4).value();
-    REQUIRE(fixture.kv.free_line_count(0) == 0);
+    REQUIRE(free_lines(fixture.kv) == 0);
     REQUIRE(allocate(fixture.kv, 1) == oom);
     release(fixture.kv, held);
     require_all_free(fixture.kv, 4);
@@ -272,6 +295,7 @@ TEST_CASE("an evicted page is fetched back from the store") {
 
 TEST_CASE("free lines are reused least recently released first") {
     cache_fixture fixture(2);
+    carve(fixture.kv, 2);
     sync_page(fixture.kv, hash_of(1), 1.0f);
     sync_page(fixture.kv, hash_of(2), 2.0f);
     line_ids evicting = allocate(fixture.kv, 1).value();
@@ -324,7 +348,7 @@ TEST_CASE("concurrent gets of a page share its line and fetch") {
     REQUIRE(line_filled_with(fixture.kv, first->front(), 5.0f));
 
     release(fixture.kv, *first);
-    REQUIRE(fixture.kv.free_line_count(0) == 1);
+    REQUIRE(free_lines(fixture.kv) == 1);
     release(fixture.kv, *second);
     require_all_free(fixture.kv, 2);
 }
@@ -395,6 +419,7 @@ TEST_CASE("clone copies a held page into unmapped held lines") {
 
 TEST_CASE("syncing a hash already cached leaves the line unmapped and still stores the page") {
     cache_fixture fixture(3);
+    carve(fixture.kv, 3);
     sync_page(fixture.kv, hash_of(1), 1.0f);
     fixture.store->pages.clear();
     line_ids duplicate = allocate(fixture.kv, 1).value();
@@ -481,7 +506,7 @@ TEST_CASE("a values_only cache keeps and stores one tensor as both k and v") {
     REQUIRE(fixture.kv.tensors(0).k.is_same(fixture.kv.tensors(0).v));
 
     line_ids allocated = allocate(fixture.kv, 1).value();
-    fixture.kv.tensors(0).v.select(1, allocated.front()).fill_(5.0f);
+    fixture.kv.tensors(0).v.select(0, allocated.front()).fill_(5.0f);
     REQUIRE(run_to_completion(sync_one_layer(fixture.kv, {hash_of(1)}, allocated)).has_value());
     release(fixture.kv, allocated);
     const page& stored = fixture.store->pages.at(key_of(1));
@@ -489,13 +514,13 @@ TEST_CASE("a values_only cache keeps and stores one tensor as both k and v") {
     REQUIRE(stored.v.eq(5.0f).all().item<bool>());
 
     line_ids evicting = allocate(fixture.kv, 2).value();
-    fixture.kv.tensors(0).v.select(1, evicting[0]).fill_(0.0f);
-    fixture.kv.tensors(0).v.select(1, evicting[1]).fill_(0.0f);
+    fixture.kv.tensors(0).v.select(0, evicting[0]).fill_(0.0f);
+    fixture.kv.tensors(0).v.select(0, evicting[1]).fill_(0.0f);
     release(fixture.kv, evicting);
     lines_result got = run_get(fixture.kv, {hash_of(1)});
     REQUIRE(got.has_value());
     REQUIRE(fixture.store->fetches.size() == 1);
-    REQUIRE(fixture.kv.tensors(0).v.select(1, got->front()).eq(5.0f).all().item<bool>());
+    REQUIRE(fixture.kv.tensors(0).v.select(0, got->front()).eq(5.0f).all().item<bool>());
     release(fixture.kv, *got);
 }
 
@@ -545,19 +570,92 @@ TEST_CASE("a page missing in one layer fails the get with miss holding nothing i
 
     layer_lines_result got = run_to_completion(fixture.kv.get(hashes, compute_stream()));
     REQUIRE((got == layer_lines_result(std::unexpected(page_error::miss))));
-    REQUIRE(fixture.kv.free_line_count(0) == 2);
-    REQUIRE(fixture.kv.free_line_count(1) == 2);
+    REQUIRE(fixture.kv.fits_free(std::vector<std::size_t>{2, 2}));
 }
 
-TEST_CASE("allocate fails with oom holding nothing when one layer runs out") {
-    memory_store backing;
-    pulsarlm::page_shape shapes[] = {shape, shape};
-    std::size_t line_counts[] = {3, 1};
-    pulsarlm::kv_cache kv(shapes, line_counts, pulsarlm::line_bytes(shape), at::Device(at::kCUDA, 0), backing);
+TEST_CASE("allocate fails with oom holding nothing when the layers together run out") {
+    cache_fixture fixture(2, {}, 2, {shape, shape});
+    REQUIRE((fixture.kv.allocate(3) == layer_lines_result(std::unexpected(page_error::oom))));
+    REQUIRE(fixture.kv.fits_free(std::vector<std::size_t>{2, 2}));
+    std::vector<line_ids> held = fixture.kv.allocate(2).value();
+    REQUIRE(!fixture.kv.fits_free(std::vector<std::size_t>{1, 0}));
+    fixture.kv.release(0, held[0]);
+    fixture.kv.release(1, held[1]);
+}
 
-    REQUIRE((kv.allocate(2) == layer_lines_result(std::unexpected(page_error::oom))));
-    REQUIRE(kv.free_line_count(0) == 3);
-    REQUIRE(kv.free_line_count(1) == 1);
+TEST_CASE("a line one layer frees serves another layer of its size and drops the first layer's page") {
+    cache_fixture fixture(1, {}, 2, {shape, shape});
+    fixture.store->pages.emplace(key_of(1, 0), host_page(1.0f));
+    fixture.store->pages.emplace(key_of(2, 1), host_page(2.0f));
+    std::vector<digest> first{hash_of(1)};
+    std::vector<digest> second{hash_of(2)};
+    std::vector<digest> none;
+
+    layer_lines_result got =
+        run_to_completion(fixture.kv.get(std::vector<std::span<const digest>>{first, none}, compute_stream()));
+    REQUIRE(got.has_value());
+    fixture.kv.release(0, (*got)[0]);
+    got = run_to_completion(fixture.kv.get(std::vector<std::span<const digest>>{none, second}, compute_stream()));
+    REQUIRE(got.has_value());
+    REQUIRE(line_filled_with(fixture.kv, (*got)[1].front(), 2.0f, 1));
+    fixture.kv.release(1, (*got)[1]);
+
+    got = run_to_completion(fixture.kv.get(std::vector<std::span<const digest>>{first, none}, compute_stream()));
+    REQUIRE(got.has_value());
+    REQUIRE(fixture.store->fetches.size() == 3);
+    fixture.kv.release(0, (*got)[0]);
+}
+
+TEST_CASE("lines of one size are not reused for another size") {
+    pulsarlm::page_shape wide = shape;
+    wide.n_kv_heads = 2 * shape.n_kv_heads;
+    memory_store backing;
+    pulsarlm::kv_cache kv(
+        std::vector<pulsarlm::page_shape>{shape, wide},
+        2 * pulsarlm::line_bytes(wide),
+        pulsarlm::line_bytes(wide),
+        at::Device(at::kCUDA, 0),
+        backing
+    );
+    REQUIRE(kv.fits(std::vector<std::size_t>{0, 2}));
+    std::vector<digest> narrow_hashes;
+    for (std::uint64_t n = 1; n <= 4; n++) {
+        backing.state->pages.emplace(key_of(n, 0), host_page(static_cast<float>(n)));
+        narrow_hashes.push_back(hash_of(n));
+    }
+    std::vector<digest> none;
+    layer_lines_result got =
+        run_to_completion(kv.get(std::vector<std::span<const digest>>{narrow_hashes, none}, compute_stream()));
+    REQUIRE(got.has_value());
+    kv.release(0, (*got)[0]);
+
+    REQUIRE(kv.fits_free(std::vector<std::size_t>{4, 0}));
+    REQUIRE(!kv.fits(std::vector<std::size_t>{0, 1}));
+    std::vector<digest> wide_hashes{hash_of(5)};
+    got = run_to_completion(kv.get(std::vector<std::span<const digest>>{none, wide_hashes}, compute_stream()));
+    REQUIRE((got == layer_lines_result(std::unexpected(page_error::oom))));
+}
+
+TEST_CASE("one call carves lines of several sizes at the bump pointer") {
+    pulsarlm::page_shape wide = shape;
+    wide.n_kv_heads = 2 * shape.n_kv_heads;
+    std::vector<pulsarlm::page_shape> shapes{shape, wide};
+    memory_store backing;
+    std::size_t narrow_bytes = pulsarlm::line_bytes(shape);
+
+    pulsarlm::kv_cache tight(shapes, 3 * narrow_bytes, 2 * narrow_bytes, at::Device(at::kCUDA, 0), backing);
+    REQUIRE((tight.allocate(1) == layer_lines_result(std::unexpected(page_error::oom))));
+    REQUIRE(!tight.fits(std::vector<std::size_t>{1, 1}));
+
+    pulsarlm::kv_cache aligned(shapes, 4 * narrow_bytes, 2 * narrow_bytes, at::Device(at::kCUDA, 0), backing);
+    std::vector<line_ids> held = aligned.allocate(1).value();
+    fill_line(aligned, held[0].front(), 1.0f, 0);
+    fill_line(aligned, held[1].front(), 2.0f, 1);
+    REQUIRE(line_filled_with(aligned, held[0].front(), 1.0f, 0));
+    REQUIRE(line_filled_with(aligned, held[1].front(), 2.0f, 1));
+    REQUIRE(!aligned.fits_free(std::vector<std::size_t>{1, 0}));
+    aligned.release(0, held[0]);
+    aligned.release(1, held[1]);
 }
 
 TEST_CASE("the staging buffer carries pages of layers with different shapes") {
@@ -566,7 +664,7 @@ TEST_CASE("the staging buffer carries pages of layers with different shapes") {
     cache_fixture fixture(4, {}, 1, {values_only, shape});
     std::vector<line_ids> allocated = fixture.kv.allocate(2).value();
     for (std::size_t j = 0; j < 2; j++) {
-        fixture.kv.tensors(0).v.select(1, allocated[0][j]).fill_(static_cast<float>(j + 1));
+        fixture.kv.tensors(0).v.select(0, allocated[0][j]).fill_(static_cast<float>(j + 1));
         fill_line(fixture.kv, allocated[1][j], static_cast<float>(j + 3), 1);
     }
     std::vector<digest> hashes{hash_of(1), hash_of(2)};
@@ -588,7 +686,7 @@ TEST_CASE("the staging buffer carries pages of layers with different shapes") {
     std::vector<std::span<const digest>> layer_hashes{hashes, hashes};
     layer_lines_result got = run_to_completion(fixture.kv.get(layer_hashes, compute_stream()));
     REQUIRE(got.has_value());
-    REQUIRE(fixture.kv.tensors(0).v.select(1, (*got)[0][1]).eq(2.0f).all().item<bool>());
+    REQUIRE(fixture.kv.tensors(0).v.select(0, (*got)[0][1]).eq(2.0f).all().item<bool>());
     REQUIRE(line_filled_with(fixture.kv, (*got)[1][0], 3.0f, 1));
     REQUIRE(line_filled_with(fixture.kv, (*got)[1][1], 4.0f, 1));
     for (std::size_t layer = 0; layer < 2; layer++) {

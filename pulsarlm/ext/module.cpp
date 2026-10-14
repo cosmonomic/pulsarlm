@@ -59,7 +59,6 @@ std::unique_ptr<python_engine> make_engine(
     at::ScalarType kv_dtype,
     double kv_cache_gib,
     double staging_gib,
-    std::size_t max_position_embeddings,
     at::Device device,
     std::vector<std::int64_t> stop_ids,
     std::size_t prefill_tokens_per_step
@@ -73,7 +72,6 @@ std::unique_ptr<python_engine> make_engine(
         kv_dtype,
         static_cast<std::size_t>(kv_cache_gib * (1ull << 30)),
         static_cast<std::size_t>(staging_gib * (1ull << 30)),
-        max_position_embeddings,
         device,
         std::move(stop_ids),
         vocab_size(model),
@@ -317,7 +315,6 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "kv_dtype"_a,
             "kv_cache_gib"_a,
             "staging_gib"_a,
-            "max_position_embeddings"_a,
             "device"_a,
             "stop_ids"_a,
             "prefill_tokens_per_step"_a

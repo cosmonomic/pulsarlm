@@ -383,7 +383,7 @@ scheduler::scheduler(
   cache(std::move(cache)),
   window_pages(0),
   stream(stream),
-  page_size(static_cast<std::size_t>(this->cache.tensors(0).k.size(2))),
+  page_size(static_cast<std::size_t>(this->cache.tensors(0).k.size(1))),
   root(root),
   stop_ids(std::move(stop_ids)),
   prefill_tokens_per_step(prefill_tokens_per_step) {
@@ -391,8 +391,7 @@ scheduler::scheduler(
     std::vector<kv_layer> layers = model.kv_layers();
     assert(layers.size() == this->cache.layer_count());
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
-        const kv& tensors = this->cache.tensors(layer);
-        lines.push_back(kv{.k = tensors.k.select(0, 0), .v = tensors.v.select(0, 0)});
+        lines.push_back(this->cache.tensors(layer));
         sliding_windows.push_back(layers[layer].sliding_window);
         if (layers[layer].sliding_window) {
             window_pages = std::max(window_pages, ceil_div(*layers[layer].sliding_window - 1, page_size));
@@ -441,20 +440,17 @@ task<void> scheduler::submit(request r, result_writer writer) {
             writer.end(std::unexpected(request_error::cancelled));
             co_return;
         }
-        bool fits = true;
-        bool free = true;
+        std::vector<std::size_t> needed(cache.layer_count());
         for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
-            std::size_t needed = lines_needed(seq, layer);
-            fits = fits && needed <= cache.line_count(layer);
-            free = free && needed <= cache.free_line_count(layer);
+            needed[layer] = lines_needed(seq, layer);
         }
-        if (!fits) {
+        if (!cache.fits(needed)) {
             writer.end(std::unexpected(request_error::oom));
             co_return;
         }
         // Taking lines without enough free ones can fail after get took some, and releasing them wakes the other
         // waiters into the same failure.
-        if (!free) {
+        if (!cache.fits_free(needed)) {
             co_await next(released);
             continue;
         }
