@@ -10,6 +10,25 @@ States are kept in an LRU cache in pinned host memory
 (`--store_gib`, default 4 GiB),
 which `--persist` also saves to disk.
 
+## How it works
+
+PulsarLM is inspired by how short-term memory forgets.
+During inference, custom attention kernels
+accumulate the attention mass of each token page.
+At regular intervals, pages that received little attention
+are removed from the context,
+while the system prompt and the most recent pages are always kept.
+Forgotten information can be recovered
+by pairing PulsarLM with an agent harness that recalls memories.
+This keeps the context window bounded,
+reducing the hardware needed for very long sessions.
+
+Removing past tokens from the context breaks the prefix cache
+that most engines rely on.
+To work around this, PulsarLM stores snapshots of the context
+at regular intervals in an external store,
+and resumes a conversation from its latest snapshot.
+
 ## Quickstart
 
 ```sh
