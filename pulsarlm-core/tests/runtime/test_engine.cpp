@@ -3,6 +3,7 @@
 #include "pulsarlm/event_loop.hpp"
 #include "pulsarlm/kv_cache.hpp"
 #include "pulsarlm/model/interface.hpp"
+#include "pulsarlm/model/paged_forward.hpp"
 #include "pulsarlm/request_callbacks.hpp"
 #include "pulsarlm/scheduler.hpp"
 
@@ -75,7 +76,10 @@ class successor_model final : public pulsarlm::Model {
 
   private:
     static at::Tensor predict(const pulsarlm::GroupBatch& g) {
-        return at::one_hot((g.tokens + 1) % static_cast<std::int64_t>(vocab), vocab).to(at::kFloat);
+        return pulsarlm::logit_inputs(
+            at::one_hot((g.tokens + 1) % static_cast<std::int64_t>(vocab), vocab).to(at::kFloat),
+            g
+        );
     }
 };
 
@@ -183,9 +187,7 @@ TEST_CASE("a submitted request passes its tokens and its end state to its callba
 
     REQUIRE(recorded->tokens == token_list{4, 5, 6, 7});
     REQUIRE(recorded->end->has_value());
-    REQUIRE((
-        (*recorded->end)->page_hashes == pulsarlm::make_page_digests(root(), token_list{1, 2, 3, 4}, page_size)
-    ));
+    REQUIRE(((*recorded->end)->page_hashes == pulsarlm::make_page_digests(root(), token_list{1, 2, 3, 4}, page_size)));
     REQUIRE((*recorded->end)->tail == token_list{5, 6});
     REQUIRE(e.exception() == nullptr);
 }

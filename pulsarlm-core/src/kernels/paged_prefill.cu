@@ -9,7 +9,6 @@
 #include <c10/cuda/CUDAStream.h>
 
 #include <cstdint>
-#include <vector>
 
 // Paged-KV prefill attention: many query tokens per sequence, causal over the
 // sequence's view, for a ragged (varlen) batch. Sequence i's queries
@@ -60,25 +59,12 @@ rotate_view_keys_kernel(const attn::PagedAttnParams<scalar_t> p, int page_size, 
 }
 
 template <typename scalar_t, bool BF16> void launch_tc_prefill(const attn::PagedAttnBatch& b, cudaStream_t stream) {
-    // The work list on the host: each query tile is up to 16 query tokens of one
-    // sequence. Grid = ntiles * n_q_heads.
-    auto cu_cpu = b.cu_seqlens_q.to(at::kCPU);
-    const int32_t* cu = cu_cpu.data_ptr<int32_t>();
-    std::vector<int32_t> tile_seq, tile_qbase;
-    for (int64_t s = 0; s < b.num_seqs; ++s) {
-        for (int32_t qb = 0; qb < cu[s + 1] - cu[s]; qb += 16) {
-            tile_seq.push_back(static_cast<int32_t>(s));
-            tile_qbase.push_back(qb);
-        }
-    }
-    const int64_t ntiles = static_cast<int64_t>(tile_seq.size());
-    if (ntiles == 0) {
+    if (b.total_q == 0) {
         return;
     }
-    auto iopts = at::TensorOptions().dtype(at::kInt);
-    auto tile_seq_dev = at::from_blob(tile_seq.data(), {ntiles}, iopts).to(b.q.device());
-    auto tile_qbase_dev = at::from_blob(tile_qbase.data(), {ntiles}, iopts).to(b.q.device());
-    const int64_t grid = ntiles * b.n_q_heads;
+    // A sequence of n queries takes ceil(n / 16) query tiles, at most n / 16 + 1; the
+    // CTAs past the last tile exit.
+    const int64_t grid = (b.total_q / 16 + b.num_seqs) * b.n_q_heads;
 
     const auto params = b.params<scalar_t>();
     const int64_t view_pages = b.num_seqs * b.max_pages;
@@ -100,12 +86,7 @@ template <typename scalar_t, bool BF16> void launch_tc_prefill(const attn::Paged
             const auto kernel = attn::
                 attn_prefill_tc_kernel<scalar_t, BS, HD, BF16, NWARPS, KEY_PAGES, kTuning.prefill_ctas_per_sm>;
             attn::allow_shared_memory(kernel, smem);
-            kernel<<<static_cast<int>(grid), NWARPS * 32, smem, stream>>>(
-                params,
-                rotated_k.data_ptr<scalar_t>(),
-                tile_seq_dev.data_ptr<int32_t>(),
-                tile_qbase_dev.data_ptr<int32_t>()
-            );
+            kernel<<<static_cast<int>(grid), NWARPS * 32, smem, stream>>>(params, rotated_k.data_ptr<scalar_t>());
         });
     });
 }

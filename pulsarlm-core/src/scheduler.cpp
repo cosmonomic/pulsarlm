@@ -331,6 +331,8 @@ void batch::enqueue(Model& model, std::span<const kv> lines, cudaStream_t stream
     if (inputs.prefill) {
         on_device.prefill = to_device(*inputs.prefill, device);
         on_device.prefill->page_tables = page_tables(all.subspan(decode_count), lines.size());
+        const at::Tensor& cu_seqlens_q = on_device.prefill->cu_seqlens_q;
+        on_device.prefill->logit_rows = cu_seqlens_q.narrow(0, 1, cu_seqlens_q.size(0) - 1).to(at::kLong) - 1;
     }
     StepLogits logits = model.forward(on_device, lines);
     if (on_device.decode && on_device.decode->cu_view_pages.defined()) {
@@ -343,16 +345,12 @@ void batch::enqueue(Model& model, std::span<const kv> lines, cudaStream_t stream
     std::vector<at::Tensor> rows;
     std::vector<sampling_params> params;
     std::vector<at::Generator> generators;
-    std::int64_t prefill_rows = 0;
     for (std::size_t i = 0; i < entries.size(); i++) {
         const entry& e = entries[i];
-        std::int64_t row = static_cast<std::int64_t>(i);
-        if (i >= decode_count) {
-            prefill_rows += static_cast<std::int64_t>(e.token_count);
-            row = prefill_rows - 1;
-        }
         if (e.samples) {
-            rows.push_back((i < decode_count ? *logits.decode : *logits.prefill).select(0, row));
+            const bool decodes = i < decode_count;
+            const auto row = static_cast<std::int64_t>(decodes ? i : i - decode_count);
+            rows.push_back((decodes ? *logits.decode : *logits.prefill).select(0, row));
             params.push_back(e.seq->sampling);
             generators.push_back(e.seq->generator);
         }

@@ -289,7 +289,7 @@ at::Tensor Gemma4Model::group_forward(const GroupBatch& g, std::span<const kv> l
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
         x = block(x, layer, per_layer.defined() ? per_layer.select(1, layer) : at::Tensor(), g, lines);
     }
-    return head(x);
+    return head(logit_inputs(x, g));
 }
 
 StepLogits Gemma4Model::forward(const StepBatch& batch, std::span<const kv> lines) {

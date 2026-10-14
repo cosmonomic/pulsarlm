@@ -60,6 +60,8 @@ struct GroupBatch {
     // against each query's own attended key count, which only the attention op can
     // read. Engine-level, so one value serves every sequence in the group.
     double mass_length_gain = 0.0;
+    // int64 [n]: the rows whose logits the forward returns, in order. Undefined returns every row's.
+    at::Tensor logit_rows;
 
     bool is_prefill() const {
         return this->cu_seqlens_q.defined();

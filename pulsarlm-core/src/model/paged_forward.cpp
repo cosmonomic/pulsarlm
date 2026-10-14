@@ -106,6 +106,10 @@ at::Tensor paged_attention(
     return o;
 }
 
+at::Tensor logit_inputs(const at::Tensor& x, const GroupBatch& g) {
+    return g.logit_rows.defined() ? x.index_select(0, g.logit_rows) : x;
+}
+
 at::Tensor paged_group_forward(
     const at::Tensor& embed,
     const GroupBatch& g,
@@ -117,7 +121,7 @@ at::Tensor paged_group_forward(
     for (int64_t layer = 0; layer < n_layers; ++layer) {
         x = layer_fn(x, layer);
     }
-    return head_fn(x);
+    return head_fn(logit_inputs(x, g));
 }
 
 StepLogits paged_forward(const StepBatch& batch, const std::function<at::Tensor(const GroupBatch&)>& group_fn) {

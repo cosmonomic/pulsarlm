@@ -50,6 +50,9 @@ at::Tensor paged_attention(
     const at::Tensor& lse_capture = {}
 );
 
+// The rows of x whose logits g asks for.
+at::Tensor logit_inputs(const at::Tensor& x, const GroupBatch& g);
+
 // Forward skeleton for one group: embed lookup -> n_layers decoder blocks ->
 // head. layer_fn(x, layer) is the model-specific decoder block; head_fn(x) is the
 // model-specific final norm + lm_head.

@@ -41,12 +41,25 @@ template <typename scalar_t, int PAGE_SIZE, int HEAD_DIM, int KEY_PAGES> constex
         sizeof(float) * 16 * (key_tile + 1);
 }
 
+// Query tiles are 16 query tokens of one sequence, numbered in sequence order. Sets the
+// sequence and first local query of tile; false past the last tile.
+template <typename scalar_t>
+__device__ __forceinline__ bool query_tile(const PagedAttnParams<scalar_t>& p, int tile, int& s, int& qbase) {
+    for (s = 0; s < p.num_seqs; ++s) {
+        const int tiles = (p.cu_seqlens_q[s + 1] - p.cu_seqlens_q[s] + 15) / 16;
+        if (tile < tiles) {
+            qbase = tile * 16;
+            return true;
+        }
+        tile -= tiles;
+    }
+    return false;
+}
+
 template <typename scalar_t, int PAGE_SIZE, int HEAD_DIM, bool BF16, int NWARPS, int KEY_PAGES, int CTAS_PER_SM>
 __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kernel(
     const PagedAttnParams<scalar_t> p,
-    const scalar_t* __restrict__ rotated_k,  // [num_seqs * max_pages, page_size, n_kv_heads, head_dim]
-    const int32_t* __restrict__ tile_seq,  // [ntiles] seq owning each query-tile
-    const int32_t* __restrict__ tile_qbase  // [ntiles] local query start of tile
+    const scalar_t* __restrict__ rotated_k  // [num_seqs * max_pages, page_size, n_kv_heads, head_dim]
 ) {
     constexpr int KEY_TILE = PAGE_SIZE * KEY_PAGES;
     // sS row stride. A stride of exactly KEY_TILE puts every row of a column on one
@@ -70,15 +83,15 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
     const int sweep_row = tid / kSweepLanes;
     const int sweep_lane = tid % kSweepLanes;
     const int blk = blockIdx.x;
-    const int tile = blk / p.n_q_heads;
     const int h = blk % p.n_q_heads;
     const int g = h / p.group;
-
-    const int s = tile_seq[tile];
+    int s, qbase;
+    if (!query_tile(p, blk / p.n_q_heads, s, qbase)) {
+        return;
+    }
     // This sequence's EMA gain alpha and the retention 1 - alpha it implies.
     const float mass_decay = p.mass ? p.mass_decay[s] : 0.0f;
     const float retention = 1.0f - mass_decay;
-    const int qbase = tile_qbase[tile];
     const int q0 = p.cu_seqlens_q[s];
     const int seq_q = p.cu_seqlens_q[s + 1] - q0;
     const int ctx_len = p.seqlens_k[s];

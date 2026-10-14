@@ -2,6 +2,7 @@
 #include "pulsarlm/event_loop.hpp"
 #include "pulsarlm/kv_cache.hpp"
 #include "pulsarlm/model/interface.hpp"
+#include "pulsarlm/model/paged_forward.hpp"
 #include "pulsarlm/request_callbacks.hpp"
 #include "pulsarlm/scheduler.hpp"
 
@@ -240,7 +241,7 @@ class sum_model final : public pulsarlm::Model {
             }
             g.page_mass.copy_(page_mass);
         }
-        return logits.to(g.tokens.device());
+        return pulsarlm::logit_inputs(logits.to(g.tokens.device()), g);
     }
 };
 
