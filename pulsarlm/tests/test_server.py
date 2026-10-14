@@ -114,7 +114,7 @@ def load(
         page_size=PAGE_SIZE,
         kv_dtype=DTYPE,
         kv_cache_gib=n_lines * LINE_BYTES / 2**30,
-        staging_gib=4 * LINE_BYTES / 2**30,
+        store_gib=64 * LINE_BYTES / 2**30,
         device=DEVICE,
         stop_ids=stop_ids,
         prefill_tokens_per_step=64,
@@ -202,7 +202,10 @@ def test_a_follow_up_continues_from_a_stored_state(client):
 
     state = client.app.state.server_state
     prompt = encode(state, follow_up)
-    with state.store.lease(prompt, state.engine.page_digests(prompt)) as (_, covered):
+    with state.store.lease(prompt, state.engine.page_digests(prompt), request_id=0) as (
+        _,
+        covered,
+    ):
         assert covered >= 2 * PAGE_SIZE
     assert post(client, messages=follow_up, max_tokens=4).status_code == 200
 
@@ -220,7 +223,9 @@ def test_a_reply_ending_at_any_stop_token_leaves_its_end_state_findable():
         ]
         state = app.state.server_state
         prompt = encode(state, follow_up)
-        with state.store.lease(prompt, state.engine.page_digests(prompt)) as (
+        with state.store.lease(
+            prompt, state.engine.page_digests(prompt), request_id=0
+        ) as (
             _,
             covered,
         ):

@@ -57,6 +57,7 @@ GroupBatch to_device(const GroupBatch& host, at::Device device) {
 
 sequence::sequence(request&& r, result_writer& writer, std::size_t n_kv_layers, at::Device device)
 : writer(writer),
+  id(r.id),
   sampling(r.sampling),
   seed(sampling_seed(r.sampling.seed)),
   max_tokens(r.max_tokens),
@@ -538,6 +539,7 @@ task<void> scheduler::launch(batch& b) {
 // that last read the lines of pages that left a window has completed, so they are released right after the sync.
 task<void> scheduler::write_back(batch& b) {
     std::vector<digest> new_hashes;
+    std::vector<std::uint64_t> new_owners;
     std::vector<std::vector<std::uint32_t>> new_lines(cache.layer_count());
     std::vector<sequence*> putting;
     const std::int64_t* next_sampled = b.sampled.defined() ? b.sampled.const_data_ptr<std::int64_t>() : nullptr;
@@ -547,6 +549,7 @@ task<void> scheduler::write_back(batch& b) {
         seq.advance(e.token_count, page_size, root);
         if (seq.page_hashes.size() > first_new_page) {
             new_hashes.insert(new_hashes.end(), seq.page_hashes.begin() + first_new_page, seq.page_hashes.end());
+            new_owners.resize(new_hashes.size(), seq.id);
             for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
                 new_lines[layer].insert(
                     new_lines[layer].end(),
@@ -570,7 +573,7 @@ task<void> scheduler::write_back(batch& b) {
     }
 
     if (!new_hashes.empty()) {
-        std::expected<void, page_error> synced = co_await cache.sync(new_hashes, new_lines, stream);
+        std::expected<void, page_error> synced = co_await cache.sync(new_hashes, new_owners, new_lines, stream);
         if (!synced) {
             for (sequence* seq : putting) {
                 seq->exited = exit_reason::oom;

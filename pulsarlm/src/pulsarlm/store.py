@@ -1,15 +1,13 @@
 """The page store and state cache of one server, in host RAM and optionally a file."""
 
-import math
 import threading
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from concurrent.futures import Future
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import count
 from pathlib import Path
-
 
 from pulsarlm.core.engine import State
 from pulsarlm.store_file import Page, StateKey, StoreFile
@@ -34,9 +32,7 @@ def page_bytes(page: Page) -> int:
 class StoredPage:
     page: Page | None
     nbytes: int
-    last_put: int
     references: int = 0
-    pins: int = 0
 
 
 @dataclass
@@ -45,23 +41,34 @@ class StoredState:
     page_keys: list[bytes]
 
 
+@dataclass
+class RunningRequest:
+    """What a running request references: the pages of its newest snapshot, the
+    state it resumed or last wrote, which its next state builds on, and the pages
+    each of its puts brought that no state it wrote covers yet."""
+
+    snapshot_keys: list[bytes]
+    puts: list[list[bytes]] = field(default_factory=list)
+
+
 class LocalStore:
     """The engine's page store and an LRU of states over its pages.
 
     fetch and put run on the engine's loop thread, the rest on the server's, so a
-    lock guards everything. A page is deleted once no stored state references it,
-    no lease pins it, and every lease open when it was last put has closed: a
-    request references the pages it puts only once its state arrives. While the
-    pages take more than capacity_bytes, the least recently used states are
-    dropped, down to the newest one; pages that cannot be deleted yet can keep
-    the store above its capacity.
+    lock guards everything. A page is deleted once neither a stored state nor a
+    running request references it. A running request references the pages of its
+    newest snapshot, which the LRU may drop from the stored states, and the pages
+    its puts own until a state it writes covers their step. While the pages take
+    more than capacity_bytes, the least recently used states are dropped, down to
+    the newest one; pages running requests reference can keep the store above its
+    capacity.
 
     With a path, the file holds a copy of every page and state, read at
     construction; a page only in the file is read into RAM when fetched.
     """
 
     def __init__(
-        self, page_size: int, capacity_bytes: int = 16 * 2**30, path: Path | None = None
+        self, page_size: int, capacity_bytes: int = 4 * 2**30, path: Path | None = None
     ) -> None:
         self._lock = threading.Lock()
         self._page_size = page_size
@@ -71,9 +78,8 @@ class LocalStore:
         self._states: OrderedDict[StateKey, StoredState] = OrderedDict()
         self._tails: dict[bytes, set[tuple[int, ...]]] = {}
         self._unreferenced: set[bytes] = set()
+        self._running: dict[int, RunningRequest] = {}
         self._clock = count()
-        # Insertion order is opening order, so the first is the oldest open lease.
-        self._open_leases: dict[int, None] = {}
         self._file = None if path is None else StoreFile(path)
         if self._file is not None:
             self._load(self._file)
@@ -81,8 +87,7 @@ class LocalStore:
     def _load(self, file: StoreFile) -> None:
         sizes, saved = file.load()
         for h, nbytes in sizes.items():
-            # Older than every lease, so a page no state references is deleted.
-            self._pages[h] = StoredPage(None, nbytes, last_put=-1)
+            self._pages[h] = StoredPage(None, nbytes)
             self._page_bytes += nbytes
         self._unreferenced.update(sizes)
         incomplete = []
@@ -133,60 +138,84 @@ class LocalStore:
         self._file.read([hashes[i] for i in in_file]).add_done_callback(keep)
         return future
 
-    def put(self, hashes: list[bytes], pages: list[Page]) -> None:
+    def put(
+        self,
+        hashes: list[bytes],
+        pages: list[Page],
+        owners: Sequence[tuple[int, int]] = (),
+    ) -> None:
+        """owners pairs a request id with the index of a page its step produced. The
+        store then fits with room for another put of these pages' size: the engine
+        takes a step's host pages from memory the store's capacity bounds before
+        it puts them."""
         with self._lock:
-            now = next(self._clock)
             new = []
             for h, page in zip(hashes, pages, strict=True):
-                if (stored := self._pages.get(h)) is not None:
-                    stored.last_put = now
-                else:
+                if h not in self._pages:
                     nbytes = page_bytes(page)
-                    self._pages[h] = StoredPage(page, nbytes, now)
+                    self._pages[h] = StoredPage(page, nbytes)
                     self._page_bytes += nbytes
                     self._unreferenced.add(h)
                     new.append((h, page, nbytes))
+            owned: dict[int, list[bytes]] = {}
+            for request_id, index in owners:
+                if request_id in self._running:
+                    owned.setdefault(request_id, []).append(hashes[index])
+            for request_id, keys in owned.items():
+                for h in keys:
+                    self._reference(h)
+                self._running[request_id].puts.append(keys)
             if self._file is not None and new:
                 self._file.put(new)
+            self._fit(room=sum(page_bytes(page) for page in pages))
 
     @contextmanager
     def lease(
-        self, prompt: list[int], page_digests: list[bytes]
+        self, prompt: list[int], page_digests: list[bytes], *, request_id: int
     ) -> Iterator[tuple[State, int]]:
         """The newest stored state reaching a proper prefix of prompt, and how many
         of prompt's tokens it covers; an empty state and 0 when there is none.
-        page_digests are prompt's full page hashes. The state's pages stay pinned,
-        and pages put meanwhile stay, until the lease closes."""
+        page_digests are prompt's full page hashes. request_id, distinct among open
+        leases, names the request to put and write while the lease is open."""
         with self._lock:
             found, covered = self._find(prompt, page_digests)
-            opened = next(self._clock)
-            self._open_leases[opened] = None
             for h in found.page_keys:
-                self._pages[h].pins += 1
+                self._reference(h)
+            self._running[request_id] = RunningRequest(found.page_keys)
         try:
             yield found.state, covered
         finally:
             with self._lock:
-                del self._open_leases[opened]
-                for h in found.page_keys:
-                    self._pages[h].pins -= 1
+                running = self._running.pop(request_id)
+                self._dereference(running.snapshot_keys)
+                for keys in running.puts:
+                    self._dereference(keys)
                 self._fit()
 
-    def write(self, state: State, page_keys: list[bytes]) -> None:
+    def write(
+        self, state: State, page_keys: list[bytes], *, request_id: int | None = None
+    ) -> None:
         """Makes state findable. page_keys are the keys of the pages a request
         resuming from it reads, all in the store: the engine puts them before it
-        reports the state, and the writer's lease keeps them."""
+        reports the state, and the writing request references them until then."""
         key = state_key(state)
         with self._lock:
             for h in page_keys:
                 self._reference(h)
             if (replaced := self._states.pop(key, None)) is not None:
-                self._dereference_all(replaced)
+                self._dereference(replaced.page_keys)
             else:
                 self._tails.setdefault(key[0], set()).add(key[1])
             self._states[key] = StoredState(state, page_keys)
             if self._file is not None:
                 self._file.write(key, state, page_keys, next(self._clock))
+            if request_id is not None and request_id in self._running:
+                running = self._running[request_id]
+                for h in page_keys:
+                    self._reference(h)
+                self._dereference(running.snapshot_keys)
+                running.snapshot_keys = page_keys
+                self._release_covered(running, set(page_keys))
             self._fit()
 
     def __len__(self) -> int:
@@ -231,37 +260,46 @@ class LocalStore:
             self._unreferenced.discard(h)
         stored.references += 1
 
-    def _dereference_all(self, dropped: StoredState) -> None:
-        for h in dropped.page_keys:
+    def _dereference(self, keys: list[bytes]) -> None:
+        for h in keys:
             page = self._pages[h]
             page.references -= 1
             if page.references == 0:
                 self._unreferenced.add(h)
 
-    def _fit(self) -> None:
+    def _release_covered(self, running: RunningRequest, covered: set[bytes]) -> None:
+        """Releases the puts up to the last one holding a page of the written state:
+        its step, and every earlier one, are behind the state, as a request puts
+        its pages in step order and a state ends at a step's end."""
+        last = max(
+            (i for i, keys in enumerate(running.puts) if not covered.isdisjoint(keys)),
+            default=-1,
+        )
+        for keys in running.puts[: last + 1]:
+            self._dereference(keys)
+        del running.puts[: last + 1]
+
+    def _fit(self, room: int = 0) -> None:
+        """Drops the least recently used states, down to the newest one, until the
+        pages and room fit the capacity."""
         deleted_states: list[StateKey] = []
         deleted_pages = self._delete_unused_pages()
-        while self._page_bytes > self._capacity_bytes and len(self._states) > 1:
+        while self._page_bytes + room > self._capacity_bytes and len(self._states) > 1:
             key, dropped = self._states.popitem(last=False)
             last_page, tail = key
             tails = self._tails[last_page]
             tails.remove(tail)
             if not tails:
                 del self._tails[last_page]
-            self._dereference_all(dropped)
+            self._dereference(dropped.page_keys)
             deleted_states.append(key)
             deleted_pages += self._delete_unused_pages()
         if self._file is not None and (deleted_states or deleted_pages):
             self._file.delete(deleted_states, deleted_pages)
 
     def _delete_unused_pages(self) -> list[bytes]:
-        oldest_lease = next(iter(self._open_leases), math.inf)
-        unused = [
-            h
-            for h in self._unreferenced
-            if self._pages[h].pins == 0 and self._pages[h].last_put < oldest_lease
-        ]
+        unused = list(self._unreferenced)
         for h in unused:
             self._page_bytes -= self._pages.pop(h).nbytes
-        self._unreferenced.difference_update(unused)
+        self._unreferenced.clear()
         return unused

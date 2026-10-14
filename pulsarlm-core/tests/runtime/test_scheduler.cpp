@@ -86,6 +86,7 @@ struct store_contents {
     std::unordered_map<digest, page, digest_hash> pages;
     std::vector<std::vector<digest>> fetches;
     std::size_t puts = 0;
+    std::vector<std::pair<std::uint64_t, digest>> owners;
 };
 
 struct memory_store final : pulsarlm::page_store {
@@ -103,8 +104,11 @@ struct memory_store final : pulsarlm::page_store {
         co_return found;
     }
 
-    void put(std::vector<digest>&& keys, std::vector<page>&& pages) override {
+    void put(std::vector<digest>&& keys, std::vector<page>&& pages, std::vector<pulsarlm::page_owner>&& owners) override {
         contents->puts++;
+        for (const pulsarlm::page_owner& owner : owners) {
+            contents->owners.emplace_back(owner.request, keys[owner.page]);
+        }
         for (std::size_t i = 0; i < keys.size(); i++) {
             contents->pages.insert_or_assign(keys[i], std::move(pages[i]));
         }
@@ -278,13 +282,13 @@ pulsarlm::kv_cache make_cache(
     pulsarlm::page_store& store
 ) {
     std::vector<pulsarlm::page_shape> shapes = page_shapes(layers);
-    std::size_t staging_bytes = 0;
+    std::size_t host_page_bytes = 0;
     std::size_t lines_bytes = 0;
     for (const pulsarlm::page_shape& shape : shapes) {
-        staging_bytes = std::max(staging_bytes, 2 * pulsarlm::line_bytes(shape));
+        host_page_bytes += 64 * pulsarlm::line_bytes(shape);
         lines_bytes += n_lines * pulsarlm::line_bytes(shape);
     }
-    return pulsarlm::kv_cache(shapes, pool_bytes.value_or(lines_bytes), staging_bytes, at::Device(at::kCUDA, 0), store);
+    return pulsarlm::kv_cache(shapes, pool_bytes.value_or(lines_bytes), host_page_bytes, at::Device(at::kCUDA, 0), store);
 }
 
 struct fixture {
@@ -477,6 +481,18 @@ TEST_CASE("a step's new pages of every KV layer reach the store in one put") {
     REQUIRE(f.model.forward_count == 1);
     REQUIRE(f.store->puts == 1);
     REQUIRE(f.store->pages.size() == 4);
+}
+
+TEST_CASE("the pages a request's steps put are owned by its id") {
+    fixture f(16);
+    token_list prompt{1, 2, 3, 4, 5, 6, 7, 8};
+    serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 1, .id = 5}});
+
+    REQUIRE(f.store->owners.size() == f.store->pages.size());
+    for (const auto& [owner, key] : f.store->owners) {
+        REQUIRE(owner == 5);
+        REQUIRE(f.store->pages.contains(key));
+    }
 }
 
 TEST_CASE("a request continues from the end state of another in the same cache") {

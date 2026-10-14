@@ -18,7 +18,9 @@ class PageStore(Protocol):
     """
 
     def fetch(self, hashes: list[bytes]) -> Future[list[Page | None]]: ...
-    def put(self, hashes: list[bytes], pages: list[Page]) -> None: ...
+    def put(
+        self, hashes: list[bytes], pages: list[Page], owners: list[tuple[int, int]]
+    ) -> None: ...
 
 class State:
     """The ordered page hashes of a view, each 16 bytes, then the tokens of its
@@ -172,7 +174,7 @@ class Engine:
         page_size: int,
         kv_dtype: torch.dtype,
         kv_cache_gib: float = 4.0,
-        staging_gib: float,
+        store_gib: float,
         device: torch.device,
         stop_ids: list[int],
         prefill_tokens_per_step: int,
@@ -185,8 +187,10 @@ class Engine:
         sampling: SamplingParams = ...,
         max_tokens: int | None = None,
         eviction: EvictionPolicy = ...,
+        request_id: int = 0,
     ) -> Request:
-        """Raises ValueError for a request the engine cannot serve."""
+        """Raises ValueError for a request the engine cannot serve. The pages the
+        request's steps put reach the store owned by request_id."""
     def page_digests(self, tokens: list[int]) -> list[bytes]:
         """The hashes of the full pages of a token history from its start: the page
         hashes a state reaching that history ends with."""

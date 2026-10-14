@@ -53,7 +53,7 @@ struct stalling_store final : pulsarlm::page_store {
         co_return {};
     }
 
-    void put(std::vector<digest>&&, std::vector<page>&&) override {}
+    void put(std::vector<digest>&&, std::vector<page>&&, std::vector<pulsarlm::page_owner>&&) override {}
 };
 
 // Predicts each token's successor, mod vocab.
@@ -145,7 +145,7 @@ pulsarlm::engine_config config(std::size_t n_lines) {
         .page_size = page_size,
         .kv_dtype = at::kFloat,
         .kv_cache_bytes = n_lines * line_bytes,
-        .staging_bytes = 2 * line_bytes,
+        .host_page_bytes = 64 * line_bytes,
         .device = at::Device(at::kCUDA, 0),
         .stop_ids = {},
         .vocab_size = vocab,
@@ -164,15 +164,6 @@ digest root() {
 TEST_CASE("an engine whose KV cache holds no line is rejected") {
     pulsarlm::engine_config sized = config(16);
     sized.kv_cache_bytes = pulsarlm::line_bytes(pulsarlm::page_shapes(sized, one_layer)[0]) - 1;
-    REQUIRE_THROWS_AS(
-        pulsarlm::engine(std::make_unique<successor_model>(), sized, std::make_unique<stalling_store>()),
-        std::invalid_argument
-    );
-}
-
-TEST_CASE("an engine whose staging buffer holds no page is rejected") {
-    pulsarlm::engine_config sized = config(16);
-    sized.staging_bytes = pulsarlm::line_bytes(pulsarlm::page_shapes(sized, one_layer)[0]) - 1;
     REQUIRE_THROWS_AS(
         pulsarlm::engine(std::make_unique<successor_model>(), sized, std::make_unique<stalling_store>()),
         std::invalid_argument

@@ -95,7 +95,7 @@ def make_engine(store: LocalStore) -> AsyncEngine:
             page_size=PAGE_SIZE,
             kv_dtype=DTYPE,
             kv_cache_gib=64 * LINE_BYTES / 2**30,
-            staging_gib=4 * LINE_BYTES / 2**30,
+            store_gib=64 * LINE_BYTES / 2**30,
             device=DEVICE,
             stop_ids=[],
             prefill_tokens_per_step=64,
@@ -118,7 +118,7 @@ async def collect(
 
 
 def covered_by_lookup(engine: AsyncEngine, store: LocalStore, prompt: list[int]) -> int:
-    with store.lease(prompt, engine.page_digests(prompt)) as (_, covered):
+    with store.lease(prompt, engine.page_digests(prompt), request_id=0) as (_, covered):
         return covered
 
 
@@ -162,7 +162,10 @@ def test_another_engine_fetches_the_state_pages_from_the_store():
         follow_up = PROMPT + reply + [11]
 
         second = make_engine(store)
-        with store.lease(follow_up, second.page_digests(follow_up)) as (state, _):
+        with store.lease(follow_up, second.page_digests(follow_up), request_id=0) as (
+            state,
+            _,
+        ):
             assert len(state.page_hashes) == 2
             keys = second.page_keys(state)
         assert len(await collect(second, store, follow_up)) == 8

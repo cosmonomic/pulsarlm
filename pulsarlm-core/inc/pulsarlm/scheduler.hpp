@@ -24,13 +24,14 @@
 namespace pulsarlm {
 
 // The tail of initial_state is forwarded again, then tokens; together they hold at least one token. Without
-// max_tokens, the request samples until one of the engine's stop tokens.
+// max_tokens, the request samples until one of the engine's stop tokens. The pages its steps put are owned by id.
 struct request {
     state initial_state;
     std::vector<std::int64_t> tokens;
     sampling_params sampling;
     std::optional<std::size_t> max_tokens;
     eviction_policy eviction;
+    std::uint64_t id = 0;
 };
 
 class scheduler;
@@ -43,6 +44,7 @@ class sequence {
     static constexpr std::uint32_t no_line = std::numeric_limits<std::uint32_t>::max();
 
     result_writer& writer;
+    std::uint64_t id;
     sampling_params sampling;
     std::uint64_t seed;
     // Tokens sampled so far, each with its own draw of the seed's noise.

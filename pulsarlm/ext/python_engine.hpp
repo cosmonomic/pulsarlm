@@ -79,7 +79,8 @@ class python_engine {
         std::vector<std::int64_t>&& tokens,
         const sampling_params& sampling,
         std::optional<std::size_t> max_tokens,
-        const eviction_policy& eviction
+        const eviction_policy& eviction,
+        std::uint64_t request_id
     );
     std::vector<digest> page_digests(const std::vector<std::int64_t>& tokens) const;
     std::vector<digest> page_keys(const state& s) const;

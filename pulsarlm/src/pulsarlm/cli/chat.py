@@ -57,7 +57,7 @@ def new_chat(
         page_size=PAGE_SIZE,
         kv_dtype=getattr(torch, settings.dtype),
         kv_cache_gib=settings.kv_cache_gib,
-        staging_gib=settings.staging_gib,
+        store_gib=settings.store_gib,
         device=torch.device(settings.device),
         stop_ids=stops,
         prefill_tokens_per_step=settings.prefill_tokens_per_step,

@@ -54,22 +54,6 @@ void check_kv_cache(const engine_config& config, std::span<const page_shape> sha
     }
 }
 
-void check_staging(const engine_config& config, std::span<const page_shape> shapes) {
-    for (std::size_t layer = 0; layer < shapes.size(); layer++) {
-        std::size_t bytes = line_bytes(shapes[layer]);
-        if (config.staging_bytes < bytes) {
-            throw std::invalid_argument(
-                std::format(
-                    "a staging buffer of {} bytes holds no page of KV layer {}; a page takes {} bytes",
-                    config.staging_bytes,
-                    layer,
-                    bytes
-                )
-            );
-        }
-    }
-}
-
 void check_attention(const engine_config& config, std::span<const kv_layer> layers) {
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
         std::optional<std::string> unsupported = attention_unsupported_reason(
@@ -89,8 +73,7 @@ kv_cache make_cache(const engine_config& config, std::span<const kv_layer> layer
     check_attention(config, layers);
     std::vector<page_shape> shapes = page_shapes(config, layers);
     check_kv_cache(config, shapes);
-    check_staging(config, shapes);
-    return kv_cache(shapes, config.kv_cache_bytes, config.staging_bytes, config.device, store);
+    return kv_cache(shapes, config.kv_cache_bytes, config.host_page_bytes, config.device, store);
 }
 
 }  // namespace
@@ -171,7 +154,7 @@ engine::~engine() {
     loop_thread.join();
 }
 
-// The loop's frames hold staging buffers the stream may still use, so they are destroyed after it finishes. Their
+// The loop's frames hold host buffers the stream may still use, so they are destroyed after it finishes. Their
 // writers end their callbacks with loop_exited after loop_exception is set.
 void engine::run_loop(std::latch& started) {
     c10::cuda::CUDAGuard device_guard(device);

@@ -16,6 +16,7 @@
 
 #include "pulsarlm/digest.hpp"
 #include "pulsarlm/event_loop.hpp"
+#include "pulsarlm/host_page_pool.hpp"
 #include "pulsarlm/model/interface.hpp"
 
 namespace pulsarlm {
@@ -51,14 +52,21 @@ digest make_root_digest(std::string_view model, std::span<const page_shape> shap
 // little-endian bytes.
 digest store_key(const digest& page, std::size_t layer);
 
+// A request whose step produced pages[page] of a put.
+struct page_owner {
+    std::uint64_t request;
+    std::size_t page;
+};
+
 class page_store {
   public:
     virtual ~page_store() = default;
 
     // The pages in the order of hashes, nullopt for those it does not have.
     virtual task<std::vector<std::optional<page>>> fetch(std::span<const digest> hashes) = 0;
-    // Takes host pages and their hashes, matched by index, and returns without waiting for the write.
-    virtual void put(std::vector<digest>&& hashes, std::vector<page>&& pages) = 0;
+    // Takes host pages and their hashes, matched by index, and returns without waiting for the write. A page has an
+    // owner for every request that produced it.
+    virtual void put(std::vector<digest>&& hashes, std::vector<page>&& pages, std::vector<page_owner>&& owners) = 0;
 };
 
 enum class page_error { miss, oom };
@@ -119,12 +127,7 @@ class kv_cache {
     std::vector<size_class> classes;
     std::vector<cache_layer> layers;
     page_store* store;
-    // Pinned host bytes every transfer goes through, one page after another, each in its layer's page layout. One
-    // transfer holds it at a time.
-    at::Tensor staging;
-    bool staging_held = false;
-    // Set when the staging buffer is released.
-    std::unique_ptr<event> staging_released;
+    host_page_pool host_pages;
 
     std::size_t pool_bytes() const noexcept;
     cache_line& line(std::size_t layer, std::uint32_t line_id) noexcept;
@@ -138,27 +141,23 @@ class kv_cache {
     // free lines: a class takes its free lines first, then lines carved at the bump pointer.
     bool covers(std::span<const std::size_t> counts, std::vector<std::size_t>&& free_lines) const noexcept;
     std::vector<std::size_t> free_counts() const;
-    task<void> hold_staging();
-    void release_staging() noexcept;
-    // The byte offset of room in the staging buffer for a page of layer, laid out as a line, past its first used bytes,
-    // which then cover it too. nullopt when the page does not fit.
-    std::optional<std::size_t> staging_offset(std::size_t layer, std::size_t& used) const;
     std::size_t line_offset(std::size_t layer, std::uint32_t line_id) const noexcept;
-    // The transfers go through the staging buffer as many pages at a time as it holds, and complete once the stream has
-    // finished them.
+    // The transfers complete once the stream has finished them. Pages in the host pool copy in one launch; a page
+    // outside it is copied into a pool block first, and without one goes through a blocking cudaMemcpyAsync.
     task<void> copy_from_host(std::span<const layer_line> targets, std::span<const page> pages, cudaStream_t stream);
     task<void> copy_to_host(std::span<const layer_line> sources, std::span<page> pages, cudaStream_t stream);
-    // Pageable host pages laid out as lines, one for each line of sources. nullopt when host memory runs out.
-    std::optional<std::vector<page>> allocate_host_pages(std::span<const layer_line> sources) const;
+    // Host pages laid out as lines, one for each line of sources, in the host pool or, past its room, pageable.
+    // nullopt when host memory runs out.
+    std::optional<std::vector<page>> allocate_host_pages(std::span<const layer_line> sources);
     void release_all(std::span<const std::vector<std::uint32_t>> line_ids) noexcept;
 
   public:
-    // shapes holds one page shape per KV layer, each with n_layers 1 and one dtype for all. The pool takes pool_bytes,
-    // and staging_bytes holds a page of any layer. store outlives the cache.
+    // shapes holds one page shape per KV layer, each with n_layers 1 and one dtype for all. The pool takes pool_bytes.
+    // The host copies sync hands the store come from a host_page_pool of host_page_bytes. store outlives the cache.
     kv_cache(
         std::span<const page_shape> shapes,
         std::size_t pool_bytes,
-        std::size_t staging_bytes,
+        std::size_t host_page_bytes,
         at::Device device,
         page_store& store
     );
@@ -180,11 +179,13 @@ class kv_cache {
     std::expected<std::vector<std::uint32_t>, page_error>
     clone(std::size_t layer, std::uint32_t line_id, std::size_t count, cudaStream_t stream);
     // Names the full page at line_ids[layer][i], held and unmapped, by hashes[i] in every layer and hands a host copy
-    // of each distinct page to the store in one put, also when another line caches its hash: the store may have
+    // of each distinct page, owned by every owners[i] of its hash, to the store in one put, also when another line
+    // caches its hash: the store may have
     // dropped that page. A hash already cached at another line leaves its line unmapped. Completes once the copies are
     // handed to the store. Fails with oom, caching nothing, when host memory for the copies cannot be allocated.
     task<std::expected<void, page_error>> sync(
         const std::vector<digest>& hashes,
+        const std::vector<std::uint64_t>& owners,
         const std::vector<std::vector<std::uint32_t>>& line_ids,
         cudaStream_t stream
     );

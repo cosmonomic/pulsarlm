@@ -42,6 +42,7 @@ struct store_state {
     std::unordered_map<digest, page, digest_hash> pages;
     std::vector<std::vector<digest>> fetches;
     std::size_t puts = 0;
+    std::vector<std::pair<std::uint64_t, digest>> owners;
     bool gated = false;
     std::vector<external_task<>::resolver> gates;
 };
@@ -66,8 +67,11 @@ struct memory_store final : pulsarlm::page_store {
         co_return found;
     }
 
-    void put(std::vector<digest>&& keys, std::vector<page>&& pages) override {
+    void put(std::vector<digest>&& keys, std::vector<page>&& pages, std::vector<pulsarlm::page_owner>&& owners) override {
         state->puts++;
+        for (const pulsarlm::page_owner& owner : owners) {
+            state->owners.emplace_back(owner.request, keys[owner.page]);
+        }
         for (std::size_t i = 0; i < keys.size(); i++) {
             state->pages.insert_or_assign(keys[i], std::move(pages[i]));
         }
@@ -86,26 +90,24 @@ std::size_t lines_bytes(const std::vector<pulsarlm::page_shape>& shapes) {
     return bytes;
 }
 
+constexpr std::size_t host_bytes = std::size_t{1} << 16;
+
 struct cache_fixture {
     memory_store backing;
     std::shared_ptr<store_state> store;
     pulsarlm::kv_cache kv;
 
     // One layer of shape unless shapes gives one per layer. The pool has room for n_lines lines of every layer, and the
-    // staging buffer for staging_pages pages of shape.
+    // host pool takes host_page_bytes.
     explicit cache_fixture(
         std::size_t n_lines,
         memory_store backing_store = {},
-        std::size_t staging_pages = 2,
+        std::size_t host_page_bytes = host_bytes,
         const std::vector<pulsarlm::page_shape>& shapes = {shape}
     )
     : backing(std::move(backing_store)),
       store(backing.state),
-      kv(shapes,
-         n_lines * lines_bytes(shapes),
-         staging_pages * pulsarlm::line_bytes(shape),
-         at::Device(at::kCUDA, 0),
-         backing) {}
+      kv(shapes, n_lines * lines_bytes(shapes), host_page_bytes, at::Device(at::kCUDA, 0), backing) {}
 };
 
 digest hash_of(std::uint64_t n) {
@@ -165,7 +167,8 @@ task<lines_result> get_one_layer(pulsarlm::kv_cache& kv, std::vector<digest> has
 task<std::expected<void, page_error>>
 sync_one_layer(pulsarlm::kv_cache& kv, std::vector<digest> hashes, line_ids synced) {
     std::vector<line_ids> layer_lines{std::move(synced)};
-    std::expected<void, page_error> result = co_await kv.sync(hashes, layer_lines, compute_stream());
+    std::vector<std::uint64_t> owners(hashes.size(), 0);
+    std::expected<void, page_error> result = co_await kv.sync(hashes, owners, layer_lines, compute_stream());
     co_return result;
 }
 
@@ -429,8 +432,8 @@ TEST_CASE("syncing a hash already cached leaves the line unmapped and still stor
     release(fixture.kv, *got);
 }
 
-TEST_CASE("sync hands the store pageable copies, a staging buffer's worth at a time") {
-    cache_fixture fixture(4, {}, 1);
+TEST_CASE("sync copies pages into pinned blocks of the host pool") {
+    cache_fixture fixture(4);
     line_ids synced = allocate(fixture.kv, 3).value();
     for (std::size_t j = 0; j < synced.size(); j++) {
         fill_line(fixture.kv, synced[j], static_cast<float>(j + 1));
@@ -441,13 +444,13 @@ TEST_CASE("sync hands the store pageable copies, a staging buffer's worth at a t
         const page& stored = fixture.store->pages.at(key_of(n));
         REQUIRE(stored.k.eq(static_cast<float>(n)).all().item<bool>());
         REQUIRE(stored.v.eq(-static_cast<float>(n)).all().item<bool>());
-        REQUIRE(!stored.k.is_pinned());
+        REQUIRE(stored.k.is_pinned());
     }
     release(fixture.kv, synced);
 }
 
-TEST_CASE("get copies the fetched pages a staging buffer's worth at a time") {
-    cache_fixture fixture(4, {}, 1);
+TEST_CASE("get copies pages from outside the host pool into their lines") {
+    cache_fixture fixture(4);
     for (std::uint64_t n = 1; n <= 3; n++) {
         fixture.store->pages.emplace(key_of(n), host_page(static_cast<float>(n)));
     }
@@ -459,8 +462,8 @@ TEST_CASE("get copies the fetched pages a staging buffer's worth at a time") {
     release(fixture.kv, *got);
 }
 
-TEST_CASE("a get and a sync take turns on the staging buffer") {
-    cache_fixture fixture(6, {}, 1);
+TEST_CASE("a get and a sync run together") {
+    cache_fixture fixture(6);
     for (std::uint64_t n = 1; n <= 3; n++) {
         fixture.store->pages.emplace(key_of(n), host_page(static_cast<float>(n)));
     }
@@ -489,11 +492,39 @@ TEST_CASE("a get and a sync take turns on the staging buffer") {
     release(fixture.kv, synced);
 }
 
+TEST_CASE("pages past the host pool's room are pageable and still reach the store and come back") {
+    cache_fixture fixture(4, {}, 4096);
+    line_ids synced = allocate(fixture.kv, 3).value();
+    for (std::size_t j = 0; j < synced.size(); j++) {
+        fill_line(fixture.kv, synced[j], static_cast<float>(j + 1));
+    }
+    std::vector<digest> hashes{hash_of(1), hash_of(2), hash_of(3)};
+    REQUIRE(run_to_completion(sync_one_layer(fixture.kv, hashes, synced)).has_value());
+    REQUIRE(fixture.store->pages.at(key_of(1)).k.is_pinned());
+    REQUIRE(!fixture.store->pages.at(key_of(2)).k.is_pinned());
+    for (std::uint64_t n = 1; n <= 3; n++) {
+        REQUIRE(fixture.store->pages.at(key_of(n)).v.eq(-static_cast<float>(n)).all().item<bool>());
+    }
+    release(fixture.kv, synced);
+
+    line_ids evicting = allocate(fixture.kv, 4).value();
+    for (std::uint32_t line_id : evicting) {
+        fill_line(fixture.kv, line_id, 0.0f);
+    }
+    release(fixture.kv, evicting);
+    lines_result got = run_get(fixture.kv, hashes);
+    REQUIRE(got.has_value());
+    for (std::size_t j = 0; j < got->size(); j++) {
+        REQUIRE(line_filled_with(fixture.kv, (*got)[j], static_cast<float>(j + 1)));
+    }
+    release(fixture.kv, *got);
+}
+
 TEST_CASE("a values_only cache keeps and stores one tensor as both k and v") {
     pulsarlm::page_shape values_only = shape;
     values_only.values_only = true;
     REQUIRE(pulsarlm::line_bytes(values_only) * 2 == pulsarlm::line_bytes(shape));
-    cache_fixture fixture(2, {}, 2, {values_only});
+    cache_fixture fixture(2, {}, host_bytes, {values_only});
     REQUIRE(fixture.kv.tensors(0).k.is_same(fixture.kv.tensors(0).v));
 
     line_ids allocated = allocate(fixture.kv, 1).value();
@@ -520,12 +551,12 @@ TEST_CASE("each layer's page is stored under its own key") {
 }
 
 TEST_CASE("sync stores a page of every layer in one put") {
-    cache_fixture fixture(2, {}, 2, {shape, shape});
+    cache_fixture fixture(2, {}, host_bytes, {shape, shape});
     std::vector<line_ids> allocated = fixture.kv.allocate(1).value();
     fill_line(fixture.kv, allocated[0].front(), 1.0f, 0);
     fill_line(fixture.kv, allocated[1].front(), 2.0f, 1);
     std::vector<digest> hashes{hash_of(1)};
-    REQUIRE(run_to_completion(fixture.kv.sync(hashes, allocated, compute_stream())).has_value());
+    REQUIRE(run_to_completion(fixture.kv.sync(hashes, std::vector<std::uint64_t>(hashes.size(), 0), allocated, compute_stream())).has_value());
 
     REQUIRE(fixture.store->puts == 1);
     REQUIRE(fixture.store->pages.at(key_of(1, 0)).k.eq(1.0f).all().item<bool>());
@@ -534,8 +565,25 @@ TEST_CASE("sync stores a page of every layer in one put") {
     fixture.kv.release(1, allocated[1]);
 }
 
+TEST_CASE("sync owns a page by every request whose hash it is, in every layer") {
+    cache_fixture fixture(4, {}, host_bytes, {shape, shape});
+    std::vector<line_ids> allocated = fixture.kv.allocate(3).value();
+    std::vector<digest> hashes{hash_of(1), hash_of(2), hash_of(1)};
+    std::vector<std::uint64_t> owners{7, 7, 9};
+    REQUIRE(run_to_completion(fixture.kv.sync(hashes, owners, allocated, compute_stream())).has_value());
+
+    REQUIRE(fixture.store->puts == 1);
+    REQUIRE(fixture.store->pages.size() == 4);
+    std::vector<std::pair<std::uint64_t, digest>> expected{
+        {7, key_of(1, 0)}, {7, key_of(2, 0)}, {9, key_of(1, 0)}, {7, key_of(1, 1)}, {7, key_of(2, 1)}, {9, key_of(1, 1)}
+    };
+    REQUIRE((fixture.store->owners == expected));
+    fixture.kv.release(0, allocated[0]);
+    fixture.kv.release(1, allocated[1]);
+}
+
 TEST_CASE("get fetches the pages of every layer in one fetch") {
-    cache_fixture fixture(2, {}, 2, {shape, shape});
+    cache_fixture fixture(2, {}, host_bytes, {shape, shape});
     fixture.store->pages.emplace(key_of(1, 0), host_page(1.0f));
     fixture.store->pages.emplace(key_of(2, 0), host_page(2.0f));
     fixture.store->pages.emplace(key_of(2, 1), host_page(3.0f));
@@ -554,7 +602,7 @@ TEST_CASE("get fetches the pages of every layer in one fetch") {
 }
 
 TEST_CASE("a page missing in one layer fails the get with miss holding nothing in any layer") {
-    cache_fixture fixture(2, {}, 2, {shape, shape});
+    cache_fixture fixture(2, {}, host_bytes, {shape, shape});
     fixture.store->pages.emplace(key_of(1, 0), host_page(1.0f));
     std::vector<digest> page_hashes{hash_of(1)};
     std::vector<std::span<const digest>> hashes{page_hashes, page_hashes};
@@ -575,7 +623,7 @@ TEST_CASE("a line holds each head's K then V together") {
 }
 
 TEST_CASE("allocate fails with oom holding nothing when the layers together run out") {
-    cache_fixture fixture(2, {}, 2, {shape, shape});
+    cache_fixture fixture(2, {}, host_bytes, {shape, shape});
     REQUIRE((fixture.kv.allocate(3) == layer_lines_result(std::unexpected(page_error::oom))));
     REQUIRE(fixture.kv.free_count() == 2);
     std::vector<line_ids> held = fixture.kv.allocate(2).value();
@@ -585,7 +633,7 @@ TEST_CASE("allocate fails with oom holding nothing when the layers together run 
 }
 
 TEST_CASE("a line one layer frees serves another layer of its size and drops the first layer's page") {
-    cache_fixture fixture(1, {}, 2, {shape, shape});
+    cache_fixture fixture(1, {}, host_bytes, {shape, shape});
     fixture.store->pages.emplace(key_of(1, 0), host_page(1.0f));
     fixture.store->pages.emplace(key_of(2, 1), host_page(2.0f));
     std::vector<digest> first{hash_of(1)};
@@ -615,7 +663,7 @@ TEST_CASE("lines of one size are not reused for another size") {
     pulsarlm::kv_cache kv(
         std::vector<pulsarlm::page_shape>{shape, wide},
         2 * pulsarlm::line_bytes(wide),
-        pulsarlm::line_bytes(wide),
+        host_bytes,
         at::Device(at::kCUDA, 0),
         backing
     );
@@ -659,17 +707,17 @@ TEST_CASE("one call carves lines of several sizes at the bump pointer") {
     aligned.release(1, held[1]);
 }
 
-TEST_CASE("the staging buffer carries pages of layers with different shapes") {
+TEST_CASE("the host pool carries pages of layers with different shapes") {
     pulsarlm::page_shape values_only = shape;
     values_only.values_only = true;
-    cache_fixture fixture(4, {}, 1, {values_only, shape});
+    cache_fixture fixture(4, {}, host_bytes, {values_only, shape});
     std::vector<line_ids> allocated = fixture.kv.allocate(2).value();
     for (std::size_t j = 0; j < 2; j++) {
         fixture.kv.tensors(0).v.select(0, allocated[0][j]).fill_(static_cast<float>(j + 1));
         fill_line(fixture.kv, allocated[1][j], static_cast<float>(j + 3), 1);
     }
     std::vector<digest> hashes{hash_of(1), hash_of(2)};
-    REQUIRE(run_to_completion(fixture.kv.sync(hashes, allocated, compute_stream())).has_value());
+    REQUIRE(run_to_completion(fixture.kv.sync(hashes, std::vector<std::uint64_t>(hashes.size(), 0), allocated, compute_stream())).has_value());
     for (std::size_t layer = 0; layer < 2; layer++) {
         fixture.kv.release(layer, allocated[layer]);
     }

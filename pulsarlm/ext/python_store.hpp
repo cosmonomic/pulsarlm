@@ -14,8 +14,8 @@ namespace pulsarlm {
 
 // A page_store backed by a Python object with two methods, called on the loop thread with the GIL held:
 //   fetch(hashes: list[bytes]) -> concurrent.futures.Future[list[tuple[Tensor, Tensor] | None]]
-//   put(hashes: list[bytes], pages: list[tuple[Tensor, Tensor]]) -> None
-// A page is its (k, v) host tensors. Both return without waiting for the store. A fetch whose call raises, or whose
+//   put(hashes: list[bytes], pages: list[tuple[Tensor, Tensor]], owners: list[tuple[int, int]]) -> None
+// A page is its (k, v) host tensors; an owner is a (request id, index into pages) pair. Both return without waiting for the store. A fetch whose call raises, or whose
 // future fails, is cancelled, is dropped unfinished or yields a malformed result, misses every page it asked for. An
 // exception raised by put is reported through sys.unraisablehook.
 class python_store final : public page_store {
@@ -31,7 +31,7 @@ class python_store final : public page_store {
     ~python_store() override;
 
     task<std::vector<std::optional<page>>> fetch(std::span<const digest> hashes) override;
-    void put(std::vector<digest>&& hashes, std::vector<page>&& pages) override;
+    void put(std::vector<digest>&& hashes, std::vector<page>&& pages, std::vector<page_owner>&& owners) override;
 };
 
 }  // namespace pulsarlm

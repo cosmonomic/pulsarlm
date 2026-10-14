@@ -58,20 +58,20 @@ std::unique_ptr<python_engine> make_engine(
     std::size_t page_size,
     at::ScalarType kv_dtype,
     double kv_cache_gib,
-    double staging_gib,
+    double store_gib,
     at::Device device,
     std::vector<std::int64_t> stop_ids,
     std::size_t prefill_tokens_per_step
 ) {
-    if (!(kv_cache_gib > 0.0) || !(staging_gib > 0.0)) {
-        throw std::invalid_argument("kv_cache_gib and staging_gib must be positive");
+    if (!(kv_cache_gib > 0.0) || !(store_gib >= 0.0)) {
+        throw std::invalid_argument("kv_cache_gib must be positive and store_gib not negative");
     }
     engine_config config{
         model_name,
         page_size,
         kv_dtype,
         static_cast<std::size_t>(kv_cache_gib * (1ull << 30)),
-        static_cast<std::size_t>(staging_gib * (1ull << 30)),
+        static_cast<std::size_t>(store_gib * (1ull << 30)),
         device,
         std::move(stop_ids),
         vocab_size(model),
@@ -336,7 +336,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "page_size"_a,
             "kv_dtype"_a,
             "kv_cache_gib"_a = 4.0,
-            "staging_gib"_a,
+            "store_gib"_a,
             "device"_a,
             "stop_ids"_a,
             "prefill_tokens_per_step"_a
@@ -349,7 +349,8 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             py::kw_only(),
             "sampling"_a = sampling_params{},
             "max_tokens"_a = py::none(),
-            "eviction"_a = eviction_policy{}
+            "eviction"_a = eviction_policy{},
+            "request_id"_a = 0
         )
         .def(
             "page_digests",

@@ -65,6 +65,7 @@ class AsyncEngine:
         sampling: SamplingParams,
         max_tokens: int | None,
         eviction: EvictionPolicy,
+        request_id: int,
     ) -> RequestStream:
         """Raises EngineStopped when the engine's loop exited, ValueError for a
         request the engine cannot serve."""
@@ -76,6 +77,7 @@ class AsyncEngine:
             sampling=sampling,
             max_tokens=max_tokens,
             eviction=eviction,
+            request_id=request_id,
         )
         stream = RequestStream(self._engine, request)
         self._streams.add(stream)

@@ -105,10 +105,14 @@ void python_store::start_fetch(std::span<const digest> hashes, external_task<fet
     }
 }
 
-void python_store::put(std::vector<digest>&& hashes, std::vector<page>&& pages) {
+void python_store::put(std::vector<digest>&& hashes, std::vector<page>&& pages, std::vector<page_owner>&& owners) {
     py::gil_scoped_acquire gil;
     try {
-        hooks.attr("put")(to_bytes_list(hashes), pages_to_python(std::move(pages)));
+        py::list owner_list(owners.size());
+        for (std::size_t i = 0; i < owners.size(); i++) {
+            owner_list[i] = py::make_tuple(owners[i].request, owners[i].page);
+        }
+        hooks.attr("put")(to_bytes_list(hashes), pages_to_python(std::move(pages)), owner_list);
     } catch (py::error_already_set& e) {
         e.discard_as_unraisable("pulsarlm page store put");
     }

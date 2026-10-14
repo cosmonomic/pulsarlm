@@ -86,7 +86,7 @@ class MemoryStore:
     async def lookup(self, hashes: list[bytes]) -> list:
         return [self.pages.get(h) for h in hashes]
 
-    def put(self, hashes: list[bytes], pages: list) -> None:
+    def put(self, hashes: list[bytes], pages: list, owners: list) -> None:
         self.pages |= zip(hashes, pages)
 
 
@@ -104,7 +104,7 @@ def make_engine(store: MemoryStore) -> Engine:
         page_size=PAGE_SIZE,
         kv_dtype=DTYPE,
         kv_cache_gib=64 * LINE_BYTES / 2**30,
-        staging_gib=4 * LINE_BYTES / 2**30,
+        store_gib=0,
         device=DEVICE,
         stop_ids=[],
         prefill_tokens_per_step=64,
@@ -235,15 +235,15 @@ def test_submit_rejects_a_token_outside_the_vocabulary():
 
 
 @pytest.mark.parametrize(
-    ("kv_cache_gib", "staging_gib", "message"),
+    ("kv_cache_gib", "store_gib", "message"),
     [
-        (0.0, LINE_BYTES / 2**30, "must be positive"),
-        (LINE_BYTES / 2 / 2**30, LINE_BYTES / 2**30, "holds no line"),
-        (LINE_BYTES / 2**30, LINE_BYTES / N_LAYERS / 2 / 2**30, "holds no page"),
+        (0.0, 0.0, "must be positive"),
+        (LINE_BYTES / 2 / 2**30, 0.0, "holds no line"),
+        (LINE_BYTES / 2**30, -1.0, "not negative"),
     ],
 )
-def test_a_cache_or_staging_buffer_without_a_page_is_rejected(
-    kv_cache_gib: float, staging_gib: float, message: str
+def test_a_cache_without_a_line_or_a_negative_store_is_rejected(
+    kv_cache_gib: float, store_gib: float, message: str
 ):
     with pytest.raises(ValueError, match=message):
         Engine(
@@ -254,7 +254,7 @@ def test_a_cache_or_staging_buffer_without_a_page_is_rejected(
             page_size=PAGE_SIZE,
             kv_dtype=DTYPE,
             kv_cache_gib=kv_cache_gib,
-            staging_gib=staging_gib,
+            store_gib=store_gib,
             device=DEVICE,
             stop_ids=[],
             prefill_tokens_per_step=64,

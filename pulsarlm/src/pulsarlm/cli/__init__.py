@@ -71,14 +71,6 @@ def serve(
             "--kv_cache_gib", help="KV cache size in GiB.", rich_help_panel="Memory"
         ),
     ] = 4.0,
-    staging_gib: Annotated[
-        float,
-        typer.Option(
-            "--staging_gib",
-            help="Pinned host buffer for transfers between the KV cache and the store, in GiB.",
-            rich_help_panel="Memory",
-        ),
-    ] = 0.25,
     prefill_tokens_per_step: Annotated[
         int,
         typer.Option(
@@ -91,10 +83,10 @@ def serve(
         float,
         typer.Option(
             "--store_gib",
-            help="Pages the store keeps, in GiB.",
+            help="Pinned host memory the store keeps pages in, in GiB.",
             rich_help_panel="Memory",
         ),
-    ] = 16.0,
+    ] = 4.0,
     persist: Annotated[
         bool,
         typer.Option(
@@ -147,7 +139,6 @@ def serve(
                 device=device,
                 dtype=dtype,
                 kv_cache_gib=kv_cache_gib,
-                staging_gib=staging_gib,
                 prefill_tokens_per_step=prefill_tokens_per_step,
                 store_gib=store_gib,
                 persist=persist,
@@ -222,14 +213,6 @@ def chat(
             "--kv_cache_gib", help="KV cache size in GiB.", rich_help_panel="Memory"
         ),
     ] = 4.0,
-    staging_gib: Annotated[
-        float,
-        typer.Option(
-            "--staging_gib",
-            help="Pinned host buffer for transfers between the KV cache and the store, in GiB.",
-            rich_help_panel="Memory",
-        ),
-    ] = 0.25,
     prefill_tokens_per_step: Annotated[
         int,
         typer.Option(
@@ -242,10 +225,10 @@ def chat(
         float,
         typer.Option(
             "--store_gib",
-            help="Pages the store keeps, in GiB.",
+            help="Pinned host memory the store keeps pages in, in GiB.",
             rich_help_panel="Memory",
         ),
-    ] = 16.0,
+    ] = 4.0,
     persist: Annotated[
         bool,
         typer.Option(
@@ -298,7 +281,6 @@ def chat(
                 device=device,
                 dtype=dtype,
                 kv_cache_gib=kv_cache_gib,
-                staging_gib=staging_gib,
                 prefill_tokens_per_step=prefill_tokens_per_step,
                 store_gib=store_gib,
                 persist=persist,

@@ -9,7 +9,6 @@ class Settings:
     device: str
     dtype: str
     kv_cache_gib: float
-    staging_gib: float
     prefill_tokens_per_step: int
     store_gib: float
     persist: bool

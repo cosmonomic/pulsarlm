@@ -3,6 +3,7 @@
 #include "pulsarlm/ops.hpp"
 
 #include <ATen/ATen.h>
+#include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/util/Exception.h>
@@ -20,7 +21,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
-#include <unordered_set>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -151,21 +152,12 @@ void check_page(const page_shape& shape, const at::Tensor& source) {
     TORCH_CHECK(source.scalar_type() == shape.dtype, "kv_cache: page is ", source.dtype(), ", line is ", shape.dtype);
 }
 
-at::Tensor make_staging(std::span<const page_shape> shapes, std::size_t staging_bytes) {
+std::size_t largest_line_bytes(std::span<const page_shape> shapes) {
+    std::size_t largest = 0;
     for (const page_shape& shape : shapes) {
-        TORCH_CHECK(
-            line_bytes(shape) <= staging_bytes,
-            "kv_cache: a staging buffer of ",
-            staging_bytes,
-            " bytes holds no page of ",
-            line_bytes(shape),
-            " bytes"
-        );
+        largest = std::max(largest, line_bytes(shape));
     }
-    return at::empty(
-        {static_cast<std::int64_t>(staging_bytes)},
-        at::TensorOptions().dtype(at::kByte).pinned_memory(true)
-    );
+    return largest;
 }
 
 }  // namespace
@@ -242,13 +234,13 @@ void kv_cache::size_class::unlink_free(std::uint32_t line_id) noexcept {
 kv_cache::kv_cache(
     std::span<const page_shape> shapes,
     std::size_t pool_bytes,
-    std::size_t staging_bytes,
+    std::size_t host_page_bytes,
     at::Device device,
     page_store& store
 )
 : pool(make_pool(shapes, pool_bytes, device)),
   store(&store),
-  staging(make_staging(shapes, staging_bytes)) {
+  host_pages(host_page_bytes, largest_line_bytes(shapes)) {
     layers.reserve(shapes.size());
     for (const page_shape& shape : shapes) {
         auto same_size = [&](const size_class& c) { return c.line_bytes == line_bytes(shape); };
@@ -366,124 +358,90 @@ std::vector<std::size_t> kv_cache::free_counts() const {
     return counts;
 }
 
-task<void> kv_cache::hold_staging() {
-    while (staging_held) {
-        if (!staging_released) {
-            staging_released = std::make_unique<event>();
-        }
-        co_await *staging_released;
-    }
-    staging_held = true;
-}
-
-// The awaiters a set event scheduled no longer refer to it, so it is destroyed right away.
-void kv_cache::release_staging() noexcept {
-    staging_held = false;
-    if (staging_released) {
-        staging_released->set();
-        staging_released.reset();
-    }
-}
-
-// A page's room starts at a multiple of 16 bytes, which lets the copy move 16-byte vectors.
-std::optional<std::size_t> kv_cache::staging_offset(std::size_t layer, std::size_t& used) const {
-    std::size_t first = ceil_div(used, 16) * 16;
-    if (first + line_bytes(layers[layer].shape) > static_cast<std::size_t>(staging.numel())) {
-        return std::nullopt;
-    }
-    used = first + line_bytes(layers[layer].shape);
-    return first;
-}
-
 std::size_t kv_cache::line_offset(std::size_t layer, std::uint32_t line_id) const noexcept {
     return line_id * classes[layers[layer].size_class].line_bytes;
 }
 
-// Slots are reused only after the stream finished the copies out of them. The staging buffer holds a page of any
-// layer, so every round copies at least one.
 task<void>
 kv_cache::copy_from_host(std::span<const layer_line> targets, std::span<const page> pages, cudaStream_t stream) {
-    co_await hold_staging();
-    std::size_t first = 0;
-    while (first < targets.size()) {
-        std::vector<std::int64_t> segments;
-        std::size_t used = 0;
-        std::size_t end = first;
-        for (; end < targets.size(); end++) {
-            auto [layer, line_id] = targets[end];
-            std::optional<std::size_t> offset = staging_offset(layer, used);
-            if (!offset) {
-                break;
+    std::vector<std::int64_t> segments;
+    std::vector<at::Tensor> copies;
+    for (std::size_t i = 0; i < targets.size(); i++) {
+        auto [layer, line_id] = targets[i];
+        const page_shape& shape = layers[layer].shape;
+        const page& source = pages[i];
+        check_page(shape, source.v);
+        check_page(shape, source.k);
+        std::optional<std::size_t> offset;
+        if (in_line_layout(source, shape)) {
+            offset = host_pages.offset_of(source.k.data_ptr(), line_bytes(shape));
+        }
+        if (!offset) {
+            auto elements = static_cast<std::int64_t>(line_bytes(shape) / c10::elementSize(shape.dtype));
+            std::optional<at::Tensor> block = host_pages.allocate(elements, shape.dtype);
+            at::Tensor copy = block ? *block : at::empty({elements}, at::TensorOptions().dtype(shape.dtype));
+            page line = line_views(copy, shape, 1, 0);
+            line.v.copy_(source.v);
+            if (!shape.values_only) {
+                line.k.copy_(source.k);
             }
-            const page_shape& shape = layers[layer].shape;
-            const page& source = pages[end];
-            check_page(shape, source.v);
-            check_page(shape, source.k);
-            if (in_line_layout(source, shape)) {
-                std::memcpy(staging.data_ptr<std::uint8_t>() + *offset, source.k.data_ptr(), line_bytes(shape));
+            copies.push_back(copy);
+            if (block) {
+                offset = host_pages.offset_of(copy.data_ptr(), line_bytes(shape));
             } else {
-                page slot = line_views(staging.view(shape.dtype), shape, 1, *offset / c10::elementSize(shape.dtype));
-                slot.v.copy_(source.v);
-                if (!shape.values_only) {
-                    slot.k.copy_(source.k);
-                }
+                C10_CUDA_CHECK(cudaMemcpyAsync(
+                    static_cast<std::byte*>(pool.data_ptr()) + line_offset(layer, line_id),
+                    copy.data_ptr(),
+                    line_bytes(shape),
+                    cudaMemcpyHostToDevice,
+                    stream
+                ));
+                continue;
             }
-            append_segment(segments, line_offset(layer, line_id), *offset, line_bytes(shape));
         }
-        at::Tensor pinned_segments = pinned_int64(segments);
-        {
-            auto guard = guard_stream(pool, stream);
-            copy_segments_cuda(pool, staging, pinned_segments, /*to_host=*/false);
-        }
-        co_await synchronize(stream);
-        first = end;
+        append_segment(segments, line_offset(layer, line_id), *offset, line_bytes(shape));
     }
-    release_staging();
+    if (!segments.empty()) {
+        auto guard = guard_stream(pool, stream);
+        copy_segments_cuda(pool, host_pages.buffer(), pinned_int64(segments), /*to_host=*/false);
+    }
+    co_await synchronize(stream);
 }
 
 task<void> kv_cache::copy_to_host(std::span<const layer_line> sources, std::span<page> pages, cudaStream_t stream) {
-    co_await hold_staging();
-    std::size_t first = 0;
-    while (first < sources.size()) {
-        std::vector<std::int64_t> segments;
-        std::vector<std::size_t> offsets;
-        std::size_t used = 0;
-        while (first + offsets.size() < sources.size()) {
-            auto [layer, line_id] = sources[first + offsets.size()];
-            std::optional<std::size_t> offset = staging_offset(layer, used);
-            if (!offset) {
-                break;
-            }
-            append_segment(segments, line_offset(layer, line_id), *offset, line_bytes(layers[layer].shape));
-            offsets.push_back(*offset);
+    std::vector<std::int64_t> segments;
+    for (std::size_t i = 0; i < sources.size(); i++) {
+        auto [layer, line_id] = sources[i];
+        const std::size_t bytes = line_bytes(layers[layer].shape);
+        if (std::optional<std::size_t> offset = host_pages.offset_of(pages[i].k.data_ptr(), bytes)) {
+            append_segment(segments, line_offset(layer, line_id), *offset, bytes);
+        } else {
+            C10_CUDA_CHECK(cudaMemcpyAsync(
+                pages[i].k.data_ptr(),
+                static_cast<const std::byte*>(pool.data_ptr()) + line_offset(layer, line_id),
+                bytes,
+                cudaMemcpyDeviceToHost,
+                stream
+            ));
         }
-        at::Tensor pinned_segments = pinned_int64(segments);
-        {
-            auto guard = guard_stream(pool, stream);
-            copy_segments_cuda(pool, staging, pinned_segments, /*to_host=*/true);
-        }
-        co_await synchronize(stream);
-        for (std::size_t j = 0; j < offsets.size(); j++) {
-            std::memcpy(
-                pages[first + j].k.data_ptr(),
-                staging.data_ptr<std::uint8_t>() + offsets[j],
-                line_bytes(layers[sources[first + j].layer].shape)
-            );
-        }
-        first += offsets.size();
     }
-    release_staging();
+    if (!segments.empty()) {
+        auto guard = guard_stream(pool, stream);
+        copy_segments_cuda(pool, host_pages.buffer(), pinned_int64(segments), /*to_host=*/true);
+    }
+    co_await synchronize(stream);
 }
 
-// A failed host allocation throws OutOfMemoryError.
-std::optional<std::vector<page>> kv_cache::allocate_host_pages(std::span<const layer_line> sources) const {
+std::optional<std::vector<page>> kv_cache::allocate_host_pages(std::span<const layer_line> sources) {
     std::vector<page> pages;
     pages.reserve(sources.size());
     try {
         for (const layer_line& source : sources) {
             const page_shape& shape = layers[source.layer].shape;
             auto elements = static_cast<std::int64_t>(line_bytes(shape) / c10::elementSize(shape.dtype));
-            pages.push_back(line_views(at::empty({elements}, at::TensorOptions().dtype(shape.dtype)), shape, 1, 0));
+            std::optional<at::Tensor> block = host_pages.allocate(elements, shape.dtype);
+            at::Tensor buffer = block ? *block : at::empty({elements}, at::TensorOptions().dtype(shape.dtype));
+            pages.push_back(line_views(buffer, shape, 1, 0));
         }
     } catch (const c10::OutOfMemoryError&) {
         return std::nullopt;
@@ -631,16 +589,20 @@ kv_cache::clone(std::size_t layer, std::uint32_t line_id, std::size_t count, cud
 
 task<std::expected<void, page_error>> kv_cache::sync(
     const std::vector<digest>& hashes,
+    const std::vector<std::uint64_t>& owners,
     const std::vector<std::vector<std::uint32_t>>& line_ids,
     cudaStream_t stream
 ) {
-    assert(line_ids.size() == layers.size());
+    assert(line_ids.size() == layers.size() && owners.size() == hashes.size());
     std::vector<std::size_t> distinct;
-    std::unordered_set<digest, digest_hash> seen;
+    std::vector<std::size_t> distinct_index(hashes.size());
+    std::unordered_map<digest, std::size_t, digest_hash> seen;
     for (std::size_t i = 0; i < hashes.size(); i++) {
-        if (seen.insert(hashes[i]).second) {
+        auto [found, inserted] = seen.try_emplace(hashes[i], distinct.size());
+        if (inserted) {
             distinct.push_back(i);
         }
+        distinct_index[i] = found->second;
     }
     std::vector<layer_line> sources;
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
@@ -656,8 +618,8 @@ task<std::expected<void, page_error>> kv_cache::sync(
         co_return {};
     }
 
-    std::optional<std::vector<page>> host_pages = allocate_host_pages(sources);
-    if (!host_pages) {
+    std::optional<std::vector<page>> copies = allocate_host_pages(sources);
+    if (!copies) {
         co_return std::unexpected(page_error::oom);
     }
     std::vector<digest> keys;
@@ -668,8 +630,15 @@ task<std::expected<void, page_error>> kv_cache::sync(
             keys.push_back(store_key(hashes[i], layer));
         }
     }
-    co_await copy_to_host(sources, *host_pages, stream);
-    store->put(std::move(keys), std::move(*host_pages));
+    std::vector<page_owner> page_owners;
+    page_owners.reserve(layers.size() * hashes.size());
+    for (std::size_t layer = 0; layer < layers.size(); layer++) {
+        for (std::size_t i = 0; i < hashes.size(); i++) {
+            page_owners.push_back(page_owner{.request = owners[i], .page = layer * distinct.size() + distinct_index[i]});
+        }
+    }
+    co_await copy_to_host(sources, *copies, stream);
+    store->put(std::move(keys), std::move(*copies), std::move(page_owners));
     co_return {};
 }
 

@@ -111,10 +111,11 @@ request_handle python_engine::submit(
     std::vector<std::int64_t>&& tokens,
     const sampling_params& sampling,
     std::optional<std::size_t> max_tokens,
-    const eviction_policy& eviction
+    const eviction_policy& eviction,
+    std::uint64_t request_id
 ) {
     auto buffer = std::make_shared<request_buffer>();
-    request r{initial_state, std::move(tokens), sampling, max_tokens, eviction};
+    request r{initial_state, std::move(tokens), sampling, max_tokens, eviction, request_id};
     {
         py::gil_scoped_release nogil;
         served->submit(std::move(r), std::make_unique<buffered_callbacks>(buffer, wake));
