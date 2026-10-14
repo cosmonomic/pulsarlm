@@ -105,8 +105,8 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
     const int first_key_tile = tile_first_key / KEY_TILE;
 
     const int32_t* seq_table = p.page_tables + static_cast<int64_t>(s) * p.max_pages;
-    const int64_t stride_slot = static_cast<int64_t>(p.n_kv_heads) * HEAD_DIM;
-    const int64_t rotated_page_stride = PAGE_SIZE * stride_slot;
+    const int64_t rotated_token_stride = static_cast<int64_t>(p.n_kv_heads) * HEAD_DIM;
+    const int64_t rotated_page_stride = PAGE_SIZE * rotated_token_stride;
 
     static_assert(sizeof(scalar_t) == 2, "the tile staging copies 8 elements at a time");
     constexpr int kChunkElems = 16 / sizeof(scalar_t);
@@ -188,19 +188,25 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
 
     // Stage one key tile into its shared tile. Always commits a group, empty tile
     // included, so every iteration costs the same number of groups and a wait count
-    // means the same thing throughout. `pool` selects K or V, pages page_stride elements
-    // apart; both land at the same offsets, so one routine serves either.
-    auto stage_tile = [&](const scalar_t* pool, int64_t page_stride, scalar_t* dst, int t, const int* pages) {
+    // means the same thing throughout. `pool` selects K or V with its page, token and head
+    // strides; both land at the same offsets, so one routine serves either.
+    auto stage_tile = [&](const scalar_t* pool,
+                          int64_t page_stride,
+                          int64_t token_stride,
+                          int64_t head_stride,
+                          scalar_t* dst,
+                          int t,
+                          const int* pages) {
         if (t < n_key_tiles) {
 #pragma unroll
             for (int kp = 0; kp < KEY_PAGES; ++kp) {
                 const int page_base = t * KEY_TILE + kp * PAGE_SIZE;
                 const int valid = page_base + PAGE_SIZE > tile_first_key ? min(PAGE_SIZE, ctx_len - page_base) : 0;
-                const int64_t page_first = static_cast<int64_t>(pages[kp]) * page_stride + g * HEAD_DIM;
+                const int64_t page_first = static_cast<int64_t>(pages[kp]) * page_stride + g * head_stride;
                 for (int c = tid; c < kPageChunks; c += NWARPS * 32) {
                     const int off = c / kRowChunks;
                     const int d = (c % kRowChunks) * kChunkElems;
-                    const int64_t idx = page_first + static_cast<int64_t>(off) * stride_slot + d;
+                    const int64_t idx = page_first + static_cast<int64_t>(off) * token_stride + d;
                     attn::cp_async_16(
                         dst + attn::swizzled_offset<HEAD_DIM>(kp * PAGE_SIZE + off, d),
                         pool + idx,
@@ -220,8 +226,8 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
     auto attends = [&](int m, int key) { return key >= qfirst[m] && key <= qpos[m]; };
 
     load_pages(first_key_tile, tile_lines, tile_keys);
-    stage_tile(rotated_k, rotated_page_stride, sK, first_key_tile, tile_keys);
-    stage_tile(p.v_pool, p.page_stride, sV, first_key_tile, tile_lines);
+    stage_tile(rotated_k, rotated_page_stride, rotated_token_stride, HEAD_DIM, sK, first_key_tile, tile_keys);
+    stage_tile(p.v_pool, p.page_stride, p.token_stride, p.head_stride, sV, first_key_tile, tile_lines);
     __syncthreads();
 
     // Pass 1: online-softmax attention with per-(row,key) causal and window masking.
@@ -233,7 +239,7 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
 
         attn::tile_qkt<scalar_t, KEY_TILE, HEAD_DIM, BF16, SCORE_STRIDE, true>(sQ, sK, sS, warp, NWARPS);
         __syncthreads();
-        stage_tile(rotated_k, rotated_page_stride, sK, t + 1, next_keys);
+        stage_tile(rotated_k, rotated_page_stride, rotated_token_stride, HEAD_DIM, sK, t + 1, next_keys);
 
         if (tid < kSweepThreads) {
             float tmax = -CUDART_INF_F;
@@ -288,7 +294,7 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
 
         attn::tile_pv_registers<scalar_t, KEY_TILE, HEAD_DIM, BF16, NWARPS, true>(sP, sV, row_rescale, out_acc, warp);
         __syncthreads();
-        stage_tile(p.v_pool, p.page_stride, sV, t + 1, next_lines);
+        stage_tile(p.v_pool, p.page_stride, p.token_stride, p.head_stride, sV, t + 1, next_lines);
     }
 
     // Normalize + write o, each lane over the accumulators it owns.
@@ -324,7 +330,7 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
     // Only K is re-streamed here, so one tile is in flight and QKᵀ frees the shared
     // tile for the next one.
     load_pages(first_key_tile, tile_lines, tile_keys);
-    stage_tile(rotated_k, rotated_page_stride, sK, first_key_tile, tile_keys);
+    stage_tile(rotated_k, rotated_page_stride, rotated_token_stride, HEAD_DIM, sK, first_key_tile, tile_keys);
     for (int t = first_key_tile; t < n_key_tiles; ++t) {
         const int tile_base = t * KEY_TILE;
         load_pages(t + 1, next_lines, next_keys);
@@ -333,7 +339,7 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
 
         attn::tile_qkt<scalar_t, KEY_TILE, HEAD_DIM, BF16, SCORE_STRIDE, true>(sQ, sK, sS, warp, NWARPS);
         __syncthreads();
-        stage_tile(rotated_k, rotated_page_stride, sK, t + 1, next_keys);
+        stage_tile(rotated_k, rotated_page_stride, rotated_token_stride, HEAD_DIM, sK, t + 1, next_keys);
 
         // One thread per (query row, key): the exponentials run across the CTA,
         // and sS carries each row's weighted share to the per-key sum below.

@@ -67,7 +67,7 @@ template <typename scalar_t, int PAGE_SIZE> __global__ void attn_scalar_kernel(c
 
     auto key_offset = [&](int j) {
         const int line = seq_table[j / PAGE_SIZE];
-        return static_cast<int64_t>(line) * p.page_stride + (j % PAGE_SIZE * p.n_kv_heads + g) * head_dim;
+        return static_cast<int64_t>(line) * p.page_stride + (j % PAGE_SIZE) * p.token_stride + g * p.head_stride;
     };
     auto score = [&](int j, int64_t offset) {
         const scalar_t* krow = p.k_pool + offset;
@@ -150,17 +150,13 @@ void check_pools(const char* op, const at::Tensor& k_pool, const at::Tensor& v_p
         op,
         ": k_pool and v_pool must be 4-D [num_pages, page_size, n_kv_heads, head_dim] of one shape and stride"
     );
-    TORCH_CHECK(
-        k_pool.stride(3) == 1 && k_pool.stride(2) == k_pool.size(3) &&
-            k_pool.stride(1) == k_pool.size(2) * k_pool.size(3),
-        op,
-        ": each pool page must be packed"
-    );
+    TORCH_CHECK(k_pool.stride(3) == 1, op, ": a pool's head_dim must be contiguous");
     auto aligned = [](const at::Tensor& pool) { return reinterpret_cast<std::uintptr_t>(pool.data_ptr()) % 16 == 0; };
+    auto aligned_stride = [&](int64_t dim) { return k_pool.stride(dim) * k_pool.element_size() % 16 == 0; };
     TORCH_CHECK(
-        aligned(k_pool) && aligned(v_pool) && k_pool.stride(0) * k_pool.element_size() % 16 == 0,
+        aligned(k_pool) && aligned(v_pool) && aligned_stride(0) && aligned_stride(1) && aligned_stride(2),
         op,
-        ": pool pages must start at multiples of 16 bytes"
+        ": pool pages, tokens and heads must start at multiples of 16 bytes"
     );
 }
 

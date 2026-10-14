@@ -56,6 +56,8 @@ struct PagedAttnBatch {
             static_cast<const scalar_t*>(data(this->k_pool)),
             static_cast<const scalar_t*>(data(this->v_pool)),
             this->k_pool.stride(0),
+            this->k_pool.stride(1),
+            this->k_pool.stride(2),
             static_cast<const int32_t*>(data(this->page_tables)),
             static_cast<const int32_t*>(data(this->cu_seqlens_q)),
             static_cast<const int32_t*>(data(this->seqlens_k)),
@@ -85,8 +87,8 @@ struct PagedAttnBatch {
 bool decode_fits(int64_t page_size, int64_t head_dim);
 bool prefill_fits(int64_t page_size, int64_t head_dim);
 
-// k_pool and v_pool are [num_pages, page_size, n_kv_heads, head_dim] with one stride, each page packed and 16-byte
-// aligned; pages may be any number of elements apart.
+// k_pool and v_pool are [num_pages, page_size, n_kv_heads, head_dim] with one stride, head_dim contiguous, and every
+// page, token and head starting 16-byte aligned.
 void check_pools(const char* op, const at::Tensor& k_pool, const at::Tensor& v_pool);
 
 // Checks the shared argument contract (see pulsarlm/ops.hpp) and allocates o. op names

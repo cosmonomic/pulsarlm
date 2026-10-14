@@ -865,106 +865,110 @@ TEST_CASE(
                         };
 
                         for (auto dt : {at::kFloat, at::kBFloat16}) {
-                            INFO(
-                                "head_dim " << head_dim << " page_size " << page_size << " window "
-                                            << window.value_or(0) << " factor " << factor << " scaled_keys "
-                                            << scaled_keys << " dtype " << dt
-                            );
-                            at::manual_seed(11);
-                            auto opts = at::device(at::kCUDA).dtype(dt);
-                            auto lines = at::randn({num_lines, 2, page_size, n_kv, head_dim}, opts);
-                            auto k_pool = lines.select(1, 0);
-                            auto v_pool = lines.select(1, 1);
-                            std::optional<at::Tensor> k_norm_weight;
-                            if (scaled_keys) {
-                                k_norm_weight = at::rand({head_dim}, at::device(at::kCUDA).dtype(at::kFloat)) + 0.5;
-                            }
-                            const double o_tol = dt == at::kFloat ? 1e-4 : 2e-2;
-                            auto q_pre = at::randn({cu_q.back(), n_q, head_dim}, opts);
-                            auto q_dec = at::randn({static_cast<int64_t>(views.size()), n_q, head_dim}, opts);
+                            for (bool head_major : {false, true}) {
+                                INFO(
+                                    "head_dim " << head_dim << " page_size " << page_size << " window "
+                                                << window.value_or(0) << " factor " << factor << " scaled_keys "
+                                                << scaled_keys << " dtype " << dt << " head_major " << head_major
+                                );
+                                at::manual_seed(11);
+                                auto opts = at::device(at::kCUDA).dtype(dt);
+                                auto lines = head_major ? at::randn({num_lines, n_kv, 2, page_size, head_dim}, opts)
+                                                              .permute({0, 2, 3, 1, 4})
+                                                        : at::randn({num_lines, 2, page_size, n_kv, head_dim}, opts);
+                                auto k_pool = lines.select(1, 0);
+                                auto v_pool = lines.select(1, 1);
+                                std::optional<at::Tensor> k_norm_weight;
+                                if (scaled_keys) {
+                                    k_norm_weight = at::rand({head_dim}, at::device(at::kCUDA).dtype(at::kFloat)) + 0.5;
+                                }
+                                const double o_tol = dt == at::kFloat ? 1e-4 : 2e-2;
+                                auto q_pre = at::randn({cu_q.back(), n_q, head_dim}, opts);
+                                auto q_dec = at::randn({static_cast<int64_t>(views.size()), n_q, head_dim}, opts);
 
-                            auto f32 = at::device(at::kCUDA).dtype(at::kFloat);
-                            auto o_pre = at::zeros({cu_q.back(), n_q, head_dim}, f32);
-                            auto o_dec = at::zeros({static_cast<int64_t>(views.size()), n_q, head_dim}, f32);
-                            auto mass_pre = new_mass();
-                            auto mass_dec = new_mass();
-                            for (size_t s = 0; s < views.size(); ++s) {
-                                auto keys = reference_keys(views[s], k_pool, rope, k_norm_weight);
-                                auto rows = [&](at::Tensor& mass) {
-                                    return mass.slice(0, s * max_pages, (s + 1) * max_pages).view({-1, n_q});
-                                };
-                                auto pre_rows = rows(mass_pre);
-                                reference_windowed(
-                                    views[s],
-                                    keys,
-                                    v_pool,
+                                auto f32 = at::device(at::kCUDA).dtype(at::kFloat);
+                                auto o_pre = at::zeros({cu_q.back(), n_q, head_dim}, f32);
+                                auto o_dec = at::zeros({static_cast<int64_t>(views.size()), n_q, head_dim}, f32);
+                                auto mass_pre = new_mass();
+                                auto mass_dec = new_mass();
+                                for (size_t s = 0; s < views.size(); ++s) {
+                                    auto keys = reference_keys(views[s], k_pool, rope, k_norm_weight);
+                                    auto rows = [&](at::Tensor& mass) {
+                                        return mass.slice(0, s * max_pages, (s + 1) * max_pages).view({-1, n_q});
+                                    };
+                                    auto pre_rows = rows(mass_pre);
+                                    reference_windowed(
+                                        views[s],
+                                        keys,
+                                        v_pool,
+                                        q_pre,
+                                        views[s].seq_q,
+                                        cu_q[s],
+                                        window,
+                                        scale,
+                                        alpha,
+                                        o_pre,
+                                        pre_rows
+                                    );
+                                    auto dec_rows = rows(mass_dec);
+                                    reference_windowed(
+                                        views[s],
+                                        keys,
+                                        v_pool,
+                                        q_dec,
+                                        1,
+                                        static_cast<int64_t>(s),
+                                        window,
+                                        scale,
+                                        alpha,
+                                        o_dec,
+                                        dec_rows
+                                    );
+                                }
+
+                                auto mass = new_mass();
+                                auto o = pulsarlm::attn_prefill_cuda(
                                     q_pre,
-                                    views[s].seq_q,
-                                    cu_q[s],
-                                    window,
-                                    scale,
-                                    alpha,
-                                    o_pre,
-                                    pre_rows
-                                );
-                                auto dec_rows = rows(mass_dec);
-                                reference_windowed(
-                                    views[s],
-                                    keys,
-                                    v_pool,
-                                    q_dec,
-                                    1,
-                                    static_cast<int64_t>(s),
-                                    window,
-                                    scale,
-                                    alpha,
-                                    o_dec,
-                                    dec_rows
-                                );
-                            }
-
-                            auto mass = new_mass();
-                            auto o = pulsarlm::attn_prefill_cuda(
-                                q_pre,
-                                k_pool,
-                                v_pool,
-                                page_tables,
-                                cu_seqlens_q,
-                                seqlens_k,
-                                rope_layout,
-                                rope,
-                                scale,
-                                window,
-                                k_norm_weight,
-                                mass,
-                                cu_view_pages,
-                                decay
-                            );
-                            CHECK(at::allclose(o.to(at::kFloat), o_pre, o_tol, o_tol));
-                            CHECK(at::allclose(mass, mass_pre, 1e-3, 1e-3));
-
-                            for (int64_t num_splits : {0, 1, 2}) {
-                                auto dec_mass = new_mass();
-                                auto dec_o = pulsarlm::attn_decode_cuda(
-                                    q_dec,
                                     k_pool,
                                     v_pool,
                                     page_tables,
+                                    cu_seqlens_q,
                                     seqlens_k,
                                     rope_layout,
                                     rope,
                                     scale,
                                     window,
                                     k_norm_weight,
-                                    dec_mass,
+                                    mass,
                                     cu_view_pages,
-                                    decay,
-                                    0.0,
-                                    std::nullopt,
-                                    num_splits
+                                    decay
                                 );
-                                CHECK(at::allclose(dec_o.to(at::kFloat), o_dec, o_tol, o_tol));
-                                CHECK(at::allclose(dec_mass, mass_dec, 1e-3, 1e-3));
+                                CHECK(at::allclose(o.to(at::kFloat), o_pre, o_tol, o_tol));
+                                CHECK(at::allclose(mass, mass_pre, 1e-3, 1e-3));
+
+                                for (int64_t num_splits : {0, 1, 2}) {
+                                    auto dec_mass = new_mass();
+                                    auto dec_o = pulsarlm::attn_decode_cuda(
+                                        q_dec,
+                                        k_pool,
+                                        v_pool,
+                                        page_tables,
+                                        seqlens_k,
+                                        rope_layout,
+                                        rope,
+                                        scale,
+                                        window,
+                                        k_norm_weight,
+                                        dec_mass,
+                                        cu_view_pages,
+                                        decay,
+                                        0.0,
+                                        std::nullopt,
+                                        num_splits
+                                    );
+                                    CHECK(at::allclose(dec_o.to(at::kFloat), o_dec, o_tol, o_tol));
+                                    CHECK(at::allclose(dec_mass, mass_dec, 1e-3, 1e-3));
+                                }
                             }
                         }
                     }
@@ -1053,6 +1057,19 @@ TEST_CASE("write_kv places each token at its view index through the page table",
     CHECK(at::equal(lines[4][0][2], k_new[7]));
     CHECK(at::equal(lines[4][1][2], v_new[7]));
     CHECK(lines.select(1, 1)[3][13].abs().sum().item<float>() == 0.0f);
+
+    auto head_major = at::zeros({num_lines, n_kv, 2, kPageSize, head_dim}, opts).permute({0, 2, 3, 1, 4});
+    pulsarlm::write_kv_cuda(
+        head_major.select(1, 0),
+        head_major.select(1, 1),
+        k_new,
+        v_new,
+        page_tables,
+        cu_seqlens_q,
+        seqlens_k
+    );
+    CHECK(at::equal(head_major.select(1, 0)[3][14], k_new[0]));
+    CHECK(at::equal(head_major.select(1, 1)[4][2], v_new[7]));
 
     auto pool = at::zeros({num_lines, kPageSize, n_kv, head_dim}, opts);
     auto decode_tokens = at::randn({2, n_kv, head_dim}, opts);

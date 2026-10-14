@@ -49,9 +49,10 @@ rotate_view_keys_kernel(const attn::PagedAttnParams<scalar_t> p, int page_size, 
         const int head = (i % pairs_per_key) / half;
         const int pair = i % half;
         const int64_t row = (static_cast<int64_t>(off) * p.n_kv_heads + head) * p.head_dim;
+        const int64_t stored = off * p.token_stride + head * p.head_stride;
         float cos_a, sin_a, lo, hi;
         attn::rope_sincos_turns(layout.position(view_page * page_size + off), p.rope_turns[pair], cos_a, sin_a);
-        attn::stored_key_pair(p, src + row, pair, half, lo, hi);
+        attn::stored_key_pair(p, src + stored, pair, half, lo, hi);
         const auto k = attn::rope_rotate<scalar_t>(lo, hi, cos_a, sin_a);
         dst[row + pair] = k.lo;
         dst[row + pair + half] = k.hi;

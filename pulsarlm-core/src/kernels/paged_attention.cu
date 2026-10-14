@@ -59,7 +59,9 @@ __global__ void write_kv_kernel(
     int max_pages,
     int n_kv_heads,
     int head_dim,
-    int64_t page_stride
+    int64_t page_stride,
+    int64_t token_stride,
+    int64_t head_stride
 ) {
     const int t = blockIdx.x;
     int s = t;
@@ -80,12 +82,13 @@ __global__ void write_kv_kernel(
     const int line = page_tables[static_cast<int64_t>(s) * max_pages + index / PAGE_SIZE];
 
     const int64_t n = static_cast<int64_t>(n_kv_heads) * head_dim;
-    const int64_t dst = static_cast<int64_t>(line) * page_stride + (index % PAGE_SIZE) * n;
+    const int64_t token = static_cast<int64_t>(line) * page_stride + (index % PAGE_SIZE) * token_stride;
     const int64_t src = static_cast<int64_t>(t) * n;
 
     for (int64_t e = threadIdx.x; e < n; e += blockDim.x) {
-        k_pool[dst + e] = k_new[src + e];
-        v_pool[dst + e] = v_new[src + e];
+        const int64_t dst = token + e / head_dim * head_stride + e % head_dim;
+        k_pool[dst] = k_new[src + e];
+        v_pool[dst] = v_new[src + e];
     }
 }
 
@@ -186,7 +189,6 @@ __device__ __forceinline__ void tc_attend_tiles(
     const int warp = tid >> 5;
     const int lane = tid & 31;
     const int32_t* seq_table = p.page_tables + static_cast<int64_t>(s) * p.max_pages;
-    const int64_t stride_slot = static_cast<int64_t>(p.n_kv_heads) * HEAD_DIM;
 
     for (int t = t_start; t < t_end; ++t) {
         const int tile_base = t * PAGE_SIZE;
@@ -198,12 +200,16 @@ __device__ __forceinline__ void tc_attend_tiles(
         if (before_window >= PAGE_SIZE) {
             continue;
         }
-        const int64_t line_base = static_cast<int64_t>(seq_table[t]) * p.page_stride + g * HEAD_DIM;
+        const int64_t line_base = static_cast<int64_t>(seq_table[t]) * p.page_stride + g * p.head_stride;
         for (int c = tid; c < PAGE_SIZE * kRowChunks; c += NWARPS * 32) {
             const int off = c / kRowChunks;
             const int d = (c % kRowChunks) * kChunkElems;
             const bool attended = off >= before_window && off < valid;
-            attn::cp_async_16(sV + off * HEAD_DIM + d, p.v_pool + line_base + off * stride_slot + d, attended ? 16 : 0);
+            attn::cp_async_16(
+                sV + off * HEAD_DIM + d,
+                p.v_pool + line_base + off * p.token_stride + d,
+                attended ? 16 : 0
+            );
         }
         attn::cp_async_commit();
         for (int c = tid; c < PAGE_SIZE * kHalfChunks; c += NWARPS * 32) {
@@ -212,7 +218,7 @@ __device__ __forceinline__ void tc_attend_tiles(
             alignas(16) scalar_t lo[kChunkElems];
             alignas(16) scalar_t hi[kChunkElems];
             if (off >= before_window && off < valid) {
-                const scalar_t* key = p.k_pool + line_base + off * stride_slot;
+                const scalar_t* key = p.k_pool + line_base + off * p.token_stride;
                 *reinterpret_cast<uint4*>(lo) = *reinterpret_cast<const uint4*>(key + pair0);
                 *reinterpret_cast<uint4*>(hi) = *reinterpret_cast<const uint4*>(key + pair0 + HALF);
                 const int position = layout.position(tile_base + off);
@@ -748,7 +754,9 @@ void write_kv_cuda(
                 static_cast<int>(tables.size(1)),
                 static_cast<int>(n_kv_heads),
                 static_cast<int>(head_dim),
-                k_pool.stride(0)
+                k_pool.stride(0),
+                k_pool.stride(1),
+                k_pool.stride(2)
             );
         });
     });
