@@ -54,16 +54,18 @@ __device__ __forceinline__ int first_key(const PagedAttnParams<scalar_t>& p, int
     return p.sliding_window > 0 ? max(0, query_index - p.sliding_window + 1) : 0;
 }
 
-// k[pair] and k[pair + half], each times its k_norm_weight entry when there is one.
+// Key element d as stored, times its k_norm_weight entry when there is one.
+template <typename scalar_t>
+__device__ __forceinline__ float stored_key(const PagedAttnParams<scalar_t>& p, scalar_t value, int d) {
+    const float key = static_cast<float>(value);
+    return p.k_norm_weight ? __fmul_rn(key, p.k_norm_weight[d]) : key;
+}
+
 template <typename scalar_t>
 __device__ __forceinline__ void
 stored_key_pair(const PagedAttnParams<scalar_t>& p, const scalar_t* key, int pair, int half, float& lo, float& hi) {
-    lo = static_cast<float>(key[pair]);
-    hi = static_cast<float>(key[pair + half]);
-    if (p.k_norm_weight) {
-        lo = __fmul_rn(lo, p.k_norm_weight[pair]);
-        hi = __fmul_rn(hi, p.k_norm_weight[pair + half]);
-    }
+    lo = stored_key(p, key[pair], pair);
+    hi = stored_key(p, key[pair + half], pair + half);
 }
 
 // The RoPE position of key index j in one sequence's view:

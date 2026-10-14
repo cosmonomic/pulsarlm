@@ -177,12 +177,13 @@ __device__ __forceinline__ void tc_attend_tiles(
     float* Lrow = tiles.Lrow;
     float* row_rescale = tiles.row_rescale;
     constexpr int HALF = HEAD_DIM / 2;
-    static_assert((NWARPS * 32) % HALF == 0, "every thread must rotate one fixed frequency pair");
+    static_assert(sizeof(scalar_t) == 2, "the tile staging moves 8 elements at a time");
+    constexpr int kChunkElems = 16 / sizeof(scalar_t);
+    constexpr int kHalfChunks = HALF / kChunkElems;
+    constexpr int kRowChunks = HEAD_DIM / kChunkElems;
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
-    const int pair = tid % HALF;
-    const uint64_t turns = p.rope_turns[pair];
     const int32_t* seq_table = p.page_tables + static_cast<int64_t>(s) * p.max_pages;
     const int64_t stride_slot = static_cast<int64_t>(p.n_kv_heads) * HEAD_DIM;
 
@@ -197,25 +198,44 @@ __device__ __forceinline__ void tc_attend_tiles(
             continue;
         }
         const int64_t line_base = static_cast<int64_t>(seq_table[t]) * p.page_stride + g * HEAD_DIM;
-        for (int i = tid; i < PAGE_SIZE * HALF; i += NWARPS * 32) {
-            const int off = i / HALF;
-            scalar_t lo = static_cast<scalar_t>(0), hi = static_cast<scalar_t>(0);
+        for (int c = tid; c < PAGE_SIZE * kRowChunks; c += NWARPS * 32) {
+            const int off = c / kRowChunks;
+            const int d = (c % kRowChunks) * kChunkElems;
+            const bool attended = off >= before_window && off < valid;
+            attn::cp_async_16(sV + off * HEAD_DIM + d, p.v_pool + line_base + off * stride_slot + d, attended ? 16 : 0);
+        }
+        attn::cp_async_commit();
+        for (int c = tid; c < PAGE_SIZE * kHalfChunks; c += NWARPS * 32) {
+            const int off = c / kHalfChunks;
+            const int pair0 = (c % kHalfChunks) * kChunkElems;
+            alignas(16) scalar_t lo[kChunkElems];
+            alignas(16) scalar_t hi[kChunkElems];
             if (off >= before_window && off < valid) {
-                float cos_a, sin_a, k_lo, k_hi;
-                attn::rope_sincos_turns(layout.position(tile_base + off), turns, cos_a, sin_a);
-                attn::stored_key_pair(p, p.k_pool + line_base + off * stride_slot, pair, HALF, k_lo, k_hi);
-                const auto k = attn::rope_rotate<scalar_t>(k_lo, k_hi, cos_a, sin_a);
-                lo = k.lo;
-                hi = k.hi;
+                const scalar_t* key = p.k_pool + line_base + off * stride_slot;
+                *reinterpret_cast<uint4*>(lo) = *reinterpret_cast<const uint4*>(key + pair0);
+                *reinterpret_cast<uint4*>(hi) = *reinterpret_cast<const uint4*>(key + pair0 + HALF);
+                const int position = layout.position(tile_base + off);
+#pragma unroll
+                for (int j = 0; j < kChunkElems; ++j) {
+                    float cos_a, sin_a;
+                    attn::rope_sincos_turns(position, p.rope_turns[pair0 + j], cos_a, sin_a);
+                    const auto k = attn::rope_rotate<scalar_t>(
+                        attn::stored_key(p, lo[j], pair0 + j),
+                        attn::stored_key(p, hi[j], pair0 + j + HALF),
+                        cos_a,
+                        sin_a
+                    );
+                    lo[j] = k.lo;
+                    hi[j] = k.hi;
+                }
+            } else {
+                *reinterpret_cast<uint4*>(lo) = make_uint4(0, 0, 0, 0);
+                *reinterpret_cast<uint4*>(hi) = make_uint4(0, 0, 0, 0);
             }
-            sK[off * HEAD_DIM + pair] = lo;
-            sK[off * HEAD_DIM + pair + HALF] = hi;
+            *reinterpret_cast<uint4*>(sK + off * HEAD_DIM + pair0) = *reinterpret_cast<const uint4*>(lo);
+            *reinterpret_cast<uint4*>(sK + off * HEAD_DIM + pair0 + HALF) = *reinterpret_cast<const uint4*>(hi);
         }
-        for (int i = tid; i < PAGE_SIZE * HEAD_DIM; i += NWARPS * 32) {
-            const int off = i / HEAD_DIM, d = i % HEAD_DIM;
-            sV[i] = off >= before_window && off < valid ? p.v_pool[line_base + off * stride_slot + d]
-                                                        : static_cast<scalar_t>(0);
-        }
+        attn::cp_async_wait<0>();
         __syncthreads();
 
         attn::tile_qkt<scalar_t, PAGE_SIZE, HEAD_DIM, BF16>(sQ, sK, sS, warp, NWARPS);
