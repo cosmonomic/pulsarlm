@@ -6,7 +6,8 @@ to keep context small and inference fast.
 Best when paired with a memory system
 for recalling forgotten context.
 
-States are kept in an LRU cache (default 16 GiB),
+States are kept in an LRU cache in pinned host memory
+(`--store_gib`, default 4 GiB),
 which `--persist` also saves to disk.
 
 ## Quickstart
