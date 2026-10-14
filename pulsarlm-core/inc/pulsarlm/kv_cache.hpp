@@ -40,7 +40,7 @@ struct page_shape {
 std::size_t line_bytes(const page_shape& shape);
 
 // The digest that the page chains of an engine start from. model names the model and its weights version; with the
-// page shape of every KV layer's cache (in KV layer order) and digest_function it covers everything that changes a
+// page shape of every KV layer (in KV layer order) and digest_function it covers everything that changes a
 // page's KV or how tokens split into pages. The seed is digest_function and model, each as an 8-byte little-endian
 // length then its bytes, then the shape count as 8 little-endian bytes, then per shape the dtype name as a length and
 // its bytes, followed by n_layers, page_size, n_kv_heads, head_dim and values_only, each as 8 little-endian bytes.
@@ -60,20 +60,10 @@ class page_store {
     virtual void put(std::vector<digest>&& hashes, std::vector<page>&& pages) = 0;
 };
 
-// Stores the pages of one KV layer in another store, under store_key.
-class layer_store : public page_store {
-    page_store& store;
-    std::size_t layer;
-
-  public:
-    layer_store(page_store& store, std::size_t layer) noexcept;
-
-    task<std::vector<std::optional<page>>> fetch(std::span<const digest> hashes) override;
-    void put(std::vector<digest>&& hashes, std::vector<page>&& pages) override;
-};
-
 enum class page_error { miss, oom };
 
+// The lines of every KV layer. Each layer has its own lines, line ids and free list; a layer's page is stored under
+// store_key(page, layer).
 class kv_cache {
   private:
     static constexpr std::uint32_t no_line = std::numeric_limits<std::uint32_t>::max();
@@ -91,79 +81,102 @@ class kv_cache {
         event done;
     };
 
-    bool values_only;
-    kv device_kv;
-    // Indexed by line.
-    std::vector<cache_line> lines;
-    // Free lines in reuse order: unmapped lines first, then mapped lines least recently released first.
-    std::uint32_t free_front = no_line;
-    std::uint32_t free_back = no_line;
-    std::size_t free_count = 0;
-    std::unordered_map<digest, std::uint32_t, digest_hash> digest_to_line_id;
-    // Pages a get is fetching into a line, not yet in digest_to_line_id.
-    std::unordered_map<digest, fetch, digest_hash> fetching;
+    struct cache_layer {
+        page_shape shape;
+        kv device_kv;
+        // Indexed by line.
+        std::vector<cache_line> lines;
+        // Free lines in reuse order: unmapped lines first, then mapped lines least recently released first.
+        std::uint32_t free_front = no_line;
+        std::uint32_t free_back = no_line;
+        std::size_t free_count = 0;
+        std::unordered_map<digest, std::uint32_t, digest_hash> digest_to_line_id;
+        // Pages a get is fetching into a line, not yet in digest_to_line_id.
+        std::unordered_map<digest, fetch, digest_hash> fetching;
+
+        cache_layer(const page_shape& shape, std::size_t n_lines, at::Device device);
+
+        void link_free_front(std::uint32_t line_id) noexcept;
+        void link_free_back(std::uint32_t line_id) noexcept;
+        void unlink_free(std::uint32_t line_id) noexcept;
+        bool is_mapped(std::uint32_t line_id) const noexcept;
+        void hold(std::uint32_t line_id) noexcept;
+        std::uint32_t take_free_line() noexcept;
+        std::vector<std::uint32_t> take_free_lines(std::size_t count) noexcept;
+        void assign_hash(std::uint32_t line_id, const digest& hash);
+        void release(std::span<const std::uint32_t> line_ids) noexcept;
+    };
+
+    struct layer_line {
+        std::size_t layer;
+        std::uint32_t line_id;
+    };
+
+    std::vector<cache_layer> layers;
     page_store* store;
-    // Pinned host memory every transfer goes through, [staging_pages, n_layers, page_size, n_kv_heads, head_dim] each:
-    // each slot has a page's layout. One transfer holds it at a time.
-    page staging;
+    // Pinned host bytes every transfer goes through, one page after another, each in its layer's page layout. One
+    // transfer holds it at a time.
+    at::Tensor staging;
     bool staging_held = false;
     // Set when the staging buffer is released.
     std::unique_ptr<event> staging_released;
 
-    void link_free_front(std::uint32_t line_id) noexcept;
-    void link_free_back(std::uint32_t line_id) noexcept;
-    void unlink_free(std::uint32_t line_id) noexcept;
-    bool is_mapped(std::uint32_t line_id) const noexcept;
-    void hold(std::uint32_t line_id) noexcept;
-    std::uint32_t take_free_line() noexcept;
-    void assign_hash(std::uint32_t line_id, const digest& hash);
     task<void> hold_staging();
     void release_staging() noexcept;
+    // Room in the staging buffer for a page of layer past its first used bytes, which then cover it too. nullopt when
+    // the page does not fit.
+    std::optional<page> staging_slot(std::size_t layer, std::size_t& used) const;
     // Device copies run on the stream, layer by layer, so no copy allocates device memory. The transfers go through
     // the staging buffer as many pages at a time as it holds, and complete once the stream has finished them.
-    task<void> copy_from_host(std::span<const std::uint32_t> line_ids, std::span<const page> pages, cudaStream_t stream);
-    task<void> copy_to_host(std::span<const std::uint32_t> line_ids, std::span<page> pages, cudaStream_t stream);
-    void copy_line(std::uint32_t source, std::span<const std::uint32_t> targets, cudaStream_t stream);
-    // Pageable host pages shaped like a line. nullopt when host memory runs out.
-    std::optional<std::vector<page>> allocate_host_pages(std::size_t count) const;
+    task<void> copy_from_host(std::span<const layer_line> targets, std::span<const page> pages, cudaStream_t stream);
+    task<void> copy_to_host(std::span<const layer_line> sources, std::span<page> pages, cudaStream_t stream);
+    // Pageable host pages, one shaped like each line of sources. nullopt when host memory runs out.
+    std::optional<std::vector<page>> allocate_host_pages(std::span<const layer_line> sources) const;
+    void release_all(std::span<const std::vector<std::uint32_t>> line_ids) noexcept;
 
   public:
-    // staging_pages is at least 1. store outlives the cache. For a values_only shape, tensors() gives one tensor as
-    // both k and v.
+    // shapes and line_counts hold one entry per KV layer. staging_bytes holds a page of any layer. store outlives
+    // the cache. A values_only layer's tensors give one tensor as both k and v.
     kv_cache(
-        const page_shape& shape,
-        std::size_t n_lines,
-        std::size_t staging_pages,
+        std::span<const page_shape> shapes,
+        std::span<const std::size_t> line_counts,
+        std::size_t staging_bytes,
         at::Device device,
         page_store& store
     );
 
     // Copies run on stream. Callers release lines only after the GPU work using them completes. get, allocate and
     // clone never wait for lines. A line is free when it is not held; free lines are reused least recently released
-    // first and their pages dropped. Without enough free lines the call fails with oom. A failed call holds nothing.
+    // first and their pages dropped. Without enough free lines in a layer the call fails with oom. A failed call holds
+    // nothing. Line ids come per layer, indexed by layer.
 
-    // hashes are distinct. Gives every page a line in their order, fetching the pages that are not resident from the
-    // store, and holds the lines until release. A page another get is fetching shares that line and fetch. Fails with
-    // miss when the store does not have a page.
-    task<std::expected<std::vector<std::uint32_t>, page_error>>
-    get(const std::vector<digest>& hashes, cudaStream_t stream);
-    // Gives count empty lines, held until release. get does not find their pages until they are synced, and releasing
-    // a line before it is synced drops its page.
-    std::expected<std::vector<std::uint32_t>, page_error> allocate(std::size_t count);
-    // Gives count unmapped lines holding a copy of the page at the held line_id, held until release.
+    // Each layer's hashes are distinct. Gives every page of hashes[layer] a line of that layer in their order, fetching
+    // the pages that are not resident from the store in one fetch, and holds the lines until release. A page another
+    // get is fetching shares that line and fetch. Fails with miss when the store does not have a page.
+    task<std::expected<std::vector<std::vector<std::uint32_t>>, page_error>>
+    get(std::span<const std::span<const digest>> hashes, cudaStream_t stream);
+    // Gives count empty lines in every layer, held until release. get does not find their pages until they are synced,
+    // and releasing a line before it is synced drops its page.
+    std::expected<std::vector<std::vector<std::uint32_t>>, page_error> allocate(std::size_t count);
+    // Gives count unmapped lines of layer holding a copy of the page at its held line_id, held until release.
     std::expected<std::vector<std::uint32_t>, page_error>
-    clone(std::uint32_t line_id, std::size_t count, cudaStream_t stream);
-    // Names the full page at each held, unmapped line by the hash at the same index and hands a host copy of each
-    // distinct page to the store, also when another line caches its hash: the store may have dropped that page. A hash
-    // already cached at another line leaves its line unmapped. Completes once the copies are handed to the store. Fails
-    // with oom, caching nothing, when host memory for the copies cannot be allocated.
-    task<std::expected<void, page_error>>
-    sync(const std::vector<digest>& hashes, const std::vector<std::uint32_t>& line_ids, cudaStream_t stream);
-    void release(std::span<const std::uint32_t> line_ids) noexcept;
+    clone(std::size_t layer, std::uint32_t line_id, std::size_t count, cudaStream_t stream);
+    // Names the full page at line_ids[layer][i], held and unmapped, by hashes[i] in every layer and hands a host copy
+    // of each distinct page to the store in one put, also when another line caches its hash: the store may have
+    // dropped that page. A hash already cached at another line leaves its line unmapped. Completes once the copies are
+    // handed to the store. Fails with oom, caching nothing, when host memory for the copies cannot be allocated.
+    task<std::expected<void, page_error>> sync(
+        const std::vector<digest>& hashes,
+        const std::vector<std::vector<std::uint32_t>>& line_ids,
+        cudaStream_t stream
+    );
+    void release(std::size_t layer, std::span<const std::uint32_t> line_ids) noexcept;
 
-    std::size_t line_count() const noexcept;
-    std::size_t free_line_count() const noexcept;
-    const kv& tensors() const noexcept;
+    std::size_t layer_count() const noexcept;
+    std::size_t line_count(std::size_t layer) const noexcept;
+    std::size_t free_line_count(std::size_t layer) const noexcept;
+    // [n_layers, n_lines, page_size, n_kv_heads, head_dim] in the layer's page shape.
+    const kv& tensors(std::size_t layer) const noexcept;
 };
 
 }  // namespace pulsarlm

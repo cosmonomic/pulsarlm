@@ -23,8 +23,9 @@
 namespace pulsarlm {
 
 // model_name names the model and its weights version; with the KV layers' page shapes it makes the root digest. The KV
-// layers' lines share kv_cache_bytes as line_counts states, and their pinned staging buffers share staging_bytes
-// equally. A step forwards every decoding sequence and at most prefill_tokens_per_step tokens of the others.
+// layers' lines share kv_cache_bytes as line_counts states, and their host transfers go through one pinned staging
+// buffer of staging_bytes, which must hold a page of any KV layer. A step forwards every decoding sequence and at most
+// prefill_tokens_per_step tokens of the others.
 struct engine_config {
     std::string model_name;
     std::size_t page_size;
@@ -42,15 +43,12 @@ struct engine_config {
 // [0, vocab_size).
 void validate(const request& r, std::size_t page_size, std::size_t vocab_size);
 
-// The page shape of each KV layer's cache, one layer each.
+// The page shape of each KV layer, one layer each.
 std::vector<page_shape> page_shapes(const engine_config& config, std::span<const kv_layer> layers);
 // The lines of each KV layer. Every layer holds lines for the same number of requests: a full-attention layer
 // ceil(max_position_embeddings / page_size) per request, a sliding one ceil(sliding_window / page_size) + 1. Throws
 // std::invalid_argument when a layer gets none.
 std::vector<std::size_t> line_counts(const engine_config& config, std::span<const kv_layer> layers);
-// The pages each KV layer's staging buffer holds in its equal share of staging_bytes. Throws std::invalid_argument
-// when one holds none.
-std::vector<std::size_t> staging_page_counts(const engine_config& config, std::span<const kv_layer> layers);
 
 // Serves requests on a loop thread it owns. Once the loop exits, after a panic or on destruction, the requests it was
 // serving end with loop_exited and the engine is shut down: calling submit after a request ended with loop_exited is
@@ -63,7 +61,6 @@ class engine {
     std::size_t vocab_size;
     digest root;
     std::unique_ptr<page_store> store;
-    std::vector<std::unique_ptr<layer_store>> layer_stores;
     scheduler sched;
     mutable std::mutex mutex;
     // Set while the loop runs.

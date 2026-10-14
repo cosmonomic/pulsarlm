@@ -139,8 +139,8 @@ class scheduler {
     using exit_reason = sequence::exit_reason;
 
     Model& model;
-    // One per KV layer, in the model's KV layer order.
-    std::vector<kv_cache> caches;
+    // One layer per KV layer, in the model's KV layer order.
+    kv_cache cache;
     std::vector<kv> lines;
     std::vector<std::optional<std::size_t>> sliding_windows;
     // The full pages eviction keeps last so that no sliding window loses a key.
@@ -175,12 +175,12 @@ class scheduler {
     void end_cycle(sequence& seq, const at::Tensor& host_density);
 
   public:
-    // caches holds one cache per entry of model.kv_layers(). root is the digest the page chains of a state with no
+    // cache holds one layer per entry of model.kv_layers(). root is the digest the page chains of a state with no
     // pages start from. A step forwards every decoding sequence and at most prefill_tokens_per_step tokens of the
     // others.
     scheduler(
         Model& model,
-        std::vector<kv_cache>&& caches,
+        kv_cache cache,
         cudaStream_t stream,
         digest root,
         std::vector<std::int64_t>&& stop_ids,

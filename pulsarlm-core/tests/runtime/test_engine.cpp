@@ -177,8 +177,15 @@ TEST_CASE("the KV layers share the cache as requests at the trained context use 
     pulsarlm::engine_config sized = config(16);
     sized.kv_cache_bytes = 10 * 1408 + 100;
     REQUIRE(pulsarlm::line_counts(sized, layers) == std::vector<std::size_t>{161, 30});
-    sized.staging_bytes = 2 * 128 + 1;
-    REQUIRE(pulsarlm::staging_page_counts(sized, layers) == std::vector<std::size_t>{2, 1});
+}
+
+TEST_CASE("an engine whose staging buffer holds no page is rejected") {
+    pulsarlm::engine_config sized = config(16);
+    sized.staging_bytes = pulsarlm::line_bytes(pulsarlm::page_shapes(sized, one_layer)[0]) - 1;
+    REQUIRE_THROWS_AS(
+        pulsarlm::engine(std::make_unique<successor_model>(), sized, std::make_unique<stalling_store>()),
+        std::invalid_argument
+    );
 }
 
 TEST_CASE("a submitted request passes its tokens and its end state to its callbacks") {

@@ -239,7 +239,7 @@ def test_submit_rejects_a_token_outside_the_vocabulary():
     [
         (0.0, LINE_BYTES / 2**30, "must be positive"),
         (LINE_BYTES / 2 / 2**30, LINE_BYTES / 2**30, "holds no line"),
-        (LINE_BYTES / 2**30, LINE_BYTES / 2 / 2**30, "holds no page"),
+        (LINE_BYTES / 2**30, LINE_BYTES / N_LAYERS / 2 / 2**30, "holds no page"),
     ],
 )
 def test_a_cache_or_staging_buffer_without_a_page_is_rejected(

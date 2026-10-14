@@ -39,28 +39,25 @@ std::size_t lines_per_request(const engine_config& config, const kv_layer& layer
     return std::max<std::size_t>(1, ceil_div(config.max_position_embeddings, config.page_size));
 }
 
-std::vector<kv_cache> make_caches(
-    const engine_config& config,
-    std::span<const kv_layer> layers,
-    std::span<const std::unique_ptr<layer_store>> stores
-) {
-    std::vector<page_shape> shapes = page_shapes(config, layers);
-    std::vector<std::size_t> lines = line_counts(config, layers);
-    std::vector<std::size_t> staging = staging_page_counts(config, layers);
-    std::vector<kv_cache> caches;
-    caches.reserve(layers.size());
-    for (std::size_t layer = 0; layer < layers.size(); layer++) {
-        caches.emplace_back(shapes[layer], lines[layer], staging[layer], config.device, *stores[layer]);
+void check_staging(const engine_config& config, std::span<const page_shape> shapes) {
+    for (std::size_t layer = 0; layer < shapes.size(); layer++) {
+        std::size_t bytes = line_bytes(shapes[layer]);
+        if (config.staging_bytes < bytes) {
+            throw std::invalid_argument(std::format(
+                "a staging buffer of {} bytes holds no page of KV layer {}; a page takes {} bytes",
+                config.staging_bytes,
+                layer,
+                bytes
+            ));
+        }
     }
-    return caches;
 }
 
-std::vector<std::unique_ptr<layer_store>> make_layer_stores(page_store& store, std::size_t n_kv_layers) {
-    std::vector<std::unique_ptr<layer_store>> stores;
-    for (std::size_t layer = 0; layer < n_kv_layers; layer++) {
-        stores.push_back(std::make_unique<layer_store>(store, layer));
-    }
-    return stores;
+kv_cache make_cache(const engine_config& config, std::span<const kv_layer> layers, page_store& store) {
+    std::vector<page_shape> shapes = page_shapes(config, layers);
+    std::vector<std::size_t> lines = line_counts(config, layers);
+    check_staging(config, shapes);
+    return kv_cache(shapes, lines, config.staging_bytes, config.device, store);
 }
 
 }  // namespace
@@ -103,23 +100,6 @@ std::vector<std::size_t> line_counts(const engine_config& config, std::span<cons
     return counts;
 }
 
-std::vector<std::size_t> staging_page_counts(const engine_config& config, std::span<const kv_layer> layers) {
-    std::vector<std::size_t> counts;
-    for (const page_shape& shape : page_shapes(config, layers)) {
-        std::size_t share = config.staging_bytes / layers.size();
-        std::size_t bytes = line_bytes(shape);
-        if (share < bytes) {
-            throw std::invalid_argument(std::format(
-                "a staging buffer share of {} bytes holds no page; a page takes {} bytes",
-                share,
-                bytes
-            ));
-        }
-        counts.push_back(share / bytes);
-    }
-    return counts;
-}
-
 void validate(const request& r, std::size_t page_size, std::size_t vocab_size) {
     if (r.initial_state.tail.size() >= page_size) {
         throw std::invalid_argument(std::format(
@@ -154,10 +134,9 @@ engine::engine(std::unique_ptr<Model> model, const engine_config& config, std::u
   vocab_size(config.vocab_size),
   root(make_root_digest(config.model_name, page_shapes(config, this->model->kv_layers()))),
   store(std::move(store)),
-  layer_stores(make_layer_stores(*this->store, this->model->kv_layers().size())),
   sched(
       *this->model,
-      make_caches(config, this->model->kv_layers(), layer_stores),
+      make_cache(config, this->model->kv_layers(), *this->store),
       stream,
       root,
       std::vector<std::int64_t>(config.stop_ids),

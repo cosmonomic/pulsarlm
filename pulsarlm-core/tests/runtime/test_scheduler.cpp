@@ -11,6 +11,7 @@
 #undef CHECK
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -83,6 +84,7 @@ const std::vector<pulsarlm::kv_layer> two_full_layers{
 struct store_contents {
     std::unordered_map<digest, page, digest_hash> pages;
     std::vector<std::vector<digest>> fetches;
+    std::size_t puts = 0;
 };
 
 struct memory_store final : pulsarlm::page_store {
@@ -101,6 +103,7 @@ struct memory_store final : pulsarlm::page_store {
     }
 
     void put(std::vector<digest>&& keys, std::vector<page>&& pages) override {
+        contents->puts++;
         for (std::size_t i = 0; i < keys.size(); i++) {
             contents->pages.insert_or_assign(keys[i], std::move(pages[i]));
         }
@@ -261,23 +264,22 @@ digest root() {
     return pulsarlm::make_root_digest("sum-model", page_shapes(two_full_layers));
 }
 
-std::vector<pulsarlm::kv_cache> make_caches(
+pulsarlm::kv_cache make_cache(
     const std::vector<pulsarlm::kv_layer>& layers,
     const std::vector<std::size_t>& line_counts,
-    std::vector<std::unique_ptr<pulsarlm::layer_store>>& stores
+    pulsarlm::page_store& store
 ) {
     std::vector<pulsarlm::page_shape> shapes = page_shapes(layers);
-    std::vector<pulsarlm::kv_cache> caches;
-    for (std::size_t layer = 0; layer < layers.size(); layer++) {
-        caches.emplace_back(shapes[layer], line_counts[layer], 2, at::Device(at::kCUDA, 0), *stores[layer]);
+    std::size_t staging_bytes = 0;
+    for (const pulsarlm::page_shape& shape : shapes) {
+        staging_bytes = std::max(staging_bytes, 2 * pulsarlm::line_bytes(shape));
     }
-    return caches;
+    return pulsarlm::kv_cache(shapes, line_counts, staging_bytes, at::Device(at::kCUDA, 0), store);
 }
 
 struct fixture {
     memory_store backing;
     std::shared_ptr<store_contents> store;
-    std::vector<std::unique_ptr<pulsarlm::layer_store>> layer_stores;
     sum_model model;
     pulsarlm::scheduler sched;
 
@@ -292,28 +294,19 @@ struct fixture {
     )
     : backing(std::move(backing_store)),
       store(backing.contents),
-      layer_stores(make_layer_stores(backing, layers.size())),
       model(with_layers(std::move(layers))),
       sched(
           model,
-          make_caches(
+          make_cache(
               model.layers,
               line_counts.empty() ? std::vector<std::size_t>(model.layers.size(), n_lines) : line_counts,
-              layer_stores
+              backing
           ),
           compute_stream(),
           root(),
           std::move(stop_ids),
           prefill_tokens_per_step
       ) {}
-
-    static std::vector<std::unique_ptr<pulsarlm::layer_store>> make_layer_stores(memory_store& store, std::size_t n) {
-        std::vector<std::unique_ptr<pulsarlm::layer_store>> stores;
-        for (std::size_t layer = 0; layer < n; layer++) {
-            stores.push_back(std::make_unique<pulsarlm::layer_store>(store, layer));
-        }
-        return stores;
-    }
 
     static sum_model with_layers(std::vector<pulsarlm::kv_layer> layers) {
         sum_model m;
@@ -335,6 +328,11 @@ std::vector<digest> keys_of(const std::vector<digest>& hashes, std::size_t layer
 }
 
 token_list concat(token_list front, const token_list& back) {
+    front.insert(front.end(), back.begin(), back.end());
+    return front;
+}
+
+std::vector<digest> concat(std::vector<digest> front, const std::vector<digest>& back) {
     front.insert(front.end(), back.begin(), back.end());
     return front;
 }
@@ -464,6 +462,17 @@ TEST_CASE("a request from an empty state prefills, decodes and ends with its sta
     }
 }
 
+TEST_CASE("a step's new pages of every KV layer reach the store in one put") {
+    fixture f(16);
+    token_list prompt{1, 2, 3, 4, 5, 6, 7, 8};
+    std::vector<request_results> results = serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 1}});
+
+    REQUIRE(results[0].tokens == continuation(prompt, 1));
+    REQUIRE(f.model.forward_count == 1);
+    REQUIRE(f.store->puts == 1);
+    REQUIRE(f.store->pages.size() == 4);
+}
+
 TEST_CASE("a request continues from the end state of another in the same cache") {
     fixture f(16);
     token_list prompt{1, 2, 3, 4, 5, 6};
@@ -502,10 +511,8 @@ TEST_CASE("a request continues from pages another cache fetches from the store")
     )[0];
 
     REQUIRE(second.tokens == continuation(concat(concat(prompt, first.tokens), user), 4));
-    REQUIRE((
-        first_engine.store->fetches ==
-        std::vector<std::vector<digest>>{keys_of(first_end.page_hashes, 0), keys_of(first_end.page_hashes, 1)}
-    ));
+    std::vector<digest> keys = concat(keys_of(first_end.page_hashes, 0), keys_of(first_end.page_hashes, 1));
+    REQUIRE((first_engine.store->fetches == std::vector<std::vector<digest>>{keys}));
 }
 
 TEST_CASE("a state page missing from the store ends the request with miss") {
@@ -796,10 +803,8 @@ TEST_CASE("a request resumed on another cache fetches only the window's pages of
     )[0];
 
     REQUIRE(second.tokens == continuation(concat(concat(prompt, first.tokens), user), 4));
-    REQUIRE((
-        first_engine.store->fetches ==
-        std::vector<std::vector<digest>>{keys_of(first_end.page_hashes, 0), keys_of({first_end.page_hashes[4]}, 1)}
-    ));
+    std::vector<digest> keys = concat(keys_of(first_end.page_hashes, 0), keys_of({first_end.page_hashes[4]}, 1));
+    REQUIRE((first_engine.store->fetches == std::vector<std::vector<digest>>{keys}));
 }
 
 TEST_CASE("eviction keeps the pages a sliding window reaches whatever n_working asks") {
