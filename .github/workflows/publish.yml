@@ -1,0 +1,57 @@
+name: Publish to PyPI
+
+# Triggers on a GitHub Release being published (not on tag push). The flow:
+#   1. Push a tag (e.g. v0.1.0-alpha-1).
+#   2. Create a Draft Release in the GitHub UI, attached to that tag.
+#   3. Review the auto-generated notes; tick "pre-release" if appropriate.
+#   4. Publish the release; this workflow then builds and uploads to PyPI.
+#
+# Only the sdist is published: the CUDA kernels are compiled for the installing machine's GPU.
+#
+# Authentication uses PyPI Trusted Publishers (OIDC), so there is no API token
+# to manage. One-time setup on the PyPI side:
+#   https://pypi.org/manage/account/publishing/ -> add a "pending" publisher with:
+#     PyPI Project Name: pulsarlm
+#     Owner:             cosmonomic
+#     Repository name:   pulsarlm
+#     Workflow name:     publish.yml
+#     Environment name:  pypi
+
+on:
+  release:
+    types: [published, prereleased]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag or commit to build and publish (e.g. v0.1.0-alpha-1)."
+        required: true
+        type: string
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/pulsarlm/
+    permissions:
+      id-token: write  # required for Trusted Publisher OIDC
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0  # hatch-vcs needs the tag, not just the commit
+
+      - uses: astral-sh/setup-uv@v10.3.0
+
+      - name: Build distribution
+        run: uv build --sdist --package pulsarlm --out-dir dist
+
+      - name: Verify the built version is not a development version
+        run: |
+          built=$(ls dist/pulsarlm-*.tar.gz | sed -E 's|.*/pulsarlm-(.+)\.tar\.gz|\1|')
+          echo "Tag:           $GITHUB_REF_NAME"
+          echo "Built version: $built"
+          case "$built" in *dev*|*+*) exit 1 ;; esac
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
