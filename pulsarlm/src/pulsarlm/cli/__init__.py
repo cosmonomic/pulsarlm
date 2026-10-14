@@ -102,7 +102,7 @@ def serve(
             help="Keep the store in store.sqlite under the data directory.",
             rich_help_panel="Memory",
         ),
-    ] = True,
+    ] = False,
     cycle_tokens: Annotated[
         int,
         typer.Option(
@@ -253,7 +253,7 @@ def chat(
             help="Keep the store in store.sqlite under the data directory.",
             rich_help_panel="Memory",
         ),
-    ] = True,
+    ] = False,
     cycle_tokens: Annotated[
         int,
         typer.Option(
