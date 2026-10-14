@@ -7,8 +7,12 @@ Best when paired with a memory system
 for recalling forgotten context.
 
 States are kept in an LRU cache in pinned host memory
-(`--store_gib`, default 4 GiB),
-which `--persist` also saves to disk.
+(default 4 GiB and not persisted).
+
+Only a handful of smaller and older models are
+implemented right now,
+but newer models are on the roadmap!
+
 
 ## How it works
 
@@ -29,6 +33,21 @@ To work around this, PulsarLM stores snapshots of the context
 at regular intervals in an external store,
 and resumes a conversation from its latest snapshot.
 
+## Performance
+
+On an RTX 5090, in bf16 with the default settings:
+
+| Model       |     Prefill | Decode, 1 request | Decode, 16 requests |
+| :---------- | ----------: | ----------------: | ------------------: |
+| Gemma 4 E2B | 15.8k tok/s |         184 tok/s |          2.4k tok/s |
+| Gemma 4 E4B | 11.2k tok/s |         113 tok/s |          1.4k tok/s |
+| Gemma 4 12B |  4.8k tok/s |          56 tok/s |           681 tok/s |
+| Qwen3 8B    |  6.7k tok/s |          89 tok/s |          1.2k tok/s |
+
+Prefill is measured on a 5k-token prompt.
+Decode is one request generating 512 tokens,
+and 16 concurrent requests generating 256 tokens each.
+
 ## Quickstart
 
 ```sh
@@ -44,8 +63,6 @@ pulsarlm chat gemma-4-e2b-it
 # or start an OpenAI compatible API server
 pulsarlm serve gemma-4-e2b-it
 ```
-
-Support for newer models is on the roadmap!
 
 ## Requirements
 
