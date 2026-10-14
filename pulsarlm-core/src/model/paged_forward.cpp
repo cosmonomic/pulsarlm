@@ -38,21 +38,25 @@ at::Tensor paged_attention(
     bool relevance_layer,
     double scale,
     const rope_parameters& rope,
+    std::optional<int64_t> sliding_window,
+    const std::optional<at::Tensor>& k_norm_weight,
     const at::Tensor& lse_capture
 ) {
     const at::Tensor& k_pool = lines.k;
     const at::Tensor& v_pool = lines.v;
     at::Tensor page_tables = g.page_tables.select(0, static_cast<int64_t>(kv_layer));
     const at::Tensor& seqlens_k = g.is_prefill() ? g.seqlens_k : g.context_lens;
-    write_kv_cuda(
-        k_pool,
-        v_pool,
-        k,
-        v,
-        page_tables,
-        g.is_prefill() ? std::optional<at::Tensor>(g.cu_seqlens_q) : std::nullopt,
-        seqlens_k
-    );
+    if (k.defined()) {
+        write_kv_cuda(
+            k_pool,
+            v_pool,
+            k,
+            v,
+            page_tables,
+            g.is_prefill() ? std::optional<at::Tensor>(g.cu_seqlens_q) : std::nullopt,
+            seqlens_k
+        );
+    }
     const auto lse = lse_capture.defined() ? std::optional<at::Tensor>(lse_capture) : std::nullopt;
     std::optional<at::Tensor> mass, cu_view_pages, mass_decay;
     if (relevance_layer && g.cu_view_pages.defined()) {
@@ -70,8 +74,8 @@ at::Tensor paged_attention(
                                         g.rope_layout,
                                         rope,
                                         scale,
-                                        std::nullopt,
-                                        std::nullopt,
+                                        sliding_window,
+                                        k_norm_weight,
                                         mass,
                                         cu_view_pages,
                                         mass_decay,
@@ -87,8 +91,8 @@ at::Tensor paged_attention(
                                         g.rope_layout,
                                         rope,
                                         scale,
-                                        std::nullopt,
-                                        std::nullopt,
+                                        sliding_window,
+                                        k_norm_weight,
                                         mass,
                                         cu_view_pages,
                                         mass_decay,

@@ -115,6 +115,8 @@ at::Tensor Qwen3Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, s
         this->relevance_layers.contains(layer),
         this->scale,
         {.theta = this->rope_theta},
+        std::nullopt,
+        std::nullopt,
         lse
     );
     if (lse.defined()) {
