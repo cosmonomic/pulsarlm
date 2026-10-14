@@ -63,8 +63,9 @@ __global__ void gumbel_race_kernel(
             if (index < vocab) {
                 float score = static_cast<float>(row_scores[index]);
                 if (temperature > 0.0f) {
-                    const float uniform = (static_cast<float>(bits[j]) + 0.5f) * 0x1.0p-32f;
-                    score = score / temperature - __logf(-__logf(uniform));
+                    // 23 bits keep uniform below 1, where the Gumbel noise -log(-log(uniform)) is finite.
+                    const float uniform = (static_cast<float>(bits[j] >> 9) + 0.5f) * 0x1.0p-23f;
+                    score = score / temperature - logf(-logf(uniform));
                 }
                 local = max(local, race_key(score, index));
             }

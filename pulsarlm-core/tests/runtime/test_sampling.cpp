@@ -63,6 +63,15 @@ TEST_CASE("temperature 1 draws tokens at their probabilities") {
     }
 }
 
+TEST_CASE("a token the noise cannot lift never wins, over a large vocabulary") {
+    constexpr std::int64_t rows = 256;
+    constexpr std::int64_t vocab = 262144;
+    at::Tensor logits = at::full({rows, vocab}, -1e4f, at::TensorOptions(device));
+    logits.select(1, 0).fill_(0.0f);
+    at::Tensor tokens = draw_tokens(logits, sampling_params{.temperature = 1.0}, 4);
+    REQUIRE(tokens.eq(0).all().item<bool>());
+}
+
 TEST_CASE("the same seed draws the same tokens") {
     at::manual_seed(0);
     at::Tensor logits = at::randn({64, 100}).to(device);
