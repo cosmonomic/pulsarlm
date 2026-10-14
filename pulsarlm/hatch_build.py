@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sysconfig
 from pathlib import Path
@@ -35,6 +36,7 @@ class CustomBuildHook(BuildHookInterface):
                 "-m",
                 "release",
                 "--tests=n",
+                f"--cuda_arch={os.environ.get('PULSARLM_CUDA_ARCH', 'native')}",
                 f"--torch_cmake_prefix={torch.utils.cmake_prefix_path}",
                 f"--python_include={sysconfig.get_paths()['include']}",
             ],

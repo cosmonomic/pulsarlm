@@ -6,7 +6,7 @@ name: Publish to PyPI
 #   3. Review the auto-generated notes; tick "pre-release" if appropriate.
 #   4. Publish the release; this workflow then builds and uploads to PyPI.
 #
-# Only the sdist is published: the CUDA kernels are compiled for the installing machine's GPU.
+# The wheels carry kernels for sm_80 to sm_120 plus sm_120 PTX; other machines build the sdist.
 #
 # Authentication uses PyPI Trusted Publishers (OIDC), so there is no API token
 # to manage. One-time setup on the PyPI side:
@@ -28,14 +28,8 @@ on:
         type: string
 
 jobs:
-  publish:
+  sdist:
     runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/project/pulsarlm/
-    permissions:
-      id-token: write  # required for Trusted Publisher OIDC
-      contents: read
     steps:
       - uses: actions/checkout@v7
         with:
@@ -44,14 +38,57 @@ jobs:
 
       - uses: astral-sh/setup-uv@v10.3.0
 
-      - name: Build distribution
+      - name: Build sdist
         run: uv build --sdist --package pulsarlm --out-dir dist
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: sdist
+          path: dist/
+
+  wheel:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0  # hatch-vcs needs the tag, not just the commit
+
+      - name: Free disk space
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Build wheel
+        run: docker run --rm -v "$PWD:/io" quay.io/pypa/manylinux_2_34_${{ matrix.arch }} bash /io/.github/build_wheel.sh
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: wheel-${{ matrix.arch }}
+          path: dist/
+
+  publish:
+    needs: [sdist, wheel]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/pulsarlm/
+    permissions:
+      id-token: write  # required for Trusted Publisher OIDC
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: dist/
+          merge-multiple: true
 
       - name: Verify the built version is not a development version
         run: |
-          built=$(ls dist/pulsarlm-*.tar.gz | sed -E 's|.*/pulsarlm-(.+)\.tar\.gz|\1|')
-          echo "Tag:           $GITHUB_REF_NAME"
-          echo "Built version: $built"
-          case "$built" in *dev*|*+*) exit 1 ;; esac
+          ls dist
+          if ls dist | grep -E 'dev|\+'; then exit 1; fi
 
       - uses: pypa/gh-action-pypi-publish@release/v1
