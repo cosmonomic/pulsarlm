@@ -5,6 +5,7 @@ from typing import Annotated
 
 import typer
 
+from pulsarlm.models import REPOSITORIES, repository_url
 from pulsarlm.settings import Settings
 
 app = typer.Typer(
@@ -32,6 +33,14 @@ def _positive(value: float) -> float:
     if value <= 0.0:
         raise typer.BadParameter(f"{value} is not positive.")
     return value
+
+
+def _known_model(model: str) -> str:
+    if model not in REPOSITORIES:
+        raise typer.BadParameter(
+            f"{model} is not a known model; `pulsarlm models` lists them."
+        )
+    return model
 
 
 @app.callback()
@@ -295,15 +304,25 @@ def chat(
 
 
 @app.command()
+def models() -> None:
+    """List the models pulsarlm can download and their Hugging Face repositories."""
+    width = max(map(len, REPOSITORIES))
+    for model in REPOSITORIES:
+        typer.echo(f"{model:<{width}}  {repository_url(model)}")
+
+
+@app.command()
 def download(
-    repo_id: Annotated[
-        str, typer.Argument(help="A Hugging Face model, such as Qwen/Qwen3-8B.")
+    model: Annotated[
+        str,
+        typer.Argument(
+            help="A model from `pulsarlm models`, such as qwen3-8b.",
+            callback=_known_model,
+        ),
     ],
     name: Annotated[
         str | None,
-        typer.Option(
-            help="The model's name in pulsarlm. Defaults to the repository's name, lowercased."
-        ),
+        typer.Option(help="The model's name in pulsarlm. Defaults to the model."),
     ] = None,
     revision: Annotated[
         str | None, typer.Option(help="A branch, tag or commit of the repository.")
@@ -320,7 +339,7 @@ def download(
     # Imported here: torch takes seconds to load, which --help does not need.
     downloading = importlib.import_module("pulsarlm.download")
     archive = downloading.download(
-        repo_id, name=name, revision=revision, data_dir=data_dir
+        model, name=name, revision=revision, data_dir=data_dir
     )
     typer.secho(f"wrote {archive}", fg=typer.colors.GREEN)
 
