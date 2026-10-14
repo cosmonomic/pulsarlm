@@ -1,5 +1,4 @@
-"""The page store and state cache of one server, in host RAM and optionally a file
-(NOTES.md section 7)."""
+"""The page store and state cache of one server, in host RAM and optionally a file."""
 
 import math
 import threading

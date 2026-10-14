@@ -1,5 +1,3 @@
-"""The SQLite file a LocalStore keeps its pages and states in (NOTES.md section 7)."""
-
 import json
 import sqlite3
 import sys
