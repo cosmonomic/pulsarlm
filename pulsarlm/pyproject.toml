@@ -3,8 +3,7 @@ name = "pulsarlm"
 dynamic = ["version", "readme"]
 description = "LLM inference engine with unbounded context."
 license = "Apache-2.0"
-# Pinned to 3.13: PyTorch has no CUDA wheels for Python 3.14 yet.
-requires-python = ">=3.13,<3.14"
+requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.115",
     "huggingface-hub>=1.24.0",
@@ -66,3 +65,15 @@ cache-keys = [
     { file = "../pulsarlm-core/inc/**" },
     { file = "../pulsarlm-core/src/**" },
 ]
+
+[tool.cibuildwheel]
+build = "cp313-manylinux_* cp314-manylinux_*"
+manylinux-x86_64-image = "manylinux_2_34"
+manylinux-aarch64-image = "manylinux_2_34"
+build-verbosity = 1
+
+[tool.cibuildwheel.linux]
+before-all = "bash {package}/../.github/install_build_tools.sh"
+environment = { PATH = "/usr/local/cuda-13.4/bin:/opt/rh/gcc-toolset-15/root/usr/bin:/root/.local/bin:$PATH", XMAKE_ROOT = "y", PULSARLM_CUDA_ARCH = "sm_80,sm_86,sm_89,sm_90,sm_100,sm_120,compute_120" }
+# torch and its CUDA runtime are loaded by `import torch` before the extension, so the wheel links them by soname.
+repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel} --exclude 'libtorch*.so' --exclude 'libc10*.so' --exclude libcudart.so.13 --exclude libnvrtc.so.13"

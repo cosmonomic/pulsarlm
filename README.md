@@ -69,7 +69,7 @@ pulsarlm serve gemma-4-e2b-it
 - Linux, x86_64 or aarch64, glibc >= 2.34 (Ubuntu 22.04+, Debian 12+, RHEL 9+)
 - NVIDIA GPU with compute capability >= 8.0 (Ampere or newer)
 - NVIDIA driver >= 580 (CUDA 13)
-- Python 3.13
+- Python 3.13 or 3.14
 
 If installing from sdist or building from source:
 
