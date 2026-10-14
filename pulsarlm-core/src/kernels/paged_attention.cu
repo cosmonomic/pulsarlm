@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 
 // Paged-KV decode attention, and the scatter that writes new K/V into the pool. One
 // query per sequence attends its whole view, or the window of it sliding_window
@@ -28,7 +29,7 @@
 // The split (flash-decode) path spreads one (s, g)'s view over nsplits CTAs:
 //   split kernel   : grid num_seqs * n_kv_heads * nsplits; each CTA runs the online
 //                    softmax over one slice and writes its RAW state.
-//   combine kernel : grid num_seqs * n_kv_heads; reduces the partials per query row
+//   combine kernel : grid num_seqs * n_q_heads; reduces one query row's partials
 //                    with the flash rescale into o and LSE.
 //   mass kernel    : grid num_seqs * n_kv_heads; adds exp(score - LSE) per key.
 // Partial buffers (fp32), for (seq s, kv head g, split i, row m):
@@ -426,8 +427,8 @@ __global__ void __launch_bounds__(NWARPS * 32) paged_decode_split_kernel(
     });
 }
 
-// Combine the nsplits partials per query row (flash rescale) into normalized o and
-// LSE. One CTA per (seq, kv head).
+// One CTA per (seq, query head). Shared memory: kThreads reduction floats, then one
+// weight per split.
 template <typename scalar_t>
 __global__ void paged_decode_combine_kernel(
     const PagedAttnParams<scalar_t> p,
@@ -437,48 +438,47 @@ __global__ void paged_decode_combine_kernel(
     const float* __restrict__ l_partial,
     int nsplits
 ) {
+    extern __shared__ float combine_shared[];
+    float* scratch = combine_shared;
+    float* weight = combine_shared + kThreads;
     const int tid = threadIdx.x;
-    const int g = blockIdx.x % p.n_kv_heads;
-    const int s = blockIdx.x / p.n_kv_heads;
-    const int64_t sg = static_cast<int64_t>(s) * p.n_kv_heads + g;
+    const int h = blockIdx.x % p.n_q_heads;
+    const int s = blockIdx.x / p.n_q_heads;
     const int group = p.group;
-    const int head_dim = p.head_dim;
-    const float* mp = m_partial + sg * nsplits * group;
-    const float* lp = l_partial + sg * nsplits * group;
-    const float* op = o_partial + sg * nsplits * group * head_dim;
+    const int m = h % group;
+    const int64_t row = (static_cast<int64_t>(s) * p.n_kv_heads + h / group) * nsplits * group + m;
+    const float* mp = m_partial + row;
+    const float* lp = l_partial + row;
+    const float* op = o_partial + row * p.head_dim;
 
-    for (int m = 0; m < group; ++m) {
-        float M = -CUDART_INF_F;
-        for (int i = 0; i < nsplits; ++i) {
-            M = fmaxf(M, mp[i * group + m]);
-        }
-        float l = 0.0f;
-        for (int i = 0; i < nsplits; ++i) {
-            const float mi = mp[i * group + m];
-            if (mi > -CUDART_INF_F) {
-                l += lp[i * group + m] * __expf(mi - M);
+    float local_max = -CUDART_INF_F;
+    for (int i = tid; i < nsplits; i += kThreads) {
+        local_max = fmaxf(local_max, mp[i * group]);
+    }
+    const float M = attn::block_reduce_max<kThreads>(scratch, tid, local_max);
+    float local_l = 0.0f;
+    for (int i = tid; i < nsplits; i += kThreads) {
+        const float mi = mp[i * group];
+        weight[i] = mi > -CUDART_INF_F ? __expf(mi - M) : 0.0f;
+        local_l += lp[i * group] * weight[i];
+    }
+    const float l = attn::block_reduce_sum<kThreads>(scratch, tid, local_l);
+    const bool bad = (l == 0.0f) || !isfinite(M);
+    const float invl = bad ? 0.0f : 1.0f / l;
+
+    scalar_t* orow = p.o + (static_cast<int64_t>(s) * p.n_q_heads + h) * p.head_dim;
+    const int64_t split_stride = static_cast<int64_t>(group) * p.head_dim;
+    for (int d = tid; d < p.head_dim; d += kThreads) {
+        float acc = 0.0f;
+        if (!bad) {
+            for (int i = 0; i < nsplits; ++i) {
+                acc += op[i * split_stride + d] * weight[i];
             }
         }
-        const bool bad = (l == 0.0f) || !isfinite(M);
-        const float invl = bad ? 0.0f : 1.0f / l;
-
-        const int h = g * group + m;
-        scalar_t* orow = p.o + (static_cast<int64_t>(s) * p.n_q_heads + h) * head_dim;
-        for (int d = tid; d < head_dim; d += blockDim.x) {
-            float acc = 0.0f;
-            if (!bad) {
-                for (int i = 0; i < nsplits; ++i) {
-                    const float mi = mp[i * group + m];
-                    if (mi > -CUDART_INF_F) {
-                        acc += op[(static_cast<int64_t>(i) * group + m) * head_dim + d] * __expf(mi - M);
-                    }
-                }
-            }
-            orow[d] = static_cast<scalar_t>(acc * invl);
-        }
-        if (tid == 0) {
-            lse_out[sg * group + m] = bad ? -CUDART_INF_F : (M + logf(l));
-        }
+        orow[d] = static_cast<scalar_t>(acc * invl);
+    }
+    if (tid == 0) {
+        lse_out[static_cast<int64_t>(s) * p.n_q_heads + h] = bad ? -CUDART_INF_F : (M + logf(l));
     }
 }
 
@@ -498,14 +498,43 @@ __global__ void paged_decode_mass_kernel(
     accumulate_group_mass(p, page_size, s, g, p.seqlens_k[s], seq_scores, lse);
 }
 
-// Split count targeting ~2 CTAs per SM. A split must own at least two tiles, so the
-// count is capped at ceil(max_pages / 2), and at 32 overall.
-int auto_splits(int64_t num_seqs, int64_t n_kv_heads, int64_t max_pages) {
-    const int sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-    const int64_t base_ctas = num_seqs * n_kv_heads;
-    int64_t splits = (2LL * sm_count + base_ctas - 1) / base_ctas;
-    splits = std::min(splits, std::max<int64_t>((max_pages + 1) / 2, 1));
-    return static_cast<int>(std::clamp<int64_t>(splits, 1, 32));
+// The split count with the least estimated time: the waves of resident CTAs the launch
+// takes, each as long as a split's pages plus one page for a CTA's fixed work. At most
+// 128 splits, at least two pages per split, no empty split; ties go to fewer splits.
+int auto_splits(int64_t base_ctas, int64_t max_pages, int64_t resident_ctas) {
+    int64_t best_splits = 1;
+    int64_t best_cost = std::numeric_limits<int64_t>::max();
+    for (int64_t splits = 1; splits <= std::clamp<int64_t>((max_pages + 1) / 2, 1, 128); ++splits) {
+        const int64_t pages_per_split = (max_pages + splits - 1) / splits;
+        const int64_t used = (max_pages + pages_per_split - 1) / pages_per_split;
+        const int64_t cost = (base_ctas * used + resident_ctas - 1) / resident_ctas * (pages_per_split + 1);
+        if (cost < best_cost) {
+            best_cost = cost;
+            best_splits = used;
+        }
+    }
+    return static_cast<int>(best_splits);
+}
+
+template <typename scalar_t, bool BF16> int64_t resident_split_ctas(const attn::PagedAttnBatch& b) {
+    int64_t resident = 0;
+    attn::dispatch_page_head("attn_decode", b.page_size, b.head_dim, [&](auto bs_tag, auto hd_tag) {
+        constexpr int BS = decltype(bs_tag)::value;
+        constexpr int HD = decltype(hd_tag)::value;
+        attn::dispatch_attn_tuning([&](auto row_tag) {
+            constexpr int NWARPS = attn::kAttnTuningTable[decltype(row_tag)::value].decode_warps;
+            constexpr size_t smem = DecodeTiles<scalar_t, BS, HD>::bytes();
+            static const int64_t kernel_resident = [] {
+                const auto kernel = paged_decode_split_kernel<scalar_t, BS, HD, BF16, NWARPS>;
+                attn::allow_shared_memory(kernel, smem);
+                int per_sm = 0;
+                C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, NWARPS * 32, smem));
+                return static_cast<int64_t>(per_sm) * at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+            }();
+            resident = kernel_resident;
+        });
+    });
+    return resident;
 }
 
 template <typename scalar_t, bool BF16>
@@ -527,8 +556,9 @@ void launch_tc_decode(const attn::PagedAttnBatch& b, int64_t forced_splits, cuda
     const int64_t attended_pages = b.sliding_window > 0
         ? std::min(b.max_pages, window_page_span(b.sliding_window, b.page_size))
         : b.max_pages;
-    const int nsplits = forced_splits > 0 ? static_cast<int>(forced_splits)
-                                          : auto_splits(b.num_seqs, b.n_kv_heads, attended_pages);
+    const int nsplits = forced_splits > 0
+        ? static_cast<int>(forced_splits)
+        : auto_splits(base_ctas, attended_pages, resident_split_ctas<scalar_t, BF16>(b));
     const bool split = forced_splits > 0 || nsplits > 1;
 
     if (!split) {
@@ -581,14 +611,16 @@ void launch_tc_decode(const attn::PagedAttnBatch& b, int64_t forced_splits, cuda
             );
         });
     });
-    paged_decode_combine_kernel<scalar_t><<<static_cast<int>(base_ctas), kThreads, 0, stream>>>(
-        p,
-        lse_out.data_ptr<float>(),
-        o_partial.data_ptr<float>(),
-        m_partial.data_ptr<float>(),
-        l_partial.data_ptr<float>(),
-        nsplits
-    );
+    const size_t combine_smem = sizeof(float) * (kThreads + nsplits);
+    paged_decode_combine_kernel<scalar_t>
+        <<<static_cast<int>(b.num_seqs * b.n_q_heads), kThreads, combine_smem, stream>>>(
+            p,
+            lse_out.data_ptr<float>(),
+            o_partial.data_ptr<float>(),
+            m_partial.data_ptr<float>(),
+            l_partial.data_ptr<float>(),
+            nsplits
+        );
     if (scores_ptr) {
         paged_decode_mass_kernel<scalar_t><<<static_cast<int>(base_ctas), kThreads, 0, stream>>>(
             p,
