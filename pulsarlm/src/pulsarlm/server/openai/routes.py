@@ -11,7 +11,6 @@ from fastapi import Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRouter
 from tokenizers import Tokenizer
-from tokenizers.decoders import DecodeStream
 
 from pulsarlm.async_engine import AsyncEngine, EngineStopped
 from pulsarlm.chat import ChatTemplate, encode_prompt
@@ -29,6 +28,7 @@ from pulsarlm.server.openai.schema import (
     ModelList,
     Usage,
 )
+from pulsarlm.reply import Part, ReplyDecoder
 from pulsarlm.store import LocalStore
 
 type FinishReason = Literal["stop", "length"]
@@ -85,6 +85,7 @@ async def create_chat_completion(body: ChatCompletionRequest, state: State):
         state.tokenizer,
         state.chat_template,
         [(m.role, m.content) for m in body.messages],
+        reasoning_effort=body.reasoning_effort,
     )
     tokens = complete(
         state.engine,
@@ -105,24 +106,24 @@ class _Reply:
     """Decodes sampled tokens until a stop token."""
 
     def __init__(self, state: ServerState, max_tokens: int | None) -> None:
-        self._tokenizer = state.tokenizer
         self._stop_ids = state.stop_ids
         self._max_tokens = max_tokens
-        self._decoder = DecodeStream(skip_special_tokens=False)
+        self._decoder = ReplyDecoder(state.tokenizer, state.stop_ids)
         self.token_count = 0
         self.finish_reason: FinishReason | None = None
 
-    def step(self, token: int) -> str:
+    def step(self, token: int) -> tuple[Part, str]:
         self.token_count += 1
         if token in self._stop_ids:
             self.finish_reason = "stop"
-            return ""
-        if self.token_count == self._max_tokens:
+        elif self.token_count == self._max_tokens:
             self.finish_reason = "length"
-        return self._decoder.step(self._tokenizer, token) or ""
+        return self._decoder.step(token)
 
 
-async def _texts(reply: _Reply, tokens: AsyncGenerator[int]) -> AsyncIterator[str]:
+async def _texts(
+    reply: _Reply, tokens: AsyncGenerator[int]
+) -> AsyncIterator[tuple[Part, str]]:
     async with aclosing(tokens):
         async for token in tokens:
             yield reply.step(token)
@@ -143,8 +144,10 @@ async def _full_completion(
     prompt_tokens: int,
 ) -> ChatCompletionResponse:
     reply = _Reply(state, body.max_tokens)
+    texts: dict[Part, list[str]] = {"reasoning": [], "content": []}
     try:
-        content = "".join([text async for text in _texts(reply, tokens)])
+        async for part, text in _texts(reply, tokens):
+            texts[part].append(text)
     except (EngineStopped, CompletionError) as error:
         raise _http_error(error) from error
 
@@ -155,7 +158,11 @@ async def _full_completion(
         choices=[
             ChatCompletionChoice(
                 index=0,
-                message=ChatMessage(role="assistant", content=content),
+                message=ChatMessage(
+                    role="assistant",
+                    content="".join(texts["content"]),
+                    reasoning="".join(texts["reasoning"]) or None,
+                ),
                 finish_reason=reply.finish_reason or "stop",
             )
         ],
@@ -192,9 +199,9 @@ def _stream_completion(
     async def events() -> AsyncIterator[str]:
         yield chunk(ChatCompletionChunkDelta(role="assistant"))
         try:
-            async for text in _texts(reply, tokens):
+            async for part, text in _texts(reply, tokens):
                 if text:
-                    yield chunk(ChatCompletionChunkDelta(content=text))
+                    yield chunk(ChatCompletionChunkDelta(**{part: text}))
         except (EngineStopped, CompletionError) as error:
             failure = _http_error(error)
             yield f"data: {json.dumps({'error': {'message': failure.detail, 'code': failure.status_code}})}\n\n"

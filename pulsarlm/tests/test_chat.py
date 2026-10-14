@@ -44,6 +44,24 @@ def test_a_prompt_without_a_system_message_sinks_nothing():
     assert system_tokens == 0
 
 
+THINKING = (
+    "{{ reasoning_effort if reasoning_effort is defined else 'undefined' }} "
+    "{{ enable_thinking if enable_thinking is defined else 'undefined' }}"
+)
+
+
+@pytest.mark.parametrize(
+    ("effort", "rendered"),
+    [(None, "undefined undefined"), ("none", "none False"), ("low", "low True")],
+)
+def test_reasoning_effort_reaches_the_template_with_enable_thinking(effort, rendered):
+    template = ChatTemplate(THINKING, {})
+    assert (
+        template.render([], add_generation_prompt=False, reasoning_effort=effort)
+        == rendered
+    )
+
+
 def test_raise_exception_in_a_template_raises():
     template = ChatTemplate("{{ raise_exception('no') }}", {})
     with pytest.raises(ValueError, match="no"):

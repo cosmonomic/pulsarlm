@@ -14,6 +14,14 @@ app = typer.Typer(
 )
 
 
+class ReasoningEffort(StrEnum):
+    none = "none"
+    minimal = "minimal"
+    low = "low"
+    medium = "medium"
+    high = "high"
+
+
 class DType(StrEnum):
     float32 = "float32"
     float16 = "float16"
@@ -143,6 +151,21 @@ def chat(
         ),
     ] = None,
     temperature: Annotated[float, typer.Option(help="Sampling temperature.")] = 1.0,
+    reasoning_effort: Annotated[
+        ReasoningEffort,
+        typer.Option(
+            "--reasoning_effort",
+            help="Passed to the chat template as reasoning_effort, and as "
+            "enable_thinking unless none.",
+        ),
+    ] = ReasoningEffort.medium,
+    show_thinking: Annotated[
+        bool,
+        typer.Option(
+            "--show_thinking",
+            help="Print the model's think blocks instead of hiding them.",
+        ),
+    ] = False,
     data_dir: Annotated[
         Path | None,
         typer.Option(
@@ -239,6 +262,8 @@ def chat(
             ),
             system=system,
             temperature=temperature,
+            reasoning_effort=reasoning_effort.value,
+            show_thinking=show_thinking,
         )
     except chat.PulsarLMModelLoadingError as error:
         typer.secho(f"error: {error}", err=True, fg=typer.colors.RED)

@@ -5,16 +5,17 @@ import math
 import readline  # noqa: F401  enables line editing in input()
 
 import torch
-from tokenizers.decoders import DecodeStream
+import typer
 
 from pulsarlm import checkpoint
 from pulsarlm.async_engine import AsyncEngine, EngineStopped
-from pulsarlm.chat import Role, encode_prompt, stop_ids
+from pulsarlm.chat import ReasoningEffort, Role, encode_prompt, stop_ids
 from pulsarlm.checkpoint import PulsarLMModelLoadingError
 from pulsarlm.completion import CompletionError, complete
 from pulsarlm.core.engine import Engine, EvictionPolicy, SamplingParams
 from pulsarlm.engine_model import engine_model
 from pulsarlm.paging import PAGE_SIZE, trained_view_pages
+from pulsarlm.reply import ReplyDecoder
 from pulsarlm.settings import Settings
 from pulsarlm.store import LocalStore
 
@@ -23,7 +24,14 @@ __all__ = ["EngineStopped", "PulsarLMModelLoadingError", "new_chat"]
 PROMPT = ">>> "
 
 
-def new_chat(settings: Settings, *, system: str | None, temperature: float) -> None:
+def new_chat(
+    settings: Settings,
+    *,
+    system: str | None,
+    temperature: float,
+    reasoning_effort: ReasoningEffort | None,
+    show_thinking: bool,
+) -> None:
     """Reads user turns until end of input or an interrupt. Raises
     PulsarLMModelLoadingError when no data path holds the model, EngineStopped
     when the engine's loop exited."""
@@ -70,12 +78,16 @@ def new_chat(settings: Settings, *, system: str | None, temperature: float) -> N
                     continue
                 messages.append(("user", line))
                 prompt, system_tokens = encode_prompt(
-                    loaded.tokenizer, loaded.chat_template, messages
+                    loaded.tokenizer,
+                    loaded.chat_template,
+                    messages,
+                    reasoning_effort=reasoning_effort,
                 )
                 if system:
                     eviction.n_sink = math.ceil(system_tokens / PAGE_SIZE)
-                decoder = DecodeStream(skip_special_tokens=False)
-                reply = []
+                decoder = ReplyDecoder(loaded.tokenizer, stops)
+                answer = []
+                reasoning_shown = False
                 try:
                     async for token in complete(
                         async_engine,
@@ -85,17 +97,23 @@ def new_chat(settings: Settings, *, system: str | None, temperature: float) -> N
                         max_tokens=None,
                         eviction=eviction,
                     ):
-                        if token in stops:
+                        part, text = decoder.step(token)
+                        if not text:
                             continue
-                        text = decoder.step(loaded.tokenizer, token) or ""
-                        reply.append(text)
-                        print(text, end="", flush=True)
+                        if part == "content":
+                            if reasoning_shown and not answer:
+                                print()
+                            answer.append(text)
+                            print(text, end="", flush=True)
+                        elif show_thinking:
+                            reasoning_shown = True
+                            print(typer.style(text, dim=True), end="", flush=True)
                 except CompletionError as error:
                     print(f"\nerror: request failed: {error}")
                     messages.pop()
                     continue
                 print()
-                messages.append(("assistant", "".join(reply)))
+                messages.append(("assistant", "".join(answer)))
         finally:
             async_engine.close()
 

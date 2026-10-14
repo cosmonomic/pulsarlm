@@ -2,10 +2,13 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from pulsarlm.chat import ReasoningEffort
+
 
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
+    reasoning: str | None = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -16,6 +19,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: float = Field(default=1.0, ge=0.0, le=2.0)
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     seed: int | None = Field(default=None, ge=0)
+    reasoning_effort: ReasoningEffort | None = None
 
 
 class Usage(BaseModel):
@@ -42,6 +46,7 @@ class ChatCompletionResponse(BaseModel):
 class ChatCompletionChunkDelta(BaseModel):
     role: Literal["assistant"] | None = None
     content: str | None = None
+    reasoning: str | None = None
 
 
 class ChatCompletionChunkChoice(BaseModel):
