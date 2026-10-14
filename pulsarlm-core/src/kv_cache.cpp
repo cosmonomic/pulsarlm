@@ -1,5 +1,7 @@
 #include "pulsarlm/kv_cache.hpp"
 
+#include "pulsarlm/ops.hpp"
+
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -94,12 +96,20 @@ at::Tensor line_of(const at::Tensor& lines, std::uint32_t line_id) {
     return lines.select(0, static_cast<std::int64_t>(line_id));
 }
 
-void copy_into_line(const at::Tensor& lines, std::uint32_t line_id, const at::Tensor& source) {
-    line_of(lines, line_id).copy_(source.select(0, 0), /*non_blocking=*/true);
+void append_segment(std::vector<std::int64_t>& segments, std::size_t device, std::size_t host, std::size_t bytes) {
+    segments.insert(
+        segments.end(),
+        {static_cast<std::int64_t>(device), static_cast<std::int64_t>(host), static_cast<std::int64_t>(bytes)}
+    );
 }
 
-void copy_out_of_line(const at::Tensor& lines, std::uint32_t line_id, const at::Tensor& target) {
-    target.select(0, 0).copy_(line_of(lines, line_id), /*non_blocking=*/true);
+at::Tensor pinned_int64(const std::vector<std::int64_t>& values) {
+    at::Tensor pinned = at::empty(
+        {static_cast<std::int64_t>(values.size() / 3), 3},
+        at::TensorOptions().dtype(at::kLong).pinned_memory(true)
+    );
+    std::ranges::copy(values, pinned.data_ptr<std::int64_t>());
+    return pinned;
 }
 
 void check_page(const page_shape& shape, const at::Tensor& source) {
@@ -342,11 +352,10 @@ void kv_cache::release_staging() noexcept {
     }
 }
 
-// A slot's tensors start at a multiple of their element size, as a typed view of the bytes requires.
-std::optional<page> kv_cache::staging_slot(std::size_t layer, std::size_t& used) const {
+// A slot starts at a multiple of 16 bytes, which lets the copy move 16-byte vectors.
+std::optional<kv_cache::staging_page> kv_cache::staging_slot(std::size_t layer, std::size_t& used) const {
     const page_shape& shape = layers[layer].shape;
-    std::size_t element_bytes = c10::elementSize(shape.dtype);
-    std::size_t first = ceil_div(used, element_bytes) * element_bytes;
+    std::size_t first = ceil_div(used, 16) * 16;
     if (first + line_bytes(shape) > static_cast<std::size_t>(staging.numel())) {
         return std::nullopt;
     }
@@ -356,9 +365,16 @@ std::optional<page> kv_cache::staging_slot(std::size_t layer, std::size_t& used)
             .view(shape.dtype)
             .view(sizes);
     };
-    at::Tensor v = tensor_at(first);
+    at::Tensor k = tensor_at(first);
     used = first + line_bytes(shape);
-    return page{.k = shape.values_only ? v : tensor_at(first + tensor_bytes(shape)), .v = v};
+    return staging_page{
+        .offset = first,
+        .views = page{.k = k, .v = shape.values_only ? k : tensor_at(first + tensor_bytes(shape))},
+    };
+}
+
+std::size_t kv_cache::line_offset(std::size_t layer, std::uint32_t line_id) const noexcept {
+    return line_id * classes[layers[layer].size_class].line_bytes;
 }
 
 // Slots are reused only after the stream finished the copies out of them. The staging buffer holds a page of any
@@ -368,27 +384,29 @@ kv_cache::copy_from_host(std::span<const layer_line> targets, std::span<const pa
     co_await hold_staging();
     std::size_t first = 0;
     while (first < targets.size()) {
+        std::vector<std::int64_t> segments;
+        std::size_t used = 0;
         std::size_t end = first;
+        for (; end < targets.size(); end++) {
+            auto [layer, line_id] = targets[end];
+            std::optional<staging_page> slot = staging_slot(layer, used);
+            if (!slot) {
+                break;
+            }
+            const page_shape& shape = layers[layer].shape;
+            const page& source = pages[end];
+            check_page(shape, source.v);
+            slot->views.v.copy_(source.v);
+            if (!shape.values_only) {
+                check_page(shape, source.k);
+                slot->views.k.copy_(source.k);
+            }
+            append_segment(segments, line_offset(layer, line_id), slot->offset, line_bytes(shape));
+        }
+        at::Tensor pinned_segments = pinned_int64(segments);
         {
             auto guard = guard_stream(pool, stream);
-            std::size_t used = 0;
-            for (; end < targets.size(); end++) {
-                auto [layer, line_id] = targets[end];
-                std::optional<page> slot = staging_slot(layer, used);
-                if (!slot) {
-                    break;
-                }
-                const cache_layer& target = layers[layer];
-                const page& source = pages[end];
-                check_page(target.shape, source.v);
-                slot->v.copy_(source.v);
-                copy_into_line(target.device_kv.v, line_id, slot->v);
-                if (!target.shape.values_only) {
-                    check_page(target.shape, source.k);
-                    slot->k.copy_(source.k);
-                    copy_into_line(target.device_kv.k, line_id, slot->k);
-                }
-            }
+            copy_segments_cuda(pool, staging, pinned_segments, /*to_host=*/false);
         }
         co_await synchronize(stream);
         first = end;
@@ -400,23 +418,22 @@ task<void> kv_cache::copy_to_host(std::span<const layer_line> sources, std::span
     co_await hold_staging();
     std::size_t first = 0;
     while (first < sources.size()) {
+        std::vector<std::int64_t> segments;
         std::vector<page> slots;
+        std::size_t used = 0;
+        while (first + slots.size() < sources.size()) {
+            auto [layer, line_id] = sources[first + slots.size()];
+            std::optional<staging_page> slot = staging_slot(layer, used);
+            if (!slot) {
+                break;
+            }
+            append_segment(segments, line_offset(layer, line_id), slot->offset, line_bytes(layers[layer].shape));
+            slots.push_back(std::move(slot->views));
+        }
+        at::Tensor pinned_segments = pinned_int64(segments);
         {
             auto guard = guard_stream(pool, stream);
-            std::size_t used = 0;
-            while (first + slots.size() < sources.size()) {
-                auto [layer, line_id] = sources[first + slots.size()];
-                std::optional<page> slot = staging_slot(layer, used);
-                if (!slot) {
-                    break;
-                }
-                const cache_layer& source = layers[layer];
-                copy_out_of_line(source.device_kv.v, line_id, slot->v);
-                if (!source.shape.values_only) {
-                    copy_out_of_line(source.device_kv.k, line_id, slot->k);
-                }
-                slots.push_back(std::move(*slot));
-            }
+            copy_segments_cuda(pool, staging, pinned_segments, /*to_host=*/true);
         }
         co_await synchronize(stream);
         for (std::size_t j = 0; j < slots.size(); j++) {

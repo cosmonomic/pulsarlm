@@ -37,6 +37,11 @@ void write_kv_cuda(
 // has run the gather.
 at::Tensor gather_page_tables_cuda(std::span<const at::Tensor> tables, int64_t n_layers, int64_t width);
 
+// Copies segment i, int64 {device byte offset, host byte offset, bytes}, between the
+// device byte tensor and the pinned host byte tensor, toward the host when to_host. The
+// kernel reads the pinned segments, so they stay alive until the stream has run it.
+void copy_segments_cuda(const at::Tensor& device, const at::Tensor& host, const at::Tensor& segments, bool to_host);
+
 // Paged attention over a batch of sequences, each a VIEW: an ordered list of lines
 // (page_size-key pages) of the shared pool. Key index j of sequence s lives at
 // (page_tables[s][j / page_size], j % page_size). A line may appear in several views.

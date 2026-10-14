@@ -112,6 +112,12 @@ class kv_cache {
         std::uint32_t line_id;
     };
 
+    // A page's room in the staging buffer: K then V from byte offset, as in a line.
+    struct staging_page {
+        std::size_t offset;
+        page views;
+    };
+
     at::Tensor pool;
     // The pool bytes below it are carved into lines.
     std::size_t bump = 0;
@@ -141,7 +147,8 @@ class kv_cache {
     void release_staging() noexcept;
     // Room in the staging buffer for a page of layer past its first used bytes, which then cover it too. nullopt when
     // the page does not fit.
-    std::optional<page> staging_slot(std::size_t layer, std::size_t& used) const;
+    std::optional<staging_page> staging_slot(std::size_t layer, std::size_t& used) const;
+    std::size_t line_offset(std::size_t layer, std::uint32_t line_id) const noexcept;
     // The transfers go through the staging buffer as many pages at a time as it holds, and complete once the stream has
     // finished them.
     task<void> copy_from_host(std::span<const layer_line> targets, std::span<const page> pages, cudaStream_t stream);
