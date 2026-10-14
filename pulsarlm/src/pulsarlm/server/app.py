@@ -28,7 +28,7 @@ def load_server_state(settings: Settings, path: Path) -> ServerState:
     store = LocalStore(
         PAGE_SIZE,
         int(settings.store_gib * 2**30),
-        checkpoint.store_path(settings.data_dir),
+        checkpoint.store_path(settings.data_dir) if settings.persist else None,
     )
     engine = Engine(
         store,

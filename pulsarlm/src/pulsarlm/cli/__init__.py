@@ -91,10 +91,18 @@ def serve(
         float,
         typer.Option(
             "--store_gib",
-            help="Pages the store keeps in host memory and in store.sqlite under the data directory, in GiB.",
+            help="Pages the store keeps, in GiB.",
             rich_help_panel="Memory",
         ),
     ] = 16.0,
+    persist: Annotated[
+        bool,
+        typer.Option(
+            "--persist/--no_persist",
+            help="Keep the store in store.sqlite under the data directory.",
+            rich_help_panel="Memory",
+        ),
+    ] = True,
     cycle_tokens: Annotated[
         int,
         typer.Option(
@@ -142,6 +150,7 @@ def serve(
                 staging_gib=staging_gib,
                 prefill_tokens_per_step=prefill_tokens_per_step,
                 store_gib=store_gib,
+                persist=persist,
                 cycle_tokens=cycle_tokens,
                 n_working=n_working,
                 evict_tau=evict_tau,
@@ -233,10 +242,18 @@ def chat(
         float,
         typer.Option(
             "--store_gib",
-            help="Pages the store keeps in host memory and in store.sqlite under the data directory, in GiB.",
+            help="Pages the store keeps, in GiB.",
             rich_help_panel="Memory",
         ),
     ] = 16.0,
+    persist: Annotated[
+        bool,
+        typer.Option(
+            "--persist/--no_persist",
+            help="Keep the store in store.sqlite under the data directory.",
+            rich_help_panel="Memory",
+        ),
+    ] = True,
     cycle_tokens: Annotated[
         int,
         typer.Option(
@@ -284,6 +301,7 @@ def chat(
                 staging_gib=staging_gib,
                 prefill_tokens_per_step=prefill_tokens_per_step,
                 store_gib=store_gib,
+                persist=persist,
                 cycle_tokens=cycle_tokens,
                 n_working=n_working,
                 evict_tau=evict_tau,

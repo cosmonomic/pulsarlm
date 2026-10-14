@@ -12,6 +12,7 @@ class Settings:
     staging_gib: float
     prefill_tokens_per_step: int
     store_gib: float
+    persist: bool
     cycle_tokens: int
     n_working: int
     evict_tau: float
