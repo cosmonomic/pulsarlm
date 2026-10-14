@@ -1,6 +1,7 @@
 """The Chat Completions route on a small random Qwen3 and a word-level tokenizer."""
 
 import json
+from collections.abc import Callable
 
 import pytest
 import torch
@@ -28,6 +29,7 @@ DEVICE = torch.device("cuda", 0)
 DTYPE = torch.bfloat16
 LINE_BYTES = 2 * N_LAYERS * PAGE_SIZE * N_KV_HEADS * HEAD_DIM * DTYPE.itemsize
 MODEL_ID = "random-qwen3"
+BASE_URL = "http://testserver/api/openai/v1"
 SPECIAL_TOKENS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>"]
 ROLES = ["system", "user", "assistant"]
 
@@ -146,16 +148,24 @@ def encode(state: ServerState, messages: list[dict[str, str]]) -> list[int]:
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
+def api_client(load_state: Callable[[], ServerState]) -> TestClient:
+    return TestClient(create_app(load_state), base_url=BASE_URL)
+
+
 @pytest.fixture
 def client():
-    with TestClient(create_app(load)) as client:
+    with api_client(load) as client:
         yield client
 
 
 def post(client: TestClient, **body):
-    return client.post(
-        "/api/openai/v1/chat/completions", json={"model": MODEL_ID, **body}
-    )
+    return client.post("/chat/completions", json={"model": MODEL_ID, **body})
+
+
+def test_the_models_route_lists_only_the_loaded_model(client):
+    response = client.get("/models")
+    assert response.status_code == 200
+    assert [card["id"] for card in response.json()["data"]] == [MODEL_ID]
 
 
 def test_a_completion_stops_at_max_tokens(client):
@@ -197,7 +207,7 @@ def test_a_follow_up_continues_from_a_stored_state(client):
 
 
 def test_a_reply_ending_at_any_stop_token_leaves_its_end_state_findable():
-    with TestClient(create_app(lambda: load([IM_END, FIRST_SAMPLED]))) as client:
+    with api_client(lambda: load([IM_END, FIRST_SAMPLED])) as client:
         first = post(client, messages=MESSAGES, max_tokens=4).json()
         assert first["choices"][0]["finish_reason"] == "stop"
         assert first["usage"]["completion_tokens"] == 1
@@ -218,7 +228,7 @@ def test_a_reply_ending_at_any_stop_token_leaves_its_end_state_findable():
 def test_a_seeded_sampled_completion_repeats():
     def sample(seed: int) -> str:
         # A small embedding scale spreads the next-token distribution.
-        with TestClient(create_app(lambda: load(embedding_scale=0.05))) as client:
+        with api_client(lambda: load(embedding_scale=0.05)) as client:
             body = post(
                 client, messages=MESSAGES, max_tokens=8, temperature=1.0, seed=seed
             ).json()
@@ -233,13 +243,13 @@ def test_a_temperature_outside_the_api_range_is_rejected(client):
 
 
 def test_a_request_larger_than_the_cache_fails():
-    with TestClient(create_app(lambda: load(n_lines=2))) as client:
+    with api_client(lambda: load(n_lines=2)) as client:
         response = post(client, messages=MESSAGES)
         assert response.status_code == 503
 
 
 def test_an_error_after_a_stream_started_is_an_error_event():
-    with TestClient(create_app(lambda: load(n_lines=2))) as client:
+    with api_client(lambda: load(n_lines=2)) as client:
         response = post(client, messages=MESSAGES, stream=True)
 
     assert response.status_code == 200
@@ -259,7 +269,7 @@ def test_the_view_cap_keeps_positions_within_the_trained_context():
 
 def test_an_unknown_model_is_not_found(client):
     response = client.post(
-        "/api/openai/v1/chat/completions",
+        "/chat/completions",
         json={"model": "other", "messages": MESSAGES},
     )
     assert response.status_code == 404
