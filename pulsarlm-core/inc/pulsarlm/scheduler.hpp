@@ -1,6 +1,5 @@
 #pragma once
 
-#include <ATen/core/Generator.h>
 #include <ATen/core/Tensor.h>
 #include <c10/core/Device.h>
 #include <cuda_runtime_api.h>
@@ -45,7 +44,9 @@ class sequence {
 
     result_writer& writer;
     sampling_params sampling;
-    at::Generator generator;
+    std::uint64_t seed;
+    // Tokens sampled so far, each with its own draw of the seed's noise.
+    std::uint64_t draw_count = 0;
     std::optional<std::size_t> max_tokens;
     std::size_t generated = 0;
     std::vector<digest> page_hashes;

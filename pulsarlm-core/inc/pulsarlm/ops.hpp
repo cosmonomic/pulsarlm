@@ -42,6 +42,11 @@ at::Tensor gather_page_tables_cuda(std::span<const at::Tensor> tables, int64_t n
 // kernel reads the pinned segments, so they stay alive until the stream has run it.
 void copy_segments_cuda(const at::Tensor& device, const at::Tensor& host, const at::Tensor& segments, bool to_host);
 
+// int64 [rows]: per row of scores [rows, vocab], argmax(x / T + g) with each g drawn from Gumbel(0, 1), which is
+// index i with probability softmax(x / T)_i; a row with T <= 0 takes argmax(x). temperatures is fp32 [rows]; draws is
+// int64 [2, rows], each row's seed and draw count, of which the noise is a function.
+at::Tensor gumbel_race_cuda(const at::Tensor& scores, const at::Tensor& temperatures, const at::Tensor& draws);
+
 // Paged attention over a batch of sequences, each a VIEW: an ordered list of lines
 // (page_size-key pages) of the shared pool. Key index j of sequence s lives at
 // (page_tables[s][j / page_size], j % page_size). A line may appear in several views.

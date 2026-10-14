@@ -1,67 +1,78 @@
 #include "pulsarlm/sampling.hpp"
 
+#include "pulsarlm/ops.hpp"
+
 #include <ATen/ATen.h>
-#include <ATen/CPUGeneratorImpl.h>
-#include <ATen/cuda/CUDAGeneratorImpl.h>
 
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <random>
 #include <span>
+#include <vector>
 
 namespace pulsarlm {
 
 namespace {
 
-// argmax(p / e), with each e drawn from Exp(1), is index i with probability p_i / sum(p). Unlike at::multinomial, it
-// reads nothing back to the host.
-at::Tensor draw(const at::Tensor& probabilities, at::Generator& generator) {
-    at::Tensor race = at::empty_like(probabilities).exponential_(1.0, generator);
-    return (probabilities / race).argmax();
-}
-
-at::Tensor sample_row(const at::Tensor& logits, const sampling_params& params, at::Generator& generator) {
-    at::Tensor probabilities = at::softmax(logits.to(at::kFloat) / params.temperature, -1);
-    bool top_k = params.top_k > 0;
-    bool top_p = params.top_p > 0.0 && params.top_p < 1.0;
-    if (!top_k && !top_p) {
-        return draw(probabilities, generator);
-    }
-    auto [sorted, order] = at::sort(probabilities, -1, /*descending=*/true);
-    at::Tensor kept = at::ones_like(sorted, at::kBool);
-    if (top_k) {
-        kept &= at::arange(sorted.size(0), sorted.options().dtype(at::kLong)) < static_cast<std::int64_t>(params.top_k);
-    }
-    if (top_p) {
-        kept &= at::cumsum(sorted, -1) - sorted <= params.top_p;
-    }
-    return order.index_select(0, draw(sorted * kept, generator).unsqueeze(0)).squeeze(0);
+template <typename T> at::Tensor rows_on_device(const std::vector<T>& values, at::ScalarType dtype, at::Device device) {
+    at::Tensor pinned = at::empty(
+        {static_cast<std::int64_t>(values.size())},
+        at::TensorOptions().dtype(dtype).pinned_memory(true)
+    );
+    std::ranges::copy(values, static_cast<T*>(pinned.data_ptr()));
+    return pinned.to(device, /*non_blocking=*/true);
 }
 
 }  // namespace
 
-at::Generator make_sampling_generator(at::Device device, std::optional<std::uint64_t> seed) {
-    at::Generator generator = device.is_cuda() ? at::make_generator<at::CUDAGeneratorImpl>(device.index())
-                                               : at::make_generator<at::CPUGeneratorImpl>();
+std::uint64_t sampling_seed(std::optional<std::uint64_t> seed) {
     if (seed) {
-        generator.set_current_seed(*seed);
-    } else {
-        generator.seed();
+        return *seed;
     }
-    return generator;
+    std::random_device device;
+    return (static_cast<std::uint64_t>(device()) << 32) | device();
 }
 
-at::Tensor sample(const at::Tensor& logits, std::span<const sampling_params> params, std::span<at::Generator> generators) {
-    assert(params.size() == static_cast<std::size_t>(logits.size(0)) && generators.size() == params.size());
-    at::Tensor tokens = logits.argmax(-1);
+// A row keeping every token gets top_k vocab and top_p 2. With top_k or top_p the race runs over the log of the kept
+// probabilities in rank order, at temperature 1 for a drawing row and 0 for an argmax row.
+at::Tensor
+sample(const at::Tensor& logits, std::span<const sampling_params> params, std::span<const sampling_draw> draws) {
+    assert(params.size() == static_cast<std::size_t>(logits.size(0)) && draws.size() == params.size());
+    const std::int64_t vocab = logits.size(1);
+    const auto rows = static_cast<std::int64_t>(params.size());
+    std::vector<float> temperature;
+    std::vector<std::int64_t> top_k;
+    std::vector<float> top_p;
+    std::vector<std::int64_t> seeds_then_counts(2 * params.size());
+    bool any_filter = false;
     for (std::size_t row = 0; row < params.size(); row++) {
-        if (params[row].temperature > 0.0) {
-            auto index = static_cast<std::int64_t>(row);
-            tokens.select(0, index).copy_(sample_row(logits.select(0, index), params[row], generators[row]));
-        }
+        const sampling_params& p = params[row];
+        const bool draws_row = p.temperature > 0.0;
+        const bool keeps_top_k = p.top_k > 0;
+        const bool keeps_top_p = p.top_p > 0.0 && p.top_p < 1.0;
+        any_filter |= draws_row && (keeps_top_k || keeps_top_p);
+        temperature.push_back(draws_row ? static_cast<float>(p.temperature) : 0.0f);
+        top_k.push_back(keeps_top_k ? static_cast<std::int64_t>(p.top_k) : vocab);
+        top_p.push_back(keeps_top_p ? static_cast<float>(p.top_p) : 2.0f);
+        seeds_then_counts[row] = static_cast<std::int64_t>(draws[row].seed);
+        seeds_then_counts[params.size() + row] = static_cast<std::int64_t>(draws[row].count);
     }
-    return tokens;
+    const at::Device device = logits.device();
+    at::Tensor draw_rows = rows_on_device(seeds_then_counts, at::kLong, device).view({2, rows});
+    at::Tensor temperatures = rows_on_device(temperature, at::kFloat, device);
+    if (!any_filter) {
+        return gumbel_race_cuda(logits.contiguous(), temperatures, draw_rows);
+    }
+    at::Tensor drawing = temperatures > 0.0f;
+    at::Tensor divisor = at::where(drawing, temperatures, at::ones_like(temperatures)).unsqueeze(1);
+    auto [sorted, order] = at::sort(at::softmax(logits.to(at::kFloat) / divisor, -1), -1, /*descending=*/true);
+    at::Tensor ranks = at::arange(vocab, sorted.options().dtype(at::kLong)).unsqueeze(0);
+    at::Tensor kept = ranks < rows_on_device(top_k, at::kLong, device).unsqueeze(1);
+    kept &= at::cumsum(sorted, -1) - sorted <= rows_on_device(top_p, at::kFloat, device).unsqueeze(1);
+    at::Tensor rank = gumbel_race_cuda(at::log(sorted * kept).contiguous(), drawing.to(at::kFloat), draw_rows);
+    return order.gather(1, rank.unsqueeze(1)).squeeze(1);
 }
 
 }  // namespace pulsarlm

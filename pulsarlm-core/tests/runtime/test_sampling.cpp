@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace {
@@ -17,16 +18,16 @@ using pulsarlm::sampling_params;
 
 const at::Device device(at::kCUDA, 0);
 
-// One generator shared by every row, so each row draws after the one before.
-std::vector<at::Generator> shared_generator(std::size_t rows, std::optional<std::uint64_t> seed) {
-    return std::vector<at::Generator>(rows, pulsarlm::make_sampling_generator(device, seed));
-}
-
+// Every row draws with seed, row r as the seed's r-th draw.
 at::Tensor draw_tokens(const at::Tensor& logits, const sampling_params& params, std::optional<std::uint64_t> seed) {
     auto rows = static_cast<std::size_t>(logits.size(0));
     std::vector<sampling_params> row_params(rows, params);
-    std::vector<at::Generator> generators = shared_generator(rows, seed);
-    return pulsarlm::sample(logits, row_params, generators).cpu();
+    std::uint64_t row_seed = pulsarlm::sampling_seed(seed);
+    std::vector<pulsarlm::sampling_draw> draws;
+    for (std::size_t row = 0; row < rows; row++) {
+        draws.push_back(pulsarlm::sampling_draw{.seed = row_seed, .count = row});
+    }
+    return pulsarlm::sample(logits, row_params, draws).cpu();
 }
 
 TEST_CASE("temperature 0 takes each row's argmax") {
@@ -71,6 +72,43 @@ TEST_CASE("the same seed draws the same tokens") {
     at::Tensor other = draw_tokens(logits, params, 8);
     REQUIRE(at::equal(first, second));
     REQUIRE(!at::equal(first, other));
+}
+
+TEST_CASE("a row draws the same token whatever the other rows of its batch are") {
+    at::manual_seed(0);
+    at::Tensor logits = at::randn({8, 100}).to(device);
+    std::vector<sampling_params> params(8, sampling_params{.temperature = 1.0});
+    std::vector<pulsarlm::sampling_draw> draws;
+    for (std::uint64_t row = 0; row < 8; row++) {
+        draws.push_back(pulsarlm::sampling_draw{.seed = 100 + row, .count = 3});
+    }
+    at::Tensor batched = pulsarlm::sample(logits, params, draws).cpu();
+    for (std::int64_t row = 0; row < 8; row++) {
+        at::Tensor alone = pulsarlm::sample(
+            logits.narrow(0, row, 1),
+            std::span(params).subspan(static_cast<std::size_t>(row), 1),
+            std::span(draws).subspan(static_cast<std::size_t>(row), 1)
+        );
+        REQUIRE(alone.item<std::int64_t>() == batched[row].item<std::int64_t>());
+    }
+}
+
+TEST_CASE("rows at temperature 0 take their argmax beside rows that draw") {
+    at::manual_seed(0);
+    at::Tensor logits = at::randn({4, 100}).to(device);
+    std::vector<sampling_params> params{
+        sampling_params{},
+        sampling_params{.temperature = 1.0, .top_k = 5},
+        sampling_params{},
+        sampling_params{.temperature = 1.0},
+    };
+    std::vector<pulsarlm::sampling_draw> draws(4, pulsarlm::sampling_draw{.seed = 1, .count = 0});
+    at::Tensor tokens = pulsarlm::sample(logits, params, draws).cpu();
+    at::Tensor argmax = logits.argmax(-1).cpu();
+    REQUIRE(tokens[0].item<std::int64_t>() == argmax[0].item<std::int64_t>());
+    REQUIRE(tokens[2].item<std::int64_t>() == argmax[2].item<std::int64_t>());
+    at::Tensor top5 = std::get<1>(logits[1].topk(5)).cpu();
+    REQUIRE(top5.eq(tokens[1]).any().item<bool>());
 }
 
 }  // namespace

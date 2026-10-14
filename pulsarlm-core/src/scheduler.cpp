@@ -58,7 +58,7 @@ GroupBatch to_device(const GroupBatch& host, at::Device device) {
 sequence::sequence(request&& r, result_writer& writer, std::size_t n_kv_layers, at::Device device)
 : writer(writer),
   sampling(r.sampling),
-  generator(make_sampling_generator(device, r.sampling.seed)),
+  seed(sampling_seed(r.sampling.seed)),
   max_tokens(r.max_tokens),
   page_hashes(std::move(r.initial_state.page_hashes)),
   pending(std::move(r.initial_state.tail)),
@@ -344,7 +344,7 @@ void batch::enqueue(Model& model, std::span<const kv> lines, cudaStream_t stream
 
     std::vector<at::Tensor> rows;
     std::vector<sampling_params> params;
-    std::vector<at::Generator> generators;
+    std::vector<sampling_draw> draws;
     for (std::size_t i = 0; i < entries.size(); i++) {
         const entry& e = entries[i];
         if (e.samples) {
@@ -352,13 +352,13 @@ void batch::enqueue(Model& model, std::span<const kv> lines, cudaStream_t stream
             const auto row = static_cast<std::int64_t>(decodes ? i : i - decode_count);
             rows.push_back((decodes ? *logits.decode : *logits.prefill).select(0, row));
             params.push_back(e.seq->sampling);
-            generators.push_back(e.seq->generator);
+            draws.push_back(sampling_draw{.seed = e.seq->seed, .count = e.seq->draw_count++});
         }
     }
     if (rows.empty()) {
         return;
     }
-    at::Tensor tokens = sample(at::stack(rows), params, generators);
+    at::Tensor tokens = sample(at::stack(rows), params, draws);
     sampled = pinned({static_cast<std::int64_t>(rows.size())}, at::kLong);
     sampled.copy_(tokens, /*non_blocking=*/true);
 }

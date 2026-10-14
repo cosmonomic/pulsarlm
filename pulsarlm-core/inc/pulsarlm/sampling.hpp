@@ -1,8 +1,6 @@
 #pragma once
 
-#include <ATen/core/Generator.h>
 #include <ATen/core/Tensor.h>
-#include <c10/core/Device.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -20,11 +18,19 @@ struct sampling_params {
     std::optional<std::uint64_t> seed;
 };
 
-// Seeded with seed, or nondeterministically without one.
-at::Generator make_sampling_generator(at::Device device, std::optional<std::uint64_t> seed);
+// A row's seed and the number of tokens drawn with it before. Rows with equal draws and probabilities draw equal
+// tokens, whatever the other rows are.
+struct sampling_draw {
+    std::uint64_t seed;
+    std::uint64_t count;
+};
 
-// One token per row of logits [rows, vocab], drawn with that row's params and generator: int64 [rows] on the logits'
+// seed, or a nondeterministic one without it.
+std::uint64_t sampling_seed(std::optional<std::uint64_t> seed);
+
+// One token per row of logits [rows, vocab], drawn with that row's params and draw: int64 [rows] on the logits'
 // device. Queues its work on the current stream and does not wait for it.
-at::Tensor sample(const at::Tensor& logits, std::span<const sampling_params> params, std::span<at::Generator> generators);
+at::Tensor
+sample(const at::Tensor& logits, std::span<const sampling_params> params, std::span<const sampling_draw> draws);
 
 }  // namespace pulsarlm
