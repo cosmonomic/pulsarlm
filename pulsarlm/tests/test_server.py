@@ -12,7 +12,7 @@ from pulsarlm.async_engine import AsyncEngine
 from pulsarlm.chat import ChatTemplate, encode_prompt
 from pulsarlm.core.engine import Engine, EvictionPolicy, ModelConfig
 from pulsarlm.server import create_app
-from pulsarlm.server.app import trained_view_pages
+from pulsarlm.paging import trained_view_pages
 from pulsarlm.server.openai import ServerState
 from pulsarlm.server.openai.schema import ChatMessage
 from pulsarlm.store import LocalStore

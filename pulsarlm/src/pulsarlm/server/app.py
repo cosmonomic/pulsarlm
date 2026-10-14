@@ -1,6 +1,5 @@
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -11,54 +10,29 @@ from pulsarlm.async_engine import AsyncEngine
 from pulsarlm.chat import stop_ids
 from pulsarlm.core.engine import Engine, EvictionPolicy
 from pulsarlm.engine_model import engine_model
+from pulsarlm.paging import PAGE_SIZE, trained_view_pages
 from pulsarlm.server.openai import ServerState
 from pulsarlm.server.openai import router as openai_router
+from pulsarlm.settings import Settings
 from pulsarlm.store import LocalStore
 
-_PAGE_SIZE = 16  # the tensor-core paged attention kernel requires 16 or 32
 
-
-@dataclass
-class Settings:
-    model: str
-    model_path: Path
-    device: str
-    dtype: torch.dtype
-    kv_cache_gib: float
-    staging_gib: float
-    prefill_tokens_per_step: int
-    store_gib: float
-    cycle_tokens: int
-    n_working: int
-    evict_tau: float
-    max_pages: int | None
-
-
-def trained_view_pages(max_positions: int, cycle_tokens: int) -> int | None:
-    """The most full pages a view keeps at a cycle's end so that, with a partial tail
-    page and the next cycle's tokens, its positions stay within the model's trained
-    context. None when the config states no limit."""
-    if max_positions <= 0:
-        return None
-    return max(1, (max_positions - cycle_tokens - (_PAGE_SIZE - 1)) // _PAGE_SIZE)
-
-
-def load_server_state(settings: Settings) -> ServerState:
+def load_server_state(settings: Settings, path: Path) -> ServerState:
     model = checkpoint.load(
-        settings.model_path,
+        path,
         device=torch.device(settings.device),
-        dtype=settings.dtype,
+        dtype=getattr(torch, settings.dtype),
     )
     cfg = model.config
     stops = stop_ids(model.tokenizer, cfg.eos_ids)
-    store = LocalStore(_PAGE_SIZE, int(settings.store_gib * 2**30))
+    store = LocalStore(PAGE_SIZE, int(settings.store_gib * 2**30))
     engine = Engine(
         store,
         engine_model(cfg),
         model.weights,
         model_name=settings.model,
-        page_size=_PAGE_SIZE,
-        kv_dtype=settings.dtype,
+        page_size=PAGE_SIZE,
+        kv_dtype=getattr(torch, settings.dtype),
         kv_cache_gib=settings.kv_cache_gib,
         staging_gib=settings.staging_gib,
         device=torch.device(settings.device),
@@ -71,7 +45,7 @@ def load_server_state(settings: Settings) -> ServerState:
         tokenizer=model.tokenizer,
         chat_template=model.chat_template,
         model_id=settings.model,
-        page_size=_PAGE_SIZE,
+        page_size=PAGE_SIZE,
         stop_ids=stops,
         eviction=EvictionPolicy(
             n_working=settings.n_working,
