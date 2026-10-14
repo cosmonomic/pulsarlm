@@ -174,8 +174,18 @@ double max_relative_error(const at::Tensor& got, const at::Tensor& expected) {
 
 void check_against_dense(at::ScalarType dtype, double tolerance) {
     weights w(dtype);
-    pulsarlm::Qwen3Model
-        model(n_layers, n_heads, n_kv_heads, head_dim, hidden, intermediate, vocab, rope_theta, rms_eps, w.named);
+    pulsarlm::Qwen3Model model(
+        n_layers,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        hidden,
+        intermediate,
+        vocab,
+        {.theta = rope_theta},
+        rms_eps,
+        w.named
+    );
     model.set_relevance_layers(relevance_layers);
     std::vector<pulsarlm::kv> kv;
     for (std::int64_t layer = 0; layer < n_layers; layer++) {

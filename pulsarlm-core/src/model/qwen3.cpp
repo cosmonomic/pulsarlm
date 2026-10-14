@@ -30,7 +30,7 @@ Qwen3Model::Qwen3Model(
     int64_t hidden,
     int64_t intermediate,
     int64_t vocab,
-    double rope_theta,
+    rope_parameters rope,
     double rms_eps,
     c10::Dict<std::string, at::Tensor> weights
 )
@@ -41,7 +41,7 @@ Qwen3Model::Qwen3Model(
   hidden(hidden),
   intermediate(intermediate),
   vocab(vocab),
-  rope_theta(rope_theta),
+  rope(rope),
   rms_eps(rms_eps),
   scale(1.0 / std::sqrt(static_cast<double>(head_dim))),
   embed_tokens(need(weights, "model.embed_tokens.weight")),
@@ -97,7 +97,7 @@ at::Tensor Qwen3Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, s
         (g.is_prefill() ? this->cap_prefill : this->cap_decode)[layer] = q_pre;
     }
 
-    q = rope_q(q, g.pos, this->n_heads, this->head_dim, {.theta = this->rope_theta});
+    q = rope_q(q, g.pos, this->n_heads, this->head_dim, this->rope);
     v = v.view({ntok, this->n_kv_heads, this->head_dim}).contiguous();
     // Capture the softmax denominator on the same layers as Q: the recall score needs
     // the denominator the attention actually used, not one rebuilt over a subset.
@@ -114,7 +114,7 @@ at::Tensor Qwen3Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, s
         g,
         this->relevance_layers.contains(layer),
         this->scale,
-        {.theta = this->rope_theta},
+        this->rope,
         std::nullopt,
         std::nullopt,
         lse

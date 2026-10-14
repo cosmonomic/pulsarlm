@@ -103,6 +103,74 @@ def test_a_qwen3_checkpoint_measures_mass_on_its_top_quarter():
     assert isinstance(engine_model(cfg), ModelConfig)
 
 
+def llama(**text) -> PulsarLMModelConfig:
+    base = {
+        "model_type": "llama",
+        "eos_token_id": [128001, 128008, 128009],
+        "vocab_size": 128256,
+        "hidden_size": 4096,
+        "intermediate_size": 14336,
+        "num_hidden_layers": 32,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "rope_theta": 500000.0,
+        "rope_scaling": None,
+        "rms_norm_eps": 1e-5,
+    }
+    return PulsarLMModelConfig.from_dict(base | text)
+
+
+LLAMA3_SCALING = {
+    "factor": 8.0,
+    "low_freq_factor": 1.0,
+    "high_freq_factor": 4.0,
+    "original_max_position_embeddings": 8192,
+    "rope_type": "llama3",
+}
+
+
+def test_a_llama_checkpoint_without_rope_scaling_takes_plain_rope():
+    model = engine_model(llama())
+
+    assert isinstance(model, ModelConfig)
+    assert model.rope.theta == 500000.0
+    assert model.rope.llama3_scaling is None
+
+
+@pytest.mark.parametrize(
+    "rope",
+    [
+        {"rope_scaling": LLAMA3_SCALING},
+        {"rope_parameters": LLAMA3_SCALING | {"rope_theta": 500000.0}},
+    ],
+)
+def test_llama3_rope_scaling_is_read_from_either_config_layout(rope):
+    model = engine_model(llama(**rope))
+
+    assert isinstance(model, ModelConfig)
+    assert model.rope.theta == 500000.0
+    scaling = model.rope.llama3_scaling
+    assert scaling is not None
+    assert scaling.factor == 8.0
+    assert scaling.low_freq_factor == 1.0
+    assert scaling.high_freq_factor == 4.0
+    assert scaling.original_max_position_embeddings == 8192
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        {"rope_scaling": {"type": "yarn", "factor": 4.0}},
+        {"rope_scaling": {"rope_type": "dynamic", "factor": 2.0}},
+        {"attention_bias": True},
+        {"mlp_bias": True},
+    ],
+)
+def test_an_unsupported_llama_config_is_rejected(text):
+    with pytest.raises(PulsarLMModelLoadingError):
+        engine_model(llama(**text))
+
+
 def test_an_unknown_architecture_is_rejected():
     with pytest.raises(PulsarLMModelLoadingError, match="unsupported architecture"):
-        PulsarLMModelConfig.from_dict({"model_type": "llama", "eos_token_id": 2})
+        PulsarLMModelConfig.from_dict({"model_type": "mistral", "eos_token_id": 2})

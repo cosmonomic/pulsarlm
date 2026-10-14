@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pulsarlm/model/interface.hpp"
+#include "pulsarlm/rope.hpp"
 
 #include <ATen/core/Tensor.h>
 
@@ -36,7 +37,7 @@ struct Qwen2Model : Model {
         int64_t hidden,
         int64_t intermediate,
         int64_t vocab,
-        double rope_theta,
+        rope_parameters rope,
         double rms_eps,
         c10::Dict<std::string, at::Tensor> weights
     );
@@ -78,7 +79,7 @@ struct Qwen2Model : Model {
     int64_t hidden;
     int64_t intermediate;
     int64_t vocab;
-    double rope_theta;
+    rope_parameters rope;
     double rms_eps;
     double scale;  // 1 / sqrt(head_dim)
     at::Tensor embed_tokens;  // [vocab, hidden]; tied lm_head

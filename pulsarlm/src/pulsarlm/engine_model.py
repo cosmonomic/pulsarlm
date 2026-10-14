@@ -1,7 +1,12 @@
 """The engine's model config for a checkpoint's text model."""
 
 from pulsarlm.checkpoint import GEMMA4, PulsarLMModelConfig, PulsarLMModelLoadingError
-from pulsarlm.core.engine import Gemma4Config, ModelConfig, RopeParameters
+from pulsarlm.core.engine import (
+    Gemma4Config,
+    Llama3RopeScaling,
+    ModelConfig,
+    RopeParameters,
+)
 
 SLIDING = "sliding_attention"
 FULL = "full_attention"
@@ -72,7 +77,33 @@ def gemma4_config(architecture: str, text: dict) -> Gemma4Config:
     )
 
 
-def qwen_config(architecture: str, text: dict) -> ModelConfig:
+def rope(text: dict) -> RopeParameters:
+    """Reads Hugging Face's rope_parameters, or the rope_scaling and rope_theta
+    that preceded it."""
+    parameters = text.get("rope_parameters") or text.get("rope_scaling") or {}
+    theta = float(parameters.get("rope_theta", text.get("rope_theta")))
+    match parameters.get("rope_type", parameters.get("type", "default")):
+        case "default":
+            return RopeParameters(theta=theta)
+        case "llama3":
+            return RopeParameters(
+                theta=theta,
+                llama3_scaling=Llama3RopeScaling(
+                    factor=float(parameters["factor"]),
+                    low_freq_factor=float(parameters["low_freq_factor"]),
+                    high_freq_factor=float(parameters["high_freq_factor"]),
+                    original_max_position_embeddings=float(
+                        parameters["original_max_position_embeddings"]
+                    ),
+                ),
+            )
+        case rope_type:
+            raise PulsarLMModelLoadingError(f"unsupported RoPE {rope_type}")
+
+
+def dense_config(architecture: str, text: dict) -> ModelConfig:
+    if text.get("attention_bias") or text.get("mlp_bias"):
+        raise PulsarLMModelLoadingError("unsupported attention or MLP bias")
     n_heads = text["num_attention_heads"]
     return ModelConfig(
         architecture=architecture,
@@ -83,7 +114,7 @@ def qwen_config(architecture: str, text: dict) -> ModelConfig:
         hidden=text["hidden_size"],
         intermediate=text["intermediate_size"],
         vocab_size=text["vocab_size"],
-        rope_theta=float(text["rope_theta"]),
+        rope=rope(text),
         rms_eps=float(text["rms_norm_eps"]),
         relevance_layers=top_quarter(text["num_hidden_layers"]),
     )
@@ -93,4 +124,4 @@ def engine_model(cfg: PulsarLMModelConfig) -> ModelConfig | Gemma4Config:
     """Measures attention mass on the full-attention layers of the top quarter."""
     if cfg.architecture in GEMMA4:
         return gemma4_config(cfg.architecture, cfg.text)
-    return qwen_config(cfg.architecture, cfg.text)
+    return dense_config(cfg.architecture, cfg.text)

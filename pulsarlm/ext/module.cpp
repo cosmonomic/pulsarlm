@@ -167,7 +167,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
                         std::int64_t hidden,
                         std::int64_t intermediate,
                         std::int64_t vocab_size,
-                        double rope_theta,
+                        const rope_parameters& rope,
                         double rms_eps,
                         std::vector<std::int64_t> relevance_layers) {
                 return model_config{
@@ -179,7 +179,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
                     hidden,
                     intermediate,
                     vocab_size,
-                    rope_theta,
+                    rope,
                     rms_eps,
                     std::move(relevance_layers),
                 };
@@ -193,22 +193,44 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "hidden"_a,
             "intermediate"_a,
             "vocab_size"_a,
-            "rope_theta"_a,
+            "rope"_a,
             "rms_eps"_a,
             "relevance_layers"_a
-        );
+        )
+        .def_readonly("rope", &model_config::rope);
+
+    py::class_<llama3_rope_scaling>(m, "Llama3RopeScaling")
+        .def(
+            py::init([](double factor,
+                        double low_freq_factor,
+                        double high_freq_factor,
+                        double original_max_position_embeddings) {
+                return llama3_rope_scaling{factor, low_freq_factor, high_freq_factor, original_max_position_embeddings};
+            }),
+            py::kw_only(),
+            "factor"_a,
+            "low_freq_factor"_a,
+            "high_freq_factor"_a,
+            "original_max_position_embeddings"_a
+        )
+        .def_readonly("factor", &llama3_rope_scaling::factor)
+        .def_readonly("low_freq_factor", &llama3_rope_scaling::low_freq_factor)
+        .def_readonly("high_freq_factor", &llama3_rope_scaling::high_freq_factor)
+        .def_readonly("original_max_position_embeddings", &llama3_rope_scaling::original_max_position_embeddings);
 
     py::class_<rope_parameters>(m, "RopeParameters")
         .def(
-            py::init([](double theta, double partial_rotary_factor) {
-                return rope_parameters{theta, partial_rotary_factor};
+            py::init([](double theta, double partial_rotary_factor, std::optional<llama3_rope_scaling> llama3_scaling) {
+                return rope_parameters{theta, partial_rotary_factor, llama3_scaling};
             }),
             py::kw_only(),
             "theta"_a,
-            "partial_rotary_factor"_a = 1.0
+            "partial_rotary_factor"_a = 1.0,
+            "llama3_scaling"_a = py::none()
         )
         .def_readonly("theta", &rope_parameters::theta)
-        .def_readonly("partial_rotary_factor", &rope_parameters::partial_rotary_factor);
+        .def_readonly("partial_rotary_factor", &rope_parameters::partial_rotary_factor)
+        .def_readonly("llama3_scaling", &rope_parameters::llama3_scaling);
 
     py::class_<gemma4_model_config>(m, "Gemma4Config")
         .def(

@@ -1,3 +1,5 @@
+from datetime import datetime
+
 import pytest
 from tokenizers import Tokenizer, models, pre_tokenizers
 
@@ -66,3 +68,9 @@ def test_raise_exception_in_a_template_raises():
     template = ChatTemplate("{{ raise_exception('no') }}", {})
     with pytest.raises(ValueError, match="no"):
         template.render([], add_generation_prompt=False)
+
+
+def test_the_template_can_read_the_date():
+    template = ChatTemplate("{{ strftime_now('%Y') }}", {})
+    rendered = template.render([], add_generation_prompt=False)
+    assert rendered == str(datetime.now().year)

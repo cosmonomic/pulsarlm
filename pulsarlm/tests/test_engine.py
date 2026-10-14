@@ -10,6 +10,7 @@ from pulsarlm.core.engine import (
     Engine,
     ModelConfig,
     RequestError,
+    RopeParameters,
     State,
 )
 
@@ -34,7 +35,7 @@ MODEL = ModelConfig(
     hidden=HIDDEN,
     intermediate=INTERMEDIATE,
     vocab_size=VOCAB_SIZE,
-    rope_theta=1e6,
+    rope=RopeParameters(theta=1e6),
     rms_eps=1e-6,
     relevance_layers=[N_LAYERS - 1],
 )

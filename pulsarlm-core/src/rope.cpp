@@ -14,15 +14,30 @@ namespace pulsarlm {
 
 namespace {
 
+constexpr long double two_pi = 6.28318530717958647692528676655900577L;
+
 double quadrants_per_position(long double frequency) {
     constexpr long double two_over_pi = 0.63661977236758134307553505349005745L;
     return static_cast<double>(frequency * two_over_pi);
 }
 
 int64_t fixed_point_turns_per_position(long double frequency) {
-    constexpr long double two_pi = 6.28318530717958647692528676655900577L;
     const long double fixed_point = std::nearbyint(std::ldexp(frequency / two_pi, 64));
     return std::bit_cast<int64_t>(static_cast<uint64_t>(fixed_point));
+}
+
+long double llama3_scaled(long double frequency, const llama3_rope_scaling& scaling) {
+    const long double wavelength = two_pi / frequency;
+    const long double original = scaling.original_max_position_embeddings;
+    if (wavelength < original / scaling.high_freq_factor) {
+        return frequency;
+    }
+    if (wavelength > original / scaling.low_freq_factor) {
+        return frequency / scaling.factor;
+    }
+    const long double smooth = (original / wavelength - scaling.low_freq_factor) /
+        (scaling.high_freq_factor - scaling.low_freq_factor);
+    return (1.0L - smooth) * frequency / scaling.factor + smooth * frequency;
 }
 
 long double rope_frequency(const rope_parameters& rope, int64_t head_dim, int64_t pair) {
@@ -31,7 +46,8 @@ long double rope_frequency(const rope_parameters& rope, int64_t head_dim, int64_
         return 0.0L;
     }
     const long double exponent = -2.0L * static_cast<long double>(pair) / static_cast<long double>(head_dim);
-    return std::pow(static_cast<long double>(rope.theta), exponent);
+    const long double frequency = std::pow(static_cast<long double>(rope.theta), exponent);
+    return rope.llama3_scaling ? llama3_scaled(frequency, *rope.llama3_scaling) : frequency;
 }
 
 // Device table of head_dim/2 entries, entry j = per_frequency(rope_frequency(rope, head_dim, j)), built once per
@@ -39,11 +55,11 @@ long double rope_frequency(const rope_parameters& rope, int64_t head_dim, int64_
 template <typename Element, Element (*per_frequency)(long double)>
 const at::Tensor&
 rope_frequency_table(const rope_parameters& rope, int64_t head_dim, at::Device device, at::ScalarType dtype) {
-    using Key = std::tuple<double, double, int64_t, int8_t>;
+    using Key = std::tuple<rope_parameters, int64_t, int8_t>;
     static std::mutex guard;
     static auto* cache = new std::map<Key, at::Tensor>();
 
-    const Key key{rope.theta, rope.partial_rotary_factor, head_dim, device.index()};
+    const Key key{rope, head_dim, device.index()};
     const std::lock_guard<std::mutex> lock(guard);
     if (const auto found = cache->find(key); found != cache->end()) {
         return found->second;

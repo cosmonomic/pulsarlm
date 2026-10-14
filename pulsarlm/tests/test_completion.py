@@ -7,7 +7,13 @@ import torch
 
 from pulsarlm.async_engine import AsyncEngine
 from pulsarlm.completion import complete
-from pulsarlm.core.engine import Engine, EvictionPolicy, ModelConfig, SamplingParams
+from pulsarlm.core.engine import (
+    Engine,
+    EvictionPolicy,
+    ModelConfig,
+    RopeParameters,
+    SamplingParams,
+)
 from pulsarlm.store import LocalStore
 
 N_LAYERS = 2
@@ -31,7 +37,7 @@ MODEL = ModelConfig(
     hidden=HIDDEN,
     intermediate=INTERMEDIATE,
     vocab_size=VOCAB_SIZE,
-    rope_theta=1e6,
+    rope=RopeParameters(theta=1e6),
     rms_eps=1e-6,
     relevance_layers=[N_LAYERS - 1],
 )

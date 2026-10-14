@@ -29,7 +29,7 @@ struct model_config {
     std::int64_t hidden;
     std::int64_t intermediate;
     std::int64_t vocab_size;
-    double rope_theta;
+    rope_parameters rope;
     double rms_eps;
     std::vector<std::int64_t> relevance_layers;
 };
@@ -40,7 +40,7 @@ struct gemma4_model_config {
     std::vector<std::int64_t> relevance_layers;
 };
 
-// A model_config's architecture is "qwen2" or "qwen3". weights use HF naming and are on the engine's device.
+// A model_config's architecture is "qwen2", "qwen3" or "llama". weights use HF naming and are on the engine's device.
 std::unique_ptr<Model> make_model(
     const std::variant<model_config, gemma4_model_config>& config,
     const std::unordered_map<std::string, at::Tensor>& weights

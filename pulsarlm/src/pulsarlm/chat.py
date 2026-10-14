@@ -1,6 +1,7 @@
 """Chat prompts from the checkpoint's own Jinja chat template, rendered as
 transformers renders them."""
 
+from datetime import datetime
 from typing import Literal, NoReturn
 
 from jinja2.ext import loopcontrols
@@ -26,6 +27,10 @@ def raise_exception(message: str) -> NoReturn:
     raise ValueError(message)
 
 
+def strftime_now(format: str) -> str:
+    return datetime.now().strftime(format)
+
+
 def special_token(value: str | dict | None) -> str | None:
     return value["content"] if isinstance(value, dict) else value
 
@@ -36,6 +41,7 @@ class ChatTemplate:
             trim_blocks=True, lstrip_blocks=True, extensions=[loopcontrols]
         )
         environment.globals["raise_exception"] = raise_exception
+        environment.globals["strftime_now"] = strftime_now
         self._template = environment.from_string(source)
         self._special_tokens = {
             name: special_token(tokenizer_config.get(name)) for name in SPECIAL_TOKENS

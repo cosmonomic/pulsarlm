@@ -21,9 +21,9 @@ class PulsarLMModelLoadingError(RuntimeError):
     pass
 
 
-QWEN = ("qwen2", "qwen3")
+DENSE = ("qwen2", "qwen3", "llama")
 GEMMA4 = ("gemma4", "gemma4_unified")
-ARCHITECTURES = QWEN + GEMMA4
+ARCHITECTURES = DENSE + GEMMA4
 
 
 @dataclass

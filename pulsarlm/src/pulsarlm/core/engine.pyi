@@ -76,6 +76,7 @@ class EvictionPolicy:
     ) -> None: ...
 
 class ModelConfig:
+    rope: RopeParameters
     def __init__(
         self,
         *,
@@ -87,9 +88,23 @@ class ModelConfig:
         hidden: int,
         intermediate: int,
         vocab_size: int,
-        rope_theta: float,
+        rope: RopeParameters,
         rms_eps: float,
         relevance_layers: list[int],
+    ) -> None: ...
+
+class Llama3RopeScaling:
+    factor: float
+    low_freq_factor: float
+    high_freq_factor: float
+    original_max_position_embeddings: float
+    def __init__(
+        self,
+        *,
+        factor: float,
+        low_freq_factor: float,
+        high_freq_factor: float,
+        original_max_position_embeddings: float,
     ) -> None: ...
 
 class RopeParameters:
@@ -98,7 +113,14 @@ class RopeParameters:
 
     theta: float
     partial_rotary_factor: float
-    def __init__(self, *, theta: float, partial_rotary_factor: float = 1.0) -> None: ...
+    llama3_scaling: Llama3RopeScaling | None
+    def __init__(
+        self,
+        *,
+        theta: float,
+        partial_rotary_factor: float = 1.0,
+        llama3_scaling: Llama3RopeScaling | None = None,
+    ) -> None: ...
 
 class Gemma4Config:
     layer_types: list[str]

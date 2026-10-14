@@ -10,7 +10,7 @@ from tokenizers import Tokenizer, models, pre_tokenizers
 
 from pulsarlm.async_engine import AsyncEngine
 from pulsarlm.chat import ChatTemplate, encode_prompt
-from pulsarlm.core.engine import Engine, EvictionPolicy, ModelConfig
+from pulsarlm.core.engine import Engine, EvictionPolicy, ModelConfig, RopeParameters
 from pulsarlm.server import create_app
 from pulsarlm.paging import trained_view_pages
 from pulsarlm.server.openai import ServerState
@@ -42,7 +42,7 @@ MODEL = ModelConfig(
     hidden=HIDDEN,
     intermediate=INTERMEDIATE,
     vocab_size=VOCAB_SIZE,
-    rope_theta=1e6,
+    rope=RopeParameters(theta=1e6),
     rms_eps=1e-6,
     relevance_layers=[N_LAYERS - 1],
 )

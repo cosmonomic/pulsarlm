@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include "pulsarlm/model/llama.hpp"
 #include "pulsarlm/model/qwen2.hpp"
 #include "pulsarlm/model/qwen3.hpp"
 
@@ -38,7 +39,7 @@ std::unique_ptr<Model> make_model(
             config.hidden,
             config.intermediate,
             config.vocab_size,
-            config.rope_theta,
+            config.rope,
             config.rms_eps,
             std::move(weight_dict)
         );
@@ -51,7 +52,20 @@ std::unique_ptr<Model> make_model(
             config.hidden,
             config.intermediate,
             config.vocab_size,
-            config.rope_theta,
+            config.rope,
+            config.rms_eps,
+            std::move(weight_dict)
+        );
+    } else if (config.architecture == "llama") {
+        model = std::make_unique<LlamaModel>(
+            config.n_layers,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            config.hidden,
+            config.intermediate,
+            config.vocab_size,
+            config.rope,
             config.rms_eps,
             std::move(weight_dict)
         );
