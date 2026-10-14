@@ -76,6 +76,19 @@ gemma4_config k_eq_v_config() {
     return c;
 }
 
+constexpr std::int64_t n_experts = 8;
+constexpr std::int64_t moe_intermediate = 32;
+
+// Experts beside every MLP, on the K=V layout.
+gemma4_config moe_config() {
+    gemma4_config c = k_eq_v_config();
+    c.layer_types = {sliding, sliding, full};
+    c.global_n_kv_heads = 2;
+    c.enable_moe_block = true;
+    c.top_k_experts = 2;
+    return c;
+}
+
 std::int64_t n_layers(const gemma4_config& c) {
     return static_cast<std::int64_t>(c.layer_types.size());
 }
@@ -144,6 +157,18 @@ struct weights {
                 add(p + "per_layer_input_gate.weight", projection(width, hidden));
                 add(p + "per_layer_projection.weight", projection(hidden, width));
                 add(p + "post_per_layer_input_norm.weight", norm(hidden));
+            }
+            if (c.enable_moe_block) {
+                add(p + "router.proj.weight", projection(n_experts, hidden));
+                add(p + "router.scale", norm(hidden));
+                add(p + "router.per_expert_scale", norm(n_experts));
+                add(p + "experts.gate_up_proj",
+                    at::randn({n_experts, 2 * moe_intermediate, hidden}) / std::sqrt(hidden));
+                add(p + "experts.down_proj",
+                    at::randn({n_experts, hidden, moe_intermediate}) / std::sqrt(moe_intermediate));
+                add(p + "pre_feedforward_layernorm_2.weight", norm(hidden));
+                add(p + "post_feedforward_layernorm_1.weight", norm(hidden));
+                add(p + "post_feedforward_layernorm_2.weight", norm(hidden));
             }
         }
     }
@@ -256,6 +281,32 @@ dense_output dense_forward(const gemma4_config& c, const weights& w, const at::T
             gate * at::linear(h2, w.layer(layer, "mlp.up_proj.weight")),
             w.layer(layer, "mlp.down_proj.weight")
         );
+        if (c.enable_moe_block) {
+            auto routed = rms_norm(x, eps) * w.layer(layer, "router.scale") * std::pow(hidden, -0.5);
+            auto probabilities = at::softmax(at::linear(routed, w.layer(layer, "router.proj.weight")), -1);
+            auto [top_weights, top_experts] = at::topk(probabilities, c.top_k_experts, -1);
+            top_weights = top_weights / top_weights.sum(-1, true) *
+                w.layer(layer, "router.per_expert_scale")
+                    .index_select(0, top_experts.flatten())
+                    .view(top_experts.sizes());
+            auto expert_input = rms_norm(x, eps, w.layer(layer, "pre_feedforward_layernorm_2.weight"));
+            auto gate_up = w.layer(layer, "experts.gate_up_proj");
+            auto down = w.layer(layer, "experts.down_proj");
+            auto experts_out = at::zeros_like(x);
+            for (std::int64_t expert = 0; expert < n_experts; expert++) {
+                auto chosen = top_experts.eq(expert);
+                auto tokens_of = chosen.any(-1).nonzero().flatten();
+                if (tokens_of.numel() == 0) {
+                    continue;
+                }
+                auto weight = (top_weights * chosen).sum(-1).index_select(0, tokens_of).unsqueeze(1);
+                auto halves = at::linear(expert_input.index_select(0, tokens_of), gate_up[expert]).chunk(2, -1);
+                auto out = at::linear(at::gelu(halves[0], "tanh") * halves[1], down[expert]);
+                experts_out.index_add_(0, tokens_of, out * weight);
+            }
+            mlp = rms_norm(mlp, eps, w.layer(layer, "post_feedforward_layernorm_1.weight")) +
+                rms_norm(experts_out, eps, w.layer(layer, "post_feedforward_layernorm_2.weight"));
+        }
         x = x + rms_norm(mlp, eps, w.layer(layer, "post_feedforward_layernorm.weight"));
         if (width > 0) {
             auto gated = at::gelu(at::linear(x, w.layer(layer, "per_layer_input_gate.weight")), "tanh") *
@@ -399,4 +450,20 @@ TEST_CASE("Gemma 4 measures attention mass on full-attention layers only", "[mod
     pulsarlm::Gemma4Model model(c, weights(c, at::kFloat).named);
     REQUIRE_THROWS_AS(model.set_relevance_layers({0}), std::invalid_argument);
     model.set_relevance_layers({2, 5});
+}
+
+TEST_CASE("Gemma 4 with experts beside every MLP matches a dense forward", "[model][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    SECTION("fp32") {
+        check_against_dense(moe_config(), at::kFloat, 1e-4);
+    }
+    // A token's top experts change with bf16's rounding of its router logits, so in bf16 every token takes every
+    // expert.
+    SECTION("bf16") {
+        gemma4_config c = moe_config();
+        c.top_k_experts = n_experts;
+        check_against_dense(c, at::kBFloat16, 5e-2);
+    }
 }

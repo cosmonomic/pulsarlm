@@ -23,7 +23,8 @@ enum class gemma4_layer_type { sliding_attention, full_attention };
 
 // Hugging Face's text config. global_n_kv_heads is the KV heads of a full-attention layer. The last
 // num_kv_shared_layers layers keep no KV: each reads the KV of the last earlier layer of its type. A
-// hidden_size_per_layer_input of 0 means no per-layer inputs.
+// hidden_size_per_layer_input of 0 means no per-layer inputs. With enable_moe_block, every layer adds the output of
+// its top_k_experts experts to its MLP's.
 struct gemma4_config {
     std::int64_t vocab_size;
     std::int64_t hidden_size;
@@ -41,6 +42,8 @@ struct gemma4_config {
     std::optional<double> final_logit_softcapping;
     std::int64_t num_kv_shared_layers;
     std::int64_t hidden_size_per_layer_input;
+    bool enable_moe_block = false;
+    std::int64_t top_k_experts = 0;
 };
 
 class Gemma4Model : public Model {
@@ -65,6 +68,15 @@ class Gemma4Model : public Model {
         at::Tensor per_layer_input_gate;
         at::Tensor per_layer_projection;
         at::Tensor post_per_layer_input_norm;
+        // Defined with MoE blocks.
+        at::Tensor router_proj;
+        at::Tensor router_scale;
+        at::Tensor router_per_expert_scale;
+        at::Tensor experts_gate_up_proj;  // [num_experts, 2 * moe_intermediate_size, hidden_size]
+        at::Tensor experts_down_proj;  // [num_experts, hidden_size, moe_intermediate_size]
+        at::Tensor pre_feedforward_layernorm_2;
+        at::Tensor post_feedforward_layernorm_1;
+        at::Tensor post_feedforward_layernorm_2;
     };
 
     gemma4_config config;
@@ -78,9 +90,10 @@ class Gemma4Model : public Model {
     at::Tensor per_layer_model_projection;
     at::Tensor per_layer_projection_norm;
     std::vector<LayerWeights> layers;
-    // One per head dim, for the weightless RMSNorm on V.
+    // For the weightless RMSNorms: on V, one per head dim, and in the router.
     at::Tensor sliding_ones;
     at::Tensor full_ones;
+    at::Tensor hidden_ones;
     std::unordered_set<std::int64_t> relevance_layers;
 
     bool sliding(std::int64_t layer) const;
@@ -93,6 +106,8 @@ class Gemma4Model : public Model {
         std::span<const kv> lines
     ) const;
     at::Tensor attention(const at::Tensor& h, std::int64_t layer, const GroupBatch& g, std::span<const kv> lines) const;
+    // The experts' output for the hidden states x a layer's MLP block starts from.
+    at::Tensor experts(const at::Tensor& x, std::int64_t layer) const;
     at::Tensor head(const at::Tensor& x) const;
     at::Tensor group_forward(const GroupBatch& g, std::span<const kv> lines) const;
 
