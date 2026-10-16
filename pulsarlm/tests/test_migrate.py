@@ -17,11 +17,11 @@ def write_source(
     src: Path, model_type: str, tensors: dict[str, torch.Tensor], tokenizer_config: dict
 ) -> None:
     config = {"model_type": model_type, "eos_token_id": 1}
-    if model_type.startswith("gemma4"):
+    if model_type.startswith(("gemma4", "qwen3_5")):
         config["text_config"] = {"vocab_size": 8, "num_hidden_layers": 1}
     (src / "config.json").write_text(json.dumps(config))
     (src / "tokenizer.json").write_text(
-        Tokenizer(models.WordLevel({"a": 0}, unk_token="a")).to_str()
+        Tokenizer(models.WordLevel({"a": 0, "<end>": 2}, unk_token="a")).to_str()
     )
     (src / "tokenizer_config.json").write_text(json.dumps(tokenizer_config))
     save_file(tensors, src / "model.safetensors")
@@ -59,6 +59,52 @@ def test_a_multimodal_checkpoint_keeps_its_text_weights_and_chat_template(
         assert torch.equal(weights["model.language_model.norm.weight"], text)
         assert archive.read("chat_template.jinja").decode() == TEMPLATE
         assert json.loads(archive.read("tokenizer_config.json"))["bos_token"] == "<bos>"
+
+
+def test_a_qwen3_5_checkpoint_keeps_its_text_weights_and_untied_head(tmp_path: Path):
+    src = tmp_path / "src"
+    src.mkdir()
+    write_source(
+        src,
+        "qwen3_5",
+        {
+            "model.language_model.norm.weight": torch.ones(2),
+            "lm_head.weight": torch.ones(3),
+            "model.visual.weight": torch.zeros(3),
+            "mtp.fc.weight": torch.zeros(3),
+        },
+        {"chat_template": TEMPLATE},
+    )
+    dst = tmp_path / "model.pulsarlm"
+    migrate(src, dst)
+
+    with zipfile.ZipFile(dst) as archive:
+        assert sorted(archived_weights(archive)) == [
+            "lm_head.weight",
+            "model.language_model.norm.weight",
+        ]
+
+
+def test_eos_ids_fall_back_to_the_text_config_and_take_the_tokenizer_eos(
+    tmp_path: Path,
+):
+    src = tmp_path / "src"
+    src.mkdir()
+    write_source(
+        src,
+        "qwen3_5",
+        {"model.language_model.norm.weight": torch.ones(2)},
+        {"chat_template": TEMPLATE, "eos_token": "<end>"},
+    )
+    config = json.loads((src / "config.json").read_text())
+    del config["eos_token_id"]
+    config["text_config"]["eos_token_id"] = 1
+    (src / "config.json").write_text(json.dumps(config))
+    dst = tmp_path / "model.pulsarlm"
+    migrate(src, dst)
+
+    with zipfile.ZipFile(dst) as archive:
+        assert json.loads(archive.read("config.json"))["eos_token_id"] == [1, 2]
 
 
 def test_a_chat_template_file_takes_precedence(tmp_path: Path):

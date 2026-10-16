@@ -1,10 +1,16 @@
 """The engine's model config for a checkpoint's text model."""
 
-from pulsarlm.checkpoint import GEMMA4, PulsarLMModelConfig, PulsarLMModelLoadingError
+from pulsarlm.checkpoint import (
+    GEMMA4,
+    QWEN3_5,
+    PulsarLMModelConfig,
+    PulsarLMModelLoadingError,
+)
 from pulsarlm.core.engine import (
     Gemma4Config,
     Llama3RopeScaling,
     ModelConfig,
+    Qwen3_5Config,
     RopeParameters,
 )
 
@@ -77,6 +83,54 @@ def gemma4_config(architecture: str, text: dict) -> Gemma4Config:
     )
 
 
+def qwen3_5_layer_types(text: dict) -> list[str]:
+    """Hugging Face's default is a full-attention layer every
+    full_attention_interval layers, the rest linear attention."""
+    interval = text.get("full_attention_interval", 4)
+    return text.get("layer_types") or [
+        FULL if (i + 1) % interval == 0 else "linear_attention"
+        for i in range(text["num_hidden_layers"])
+    ]
+
+
+def qwen3_5_config(text: dict) -> Qwen3_5Config:
+    if text.get("attention_bias"):
+        raise PulsarLMModelLoadingError("unsupported attention bias")
+    if text.get("hidden_act", "silu") != "silu":
+        raise PulsarLMModelLoadingError(f"unsupported activation {text['hidden_act']}")
+    if not text.get("attn_output_gate", True):
+        raise PulsarLMModelLoadingError(
+            "attention without an output gate is not supported"
+        )
+    parameters = text.get("rope_parameters") or {}
+    if parameters.get("rope_type", "default") != "default":
+        raise PulsarLMModelLoadingError(f"unsupported RoPE {parameters['rope_type']}")
+    layer_types = qwen3_5_layer_types(text)
+    full_layers = [i for i, t in enumerate(layer_types) if t == FULL]
+    return Qwen3_5Config(
+        vocab_size=text["vocab_size"],
+        hidden_size=text["hidden_size"],
+        intermediate_size=text["intermediate_size"],
+        layer_types=layer_types,
+        n_heads=text["num_attention_heads"],
+        n_kv_heads=text["num_key_value_heads"],
+        head_dim=text["head_dim"],
+        rope_theta=float(parameters.get("rope_theta") or text["rope_theta"]),
+        partial_rotary_factor=float(
+            parameters.get(
+                "partial_rotary_factor", text.get("partial_rotary_factor", 1.0)
+            )
+        ),
+        linear_n_key_heads=text["linear_num_key_heads"],
+        linear_n_value_heads=text["linear_num_value_heads"],
+        linear_key_head_dim=text["linear_key_head_dim"],
+        linear_value_head_dim=text["linear_value_head_dim"],
+        linear_conv_kernel=text["linear_conv_kernel_dim"],
+        rms_norm_eps=float(text["rms_norm_eps"]),
+        relevance_layers=[i for i in top_quarter(len(layer_types)) if i in full_layers],
+    )
+
+
 def rope(text: dict) -> RopeParameters:
     """Reads Hugging Face's rope_parameters, or the rope_scaling and rope_theta
     that preceded it."""
@@ -120,8 +174,12 @@ def dense_config(architecture: str, text: dict) -> ModelConfig:
     )
 
 
-def engine_model(cfg: PulsarLMModelConfig) -> ModelConfig | Gemma4Config:
+def engine_model(
+    cfg: PulsarLMModelConfig,
+) -> ModelConfig | Gemma4Config | Qwen3_5Config:
     """Measures attention mass on the full-attention layers of the top quarter."""
     if cfg.architecture in GEMMA4:
         return gemma4_config(cfg.architecture, cfg.text)
+    if cfg.architecture in QWEN3_5:
+        return qwen3_5_config(cfg.text)
     return dense_config(cfg.architecture, cfg.text)

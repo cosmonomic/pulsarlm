@@ -14,6 +14,7 @@
 #include "pulsarlm/engine.hpp"
 #include "pulsarlm/eviction.hpp"
 #include "pulsarlm/model/gemma4.hpp"
+#include "pulsarlm/model/qwen3_5.hpp"
 #include "pulsarlm/sampling.hpp"
 #include "request_buffer.hpp"
 #include "wake_fd.hpp"
@@ -40,11 +41,17 @@ struct gemma4_model_config {
     std::vector<std::int64_t> relevance_layers;
 };
 
+// The Qwen3.5 text config and the layers whose attention mass the engine measures.
+struct qwen3_5_model_config {
+    qwen3_5_config text;
+    std::vector<std::int64_t> relevance_layers;
+};
+
+using any_model_config = std::variant<model_config, gemma4_model_config, qwen3_5_model_config>;
+
 // A model_config's architecture is "qwen2", "qwen3" or "llama". weights use HF naming and are on the engine's device.
-std::unique_ptr<Model> make_model(
-    const std::variant<model_config, gemma4_model_config>& config,
-    const std::unordered_map<std::string, at::Tensor>& weights
-);
+std::unique_ptr<Model>
+make_model(const any_model_config& config, const std::unordered_map<std::string, at::Tensor>& weights);
 
 // Python's handle on a request. Dropping it cancels the request.
 class request_handle {

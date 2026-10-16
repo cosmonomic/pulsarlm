@@ -23,7 +23,10 @@ class PulsarLMModelLoadingError(RuntimeError):
 
 DENSE = ("qwen2", "qwen3", "llama")
 GEMMA4 = ("gemma4", "gemma4_unified")
-ARCHITECTURES = DENSE + GEMMA4
+QWEN3_5 = ("qwen3_5",)
+# Multimodal checkpoints whose text model's config is their text_config.
+MULTIMODAL = GEMMA4 + QWEN3_5
+ARCHITECTURES = DENSE + MULTIMODAL
 
 
 @dataclass
@@ -40,7 +43,7 @@ class PulsarLMModelConfig:
         eos = raw["eos_token_id"]
         return cls(
             architecture=architecture,
-            text=raw["text_config"] if architecture in GEMMA4 else raw,
+            text=raw["text_config"] if architecture in MULTIMODAL else raw,
             eos_ids=eos if isinstance(eos, list) else [eos],
         )
 

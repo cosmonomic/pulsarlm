@@ -14,10 +14,10 @@
 namespace pulsarlm {
 namespace {
 
-template <typename scalar_t>
+template <typename scalar_t, typename weight_t>
 __global__ void rmsnorm_kernel(
     const scalar_t* __restrict__ x,
-    const scalar_t* __restrict__ weight,
+    const weight_t* __restrict__ weight,
     scalar_t* __restrict__ y,
     int64_t dim,
     double eps
@@ -54,7 +54,10 @@ __global__ void rmsnorm_kernel(
 
 at::Tensor rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, double eps) {
     TORCH_CHECK(x.is_cuda() && weight.is_cuda(), "rmsnorm: inputs must be CUDA tensors");
-    TORCH_CHECK(x.scalar_type() == weight.scalar_type(), "rmsnorm: dtype mismatch");
+    TORCH_CHECK(
+        weight.scalar_type() == x.scalar_type() || weight.scalar_type() == at::kFloat,
+        "rmsnorm: the weight's dtype must be x's or float32"
+    );
     TORCH_CHECK(
         weight.dim() == 1 && weight.size(0) == x.size(-1),
         "rmsnorm: weight must be [dim] matching the last axis of x"
@@ -76,13 +79,23 @@ at::Tensor rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, double ep
     auto stream = at::cuda::getCurrentCUDAStream();
 
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, xc.scalar_type(), "rmsnorm_cuda", [&] {
-        rmsnorm_kernel<scalar_t><<<rows, threads, smem, stream>>>(
-            xc.data_ptr<scalar_t>(),
-            wc.data_ptr<scalar_t>(),
-            y.data_ptr<scalar_t>(),
-            dim,
-            eps
-        );
+        if (wc.scalar_type() == xc.scalar_type()) {
+            rmsnorm_kernel<scalar_t, scalar_t><<<rows, threads, smem, stream>>>(
+                xc.data_ptr<scalar_t>(),
+                wc.data_ptr<scalar_t>(),
+                y.data_ptr<scalar_t>(),
+                dim,
+                eps
+            );
+        } else {
+            rmsnorm_kernel<scalar_t, float><<<rows, threads, smem, stream>>>(
+                xc.data_ptr<scalar_t>(),
+                wc.data_ptr<float>(),
+                y.data_ptr<scalar_t>(),
+                dim,
+                eps
+            );
+        }
     });
     return y;
 }

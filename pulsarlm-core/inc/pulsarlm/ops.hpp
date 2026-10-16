@@ -12,7 +12,7 @@
 
 namespace pulsarlm {
 
-// RMSNorm. Stateless.
+// RMSNorm over x's last axis, in fp32. weight is in x's dtype or fp32.
 at::Tensor rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, double eps);
 
 // Scatter a batch's new K/V rows into paged pools. k_pool/v_pool are [num_pages,

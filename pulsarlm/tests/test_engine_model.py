@@ -1,7 +1,7 @@
 import pytest
 
 from pulsarlm.checkpoint import PulsarLMModelConfig, PulsarLMModelLoadingError
-from pulsarlm.core.engine import Gemma4Config, ModelConfig
+from pulsarlm.core.engine import Gemma4Config, ModelConfig, Qwen3_5Config
 from pulsarlm.engine_model import engine_model
 
 ROPE = {
@@ -36,6 +36,47 @@ def gemma4(model_type: str, **text) -> PulsarLMModelConfig:
             "text_config": base | text,
         }
     )
+
+
+def qwen3_5(**text) -> PulsarLMModelConfig:
+    base = {
+        "vocab_size": 248320,
+        "hidden_size": 1024,
+        "intermediate_size": 3584,
+        "num_hidden_layers": 8,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "full_attention_interval": 4,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 16,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "rope_parameters": {
+            "rope_type": "default",
+            "rope_theta": 10000000,
+            "partial_rotary_factor": 0.25,
+            "mrope_section": [11, 11, 10],
+        },
+        "rms_norm_eps": 1e-6,
+    }
+    return PulsarLMModelConfig.from_dict(
+        {"model_type": "qwen3_5", "eos_token_id": [248044], "text_config": base | text}
+    )
+
+
+def test_a_qwen3_5_checkpoint_maps_its_text_config():
+    model = engine_model(qwen3_5())
+
+    assert isinstance(model, Qwen3_5Config)
+    assert model.layer_types == (["linear_attention"] * 3 + ["full_attention"]) * 2
+    assert model.relevance_layers == [7]
+
+
+def test_a_qwen3_5_checkpoint_without_an_output_gate_is_rejected():
+    with pytest.raises(PulsarLMModelLoadingError, match="output gate"):
+        engine_model(qwen3_5(attn_output_gate=False))
 
 
 def test_a_gemma4_checkpoint_maps_its_text_config():

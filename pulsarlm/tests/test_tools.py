@@ -7,11 +7,11 @@ Q = '<|"|>'
 
 def test_a_json_call_has_a_name_and_arguments():
     body = '\n{"name": "read", "arguments": {"start": 0, "end": 10}}\n'
-    assert parse_tool_call("json", body) == ToolCall("read", {"start": 0, "end": 10})
+    assert parse_tool_call("qwen", body) == ToolCall("read", {"start": 0, "end": 10})
 
 
 def test_a_json_call_without_arguments_takes_none():
-    assert parse_tool_call("json", '{"name": "now"}') == ToolCall("now", {})
+    assert parse_tool_call("qwen", '{"name": "now"}') == ToolCall("now", {})
 
 
 @pytest.mark.parametrize(
@@ -19,7 +19,41 @@ def test_a_json_call_without_arguments_takes_none():
 )
 def test_a_malformed_json_call_is_an_error(body):
     with pytest.raises(ToolCallError):
-        parse_tool_call("json", body)
+        parse_tool_call("qwen", body)
+
+
+def test_a_function_call_reads_its_parameters():
+    body = (
+        "\n<function=search>\n<parameter=query>\na multi\nline text\n</parameter>\n"
+        '<parameter=limit>\n5\n</parameter>\n<parameter=where>\n{"key": [1, "v"]}\n</parameter>\n'
+        '<parameter=label>\n"quoted"\n</parameter>\n</function>\n'
+    )
+    assert parse_tool_call("qwen", body) == ToolCall(
+        "search",
+        {
+            "query": "a multi\nline text",
+            "limit": 5,
+            "where": {"key": [1, "v"]},
+            "label": '"quoted"',
+        },
+    )
+
+
+def test_a_function_call_without_parameters_takes_none():
+    assert parse_tool_call("qwen", "<function=now>\n</function>") == ToolCall("now", {})
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "<function=a>",
+        "<function=a>\nstray\n</function>",
+        "<function=a>\n<parameter=x>\n1\n</parameter>\ntail\n</function>",
+    ],
+)
+def test_a_malformed_function_call_is_an_error(body):
+    with pytest.raises(ToolCallError):
+        parse_tool_call("qwen", body)
 
 
 def test_a_gemma_call_reads_every_value_kind():

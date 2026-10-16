@@ -62,7 +62,7 @@ def test_tool_call_bodies_are_collected_and_not_content():
     words = ["a", "<tool_call>", "b", " ", "c", "</tool_call>", "<tool_call>", "a"]
     assert decode(words + ["</tool_call>", "<eos>"], decoder) == [("content", "a")]
     assert decoder.tool_call_marker is not None
-    assert decoder.tool_call_marker.syntax == "json"
+    assert decoder.tool_call_marker.syntax == "qwen"
     assert decoder.tool_call_bodies == ["b c", "a"]
 
 

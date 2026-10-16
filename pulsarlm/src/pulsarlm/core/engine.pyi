@@ -177,6 +177,30 @@ class Gemma4Config:
         relevance_layers: list[int],
     ) -> None: ...
 
+class Qwen3_5Config:
+    layer_types: list[str]
+    relevance_layers: list[int]
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        hidden_size: int,
+        intermediate_size: int,
+        layer_types: list[str],
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        rope_theta: float,
+        partial_rotary_factor: float,
+        linear_n_key_heads: int,
+        linear_n_value_heads: int,
+        linear_key_head_dim: int,
+        linear_value_head_dim: int,
+        linear_conv_kernel: int,
+        rms_norm_eps: float,
+        relevance_layers: list[int],
+    ) -> None: ...
+
 class Request:
     def take(
         self,
@@ -189,7 +213,7 @@ class Engine:
     def __init__(
         self,
         store: PageStore,
-        model: ModelConfig | Gemma4Config,
+        model: ModelConfig | Gemma4Config | Qwen3_5Config,
         weights: dict[str, Tensor],
         *,
         model_name: str,

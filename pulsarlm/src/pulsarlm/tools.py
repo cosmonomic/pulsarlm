@@ -1,10 +1,11 @@
 """Tool call bodies in the syntaxes chat templates render them in."""
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
-type ToolCallSyntax = Literal["json", "gemma"]
+type ToolCallSyntax = Literal["qwen", "gemma"]
 
 GEMMA_QUOTE = '<|"|>'
 
@@ -20,8 +21,11 @@ class ToolCallError(ValueError):
 
 
 def parse_tool_call(syntax: ToolCallSyntax, body: str) -> ToolCall:
-    """Raises ToolCallError when body is not a call in syntax."""
-    if syntax == "json":
+    """Raises ToolCallError when body is not a call in syntax. A qwen call is a
+    JSON object (Qwen2, Qwen3) or XML-like <function=NAME> tags (Qwen3.5)."""
+    if syntax == "qwen":
+        if body.lstrip().startswith("<function="):
+            return parse_function_call(body)
         return parse_json_call(body)
     return GemmaCallParser(body).call()
 
@@ -37,6 +41,41 @@ def parse_json_call(body: str) -> ToolCall:
     if not isinstance(arguments, dict):
         raise ToolCallError("arguments must be an object")
     return ToolCall(call["name"], arguments)
+
+
+FUNCTION_CALL = re.compile(r"\s*<function=([^>\n]+)>(.*)</function>\s*", re.DOTALL)
+PARAMETER = re.compile(r"<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>", re.DOTALL)
+
+
+def parse_function_call(body: str) -> ToolCall:
+    """<function=NAME> then a <parameter=KEY> block per argument, as Qwen3.5's
+    template renders them: a value that parses as JSON other than a string is
+    that value, any other is its text."""
+    call = FUNCTION_CALL.fullmatch(body)
+    if call is None:
+        raise ToolCallError("a call is <function=NAME>...</function>")
+    name, inner = call.groups()
+    arguments: dict[str, Any] = {}
+    end = 0
+    for parameter in PARAMETER.finditer(inner):
+        if inner[end : parameter.start()].strip():
+            raise ToolCallError(
+                f"text between parameters: {inner[end : parameter.start()]!r}"
+            )
+        key, text = parameter.groups()
+        arguments[key] = parameter_value(text)
+        end = parameter.end()
+    if inner[end:].strip():
+        raise ToolCallError(f"text after the parameters: {inner[end:]!r}")
+    return ToolCall(name.strip(), arguments)
+
+
+def parameter_value(text: str) -> Any:
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+    return text if isinstance(value, str) else value
 
 
 class GemmaCallParser:

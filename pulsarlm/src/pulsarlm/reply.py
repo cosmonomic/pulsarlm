@@ -28,7 +28,7 @@ class ToolCallMarker(NamedTuple):
 
 
 TOOL_CALL_MARKERS = (
-    ToolCallMarker("<tool_call>", "</tool_call>", "json"),
+    ToolCallMarker("<tool_call>", "</tool_call>", "qwen"),
     ToolCallMarker("<|tool_call>", "<tool_call|>", "gemma"),
 )
 

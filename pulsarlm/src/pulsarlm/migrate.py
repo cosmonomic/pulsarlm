@@ -6,8 +6,8 @@ Reads::
     <src>/tokenizer.json
     <src>/tokenizer_config.json
     <src>/chat_template.jinja                   (or tokenizer_config.json's chat_template)
-    <src>/model.safetensors                    (or a sharded model-0000N-of-*.safetensors
-                                                  set named by model.safetensors.index.json)
+    <src>/model.safetensors                    (or a sharded set named by
+                                                  model.safetensors.index.json)
     <src>/generation_config.json                (optional)
 
 and writes a single zip archive of config.json, tokenizer.json,
@@ -16,8 +16,9 @@ pulsarlm.checkpoint for how that archive is read back. The weights are the text
 model's alone.
 
 eos_token_id is resolved here, from generation_config.json falling back to
-config.json, and written into the archived config.json as a list of ids; the
-archive never carries generation_config.json itself.
+config.json and its text_config, plus the tokenizer config's eos_token, and
+written into the archived config.json as a list of ids; the archive never
+carries generation_config.json itself.
 """
 
 import json
@@ -27,8 +28,15 @@ from pathlib import Path
 
 import safetensors
 from safetensors.torch import save_file
+from tokenizers import Tokenizer
 
-from pulsarlm.checkpoint import GEMMA4, PulsarLMModelConfig, PulsarLMModelLoadingError
+from pulsarlm.chat import special_token
+from pulsarlm.checkpoint import (
+    GEMMA4,
+    QWEN3_5,
+    PulsarLMModelConfig,
+    PulsarLMModelLoadingError,
+)
 
 SOURCE_FILES = [
     "config.json",
@@ -39,16 +47,31 @@ SOURCE_FILES = [
     "model.safetensors",
     "model.safetensors.index.json",
     "model-*.safetensors",
+    "model.safetensors-*.safetensors",
 ]
 
 
-def resolve_eos(src: Path, cfg_raw: dict) -> list[int]:
+def resolve_eos(src: Path, cfg_raw: dict, tokenizer_config: dict) -> list[int]:
     gen_path = src / "generation_config.json"
     gen_raw = json.loads(gen_path.read_text()) if gen_path.exists() else cfg_raw
-    eos = gen_raw.get("eos_token_id", cfg_raw.get("eos_token_id"))
-    if eos is None:
-        return []
-    return [int(e) for e in eos] if isinstance(eos, list) else [int(eos)]
+    eos = gen_raw.get(
+        "eos_token_id",
+        cfg_raw.get("eos_token_id", cfg_raw.get("text_config", {}).get("eos_token_id")),
+    )
+    ids = (
+        []
+        if eos is None
+        else [int(e) for e in eos]
+        if isinstance(eos, list)
+        else [int(eos)]
+    )
+    if (token := special_token(tokenizer_config.get("eos_token"))) is not None:
+        tokenizer = Tokenizer.from_file(str(src / "tokenizer.json"))
+        if (
+            token_id := tokenizer.token_to_id(token)
+        ) is not None and token_id not in ids:
+            ids.append(token_id)
+    return ids
 
 
 def weight_shards(src: Path) -> list[Path]:
@@ -77,14 +100,20 @@ def chat_template(src: Path, tokenizer_config: dict) -> str:
     return template
 
 
-def text_weight_prefix(architecture: str) -> str:
-    return "model.language_model." if architecture in GEMMA4 else ""
+def is_text_weight(architecture: str, name: str) -> bool:
+    if architecture in GEMMA4:
+        return name.startswith("model.language_model.")
+    if architecture in QWEN3_5:
+        return name.startswith("model.language_model.") or name == "lm_head.weight"
+    return True
 
 
-def write_shard(zf: zipfile.ZipFile, shard: Path, prefix: str, scratch: Path) -> None:
+def write_shard(
+    zf: zipfile.ZipFile, shard: Path, architecture: str, scratch: Path
+) -> None:
     with safetensors.safe_open(shard, framework="pt") as f:
         names = list(f.keys())
-        kept = [name for name in names if name.startswith(prefix)]
+        kept = [name for name in names if is_text_weight(architecture, name)]
         if len(kept) == len(names):
             zf.write(shard, f"weights/{shard.name}")
             return
@@ -99,11 +128,11 @@ def write_shard(zf: zipfile.ZipFile, shard: Path, prefix: str, scratch: Path) ->
 
 def migrate(src: Path, dst: Path) -> None:
     cfg_raw = json.loads((src / "config.json").read_text())
-    cfg_raw["eos_token_id"] = resolve_eos(src, cfg_raw)
+    tokenizer_config = json.loads((src / "tokenizer_config.json").read_text())
+    cfg_raw["eos_token_id"] = resolve_eos(src, cfg_raw, tokenizer_config)
     cfg = PulsarLMModelConfig.from_dict(
         cfg_raw
     )  # raises on a config pulsarlm cannot load
-    tokenizer_config = json.loads((src / "tokenizer_config.json").read_text())
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_suffix(dst.suffix + ".tmp")
@@ -113,5 +142,5 @@ def migrate(src: Path, dst: Path) -> None:
         zf.writestr("tokenizer_config.json", json.dumps(tokenizer_config))
         zf.writestr("chat_template.jinja", chat_template(src, tokenizer_config))
         for shard in weight_shards(src):
-            write_shard(zf, shard, text_weight_prefix(cfg.architecture), dst.parent)
+            write_shard(zf, shard, cfg.architecture, dst.parent)
     tmp.replace(dst)
