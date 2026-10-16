@@ -10,8 +10,17 @@
 
 namespace pulsarlm {
 
+// A recurrent layer's state: one tensor of sizes and dtype.
+struct recurrent_state {
+    std::vector<std::int64_t> sizes;
+    at::ScalarType dtype;
+
+    bool operator==(const recurrent_state&) const = default;
+};
+
 // With values_only, one tensor serves as both K and V. A layer with a sliding window attends only its last
-// sliding_window keys.
+// sliding_window keys. A recurrent layer (state set) keeps no keys: its page is the state after the page's last token,
+// and a state reaches only its newest full page; head counts and values_only do not apply to it.
 struct kv_layer {
     std::size_t n_kv_heads;
     std::size_t head_dim;
@@ -19,10 +28,11 @@ struct kv_layer {
     std::size_t n_q_heads = 0;
     bool values_only = false;
     std::optional<std::size_t> sliding_window;
+    std::optional<recurrent_state> state;
 };
 
 // One KV layer's lines, [n_lines, page_size, n_kv_heads, head_dim] each; k and v are one tensor for a values_only
-// layer. K is stored unrotated.
+// layer. K is stored unrotated. A recurrent layer's lines are one tensor [n_lines, state sizes...] as both.
 struct kv {
     at::Tensor k;
     at::Tensor v;
@@ -39,8 +49,12 @@ struct GroupBatch {
     at::Tensor tokens;
     at::Tensor pos;
     // int32 [n_kv_layers, num_seqs, max_pages]. A sliding layer's entries before the window of the sequence's first
-    // query hold no line.
+    // query hold no line. A recurrent layer's row holds the line whose state the forward starts from and updates in
+    // place, then the line it writes the state after page_end_tokens[s] of the sequence's tokens into.
     at::Tensor page_tables;
+    // int32 [num_seqs], defined when a KV layer is recurrent: the number of sequence s's tokens in the group whose last
+    // ends its newest full page, 0 when none of them ends a page.
+    at::Tensor page_end_tokens;
     at::Tensor cu_seqlens_q;  // int32 [num_seqs + 1], defined iff prefill
     at::Tensor seqlens_k;  // int32 [num_seqs],     defined iff prefill
     at::Tensor context_lens;  // int32 [num_seqs],     defined iff decode

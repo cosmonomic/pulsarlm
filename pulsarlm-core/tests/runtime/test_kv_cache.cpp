@@ -151,8 +151,12 @@ lines_result only_layer(layer_lines_result result) {
     return std::move(result->front());
 }
 
+layer_lines_result allocate_each(pulsarlm::kv_cache& kv, std::size_t count) {
+    return kv.allocate(std::vector<std::size_t>(kv.layer_count(), count));
+}
+
 lines_result allocate(pulsarlm::kv_cache& kv, std::size_t count) {
-    return only_layer(kv.allocate(count));
+    return only_layer(allocate_each(kv, count));
 }
 
 void release(pulsarlm::kv_cache& kv, const line_ids& held) {
@@ -165,12 +169,23 @@ task<lines_result> get_one_layer(pulsarlm::kv_cache& kv, std::vector<digest> has
     co_return only_layer(std::move(got));
 }
 
+// Names lines[layer][i] by hashes[i] in every layer, owned by owners[i].
+task<std::expected<void, page_error>> sync_each(
+    pulsarlm::kv_cache& kv,
+    std::vector<digest> hashes,
+    std::vector<std::uint64_t> owners,
+    std::vector<line_ids> lines
+) {
+    std::vector<std::vector<digest>> layer_hashes(kv.layer_count(), hashes);
+    std::vector<std::vector<std::uint64_t>> layer_owners(kv.layer_count(), owners);
+    std::expected<void, page_error> result = co_await kv.sync(layer_hashes, layer_owners, lines, compute_stream());
+    co_return result;
+}
+
 task<std::expected<void, page_error>>
 sync_one_layer(pulsarlm::kv_cache& kv, std::vector<digest> hashes, line_ids synced) {
-    std::vector<line_ids> layer_lines{std::move(synced)};
     std::vector<std::uint64_t> owners(hashes.size(), 0);
-    std::expected<void, page_error> result = co_await kv.sync(hashes, owners, layer_lines, compute_stream());
-    co_return result;
+    co_return co_await sync_each(kv, std::move(hashes), std::move(owners), {std::move(synced)});
 }
 
 template <typename t> task<void> store_result(task<t> work, std::optional<t>* result) {
@@ -553,13 +568,11 @@ TEST_CASE("each layer's page is stored under its own key") {
 
 TEST_CASE("sync stores a page of every layer in one put") {
     cache_fixture fixture(2, {}, host_bytes, {shape, shape});
-    std::vector<line_ids> allocated = fixture.kv.allocate(1).value();
+    std::vector<line_ids> allocated = allocate_each(fixture.kv, 1).value();
     fill_line(fixture.kv, allocated[0].front(), 1.0f, 0);
     fill_line(fixture.kv, allocated[1].front(), 2.0f, 1);
     std::vector<digest> hashes{hash_of(1)};
-    REQUIRE(run_to_completion(
-                fixture.kv.sync(hashes, std::vector<std::uint64_t>(hashes.size(), 0), allocated, compute_stream())
-    )
+    REQUIRE(run_to_completion(sync_each(fixture.kv, hashes, std::vector<std::uint64_t>(hashes.size(), 0), allocated))
                 .has_value());
 
     REQUIRE(fixture.store->puts == 1);
@@ -571,10 +584,10 @@ TEST_CASE("sync stores a page of every layer in one put") {
 
 TEST_CASE("sync owns a page by every request whose hash it is, in every layer") {
     cache_fixture fixture(4, {}, host_bytes, {shape, shape});
-    std::vector<line_ids> allocated = fixture.kv.allocate(3).value();
+    std::vector<line_ids> allocated = allocate_each(fixture.kv, 3).value();
     std::vector<digest> hashes{hash_of(1), hash_of(2), hash_of(1)};
     std::vector<std::uint64_t> owners{7, 7, 9};
-    REQUIRE(run_to_completion(fixture.kv.sync(hashes, owners, allocated, compute_stream())).has_value());
+    REQUIRE(run_to_completion(sync_each(fixture.kv, hashes, owners, allocated)).has_value());
 
     REQUIRE(fixture.store->puts == 1);
     REQUIRE(fixture.store->pages.size() == 4);
@@ -633,9 +646,9 @@ TEST_CASE("a line holds each head's K then V together") {
 
 TEST_CASE("allocate fails with oom holding nothing when the layers together run out") {
     cache_fixture fixture(2, {}, host_bytes, {shape, shape});
-    REQUIRE((fixture.kv.allocate(3) == layer_lines_result(std::unexpected(page_error::oom))));
+    REQUIRE((allocate_each(fixture.kv, 3) == layer_lines_result(std::unexpected(page_error::oom))));
     REQUIRE(fixture.kv.free_count() == 2);
-    std::vector<line_ids> held = fixture.kv.allocate(2).value();
+    std::vector<line_ids> held = allocate_each(fixture.kv, 2).value();
     REQUIRE(fixture.kv.free_count() == 0);
     fixture.kv.release(0, held[0]);
     fixture.kv.release(1, held[1]);
@@ -727,7 +740,7 @@ TEST_CASE("lines of several sizes pack into regions of the largest size") {
 
     pulsarlm::kv_cache aligned(shapes, 4 * narrow_bytes, 2 * narrow_bytes, at::Device(at::kCUDA, 0), backing);
     REQUIRE(aligned.free_count() == 1);
-    std::vector<line_ids> held = aligned.allocate(1).value();
+    std::vector<line_ids> held = allocate_each(aligned, 1).value();
     fill_line(aligned, held[0].front(), 1.0f, 0);
     fill_line(aligned, held[1].front(), 2.0f, 1);
     REQUIRE(line_filled_with(aligned, held[0].front(), 1.0f, 0));
@@ -741,19 +754,57 @@ TEST_CASE("lines of several sizes pack into regions of the largest size") {
     aligned.release(1, held[1]);
 }
 
+TEST_CASE("a recurrent layer's line is one tensor of its state sizes and dtype, stored and fetched as one") {
+    pulsarlm::page_shape state{
+        .n_layers = 1,
+        .page_size = shape.page_size,
+        .n_kv_heads = 0,
+        .head_dim = 0,
+        .dtype = at::kDouble,
+        .values_only = true,
+        .state_sizes = {3, 5},
+    };
+    REQUIRE(pulsarlm::line_bytes(state) == 3 * 5 * 8);
+    cache_fixture fixture(3, {}, host_bytes, {shape, state});
+    const pulsarlm::kv& lines = fixture.kv.tensors(1);
+    REQUIRE(lines.k.is_same(lines.v));
+    REQUIRE(lines.k.scalar_type() == at::kDouble);
+    REQUIRE((lines.k.sizes().slice(1) == at::IntArrayRef{3, 5}));
+    REQUIRE(lines.k.stride(0) == static_cast<std::int64_t>(pulsarlm::block_bytes(state) / 8));
+
+    std::vector<line_ids> allocated = allocate_each(fixture.kv, 1).value();
+    lines.k.select(0, allocated[1].front()).copy_(at::arange(15, at::kDouble).view({3, 5}));
+    fill_line(fixture.kv, allocated[0].front(), 1.0f, 0);
+    REQUIRE(run_to_completion(sync_each(fixture.kv, {hash_of(1)}, {0}, allocated)).has_value());
+    fixture.kv.release(0, allocated[0]);
+    fixture.kv.release(1, allocated[1]);
+    REQUIRE(fixture.store->pages.at(key_of(1, 1)).k.equal(at::arange(15, at::kDouble).view({1, 3, 5})));
+
+    std::vector<line_ids> evicting = allocate_each(fixture.kv, 2).value();
+    lines.k.zero_();
+    fixture.kv.release(0, evicting[0]);
+    fixture.kv.release(1, evicting[1]);
+    std::vector<digest> none;
+    std::vector<digest> wanted{hash_of(1)};
+    layer_lines_result got = run_to_completion(
+        fixture.kv.get(std::vector<std::span<const digest>>{none, wanted}, compute_stream())
+    );
+    REQUIRE(got.has_value());
+    REQUIRE(lines.k.select(0, (*got)[1].front()).equal(at::arange(15, at::kDouble).view({3, 5}).cuda()));
+    fixture.kv.release(1, (*got)[1]);
+}
+
 TEST_CASE("the host pool carries pages of layers with different shapes") {
     pulsarlm::page_shape values_only = shape;
     values_only.values_only = true;
     cache_fixture fixture(4, {}, host_bytes, {values_only, shape});
-    std::vector<line_ids> allocated = fixture.kv.allocate(2).value();
+    std::vector<line_ids> allocated = allocate_each(fixture.kv, 2).value();
     for (std::size_t j = 0; j < 2; j++) {
         fixture.kv.tensors(0).v.select(0, allocated[0][j]).fill_(static_cast<float>(j + 1));
         fill_line(fixture.kv, allocated[1][j], static_cast<float>(j + 3), 1);
     }
     std::vector<digest> hashes{hash_of(1), hash_of(2)};
-    REQUIRE(run_to_completion(
-                fixture.kv.sync(hashes, std::vector<std::uint64_t>(hashes.size(), 0), allocated, compute_stream())
-    )
+    REQUIRE(run_to_completion(sync_each(fixture.kv, hashes, std::vector<std::uint64_t>(hashes.size(), 0), allocated))
                 .has_value());
     for (std::size_t layer = 0; layer < 2; layer++) {
         fixture.kv.release(layer, allocated[layer]);
@@ -763,7 +814,7 @@ TEST_CASE("the host pool carries pages of layers with different shapes") {
     REQUIRE(fixture.store->pages.at(key_of(1, 1)).k.eq(3.0f).all().item<bool>());
     REQUIRE(fixture.store->pages.at(key_of(2, 1)).v.eq(-4.0f).all().item<bool>());
 
-    std::vector<line_ids> evicting = fixture.kv.allocate(4).value();
+    std::vector<line_ids> evicting = allocate_each(fixture.kv, 4).value();
     for (std::size_t layer = 0; layer < 2; layer++) {
         fixture.kv.tensors(layer).k.zero_();
         fixture.kv.tensors(layer).v.zero_();

@@ -49,6 +49,11 @@ std::size_t ceil_div(std::size_t n, std::size_t d) {
 }
 
 std::vector<std::int64_t> page_sizes(const page_shape& shape) {
+    if (!shape.state_sizes.empty()) {
+        std::vector<std::int64_t> sizes{static_cast<std::int64_t>(shape.n_layers)};
+        sizes.insert(sizes.end(), shape.state_sizes.begin(), shape.state_sizes.end());
+        return sizes;
+    }
     return {
         static_cast<std::int64_t>(shape.n_layers),
         static_cast<std::int64_t>(shape.page_size),
@@ -69,7 +74,7 @@ at::Tensor make_pool(std::span<const page_shape> shapes, std::size_t pool_bytes,
     TORCH_CHECK(!shapes.empty(), "kv_cache: no KV layer");
     for (const page_shape& shape : shapes) {
         TORCH_CHECK(shape.n_layers == 1, "kv_cache: a KV layer's page shape has n_layers 1");
-        TORCH_CHECK(shape.dtype == shapes.front().dtype, "kv_cache: the KV layers share a dtype");
+        TORCH_CHECK(shape.state_sizes.empty() || shape.values_only, "kv_cache: a recurrent page is values_only");
         TORCH_CHECK(
             pool_bytes / block_bytes(shape) < std::numeric_limits<std::uint32_t>::max(),
             "kv_cache: too many lines in a pool of ",
@@ -81,6 +86,14 @@ at::Tensor make_pool(std::span<const page_shape> shapes, std::size_t pool_bytes,
 }
 
 std::vector<std::int64_t> line_strides(const page_shape& shape) {
+    if (!shape.state_sizes.empty()) {
+        std::vector<std::int64_t> sizes = page_sizes(shape);
+        std::vector<std::int64_t> strides(sizes.size(), 1);
+        for (std::size_t dim = sizes.size() - 1; dim > 0; dim--) {
+            strides[dim - 1] = strides[dim] * sizes[dim];
+        }
+        return strides;
+    }
     auto tensor_elements = static_cast<std::int64_t>(shape.page_size * shape.head_dim);
     auto head_elements = static_cast<std::int64_t>(tensor_count(shape)) * tensor_elements;
     return {
@@ -92,15 +105,19 @@ std::vector<std::int64_t> line_strides(const page_shape& shape) {
 }
 
 // count lines from element first of elements (1-D, in the shape's dtype), each [n_kv_heads, k then v, page_size,
-// head_dim], as K and V views of [count, page_size, n_kv_heads, head_dim].
+// head_dim], as K and V views of [count, page_size, n_kv_heads, head_dim]; a recurrent shape's lines are contiguous
+// [count, state_sizes...].
 page line_views(const at::Tensor& elements, const page_shape& shape, std::size_t count, std::size_t first) {
     std::vector<std::int64_t> sizes = page_sizes(shape);
     sizes.front() = static_cast<std::int64_t>(count);
     std::vector<std::int64_t> strides = line_strides(shape);
     std::int64_t k_first = elements.storage_offset() + static_cast<std::int64_t>(first);
     at::Tensor k = elements.as_strided(sizes, strides, k_first);
+    if (shape.values_only) {
+        return page{.k = k, .v = k};
+    }
     auto v_first = k_first + static_cast<std::int64_t>(shape.page_size * shape.head_dim);
-    return page{.k = k, .v = shape.values_only ? k : elements.as_strided(sizes, strides, v_first)};
+    return page{.k = k, .v = elements.as_strided(sizes, strides, v_first)};
 }
 
 // Whether candidate is laid out as a line of shape, so its bytes copy as one block from k's first element.
@@ -184,6 +201,13 @@ std::size_t largest_line_bytes(std::span<const page_shape> shapes) {
 }  // namespace
 
 std::size_t line_bytes(const page_shape& shape) {
+    if (!shape.state_sizes.empty()) {
+        std::size_t elements = shape.n_layers;
+        for (std::int64_t size : shape.state_sizes) {
+            elements *= static_cast<std::size_t>(size);
+        }
+        return elements * c10::elementSize(shape.dtype);
+    }
     std::size_t tensors = shape.values_only ? 1 : 2;
     return tensors * shape.n_layers * shape.page_size * shape.n_kv_heads * shape.head_dim *
         c10::elementSize(shape.dtype);
@@ -205,6 +229,10 @@ digest make_root_digest(std::string_view model, std::span<const page_shape> shap
         append_u64(seed, shape.n_kv_heads);
         append_u64(seed, shape.head_dim);
         append_u64(seed, shape.values_only);
+        append_u64(seed, shape.state_sizes.size());
+        for (std::int64_t size : shape.state_sizes) {
+            append_u64(seed, static_cast<std::uint64_t>(size));
+        }
     }
     return make_digest(seed);
 }
@@ -522,12 +550,11 @@ kv_cache::get(std::span<const std::span<const digest>> hashes, cudaStream_t stre
     co_return line_ids;
 }
 
-std::expected<std::vector<std::vector<std::uint32_t>>, page_error> kv_cache::allocate(std::size_t count) {
+std::expected<std::vector<std::vector<std::uint32_t>>, page_error>
+kv_cache::allocate(std::span<const std::size_t> counts) {
+    assert(counts.size() == layers.size());
     line_allocator::transaction taking(allocator);
-    std::optional<std::vector<std::vector<std::uint32_t>>> taken = take_lines(
-        taking,
-        std::vector<std::size_t>(layers.size(), count)
-    );
+    std::optional<std::vector<std::vector<std::uint32_t>>> taken = take_lines(taking, counts);
     if (!taken) {
         return std::unexpected(page_error::oom);
     }
@@ -559,30 +586,29 @@ kv_cache::clone(std::size_t layer, std::uint32_t line_id, std::size_t count, cud
 }
 
 task<std::expected<void, page_error>> kv_cache::sync(
-    const std::vector<digest>& hashes,
-    const std::vector<std::uint64_t>& owners,
+    const std::vector<std::vector<digest>>& hashes,
+    const std::vector<std::vector<std::uint64_t>>& owners,
     const std::vector<std::vector<std::uint32_t>>& line_ids,
     cudaStream_t stream
 ) {
-    assert(line_ids.size() == layers.size() && owners.size() == hashes.size());
-    std::vector<std::size_t> distinct;
-    std::vector<std::size_t> distinct_index(hashes.size());
-    std::unordered_map<digest, std::size_t, digest_hash> seen;
-    for (std::size_t i = 0; i < hashes.size(); i++) {
-        auto [found, inserted] = seen.try_emplace(hashes[i], distinct.size());
-        if (inserted) {
-            distinct.push_back(i);
-        }
-        distinct_index[i] = found->second;
-    }
+    assert(hashes.size() == layers.size() && owners.size() == layers.size() && line_ids.size() == layers.size());
     std::vector<layer_line> sources;
+    std::vector<digest> keys;
+    std::vector<page_owner> page_owners;
+    std::vector<std::pair<layer_line, digest>> named;
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
-        assert(line_ids[layer].size() == hashes.size());
-        for (std::uint32_t line_id : line_ids[layer]) {
+        assert(line_ids[layer].size() == hashes[layer].size() && owners[layer].size() == hashes[layer].size());
+        std::unordered_map<digest, std::size_t, digest_hash> put_index;
+        for (std::size_t i = 0; i < hashes[layer].size(); i++) {
+            std::uint32_t line_id = line_ids[layer][i];
             assert(line(layer, line_id).ref > 0 && !line(layer, line_id).hash);
-        }
-        for (std::size_t i : distinct) {
-            sources.push_back(layer_line{.layer = layer, .line_id = line_ids[layer][i]});
+            auto [found, inserted] = put_index.try_emplace(hashes[layer][i], sources.size());
+            if (inserted) {
+                sources.push_back(layer_line{.layer = layer, .line_id = line_id});
+                keys.push_back(store_key(hashes[layer][i], layer));
+                named.emplace_back(layer_line{.layer = layer, .line_id = line_id}, hashes[layer][i]);
+            }
+            page_owners.push_back(page_owner{.request = owners[layer][i], .page = found->second});
         }
     }
     if (sources.empty()) {
@@ -593,20 +619,8 @@ task<std::expected<void, page_error>> kv_cache::sync(
     if (!copies) {
         co_return std::unexpected(page_error::oom);
     }
-    std::vector<digest> keys;
-    keys.reserve(sources.size());
-    for (std::size_t layer = 0; layer < layers.size(); layer++) {
-        for (std::size_t i : distinct) {
-            assign_hash(layer, line_ids[layer][i], hashes[i]);
-            keys.push_back(store_key(hashes[i], layer));
-        }
-    }
-    std::vector<page_owner> page_owners;
-    page_owners.reserve(layers.size() * hashes.size());
-    for (std::size_t layer = 0; layer < layers.size(); layer++) {
-        for (std::size_t i = 0; i < hashes.size(); i++) {
-            page_owners.push_back(page_owner{.request = owners[i], .page = layer * distinct.size() + distinct_index[i]});
-        }
+    for (const auto& [target, hash] : named) {
+        assign_hash(target.layer, target.line_id, hash);
     }
     co_await copy_to_host(sources, *copies, stream);
     store->put(std::move(keys), std::move(*copies), std::move(page_owners));

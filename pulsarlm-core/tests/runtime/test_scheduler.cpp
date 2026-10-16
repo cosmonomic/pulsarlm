@@ -118,9 +118,11 @@ struct memory_store final : pulsarlm::page_store {
     }
 };
 
-// Writes each token's id as its K and its view index as its V in every KV layer. The token after a query is the sum of
-// the layer 0 K of every key the query attends, mod vocab. A view page's mass is 1 when it holds a key important
-// accepts, else 0. Every key a sliding layer reads must equal layer 0's key at its view index.
+// Writes each token's id as its K and its view index as its V in every attention KV layer. The token after a query is
+// the sum of the K of every key the query attends in the first full-attention layer, mod vocab; with a recurrent layer,
+// whose state is the sum of every token forwarded, evicted or not, it is that sum mod vocab instead. A view page's mass
+// is 1 when it holds a key important accepts, else 0. Every key a sliding layer reads must equal the full-attention
+// layer's key at its view index.
 class sum_model final : public pulsarlm::Model {
   public:
     std::vector<pulsarlm::kv_layer> layers = two_full_layers;
@@ -169,10 +171,19 @@ class sum_model final : public pulsarlm::Model {
         auto query_start = query_starts.accessor<std::int32_t, 1>();
         std::size_t n_seqs = static_cast<std::size_t>(all_tables.size(1));
 
-        std::vector<at::Tensor> keys;
+        std::size_t view = 0;
+        while (layers[view].state || layers[view].sliding_window) {
+            view++;
+        }
+        std::optional<std::vector<double>> state_sums;
+        std::vector<at::Tensor> keys(lines.size());
         std::vector<at::Tensor> tables;
         for (std::size_t layer = 0; layer < lines.size(); layer++) {
             tables.push_back(all_tables[static_cast<std::int64_t>(layer)]);
+            if (layers[layer].state) {
+                state_sums = run_state(g, lines[layer], tables.back());
+                continue;
+            }
             auto table = tables.back().accessor<std::int32_t, 2>();
             std::vector<std::int64_t> line_ids;
             std::vector<std::int64_t> offsets;
@@ -198,13 +209,13 @@ class sum_model final : public pulsarlm::Model {
                 written,
                 g.pos.to(at::kFloat).view({n_tokens, 1}).expand({n_tokens, 2})
             );
-            keys.push_back(layer_lines.k.select(2, 0).select(2, 0).cpu());
+            keys[layer] = layer_lines.k.select(2, 0).select(2, 0).cpu();
         }
 
         at::Tensor logits = at::zeros({n_tokens, vocab});
         auto logit = logits.accessor<float, 2>();
-        auto key = keys[0].accessor<float, 2>();
-        auto table = tables[0].accessor<std::int32_t, 2>();
+        auto key = keys[view].accessor<float, 2>();
+        auto table = tables[view].accessor<std::int32_t, 2>();
         for (std::size_t s = 0; s < n_seqs; s++) {
             REQUIRE((rope_layout[s][0] == 0 && rope_layout[s][1] == 0 && rope_layout[s][2] == -1));
             auto end_row = static_cast<std::size_t>(query_start[s + 1]);
@@ -215,8 +226,11 @@ class sum_model final : public pulsarlm::Model {
                 for (std::size_t j = 0; j <= view_index; j++) {
                     sum += static_cast<std::int64_t>(key[table[s][j / page_size]][j % page_size]);
                 }
+                if (state_sums) {
+                    sum = static_cast<std::int64_t>((*state_sums)[row]);
+                }
                 logit[row][sum % vocab] = 1.0f;
-                for (std::size_t layer = 1; layer < lines.size(); layer++) {
+                for (std::size_t layer = 0; layer < lines.size(); layer++) {
                     std::optional<std::size_t> window = layers[layer].sliding_window;
                     if (!window) {
                         continue;
@@ -250,6 +264,36 @@ class sum_model final : public pulsarlm::Model {
         }
         return pulsarlm::logit_inputs(logits.to(g.tokens.device()), g);
     }
+
+    // Each row's sum of every token forwarded through it. Starts from each sequence's first line, updates it, and
+    // writes the sum after the sequence's page_end_tokens into its second line.
+    static std::vector<double>
+    run_state(const pulsarlm::GroupBatch& g, const pulsarlm::kv& lines, const at::Tensor& rows) {
+        REQUIRE(g.page_end_tokens.defined());
+        at::Tensor tokens = g.tokens.cpu();
+        at::Tensor page_end_tokens = g.page_end_tokens.cpu();
+        at::Tensor query_starts = g.is_prefill() ? g.cu_seqlens_q.cpu() : at::arange(rows.size(0) + 1, at::kInt);
+        at::Tensor states = lines.k.cpu();
+        auto token = tokens.accessor<std::int64_t, 1>();
+        auto page_end = page_end_tokens.accessor<std::int32_t, 1>();
+        auto query_start = query_starts.accessor<std::int32_t, 1>();
+        auto table = rows.accessor<std::int32_t, 2>();
+        auto state = states.accessor<float, 2>();
+        std::vector<double> sums;
+        for (std::int64_t s = 0; s < rows.size(0); s++) {
+            double sum = state[table[s][0]][0];
+            for (std::int32_t row = query_start[s]; row < query_start[s + 1]; row++) {
+                sum += static_cast<double>(token[row]);
+                sums.push_back(sum);
+                if (row - query_start[s] + 1 == page_end[s]) {
+                    state[table[s][1]][0] = static_cast<float>(sum);
+                }
+            }
+            state[table[s][0]][0] = static_cast<float>(sum);
+        }
+        lines.k.copy_(states);
+        return sums;
+    }
 };
 
 cudaStream_t compute_stream() {
@@ -266,7 +310,8 @@ std::vector<pulsarlm::page_shape> page_shapes(const std::vector<pulsarlm::kv_lay
                 .n_kv_heads = layer.n_kv_heads,
                 .head_dim = layer.head_dim,
                 .dtype = at::kFloat,
-                .values_only = layer.values_only,
+                .values_only = layer.values_only || layer.state.has_value(),
+                .state_sizes = layer.state ? layer.state->sizes : std::vector<std::int64_t>(),
             }
         );
     }
@@ -1007,6 +1052,112 @@ TEST_CASE("eviction keeps the pages a sliding window reaches whatever n_working 
 
     std::vector<digest> chain = pulsarlm::make_page_digests(root(), prompt, page_size);
     REQUIRE((hashes_of(results[0].cycle_ends[0].reached) == std::vector{chain[2], chain[3]}));
+}
+
+const std::vector<pulsarlm::kv_layer> recurrent_and_full{
+    pulsarlm::kv_layer{
+        .n_kv_heads = 1,
+        .head_dim = 2,
+        .state = pulsarlm::recurrent_state{.sizes = {1}, .dtype = at::kFloat},
+    },
+    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2},
+};
+
+std::int64_t sum_of_first(const token_list& tokens, std::size_t count) {
+    return std::accumulate(tokens.begin(), tokens.begin() + static_cast<std::ptrdiff_t>(count), std::int64_t{0});
+}
+
+std::int64_t stored_state(const fixture& f, const digest& hash) {
+    return static_cast<std::int64_t>(f.stored(hash, 0).k.item<float>());
+}
+
+TEST_CASE("a recurrent layer carries its state across steps and keeps the state at the newest page") {
+    fixture f(16, 3, {}, {}, recurrent_and_full);
+    token_list prompt{1, 2, 3, 4, 5, 6, 7};
+    std::vector<request_results> results = serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 6}});
+
+    token_list generated = continuation(prompt, 6);
+    REQUIRE(results[0].tokens == generated);
+    REQUIRE(f.model.prefill_chunks == std::vector<token_list>{{3}, {3}});
+    pulsarlm::state end = ended_state(results[0]);
+    token_list forwarded = concat(prompt, without_last(generated));
+    std::vector<digest> hashes = pulsarlm::make_page_digests(root(), forwarded, page_size);
+    REQUIRE(hashes.size() == 3);
+    REQUIRE((end.head == hashes.back()));
+    REQUIRE((hashes_of(end, 1) == hashes));
+    REQUIRE((hashes_of(end, 0) == std::vector{hashes.back()}));
+    REQUIRE(stored_state(f, hashes.back()) == sum_of_first(forwarded, 12));
+    REQUIRE(!f.store->pages.contains(pulsarlm::store_key(hashes[1], 0)));
+    f.sched.validate_state(end);
+    pulsarlm::state every_page = end;
+    every_page.layers[0] = every_page.layers[1];
+    REQUIRE_THROWS_AS(f.sched.validate_state(every_page), std::invalid_argument);
+}
+
+TEST_CASE("a request resumes a recurrent layer's state from another cache") {
+    fixture first_engine(16, 64, {}, {}, recurrent_and_full);
+    token_list prompt{1, 2, 3, 4, 5, 6};
+    request_results first = serve_all(first_engine.sched, {request{.tokens = prompt, .max_tokens = 5}})[0];
+    pulsarlm::state first_end = ended_state(first);
+
+    memory_store shared_store;
+    shared_store.contents = first_engine.store;
+    fixture second_engine(16, 64, {}, shared_store, recurrent_and_full);
+    token_list user{7, 8};
+    request_results second = serve_all(
+        second_engine.sched,
+        {request{.initial_state = first_end, .tokens = concat({first.tokens.back()}, user), .max_tokens = 4}}
+    )[0];
+
+    REQUIRE(second.tokens == continuation(concat(concat(prompt, first.tokens), user), 4));
+    std::vector<digest> keys = concat(keys_of({*first_end.head}, 0), keys_of(hashes_of(first_end, 1), 1));
+    REQUIRE((first_engine.store->fetches == std::vector<std::vector<digest>>{keys}));
+}
+
+TEST_CASE("a recurrent layer's state covers the pages eviction drops") {
+    fixture f(16, 64, {}, {}, recurrent_and_full);
+    token_list prompt(16);
+    std::iota(prompt.begin(), prompt.end(), 1);
+    std::vector<request_results> results = serve_all(
+        f.sched,
+        {request{
+            .tokens = prompt,
+            .max_tokens = 2,
+            .eviction = {.n_sink = 0, .n_working = 1, .cycle_tokens = 16, .max_pages = 2}
+        }}
+    );
+
+    REQUIRE(results[0].tokens == continuation(prompt, 2));
+    std::vector<digest> chain = pulsarlm::make_page_digests(root(), prompt, page_size);
+    const pulsarlm::state& reached = results[0].cycle_ends[0].reached;
+    REQUIRE((hashes_of(reached, 1) == std::vector{chain[2], chain[3]}));
+    REQUIRE((hashes_of(reached, 0) == std::vector{chain[3]}));
+    REQUIRE(stored_state(f, chain[3]) == sum_of_first(prompt, 16));
+}
+
+TEST_CASE("each state a recurrent request reaches has the state at its head in the store") {
+    fixture f(16, 64, {}, {}, recurrent_and_full);
+    token_list prompt{1, 2, 3, 4, 5, 6};
+    std::vector<request_results> results = serve_all(
+        f.sched,
+        {request{.tokens = prompt, .max_tokens = 7, .eviction = {.cycle_tokens = 2}}}
+    );
+
+    token_list history = concat(prompt, results[0].tokens);
+    REQUIRE(results[0].tokens == continuation(prompt, 7));
+    std::vector<pulsarlm::state> states;
+    for (const pulsarlm::cycle_end& ended : results[0].cycle_ends) {
+        states.push_back(ended.reached);
+    }
+    states.push_back(ended_state(results[0]));
+    REQUIRE(states.size() == 6);
+    for (const pulsarlm::state& reached : states) {
+        std::size_t pages = hashes_of(reached, 1).size();
+        if (pages > 0) {
+            REQUIRE((hashes_of(reached, 0) == std::vector{*reached.head}));
+            REQUIRE(stored_state(f, *reached.head) == sum_of_first(history, pages * page_size));
+        }
+    }
 }
 
 }  // namespace

@@ -58,9 +58,16 @@ class sequence {
     // page never measured.
     std::vector<float> state_density;
     std::vector<std::int64_t> pending;
+    // Per KV layer, whether it is recurrent; the scheduler's.
+    const std::vector<bool>& recurrent;
+    // The KV layer whose lines are one per view page.
+    std::size_t view_layer;
     // Per KV layer, the line of each page in view order: the full pages, then the pages of tail and pending. A sliding
-    // layer's pages before first_held[layer] hold no_line.
+    // layer's pages before first_held[layer] hold no_line. A recurrent layer's lines are the one its state is updated
+    // in, then the one a step writes the state at its newest page end into.
     std::vector<std::vector<std::uint32_t>> lines;
+    // Whether the recurrent layers' second lines hold the state at head, which the store does not have yet.
+    bool state_pending = false;
     std::vector<std::size_t> first_held;
     // int32 [n_kv_layers, capacity] on the device, lines with no_line as 0. Columns past those of lines are unused.
     at::Tensor table;
@@ -79,9 +86,9 @@ class sequence {
     // density.
     sequence(
         request&& r,
+        const std::vector<bool>& recurrent,
         std::size_t view_layer,
         result_writer& writer,
-        std::size_t n_kv_layers,
         at::Device device,
         cudaStream_t stream
     );
@@ -97,19 +104,22 @@ class sequence {
     // The tokens the cycle can still forward: no more than its length allows, nor than the request will forward.
     std::size_t cycle_tokens_left(std::size_t page_size) const noexcept;
     std::size_t view_page_count() const noexcept;
+    // The columns of table the lines take.
+    std::size_t table_width() const noexcept;
     // Drops the full pages at the ascending view indices pages, queuing on stream the drop of their density, and returns
     // their held lines per KV layer.
     std::vector<std::vector<std::uint32_t>> remove_pages(std::span<const std::size_t> pages, cudaStream_t stream);
     // Queues on stream the upload of the view pages from first_page on into table, all of them when table grows.
     void upload_table(std::size_t first_page, cudaStream_t stream);
-    // One line per page the cycle's tokens fill, in each KV layer. Called at the start of a cycle, with an empty tail.
+    // One line per page the cycle's tokens fill, in each KV layer of pages. Called at the start of a cycle, with an
+    // empty tail.
     std::size_t cycle_lines(std::size_t page_size) const noexcept;
     // Queue on stream: ages the density by token_count tokens and adds step_mass.
     void add_step_mass(const at::Tensor& step_mass, std::size_t token_count, cudaStream_t stream);
     // A pinned host copy of the density, complete once stream reaches this point.
     at::Tensor density_on_host(cudaStream_t stream) const;
-    // The lines the sequence lacks in each KV layer to forward every token left in its cycle.
-    std::size_t missing_lines(std::size_t page_size) const noexcept;
+    // Per KV layer, the lines the sequence lacks to forward every token left in its cycle.
+    std::vector<std::size_t> missing_lines(std::size_t page_size) const;
 
     friend class scheduler;
     friend class batch;
@@ -138,9 +148,15 @@ class batch {
     // Pinned host int64, one token per entry that samples, in entry order.
     at::Tensor sampled;
 
-    batch(std::span<sequence* const> running, std::size_t page_size, std::size_t prefill_tokens_per_step);
+    // With recurrent, the inputs carry each sequence's page end tokens.
+    batch(
+        std::span<sequence* const> running,
+        std::size_t page_size,
+        std::size_t prefill_tokens_per_step,
+        bool recurrent
+    );
 
-    static GroupBatch make_group(std::span<const entry> group, std::size_t page_size, bool prefill);
+    static GroupBatch make_group(std::span<const entry> group, std::size_t page_size, bool prefill, bool recurrent);
     static bool measures_mass(std::span<const entry> group) noexcept;
     static at::Tensor page_tables(std::span<const entry> group, std::size_t n_kv_layers);
     // Queues on stream the inputs' copies, the forward, the sampling and the copy of the sampled tokens to the host,
@@ -159,6 +175,7 @@ class scheduler {
     kv_cache cache;
     std::vector<kv> lines;
     std::vector<std::optional<std::size_t>> sliding_windows;
+    std::vector<bool> recurrent;
     // A full-attention KV layer, whose sequence of a state is the view every other layer's sequence is a part of.
     std::size_t view_layer;
     // The full pages eviction keeps last so that no sliding window loses a key.
@@ -177,11 +194,12 @@ class scheduler {
     // The view page of the first key KV layer layer reads for a query at view index query.
     std::size_t first_held_page(std::size_t layer, std::size_t query) const noexcept;
     // Per KV layer, the pages of view a request resuming from it reads: every page for a full-attention layer, those
-    // its window reaches for a sliding layer.
+    // its window reaches for a sliding layer, the last for a recurrent layer.
     std::vector<layer_sequence> layer_sequences(std::span<const active_page> view) const;
     state reached(const sequence& seq) const;
-    // Per KV layer, lines for the page_hashes from its first held page for a query at their end, in their order, then
-    // line_count empty lines. Holds nothing on failure.
+    // Per KV layer of pages, lines for the page_hashes from its first held page for a query at their end, in their
+    // order, then line_count empty lines; per recurrent layer, a copy of the state at head, or zeros without head, and
+    // an empty line. Holds nothing on failure.
     task<std::expected<void, page_error>> take_lines(sequence& seq, std::size_t line_count);
     void release_lines(sequence& seq) noexcept;
     // Releases the lines of the sliding layers' pages before the window of the next query.

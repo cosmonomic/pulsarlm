@@ -50,6 +50,9 @@ void check_kv_cache(const engine_config& config, std::span<const page_shape> sha
 
 void check_attention(const engine_config& config, std::span<const kv_layer> layers) {
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
+        if (layers[layer].state) {
+            continue;
+        }
         std::optional<std::string> unsupported = attention_unsupported_reason(
             config.kv_dtype,
             static_cast<std::int64_t>(config.page_size),
@@ -75,6 +78,20 @@ kv_cache make_cache(const engine_config& config, std::span<const kv_layer> layer
 std::vector<page_shape> page_shapes(const engine_config& config, std::span<const kv_layer> layers) {
     std::vector<page_shape> shapes;
     for (const kv_layer& layer : layers) {
+        if (layer.state) {
+            shapes.push_back(
+                page_shape{
+                    .n_layers = 1,
+                    .page_size = config.page_size,
+                    .n_kv_heads = 0,
+                    .head_dim = 0,
+                    .dtype = layer.state->dtype,
+                    .values_only = true,
+                    .state_sizes = layer.state->sizes,
+                }
+            );
+            continue;
+        }
         shapes.push_back(
             page_shape{
                 .n_layers = 1,

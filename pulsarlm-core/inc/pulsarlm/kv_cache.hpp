@@ -28,7 +28,8 @@ struct page {
     at::Tensor v;
 };
 
-// With values_only, one tensor per layer serves as both K and V.
+// With values_only, one tensor per layer serves as both K and V. A recurrent layer's page (state_sizes not empty) is one
+// tensor [n_layers, state_sizes...] with values_only set; page_size, n_kv_heads and head_dim do not apply to it.
 struct page_shape {
     std::size_t n_layers;
     std::size_t page_size;
@@ -36,6 +37,7 @@ struct page_shape {
     std::size_t head_dim;
     at::ScalarType dtype;
     bool values_only = false;
+    std::vector<std::int64_t> state_sizes;
 };
 
 // The device bytes of one line: its K and V in every layer, or its one tensor for values_only.
@@ -159,26 +161,26 @@ class kv_cache {
     // get is fetching shares that line and fetch. Fails with miss when the store does not have a page.
     task<std::expected<std::vector<std::vector<std::uint32_t>>, page_error>>
     get(std::span<const std::span<const digest>> hashes, cudaStream_t stream);
-    // Gives count empty lines in every layer, held until release. get does not find their pages until they are synced,
-    // and releasing a line before it is synced drops its page.
-    std::expected<std::vector<std::vector<std::uint32_t>>, page_error> allocate(std::size_t count);
+    // Gives counts[layer] empty lines of each layer, held until release. get does not find their pages until they are
+    // synced, and releasing a line before it is synced drops its page.
+    std::expected<std::vector<std::vector<std::uint32_t>>, page_error> allocate(std::span<const std::size_t> counts);
     // Gives count unmapped lines of layer holding a copy of the page at its held line_id, held until release.
     std::expected<std::vector<std::uint32_t>, page_error>
     clone(std::size_t layer, std::uint32_t line_id, std::size_t count, cudaStream_t stream);
-    // Names the full page at line_ids[layer][i], held and unmapped, by hashes[i] in every layer and hands a host copy
-    // of each distinct page, owned by every owners[i] of its hash, to the store in one put, also when another line
-    // caches its hash: the store may have
-    // dropped that page. A hash already cached at another line leaves its line unmapped. Completes once the copies are
-    // handed to the store. Fails with oom, caching nothing, when host memory for the copies cannot be allocated.
+    // Names the page at line_ids[layer][i], held and unmapped, by hashes[layer][i] and hands a host copy of each
+    // distinct page of a layer, owned by every owners[layer][i] of its hash, to the store in one put, also when another
+    // line caches its hash: the store may have dropped that page. A hash already cached at another line leaves its line
+    // unmapped. Completes once the copies are handed to the store. Fails with oom, caching nothing, when host memory for
+    // the copies cannot be allocated.
     task<std::expected<void, page_error>> sync(
-        const std::vector<digest>& hashes,
-        const std::vector<std::uint64_t>& owners,
+        const std::vector<std::vector<digest>>& hashes,
+        const std::vector<std::vector<std::uint64_t>>& owners,
         const std::vector<std::vector<std::uint32_t>>& line_ids,
         cudaStream_t stream
     );
     void release(std::size_t layer, std::span<const std::uint32_t> line_ids) noexcept;
 
-    // The largest count for which allocate(count) succeeds now.
+    // The largest count for which allocate gives count lines of every layer now.
     std::size_t free_count();
     std::size_t layer_count() const noexcept;
     // [n_lines, page_size, n_kv_heads, head_dim] views of the pool, indexed by line id, lines a block apart.
