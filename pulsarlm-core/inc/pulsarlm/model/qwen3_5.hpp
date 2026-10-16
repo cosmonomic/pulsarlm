@@ -62,7 +62,7 @@ class Qwen3_5Model : public Model {
         at::Tensor in_proj_b;
         at::Tensor in_proj_a;
         at::Tensor conv;  // [conv channels, 1, linear_conv_kernel]
-        at::Tensor dt_bias;
+        at::Tensor dt_bias;  // fp32
         at::Tensor neg_a;  // fp32 -exp(A_log)
         at::Tensor norm;
         at::Tensor out_proj;

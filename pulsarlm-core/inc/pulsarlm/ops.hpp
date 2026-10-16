@@ -15,6 +15,46 @@ namespace pulsarlm {
 // RMSNorm over x's last axis, in fp32. weight is in x's dtype or fp32.
 at::Tensor rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, double eps);
 
+// The Gated DeltaNet ops run a ragged batch: sequence s holds tokens [cu_seqlens_q[s], cu_seqlens_q[s + 1]) of x, or
+// token s alone without cu_seqlens_q. rows [num_seqs, >= 2] int32 holds each sequence's running line, whose state the
+// sequence continues and which then holds the state after its last token, and its boundary line, which receives the
+// state after its first page_end_tokens[s] tokens when page_end_tokens[s] > 0. A pool's lines lie any number of
+// elements apart, a state pool's lines 16-byte aligned.
+
+// silu of the causal depthwise convolution of x [tokens, channels] by weight [channels, 1, kernel], in x's dtype. A
+// line of conv_pool [lines, channels, kernel - 1] holds the kernel - 1 inputs before a sequence's next token.
+at::Tensor causal_conv_cuda(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& conv_pool,
+    const at::Tensor& rows,
+    const std::optional<at::Tensor>& cu_seqlens_q,
+    const at::Tensor& page_end_tokens
+);
+
+// The gated delta rule's outputs [tokens, value heads, value dim] in x's dtype. Each row of x [tokens, 2 * key_heads *
+// key dim + value heads * value dim] holds the token's query heads, key heads and value heads; value head h reads key
+// head h / (value heads / key_heads). Queries and keys are L2-normalized, with 1e-6 added to the sum of squares, and
+// queries scaled by 1 / sqrt(key dim). a and b are [tokens, value heads] in x's dtype: the state decays by
+// exp(neg_a * softplus(a + dt_bias)) and learns at sigmoid(b), rounded to x's dtype; dt_bias and neg_a are fp32
+// [value heads]. A line of state_pool, fp32 [lines, value heads, key dim, value dim], holds a sequence's state.
+at::Tensor gated_delta_rule_cuda(
+    const at::Tensor& x,
+    const at::Tensor& a,
+    const at::Tensor& b,
+    const at::Tensor& dt_bias,
+    const at::Tensor& neg_a,
+    const at::Tensor& state_pool,
+    const at::Tensor& rows,
+    const std::optional<at::Tensor>& cu_seqlens_q,
+    const at::Tensor& page_end_tokens,
+    int64_t key_heads
+);
+
+// weight * RMSNorm(x) * silu(z) over the last axis, the normalized x and its product with weight each rounded to x's
+// dtype. z and weight are in x's dtype.
+at::Tensor gated_rmsnorm_cuda(const at::Tensor& x, const at::Tensor& z, const at::Tensor& weight, double eps);
+
 // Scatter a batch's new K/V rows into paged pools. k_pool/v_pool are [num_pages,
 // page_size, n_kv_heads, head_dim] of one stride, each page packed and 16-byte aligned
 // with pages any number of elements apart, and may be one tensor; k_new/v_new are
