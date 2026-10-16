@@ -193,7 +193,7 @@ def test_another_engine_continues_a_state_from_the_store():
 def test_a_page_missing_from_the_store_ends_with_miss():
     async def main():
         engine = make_engine(MemoryStore(asyncio.get_running_loop()))
-        missing = State(page_hashes=[bytes(16)])
+        missing = State(page_hashes=[bytes(16)], density=[0.0])
         _, _, end = await run(engine, engine.submit(missing, [1], max_tokens=1))
 
         assert end == RequestError.MISS
@@ -204,7 +204,7 @@ def test_a_page_missing_from_the_store_ends_with_miss():
 def test_a_failing_fetch_misses():
     async def main():
         engine = make_engine(FailingStore(asyncio.get_running_loop()))
-        missing = State(page_hashes=[bytes(16)])
+        missing = State(page_hashes=[bytes(16)], density=[0.0])
         _, _, end = await run(engine, engine.submit(missing, [1], max_tokens=1))
 
         assert end == RequestError.MISS

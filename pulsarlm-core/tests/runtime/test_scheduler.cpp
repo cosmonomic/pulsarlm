@@ -13,6 +13,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -464,6 +465,7 @@ TEST_CASE("a request from an empty state prefills, decodes and ends with its sta
     REQUIRE((end.page_hashes == pulsarlm::make_page_digests(root(), forwarded, page_size)));
     REQUIRE(end.tail == token_list(forwarded.begin() + full_tokens, forwarded.end()));
     REQUIRE(end.page_hashes.size() == 2);
+    REQUIRE(end.density == std::vector<float>(2, 0.0f));
     for (std::size_t i = 0; i < end.page_hashes.size(); i++) {
         std::size_t first_index = i * page_size;
         token_list page_tokens(forwarded.begin() + first_index, forwarded.begin() + first_index + page_size);
@@ -542,7 +544,7 @@ TEST_CASE("a request continues from pages another cache fetches from the store")
 
 TEST_CASE("a state page missing from the store ends the request with miss") {
     fixture f(16);
-    pulsarlm::state unknown{.page_hashes = {digest{.hi = 1, .lo = 2}}};
+    pulsarlm::state unknown{.page_hashes = {digest{.hi = 1, .lo = 2}}, .density = {0.0f}};
     std::vector<request_results> results = serve_all(
         f.sched,
         {request{.initial_state = unknown, .tokens = {3}, .max_tokens = 1}}
@@ -710,6 +712,63 @@ TEST_CASE("a cycle's end evicts the pages below the bar outside the sink and wor
     pulsarlm::state end = ended_state(results[0]);
     REQUIRE((end.page_hashes == std::vector{chain[0], chain[1], chain[3]}));
     REQUIRE(end.tail == token_list{first});
+}
+
+TEST_CASE("a page's density carries over from the cycles before") {
+    fixture f(16);
+    f.model.important = [&f](std::int64_t token) { return token == 7 && f.model.forward_count == 1; };
+    token_list prompt{100, 101, 102, 103, 7, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114};
+    std::vector<request_results> results = serve_all(
+        f.sched,
+        {request{
+            .tokens = prompt,
+            .max_tokens = 2,
+            .eviction =
+                {.n_sink = 1, .n_working = 1, .cycle_tokens = 8, .evict_tau = 0.4, .attention_mass_decay = 0.01},
+        }}
+    );
+
+    REQUIRE(f.model.prefill_chunks == std::vector<token_list>{{8}, {8}});
+    std::vector<digest> chain = pulsarlm::make_page_digests(root(), prompt, page_size);
+    REQUIRE(results[0].cycle_ends.size() == 2);
+    const pulsarlm::state& reached = results[0].cycle_ends[1].reached;
+    REQUIRE((reached.page_hashes == std::vector{chain[0], chain[1], chain[3]}));
+    REQUIRE(reached.density.size() == 3);
+    REQUIRE(reached.density[0] == 0.0f);
+    REQUIRE(reached.density[1] == static_cast<float>(std::pow(0.99, 8)));
+    REQUIRE(reached.density[2] == 0.0f);
+}
+
+TEST_CASE("a request resumes with the density of its initial state") {
+    fixture f(16);
+    f.model.important = [](std::int64_t token) { return token == 7; };
+    token_list prompt{100, 101, 102, 103, 7, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114};
+    pulsarlm::eviction_policy policy{.n_sink = 1, .n_working = 1, .cycle_tokens = 4, .evict_tau = 0.4};
+    std::vector<request_results> results = serve_in_turn(
+        f.sched,
+        request{
+            .tokens = prompt,
+            .max_tokens = 1,
+            .eviction = {.n_sink = 1, .n_working = 4, .cycle_tokens = 16, .evict_tau = 0.4}
+        },
+        [&](const request_results& first) {
+            f.model.important = [](std::int64_t) { return false; };
+            return request{
+                .initial_state = ended_state(first),
+                .tokens = {first.tokens.back(), 200, 201, 202},
+                .max_tokens = 2,
+                .eviction = policy,
+            };
+        }
+    );
+
+    std::vector<digest> chain = pulsarlm::make_page_digests(root(), prompt, page_size);
+    pulsarlm::state first_end = ended_state(results[0]);
+    REQUIRE((first_end.page_hashes == chain));
+    REQUIRE(first_end.density == std::vector<float>{0.0f, 1.0f, 0.0f, 0.0f});
+    const pulsarlm::state& reached = results[1].cycle_ends[0].reached;
+    REQUIRE(reached.page_hashes.size() == 3);
+    REQUIRE((std::vector{reached.page_hashes[0], reached.page_hashes[1]} == std::vector{chain[0], chain[1]}));
 }
 
 TEST_CASE("a cycle's end evicts down to max_pages, the oldest first on ties") {

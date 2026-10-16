@@ -55,19 +55,26 @@ GroupBatch to_device(const GroupBatch& host, at::Device device) {
 
 }  // namespace
 
-sequence::sequence(request&& r, result_writer& writer, std::size_t n_kv_layers, at::Device device)
+sequence::sequence(request&& r, result_writer& writer, std::size_t n_kv_layers, at::Device device, cudaStream_t stream)
 : writer(writer),
   id(r.id),
   sampling(r.sampling),
   seed(sampling_seed(r.sampling.seed)),
   max_tokens(r.max_tokens),
   page_hashes(std::move(r.initial_state.page_hashes)),
+  state_density(std::move(r.initial_state.density)),
   pending(std::move(r.initial_state.tail)),
   lines(n_kv_layers),
   first_held(n_kv_layers, 0),
   table(at::zeros({static_cast<std::int64_t>(n_kv_layers), 0}, at::TensorOptions().dtype(at::kInt).device(device))),
   eviction(r.eviction) {
     pending.insert(pending.end(), r.tokens.begin(), r.tokens.end());
+    if (eviction.can_evict()) {
+        at::Tensor host = pinned({static_cast<std::int64_t>(state_density.size())}, at::kFloat);
+        std::ranges::copy(state_density, host.mutable_data_ptr<float>());
+        c10::cuda::CUDAStreamGuard guard(c10::cuda::getStreamFromExternal(stream, device.index()));
+        density = page_density(host.to(device, /*non_blocking=*/true));
+    }
 }
 
 std::size_t sequence::forwarded_count(std::size_t page_size) const noexcept {
@@ -78,24 +85,32 @@ bool sequence::may_sample() const noexcept {
     return !max_tokens || generated < *max_tokens;
 }
 
-void sequence::advance(std::size_t count, std::size_t page_size, const digest& root) {
+void sequence::advance(std::size_t count, std::size_t page_size, const digest& root, const at::Tensor& host_density) {
     assert(count <= pending.size());
     tail.insert(tail.end(), pending.begin(), pending.begin() + count);
     pending.erase(pending.begin(), pending.begin() + count);
     covered_count += count;
-    std::size_t completed_tokens = tail.size() - tail.size() % page_size;
-    if (completed_tokens == 0) {
-        return;
+    if (std::size_t completed_tokens = tail.size() - tail.size() % page_size; completed_tokens > 0) {
+        digest parent = page_hashes.empty() ? root : page_hashes.back();
+        std::vector<digest> completed = make_page_digests(parent, std::span(tail).first(completed_tokens), page_size);
+        page_hashes.insert(page_hashes.end(), completed.begin(), completed.end());
+        tail.erase(tail.begin(), tail.begin() + completed_tokens);
     }
-    digest parent = page_hashes.empty() ? root : page_hashes.back();
-    std::vector<digest> completed = make_page_digests(parent, std::span(tail).first(completed_tokens), page_size);
-    page_hashes.insert(page_hashes.end(), completed.begin(), completed.end());
-    tail.erase(tail.begin(), tail.begin() + completed_tokens);
+    if (host_density.defined()) {
+        assert(static_cast<std::size_t>(host_density.size(0)) >= page_hashes.size());
+        const float* measured = host_density.const_data_ptr<float>();
+        state_density.assign(measured, measured + page_hashes.size());
+    } else {
+        state_density.resize(page_hashes.size(), 0.0f);
+    }
+}
+
+state sequence::reached() const {
+    return state{.page_hashes = page_hashes, .tail = tail, .density = state_density};
 }
 
 void sequence::start_cycle(std::size_t page_size) noexcept {
     cycle_start = forwarded_count(page_size);
-    density.reset();
 }
 
 bool sequence::ends_cycle(std::size_t token_count, std::size_t page_size) const noexcept {
@@ -117,7 +132,8 @@ std::size_t sequence::view_page_count() const noexcept {
 }
 
 // Evicted pages precede every sliding window, so a sliding layer's evicted entries hold no_line.
-std::vector<std::vector<std::uint32_t>> sequence::remove_pages(std::span<const std::size_t> pages) {
+std::vector<std::vector<std::uint32_t>>
+sequence::remove_pages(std::span<const std::size_t> pages, cudaStream_t stream) {
     std::vector<std::vector<std::uint32_t>> removed(lines.size());
     std::size_t kept = 0;
     std::size_t next_removed = 0;
@@ -132,6 +148,7 @@ std::vector<std::vector<std::uint32_t>> sequence::remove_pages(std::span<const s
             continue;
         }
         page_hashes[kept] = page_hashes[page];
+        state_density[kept] = state_density[page];
         for (std::vector<std::uint32_t>& layer_lines : lines) {
             layer_lines[kept] = layer_lines[page];
         }
@@ -140,10 +157,16 @@ std::vector<std::vector<std::uint32_t>> sequence::remove_pages(std::span<const s
     assert(next_removed == pages.size());
     std::size_t full_pages = page_hashes.size();
     page_hashes.resize(kept);
+    state_density.resize(kept);
     for (std::size_t layer = 0; layer < lines.size(); layer++) {
         lines[layer].erase(lines[layer].begin() + kept, lines[layer].begin() + full_pages);
         assert(first_held[layer] == 0 || first_held[layer] >= pages.size());
         first_held[layer] -= std::min(first_held[layer], pages.size());
+    }
+    if (density.by_page().defined()) {
+        const at::Tensor& on_device = density.by_page();
+        c10::cuda::CUDAStreamGuard guard(c10::cuda::getStreamFromExternal(stream, on_device.device().index()));
+        density.remove(pages);
     }
     return removed;
 }
@@ -420,8 +443,9 @@ task<void> scheduler::submit(request r, result_writer writer) {
     assert(!r.initial_state.tail.empty() || !r.tokens.empty());
     assert(r.eviction.n_working >= 1 && r.eviction.cycle_tokens >= 1);
     assert(r.eviction.attention_mass_decay > 0.0 && r.eviction.attention_mass_decay <= 1.0);
+    assert(r.initial_state.density.size() == r.initial_state.page_hashes.size());
     r.eviction.n_working = std::max(r.eviction.n_working, window_pages);
-    sequence seq(std::move(r), writer, cache.layer_count(), cache.tensors(0).k.device());
+    sequence seq(std::move(r), writer, cache.layer_count(), cache.tensors(0).k.device(), stream);
     seq.start_cycle(page_size);
     if (writer.cancelled()) {
         writer.end(std::unexpected(request_error::cancelled));
@@ -442,7 +466,7 @@ task<void> scheduler::submit(request r, result_writer writer) {
 
     switch (*seq.exited) {
     case exit_reason::finished:
-        writer.end(state{.page_hashes = std::move(seq.page_hashes), .tail = std::move(seq.tail)});
+        writer.end(seq.reached());
         co_return;
     case exit_reason::cancelled:
         writer.end(std::unexpected(request_error::cancelled));
@@ -527,9 +551,7 @@ task<void> scheduler::launch(batch& b) {
     for (batch::entry& e : b.entries) {
         if (e.step_mass.defined()) {
             e.seq->add_step_mass(e.step_mass, e.token_count, stream);
-            if (e.ends_cycle) {
-                e.host_density = e.seq->density_on_host(stream);
-            }
+            e.host_density = e.seq->density_on_host(stream);
         }
     }
     co_await synchronize(stream);
@@ -546,7 +568,7 @@ task<void> scheduler::write_back(batch& b) {
     for (const batch::entry& e : b.entries) {
         sequence& seq = *e.seq;
         std::size_t first_new_page = seq.page_hashes.size();
-        seq.advance(e.token_count, page_size, root);
+        seq.advance(e.token_count, page_size, root, e.host_density);
         if (seq.page_hashes.size() > first_new_page) {
             new_hashes.insert(new_hashes.end(), seq.page_hashes.begin() + first_new_page, seq.page_hashes.end());
             new_owners.resize(new_hashes.size(), seq.id);
@@ -592,7 +614,7 @@ task<void> scheduler::write_back(batch& b) {
         }
         release_passed_lines(seq);
         if (e.ends_cycle) {
-            end_cycle(seq, e.host_density);
+            end_cycle(seq);
         }
         if (std::size_t missing = seq.missing_lines(page_size); missing > 0) {
             std::size_t first_new_page = seq.view_page_count();
@@ -617,22 +639,18 @@ task<void> scheduler::write_back(batch& b) {
 }
 
 // The step that last used the evicted lines has completed, so they are released right away.
-void scheduler::end_cycle(sequence& seq, const at::Tensor& host_density) {
-    if (host_density.defined()) {
-        std::span<const float> density(host_density.const_data_ptr<float>(), seq.page_hashes.size());
-        std::vector<std::size_t>
-            evicted = pages_to_evict(density, page_size, seq.cycle_start, seq.forwarded_count(page_size), seq.eviction);
+void scheduler::end_cycle(sequence& seq) {
+    if (seq.eviction.can_evict()) {
+        std::vector<std::size_t> evicted = pages_to_evict(seq.state_density, seq.eviction);
         if (!evicted.empty()) {
-            std::vector<std::vector<std::uint32_t>> removed = seq.remove_pages(evicted);
+            std::vector<std::vector<std::uint32_t>> removed = seq.remove_pages(evicted, stream);
             for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
                 cache.release(layer, removed[layer]);
             }
             seq.upload_table(0, stream);
         }
     }
-    seq.writer.append(
-        cycle_end{.reached = state{.page_hashes = seq.page_hashes, .tail = seq.tail}, .token_count = seq.covered_count}
-    );
+    seq.writer.append(cycle_end{.reached = seq.reached(), .token_count = seq.covered_count});
     seq.start_cycle(page_size);
 }
 

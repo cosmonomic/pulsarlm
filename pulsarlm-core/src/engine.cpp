@@ -5,6 +5,8 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -110,6 +112,18 @@ void validate(const request& r, std::size_t page_size, std::size_t vocab_size) {
     }
     check_tokens(r.initial_state.tail, vocab_size);
     check_tokens(r.tokens, vocab_size);
+    if (r.initial_state.density.size() != r.initial_state.page_hashes.size()) {
+        throw std::invalid_argument(
+            std::format(
+                "the initial state holds {} densities for {} pages",
+                r.initial_state.density.size(),
+                r.initial_state.page_hashes.size()
+            )
+        );
+    }
+    if (!std::ranges::all_of(r.initial_state.density, [](float d) { return std::isfinite(d) && d >= 0.0f; })) {
+        throw std::invalid_argument("the initial state's densities must be finite and non-negative");
+    }
     if (r.eviction.n_working < 1) {
         throw std::invalid_argument("eviction.n_working must be at least 1");
     }

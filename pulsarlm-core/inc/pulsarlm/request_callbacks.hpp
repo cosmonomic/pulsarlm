@@ -10,11 +10,13 @@
 
 namespace pulsarlm {
 
-// The ordered page hashes of a view, then the tokens of its partial last page. The page hashes are distinct: they come
-// from one digest chain. A state that breaks this is undefined behaviour.
+// The ordered page hashes of a view, the tokens of its partial last page, then the eviction density of each page, 0 for
+// a page never measured. The page hashes are distinct: they come from one digest chain. A state that breaks this is
+// undefined behaviour.
 struct state {
     std::vector<digest> page_hashes;
     std::vector<std::int64_t> tail;
+    std::vector<float> density;
 };
 
 // The state a request reached when an eviction cycle ended. It covers the request's first token_count tokens: the

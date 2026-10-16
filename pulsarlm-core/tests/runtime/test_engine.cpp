@@ -211,6 +211,20 @@ TEST_CASE("submit rejects an invalid request without calling its callbacks") {
         std::invalid_argument
     );
     REQUIRE_THROWS_AS(
+        e.submit(
+            request{.initial_state = {.page_hashes = {digest{.hi = 1, .lo = 2}}}, .tokens = {1}},
+            record_into(recorded)
+        ),
+        std::invalid_argument
+    );
+    REQUIRE_THROWS_AS(
+        e.submit(
+            request{.initial_state = {.page_hashes = {digest{.hi = 1, .lo = 2}}, .density = {-1.0f}}, .tokens = {1}},
+            record_into(recorded)
+        ),
+        std::invalid_argument
+    );
+    REQUIRE_THROWS_AS(
         e.submit(request{.tokens = {1}, .eviction = {.n_working = 0}}, record_into(recorded)),
         std::invalid_argument
     );
@@ -237,7 +251,11 @@ TEST_CASE("destroying the engine ends the requests it serves with loop_exited") 
     e.emplace(std::make_unique<successor_model>(), config(16), std::move(store));
     auto recorded = std::make_shared<request_results>();
     e->submit(
-        request{.initial_state = {.page_hashes = {digest{.hi = 1, .lo = 2}}}, .tokens = {1}, .max_tokens = 1},
+        request{
+            .initial_state = {.page_hashes = {digest{.hi = 1, .lo = 2}}, .density = {0.0f}},
+            .tokens = {1},
+            .max_tokens = 1
+        },
         record_into(recorded)
     );
     fetch_started->wait();

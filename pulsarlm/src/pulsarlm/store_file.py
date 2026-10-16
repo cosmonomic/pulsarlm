@@ -1,4 +1,5 @@
 import json
+from array import array
 import sqlite3
 import sys
 import traceback
@@ -17,6 +18,7 @@ type StateKey = tuple[bytes, tuple[int, ...]]
 type SavedState = tuple[StateKey, State, list[bytes], int]
 
 DIGEST_BYTES = 16
+DENSITY_BYTES = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS pages (
@@ -33,6 +35,7 @@ CREATE TABLE IF NOT EXISTS states (
     page_hashes BLOB NOT NULL,
     page_keys BLOB NOT NULL,
     used INTEGER NOT NULL,
+    density BLOB NOT NULL,
     PRIMARY KEY (last_page, tail)
 );
 """
@@ -44,6 +47,14 @@ class StoreInUseError(RuntimeError):
 
 def split_digests(joined: bytes) -> list[bytes]:
     return [joined[i : i + DIGEST_BYTES] for i in range(0, len(joined), DIGEST_BYTES)]
+
+
+def density_bytes(density: list[float]) -> bytes:
+    return array("f", density).tobytes()
+
+
+def density_from(blob: bytes) -> list[float]:
+    return array("f", blob).tolist()
 
 
 def tail_text(tail: tuple[int, ...]) -> str:
@@ -84,6 +95,22 @@ def transaction(connection: sqlite3.Connection) -> Iterator[None]:
     connection.execute("COMMIT")
 
 
+def add_density_column(connection: sqlite3.Connection) -> None:
+    """Gives the states of a file written before states carried densities a
+    density of 0 for every page."""
+    columns = [row[1] for row in connection.execute("PRAGMA table_info(states)")]
+    if "density" in columns:
+        return
+    with transaction(connection):
+        connection.execute(
+            "ALTER TABLE states ADD COLUMN density BLOB NOT NULL DEFAULT x''"
+        )
+        connection.execute(
+            "UPDATE states SET density = zeroblob(length(page_hashes) / ?)",
+            (DIGEST_BYTES // DENSITY_BYTES,),
+        )
+
+
 def connect(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, timeout=0, isolation_level=None)
@@ -91,6 +118,7 @@ def connect(path: Path) -> sqlite3.Connection:
         connection.execute("PRAGMA locking_mode = EXCLUSIVE")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.executescript(SCHEMA)
+        add_density_column(connection)
         # A write takes the exclusive lock, which EXCLUSIVE locking mode keeps until the connection closes.
         connection.execute("BEGIN EXCLUSIVE")
         connection.execute("COMMIT")
@@ -138,13 +166,17 @@ class StoreFile:
     def _load(self) -> tuple[dict[bytes, int], list[SavedState]]:
         pages = dict(self._connection.execute("SELECT key, nbytes FROM pages"))
         rows = self._connection.execute(
-            "SELECT last_page, tail, page_hashes, page_keys, used FROM states"
-            " ORDER BY used"
+            "SELECT last_page, tail, page_hashes, page_keys, used, density"
+            " FROM states ORDER BY used"
         )
         states = []
-        for last_page, tail, page_hashes, page_keys, used in rows:
+        for last_page, tail, page_hashes, page_keys, used, density in rows:
             tokens = json.loads(tail)
-            state = State(page_hashes=split_digests(page_hashes), tail=tokens)
+            state = State(
+                page_hashes=split_digests(page_hashes),
+                tail=tokens,
+                density=density_from(density),
+            )
             states.append(
                 ((last_page, tuple(tokens)), state, split_digests(page_keys), used)
             )
@@ -175,13 +207,16 @@ class StoreFile:
         last_page, tail = key
         with transaction(self._connection):
             self._connection.execute(
-                "INSERT OR REPLACE INTO states VALUES (?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO states"
+                " (last_page, tail, page_hashes, page_keys, used, density)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     last_page,
                     tail_text(tail),
                     b"".join(state.page_hashes),
                     b"".join(page_keys),
                     used,
+                    density_bytes(state.density),
                 ),
             )
 

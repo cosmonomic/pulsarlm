@@ -92,18 +92,22 @@ PYBIND11_MODULE(pulsarlm_core, m) {
 
     py::class_<state>(m, "State")
         .def(
-            py::init([](const std::vector<py::bytes>& page_hashes, std::vector<std::int64_t> tail) {
-                return state{digests_from_bytes(page_hashes), std::move(tail)};
+            py::init([](const std::vector<py::bytes>& page_hashes,
+                        std::vector<std::int64_t> tail,
+                        std::vector<float> density) {
+                return state{digests_from_bytes(page_hashes), std::move(tail), std::move(density)};
             }),
             "page_hashes"_a = std::vector<py::bytes>(),
-            "tail"_a = std::vector<std::int64_t>()
+            "tail"_a = std::vector<std::int64_t>(),
+            "density"_a = std::vector<float>()
         )
         .def_property(
             "page_hashes",
             [](const state& s) { return to_bytes_list(s.page_hashes); },
             [](state& s, const std::vector<py::bytes>& page_hashes) { s.page_hashes = digests_from_bytes(page_hashes); }
         )
-        .def_readwrite("tail", &state::tail);
+        .def_readwrite("tail", &state::tail)
+        .def_readwrite("density", &state::density);
 
     py::class_<cycle_end>(m, "CycleEnd")
         .def_readonly("reached", &cycle_end::reached)

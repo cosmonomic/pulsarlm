@@ -34,8 +34,14 @@ def page_digests(tokens: list[int]) -> list[bytes]:
 
 def reached(history: list[int], evicted: set[int] = set()) -> State:
     full = len(history) // PAGE_SIZE * PAGE_SIZE
-    hashes = [h for i, h in enumerate(page_digests(history)) if i not in evicted]
-    return State(page_hashes=hashes, tail=history[full:])
+    kept = [
+        (h, i / 4) for i, h in enumerate(page_digests(history)) if i not in evicted
+    ]
+    return State(
+        page_hashes=[h for h, _ in kept],
+        tail=history[full:],
+        density=[d for _, d in kept],
+    )
 
 
 def page(value: float) -> tuple[torch.Tensor, torch.Tensor]:
@@ -304,6 +310,7 @@ def test_states_and_pages_survive_a_restart(tmp_path: Path):
         assert covered == 9
         assert state.page_hashes == page_digests(HISTORY[:8])
         assert state.tail == [HISTORY[8]]
+        assert state.density == [0.0, 0.25]
         fetched = store.fetch(state.page_hashes[1:]).result()[0]
         assert fetched is not None
         k, v = fetched
@@ -378,6 +385,27 @@ def test_a_restart_drops_a_state_missing_a_page(tmp_path: Path):
     store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=path)
     assert len(store) == 0
     assert store.page_count() == 0
+
+
+def test_a_file_from_before_densities_gives_its_states_zero_densities(
+    tmp_path: Path,
+):
+    path = tmp_path / "store.sqlite"
+    wrote = in_another_process(
+        path,
+        """
+        store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=store_path)
+        run_request(store, HISTORY, HISTORY[:9])
+        """,
+    )
+    assert wrote.returncode == 0, wrote.stderr
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute("ALTER TABLE states DROP COLUMN density")
+
+    store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=path)
+    with lookup(store, HISTORY) as (state, covered):
+        assert covered == 9
+        assert state.density == [0.0, 0.0]
 
 
 def test_recency_survives_a_restart(tmp_path: Path):

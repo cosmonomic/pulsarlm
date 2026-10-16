@@ -53,6 +53,9 @@ class sequence {
     std::size_t generated = 0;
     std::vector<digest> page_hashes;
     std::vector<std::int64_t> tail;
+    // The density of each full page in the states the sequence reaches: as of the last step that measured mass, 0 for a
+    // page never measured.
+    std::vector<float> state_density;
     std::vector<std::int64_t> pending;
     // Per KV layer, the line of each page in view order: the full pages, then the pages of tail and pending. A sliding
     // layer's pages before first_held[layer] hold no_line.
@@ -66,31 +69,36 @@ class sequence {
     eviction_policy eviction;
     // forwarded_count when the eviction cycle began.
     std::size_t cycle_start = 0;
-    cycle_density density;
+    // Defined when the sequence can evict.
+    page_density density;
     // The request's tokens the state covers: the initial state's tail, then the request's tokens, then sampled tokens.
     std::size_t covered_count = 0;
 
-    sequence(request&& r, result_writer& writer, std::size_t n_kv_layers, at::Device device);
+    // Queues on stream the upload of the initial state's density.
+    sequence(request&& r, result_writer& writer, std::size_t n_kv_layers, at::Device device, cudaStream_t stream);
 
     std::size_t forwarded_count(std::size_t page_size) const noexcept;
     bool may_sample() const noexcept;
-    // Moves the first count pending tokens to tail, then the pages they complete to page_hashes.
-    void advance(std::size_t count, std::size_t page_size, const digest& root);
+    // Moves the first count pending tokens to tail, then the pages they complete to page_hashes. host_density, when
+    // defined, is the density after the step that forwarded them.
+    void advance(std::size_t count, std::size_t page_size, const digest& root, const at::Tensor& host_density);
+    state reached() const;
     void start_cycle(std::size_t page_size) noexcept;
     // Whether forwarding token_count more tokens ends the eviction cycle.
     bool ends_cycle(std::size_t token_count, std::size_t page_size) const noexcept;
     // The tokens the cycle can still forward: no more than its length allows, nor than the request will forward.
     std::size_t cycle_tokens_left(std::size_t page_size) const noexcept;
     std::size_t view_page_count() const noexcept;
-    // Drops the full pages at the ascending view indices pages, and returns their held lines per KV layer.
-    std::vector<std::vector<std::uint32_t>> remove_pages(std::span<const std::size_t> pages);
+    // Drops the full pages at the ascending view indices pages, queuing on stream the drop of their density, and returns
+    // their held lines per KV layer.
+    std::vector<std::vector<std::uint32_t>> remove_pages(std::span<const std::size_t> pages, cudaStream_t stream);
     // Queues on stream the upload of the view pages from first_page on into table, all of them when table grows.
     void upload_table(std::size_t first_page, cudaStream_t stream);
     // One line per page the cycle's tokens fill, in each KV layer. Called at the start of a cycle, with an empty tail.
     std::size_t cycle_lines(std::size_t page_size) const noexcept;
-    // Queue on stream: ages the cycle density by token_count tokens and adds step_mass.
+    // Queue on stream: ages the density by token_count tokens and adds step_mass.
     void add_step_mass(const at::Tensor& step_mass, std::size_t token_count, cudaStream_t stream);
-    // A pinned host copy of the cycle density, complete once stream reaches this point.
+    // A pinned host copy of the density, complete once stream reaches this point.
     at::Tensor density_on_host(cudaStream_t stream) const;
     // The lines the sequence lacks in each KV layer to forward every token left in its cycle.
     std::size_t missing_lines(std::size_t page_size) const noexcept;
@@ -110,8 +118,7 @@ class batch {
         // fp32 [view pages] on the device, the attention mass the step gave each of the sequence's view pages.
         // Defined when the sequence can evict.
         at::Tensor step_mass;
-        // Pinned host fp32, the sequence's cycle density after the step. Set by the scheduler when the step ends a
-        // cycle of a sequence that can evict.
+        // Pinned host fp32, the sequence's density after the step. Set by the scheduler with step_mass.
         at::Tensor host_density;
     };
 
@@ -168,7 +175,7 @@ class scheduler {
     task<batch> build_batch();
     task<void> launch(batch& b);
     task<void> write_back(batch& b);
-    void end_cycle(sequence& seq, const at::Tensor& host_density);
+    void end_cycle(sequence& seq);
 
   public:
     // cache holds one layer per entry of model.kv_layers(). root is the digest the page chains of a state with no

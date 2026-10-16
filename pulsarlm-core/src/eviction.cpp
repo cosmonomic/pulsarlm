@@ -6,9 +6,11 @@
 #include <cassert>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <span>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace pulsarlm {
@@ -27,7 +29,10 @@ double evict_bar_from_tau(double tau) noexcept {
     return tau / (1.0 - tau);
 }
 
-void cycle_density::add(const at::Tensor& step_mass, std::size_t token_count, double attention_mass_decay) {
+page_density::page_density(at::Tensor initial) noexcept
+: values(std::move(initial)) {}
+
+void page_density::add(const at::Tensor& step_mass, std::size_t token_count, double attention_mass_decay) {
     at::Tensor added = step_mass.clone();
     if (values.defined()) {
         assert(values.size(0) <= added.size(0));
@@ -37,21 +42,33 @@ void cycle_density::add(const at::Tensor& step_mass, std::size_t token_count, do
     values = added;
 }
 
-void cycle_density::reset() noexcept {
-    values.reset();
+void page_density::remove(std::span<const std::size_t> pages) {
+    if (!values.defined() || pages.empty()) {
+        return;
+    }
+    auto page_count = static_cast<std::size_t>(values.size(0));
+    at::Tensor kept = at::empty(
+        {static_cast<std::int64_t>(page_count - pages.size())},
+        at::TensorOptions().dtype(at::kLong).pinned_memory(true)
+    );
+    auto* next_kept = kept.mutable_data_ptr<std::int64_t>();
+    std::size_t next_removed = 0;
+    for (std::size_t page = 0; page < page_count; page++) {
+        if (next_removed < pages.size() && pages[next_removed] == page) {
+            next_removed++;
+        } else {
+            *next_kept++ = static_cast<std::int64_t>(page);
+        }
+    }
+    assert(next_removed == pages.size());
+    values = values.index_select(0, kept.to(values.device(), /*non_blocking=*/true));
 }
 
-const at::Tensor& cycle_density::by_page() const noexcept {
+const at::Tensor& page_density::by_page() const noexcept {
     return values;
 }
 
-std::vector<std::size_t> pages_to_evict(
-    std::span<const float> density,
-    std::size_t page_size,
-    std::size_t cycle_start,
-    std::size_t forwarded_count,
-    const eviction_policy& policy
-) {
+std::vector<std::size_t> pages_to_evict(std::span<const float> density, const eviction_policy& policy) {
     assert(policy.n_working >= 1);
     std::size_t page_count = density.size();
     if (page_count <= policy.n_sink + policy.n_working) {
@@ -66,15 +83,10 @@ std::vector<std::size_t> pages_to_evict(
     std::vector<candidate> kept;
     std::vector<std::size_t> evicted;
     for (std::size_t page = policy.n_sink; page < page_count - policy.n_working; page++) {
-        std::size_t first_query = std::max(cycle_start, page * page_size);
-        assert(first_query < forwarded_count);
-        double weight =
-            1.0 - std::pow(1.0 - policy.attention_mass_decay, static_cast<double>(forwarded_count - first_query));
-        double corrected = density[page] / weight;
-        if (corrected < bar) {
+        if (density[page] < bar) {
             evicted.push_back(page);
         } else {
-            kept.push_back(candidate{.page = page, .density = corrected});
+            kept.push_back(candidate{.page = page, .density = density[page]});
         }
     }
 

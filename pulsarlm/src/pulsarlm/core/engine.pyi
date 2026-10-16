@@ -23,12 +23,19 @@ class PageStore(Protocol):
     ) -> None: ...
 
 class State:
-    """The ordered page hashes of a view, each 16 bytes, then the tokens of its
-    partial last page."""
+    """The ordered page hashes of a view, each 16 bytes, the tokens of its partial
+    last page, then the eviction density of each page, 0 for a page never
+    measured."""
 
     page_hashes: list[bytes]
     tail: list[int]
-    def __init__(self, page_hashes: list[bytes] = [], tail: list[int] = []) -> None: ...
+    density: list[float]
+    def __init__(
+        self,
+        page_hashes: list[bytes] = [],
+        tail: list[int] = [],
+        density: list[float] = [],
+    ) -> None: ...
 
 class CycleEnd:
     """The state a request reached when an eviction cycle ended, covering the
