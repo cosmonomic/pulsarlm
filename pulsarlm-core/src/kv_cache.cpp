@@ -16,8 +16,10 @@
 #include <cstring>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -68,9 +70,8 @@ at::Tensor make_pool(std::span<const page_shape> shapes, std::size_t pool_bytes,
     for (const page_shape& shape : shapes) {
         TORCH_CHECK(shape.n_layers == 1, "kv_cache: a KV layer's page shape has n_layers 1");
         TORCH_CHECK(shape.dtype == shapes.front().dtype, "kv_cache: the KV layers share a dtype");
-        TORCH_CHECK(line_bytes(shape) <= pool_bytes, "kv_cache: a pool of ", pool_bytes, " bytes holds no line");
         TORCH_CHECK(
-            pool_bytes / line_bytes(shape) < std::numeric_limits<std::uint32_t>::max(),
+            pool_bytes / block_bytes(shape) < std::numeric_limits<std::uint32_t>::max(),
             "kv_cache: too many lines in a pool of ",
             pool_bytes,
             " bytes"
@@ -112,14 +113,34 @@ bool in_line_layout(const page& candidate, const page_shape& shape) {
         v_from_k == expected_v_from_k;
 }
 
-kv pool_views(const at::Tensor& pool, const page_shape& shape) {
-    page lines = line_views(
-        pool.view(shape.dtype),
-        shape,
-        static_cast<std::size_t>(pool.numel()) / line_bytes(shape),
-        0
-    );
-    return kv{.k = lines.k, .v = lines.v};
+// line_count lines of the pool, a block apart.
+kv pool_views(const at::Tensor& pool, const page_shape& shape, std::size_t line_count) {
+    page lines = line_views(pool.view(shape.dtype), shape, line_count, 0);
+    auto block_elements = static_cast<std::int64_t>(block_bytes(shape) / c10::elementSize(shape.dtype));
+    std::vector<std::int64_t> strides = line_strides(shape);
+    strides.front() = block_elements;
+    at::Tensor k = lines.k.as_strided(lines.k.sizes(), strides, lines.k.storage_offset());
+    return kv{
+        .k = k,
+        .v = shape.values_only ? k : lines.v.as_strided(lines.v.sizes(), strides, lines.v.storage_offset())
+    };
+}
+
+std::vector<std::size_t> layer_block_bytes(std::span<const page_shape> shapes) {
+    std::vector<std::size_t> blocks;
+    for (const page_shape& shape : shapes) {
+        blocks.push_back(block_bytes(shape));
+    }
+    return blocks;
+}
+
+// Ascending; a layer's block class is the index of its block size.
+std::vector<std::size_t> distinct_block_bytes(std::span<const page_shape> shapes) {
+    std::vector<std::size_t> blocks = layer_block_bytes(shapes);
+    std::ranges::sort(blocks);
+    auto [first, last] = std::ranges::unique(blocks);
+    blocks.erase(first, last);
+    return blocks;
 }
 
 c10::cuda::CUDAStreamGuard guard_stream(const at::Tensor& lines, cudaStream_t stream) {
@@ -168,6 +189,10 @@ std::size_t line_bytes(const page_shape& shape) {
         c10::elementSize(shape.dtype);
 }
 
+std::size_t block_bytes(const page_shape& shape) {
+    return std::bit_ceil(line_bytes(shape));
+}
+
 digest make_root_digest(std::string_view model, std::span<const page_shape> shapes) {
     std::vector<std::byte> seed;
     append_string(seed, digest_function());
@@ -192,45 +217,6 @@ digest store_key(const digest& page, std::size_t layer) {
     return make_digest(seed);
 }
 
-void kv_cache::size_class::link_free_front(std::uint32_t line_id) noexcept {
-    lines[line_id].previous_free = no_line;
-    lines[line_id].next_free = free_front;
-    if (free_front == no_line) {
-        free_back = line_id;
-    } else {
-        lines[free_front].previous_free = line_id;
-    }
-    free_front = line_id;
-    free_count++;
-}
-
-void kv_cache::size_class::link_free_back(std::uint32_t line_id) noexcept {
-    lines[line_id].previous_free = free_back;
-    lines[line_id].next_free = no_line;
-    if (free_back == no_line) {
-        free_front = line_id;
-    } else {
-        lines[free_back].next_free = line_id;
-    }
-    free_back = line_id;
-    free_count++;
-}
-
-void kv_cache::size_class::unlink_free(std::uint32_t line_id) noexcept {
-    cache_line& unlinked = lines[line_id];
-    if (unlinked.previous_free == no_line) {
-        free_front = unlinked.next_free;
-    } else {
-        lines[unlinked.previous_free].next_free = unlinked.next_free;
-    }
-    if (unlinked.next_free == no_line) {
-        free_back = unlinked.previous_free;
-    } else {
-        lines[unlinked.next_free].previous_free = unlinked.previous_free;
-    }
-    free_count--;
-}
-
 kv_cache::kv_cache(
     std::span<const page_shape> shapes,
     std::size_t pool_bytes,
@@ -239,36 +225,47 @@ kv_cache::kv_cache(
     page_store& store
 )
 : pool(make_pool(shapes, pool_bytes, device)),
+  allocator(distinct_block_bytes(shapes), pool_bytes),
   store(&store),
   host_pages(host_page_bytes, largest_line_bytes(shapes)) {
+    TORCH_CHECK(
+        pool_bytes >= min_pool_bytes(layer_block_bytes(shapes)),
+        "kv_cache: a pool of ",
+        pool_bytes,
+        " bytes holds no line of every layer"
+    );
+    std::vector<std::size_t> blocks = distinct_block_bytes(shapes);
+    for (std::size_t c = 0; c < blocks.size(); c++) {
+        classes.push_back(
+            block_class{.block_bytes = blocks[c], .lines = std::vector<cache_line>(allocator.line_count(c))}
+        );
+    }
     layers.reserve(shapes.size());
     for (const page_shape& shape : shapes) {
-        auto same_size = [&](const size_class& c) { return c.line_bytes == line_bytes(shape); };
-        auto found = std::ranges::find_if(classes, same_size);
-        std::size_t class_index = static_cast<std::size_t>(found - classes.begin());
-        if (found == classes.end()) {
-            classes.push_back(size_class{.line_bytes = line_bytes(shape)});
-        }
+        auto class_index = static_cast<std::size_t>(
+            std::ranges::lower_bound(blocks, block_bytes(shape)) - blocks.begin()
+        );
         layers.push_back(
             cache_layer{
                 .shape = shape,
-                .size_class = class_index,
-                .device_kv = pool_views(pool, shape),
+                .block_class = class_index,
+                .device_kv = pool_views(pool, shape, classes[class_index].lines.size()),
             }
         );
     }
 }
 
-std::size_t kv_cache::pool_bytes() const noexcept {
-    return static_cast<std::size_t>(pool.numel());
+void kv_cache::assign_hash(std::size_t layer, std::uint32_t line_id, const digest& hash) {
+    line(layer, line_id).hash = hash;
+    layers[layer].digest_to_line_id.try_emplace(hash, line_id);
 }
 
 kv_cache::cache_line& kv_cache::line(std::size_t layer, std::uint32_t line_id) noexcept {
-    return classes[layers[layer].size_class].lines[line_id];
+    return classes[layers[layer].block_class].lines[line_id];
 }
 
 const kv_cache::cache_line& kv_cache::line(std::size_t layer, std::uint32_t line_id) const noexcept {
-    return classes[layers[layer].size_class].lines[line_id];
+    return classes[layers[layer].block_class].lines[line_id];
 }
 
 // A line keeps its hash unmapped when another line cached that hash before its fetch or sync completed.
@@ -282,84 +279,56 @@ bool kv_cache::is_mapped(std::size_t layer, std::uint32_t line_id) const noexcep
     return it != mapped.end() && it->second == line_id;
 }
 
-void kv_cache::hold(std::size_t layer, std::uint32_t line_id) noexcept {
+void kv_cache::hold(line_allocator::transaction& taking, std::size_t layer, std::uint32_t line_id) {
     cache_line& held = line(layer, line_id);
     if (held.ref == 0) {
-        classes[layers[layer].size_class].unlink_free(line_id);
+        taking.hold(layers[layer].block_class, line_id);
     }
     held.ref++;
 }
 
-// Reusing a mapped line drops its page from the layer that cached it, which may be another layer of the class.
-std::uint32_t kv_cache::take_free_line(std::size_t layer) noexcept {
-    size_class& taken_from = classes[layers[layer].size_class];
-    std::uint32_t line_id = taken_from.free_front;
-    if (line_id != no_line) {
-        taken_from.unlink_free(line_id);
-        const cache_line& reused = taken_from.lines[line_id];
-        if (is_mapped(reused.layer, line_id)) {
-            layers[reused.layer].digest_to_line_id.erase(*reused.hash);
+std::optional<std::vector<std::vector<std::uint32_t>>>
+kv_cache::take_lines(line_allocator::transaction& taking, std::span<const std::size_t> counts) {
+    std::vector<std::size_t> by_block(layers.size());
+    std::iota(by_block.begin(), by_block.end(), std::size_t{0});
+    std::ranges::stable_sort(by_block, std::greater{}, [&](std::size_t layer) { return layers[layer].block_class; });
+    std::vector<std::vector<std::uint32_t>> taken(layers.size());
+    for (std::size_t layer : by_block) {
+        for (std::size_t i = 0; i < counts[layer]; i++) {
+            std::optional<std::uint32_t> line_id = taking.take(layers[layer].block_class);
+            if (!line_id) {
+                return std::nullopt;
+            }
+            taken[layer].push_back(*line_id);
         }
-    } else {
-        std::size_t first = ceil_div(bump, taken_from.line_bytes) * taken_from.line_bytes;
-        assert(first + taken_from.line_bytes <= pool_bytes());
-        line_id = static_cast<std::uint32_t>(first / taken_from.line_bytes);
-        if (taken_from.lines.size() <= line_id) {
-            taken_from.lines.resize(line_id + 1);
-        }
-        bump = first + taken_from.line_bytes;
     }
-    cache_line& taken = taken_from.lines[line_id];
-    taken.hash.reset();
-    taken.layer = layer;
-    taken.ref = 1;
-    return line_id;
+    return taken;
 }
 
-std::vector<std::uint32_t> kv_cache::take_free_lines(std::size_t layer, std::size_t count) noexcept {
-    std::vector<std::uint32_t> line_ids(count);
-    for (std::uint32_t& line_id : line_ids) {
-        line_id = take_free_line(layer);
-    }
-    return line_ids;
-}
-
-void kv_cache::assign_hash(std::size_t layer, std::uint32_t line_id, const digest& hash) {
-    line(layer, line_id).hash = hash;
-    layers[layer].digest_to_line_id.try_emplace(hash, line_id);
-}
-
-bool kv_cache::covers(std::span<const std::size_t> counts, std::vector<std::size_t>&& free_lines) const noexcept {
-    std::size_t carved_end = bump;
-    for (std::size_t layer = 0; layer < layers.size(); layer++) {
-        std::size_t class_index = layers[layer].size_class;
-        std::size_t from_free = std::min(free_lines[class_index], counts[layer]);
-        free_lines[class_index] -= from_free;
-        std::size_t carved = counts[layer] - from_free;
-        if (carved == 0) {
-            continue;
+// A reclaimed region holds no held line, so each line of it that maps its hash caches a page.
+void kv_cache::commit(line_allocator::transaction& taking, std::span<const std::vector<std::uint32_t>> taken) {
+    for (std::uint32_t region : taking.commit()) {
+        for (std::size_t c = 0; c < classes.size(); c++) {
+            auto [first, last] = allocator.lines_of_region(c, region);
+            for (std::uint32_t line_id = first; line_id < last; line_id++) {
+                cache_line& dropped = classes[c].lines[line_id];
+                assert(dropped.ref == 0);
+                if (dropped.hash && is_mapped(dropped.layer, line_id)) {
+                    layers[dropped.layer].digest_to_line_id.erase(*dropped.hash);
+                }
+                dropped.hash.reset();
+            }
         }
-        std::size_t size = classes[class_index].line_bytes;
-        std::size_t first = ceil_div(carved_end, size) * size;
-        if (first > pool_bytes() || carved > (pool_bytes() - first) / size) {
-            return false;
+    }
+    for (std::size_t layer = 0; layer < taken.size(); layer++) {
+        for (std::uint32_t line_id : taken[layer]) {
+            line(layer, line_id) = cache_line{.layer = layer, .ref = 1};
         }
-        carved_end = first + carved * size;
     }
-    return true;
-}
-
-std::vector<std::size_t> kv_cache::free_counts() const {
-    std::vector<std::size_t> counts;
-    counts.reserve(classes.size());
-    for (const size_class& c : classes) {
-        counts.push_back(c.free_count);
-    }
-    return counts;
 }
 
 std::size_t kv_cache::line_offset(std::size_t layer, std::uint32_t line_id) const noexcept {
-    return line_id * classes[layers[layer].size_class].line_bytes;
+    return line_id * classes[layers[layer].block_class].block_bytes;
 }
 
 task<void>
@@ -455,30 +424,15 @@ void kv_cache::release_all(std::span<const std::vector<std::uint32_t>> line_ids)
     }
 }
 
-// Every layer's resident pages are held before any free line is taken, so taking one never drops a page this call
-// needs, also when the layers share a size class.
+// Every layer's resident pages are held before any line is taken, so taking one never drops a page this call needs.
 task<std::expected<std::vector<std::vector<std::uint32_t>>, page_error>>
 kv_cache::get(std::span<const std::span<const digest>> hashes, cudaStream_t stream) {
     assert(hashes.size() == layers.size());
-    std::vector<std::size_t> lines_needed(layers.size());
-    std::vector<std::size_t> free_lines = free_counts();
-    for (std::size_t layer = 0; layer < layers.size(); layer++) {
-        const cache_layer& cached = layers[layer];
-        for (const digest& hash : hashes[layer]) {
-            if (auto it = cached.digest_to_line_id.find(hash); it != cached.digest_to_line_id.end()) {
-                free_lines[cached.size_class] -= line(layer, it->second).ref == 0;
-            } else if (!cached.fetching.contains(hash)) {
-                lines_needed[layer]++;
-            }
-        }
-    }
-    if (!covers(lines_needed, std::move(free_lines))) {
-        co_return std::unexpected(page_error::oom);
-    }
-
     std::vector<std::vector<std::uint32_t>> line_ids(layers.size());
     std::vector<std::vector<std::size_t>> joined(layers.size());
     std::vector<std::vector<std::size_t>> to_fetch(layers.size());
+    std::vector<layer_line> held;
+    line_allocator::transaction taking(allocator);
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
         cache_layer& cached = layers[layer];
         std::span<const digest> layer_hashes = hashes[layer];
@@ -487,24 +441,38 @@ kv_cache::get(std::span<const std::span<const digest>> hashes, cudaStream_t stre
         for (std::size_t i = 0; i < layer_hashes.size(); i++) {
             if (auto it = cached.digest_to_line_id.find(layer_hashes[i]); it != cached.digest_to_line_id.end()) {
                 layer_lines[i] = it->second;
-                hold(layer, layer_lines[i]);
             } else if (auto it = cached.fetching.find(layer_hashes[i]); it != cached.fetching.end()) {
                 layer_lines[i] = it->second.line_id;
-                hold(layer, layer_lines[i]);
                 joined[layer].push_back(i);
             } else {
                 to_fetch[layer].push_back(i);
+                continue;
             }
+            hold(taking, layer, layer_lines[i]);
+            held.push_back(layer_line{.layer = layer, .line_id = layer_lines[i]});
         }
     }
+    std::vector<std::size_t> fetch_counts;
+    for (const std::vector<std::size_t>& fetched : to_fetch) {
+        fetch_counts.push_back(fetched.size());
+    }
+    std::optional<std::vector<std::vector<std::uint32_t>>> taken = take_lines(taking, fetch_counts);
+    if (!taken) {
+        for (const layer_line& undone : held) {
+            line(undone.layer, undone.line_id).ref--;
+        }
+        co_return std::unexpected(page_error::oom);
+    }
+    commit(taking, *taken);
 
     std::vector<digest> fetch_hashes;
     std::vector<digest> fetch_keys;
     std::vector<layer_line> fetch_lines;
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
-        for (std::size_t i : to_fetch[layer]) {
+        for (std::size_t j = 0; j < to_fetch[layer].size(); j++) {
+            std::size_t i = to_fetch[layer][j];
             const digest& hash = hashes[layer][i];
-            line_ids[layer][i] = take_free_line(layer);
+            line_ids[layer][i] = (*taken)[layer][j];
             layers[layer].fetching.try_emplace(hash, line_ids[layer][i]);
             fetch_hashes.push_back(hash);
             fetch_keys.push_back(store_key(hash, layer));
@@ -555,16 +523,16 @@ kv_cache::get(std::span<const std::span<const digest>> hashes, cudaStream_t stre
 }
 
 std::expected<std::vector<std::vector<std::uint32_t>>, page_error> kv_cache::allocate(std::size_t count) {
-    std::vector<std::size_t> counts(layers.size(), count);
-    if (!covers(counts, free_counts())) {
+    line_allocator::transaction taking(allocator);
+    std::optional<std::vector<std::vector<std::uint32_t>>> taken = take_lines(
+        taking,
+        std::vector<std::size_t>(layers.size(), count)
+    );
+    if (!taken) {
         return std::unexpected(page_error::oom);
     }
-    std::vector<std::vector<std::uint32_t>> line_ids;
-    line_ids.reserve(layers.size());
-    for (std::size_t layer = 0; layer < layers.size(); layer++) {
-        line_ids.push_back(take_free_lines(layer, count));
-    }
-    return line_ids;
+    commit(taking, *taken);
+    return std::move(*taken);
 }
 
 std::expected<std::vector<std::uint32_t>, page_error>
@@ -572,10 +540,13 @@ kv_cache::clone(std::size_t layer, std::uint32_t line_id, std::size_t count, cud
     assert(line(layer, line_id).ref > 0);
     std::vector<std::size_t> counts(layers.size(), 0);
     counts[layer] = count;
-    if (!covers(counts, free_counts())) {
+    line_allocator::transaction taking(allocator);
+    std::optional<std::vector<std::vector<std::uint32_t>>> taken = take_lines(taking, counts);
+    if (!taken) {
         return std::unexpected(page_error::oom);
     }
-    std::vector<std::uint32_t> copies = take_free_lines(layer, count);
+    commit(taking, *taken);
+    std::vector<std::uint32_t> copies = std::move((*taken)[layer]);
     const kv& tensors = layers[layer].device_kv;
     auto guard = guard_stream(pool, stream);
     for (std::uint32_t copy : copies) {
@@ -643,31 +614,31 @@ task<std::expected<void, page_error>> kv_cache::sync(
 }
 
 void kv_cache::release(std::size_t layer, std::span<const std::uint32_t> line_ids) noexcept {
-    size_class& owner = classes[layers[layer].size_class];
     for (std::uint32_t line_id : line_ids) {
         cache_line& released = line(layer, line_id);
         assert(released.ref > 0);
         if (--released.ref > 0) {
             continue;
         }
-        if (is_mapped(layer, line_id)) {
-            owner.link_free_back(line_id);
-        } else {
+        bool keeps_page = is_mapped(layer, line_id);
+        if (!keeps_page) {
             released.hash.reset();
-            owner.link_free_front(line_id);
         }
+        allocator.release(layers[layer].block_class, line_id, keeps_page);
     }
 }
 
-std::size_t kv_cache::free_count() const {
-    std::size_t low = 0;
-    std::size_t high = std::numeric_limits<std::size_t>::max();
-    for (const size_class& c : classes) {
-        high = std::min(high, c.free_count + (pool_bytes() - bump) / c.line_bytes);
+std::size_t kv_cache::free_count() {
+    std::size_t block_total = 0;
+    for (const cache_layer& layer : layers) {
+        block_total += classes[layer.block_class].block_bytes;
     }
+    std::size_t low = 0;
+    std::size_t high = allocator.line_count(0) * classes.front().block_bytes / block_total;
     while (low < high) {
         std::size_t count = high - (high - low) / 2;
-        if (covers(std::vector<std::size_t>(layers.size(), count), free_counts())) {
+        line_allocator::transaction trial(allocator);
+        if (take_lines(trial, std::vector<std::size_t>(layers.size(), count))) {
             low = count;
         } else {
             high = count - 1;

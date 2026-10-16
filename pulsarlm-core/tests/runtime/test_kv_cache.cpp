@@ -67,7 +67,8 @@ struct memory_store final : pulsarlm::page_store {
         co_return found;
     }
 
-    void put(std::vector<digest>&& keys, std::vector<page>&& pages, std::vector<pulsarlm::page_owner>&& owners) override {
+    void
+    put(std::vector<digest>&& keys, std::vector<page>&& pages, std::vector<pulsarlm::page_owner>&& owners) override {
         state->puts++;
         for (const pulsarlm::page_owner& owner : owners) {
             state->owners.emplace_back(owner.request, keys[owner.page]);
@@ -556,7 +557,10 @@ TEST_CASE("sync stores a page of every layer in one put") {
     fill_line(fixture.kv, allocated[0].front(), 1.0f, 0);
     fill_line(fixture.kv, allocated[1].front(), 2.0f, 1);
     std::vector<digest> hashes{hash_of(1)};
-    REQUIRE(run_to_completion(fixture.kv.sync(hashes, std::vector<std::uint64_t>(hashes.size(), 0), allocated, compute_stream())).has_value());
+    REQUIRE(run_to_completion(
+                fixture.kv.sync(hashes, std::vector<std::uint64_t>(hashes.size(), 0), allocated, compute_stream())
+    )
+                .has_value());
 
     REQUIRE(fixture.store->puts == 1);
     REQUIRE(fixture.store->pages.at(key_of(1, 0)).k.eq(1.0f).all().item<bool>());
@@ -575,7 +579,12 @@ TEST_CASE("sync owns a page by every request whose hash it is, in every layer") 
     REQUIRE(fixture.store->puts == 1);
     REQUIRE(fixture.store->pages.size() == 4);
     std::vector<std::pair<std::uint64_t, digest>> expected{
-        {7, key_of(1, 0)}, {7, key_of(2, 0)}, {9, key_of(1, 0)}, {7, key_of(1, 1)}, {7, key_of(2, 1)}, {9, key_of(1, 1)}
+        {7, key_of(1, 0)},
+        {7, key_of(2, 0)},
+        {9, key_of(1, 0)},
+        {7, key_of(1, 1)},
+        {7, key_of(2, 1)},
+        {9, key_of(1, 1)}
     };
     REQUIRE((fixture.store->owners == expected));
     fixture.kv.release(0, allocated[0]);
@@ -632,31 +641,33 @@ TEST_CASE("allocate fails with oom holding nothing when the layers together run 
     fixture.kv.release(1, held[1]);
 }
 
-TEST_CASE("a line one layer frees serves another layer of its size and drops the first layer's page") {
+TEST_CASE("a layer's line reclaims the region whose cached page is oldest, whichever layer cached it") {
     cache_fixture fixture(1, {}, host_bytes, {shape, shape});
     fixture.store->pages.emplace(key_of(1, 0), host_page(1.0f));
     fixture.store->pages.emplace(key_of(2, 1), host_page(2.0f));
-    std::vector<digest> first{hash_of(1)};
-    std::vector<digest> second{hash_of(2)};
+    fixture.store->pages.emplace(key_of(3, 1), host_page(3.0f));
     std::vector<digest> none;
+    auto get_released = [&](std::size_t layer, std::uint64_t n) {
+        std::vector<digest> wanted{hash_of(n)};
+        std::vector<std::span<const digest>> hashes{none, none};
+        hashes[layer] = wanted;
+        layer_lines_result got = run_to_completion(fixture.kv.get(hashes, compute_stream()));
+        REQUIRE(got.has_value());
+        REQUIRE(line_filled_with(fixture.kv, (*got)[layer].front(), static_cast<float>(n), layer));
+        fixture.kv.release(layer, (*got)[layer]);
+    };
 
-    layer_lines_result got = run_to_completion(
-        fixture.kv.get(std::vector<std::span<const digest>>{first, none}, compute_stream())
-    );
-    REQUIRE(got.has_value());
-    fixture.kv.release(0, (*got)[0]);
-    got = run_to_completion(fixture.kv.get(std::vector<std::span<const digest>>{none, second}, compute_stream()));
-    REQUIRE(got.has_value());
-    REQUIRE(line_filled_with(fixture.kv, (*got)[1].front(), 2.0f, 1));
-    fixture.kv.release(1, (*got)[1]);
-
-    got = run_to_completion(fixture.kv.get(std::vector<std::span<const digest>>{first, none}, compute_stream()));
-    REQUIRE(got.has_value());
+    get_released(0, 1);
+    get_released(1, 2);
+    REQUIRE(fixture.store->fetches.size() == 2);
+    get_released(1, 3);
+    get_released(1, 2);
     REQUIRE(fixture.store->fetches.size() == 3);
-    fixture.kv.release(0, (*got)[0]);
+    get_released(0, 1);
+    REQUIRE(fixture.store->fetches.size() == 4);
 }
 
-TEST_CASE("lines of one size are not reused for another size") {
+TEST_CASE("a large line reclaims a region of cached small pages and drops them all") {
     pulsarlm::page_shape wide = shape;
     wide.n_kv_heads = 2 * shape.n_kv_heads;
     memory_store backing;
@@ -672,6 +683,14 @@ TEST_CASE("lines of one size are not reused for another size") {
         backing.state->pages.emplace(key_of(n, 0), host_page(static_cast<float>(n)));
         narrow_hashes.push_back(hash_of(n));
     }
+    std::vector<std::int64_t> wide_sizes{
+        1,
+        static_cast<std::int64_t>(wide.page_size),
+        static_cast<std::int64_t>(wide.n_kv_heads),
+        static_cast<std::int64_t>(wide.head_dim),
+    };
+    page wide_page{.k = at::full(wide_sizes, 5.0f), .v = at::full(wide_sizes, -5.0f)};
+    backing.state->pages.emplace(key_of(5, 1), wide_page);
     std::vector<digest> none;
     layer_lines_result got = run_to_completion(
         kv.get(std::vector<std::span<const digest>>{narrow_hashes, none}, compute_stream())
@@ -681,19 +700,30 @@ TEST_CASE("lines of one size are not reused for another size") {
 
     std::vector<digest> wide_hashes{hash_of(5)};
     got = run_to_completion(kv.get(std::vector<std::span<const digest>>{none, wide_hashes}, compute_stream()));
-    REQUIRE((got == layer_lines_result(std::unexpected(page_error::oom))));
+    REQUIRE(got.has_value());
+    kv.release(1, (*got)[1]);
+    REQUIRE(backing.state->fetches.size() == 2);
+
+    std::vector<digest> newer{hash_of(3), hash_of(4)};
+    got = run_to_completion(kv.get(std::vector<std::span<const digest>>{newer, none}, compute_stream()));
+    REQUIRE(got.has_value());
+    kv.release(0, (*got)[0]);
+    REQUIRE(backing.state->fetches.size() == 2);
+    std::vector<digest> older{hash_of(1)};
+    got = run_to_completion(kv.get(std::vector<std::span<const digest>>{older, none}, compute_stream()));
+    REQUIRE(got.has_value());
+    kv.release(0, (*got)[0]);
+    REQUIRE(backing.state->fetches.size() == 3);
 }
 
-TEST_CASE("one call carves lines of several sizes at the bump pointer") {
+TEST_CASE("lines of several sizes pack into regions of the largest size") {
     pulsarlm::page_shape wide = shape;
     wide.n_kv_heads = 2 * shape.n_kv_heads;
     std::vector<pulsarlm::page_shape> shapes{shape, wide};
     memory_store backing;
     std::size_t narrow_bytes = pulsarlm::line_bytes(shape);
 
-    pulsarlm::kv_cache tight(shapes, 3 * narrow_bytes, 2 * narrow_bytes, at::Device(at::kCUDA, 0), backing);
-    REQUIRE(tight.free_count() == 0);
-    REQUIRE((tight.allocate(1) == layer_lines_result(std::unexpected(page_error::oom))));
+    REQUIRE_THROWS(pulsarlm::kv_cache(shapes, 3 * narrow_bytes, 2 * narrow_bytes, at::Device(at::kCUDA, 0), backing));
 
     pulsarlm::kv_cache aligned(shapes, 4 * narrow_bytes, 2 * narrow_bytes, at::Device(at::kCUDA, 0), backing);
     REQUIRE(aligned.free_count() == 1);
@@ -703,6 +733,10 @@ TEST_CASE("one call carves lines of several sizes at the bump pointer") {
     REQUIRE(line_filled_with(aligned, held[0].front(), 1.0f, 0));
     REQUIRE(line_filled_with(aligned, held[1].front(), 2.0f, 1));
     REQUIRE(aligned.free_count() == 0);
+    line_ids narrow = aligned.clone(0, held[0].front(), 1, compute_stream()).value();
+    REQUIRE(line_filled_with(aligned, narrow.front(), 1.0f, 0));
+    REQUIRE((aligned.clone(0, held[0].front(), 1, compute_stream()) == lines_result(std::unexpected(page_error::oom))));
+    aligned.release(0, narrow);
     aligned.release(0, held[0]);
     aligned.release(1, held[1]);
 }
@@ -717,7 +751,10 @@ TEST_CASE("the host pool carries pages of layers with different shapes") {
         fill_line(fixture.kv, allocated[1][j], static_cast<float>(j + 3), 1);
     }
     std::vector<digest> hashes{hash_of(1), hash_of(2)};
-    REQUIRE(run_to_completion(fixture.kv.sync(hashes, std::vector<std::uint64_t>(hashes.size(), 0), allocated, compute_stream())).has_value());
+    REQUIRE(run_to_completion(
+                fixture.kv.sync(hashes, std::vector<std::uint64_t>(hashes.size(), 0), allocated, compute_stream())
+    )
+                .has_value());
     for (std::size_t layer = 0; layer < 2; layer++) {
         fixture.kv.release(layer, allocated[layer]);
     }

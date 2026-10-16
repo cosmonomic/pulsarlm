@@ -32,23 +32,17 @@ void check_tokens(std::span<const std::int64_t> tokens, std::size_t vocab_size) 
     }
 }
 
-std::size_t ceil_div(std::size_t n, std::size_t d) {
-    return (n + d - 1) / d;
-}
-
-// Lines are carved one after another, each at a multiple of its size.
 void check_kv_cache(const engine_config& config, std::span<const page_shape> shapes) {
-    std::size_t carved_end = 0;
+    std::vector<std::size_t> blocks;
     for (const page_shape& shape : shapes) {
-        std::size_t bytes = line_bytes(shape);
-        carved_end = ceil_div(carved_end, bytes) * bytes + bytes;
+        blocks.push_back(block_bytes(shape));
     }
-    if (config.kv_cache_bytes < carved_end) {
+    if (std::size_t needed = min_pool_bytes(blocks); config.kv_cache_bytes < needed) {
         throw std::invalid_argument(
             std::format(
                 "a KV cache of {} bytes holds no line of every KV layer; a line of each takes {} bytes",
                 config.kv_cache_bytes,
-                carved_end
+                needed
             )
         );
     }
