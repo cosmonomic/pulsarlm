@@ -4,19 +4,36 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "pulsarlm/digest.hpp"
 
 namespace pulsarlm {
 
-// The ordered page hashes of a view, the tokens of its partial last page, then the eviction density of each page, 0 for
-// a page never measured. The page hashes are distinct: they come from one digest chain. A state that breaks this is
-// undefined behaviour.
+// A page of a sequence: its hash and its eviction density, 0 for a page never measured.
+struct active_page {
+    digest hash;
+    float density = 0.0f;
+
+    bool operator==(const active_page&) const = default;
+};
+
+// One KV layer's active pages, in view order.
+struct layer_sequence {
+    std::vector<active_page> pages;
+
+    bool operator==(const layer_sequence&) const = default;
+};
+
+// head is the hash of the newest full page of the history, which new pages chain from and every non-empty sequence
+// ends with; absent before the first full page. layers holds one sequence per KV layer, and may be empty when head is
+// absent. tail holds the tokens after head. A sequence's hashes are distinct: they come from one digest chain. A state
+// that breaks this is undefined behaviour.
 struct state {
-    std::vector<digest> page_hashes;
+    std::optional<digest> head;
+    std::vector<layer_sequence> layers;
     std::vector<std::int64_t> tail;
-    std::vector<float> density;
 };
 
 // The state a request reached when an eviction cycle ended. It covers the request's first token_count tokens: the

@@ -22,6 +22,7 @@
 #include <numeric>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -105,7 +106,8 @@ struct memory_store final : pulsarlm::page_store {
         co_return found;
     }
 
-    void put(std::vector<digest>&& keys, std::vector<page>&& pages, std::vector<pulsarlm::page_owner>&& owners) override {
+    void
+    put(std::vector<digest>&& keys, std::vector<page>&& pages, std::vector<pulsarlm::page_owner>&& owners) override {
         contents->puts++;
         for (const pulsarlm::page_owner& owner : owners) {
             contents->owners.emplace_back(owner.request, keys[owner.page]);
@@ -289,7 +291,13 @@ pulsarlm::kv_cache make_cache(
         host_page_bytes += 64 * pulsarlm::line_bytes(shape);
         lines_bytes += n_lines * pulsarlm::line_bytes(shape);
     }
-    return pulsarlm::kv_cache(shapes, pool_bytes.value_or(lines_bytes), host_page_bytes, at::Device(at::kCUDA, 0), store);
+    return pulsarlm::kv_cache(
+        shapes,
+        pool_bytes.value_or(lines_bytes),
+        host_page_bytes,
+        at::Device(at::kCUDA, 0),
+        store
+    );
 }
 
 struct fixture {
@@ -374,6 +382,34 @@ request_error ended_error(const request_results& result) {
     REQUIRE(result.end.has_value());
     REQUIRE(!result.end->has_value());
     return result.end->error();
+}
+
+std::vector<digest> hashes_of(const pulsarlm::state& s, std::size_t layer = 0) {
+    std::vector<digest> hashes;
+    for (const pulsarlm::active_page& page : s.layers[layer].pages) {
+        hashes.push_back(page.hash);
+    }
+    return hashes;
+}
+
+std::vector<float> densities_of(const pulsarlm::state& s, std::size_t layer = 0) {
+    std::vector<float> densities;
+    for (const pulsarlm::active_page& page : s.layers[layer].pages) {
+        densities.push_back(page.density);
+    }
+    return densities;
+}
+
+// Every sequence holds every page of hashes, at density 0.
+pulsarlm::state full_layers_state(const std::vector<digest>& hashes, std::size_t n_layers) {
+    pulsarlm::layer_sequence sequence;
+    for (const digest& hash : hashes) {
+        sequence.pages.push_back(pulsarlm::active_page{.hash = hash});
+    }
+    return pulsarlm::state{
+        .head = hashes.empty() ? std::nullopt : std::optional(hashes.back()),
+        .layers = std::vector(n_layers, sequence),
+    };
 }
 
 // p holds tokens as K and their view indices, from first_index on, as V.
@@ -462,15 +498,15 @@ TEST_CASE("a request from an empty state prefills, decodes and ends with its sta
     pulsarlm::state end = ended_state(results[0]);
     token_list forwarded = concat(prompt, without_last(generated));
     std::size_t full_tokens = forwarded.size() - forwarded.size() % page_size;
-    REQUIRE((end.page_hashes == pulsarlm::make_page_digests(root(), forwarded, page_size)));
+    REQUIRE((hashes_of(end) == pulsarlm::make_page_digests(root(), forwarded, page_size)));
     REQUIRE(end.tail == token_list(forwarded.begin() + full_tokens, forwarded.end()));
-    REQUIRE(end.page_hashes.size() == 2);
-    REQUIRE(end.density == std::vector<float>(2, 0.0f));
-    for (std::size_t i = 0; i < end.page_hashes.size(); i++) {
+    REQUIRE(hashes_of(end).size() == 2);
+    REQUIRE(densities_of(end) == std::vector<float>(2, 0.0f));
+    for (std::size_t i = 0; i < hashes_of(end).size(); i++) {
         std::size_t first_index = i * page_size;
         token_list page_tokens(forwarded.begin() + first_index, forwarded.begin() + first_index + page_size);
-        REQUIRE(page_holds(f.stored(end.page_hashes[i], 0), page_tokens, first_index));
-        REQUIRE(page_holds(f.stored(end.page_hashes[i], 1), page_tokens, first_index));
+        REQUIRE(page_holds(f.stored(hashes_of(end)[i], 0), page_tokens, first_index));
+        REQUIRE(page_holds(f.stored(hashes_of(end)[i], 1), page_tokens, first_index));
     }
 }
 
@@ -516,7 +552,7 @@ TEST_CASE("a request continues from the end state of another in the same cache")
     token_list context = concat(concat(prompt, results[0].tokens), user);
     REQUIRE(results[1].tokens == continuation(context, 4));
     REQUIRE(
-        (ended_state(results[1]).page_hashes ==
+        (hashes_of(ended_state(results[1])) ==
          pulsarlm::make_page_digests(root(), concat(context, without_last(results[1].tokens)), page_size))
     );
     REQUIRE(f.store->fetches.empty());
@@ -538,13 +574,13 @@ TEST_CASE("a request continues from pages another cache fetches from the store")
     )[0];
 
     REQUIRE(second.tokens == continuation(concat(concat(prompt, first.tokens), user), 4));
-    std::vector<digest> keys = concat(keys_of(first_end.page_hashes, 0), keys_of(first_end.page_hashes, 1));
+    std::vector<digest> keys = concat(keys_of(hashes_of(first_end), 0), keys_of(hashes_of(first_end), 1));
     REQUIRE((first_engine.store->fetches == std::vector<std::vector<digest>>{keys}));
 }
 
 TEST_CASE("a state page missing from the store ends the request with miss") {
     fixture f(16);
-    pulsarlm::state unknown{.page_hashes = {digest{.hi = 1, .lo = 2}}, .density = {0.0f}};
+    pulsarlm::state unknown = full_layers_state({digest{.hi = 1, .lo = 2}}, 2);
     std::vector<request_results> results = serve_all(
         f.sched,
         {request{.initial_state = unknown, .tokens = {3}, .max_tokens = 1}}
@@ -564,7 +600,7 @@ TEST_CASE("a stop token ends the request after it is emitted") {
 
     REQUIRE(results[0].tokens == token_list{6, 12, 24});
     pulsarlm::state end = ended_state(results[0]);
-    REQUIRE((end.page_hashes == pulsarlm::make_page_digests(root(), token_list{1, 2, 3, 6}, page_size)));
+    REQUIRE((hashes_of(end) == pulsarlm::make_page_digests(root(), token_list{1, 2, 3, 6}, page_size)));
     REQUIRE(end.tail == token_list{12});
 }
 
@@ -575,7 +611,7 @@ TEST_CASE("max_tokens 0 forwards the tokens and ends with their state") {
 
     REQUIRE(results[0].tokens.empty());
     pulsarlm::state end = ended_state(results[0]);
-    REQUIRE((end.page_hashes == pulsarlm::make_page_digests(root(), prompt, page_size)));
+    REQUIRE((hashes_of(end) == pulsarlm::make_page_digests(root(), prompt, page_size)));
     REQUIRE(end.tail == token_list{9});
     REQUIRE(f.store->pages.size() == 4);
 }
@@ -677,11 +713,11 @@ TEST_CASE("a cycle ends every cycle_tokens tokens with the state it reached") {
     REQUIRE(cycle_ends.size() == 2);
     token_list first_pages(prompt.begin(), prompt.begin() + 4);
     REQUIRE(cycle_ends[0].token_count == 4);
-    REQUIRE((cycle_ends[0].reached.page_hashes == pulsarlm::make_page_digests(root(), first_pages, page_size)));
+    REQUIRE((hashes_of(cycle_ends[0].reached) == pulsarlm::make_page_digests(root(), first_pages, page_size)));
     REQUIRE(cycle_ends[0].reached.tail.empty());
     token_list forwarded = concat(prompt, token_list(generated.begin(), generated.begin() + 2));
     REQUIRE(cycle_ends[1].token_count == 8);
-    REQUIRE((cycle_ends[1].reached.page_hashes == pulsarlm::make_page_digests(root(), forwarded, page_size)));
+    REQUIRE((hashes_of(cycle_ends[1].reached) == pulsarlm::make_page_digests(root(), forwarded, page_size)));
     REQUIRE(cycle_ends[1].reached.tail.empty());
 }
 
@@ -706,11 +742,11 @@ TEST_CASE("a cycle's end evicts the pages below the bar outside the sink and wor
     std::int64_t first = continuation(prompt, 1)[0];
     REQUIRE(results[0].tokens == token_list{first, continuation(concat(kept, {first}), 1)[0]});
     REQUIRE(results[0].cycle_ends.size() == 1);
-    REQUIRE((results[0].cycle_ends[0].reached.page_hashes == std::vector{chain[0], chain[1], chain[3]}));
+    REQUIRE((hashes_of(results[0].cycle_ends[0].reached) == std::vector{chain[0], chain[1], chain[3]}));
     REQUIRE(results[0].cycle_ends[0].reached.tail.empty());
     REQUIRE(results[0].cycle_ends[0].token_count == 16);
     pulsarlm::state end = ended_state(results[0]);
-    REQUIRE((end.page_hashes == std::vector{chain[0], chain[1], chain[3]}));
+    REQUIRE((hashes_of(end) == std::vector{chain[0], chain[1], chain[3]}));
     REQUIRE(end.tail == token_list{first});
 }
 
@@ -732,11 +768,11 @@ TEST_CASE("a page's density carries over from the cycles before") {
     std::vector<digest> chain = pulsarlm::make_page_digests(root(), prompt, page_size);
     REQUIRE(results[0].cycle_ends.size() == 2);
     const pulsarlm::state& reached = results[0].cycle_ends[1].reached;
-    REQUIRE((reached.page_hashes == std::vector{chain[0], chain[1], chain[3]}));
-    REQUIRE(reached.density.size() == 3);
-    REQUIRE(reached.density[0] == 0.0f);
-    REQUIRE(reached.density[1] == static_cast<float>(std::pow(0.99, 8)));
-    REQUIRE(reached.density[2] == 0.0f);
+    REQUIRE((hashes_of(reached) == std::vector{chain[0], chain[1], chain[3]}));
+    REQUIRE(densities_of(reached).size() == 3);
+    REQUIRE(densities_of(reached)[0] == 0.0f);
+    REQUIRE(densities_of(reached)[1] == static_cast<float>(std::pow(0.99, 8)));
+    REQUIRE(densities_of(reached)[2] == 0.0f);
 }
 
 TEST_CASE("a request resumes with the density of its initial state") {
@@ -764,11 +800,11 @@ TEST_CASE("a request resumes with the density of its initial state") {
 
     std::vector<digest> chain = pulsarlm::make_page_digests(root(), prompt, page_size);
     pulsarlm::state first_end = ended_state(results[0]);
-    REQUIRE((first_end.page_hashes == chain));
-    REQUIRE(first_end.density == std::vector<float>{0.0f, 1.0f, 0.0f, 0.0f});
+    REQUIRE((hashes_of(first_end) == chain));
+    REQUIRE(densities_of(first_end) == std::vector<float>{0.0f, 1.0f, 0.0f, 0.0f});
     const pulsarlm::state& reached = results[1].cycle_ends[0].reached;
-    REQUIRE(reached.page_hashes.size() == 3);
-    REQUIRE((std::vector{reached.page_hashes[0], reached.page_hashes[1]} == std::vector{chain[0], chain[1]}));
+    REQUIRE(hashes_of(reached).size() == 3);
+    REQUIRE((std::vector{hashes_of(reached)[0], hashes_of(reached)[1]} == std::vector{chain[0], chain[1]}));
 }
 
 TEST_CASE("a cycle's end evicts down to max_pages, the oldest first on ties") {
@@ -787,7 +823,7 @@ TEST_CASE("a cycle's end evicts down to max_pages, the oldest first on ties") {
     token_list kept(prompt.begin() + 8, prompt.end());
     std::int64_t first = continuation(prompt, 1)[0];
     REQUIRE(results[0].tokens == token_list{first, continuation(concat(kept, {first}), 1)[0]});
-    REQUIRE((results[0].cycle_ends[0].reached.page_hashes == std::vector{chain[2], chain[3]}));
+    REQUIRE((hashes_of(results[0].cycle_ends[0].reached) == std::vector{chain[2], chain[3]}));
 }
 
 TEST_CASE("a prompt longer than the cache fits when each cycle evicts down to max_pages") {
@@ -808,7 +844,7 @@ TEST_CASE("a prompt longer than the cache fits when each cycle evicts down to ma
     std::int64_t first = continuation(last_two_cycles, 1)[0];
     REQUIRE(results[0].tokens == token_list{first, continuation(concat(last_cycle, {first}), 1)[0]});
     REQUIRE(results[0].cycle_ends.size() == 4);
-    REQUIRE(ended_state(results[0]).page_hashes.size() == 2);
+    REQUIRE(hashes_of(ended_state(results[0])).size() == 2);
 }
 
 TEST_CASE("prefill forwards at most the step's prefill tokens") {
@@ -862,10 +898,10 @@ TEST_CASE("a sliding layer holds only the pages its window reaches") {
     REQUIRE(f.model.decode_sizes == std::vector<std::int64_t>(5, 2));
     pulsarlm::state end = ended_state(results[0]);
     token_list forwarded = concat(first, without_last(results[0].tokens));
-    REQUIRE((end.page_hashes == pulsarlm::make_page_digests(root(), forwarded, page_size)));
-    for (std::size_t i = 0; i < end.page_hashes.size(); i++) {
+    REQUIRE((hashes_of(end) == pulsarlm::make_page_digests(root(), forwarded, page_size)));
+    for (std::size_t i = 0; i < hashes_of(end).size(); i++) {
         token_list page_tokens(forwarded.begin() + i * page_size, forwarded.begin() + (i + 1) * page_size);
-        REQUIRE(page_holds(f.stored(end.page_hashes[i], 1), page_tokens, i * page_size));
+        REQUIRE(page_holds(f.stored(hashes_of(end)[i], 1), page_tokens, i * page_size));
     }
 }
 
@@ -886,22 +922,48 @@ TEST_CASE("the pool gives each line size the lines its layers need") {
 
     request_results served = serve_in(8 * 64 + 5 * 128);
     REQUIRE(served.tokens == continuation(prompt, 16));
-    REQUIRE(ended_state(served).page_hashes.size() == 7);
+    REQUIRE(hashes_of(ended_state(served)).size() == 7);
     REQUIRE(ended_error(serve_in(7 * 64 + 5 * 128)) == request_error::oom);
 }
 
-TEST_CASE("page_keys names every full-attention page and the pages a sliding window reaches") {
+TEST_CASE("a state's sliding layer holds the pages its window reaches from the tail") {
     fixture f(16, 64, {}, {}, full_and_sliding);
     token_list history(26);
     std::iota(history.begin(), history.end(), 1);
+    pulsarlm::state end = ended_state(serve_all(f.sched, {request{.tokens = history, .max_tokens = 0}})[0]);
+
     std::vector<digest> hashes = pulsarlm::make_page_digests(root(), history, page_size);
     REQUIRE(hashes.size() == 6);
+    REQUIRE((end.head == hashes.back()));
+    REQUIRE((hashes_of(end, 0) == hashes));
+    REQUIRE((hashes_of(end, 1) == std::vector{hashes[5]}));
+    REQUIRE(end.tail == token_list{25, 26});
+}
 
-    std::vector<digest> keys = f.sched.page_keys(pulsarlm::state{.page_hashes = hashes, .tail = {25, 26}});
-    std::vector<digest> expected = keys_of(hashes, 0);
-    std::vector<digest> window_keys = keys_of({hashes[5]}, 1);
-    expected.insert(expected.end(), window_keys.begin(), window_keys.end());
-    REQUIRE((keys == expected));
+TEST_CASE("validate_state accepts the states the scheduler reaches and rejects others") {
+    fixture f(16, 64, {}, {}, full_and_sliding);
+    token_list history(26);
+    std::iota(history.begin(), history.end(), 1);
+    pulsarlm::state end = ended_state(serve_all(f.sched, {request{.tokens = history, .max_tokens = 0}})[0]);
+    f.sched.validate_state(end);
+    f.sched.validate_state(pulsarlm::state{});
+    f.sched.validate_state(pulsarlm::state{.layers = std::vector<pulsarlm::layer_sequence>(2)});
+
+    pulsarlm::state headless = end;
+    headless.head.reset();
+    REQUIRE_THROWS_AS(f.sched.validate_state(headless), std::invalid_argument);
+    pulsarlm::state one_layer = end;
+    one_layer.layers.pop_back();
+    REQUIRE_THROWS_AS(f.sched.validate_state(one_layer), std::invalid_argument);
+    pulsarlm::state full_window = end;
+    full_window.layers[1] = full_window.layers[0];
+    REQUIRE_THROWS_AS(f.sched.validate_state(full_window), std::invalid_argument);
+    pulsarlm::state stale_density = end;
+    stale_density.layers[0].pages[5].density = 1.0f;
+    REQUIRE_THROWS_AS(f.sched.validate_state(stale_density), std::invalid_argument);
+    pulsarlm::state negative = end;
+    negative.layers[0].pages[0].density = -1.0f;
+    REQUIRE_THROWS_AS(f.sched.validate_state(negative), std::invalid_argument);
 }
 
 TEST_CASE("a request resumed on another cache fetches only the window's pages of a sliding layer") {
@@ -910,7 +972,7 @@ TEST_CASE("a request resumed on another cache fetches only the window's pages of
     std::iota(prompt.begin(), prompt.end(), 1);
     request_results first = serve_all(first_engine.sched, {request{.tokens = prompt, .max_tokens = 3}})[0];
     pulsarlm::state first_end = ended_state(first);
-    REQUIRE(first_end.page_hashes.size() == 5);
+    REQUIRE(hashes_of(first_end).size() == 5);
 
     memory_store shared_store;
     shared_store.contents = first_engine.store;
@@ -922,7 +984,7 @@ TEST_CASE("a request resumed on another cache fetches only the window's pages of
     )[0];
 
     REQUIRE(second.tokens == continuation(concat(concat(prompt, first.tokens), user), 4));
-    std::vector<digest> keys = concat(keys_of(first_end.page_hashes, 0), keys_of({first_end.page_hashes[4]}, 1));
+    std::vector<digest> keys = concat(keys_of(hashes_of(first_end), 0), keys_of({hashes_of(first_end)[4]}, 1));
     REQUIRE((first_engine.store->fetches == std::vector<std::vector<digest>>{keys}));
 }
 
@@ -944,7 +1006,7 @@ TEST_CASE("eviction keeps the pages a sliding window reaches whatever n_working 
     );
 
     std::vector<digest> chain = pulsarlm::make_page_digests(root(), prompt, page_size);
-    REQUIRE((results[0].cycle_ends[0].reached.page_hashes == std::vector{chain[2], chain[3]}));
+    REQUIRE((hashes_of(results[0].cycle_ends[0].reached) == std::vector{chain[2], chain[3]}));
 }
 
 }  // namespace

@@ -52,13 +52,4 @@ pybind11::list to_bytes_list(std::span<const digest> digests) {
     return list;
 }
 
-std::vector<digest> digests_from_bytes(const std::vector<pybind11::bytes>& list) {
-    std::vector<digest> digests;
-    digests.reserve(list.size());
-    for (const pybind11::bytes& bytes : list) {
-        digests.push_back(digest_from_bytes(bytes));
-    }
-    return digests;
-}
-
 }  // namespace pulsarlm

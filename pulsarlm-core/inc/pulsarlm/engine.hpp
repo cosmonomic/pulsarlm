@@ -71,16 +71,14 @@ class engine {
     engine& operator=(const engine&) = delete;
     ~engine();
 
-    // Serves r, passing its results to callbacks. Safe to call from any thread. Throws as validate does, without
-    // calling callbacks.
+    // Serves r, passing its results to callbacks. Safe to call from any thread. Throws as validate and
+    // scheduler::validate_state do, without calling callbacks.
     void submit(request&& r, std::unique_ptr<request_callbacks> callbacks);
     // The exception that panicked the loop; null while the loop runs or when it was stopped.
     std::exception_ptr exception() const;
-    // The digests of the full pages of a token history from its start, the page hashes a state reaching it would end
-    // with.
+    // The digests of the full pages of a token history from its start; the last is the head of a state reaching it.
     std::vector<digest> page_digests(std::span<const std::int64_t> tokens) const;
-    // The store keys of the pages a request resuming from s reads, see scheduler::page_keys. Safe to call from any
-    // thread.
+    // The store keys of the pages of s's sequences, which a request resuming from s reads. Safe to call from any thread.
     std::vector<digest> page_keys(const state& s) const;
 };
 

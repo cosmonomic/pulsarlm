@@ -166,7 +166,7 @@ def test_another_engine_fetches_the_state_pages_from_the_store():
             state,
             _,
         ):
-            assert len(state.page_hashes) == 2
+            assert len(state.layers[0].pages) == 2
             keys = second.page_keys(state)
         assert len(await collect(second, store, follow_up)) == 8
         assert store.fetched == keys

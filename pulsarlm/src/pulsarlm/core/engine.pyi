@@ -22,19 +22,34 @@ class PageStore(Protocol):
         self, hashes: list[bytes], pages: list[Page], owners: list[tuple[int, int]]
     ) -> None: ...
 
-class State:
-    """The ordered page hashes of a view, each 16 bytes, the tokens of its partial
-    last page, then the eviction density of each page, 0 for a page never
-    measured."""
+class ActivePage:
+    """A page of a sequence: its 16-byte hash and its eviction density, 0 for a
+    page never measured."""
 
-    page_hashes: list[bytes]
+    hash: bytes
+    density: float
+    def __init__(self, hash: bytes, density: float = 0.0) -> None: ...
+
+class LayerSequence:
+    """One KV layer's active pages, in view order."""
+
+    pages: list[ActivePage]
+    def __init__(self, pages: list[ActivePage] = []) -> None: ...
+
+class State:
+    """head is the 16-byte hash of the newest full page of the history, which every
+    non-empty sequence ends with; None before the first full page. layers holds one
+    sequence per KV layer, and may be empty when head is None. tail holds the tokens
+    after head."""
+
+    head: bytes | None
+    layers: list[LayerSequence]
     tail: list[int]
-    density: list[float]
     def __init__(
         self,
-        page_hashes: list[bytes] = [],
+        head: bytes | None = None,
+        layers: list[LayerSequence] = [],
         tail: list[int] = [],
-        density: list[float] = [],
     ) -> None: ...
 
 class CycleEnd:
@@ -199,10 +214,11 @@ class Engine:
         """Raises ValueError for a request the engine cannot serve. The pages the
         request's steps put reach the store owned by request_id."""
     def page_digests(self, tokens: list[int]) -> list[bytes]:
-        """The hashes of the full pages of a token history from its start: the page
-        hashes a state reaching that history ends with."""
+        """The hashes of the full pages of a token history from its start; the last
+        is the head of a state reaching that history."""
     def page_keys(self, state: State) -> list[bytes]:
-        """The store keys of the pages a request resuming from state reads."""
+        """The store keys of the pages of state's sequences, which a request
+        resuming from state reads."""
     def fileno(self) -> int:
         """An eventfd that becomes readable when a request has results to take."""
     def clear_wake(self) -> None:

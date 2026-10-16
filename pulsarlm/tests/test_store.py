@@ -12,7 +12,7 @@ from pathlib import Path
 
 import torch
 
-from pulsarlm.core.engine import State
+from pulsarlm.core.engine import ActivePage, LayerSequence, State
 from pulsarlm.store import LocalStore
 from pulsarlm.store_file import StoreInUseError
 
@@ -33,15 +33,29 @@ def page_digests(tokens: list[int]) -> list[bytes]:
 
 
 def reached(history: list[int], evicted: set[int] = set()) -> State:
+    """A state of two layers: one keeping every page not evicted, one the newest."""
     full = len(history) // PAGE_SIZE * PAGE_SIZE
-    kept = [
-        (h, i / 4) for i, h in enumerate(page_digests(history)) if i not in evicted
+    pages = [
+        ActivePage(h, i / 4)
+        for i, h in enumerate(page_digests(history))
+        if i not in evicted
     ]
     return State(
-        page_hashes=[h for h, _ in kept],
+        head=pages[-1].hash if pages else None,
+        layers=[LayerSequence(pages), LayerSequence(pages[-1:])],
         tail=history[full:],
-        density=[d for _, d in kept],
     )
+
+
+def state_of(hashes: list[bytes]) -> State:
+    """A state of one layer keeping hashes."""
+    return State(
+        head=hashes[-1], layers=[LayerSequence([ActivePage(h) for h in hashes])]
+    )
+
+
+def hashes_of(state: State) -> list[bytes]:
+    return [p.hash for p in state.layers[0].pages] if state.layers else []
 
 
 def page(value: float) -> tuple[torch.Tensor, torch.Tensor]:
@@ -70,7 +84,7 @@ def lookup(store: LocalStore, prompt: list[int]) -> Iterator[tuple[State, int]]:
 
 
 def write(store: LocalStore, state: State, request_id: int | None = None) -> None:
-    store.write(state, state.page_hashes, request_id=request_id)
+    store.write(state, hashes_of(state), request_id=request_id)
 
 
 def put_pages(
@@ -99,7 +113,7 @@ HISTORY = list(range(1, 15))
 def test_an_empty_store_gives_an_empty_state():
     store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY)
     with lookup(store, HISTORY) as (state, covered):
-        assert state.page_hashes == [] and state.tail == []
+        assert state.head is None and state.layers == [] and state.tail == []
         assert covered == 0
 
 
@@ -108,7 +122,7 @@ def test_lookup_takes_the_longest_state_the_prompt_continues():
     run_request(store, HISTORY, HISTORY[:5], HISTORY[:9], HISTORY[:10])
     with lookup(store, HISTORY) as (state, covered):
         assert covered == 10
-        assert state.page_hashes == page_digests(HISTORY[:8])
+        assert hashes_of(state) == page_digests(HISTORY[:8])
         assert state.tail == HISTORY[8:10]
 
 
@@ -134,7 +148,7 @@ def test_a_state_with_evicted_pages_is_found_by_its_last_page():
         write(store, reached(history, evicted={1}), request_id)
     with lookup(store, HISTORY) as (state, covered):
         assert covered == 13
-        assert len(state.page_hashes) == 2
+        assert len(hashes_of(state)) == 2
 
 
 def test_dropping_a_state_from_the_lru_deletes_the_pages_only_it_references():
@@ -160,7 +174,7 @@ def test_a_request_keeps_the_pages_of_the_state_it_resumed_until_its_lease_close
     resumed = page_digests(HISTORY[:9])
     other = [50 + t for t in HISTORY[:8]]
     with lookup(store, HISTORY) as (state, _):
-        assert state.page_hashes == resumed
+        assert hashes_of(state) == resumed
         run_request(store, other, other)
         assert all(stored(store, h) for h in resumed)
     assert not any(stored(store, h) for h in resumed)
@@ -190,7 +204,7 @@ def test_a_written_state_releases_the_pages_of_its_steps_it_does_not_reference()
     with request(store, HISTORY) as (request_id, _, _):
         for h in (first, evicted, last):
             put_pages(store, [h], request_id)
-        write(store, State(page_hashes=[first, last], tail=[]), request_id)
+        write(store, state_of([first, last]), request_id)
         assert not stored(store, evicted)
         assert stored(store, first) and stored(store, last)
 
@@ -201,7 +215,7 @@ def test_the_pages_a_request_put_after_the_step_of_a_state_it_writes_stay():
     with request(store, HISTORY) as (request_id, _, _):
         put_pages(store, [first], request_id)
         put_pages(store, [second], request_id)
-        write(store, State(page_hashes=[first], tail=[]), request_id)
+        write(store, state_of([first]), request_id)
         assert stored(store, second)
     assert stored(store, first)
     assert not stored(store, second)
@@ -212,11 +226,11 @@ def test_a_running_request_keeps_its_newest_snapshot_after_the_lru_drops_it():
     first, second = page_digests(HISTORY[:8])
     with request(store, HISTORY) as (request_id, _, _):
         put_pages(store, [first], request_id)
-        write(store, State(page_hashes=[first], tail=[]), request_id)
+        write(store, state_of([first]), request_id)
         run_request(store, [7] * 5, [7] * 5)
         assert stored(store, first)
         put_pages(store, [second], request_id)
-        write(store, State(page_hashes=[first, second], tail=[]), request_id)
+        write(store, state_of([first, second]), request_id)
     assert stored(store, first) and stored(store, second)
 
 
@@ -308,10 +322,10 @@ def test_states_and_pages_survive_a_restart(tmp_path: Path):
     assert store.byte_count() == 2 * PAGE_BYTES
     with lookup(store, HISTORY) as (state, covered):
         assert covered == 9
-        assert state.page_hashes == page_digests(HISTORY[:8])
+        assert state.head == reached(HISTORY[:9]).head
+        assert state.layers == reached(HISTORY[:9]).layers
         assert state.tail == [HISTORY[8]]
-        assert state.density == [0.0, 0.25]
-        fetched = store.fetch(state.page_hashes[1:]).result()[0]
+        fetched = store.fetch(hashes_of(state)[1:]).result()[0]
         assert fetched is not None
         k, v = fetched
         assert k.tolist() == [1.0] and v.tolist() == [-1.0]
@@ -387,9 +401,7 @@ def test_a_restart_drops_a_state_missing_a_page(tmp_path: Path):
     assert store.page_count() == 0
 
 
-def test_a_file_from_before_densities_gives_its_states_zero_densities(
-    tmp_path: Path,
-):
+def test_a_file_in_another_format_is_emptied(tmp_path: Path):
     path = tmp_path / "store.sqlite"
     wrote = in_another_process(
         path,
@@ -400,12 +412,13 @@ def test_a_file_from_before_densities_gives_its_states_zero_densities(
     )
     assert wrote.returncode == 0, wrote.stderr
     with closing(sqlite3.connect(path)) as connection, connection:
-        connection.execute("ALTER TABLE states DROP COLUMN density")
+        connection.execute("PRAGMA user_version = 0")
 
     store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=path)
-    with lookup(store, HISTORY) as (state, covered):
-        assert covered == 9
-        assert state.density == [0.0, 0.0]
+    assert len(store) == 0
+    assert store.page_count() == 0
+    with lookup(store, HISTORY) as (_, covered):
+        assert covered == 0
 
 
 def test_recency_survives_a_restart(tmp_path: Path):

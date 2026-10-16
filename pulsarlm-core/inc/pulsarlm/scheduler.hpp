@@ -37,7 +37,7 @@ struct request {
 class scheduler;
 
 // A request being served. Its tokens move from pending to tail as steps forward them, and the pages the tail fills
-// move to page_hashes.
+// move to page_hashes, the view of the full pages, the last of them head.
 class sequence {
     enum class exit_reason { finished, cancelled, oom };
 
@@ -51,6 +51,7 @@ class sequence {
     std::uint64_t draw_count = 0;
     std::optional<std::size_t> max_tokens;
     std::size_t generated = 0;
+    std::optional<digest> head;
     std::vector<digest> page_hashes;
     std::vector<std::int64_t> tail;
     // The density of each full page in the states the sequence reaches: as of the last step that measured mass, 0 for a
@@ -74,15 +75,22 @@ class sequence {
     // The request's tokens the state covers: the initial state's tail, then the request's tokens, then sampled tokens.
     std::size_t covered_count = 0;
 
-    // Queues on stream the upload of the initial state's density.
-    sequence(request&& r, result_writer& writer, std::size_t n_kv_layers, at::Device device, cudaStream_t stream);
+    // The view comes from the initial state's sequence of KV layer view_layer. Queues on stream the upload of its
+    // density.
+    sequence(
+        request&& r,
+        std::size_t view_layer,
+        result_writer& writer,
+        std::size_t n_kv_layers,
+        at::Device device,
+        cudaStream_t stream
+    );
 
     std::size_t forwarded_count(std::size_t page_size) const noexcept;
     bool may_sample() const noexcept;
     // Moves the first count pending tokens to tail, then the pages they complete to page_hashes. host_density, when
     // defined, is the density after the step that forwarded them.
     void advance(std::size_t count, std::size_t page_size, const digest& root, const at::Tensor& host_density);
-    state reached() const;
     void start_cycle(std::size_t page_size) noexcept;
     // Whether forwarding token_count more tokens ends the eviction cycle.
     bool ends_cycle(std::size_t token_count, std::size_t page_size) const noexcept;
@@ -151,6 +159,8 @@ class scheduler {
     kv_cache cache;
     std::vector<kv> lines;
     std::vector<std::optional<std::size_t>> sliding_windows;
+    // A full-attention KV layer, whose sequence of a state is the view every other layer's sequence is a part of.
+    std::size_t view_layer;
     // The full pages eviction keeps last so that no sliding window loses a key.
     std::size_t window_pages;
     cudaStream_t stream;
@@ -166,6 +176,10 @@ class scheduler {
     static void wake(std::optional<event>& waited) noexcept;
     // The view page of the first key KV layer layer reads for a query at view index query.
     std::size_t first_held_page(std::size_t layer, std::size_t query) const noexcept;
+    // Per KV layer, the pages of view a request resuming from it reads: every page for a full-attention layer, those
+    // its window reaches for a sliding layer.
+    std::vector<layer_sequence> layer_sequences(std::span<const active_page> view) const;
+    state reached(const sequence& seq) const;
     // Per KV layer, lines for the page_hashes from its first held page for a query at their end, in their order, then
     // line_count empty lines. Holds nothing on failure.
     task<std::expected<void, page_error>> take_lines(sequence& seq, std::size_t line_count);
@@ -197,9 +211,10 @@ class scheduler {
     task<void> submit(request r, result_writer writer);
     // Steps the running sequences until the loop stops.
     task<void> run();
-    // The store keys of the pages a request resuming from s reads: every page of a full-attention layer, and those a
-    // sliding layer's window reaches. Safe to call from any thread.
-    std::vector<digest> page_keys(const state& s) const;
+    // Throws std::invalid_argument unless s is a state the scheduler reaches: with one sequence per KV layer, each
+    // the pages of the view layer's sequence its layer reads, ending with head, and every density finite and
+    // non-negative. Safe to call from any thread.
+    void validate_state(const state& s) const;
 };
 
 }  // namespace pulsarlm

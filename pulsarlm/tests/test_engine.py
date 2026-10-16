@@ -7,7 +7,9 @@ import pytest
 import torch
 
 from pulsarlm.core.engine import (
+    ActivePage,
     Engine,
+    LayerSequence,
     ModelConfig,
     RequestError,
     RopeParameters,
@@ -146,7 +148,7 @@ def test_generates_max_tokens_and_ends_with_a_state():
         assert all(0 <= t < VOCAB_SIZE for t in tokens)
         assert isinstance(end, State)
         forwarded = len(PROMPT) + len(tokens) - 1
-        assert len(end.page_hashes) * PAGE_SIZE + len(end.tail) == forwarded
+        assert len(end.layers[0].pages) * PAGE_SIZE + len(end.tail) == forwarded
         assert all(k in store.pages for k in engine.page_keys(end))
 
     asyncio.run(main())
@@ -158,7 +160,9 @@ def test_page_digests_are_the_page_hashes_of_the_end_state():
         tokens, _, end = await run(engine, engine.submit(State(), PROMPT, max_tokens=8))
 
         assert isinstance(end, State)
-        assert engine.page_digests(PROMPT + tokens[:-1]) == end.page_hashes
+        digests = engine.page_digests(PROMPT + tokens[:-1])
+        assert end.head == digests[-1]
+        assert all([p.hash for p in layer.pages] == digests for layer in end.layers)
         assert engine.page_digests(PROMPT[: PAGE_SIZE - 1]) == []
 
     asyncio.run(main())
@@ -193,7 +197,9 @@ def test_another_engine_continues_a_state_from_the_store():
 def test_a_page_missing_from_the_store_ends_with_miss():
     async def main():
         engine = make_engine(MemoryStore(asyncio.get_running_loop()))
-        missing = State(page_hashes=[bytes(16)], density=[0.0])
+        missing = State(
+            head=bytes(16), layers=[LayerSequence([ActivePage(bytes(16))])] * N_LAYERS
+        )
         _, _, end = await run(engine, engine.submit(missing, [1], max_tokens=1))
 
         assert end == RequestError.MISS
@@ -204,7 +210,9 @@ def test_a_page_missing_from_the_store_ends_with_miss():
 def test_a_failing_fetch_misses():
     async def main():
         engine = make_engine(FailingStore(asyncio.get_running_loop()))
-        missing = State(page_hashes=[bytes(16)], density=[0.0])
+        missing = State(
+            head=bytes(16), layers=[LayerSequence([ActivePage(bytes(16))])] * N_LAYERS
+        )
         _, _, end = await run(engine, engine.submit(missing, [1], max_tokens=1))
 
         assert end == RequestError.MISS
@@ -263,4 +271,4 @@ def test_a_cache_without_a_line_or_a_negative_store_is_rejected(
 
 def test_a_digest_is_16_bytes():
     with pytest.raises(ValueError, match="16 bytes"):
-        State(page_hashes=[b"short"])
+        State(head=b"short")

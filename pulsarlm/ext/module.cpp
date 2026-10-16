@@ -1,6 +1,7 @@
 #include <torch/csrc/utils/pybind.h>
 
 #include <pybind11/native_enum.h>
+#include <pybind11/operators.h>
 #include <pybind11/stl.h>
 
 #include <cstddef>
@@ -90,24 +91,56 @@ PYBIND11_MODULE(pulsarlm_core, m) {
     using namespace pulsarlm;
     using namespace py::literals;
 
-    py::class_<state>(m, "State")
+    py::class_<active_page>(m, "ActivePage")
         .def(
-            py::init([](const std::vector<py::bytes>& page_hashes,
-                        std::vector<std::int64_t> tail,
-                        std::vector<float> density) {
-                return state{digests_from_bytes(page_hashes), std::move(tail), std::move(density)};
+            py::init([](const py::bytes& hash, float density) {
+                return active_page{.hash = digest_from_bytes(hash), .density = density};
             }),
-            "page_hashes"_a = std::vector<py::bytes>(),
-            "tail"_a = std::vector<std::int64_t>(),
-            "density"_a = std::vector<float>()
+            "hash"_a,
+            "density"_a = 0.0f
         )
         .def_property(
-            "page_hashes",
-            [](const state& s) { return to_bytes_list(s.page_hashes); },
-            [](state& s, const std::vector<py::bytes>& page_hashes) { s.page_hashes = digests_from_bytes(page_hashes); }
+            "hash",
+            [](const active_page& p) { return to_bytes(p.hash); },
+            [](active_page& p, const py::bytes& hash) { p.hash = digest_from_bytes(hash); }
         )
-        .def_readwrite("tail", &state::tail)
-        .def_readwrite("density", &state::density);
+        .def_readwrite("density", &active_page::density)
+        .def(py::self == py::self);
+
+    py::class_<layer_sequence>(m, "LayerSequence")
+        .def(
+            py::init([](std::vector<active_page> pages) { return layer_sequence{.pages = std::move(pages)}; }),
+            "pages"_a = std::vector<active_page>()
+        )
+        .def_readwrite("pages", &layer_sequence::pages)
+        .def(py::self == py::self);
+
+    py::class_<state>(m, "State")
+        .def(
+            py::init([](const std::optional<py::bytes>& head,
+                        std::vector<layer_sequence> layers,
+                        std::vector<std::int64_t> tail) {
+                return state{
+                    .head = head ? std::optional(digest_from_bytes(*head)) : std::nullopt,
+                    .layers = std::move(layers),
+                    .tail = std::move(tail),
+                };
+            }),
+            "head"_a = py::none(),
+            "layers"_a = std::vector<layer_sequence>(),
+            "tail"_a = std::vector<std::int64_t>()
+        )
+        .def_property(
+            "head",
+            [](const state& s) -> std::optional<py::bytes> {
+                return s.head ? std::optional(to_bytes(*s.head)) : std::nullopt;
+            },
+            [](state& s, const std::optional<py::bytes>& head) {
+                s.head = head ? std::optional(digest_from_bytes(*head)) : std::nullopt;
+            }
+        )
+        .def_readwrite("layers", &state::layers)
+        .def_readwrite("tail", &state::tail);
 
     py::class_<cycle_end>(m, "CycleEnd")
         .def_readonly("reached", &cycle_end::reached)

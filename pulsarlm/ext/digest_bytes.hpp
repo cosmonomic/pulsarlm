@@ -3,7 +3,6 @@
 #include <pybind11/pybind11.h>
 
 #include <span>
-#include <vector>
 
 #include "pulsarlm/digest.hpp"
 
@@ -15,6 +14,5 @@ pybind11::bytes to_bytes(const digest& d);
 digest digest_from_bytes(const pybind11::bytes& bytes);
 
 pybind11::list to_bytes_list(std::span<const digest> digests);
-std::vector<digest> digests_from_bytes(const std::vector<pybind11::bytes>& list);
 
 }  // namespace pulsarlm

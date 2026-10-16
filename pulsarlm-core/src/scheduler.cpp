@@ -8,11 +8,14 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <format>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -55,20 +58,32 @@ GroupBatch to_device(const GroupBatch& host, at::Device device) {
 
 }  // namespace
 
-sequence::sequence(request&& r, result_writer& writer, std::size_t n_kv_layers, at::Device device, cudaStream_t stream)
+sequence::sequence(
+    request&& r,
+    std::size_t view_layer,
+    result_writer& writer,
+    std::size_t n_kv_layers,
+    at::Device device,
+    cudaStream_t stream
+)
 : writer(writer),
   id(r.id),
   sampling(r.sampling),
   seed(sampling_seed(r.sampling.seed)),
   max_tokens(r.max_tokens),
-  page_hashes(std::move(r.initial_state.page_hashes)),
-  state_density(std::move(r.initial_state.density)),
+  head(r.initial_state.head),
   pending(std::move(r.initial_state.tail)),
   lines(n_kv_layers),
   first_held(n_kv_layers, 0),
   table(at::zeros({static_cast<std::int64_t>(n_kv_layers), 0}, at::TensorOptions().dtype(at::kInt).device(device))),
   eviction(r.eviction) {
     pending.insert(pending.end(), r.tokens.begin(), r.tokens.end());
+    if (!r.initial_state.layers.empty()) {
+        for (const active_page& page : r.initial_state.layers[view_layer].pages) {
+            page_hashes.push_back(page.hash);
+            state_density.push_back(page.density);
+        }
+    }
     if (eviction.can_evict()) {
         at::Tensor host = pinned({static_cast<std::int64_t>(state_density.size())}, at::kFloat);
         std::ranges::copy(state_density, host.mutable_data_ptr<float>());
@@ -91,9 +106,13 @@ void sequence::advance(std::size_t count, std::size_t page_size, const digest& r
     pending.erase(pending.begin(), pending.begin() + count);
     covered_count += count;
     if (std::size_t completed_tokens = tail.size() - tail.size() % page_size; completed_tokens > 0) {
-        digest parent = page_hashes.empty() ? root : page_hashes.back();
-        std::vector<digest> completed = make_page_digests(parent, std::span(tail).first(completed_tokens), page_size);
+        std::vector<digest> completed = make_page_digests(
+            head.value_or(root),
+            std::span(tail).first(completed_tokens),
+            page_size
+        );
         page_hashes.insert(page_hashes.end(), completed.begin(), completed.end());
+        head = completed.back();
         tail.erase(tail.begin(), tail.begin() + completed_tokens);
     }
     if (host_density.defined()) {
@@ -103,10 +122,6 @@ void sequence::advance(std::size_t count, std::size_t page_size, const digest& r
     } else {
         state_density.resize(page_hashes.size(), 0.0f);
     }
-}
-
-state sequence::reached() const {
-    return state{.page_hashes = page_hashes, .tail = tail, .density = state_density};
 }
 
 void sequence::start_cycle(std::size_t page_size) noexcept {
@@ -398,6 +413,7 @@ scheduler::scheduler(
 : model(model),
   cache(std::move(cache)),
   window_pages(0),
+  view_layer(0),
   stream(stream),
   page_size(static_cast<std::size_t>(this->cache.tensors(0).k.size(1))),
   root(root),
@@ -412,6 +428,10 @@ scheduler::scheduler(
         if (layers[layer].sliding_window) {
             window_pages = std::max(window_pages, ceil_div(*layers[layer].sliding_window - 1, page_size));
         }
+    }
+    while (sliding_windows[view_layer]) {
+        view_layer++;
+        assert(view_layer < sliding_windows.size());
     }
 }
 
@@ -443,9 +463,8 @@ task<void> scheduler::submit(request r, result_writer writer) {
     assert(!r.initial_state.tail.empty() || !r.tokens.empty());
     assert(r.eviction.n_working >= 1 && r.eviction.cycle_tokens >= 1);
     assert(r.eviction.attention_mass_decay > 0.0 && r.eviction.attention_mass_decay <= 1.0);
-    assert(r.initial_state.density.size() == r.initial_state.page_hashes.size());
     r.eviction.n_working = std::max(r.eviction.n_working, window_pages);
-    sequence seq(std::move(r), writer, cache.layer_count(), cache.tensors(0).k.device(), stream);
+    sequence seq(std::move(r), view_layer, writer, cache.layer_count(), cache.tensors(0).k.device(), stream);
     seq.start_cycle(page_size);
     if (writer.cancelled()) {
         writer.end(std::unexpected(request_error::cancelled));
@@ -466,7 +485,7 @@ task<void> scheduler::submit(request r, result_writer writer) {
 
     switch (*seq.exited) {
     case exit_reason::finished:
-        writer.end(seq.reached());
+        writer.end(reached(seq));
         co_return;
     case exit_reason::cancelled:
         writer.end(std::unexpected(request_error::cancelled));
@@ -650,19 +669,59 @@ void scheduler::end_cycle(sequence& seq) {
             seq.upload_table(0, stream);
         }
     }
-    seq.writer.append(cycle_end{.reached = seq.reached(), .token_count = seq.covered_count});
+    seq.writer.append(cycle_end{.reached = reached(seq), .token_count = seq.covered_count});
     seq.start_cycle(page_size);
 }
 
-std::vector<digest> scheduler::page_keys(const state& s) const {
-    std::vector<digest> keys;
-    std::size_t pages = s.page_hashes.size();
-    for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
-        for (std::size_t page = first_held_page(layer, pages * page_size); page < pages; page++) {
-            keys.push_back(store_key(s.page_hashes[page], layer));
+std::vector<layer_sequence> scheduler::layer_sequences(std::span<const active_page> view) const {
+    std::vector<layer_sequence> layers(cache.layer_count());
+    for (std::size_t layer = 0; layer < layers.size(); layer++) {
+        std::span<const active_page> read = view.subspan(first_held_page(layer, view.size() * page_size));
+        layers[layer].pages.assign(read.begin(), read.end());
+    }
+    return layers;
+}
+
+state scheduler::reached(const sequence& seq) const {
+    std::vector<active_page> view;
+    for (std::size_t page = 0; page < seq.page_hashes.size(); page++) {
+        view.push_back(active_page{.hash = seq.page_hashes[page], .density = seq.state_density[page]});
+    }
+    return state{.head = seq.head, .layers = layer_sequences(view), .tail = seq.tail};
+}
+
+void scheduler::validate_state(const state& s) const {
+    if (s.layers.empty() && !s.head) {
+        return;
+    }
+    if (s.layers.size() != cache.layer_count()) {
+        throw std::invalid_argument(
+            std::format("the state holds {} sequences for {} KV layers", s.layers.size(), cache.layer_count())
+        );
+    }
+    std::span<const active_page> view = s.layers[view_layer].pages;
+    if (view.empty() != !s.head || (s.head && view.back().hash != *s.head)) {
+        throw std::invalid_argument(
+            std::format("the sequence of KV layer {} must end with the state's head, and only it", view_layer)
+        );
+    }
+    if (!std::ranges::all_of(view, [](const active_page& p) {
+            return std::isfinite(p.density) && p.density >= 0.0f;
+        })) {
+        throw std::invalid_argument("the state's densities must be finite and non-negative");
+    }
+    std::vector<layer_sequence> expected = layer_sequences(view);
+    for (std::size_t layer = 0; layer < expected.size(); layer++) {
+        if (s.layers[layer] != expected[layer]) {
+            throw std::invalid_argument(
+                std::format(
+                    "the sequence of KV layer {} must be the pages it reads of KV layer {}'s sequence",
+                    layer,
+                    view_layer
+                )
+            );
         }
     }
-    return keys;
 }
 
 }  // namespace pulsarlm

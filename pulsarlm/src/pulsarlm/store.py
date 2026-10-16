@@ -16,11 +16,9 @@ NO_PAGES = b""
 
 
 def state_key(state: State) -> StateKey:
-    """The last page hash and the tail, which identify the token history a state
-    reaches: the newest page is never evicted, and its hash chains every page
-    before it."""
-    last_page = state.page_hashes[-1] if state.page_hashes else NO_PAGES
-    return last_page, tuple(state.tail)
+    """The head and the tail, which identify the token history a state reaches:
+    the head's hash chains every page before it."""
+    return state.head or NO_PAGES, tuple(state.tail)
 
 
 def page_bytes(page: Page) -> int:
@@ -235,10 +233,10 @@ class LocalStore:
         self, prompt: list[int], page_digests: list[bytes]
     ) -> tuple[StoredState, int]:
         for page_count in range(len(page_digests), -1, -1):
-            last_page = page_digests[page_count - 1] if page_count else NO_PAGES
+            head = page_digests[page_count - 1] if page_count else NO_PAGES
             start = page_count * self._page_size
             longest: tuple[int, ...] | None = None
-            for tail in self._tails.get(last_page, ()):
+            for tail in self._tails.get(head, ()):
                 end = start + len(tail)
                 if (
                     end < len(prompt)
@@ -247,7 +245,7 @@ class LocalStore:
                 ):
                     longest = tail
             if longest is not None:
-                key = (last_page, longest)
+                key = (head, longest)
                 self._states.move_to_end(key)
                 if self._file is not None:
                     self._file.touch(key, next(self._clock))
@@ -286,11 +284,11 @@ class LocalStore:
         deleted_pages = self._delete_unused_pages()
         while self._page_bytes + room > self._capacity_bytes and len(self._states) > 1:
             key, dropped = self._states.popitem(last=False)
-            last_page, tail = key
-            tails = self._tails[last_page]
+            head, tail = key
+            tails = self._tails[head]
             tails.remove(tail)
             if not tails:
-                del self._tails[last_page]
+                del self._tails[head]
             self._dereference(dropped.page_keys)
             deleted_states.append(key)
             deleted_pages += self._delete_unused_pages()

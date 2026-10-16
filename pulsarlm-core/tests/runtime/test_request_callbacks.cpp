@@ -70,14 +70,12 @@ TEST_CASE("the writer passes tokens and cycle ends to its callbacks") {
     result_writer writer = make_writer(recorded);
     pulsarlm::digest page_hash{.hi = 3, .lo = 4};
     writer.append(1);
-    writer.append(
-        pulsarlm::cycle_end{.reached = pulsarlm::state{.page_hashes = {page_hash}, .tail = {1}}, .token_count = 5}
-    );
+    writer.append(pulsarlm::cycle_end{.reached = pulsarlm::state{.head = page_hash, .tail = {1}}, .token_count = 5});
     writer.append(2);
 
     REQUIRE(recorded->tokens == token_list{1, 2});
     REQUIRE(recorded->cycle_ends.size() == 1);
-    REQUIRE(recorded->cycle_ends[0].reached.page_hashes == std::vector{page_hash});
+    REQUIRE((recorded->cycle_ends[0].reached.head == page_hash));
     REQUIRE(recorded->cycle_ends[0].reached.tail == token_list{1});
     REQUIRE(recorded->cycle_ends[0].token_count == 5);
     REQUIRE(!recorded->end);
@@ -88,11 +86,11 @@ TEST_CASE("the writer ends its callbacks once, then destroys them") {
     {
         result_writer writer = make_writer(recorded);
         pulsarlm::digest page_hash{.hi = 1, .lo = 2};
-        writer.end(pulsarlm::state{.page_hashes = {page_hash}, .tail = {5}});
+        writer.end(pulsarlm::state{.head = page_hash, .tail = {5}});
 
         REQUIRE(recorded->callbacks_destroyed);
         REQUIRE(recorded->end->has_value());
-        REQUIRE((*recorded->end)->page_hashes == std::vector{page_hash});
+        REQUIRE(((*recorded->end)->head == page_hash));
         REQUIRE((*recorded->end)->tail == token_list{5});
     }
 

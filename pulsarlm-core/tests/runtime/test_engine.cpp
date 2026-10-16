@@ -157,6 +157,11 @@ bool ended_with(const request_results& recorded, request_error error) {
     return recorded.end && !recorded.end->has_value() && recorded.end->error() == error;
 }
 
+// A state of one_layer's model whose one page is hash.
+pulsarlm::state one_page_state(const digest& hash, float density) {
+    return pulsarlm::state{.head = hash, .layers = {{.pages = {{.hash = hash, .density = density}}}}};
+}
+
 digest root() {
     return pulsarlm::make_root_digest("successor", pulsarlm::page_shapes(config(16), one_layer));
 }
@@ -187,7 +192,9 @@ TEST_CASE("a submitted request passes its tokens and its end state to its callba
 
     REQUIRE(recorded->tokens == token_list{4, 5, 6, 7});
     REQUIRE(recorded->end->has_value());
-    REQUIRE(((*recorded->end)->page_hashes == pulsarlm::make_page_digests(root(), token_list{1, 2, 3, 4}, page_size)));
+    std::vector<digest> hashes = pulsarlm::make_page_digests(root(), token_list{1, 2, 3, 4}, page_size);
+    REQUIRE(((*recorded->end)->head == hashes.back()));
+    REQUIRE(((*recorded->end)->layers == std::vector{pulsarlm::layer_sequence{.pages = {{.hash = hashes[0]}}}}));
     REQUIRE((*recorded->end)->tail == token_list{5, 6});
     REQUIRE(e.exception() == nullptr);
 }
@@ -211,15 +218,12 @@ TEST_CASE("submit rejects an invalid request without calling its callbacks") {
         std::invalid_argument
     );
     REQUIRE_THROWS_AS(
-        e.submit(
-            request{.initial_state = {.page_hashes = {digest{.hi = 1, .lo = 2}}}, .tokens = {1}},
-            record_into(recorded)
-        ),
+        e.submit(request{.initial_state = {.head = digest{.hi = 1, .lo = 2}}, .tokens = {1}}, record_into(recorded)),
         std::invalid_argument
     );
     REQUIRE_THROWS_AS(
         e.submit(
-            request{.initial_state = {.page_hashes = {digest{.hi = 1, .lo = 2}}, .density = {-1.0f}}, .tokens = {1}},
+            request{.initial_state = one_page_state(digest{.hi = 1, .lo = 2}, -1.0f), .tokens = {1}},
             record_into(recorded)
         ),
         std::invalid_argument
@@ -251,11 +255,7 @@ TEST_CASE("destroying the engine ends the requests it serves with loop_exited") 
     e.emplace(std::make_unique<successor_model>(), config(16), std::move(store));
     auto recorded = std::make_shared<request_results>();
     e->submit(
-        request{
-            .initial_state = {.page_hashes = {digest{.hi = 1, .lo = 2}}, .density = {0.0f}},
-            .tokens = {1},
-            .max_tokens = 1
-        },
+        request{.initial_state = one_page_state(digest{.hi = 1, .lo = 2}, 0.0f), .tokens = {1}, .max_tokens = 1},
         record_into(recorded)
     );
     fetch_started->wait();

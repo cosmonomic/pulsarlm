@@ -1,6 +1,6 @@
 import json
-from array import array
 import sqlite3
+import struct
 import sys
 import traceback
 from collections.abc import Callable, Iterator
@@ -11,7 +11,7 @@ from pathlib import Path
 import torch
 from torch import Tensor
 
-from pulsarlm.core.engine import State
+from pulsarlm.core.engine import ActivePage, LayerSequence, State
 
 type Page = tuple[Tensor, Tensor]
 type StateKey = tuple[bytes, tuple[int, ...]]
@@ -19,6 +19,7 @@ type SavedState = tuple[StateKey, State, list[bytes], int]
 
 DIGEST_BYTES = 16
 DENSITY_BYTES = 4
+SCHEMA_VERSION = 1
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS pages (
@@ -30,13 +31,12 @@ CREATE TABLE IF NOT EXISTS pages (
     v BLOB NOT NULL
 );
 CREATE TABLE IF NOT EXISTS states (
-    last_page BLOB NOT NULL,
+    head BLOB NOT NULL,
     tail TEXT NOT NULL,
-    page_hashes BLOB NOT NULL,
+    layers BLOB NOT NULL,
     page_keys BLOB NOT NULL,
     used INTEGER NOT NULL,
-    density BLOB NOT NULL,
-    PRIMARY KEY (last_page, tail)
+    PRIMARY KEY (head, tail)
 );
 """
 
@@ -49,12 +49,31 @@ def split_digests(joined: bytes) -> list[bytes]:
     return [joined[i : i + DIGEST_BYTES] for i in range(0, len(joined), DIGEST_BYTES)]
 
 
-def density_bytes(density: list[float]) -> bytes:
-    return array("f", density).tobytes()
+def layers_bytes(layers: list[LayerSequence]) -> bytes:
+    """Per layer, its page count as 4 little-endian bytes, its page hashes, then
+    its densities as little-endian fp32."""
+    parts = []
+    for layer in layers:
+        pages = layer.pages
+        parts.append(struct.pack("<I", len(pages)))
+        parts.extend(page.hash for page in pages)
+        parts.append(struct.pack(f"<{len(pages)}f", *(page.density for page in pages)))
+    return b"".join(parts)
 
 
-def density_from(blob: bytes) -> list[float]:
-    return array("f", blob).tolist()
+def layers_from(blob: bytes) -> list[LayerSequence]:
+    layers = []
+    offset = 0
+    while offset < len(blob):
+        (count,) = struct.unpack_from("<I", blob, offset)
+        offset += 4
+        hashes = split_digests(blob[offset : offset + count * DIGEST_BYTES])
+        offset += count * DIGEST_BYTES
+        densities = struct.unpack_from(f"<{count}f", blob, offset)
+        offset += count * DENSITY_BYTES
+        pages = [ActivePage(h, d) for h, d in zip(hashes, densities, strict=True)]
+        layers.append(LayerSequence(pages))
+    return layers
 
 
 def tail_text(tail: tuple[int, ...]) -> str:
@@ -95,20 +114,15 @@ def transaction(connection: sqlite3.Connection) -> Iterator[None]:
     connection.execute("COMMIT")
 
 
-def add_density_column(connection: sqlite3.Connection) -> None:
-    """Gives the states of a file written before states carried densities a
-    density of 0 for every page."""
-    columns = [row[1] for row in connection.execute("PRAGMA table_info(states)")]
-    if "density" in columns:
+def discard_other_schema(connection: sqlite3.Connection) -> None:
+    """Drops every page and state of a file written in another format."""
+    (version,) = connection.execute("PRAGMA user_version").fetchone()
+    if version == SCHEMA_VERSION:
         return
-    with transaction(connection):
-        connection.execute(
-            "ALTER TABLE states ADD COLUMN density BLOB NOT NULL DEFAULT x''"
-        )
-        connection.execute(
-            "UPDATE states SET density = zeroblob(length(page_hashes) / ?)",
-            (DIGEST_BYTES // DENSITY_BYTES,),
-        )
+    connection.execute("DROP TABLE IF EXISTS states")
+    connection.execute("DROP TABLE IF EXISTS pages")
+    connection.execute("VACUUM")
+    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -117,8 +131,8 @@ def connect(path: Path) -> sqlite3.Connection:
     try:
         connection.execute("PRAGMA locking_mode = EXCLUSIVE")
         connection.execute("PRAGMA journal_mode = WAL")
+        discard_other_schema(connection)
         connection.executescript(SCHEMA)
-        add_density_column(connection)
         # A write takes the exclusive lock, which EXCLUSIVE locking mode keeps until the connection closes.
         connection.execute("BEGIN EXCLUSIVE")
         connection.execute("COMMIT")
@@ -166,19 +180,14 @@ class StoreFile:
     def _load(self) -> tuple[dict[bytes, int], list[SavedState]]:
         pages = dict(self._connection.execute("SELECT key, nbytes FROM pages"))
         rows = self._connection.execute(
-            "SELECT last_page, tail, page_hashes, page_keys, used, density"
-            " FROM states ORDER BY used"
+            "SELECT head, tail, layers, page_keys, used FROM states ORDER BY used"
         )
         states = []
-        for last_page, tail, page_hashes, page_keys, used, density in rows:
+        for head, tail, layers, page_keys, used in rows:
             tokens = json.loads(tail)
-            state = State(
-                page_hashes=split_digests(page_hashes),
-                tail=tokens,
-                density=density_from(density),
-            )
+            state = State(head=head or None, layers=layers_from(layers), tail=tokens)
             states.append(
-                ((last_page, tuple(tokens)), state, split_digests(page_keys), used)
+                ((head, tuple(tokens)), state, split_digests(page_keys), used)
             )
         return pages, states
 
@@ -204,35 +213,33 @@ class StoreFile:
     def _write(
         self, key: StateKey, state: State, page_keys: list[bytes], used: int
     ) -> None:
-        last_page, tail = key
+        head, tail = key
         with transaction(self._connection):
             self._connection.execute(
-                "INSERT OR REPLACE INTO states"
-                " (last_page, tail, page_hashes, page_keys, used, density)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO states (head, tail, layers, page_keys, used)"
+                " VALUES (?, ?, ?, ?, ?)",
                 (
-                    last_page,
+                    head,
                     tail_text(tail),
-                    b"".join(state.page_hashes),
+                    layers_bytes(state.layers),
                     b"".join(page_keys),
                     used,
-                    density_bytes(state.density),
                 ),
             )
 
     def _touch(self, key: StateKey, used: int) -> None:
-        last_page, tail = key
+        head, tail = key
         with transaction(self._connection):
             self._connection.execute(
-                "UPDATE states SET used = ? WHERE last_page = ? AND tail = ?",
-                (used, last_page, tail_text(tail)),
+                "UPDATE states SET used = ? WHERE head = ? AND tail = ?",
+                (used, head, tail_text(tail)),
             )
 
     def _delete(self, state_keys: list[StateKey], page_keys: list[bytes]) -> None:
         with transaction(self._connection):
             self._connection.executemany(
-                "DELETE FROM states WHERE last_page = ? AND tail = ?",
-                [(last_page, tail_text(tail)) for last_page, tail in state_keys],
+                "DELETE FROM states WHERE head = ? AND tail = ?",
+                [(head, tail_text(tail)) for head, tail in state_keys],
             )
             self._connection.executemany(
                 "DELETE FROM pages WHERE key = ?", [(key,) for key in page_keys]
