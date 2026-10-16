@@ -20,11 +20,11 @@
 //
 // The tensor-core path runs one warp group per (sequence s, kv head g): the `group`
 // query heads sharing g occupy MMA rows 0..group-1 (rows group..15 are zero and
-// discarded), and the view is streamed one page (PAGE_SIZE keys) at a time, each key
-// rotated to its position as it is staged. Online softmax runs per query row in shared
-// memory between the two MMAs, the running output stays in the registers of the
-// warps that own its dim slabs, and pass 1 stashes every scaled score so the mass pass
-// never re-reads K. The QKᵀ/PV tiles and their fragment layout live in attn_tiles.cuh.
+// discarded), and the view is streamed a key tile (decode_key_tile keys, independent of
+// the page size) at a time, each key rotated to its position once staged. Online
+// softmax runs per query row across the CTA between the two MMAs, the running output
+// stays in the registers of the warps that own its dim slabs, and pass 1 stashes every
+// scaled score so the mass pass never re-reads K. The QKᵀ/PV tiles and their fragment layout live in attn_tiles.cuh.
 //
 // The split (flash-decode) path spreads one (s, g)'s view over nsplits CTAs:
 //   split kernel   : grid num_seqs * n_kv_heads * nsplits; each CTA runs the online
@@ -92,41 +92,59 @@ __global__ void write_kv_kernel(
     }
 }
 
+// Keys one staged tile holds: 4096 / head_dim, at least one MMA's 16, which keeps a CTA
+// within the 48 KiB of shared memory every device grants without opting in up to head
+// dim 256.
+constexpr int decode_key_tile(int head_dim) {
+    return 4096 / head_dim > 16 ? 4096 / head_dim : 16;
+}
+
 // Every tile size is a multiple of 16 bytes, which keeps each tile 16-byte aligned for
-// ldmatrix.
-template <typename scalar_t, int PAGE_SIZE, int HEAD_DIM> struct DecodeTiles {
+// ldmatrix. sQ and the ring's tiles are staged through attn::swizzled_offset.
+template <typename scalar_t, int HEAD_DIM, int NWARPS> struct DecodeTiles {
+    static constexpr int KEY_TILE = decode_key_tile(HEAD_DIM);
+    static constexpr int QKT_PARTS = attn::qkt_parts<KEY_TILE, NWARPS>();
+    static constexpr int TILE_ELEMS = KEY_TILE * HEAD_DIM;
+
     scalar_t* sQ;  // [16, HEAD_DIM]
-    scalar_t* sK;  // [PAGE_SIZE, HEAD_DIM]
-    scalar_t* sV;  // [PAGE_SIZE, HEAD_DIM]
-    scalar_t* sP;  // [16, PAGE_SIZE]
-    float* sS;  // [16, PAGE_SIZE]
+    scalar_t* ring;  // [2][K, V][KEY_TILE, HEAD_DIM]
+    scalar_t* sP;  // [16, KEY_TILE]
+    float* sS;  // [QKT_PARTS][16, KEY_TILE]
     float* Mrow;  // [16]
     float* Lrow;  // [16]
     float* row_rescale;  // [16]
     float* LSE;  // [16]
 
     static constexpr size_t bytes() {
-        return sizeof(scalar_t) * (16 * HEAD_DIM + 2 * PAGE_SIZE * HEAD_DIM + 16 * PAGE_SIZE) +
-            sizeof(float) * (16 * PAGE_SIZE + 4 * 16);
+        return sizeof(scalar_t) * (16 * HEAD_DIM + 2 * 2 * TILE_ELEMS + 16 * KEY_TILE) +
+            sizeof(float) * (QKT_PARTS * 16 * KEY_TILE + 4 * 16);
     }
 
     __device__ static DecodeTiles carve(unsigned char* base) {
         DecodeTiles tiles;
         tiles.sQ = reinterpret_cast<scalar_t*>(base);
-        tiles.sK = tiles.sQ + 16 * HEAD_DIM;
-        tiles.sV = tiles.sK + PAGE_SIZE * HEAD_DIM;
-        tiles.sP = tiles.sV + PAGE_SIZE * HEAD_DIM;
-        tiles.sS = reinterpret_cast<float*>(tiles.sP + 16 * PAGE_SIZE);
-        tiles.Mrow = tiles.sS + 16 * PAGE_SIZE;
+        tiles.ring = tiles.sQ + 16 * HEAD_DIM;
+        tiles.sP = tiles.ring + 2 * 2 * TILE_ELEMS;
+        tiles.sS = reinterpret_cast<float*>(tiles.sP + 16 * KEY_TILE);
+        tiles.Mrow = tiles.sS + QKT_PARTS * 16 * KEY_TILE;
         tiles.Lrow = tiles.Mrow + 16;
         tiles.row_rescale = tiles.Lrow + 16;
         tiles.LSE = tiles.row_rescale + 16;
         return tiles;
     }
+
+    __device__ scalar_t* keys(int slot) const {
+        return ring + slot * 2 * TILE_ELEMS;
+    }
+
+    __device__ scalar_t* values(int slot) const {
+        return ring + slot * 2 * TILE_ELEMS + TILE_ELEMS;
+    }
 };
 
-int64_t window_page_span(int64_t sliding_window, int64_t page_size) {
-    return (sliding_window - 1 + page_size - 1) / page_size + 1;
+// Tiles of tile_keys keys a sliding window can touch when it does not start on a tile boundary.
+int64_t window_tile_span(int64_t sliding_window, int64_t tile_keys) {
+    return (sliding_window - 1 + tile_keys - 1) / tile_keys + 1;
 }
 
 // Load the group's query heads into MMA rows 0..group-1 and zero the rest, and reset
@@ -142,7 +160,7 @@ begin_group(const PagedAttnParams<scalar_t>& p, int s, int g, scalar_t* sQ, floa
             const int h = g * p.group + row;
             v = p.q[(static_cast<int64_t>(s) * p.n_q_heads + h) * HEAD_DIM + col];
         }
-        sQ[i] = v;
+        sQ[attn::swizzled_offset<HEAD_DIM>(row, col)] = v;
     }
     if (tid < 16) {
         Mrow[tid] = -CUDART_INF_F;
@@ -150,14 +168,20 @@ begin_group(const PagedAttnParams<scalar_t>& p, int s, int g, scalar_t* sQ, floa
     }
 }
 
-// Online-softmax attention over view tiles [t_start, t_end) for one (seq s, kv head
-// g), keys from index first on. Tiles wholly before first are not read.
+// Online-softmax attention over view tiles [t_start, t_end) of KEY_TILE keys for one
+// (seq s, kv head g), keys from index first on. Tiles wholly before first are not read.
 // Accumulates the RAW, UNNORMALIZED state: out (this lane's tile_pv_registers share of
 // the sum of exp(scale*q.k - Mrow)*V per query row), Mrow (running row max), Lrow
 // (running denominator); the caller owns normalization and LSE. When seq_scores is
 // non-null, each scaled score is stashed to seq_scores[key * group + m] for the mass
-// pass. A tile with no keys ends the loop, so a slice past the view leaves out = 0,
-// Mrow = -inf, Lrow = 0.
+// pass. A slice past the view leaves out = 0, Mrow = -inf, Lrow = 0.
+//
+// Raw K and V tiles stream through two slots each by cp.async: a tile's keys are
+// staged once QKᵀ frees their slot, two tiles ahead, and its values once PV frees
+// theirs, one tile ahead. Each thread rotates the key pairs it copied itself once its
+// own copies land, so the barrier that follows publishes rotated keys. Pools that are
+// one tensor hold K = V, which is then read once: the rotation writes the key tile from
+// the staged values.
 template <typename scalar_t, int PAGE_SIZE, int HEAD_DIM, bool BF16, int NWARPS>
 __device__ __forceinline__ void tc_attend_tiles(
     const PagedAttnParams<scalar_t>& p,
@@ -169,119 +193,174 @@ __device__ __forceinline__ void tc_attend_tiles(
     float* __restrict__ seq_scores,
     int t_start,
     int t_end,
-    const DecodeTiles<scalar_t, PAGE_SIZE, HEAD_DIM>& tiles,
+    const DecodeTiles<scalar_t, HEAD_DIM, NWARPS>& tiles,
     float* out
 ) {
-    scalar_t* sQ = tiles.sQ;
-    scalar_t* sK = tiles.sK;
-    scalar_t* sV = tiles.sV;
+    using Tiles = DecodeTiles<scalar_t, HEAD_DIM, NWARPS>;
+    constexpr int KEY_TILE = Tiles::KEY_TILE;
+    constexpr int THREADS = NWARPS * 32;
+    constexpr int HALF = HEAD_DIM / 2;
+    static_assert(sizeof(scalar_t) == 2, "the tile staging moves 8 elements at a time");
+    constexpr int kChunkElems = 16 / sizeof(scalar_t);
+    constexpr int kPairChunks = KEY_TILE * HALF / kChunkElems;
+    // The softmax gives each of the 16 query rows ROW_LANES consecutive threads.
+    constexpr int ROW_LANES = THREADS / 16;
+    static_assert(ROW_LANES <= 32 && KEY_TILE % ROW_LANES == 0, "a row's lanes must share a warp and split the tile");
+    constexpr int kRowCols = KEY_TILE / ROW_LANES;
+
     scalar_t* sP = tiles.sP;
     float* sS = tiles.sS;
     float* Mrow = tiles.Mrow;
     float* Lrow = tiles.Lrow;
     float* row_rescale = tiles.row_rescale;
-    constexpr int HALF = HEAD_DIM / 2;
-    static_assert(sizeof(scalar_t) == 2, "the tile staging moves 8 elements at a time");
-    constexpr int kChunkElems = 16 / sizeof(scalar_t);
-    constexpr int kHalfChunks = HALF / kChunkElems;
-    constexpr int kRowChunks = HEAD_DIM / kChunkElems;
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
-    const int lane = tid & 31;
     const int32_t* seq_table = p.page_tables + static_cast<int64_t>(s) * p.max_pages;
+    const bool keys_are_values = p.k_pool == p.v_pool;
+    const int t_first = max(t_start, first / KEY_TILE);
+    const int t_last = min(t_end, (ctx_len + KEY_TILE - 1) / KEY_TILE);
 
-    for (int t = t_start; t < t_end; ++t) {
-        const int tile_base = t * PAGE_SIZE;
-        const int valid = min(PAGE_SIZE, ctx_len - tile_base);
-        if (valid <= 0) {
-            break;
-        }
-        const int before_window = max(0, first - tile_base);
-        if (before_window >= PAGE_SIZE) {
-            continue;
-        }
-        const int64_t line_base = static_cast<int64_t>(seq_table[t]) * p.page_stride + g * p.head_stride;
-        for (int c = tid; c < PAGE_SIZE * kRowChunks; c += NWARPS * 32) {
-            const int off = c / kRowChunks;
-            const int d = (c % kRowChunks) * kChunkElems;
-            const bool attended = off >= before_window && off < valid;
-            attn::cp_async_16(
-                sV + off * HEAD_DIM + d,
-                p.v_pool + line_base + off * p.token_stride + d,
-                attended ? 16 : 0
-            );
+    auto attended = [&](int key) { return key >= first && key < ctx_len; };
+    // Chunk c is the 16-byte chunks at elements d and d + HALF of one key, so the thread that copies a key's
+    // halves is the one that rotates them. Always commits a group, so a wait count means the same tiles throughout.
+    auto stage = [&](const scalar_t* pool, scalar_t* dst, int t) {
+        if (t < t_last) {
+            for (int c = tid; c < kPairChunks; c += THREADS) {
+                const int off = c / (HALF / kChunkElems);
+                const int d = (c % (HALF / kChunkElems)) * kChunkElems;
+                const int key = t * KEY_TILE + off;
+                const bool copied = attended(key);
+                const int64_t base = copied ? static_cast<int64_t>(seq_table[key / PAGE_SIZE]) * p.page_stride +
+                        g * p.head_stride + (key % PAGE_SIZE) * p.token_stride
+                                            : 0;
+                const int bytes = copied ? 16 : 0;
+                attn::cp_async_16(dst + attn::swizzled_offset<HEAD_DIM>(off, d), pool + base + d, bytes);
+                attn::cp_async_16(dst + attn::swizzled_offset<HEAD_DIM>(off, d + HALF), pool + base + d + HALF, bytes);
+            }
         }
         attn::cp_async_commit();
-        for (int c = tid; c < PAGE_SIZE * kHalfChunks; c += NWARPS * 32) {
-            const int off = c / kHalfChunks;
-            const int pair0 = (c % kHalfChunks) * kChunkElems;
+    };
+    auto stage_keys = [&](int t) { stage(p.k_pool, tiles.keys((t - t_first) % 2), keys_are_values ? t_last : t); };
+    auto stage_values = [&](int t) { stage(p.v_pool, tiles.values((t - t_first) % 2), t); };
+    // A thread's chunks all sit at the same pairs, so their RoPE turns and k_norm weights are read once.
+    static_assert(THREADS % (HALF / kChunkElems) == 0, "every chunk of a thread must hold the same pairs");
+    const int pair0 = (tid % (HALF / kChunkElems)) * kChunkElems;
+    uint64_t turns[kChunkElems];
+    float lo_weight[kChunkElems];
+    float hi_weight[kChunkElems];
+#pragma unroll
+    for (int j = 0; j < kChunkElems; ++j) {
+        turns[j] = p.rope_turns[pair0 + j];
+        lo_weight[j] = p.k_norm_weight ? p.k_norm_weight[pair0 + j] : 1.0f;
+        hi_weight[j] = p.k_norm_weight ? p.k_norm_weight[pair0 + j + HALF] : 1.0f;
+    }
+    auto rotate = [&](int t) {
+        const int slot = (t - t_first) % 2;
+        scalar_t* sK = tiles.keys(slot);
+        const scalar_t* raw = keys_are_values ? tiles.values(slot) : sK;
+        for (int c = tid; c < kPairChunks; c += THREADS) {
+            const int off = c / (HALF / kChunkElems);
+            const int key = t * KEY_TILE + off;
+            const int lo_at = attn::swizzled_offset<HEAD_DIM>(off, pair0);
+            const int hi_at = attn::swizzled_offset<HEAD_DIM>(off, pair0 + HALF);
             alignas(16) scalar_t lo[kChunkElems];
             alignas(16) scalar_t hi[kChunkElems];
-            if (off >= before_window && off < valid) {
-                const scalar_t* key = p.k_pool + line_base + off * p.token_stride;
-                *reinterpret_cast<uint4*>(lo) = *reinterpret_cast<const uint4*>(key + pair0);
-                *reinterpret_cast<uint4*>(hi) = *reinterpret_cast<const uint4*>(key + pair0 + HALF);
-                const int position = layout.position(tile_base + off);
+            *reinterpret_cast<uint4*>(lo) = make_uint4(0, 0, 0, 0);
+            *reinterpret_cast<uint4*>(hi) = make_uint4(0, 0, 0, 0);
+            if (attended(key)) {
+                *reinterpret_cast<uint4*>(lo) = *reinterpret_cast<const uint4*>(raw + lo_at);
+                *reinterpret_cast<uint4*>(hi) = *reinterpret_cast<const uint4*>(raw + hi_at);
+                const int position = layout.position(key);
 #pragma unroll
                 for (int j = 0; j < kChunkElems; ++j) {
                     float cos_a, sin_a;
-                    attn::rope_sincos_turns(position, p.rope_turns[pair0 + j], cos_a, sin_a);
+                    attn::rope_sincos_turns(position, turns[j], cos_a, sin_a);
                     const auto k = attn::rope_rotate<scalar_t>(
-                        attn::stored_key(p, lo[j], pair0 + j),
-                        attn::stored_key(p, hi[j], pair0 + j + HALF),
+                        __fmul_rn(static_cast<float>(lo[j]), lo_weight[j]),
+                        __fmul_rn(static_cast<float>(hi[j]), hi_weight[j]),
                         cos_a,
                         sin_a
                     );
                     lo[j] = k.lo;
                     hi[j] = k.hi;
                 }
-            } else {
-                *reinterpret_cast<uint4*>(lo) = make_uint4(0, 0, 0, 0);
-                *reinterpret_cast<uint4*>(hi) = make_uint4(0, 0, 0, 0);
             }
-            *reinterpret_cast<uint4*>(sK + off * HEAD_DIM + pair0) = *reinterpret_cast<const uint4*>(lo);
-            *reinterpret_cast<uint4*>(sK + off * HEAD_DIM + pair0 + HALF) = *reinterpret_cast<const uint4*>(hi);
+            *reinterpret_cast<uint4*>(sK + lo_at) = *reinterpret_cast<const uint4*>(lo);
+            *reinterpret_cast<uint4*>(sK + hi_at) = *reinterpret_cast<const uint4*>(hi);
         }
-        attn::cp_async_wait<0>();
-        __syncthreads();
+    };
 
-        attn::tile_qkt<scalar_t, PAGE_SIZE, HEAD_DIM, BF16>(sQ, sK, sS, warp, NWARPS);
+    stage_keys(t_first);
+    stage_values(t_first);
+    stage_keys(t_first + 1);
+    const int row = tid / ROW_LANES;
+    const int row_lane = tid % ROW_LANES;
+    for (int t = t_first; t < t_last; ++t) {
+        const int slot = (t - t_first) % 2;
+        const int tile_base = t * KEY_TILE;
+        // Only the keys of tile t + 1 may still be in flight.
+        attn::cp_async_wait<1>();
+        rotate(t);
+        // Also ends the previous tile's PV, which frees the value slot of tile t + 1.
         __syncthreads();
+        stage_values(t + 1);
 
-        // Warp 0's first 16 lanes own the query rows.
-        if (warp == 0 && lane < 16) {
-            const int m = lane;
-            float tmax = -CUDART_INF_F;
+        attn::tile_qkt_parts<scalar_t, KEY_TILE, HEAD_DIM, BF16, NWARPS>(tiles.sQ, tiles.keys(slot), sS, warp);
+        // Also frees this tile's key slot for tile t + 2.
+        __syncthreads();
+        stage_keys(t + 2);
+
+        // A tile in [t_first, t_last) holds an attended key, so newM is finite.
+        float scores[kRowCols];
+        float tmax = -CUDART_INF_F;
 #pragma unroll
-            for (int c = 0; c < PAGE_SIZE; ++c) {
-                if (c >= before_window && c < valid) {
-                    tmax = fmaxf(tmax, p.scale * sS[m * PAGE_SIZE + c]);
-                }
-            }
-            const float newM = fmaxf(Mrow[m], tmax);
-            const float corr = __expf(Mrow[m] - newM);  // 0 when Mrow == -inf
-            float lsum = Lrow[m] * corr;
+        for (int j = 0; j < kRowCols; ++j) {
+            const int c = j * ROW_LANES + row_lane;
+            float raw_score = 0.0f;
 #pragma unroll
-            for (int c = 0; c < PAGE_SIZE; ++c) {
-                float pw = 0.0f;
-                if (c >= before_window && c < valid) {
-                    const float ssc = p.scale * sS[m * PAGE_SIZE + c];
-                    pw = __expf(ssc - newM);
-                    if (seq_scores && m < p.group) {
-                        seq_scores[static_cast<int64_t>(tile_base + c) * p.group + m] = ssc;
-                    }
-                }
-                sP[m * PAGE_SIZE + c] = static_cast<scalar_t>(pw);
-                lsum += pw;
+            for (int part = 0; part < Tiles::QKT_PARTS; ++part) {
+                raw_score += sS[(part * 16 + row) * KEY_TILE + c];
             }
-            row_rescale[m] = corr;
-            Mrow[m] = newM;
-            Lrow[m] = lsum;
+            scores[j] = attended(tile_base + c) ? p.scale * raw_score : -CUDART_INF_F;
+            tmax = fmaxf(tmax, scores[j]);
+        }
+#pragma unroll
+        for (int lanes = ROW_LANES / 2; lanes > 0; lanes >>= 1) {
+            tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, lanes));
+        }
+        const float oldM = Mrow[row];
+        const float newM = fmaxf(oldM, tmax);
+        float lsum = 0.0f;
+#pragma unroll
+        for (int j = 0; j < kRowCols; ++j) {
+            const int c = j * ROW_LANES + row_lane;
+            const bool kept = scores[j] > -CUDART_INF_F;
+            const float pw = kept ? __expf(scores[j] - newM) : 0.0f;
+            if (kept && seq_scores && row < p.group) {
+                seq_scores[static_cast<int64_t>(tile_base + c) * p.group + row] = scores[j];
+            }
+            sP[row * KEY_TILE + c] = static_cast<scalar_t>(pw);
+            lsum += pw;
+        }
+#pragma unroll
+        for (int lanes = ROW_LANES / 2; lanes > 0; lanes >>= 1) {
+            lsum += __shfl_xor_sync(0xffffffffu, lsum, lanes);
+        }
+        if (row_lane == 0) {
+            const float corr = __expf(oldM - newM);  // 0 when oldM == -inf
+            row_rescale[row] = corr;
+            Mrow[row] = newM;
+            Lrow[row] = Lrow[row] * corr + lsum;
         }
         __syncthreads();
 
-        attn::tile_pv_registers<scalar_t, PAGE_SIZE, HEAD_DIM, BF16, NWARPS>(sP, sV, row_rescale, out, warp);
-        __syncthreads();
+        attn::tile_pv_registers<scalar_t, KEY_TILE, HEAD_DIM, BF16, NWARPS, true>(
+            sP,
+            tiles.values(slot),
+            row_rescale,
+            out,
+            warp
+        );
     }
 }
 
@@ -324,12 +403,11 @@ __global__ void __launch_bounds__(NWARPS * 32) attn_decode_tc_kernel(
     const int s = blockIdx.x / p.n_kv_heads;
     const int g = blockIdx.x % p.n_kv_heads;
     const int ctx_len = p.seqlens_k[s];
-    const int ntiles = (ctx_len + PAGE_SIZE - 1) / PAGE_SIZE;
     const int first = attn::first_key(p, ctx_len - 1);
     float* seq_scores = p.mass ? scores + s * scores_stride_seq + g * scores_stride_head : nullptr;
 
     extern __shared__ __align__(16) unsigned char shared_memory[];
-    const auto tiles = DecodeTiles<scalar_t, PAGE_SIZE, HEAD_DIM>::carve(shared_memory);
+    const auto tiles = DecodeTiles<scalar_t, HEAD_DIM, NWARPS>::carve(shared_memory);
     const float* Mrow = tiles.Mrow;
     const float* Lrow = tiles.Lrow;
     float* LSE = tiles.LSE;
@@ -345,8 +423,8 @@ __global__ void __launch_bounds__(NWARPS * 32) attn_decode_tc_kernel(
         first,
         attn::key_layout(p.rope_layout, s),
         seq_scores,
-        first / PAGE_SIZE,
-        ntiles,
+        0,
+        std::numeric_limits<int>::max(),
         tiles,
         out
     );
@@ -396,14 +474,14 @@ __global__ void __launch_bounds__(NWARPS * 32) paged_decode_split_kernel(
     float* seq_scores = p.mass ? scores + s * scores_stride_seq + g * scores_stride_head : nullptr;
 
     extern __shared__ __align__(16) unsigned char shared_memory[];
-    const auto tiles = DecodeTiles<scalar_t, PAGE_SIZE, HEAD_DIM>::carve(shared_memory);
+    const auto tiles = DecodeTiles<scalar_t, HEAD_DIM, NWARPS>::carve(shared_memory);
     const float* Mrow = tiles.Mrow;
     const float* Lrow = tiles.Lrow;
     float out[attn::pv_slabs_per_warp<HEAD_DIM, NWARPS>() * attn::kPvSlabAccums] = {};
 
     begin_group<scalar_t, HEAD_DIM, NWARPS>(p, s, g, tiles.sQ, tiles.Mrow, tiles.Lrow);
     __syncthreads();
-    const int t_start = first / PAGE_SIZE + split * tiles_per_split;
+    const int t_start = first / DecodeTiles<scalar_t, HEAD_DIM, NWARPS>::KEY_TILE + split * tiles_per_split;
     tc_attend_tiles<scalar_t, PAGE_SIZE, HEAD_DIM, BF16, NWARPS>(
         p,
         s,
@@ -505,15 +583,15 @@ __global__ void paged_decode_mass_kernel(
 }
 
 // The split count with the least estimated time: the waves of resident CTAs the launch
-// takes, each as long as a split's pages plus one page for a CTA's fixed work. At most
-// 128 splits, at least two pages per split, no empty split; ties go to fewer splits.
-int auto_splits(int64_t base_ctas, int64_t max_pages, int64_t resident_ctas) {
+// takes, each as long as a split's key tiles plus one tile for a CTA's fixed work. At
+// most 128 splits, at least two tiles per split, no empty split; ties go to fewer splits.
+int auto_splits(int64_t base_ctas, int64_t max_tiles, int64_t resident_ctas) {
     int64_t best_splits = 1;
     int64_t best_cost = std::numeric_limits<int64_t>::max();
-    for (int64_t splits = 1; splits <= std::clamp<int64_t>((max_pages + 1) / 2, 1, 128); ++splits) {
-        const int64_t pages_per_split = (max_pages + splits - 1) / splits;
-        const int64_t used = (max_pages + pages_per_split - 1) / pages_per_split;
-        const int64_t cost = (base_ctas * used + resident_ctas - 1) / resident_ctas * (pages_per_split + 1);
+    for (int64_t splits = 1; splits <= std::clamp<int64_t>((max_tiles + 1) / 2, 1, 128); ++splits) {
+        const int64_t tiles_per_split = (max_tiles + splits - 1) / splits;
+        const int64_t used = (max_tiles + tiles_per_split - 1) / tiles_per_split;
+        const int64_t cost = (base_ctas * used + resident_ctas - 1) / resident_ctas * (tiles_per_split + 1);
         if (cost < best_cost) {
             best_cost = cost;
             best_splits = used;
@@ -529,7 +607,7 @@ template <typename scalar_t, bool BF16> int64_t resident_split_ctas(const attn::
         constexpr int HD = decltype(hd_tag)::value;
         attn::dispatch_attn_tuning([&](auto row_tag) {
             constexpr int NWARPS = attn::kAttnTuningTable[decltype(row_tag)::value].decode_warps;
-            constexpr size_t smem = DecodeTiles<scalar_t, BS, HD>::bytes();
+            constexpr size_t smem = DecodeTiles<scalar_t, HD, NWARPS>::bytes();
             static const int64_t kernel_resident = [] {
                 const auto kernel = paged_decode_split_kernel<scalar_t, BS, HD, BF16, NWARPS>;
                 attn::allow_shared_memory(kernel, smem);
@@ -559,12 +637,14 @@ void launch_tc_decode(const attn::PagedAttnBatch& b, int64_t forced_splits, cuda
     const int64_t stride_head = kv_capacity * group;
     const int64_t stride_seq = b.n_kv_heads * stride_head;
 
-    const int64_t attended_pages = b.sliding_window > 0
-        ? std::min(b.max_pages, window_page_span(b.sliding_window, b.page_size))
-        : b.max_pages;
+    const int64_t key_tile = decode_key_tile(static_cast<int>(b.head_dim));
+    const int64_t view_tiles = (kv_capacity + key_tile - 1) / key_tile;
+    const int64_t attended_tiles = b.sliding_window > 0
+        ? std::min(view_tiles, window_tile_span(b.sliding_window, key_tile))
+        : view_tiles;
     const int nsplits = forced_splits > 0
         ? static_cast<int>(forced_splits)
-        : auto_splits(base_ctas, attended_pages, resident_split_ctas<scalar_t, BF16>(b));
+        : auto_splits(base_ctas, attended_tiles, resident_split_ctas<scalar_t, BF16>(b));
     const bool split = forced_splits > 0 || nsplits > 1;
 
     if (!split) {
@@ -573,7 +653,7 @@ void launch_tc_decode(const attn::PagedAttnBatch& b, int64_t forced_splits, cuda
             constexpr int HD = decltype(hd_tag)::value;
             attn::dispatch_attn_tuning([&](auto row_tag) {
                 constexpr int NWARPS = attn::kAttnTuningTable[decltype(row_tag)::value].decode_warps;
-                constexpr size_t smem = DecodeTiles<scalar_t, BS, HD>::bytes();
+                constexpr size_t smem = DecodeTiles<scalar_t, HD, NWARPS>::bytes();
                 const auto kernel = attn_decode_tc_kernel<scalar_t, BS, HD, BF16, NWARPS>;
                 attn::allow_shared_memory(kernel, smem);
                 kernel<<<static_cast<int>(base_ctas), NWARPS * 32, smem, stream>>>(
@@ -587,7 +667,7 @@ void launch_tc_decode(const attn::PagedAttnBatch& b, int64_t forced_splits, cuda
         return;
     }
 
-    const int tiles_per_split = static_cast<int>((attended_pages + nsplits - 1) / nsplits);
+    const int tiles_per_split = static_cast<int>((attended_tiles + nsplits - 1) / nsplits);
     auto o_partial = at::empty({b.num_seqs, b.n_kv_heads, nsplits, group, b.head_dim}, fopts);
     auto m_partial = at::empty({b.num_seqs, b.n_kv_heads, nsplits, group}, fopts);
     auto l_partial = at::empty({b.num_seqs, b.n_kv_heads, nsplits, group}, fopts);
@@ -601,7 +681,7 @@ void launch_tc_decode(const attn::PagedAttnBatch& b, int64_t forced_splits, cuda
         constexpr int HD = decltype(hd_tag)::value;
         attn::dispatch_attn_tuning([&](auto row_tag) {
             constexpr int NWARPS = attn::kAttnTuningTable[decltype(row_tag)::value].decode_warps;
-            constexpr size_t smem = DecodeTiles<scalar_t, BS, HD>::bytes();
+            constexpr size_t smem = DecodeTiles<scalar_t, HD, NWARPS>::bytes();
             const auto kernel = paged_decode_split_kernel<scalar_t, BS, HD, BF16, NWARPS>;
             attn::allow_shared_memory(kernel, smem);
             kernel<<<static_cast<int>(base_ctas * nsplits), NWARPS * 32, smem, stream>>>(
@@ -643,10 +723,11 @@ void launch_tc_decode(const attn::PagedAttnBatch& b, int64_t forced_splits, cuda
 
 bool attn::decode_fits(int64_t page_size, int64_t head_dim) {
     bool fits = false;
-    attn::dispatch_page_head("attn_decode", page_size, head_dim, [&](auto bs_tag, auto hd_tag) {
-        fits = attn::fits_shared_memory(
-            DecodeTiles<at::Half, decltype(bs_tag)::value, decltype(hd_tag)::value>::bytes()
-        );
+    attn::dispatch_page_head("attn_decode", page_size, head_dim, [&](auto, auto hd_tag) {
+        attn::dispatch_attn_tuning([&](auto row_tag) {
+            constexpr int NWARPS = attn::kAttnTuningTable[decltype(row_tag)::value].decode_warps;
+            fits = attn::fits_shared_memory(DecodeTiles<at::Half, decltype(hd_tag)::value, NWARPS>::bytes());
+        });
     });
     return fits;
 }

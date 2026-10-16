@@ -111,6 +111,51 @@ __device__ __forceinline__ void tile_qkt(const scalar_t* sQ, const scalar_t* sK,
     }
 }
 
+// Head-dim ranges tile_qkt_parts splits QKᵀ into: one when the tile's 8-key subtiles
+// cover every warp, else as many as it takes to give each warp a (subtile, range) pair.
+template <int KEY_TILE, int NWARPS> __host__ __device__ constexpr int qkt_parts() {
+    return KEY_TILE / 8 >= NWARPS ? 1 : NWARPS / (KEY_TILE / 8);
+}
+
+// QKᵀ over the loaded tile with every warp busy: sS[part][m][n] = sum over part's
+// range of d of sQ[m][d] * sK[n][d] (raw, unscaled), each part a [16][KEY_TILE] block;
+// the caller sums the parts. sQ and sK are staged through swizzled_offset.
+template <typename scalar_t, int KEY_TILE, int HEAD_DIM, bool BF16, int NWARPS>
+__device__ __forceinline__ void tile_qkt_parts(const scalar_t* sQ, const scalar_t* sK, float* sS, int warp) {
+    constexpr int NSUB = KEY_TILE / 8;
+    constexpr int PARTS = qkt_parts<KEY_TILE, NWARPS>();
+    constexpr int PART_DC = HEAD_DIM / 16 / PARTS;
+    static_assert(PARTS == 1 || NSUB * PARTS == NWARPS, "warps and subtiles must be powers of two");
+    static_assert(PART_DC * PARTS * 16 == HEAD_DIM, "the head dim must split evenly into the parts");
+
+    const int lane = threadIdx.x & 31;
+    const int gid = lane >> 2, tg = lane & 3;
+    const int quad = lane >> 3, rin = lane & 7;
+    const int arow = (quad & 1) * 8 + rin, acol = (quad >> 1) * 8;
+    const int part = PARTS == 1 ? 0 : warp / NSUB;
+    float* part_scores = sS + part * 16 * KEY_TILE;
+
+    for (int ns = PARTS == 1 ? warp : warp % NSUB; ns < NSUB; ns += PARTS == 1 ? NWARPS : NSUB) {
+        const int kc = ns >> 1;
+        const int within = ns & 1;
+        float acc[4] = {0, 0, 0, 0};
+#pragma unroll
+        for (int i = 0; i < PART_DC; ++i) {
+            const int dc = part * PART_DC + i;
+            uint32_t ra[4], kf[4];
+            mma::ldmatrix_x4(ra, &sQ[swizzled_offset<HEAD_DIM>(arow, dc * 16 + acol)]);
+            mma::ldmatrix_x4(kf, &sK[swizzled_offset<HEAD_DIM>(kc * 16 + arow, dc * 16 + acol)]);
+            uint32_t b[2] = {within ? kf[1] : kf[0], within ? kf[3] : kf[2]};
+            mma::mma_m16n8k16<BF16>(acc, ra, b, acc);
+        }
+        const int cb = ns * 8;
+        part_scores[gid * KEY_TILE + cb + tg * 2 + 0] = acc[0];
+        part_scores[gid * KEY_TILE + cb + tg * 2 + 1] = acc[1];
+        part_scores[(gid + 8) * KEY_TILE + cb + tg * 2 + 0] = acc[2];
+        part_scores[(gid + 8) * KEY_TILE + cb + tg * 2 + 1] = acc[3];
+    }
+}
+
 // PV over the loaded tile with the running output held in registers:
 // out = out * row_rescale[row] + sum_n sP[m][n] * sV[n][d]. Warp w owns dim slabs
 // w, w + NWARPS, ...; `out` holds kPvSlabAccums entries per slab, slabs in

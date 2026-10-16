@@ -113,24 +113,12 @@ rope_sincos_turns(int position, uint64_t turns_per_position, float& cos_out, flo
 
     float sine, cosine;
     __sincosf(static_cast<float>(remainder) * kRadiansPerUnit, &sine, &cosine);
-    switch (quadrant & 3) {
-    case 0:
-        cos_out = cosine;
-        sin_out = sine;
-        break;
-    case 1:
-        cos_out = -sine;
-        sin_out = cosine;
-        break;
-    case 2:
-        cos_out = -cosine;
-        sin_out = -sine;
-        break;
-    default:
-        cos_out = sine;
-        sin_out = -cosine;
-        break;
-    }
+    // Quadrants 1 and 3 swap cosine and sine; cos is negative in quadrants 1 and 2, sin in 2 and 3.
+    const bool swapped = quadrant & 1;
+    const uint32_t cos_sign = ((quadrant + 1) & 2) << 30;
+    const uint32_t sin_sign = (quadrant & 2) << 30;
+    cos_out = __uint_as_float(__float_as_uint(swapped ? sine : cosine) ^ cos_sign);
+    sin_out = __uint_as_float(__float_as_uint(swapped ? cosine : sine) ^ sin_sign);
 }
 
 template <typename scalar_t> struct RotatedPair {
