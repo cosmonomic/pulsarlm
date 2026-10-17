@@ -70,6 +70,16 @@ qwen3_5_layer_type qwen3_5_layer(const std::string& name) {
     throw std::invalid_argument("unknown Qwen3.5 layer type " + name);
 }
 
+qwen4_exp_layer_type qwen4_exp_layer(const std::string& name) {
+    if (name == "linear_attention") {
+        return qwen4_exp_layer_type::linear_attention;
+    }
+    if (name == "indexed_attention") {
+        return qwen4_exp_layer_type::indexed_attention;
+    }
+    throw std::invalid_argument("unknown Qwen4-Exp layer type " + name);
+}
+
 gate_activation activation(const std::string& name) {
     if (name == "silu") {
         return gate_activation::silu;
@@ -524,10 +534,14 @@ PYBIND11_MODULE(pulsarlm_core, m) {
                         std::int64_t hc_count,
                         std::vector<std::int64_t> ple_layers,
                         std::int64_t ngram_size,
-                        std::int64_t eos_token_id) {
-                std::vector<qwen3_5_layer_type> types;
+                        std::int64_t eos_token_id,
+                        std::int64_t indexer_n_heads,
+                        std::int64_t indexer_head_dim,
+                        std::int64_t indexer_budget,
+                        std::int64_t indexer_compress_ratio) {
+                std::vector<qwen4_exp_layer_type> types;
                 for (const std::string& name : layer_types) {
-                    types.push_back(qwen3_5_layer(name));
+                    types.push_back(qwen4_exp_layer(name));
                 }
                 return qwen4_exp_config{
                     .vocab_size = vocab_size,
@@ -550,6 +564,10 @@ PYBIND11_MODULE(pulsarlm_core, m) {
                     .ple_layers = std::move(ple_layers),
                     .ngram_size = ngram_size,
                     .eos_token_id = eos_token_id,
+                    .indexer_n_heads = indexer_n_heads,
+                    .indexer_head_dim = indexer_head_dim,
+                    .indexer_budget = indexer_budget,
+                    .indexer_compress_ratio = indexer_compress_ratio,
                 };
             }),
             py::kw_only(),
@@ -572,9 +590,25 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "hc_count"_a,
             "ple_layers"_a,
             "ngram_size"_a,
-            "eos_token_id"_a
+            "eos_token_id"_a,
+            "indexer_n_heads"_a,
+            "indexer_head_dim"_a,
+            "indexer_budget"_a,
+            "indexer_compress_ratio"_a
         )
         .def_readonly("ple_layers", &qwen4_exp_config::ple_layers)
+        .def_property_readonly(
+            "layer_types",
+            [](const qwen4_exp_config& c) {
+                std::vector<std::string> names;
+                for (qwen4_exp_layer_type type : c.layer_types) {
+                    names.push_back(
+                        type == qwen4_exp_layer_type::linear_attention ? "linear_attention" : "indexed_attention"
+                    );
+                }
+                return names;
+            }
+        )
         .def_readonly("eos_token_id", &qwen4_exp_config::eos_token_id);
 
     py::class_<request_handle>(m, "Request").def("take", &take_to_python).def("cancel", &request_handle::cancel);

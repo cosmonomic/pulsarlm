@@ -1,7 +1,6 @@
 #pragma once
 
 #include "pulsarlm/model/interface.hpp"
-#include "pulsarlm/model/qwen3_5.hpp"
 #include "pulsarlm/ops.hpp"
 #include "pulsarlm/rope.hpp"
 
@@ -15,20 +14,24 @@
 #include <string>
 #include <vector>
 
-// Qwen4-Exp text decoder (qwen4_exp), over the paged CUDA ops: Qwen3.5's Gated DeltaNet and gated full-attention
+// Qwen4-Exp text decoder (qwen4_exp), over the paged CUDA ops: Qwen3.5's Gated DeltaNet layers and indexed attention
 // layers, each followed by qwen3_5_moe's sparse block, on hc_count residual streams mixed into each sublayer's input
 // and injected back from its output, with hashed n-gram embeddings (PLE) added to the streams before the ple_layers.
-// The full-attention layers attend every key, which is QSA's selection while a query sees at most its budget of
-// complete blocks. Weights carry Hugging Face's names under model.language_model., the untied head lm_head.weight, and
+// An indexed attention layer is Qwen3.5's gated attention over the keys QSA selects: each query's top
+// indexer_budget / indexer_compress_ratio complete blocks of indexer_compress_ratio view keys, scored by its indexer
+// heads against the RMSNorm of each block's mean raw index key roped at the block's first key, and the incomplete
+// block holding it. Weights carry Hugging Face's names under model.language_model., the untied head lm_head.weight, and
 // each PLE layer's n-gram table its shards ple.ple_embedding.ngram_embedding.shard_<i>.weight.
 
 namespace pulsarlm {
 
-// Hugging Face's text config, its indexed_attention layers full_attention. ple_layers are zero-indexed.
+enum class qwen4_exp_layer_type { linear_attention, indexed_attention };
+
+// Hugging Face's text config. ple_layers are zero-indexed.
 struct qwen4_exp_config {
     std::int64_t vocab_size;
     std::int64_t hidden_size;
-    std::vector<qwen3_5_layer_type> layer_types;
+    std::vector<qwen4_exp_layer_type> layer_types;
     std::int64_t n_heads;
     std::int64_t n_kv_heads;
     std::int64_t head_dim;
@@ -46,9 +49,14 @@ struct qwen4_exp_config {
     std::vector<std::int64_t> ple_layers;
     std::int64_t ngram_size;
     std::int64_t eos_token_id;
+    std::int64_t indexer_n_heads;
+    std::int64_t indexer_head_dim;
+    std::int64_t indexer_budget;
+    std::int64_t indexer_compress_ratio;
 };
 
-// A Gated DeltaNet layer keeps Qwen3.5's two recurrent KV layers. A PLE layer then keeps two more: its convolution's
+// An indexed attention layer's KV layer also keeps each token's raw index key. A Gated DeltaNet layer keeps Qwen3.5's two
+// recurrent KV layers. A PLE layer then keeps two more: its convolution's
 // last (kernel - 1) * ngram_size inputs, [hc_count * hidden, (kernel - 1) * ngram_size] in the weights' dtype, and the
 // last ngram_size - 1 tokens, int64, each XOR eos_token_id so that a zeroed line holds EOS.
 class Qwen4ExpModel : public Model {
@@ -60,6 +68,9 @@ class Qwen4ExpModel : public Model {
         at::Tensor o_proj;
         at::Tensor q_norm;  // fp32 1 + weight
         at::Tensor k_norm;
+        at::Tensor index_qk_proj;  // [(indexer_n_heads + 1) * indexer_head_dim, hidden], the query heads then the key
+        at::Tensor index_q_norm;  // fp32 1 + weight
+        at::Tensor index_k_norm;
     };
 
     struct DeltaNetWeights {
@@ -125,6 +136,8 @@ class Qwen4ExpModel : public Model {
     qwen4_exp_config config;
     std::int64_t n_layers;
     rope_parameters rope;
+    // fp32 [rotary_dim / 2]: Hugging Face's RoPE frequencies, which the indexer rotates its queries and blocks by.
+    at::Tensor index_inv_freq;
     // The first KV layer of each layer.
     std::vector<std::size_t> kv_layer_of;
     std::vector<kv_layer> kv_specs;
@@ -133,7 +146,20 @@ class Qwen4ExpModel : public Model {
     MixerWeights hyper_connection_mixer;
     std::vector<LayerWeights> layers;
 
-    bool full_attention(std::int64_t layer) const;
+    bool indexed_attention(std::int64_t layer) const;
+    // x [..., indexer_head_dim] with its first rotary_dim dims rotated as Hugging Face rotates them, at positions
+    // [...] (x's leading dims, or all but its last two).
+    at::Tensor index_rope(const at::Tensor& x, const at::Tensor& positions) const;
+    // int32 [ntok, words]: each query's selected blocks, as attn_indexed_cuda reads them.
+    at::Tensor selected_blocks(
+        const AttentionWeights& w,
+        const at::Tensor& queries,
+        const kv& lines,
+        const at::Tensor& page_tables,
+        const at::Tensor& cu_seqlens_q,
+        const at::Tensor& key_counts,
+        const at::Tensor& rope_layout
+    ) const;
     at::Tensor stream_norm(const at::Tensor& x, const at::Tensor& weight) const;
     // The mix of the normed streams [ntok, hc_count * hidden] a sublayer or the head reads.
     at::Tensor mixed_streams(const at::Tensor& normed, const MixerWeights& w) const;

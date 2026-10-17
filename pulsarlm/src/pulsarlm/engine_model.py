@@ -21,6 +21,7 @@ from pulsarlm.core.engine import (
 SLIDING = "sliding_attention"
 QWEN3_5_MOE = ("qwen3_5_moe", "qwen3_5_moe_text")
 FULL = "full_attention"
+INDEXED = "indexed_attention"
 
 
 def gemma4_layer_types(text: dict) -> list[str]:
@@ -142,9 +143,8 @@ def qwen3_5_moe_config(text: dict) -> Qwen3_5MoeConfig:
 
 
 def qwen4_exp_config(text: dict) -> Qwen4ExpConfig:
-    """Attends every key of the indexed attention layers, which is QSA's
-    selection only while a query sees at most indexer_budget tokens in complete
-    blocks."""
+    """The checkpoint's full_attention layers are indexed attention layers, as
+    transformers reads them."""
     if text.get("attention_bias"):
         raise PulsarLMModelLoadingError("unsupported attention bias")
     if text.get("hidden_act", "silu") != "silu":
@@ -161,8 +161,7 @@ def qwen4_exp_config(text: dict) -> Qwen4ExpConfig:
         vocab_size=text["vocab_size"],
         hidden_size=text["hidden_size"],
         layer_types=[
-            FULL if layer == "indexed_attention" else layer
-            for layer in qwen3_5_layer_types(text)
+            INDEXED if layer == FULL else layer for layer in qwen3_5_layer_types(text)
         ],
         n_heads=text["num_attention_heads"],
         n_kv_heads=text["num_key_value_heads"],
@@ -187,6 +186,10 @@ def qwen4_exp_config(text: dict) -> Qwen4ExpConfig:
         ple_layers=[layer - 1 for layer in text.get("ple_layer_ids") or []],
         ngram_size=text["ngram_size"],
         eos_token_id=eos[0] if isinstance(eos, list) else eos,
+        indexer_n_heads=text["indexer_n_heads"],
+        indexer_head_dim=text["indexer_head_dim"],
+        indexer_budget=text["indexer_budget"],
+        indexer_compress_ratio=text["indexer_compress_ratio"],
     )
 
 
@@ -234,7 +237,7 @@ def dense_config(architecture: str, text: dict) -> ModelConfig:
 
 def engine_model(
     cfg: PulsarLMModelConfig,
-) -> ModelConfig | Gemma4Config | Qwen3_5Config | Qwen3_5MoeConfig:
+) -> ModelConfig | Gemma4Config | Qwen3_5Config | Qwen3_5MoeConfig | Qwen4ExpConfig:
     """Measures attention mass on the full-attention layers of the top quarter."""
     if cfg.architecture in GEMMA4:
         return gemma4_config(cfg.architecture, cfg.text)
@@ -243,7 +246,5 @@ def engine_model(
     if cfg.architecture in QWEN3_5 + QWEN3_5_TEXT:
         return qwen3_5_config(cfg.text)
     if cfg.architecture in QWEN4_EXP:
-        raise PulsarLMModelLoadingError(
-            "qwen4_exp's sparse attention is not implemented"
-        )
+        return qwen4_exp_config(cfg.text)
     return dense_config(cfg.architecture, cfg.text)

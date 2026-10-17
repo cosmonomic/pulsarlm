@@ -12,12 +12,13 @@
 #include <vector>
 
 // Qwen4ExpModel's paged forward against a dense ATen Qwen4-Exp written from Hugging Face's code, with the delta rule
-// run token by token, the experts one by one and the n-gram ids hashed on the host: chunked prefill then decode,
-// checking the logits and the lines of every recurrent KV layer at the end and at the newest page end.
+// run token by token, the experts one by one, QSA's blocks selected query by query and the n-gram ids hashed on the
+// host: chunked prefill then decode, checking the logits and the lines of every recurrent KV layer at the end and at the
+// newest page end.
 
 namespace {
 
-using pulsarlm::qwen3_5_layer_type;
+using pulsarlm::qwen4_exp_layer_type;
 
 constexpr std::int64_t hidden = 64;
 constexpr std::int64_t vocab = 300;
@@ -48,13 +49,16 @@ const std::vector<std::int64_t> layer_multipliers{1000003, 999983, 12345679};
 constexpr std::int64_t ngram_rows = 430;
 constexpr std::int64_t ngram_dim = 16;
 constexpr std::int64_t ngram_shards = 2;
+constexpr std::int64_t indexer_heads = 4;
+constexpr std::int64_t indexer_dim = 32;
+constexpr std::int64_t compress_ratio = 4;
 constexpr double rms_eps = 1e-6;
 constexpr std::int64_t page_size = 16;
-const std::vector<qwen3_5_layer_type> layer_types{
-    qwen3_5_layer_type::linear_attention,
-    qwen3_5_layer_type::linear_attention,
-    qwen3_5_layer_type::full_attention,
-    qwen3_5_layer_type::linear_attention,
+const std::vector<qwen4_exp_layer_type> layer_types{
+    qwen4_exp_layer_type::linear_attention,
+    qwen4_exp_layer_type::linear_attention,
+    qwen4_exp_layer_type::indexed_attention,
+    qwen4_exp_layer_type::linear_attention,
 };
 const std::vector<std::int32_t> view_lines{3, 0, 5, 1};
 constexpr std::int32_t running_line = 2;
@@ -71,8 +75,8 @@ at::Tensor int32_cuda(const std::vector<std::int32_t>& values) {
     return at::tensor(values, at::dtype(at::kInt)).to(at::kCUDA);
 }
 
-bool full(std::size_t layer) {
-    return layer_types[layer] == qwen3_5_layer_type::full_attention;
+bool indexed(std::size_t layer) {
+    return layer_types[layer] == qwen4_exp_layer_type::indexed_attention;
 }
 
 std::vector<std::int64_t> head_offsets() {
@@ -117,7 +121,11 @@ struct weights {
             add(l + "mlp.shared_expert.up_proj.weight", projection(shared_intermediate, hidden));
             add(l + "mlp.shared_expert.down_proj.weight", projection(hidden, shared_intermediate));
             add(l + "mlp.shared_expert_gate.weight", projection(1, hidden));
-            if (full(layer)) {
+            if (indexed(layer)) {
+                add(l + "self_attn.indexer.index_qk_proj.weight",
+                    projection((indexer_heads + 1) * indexer_dim, hidden));
+                add(l + "self_attn.indexer.q_layernorm.weight", norm(indexer_dim));
+                add(l + "self_attn.indexer.k_layernorm.weight", norm(indexer_dim));
                 add(l + "self_attn.q_proj.weight", projection(2 * n_heads * head_dim, hidden));
                 add(l + "self_attn.k_proj.weight", projection(n_kv_heads * head_dim, hidden));
                 add(l + "self_attn.v_proj.weight", projection(n_kv_heads * head_dim, hidden));
@@ -275,7 +283,53 @@ at::Tensor deltanet(const weights& w, std::size_t layer, const at::Tensor& h, de
     return at::linear(gated, w.layer(layer, "linear_attn.out_proj.weight"));
 }
 
-at::Tensor attention(const weights& w, std::size_t layer, const at::Tensor& h) {
+// Hugging Face's partial RoPE in the indexer: the first rotary_dim dims rotate among themselves, its frequencies and
+// angles in fp32. x is [..., indexer_dim], positions x's leading dims or all but its last two.
+at::Tensor index_rope(const at::Tensor& x, const at::Tensor& positions) {
+    auto inv_freq = 1.0 / at::pow(rope_theta, at::arange(0, rotary_dim, 2, at::kLong).to(at::kFloat) / rotary_dim);
+    auto freqs = positions.to(at::kFloat).unsqueeze(-1) * inv_freq.to(at::kCUDA);
+    auto angles = at::cat({freqs, freqs}, -1);
+    if (x.dim() > angles.dim()) {
+        angles = angles.unsqueeze(-2);
+    }
+    at::Tensor rotated = x.narrow(-1, 0, rotary_dim);
+    rotated = rotated * angles.cos() + rotate_half(rotated) * angles.sin();
+    return at::cat({rotated, x.narrow(-1, rotary_dim, x.size(-1) - rotary_dim)}, -1);
+}
+
+// Hugging Face's QSA indexer, query by query: [n, n] whether query i attends key j. The lower block wins among equal
+// scores, where torch.topk leaves the order unspecified.
+at::Tensor qsa_selection(const weights& w, std::size_t layer, const at::Tensor& h, std::int64_t budget) {
+    const std::int64_t n = h.size(0);
+    auto qk = at::linear(h, w.layer(layer, "self_attn.indexer.index_qk_proj.weight"));
+    auto q = rms_norm(
+        qk.narrow(1, 0, indexer_heads * indexer_dim).view({n, indexer_heads, indexer_dim}),
+        w.layer(layer, "self_attn.indexer.q_layernorm.weight")
+    );
+    q = index_rope(q, at::arange(n, cuda(at::kLong)));
+    auto raw_keys = qk.narrow(1, indexer_heads * indexer_dim, indexer_dim);
+    auto attends = at::zeros({n, n}, cuda(at::kBool));
+    for (std::int64_t i = 0; i < n; i++) {
+        const std::int64_t complete = (i + 1) / compress_ratio;
+        if (complete > 0) {
+            auto pooled = raw_keys.narrow(0, 0, complete * compress_ratio)
+                              .view({complete, compress_ratio, indexer_dim})
+                              .mean(1);
+            pooled = rms_norm(pooled, w.layer(layer, "self_attn.indexer.k_layernorm.weight"));
+            auto keys = index_rope(pooled, at::arange(complete, cuda(at::kLong)) * compress_ratio);
+            auto scores = at::relu(at::matmul(q[i], keys.t())).sum(0) / std::sqrt(static_cast<double>(indexer_dim));
+            auto [sorted, order] = at::sort(scores, /*stable=*/true, /*dim=*/0, /*descending=*/true);
+            auto top = order.narrow(0, 0, std::min(budget / compress_ratio, complete)).cpu();
+            for (std::int64_t t = 0; t < top.size(0); t++) {
+                attends[i].narrow(0, top[t].item<std::int64_t>() * compress_ratio, compress_ratio).fill_(true);
+            }
+        }
+        attends[i].narrow(0, complete * compress_ratio, i + 1 - complete * compress_ratio).fill_(true);
+    }
+    return attends;
+}
+
+at::Tensor attention(const weights& w, std::size_t layer, const at::Tensor& h, std::int64_t budget) {
     const std::int64_t n = h.size(0);
     auto query_gate = at::linear(h, w.layer(layer, "self_attn.q_proj.weight")).view({n, n_heads, 2 * head_dim});
     auto q = rms_norm(query_gate.narrow(-1, 0, head_dim), w.layer(layer, "self_attn.q_norm.weight"));
@@ -289,9 +343,9 @@ at::Tensor attention(const weights& w, std::size_t layer, const at::Tensor& h) {
     auto q_heads = rope(q).transpose(0, 1);
     auto k_heads = rope(k).repeat_interleave(group, 1).transpose(0, 1);
     auto v_heads = v.repeat_interleave(group, 1).transpose(0, 1);
-    auto causal = at::ones({n, n}, cuda(at::kBool)).tril();
+    auto attends = qsa_selection(w, layer, h, budget);
     auto scores = at::matmul(q_heads, k_heads.transpose(1, 2)) / std::sqrt(static_cast<double>(head_dim));
-    auto probabilities = at::softmax(scores.masked_fill(causal.logical_not(), -INFINITY), -1);
+    auto probabilities = at::softmax(scores.masked_fill(attends.logical_not(), -INFINITY), -1);
     auto o = at::matmul(probabilities, v_heads).transpose(0, 1).reshape({n, n_heads * head_dim});
     return at::linear(o * at::sigmoid(gate), w.layer(layer, "self_attn.o_proj.weight"));
 }
@@ -387,7 +441,8 @@ at::Tensor ple(const weights& w, const at::Tensor& x, const std::vector<std::int
     return gated + convolved;
 }
 
-dense_output dense_forward(const weights& w, const std::vector<std::int64_t>& tokens, std::int64_t top_k) {
+dense_output
+dense_forward(const weights& w, const std::vector<std::int64_t>& tokens, std::int64_t top_k, std::int64_t budget) {
     dense_output out{
         .states = std::vector<at::Tensor>(layer_types.size()),
         .conv_inputs = std::vector<at::Tensor>(layer_types.size()),
@@ -400,7 +455,11 @@ dense_output dense_forward(const weights& w, const std::vector<std::int64_t>& to
             x = x + ple(w, x, tokens, out);
         }
         mixed_input mixed = mix(w, l + "attn_hyper_connection.", x);
-        x = inject(x, full(layer) ? attention(w, layer, mixed.input) : deltanet(w, layer, mixed.input, out), mixed);
+        x = inject(
+            x,
+            indexed(layer) ? attention(w, layer, mixed.input, budget) : deltanet(w, layer, mixed.input, out),
+            mixed
+        );
         mixed = mix(w, l + "mlp_hyper_connection.", x);
         x = inject(x, sparse_moe(w, layer, mixed.input, top_k), mixed);
     }
@@ -408,7 +467,7 @@ dense_output dense_forward(const weights& w, const std::vector<std::int64_t>& to
     return out;
 }
 
-pulsarlm::qwen4_exp_config model_config(std::int64_t experts_per_token) {
+pulsarlm::qwen4_exp_config model_config(std::int64_t experts_per_token, std::int64_t budget) {
     return {
         .vocab_size = vocab,
         .hidden_size = hidden,
@@ -430,6 +489,10 @@ pulsarlm::qwen4_exp_config model_config(std::int64_t experts_per_token) {
         .ple_layers = {ple_layer},
         .ngram_size = ngram_size,
         .eos_token_id = eos,
+        .indexer_n_heads = indexer_heads,
+        .indexer_head_dim = indexer_dim,
+        .indexer_budget = budget,
+        .indexer_compress_ratio = compress_ratio,
     };
 }
 
@@ -471,9 +534,9 @@ double max_relative_error(const at::Tensor& got, const at::Tensor& expected) {
     return ((got.to(at::kFloat) - expected).abs().max() / expected.abs().max()).item<double>();
 }
 
-void check_against_dense(at::ScalarType dtype, double tolerance, std::int64_t experts_per_token) {
+void check_against_dense(at::ScalarType dtype, double tolerance, std::int64_t experts_per_token, std::int64_t budget) {
     weights w(dtype);
-    pulsarlm::Qwen4ExpModel model(model_config(experts_per_token), w.named);
+    pulsarlm::Qwen4ExpModel model(model_config(experts_per_token, budget), w.named);
     std::vector<pulsarlm::kv_layer> specs = model.kv_layers();
     REQUIRE(specs.size() == 9);
     std::vector<pulsarlm::kv> kv;
@@ -488,6 +551,7 @@ void check_against_dense(at::ScalarType dtype, double tolerance, std::int64_t ex
                 pulsarlm::kv{
                     .k = at::zeros({n_lines, page_size, n_kv_heads, head_dim}, cuda(dtype)),
                     .v = at::zeros({n_lines, page_size, n_kv_heads, head_dim}, cuda(dtype)),
+                    .index_keys = at::zeros({n_lines, page_size, indexer_dim}, cuda(dtype)),
                 }
             );
         }
@@ -502,7 +566,7 @@ void check_against_dense(at::ScalarType dtype, double tolerance, std::int64_t ex
         host_tokens.data_ptr<std::int64_t>(),
         host_tokens.data_ptr<std::int64_t>() + n_tokens
     );
-    dense_output dense = dense_forward(w, token_ids, experts_per_token);
+    dense_output dense = dense_forward(w, token_ids, experts_per_token, budget);
 
     struct chunk {
         std::int64_t first;
@@ -522,7 +586,7 @@ void check_against_dense(at::ScalarType dtype, double tolerance, std::int64_t ex
     std::size_t kv_index = 0;
     for (std::size_t layer = 0; layer < layer_types.size(); layer++) {
         INFO("layer " << layer);
-        if (full(layer)) {
+        if (indexed(layer)) {
             kv_index++;
             continue;
         }
@@ -564,26 +628,29 @@ TEST_CASE("Qwen4-Exp kv_layers add a PLE layer's convolution and token lines", "
         SKIP("no CUDA device");
     }
     weights w(at::kFloat);
-    pulsarlm::Qwen4ExpModel model(model_config(2), w.named);
+    pulsarlm::Qwen4ExpModel model(model_config(2, 8), w.named);
     std::vector<pulsarlm::kv_layer> specs = model.kv_layers();
     REQUIRE(specs.size() == 9);
     CHECK(specs[4].state->sizes == std::vector<std::int64_t>{hc * hidden, ple_history});
     CHECK(specs[5].state->sizes == std::vector<std::int64_t>{ngram_size - 1});
     CHECK(specs[5].state->dtype == at::kLong);
     CHECK(!specs[6].state);
+    CHECK(specs[6].index_head_dim == indexer_dim);
 }
 
+// A budget of 2 blocks, so that QSA selects from the 12 complete blocks the last queries see.
 TEST_CASE("Qwen4-Exp matches a dense forward in fp32", "[model][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
-    check_against_dense(at::kFloat, 1e-4, 2);
+    check_against_dense(at::kFloat, 1e-4, 2, 8);
 }
 
-// A token's top experts change with bf16's rounding of its router logits, so in bf16 every token takes every expert.
+// A token's top experts and top blocks change with bf16's rounding of its router logits and block scores, so in bf16
+// every token takes every expert and every block.
 TEST_CASE("Qwen4-Exp matches a dense forward in bf16", "[model][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
-    check_against_dense(at::kBFloat16, 5e-2, n_experts);
+    check_against_dense(at::kBFloat16, 5e-2, n_experts, n_tokens * compress_ratio);
 }

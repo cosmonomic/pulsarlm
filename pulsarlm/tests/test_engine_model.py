@@ -6,8 +6,9 @@ from pulsarlm.core.engine import (
     ModelConfig,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
+    Qwen4ExpConfig,
 )
-from pulsarlm.engine_model import engine_model, qwen4_exp_config
+from pulsarlm.engine_model import engine_model
 
 ROPE = {
     "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
@@ -128,17 +129,15 @@ def qwen4_exp_text(**text) -> dict:
         },
         "rms_norm_eps": 1e-6,
         "eos_token_id": 248044,
+        "indexer_n_heads": 4,
+        "indexer_kv_heads": 1,
+        "indexer_head_dim": 128,
+        "indexer_budget": 2048,
+        "indexer_compress_ratio": 4,
     } | text
 
 
-def test_a_qwen4_exp_text_config_maps_its_ple_layers_and_eos():
-    model = qwen4_exp_config(qwen4_exp_text())
-
-    assert model.ple_layers == [1]
-    assert model.eos_token_id == 248044
-
-
-def test_a_qwen4_exp_checkpoint_is_not_loaded_without_sparse_attention():
+def test_a_qwen4_exp_checkpoint_maps_its_ple_layers_and_text_eos():
     cfg = PulsarLMModelConfig.from_dict(
         {
             "model_type": "qwen4_exp",
@@ -146,8 +145,12 @@ def test_a_qwen4_exp_checkpoint_is_not_loaded_without_sparse_attention():
             "text_config": qwen4_exp_text(),
         }
     )
-    with pytest.raises(PulsarLMModelLoadingError, match="sparse attention"):
-        engine_model(cfg)
+    model = engine_model(cfg)
+
+    assert isinstance(model, Qwen4ExpConfig)
+    assert model.ple_layers == [1]
+    assert model.eos_token_id == 248044
+    assert model.layer_types == (["linear_attention"] * 3 + ["indexed_attention"]) * 2
 
 
 def test_a_gemma4_checkpoint_maps_its_text_config():

@@ -219,6 +219,7 @@ class Qwen3_5MoeConfig:
     ) -> None: ...
 
 class Qwen4ExpConfig:
+    layer_types: list[str]
     ple_layers: list[int]
     eos_token_id: int
     def __init__(
@@ -244,6 +245,10 @@ class Qwen4ExpConfig:
         ple_layers: list[int],
         ngram_size: int,
         eos_token_id: int,
+        indexer_n_heads: int,
+        indexer_head_dim: int,
+        indexer_budget: int,
+        indexer_compress_ratio: int,
     ) -> None: ...
 
 class Request:

@@ -64,8 +64,13 @@ Qwen4ExpModel::Qwen4ExpModel(qwen4_exp_config config, const c10::Dict<std::strin
     if (c.hc_count < 2 || c.ngram_size < 2) {
         throw std::invalid_argument("Qwen4ExpModel: hc_count and ngram_size must be at least 2");
     }
+    if (c.indexer_budget % c.indexer_compress_ratio != 0 || rotary_dim > c.indexer_head_dim) {
+        throw std::invalid_argument(
+            "Qwen4ExpModel: the indexer budget must be whole blocks and the rotated dims fit an index head"
+        );
+    }
     for (std::int64_t layer : c.ple_layers) {
-        if (layer < 0 || layer >= n_layers || c.layer_types[layer] != qwen3_5_layer_type::linear_attention) {
+        if (layer < 0 || layer >= n_layers || c.layer_types[layer] != qwen4_exp_layer_type::linear_attention) {
             throw std::invalid_argument("Qwen4ExpModel: a PLE layer must be a linear attention layer");
         }
     }
@@ -73,6 +78,9 @@ Qwen4ExpModel::Qwen4ExpModel(qwen4_exp_config config, const c10::Dict<std::strin
         .theta = std::pow(c.rope_theta, static_cast<double>(c.head_dim) / static_cast<double>(rotary_dim)),
         .partial_rotary_factor = static_cast<double>(rotary_dim) / static_cast<double>(c.head_dim),
     };
+    index_inv_freq = 1.0 /
+        at::pow(c.rope_theta, at::arange(0, rotary_dim, 2, at::kLong).to(at::kFloat) / static_cast<double>(rotary_dim))
+            .to(embed_tokens.device());
     lm_head = weights.contains("lm_head.weight") ? weights.at("lm_head.weight") : embed_tokens;
     at::Tensor permutation = rope_permutation(c.head_dim, rotary_dim, embed_tokens.device());
     const std::int64_t conv_channels = 2 * c.linear_n_key_heads * c.linear_key_head_dim +
@@ -118,7 +126,7 @@ Qwen4ExpModel::Qwen4ExpModel(qwen4_exp_config config, const c10::Dict<std::strin
             throw std::invalid_argument("Qwen4ExpModel: num_experts_per_tok must be between 1 and the experts");
         }
         kv_layer_of.push_back(kv_specs.size());
-        if (full_attention(layer)) {
+        if (indexed_attention(layer)) {
             w.attention = AttentionWeights{
                 .q_proj = permute_queries(need(weights, p + "self_attn.q_proj.weight"), c.n_heads, permutation),
                 .k_proj = permute_heads(need(weights, p + "self_attn.k_proj.weight"), c.n_kv_heads, permutation),
@@ -126,12 +134,16 @@ Qwen4ExpModel::Qwen4ExpModel(qwen4_exp_config config, const c10::Dict<std::strin
                 .o_proj = need(weights, p + "self_attn.o_proj.weight"),
                 .q_norm = zero_centered(need(weights, p + "self_attn.q_norm.weight")).index_select(0, permutation),
                 .k_norm = zero_centered(need(weights, p + "self_attn.k_norm.weight")).index_select(0, permutation),
+                .index_qk_proj = need(weights, p + "self_attn.indexer.index_qk_proj.weight"),
+                .index_q_norm = zero_centered(need(weights, p + "self_attn.indexer.q_layernorm.weight")),
+                .index_k_norm = zero_centered(need(weights, p + "self_attn.indexer.k_layernorm.weight")),
             };
             kv_specs.push_back(
                 kv_layer{
                     .n_kv_heads = static_cast<std::size_t>(c.n_kv_heads),
                     .head_dim = static_cast<std::size_t>(c.head_dim),
                     .n_q_heads = static_cast<std::size_t>(c.n_heads),
+                    .index_head_dim = static_cast<std::size_t>(c.indexer_head_dim),
                 }
             );
         } else {
@@ -177,8 +189,98 @@ Qwen4ExpModel::Qwen4ExpModel(qwen4_exp_config config, const c10::Dict<std::strin
     }
 }
 
-bool Qwen4ExpModel::full_attention(std::int64_t layer) const {
-    return config.layer_types[layer] == qwen3_5_layer_type::full_attention;
+bool Qwen4ExpModel::indexed_attention(std::int64_t layer) const {
+    return config.layer_types[layer] == qwen4_exp_layer_type::indexed_attention;
+}
+
+at::Tensor Qwen4ExpModel::index_rope(const at::Tensor& x, const at::Tensor& positions) const {
+    const std::int64_t rotary_dim = 2 * index_inv_freq.size(0);
+    at::Tensor freqs = positions.to(at::kFloat).unsqueeze(-1) * index_inv_freq;
+    at::Tensor angles = at::cat({freqs, freqs}, -1);
+    std::vector<std::int64_t> sizes = angles.sizes().vec();
+    while (static_cast<std::int64_t>(sizes.size()) < x.dim()) {
+        sizes.insert(sizes.end() - 1, 1);
+    }
+    at::Tensor cos = angles.cos().to(x.scalar_type()).view(sizes);
+    at::Tensor sin = angles.sin().to(x.scalar_type()).view(sizes);
+    at::Tensor rotated = x.narrow(-1, 0, rotary_dim);
+    const std::int64_t half = rotary_dim / 2;
+    at::Tensor rotated_half = at::cat({-rotated.narrow(-1, half, half), rotated.narrow(-1, 0, half)}, -1);
+    return at::cat({rotated * cos + rotated_half * sin, x.narrow(-1, rotary_dim, x.size(-1) - rotary_dim)}, -1);
+}
+
+// Hugging Face takes a query's top blocks with torch.topk, whose order among equal scores is unspecified; here the lower
+// block wins.
+at::Tensor Qwen4ExpModel::selected_blocks(
+    const AttentionWeights& w,
+    const at::Tensor& queries,
+    const kv& lines,
+    const at::Tensor& page_tables,
+    const at::Tensor& cu_seqlens_q,
+    const at::Tensor& key_counts,
+    const at::Tensor& rope_layout
+) const {
+    const qwen4_exp_config& c = config;
+    const std::int64_t ratio = c.indexer_compress_ratio;
+    const std::int64_t ntok = queries.size(0);
+    const std::int64_t num_seqs = page_tables.size(0);
+    const std::int64_t page_size = lines.index_keys.size(1);
+    TORCH_CHECK(page_size % ratio == 0, "Qwen4ExpModel: a page must hold whole index blocks");
+    const std::int64_t max_blocks = page_tables.size(1) * page_size / ratio;
+    const std::int64_t words = max_blocks / 32 + 1;
+    const auto longs = queries.options().dtype(at::kLong);
+
+    at::Tensor keys = lines.index_keys.index_select(0, page_tables.flatten().to(at::kLong))
+                          .view({num_seqs, max_blocks, ratio, c.indexer_head_dim});
+    at::Tensor pooled = rmsnorm_cuda(
+        keys.to(at::kFloat).mean(2).to(keys.scalar_type()),
+        w.index_k_norm,
+        c.rms_norm_eps
+    );
+    at::Tensor first_keys = at::arange(max_blocks, longs).unsqueeze(0) * ratio;
+    at::Tensor layout = rope_layout.to(at::kLong);
+    at::Tensor n_sink = layout.select(1, 0).unsqueeze(1);
+    at::Tensor working_lo = layout.select(1, 1).unsqueeze(1);
+    at::Tensor short_offset = layout.select(1, 2).unsqueeze(1);
+    at::Tensor positions = at::where(
+        first_keys < n_sink,
+        first_keys,
+        at::where(first_keys < working_lo, short_offset, short_offset + 1 + first_keys - working_lo)
+    );
+    at::Tensor blocks = index_rope(pooled, positions).contiguous();
+
+    at::Tensor starts = cu_seqlens_q.to(at::kLong);
+    at::Tensor counts = starts.narrow(0, 1, num_seqs) - starts.narrow(0, 0, num_seqs);
+    at::Tensor sequence_of = at::repeat_interleave(counts, std::optional<std::int64_t>(ntok));
+    at::Tensor view_index = key_counts.to(at::kLong).index_select(0, sequence_of) -
+        counts.index_select(0, sequence_of) + at::arange(ntok, longs) - starts.index_select(0, sequence_of);
+    at::Tensor complete_blocks = at::floor_divide(view_index + 1, ratio);
+
+    const std::int64_t top = std::min(c.indexer_budget / ratio, max_blocks);
+    const std::int64_t chunk_rows = std::max<std::int64_t>(1, (std::int64_t{1} << 26) / max_blocks);
+    at::Tensor bit_values = at::pow(2, at::arange(32, longs));
+    std::vector<at::Tensor> selected;
+    for (std::int64_t first = 0; first < ntok; first += chunk_rows) {
+        const std::int64_t rows = std::min(chunk_rows, ntok - first);
+        at::Tensor row_blocks = complete_blocks.narrow(0, first, rows);
+        at::Tensor scores = index_scores_cuda(
+            queries.narrow(0, first, rows).contiguous(),
+            blocks,
+            sequence_of.narrow(0, first, rows).contiguous(),
+            row_blocks.contiguous(),
+            1.0 / std::sqrt(static_cast<double>(c.indexer_head_dim))
+        );
+        auto [sorted, order] = at::sort(scores, /*stable=*/true, /*dim=*/-1, /*descending=*/true);
+        at::Tensor bits = at::zeros({rows, words * 32}, longs.dtype(at::kBool));
+        bits.scatter_(1, order.narrow(1, 0, top), sorted.narrow(1, 0, top) > -INFINITY);
+        at::Tensor tail = row_blocks.unsqueeze(1);
+        bits.scatter_(1, tail, tail * ratio <= view_index.narrow(0, first, rows).unsqueeze(1));
+        at::Tensor packed = (bits.view({rows, words, 32}).to(at::kLong) * bit_values).sum(-1);
+        selected.push_back(
+            at::where(packed >= (std::int64_t{1} << 31), packed - (std::int64_t{1} << 32), packed).to(at::kInt)
+        );
+    }
+    return at::cat(selected);
 }
 
 std::vector<kv_layer> Qwen4ExpModel::kv_layers() const {
@@ -239,16 +341,63 @@ at::Tensor Qwen4ExpModel::attention(
         c.rms_norm_eps
     );
     at::Tensor v = at::linear(h, w.v_proj).view({ntok, c.n_kv_heads, c.head_dim}).contiguous();
-    at::Tensor o = paged_attention(
-        q,
-        k,
-        v,
-        lines[kv_index],
-        kv_index,
-        g,
-        1.0 / std::sqrt(static_cast<double>(c.head_dim)),
-        rope
+
+    const kv& line = lines[kv_index];
+    const auto layer_row = static_cast<std::int64_t>(kv_index);
+    at::Tensor page_tables = g.page_tables.select(0, layer_row);
+    at::Tensor key_counts = g.key_counts.select(0, layer_row);
+    std::optional<at::Tensor> cu_seqlens_write;
+    at::Tensor cu_seqlens_q;
+    if (g.is_prefill()) {
+        cu_seqlens_write = g.cu_seqlens_q;
+        cu_seqlens_q = g.cu_seqlens_q;
+    } else {
+        cu_seqlens_q = at::arange(page_tables.size(0) + 1, page_tables.options());
+    }
+    write_kv_cuda(line.k, line.v, k, v, page_tables, cu_seqlens_write, key_counts);
+
+    at::Tensor index_qk = at::linear(h, w.index_qk_proj);
+    at::Tensor index_queries = rmsnorm_cuda(
+        index_qk.narrow(1, 0, c.indexer_n_heads * c.indexer_head_dim)
+            .view({ntok, c.indexer_n_heads, c.indexer_head_dim}),
+        w.index_q_norm,
+        c.rms_norm_eps
     );
+    index_queries = index_rope(index_queries, g.pos.select(0, layer_row));
+    at::Tensor index_keys = index_qk.narrow(1, c.indexer_n_heads * c.indexer_head_dim, c.indexer_head_dim)
+                                .contiguous()
+                                .view({ntok, 1, -1});
+    at::Tensor index_pool = line.index_keys.unsqueeze(2);
+    write_kv_cuda(index_pool, index_pool, index_keys, index_keys, page_tables, cu_seqlens_write, key_counts);
+    at::Tensor selected = selected_blocks(w, index_queries, line, page_tables, cu_seqlens_q, key_counts, g.rope_layout);
+
+    std::optional<at::Tensor> mass, cu_view_pages, mass_decay;
+    at::Tensor page_mass = g.page_mass.empty() ? at::Tensor() : g.page_mass[kv_index];
+    if (page_mass.defined()) {
+        mass = at::zeros({page_mass.size(0), line.k.size(1), c.n_heads}, q.options().dtype(at::kFloat));
+        cu_view_pages = g.cu_view_pages.select(0, layer_row);
+        mass_decay = g.attention_mass_decay;
+    }
+    at::Tensor o = attn_indexed_cuda(
+        q,
+        line.k,
+        line.v,
+        page_tables,
+        cu_seqlens_q,
+        key_counts,
+        g.rope_layout,
+        rope,
+        1.0 / std::sqrt(static_cast<double>(c.head_dim)),
+        selected,
+        c.indexer_compress_ratio,
+        mass,
+        cu_view_pages,
+        mass_decay,
+        g.mass_length_gain
+    );
+    if (mass) {
+        at::maximum_out(page_mass, page_mass, mass->mean(-1).amax(-1));
+    }
     return at::linear(o.reshape({ntok, c.n_heads * c.head_dim}) * at::sigmoid(gate), w.o_proj);
 }
 
@@ -414,7 +563,7 @@ at::Tensor Qwen4ExpModel::group_forward(const GroupBatch& g, std::span<const kv>
         MixedInput mixed = mix(x, w.attn_hyper_connection);
         x = inject(
             x,
-            full_attention(layer) ? attention(mixed.input, layer, g, lines) : deltanet(mixed.input, layer, g, lines),
+            indexed_attention(layer) ? attention(mixed.input, layer, g, lines) : deltanet(mixed.input, layer, g, lines),
             mixed
         );
         mixed = mix(x, w.mlp_hyper_connection);

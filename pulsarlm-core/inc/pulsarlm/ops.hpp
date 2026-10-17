@@ -226,6 +226,18 @@ at::Tensor attn_indexed_cuda(
     double mass_length_gain
 );
 
+// QSA's block scores, fp32 [rows, max_blocks]: for query row r of sequence row_sequence[r], block b below row_blocks[r]
+// scores scale times the sum over its heads of relu(queries[r, h] . blocks[row_sequence[r], b]), dot products in fp32;
+// the blocks past row_blocks[r] score -inf. queries [rows, heads, dim] and blocks [sequences, max_blocks, dim] share a
+// dtype; row_sequence and row_blocks are int64 [rows].
+at::Tensor index_scores_cuda(
+    const at::Tensor& queries,
+    const at::Tensor& blocks,
+    const at::Tensor& row_sequence,
+    const at::Tensor& row_blocks,
+    double scale
+);
+
 // Fused w4a16 dequant-GEMM: y = x @ dequant(W)^T for a Linear with group-wise
 // symmetric int4 weights. Computes y[m,n] = sum_k x[m,k] * w_deq[n,k] with
 // w_deq[n,k] = int4(weight_packed[n,k]) * weight_scale[n, k/group_size].
