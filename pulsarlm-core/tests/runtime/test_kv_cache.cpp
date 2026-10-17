@@ -119,18 +119,18 @@ digest key_of(std::uint64_t n, std::size_t layer = 0) {
     return pulsarlm::store_key(hash_of(n), layer);
 }
 
-at::Tensor page_tensor(float value) {
-    return at::full(
-        {static_cast<std::int64_t>(shape.n_layers),
-         static_cast<std::int64_t>(shape.page_size),
-         static_cast<std::int64_t>(shape.n_kv_heads),
-         static_cast<std::int64_t>(shape.head_dim)},
-        value
-    );
+// K filled with value and V with -value, in pageable memory.
+page host_page(float value, const pulsarlm::page_shape& page_shape = shape) {
+    page filled{.bytes = at::empty({static_cast<std::int64_t>(pulsarlm::line_bytes(page_shape))}, at::kByte)};
+    pulsarlm::kv tensors = pulsarlm::page_tensors(filled, page_shape);
+    tensors.k.fill_(value);
+    tensors.v.fill_(-value);
+    return filled;
 }
 
-page host_page(float value) {
-    return page{.k = page_tensor(value), .v = page_tensor(-value)};
+pulsarlm::kv
+stored_tensors(const store_state& store, const digest& key, const pulsarlm::page_shape& page_shape = shape) {
+    return pulsarlm::page_tensors(store.pages.at(key), page_shape);
 }
 
 void fill_line(pulsarlm::kv_cache& kv, std::uint32_t line_id, float value, std::size_t layer = 0) {
@@ -276,8 +276,8 @@ TEST_CASE("sync stores host copies and get finds the page without fetching") {
     cache_fixture fixture(4);
     sync_page(fixture.kv, hash_of(1), 3.0f);
     REQUIRE(fixture.store->puts == 1);
-    REQUIRE(fixture.store->pages.at(key_of(1)).k.eq(3.0f).all().item<bool>());
-    REQUIRE(fixture.store->pages.at(key_of(1)).v.eq(-3.0f).all().item<bool>());
+    REQUIRE(stored_tensors(*fixture.store, key_of(1)).k.eq(3.0f).all().item<bool>());
+    REQUIRE(stored_tensors(*fixture.store, key_of(1)).v.eq(-3.0f).all().item<bool>());
 
     lines_result got = run_get(fixture.kv, {hash_of(1)});
     REQUIRE(got.has_value());
@@ -457,7 +457,7 @@ TEST_CASE("sync copies pages into pinned blocks of the host pool") {
     REQUIRE(run_to_completion(sync_one_layer(fixture.kv, {hash_of(1), hash_of(2), hash_of(3)}, synced)).has_value());
 
     for (std::uint64_t n = 1; n <= 3; n++) {
-        const page& stored = fixture.store->pages.at(key_of(n));
+        pulsarlm::kv stored = stored_tensors(*fixture.store, key_of(n));
         REQUIRE(stored.k.eq(static_cast<float>(n)).all().item<bool>());
         REQUIRE(stored.v.eq(-static_cast<float>(n)).all().item<bool>());
         REQUIRE(stored.k.is_pinned());
@@ -502,8 +502,8 @@ TEST_CASE("a get and a sync run together") {
         REQUIRE(line_filled_with(fixture.kv, (*got)[j], static_cast<float>(j + 1)));
     }
     REQUIRE(sync_result.has_value());
-    REQUIRE(fixture.store->pages.at(key_of(4)).k.eq(4.0f).all().item<bool>());
-    REQUIRE(fixture.store->pages.at(key_of(5)).k.eq(5.0f).all().item<bool>());
+    REQUIRE(stored_tensors(*fixture.store, key_of(4)).k.eq(4.0f).all().item<bool>());
+    REQUIRE(stored_tensors(*fixture.store, key_of(5)).k.eq(5.0f).all().item<bool>());
     release(fixture.kv, *got);
     release(fixture.kv, synced);
 }
@@ -516,10 +516,10 @@ TEST_CASE("pages past the host pool's room are pageable and still reach the stor
     }
     std::vector<digest> hashes{hash_of(1), hash_of(2), hash_of(3)};
     REQUIRE(run_to_completion(sync_one_layer(fixture.kv, hashes, synced)).has_value());
-    REQUIRE(fixture.store->pages.at(key_of(1)).k.is_pinned());
-    REQUIRE(!fixture.store->pages.at(key_of(2)).k.is_pinned());
+    REQUIRE(stored_tensors(*fixture.store, key_of(1)).k.is_pinned());
+    REQUIRE(!stored_tensors(*fixture.store, key_of(2)).k.is_pinned());
     for (std::uint64_t n = 1; n <= 3; n++) {
-        REQUIRE(fixture.store->pages.at(key_of(n)).v.eq(-static_cast<float>(n)).all().item<bool>());
+        REQUIRE(stored_tensors(*fixture.store, key_of(n)).v.eq(-static_cast<float>(n)).all().item<bool>());
     }
     release(fixture.kv, synced);
 
@@ -547,7 +547,7 @@ TEST_CASE("a values_only cache keeps and stores one tensor as both k and v") {
     fixture.kv.tensors(0).v.select(0, allocated.front()).fill_(5.0f);
     REQUIRE(run_to_completion(sync_one_layer(fixture.kv, {hash_of(1)}, allocated)).has_value());
     release(fixture.kv, allocated);
-    const page& stored = fixture.store->pages.at(key_of(1));
+    pulsarlm::kv stored = stored_tensors(*fixture.store, key_of(1), values_only);
     REQUIRE(stored.k.is_same(stored.v));
     REQUIRE(stored.v.eq(5.0f).all().item<bool>());
 
@@ -576,8 +576,8 @@ TEST_CASE("sync stores a page of every layer in one put") {
                 .has_value());
 
     REQUIRE(fixture.store->puts == 1);
-    REQUIRE(fixture.store->pages.at(key_of(1, 0)).k.eq(1.0f).all().item<bool>());
-    REQUIRE(fixture.store->pages.at(key_of(1, 1)).k.eq(2.0f).all().item<bool>());
+    REQUIRE(stored_tensors(*fixture.store, key_of(1, 0)).k.eq(1.0f).all().item<bool>());
+    REQUIRE(stored_tensors(*fixture.store, key_of(1, 1)).k.eq(2.0f).all().item<bool>());
     fixture.kv.release(0, allocated[0]);
     fixture.kv.release(1, allocated[1]);
 }
@@ -696,14 +696,7 @@ TEST_CASE("a large line reclaims a region of cached small pages and drops them a
         backing.state->pages.emplace(key_of(n, 0), host_page(static_cast<float>(n)));
         narrow_hashes.push_back(hash_of(n));
     }
-    std::vector<std::int64_t> wide_sizes{
-        1,
-        static_cast<std::int64_t>(wide.page_size),
-        static_cast<std::int64_t>(wide.n_kv_heads),
-        static_cast<std::int64_t>(wide.head_dim),
-    };
-    page wide_page{.k = at::full(wide_sizes, 5.0f), .v = at::full(wide_sizes, -5.0f)};
-    backing.state->pages.emplace(key_of(5, 1), wide_page);
+    backing.state->pages.emplace(key_of(5, 1), host_page(5.0f, wide));
     std::vector<digest> none;
     layer_lines_result got = run_to_completion(
         kv.get(std::vector<std::span<const digest>>{narrow_hashes, none}, compute_stream())
@@ -778,7 +771,7 @@ TEST_CASE("a recurrent layer's line is one tensor of its state sizes and dtype, 
     REQUIRE(run_to_completion(sync_each(fixture.kv, {hash_of(1)}, {0}, allocated)).has_value());
     fixture.kv.release(0, allocated[0]);
     fixture.kv.release(1, allocated[1]);
-    REQUIRE(fixture.store->pages.at(key_of(1, 1)).k.equal(at::arange(15, at::kDouble).view({1, 3, 5})));
+    REQUIRE(stored_tensors(*fixture.store, key_of(1, 1), state).k.equal(at::arange(15, at::kDouble).view({1, 3, 5})));
 
     std::vector<line_ids> evicting = allocate_each(fixture.kv, 2).value();
     lines.k.zero_();
@@ -809,10 +802,10 @@ TEST_CASE("the host pool carries pages of layers with different shapes") {
     for (std::size_t layer = 0; layer < 2; layer++) {
         fixture.kv.release(layer, allocated[layer]);
     }
-    REQUIRE(fixture.store->pages.at(key_of(1, 0)).v.eq(1.0f).all().item<bool>());
-    REQUIRE(fixture.store->pages.at(key_of(2, 0)).v.eq(2.0f).all().item<bool>());
-    REQUIRE(fixture.store->pages.at(key_of(1, 1)).k.eq(3.0f).all().item<bool>());
-    REQUIRE(fixture.store->pages.at(key_of(2, 1)).v.eq(-4.0f).all().item<bool>());
+    REQUIRE(stored_tensors(*fixture.store, key_of(1, 0), values_only).v.eq(1.0f).all().item<bool>());
+    REQUIRE(stored_tensors(*fixture.store, key_of(2, 0), values_only).v.eq(2.0f).all().item<bool>());
+    REQUIRE(stored_tensors(*fixture.store, key_of(1, 1)).k.eq(3.0f).all().item<bool>());
+    REQUIRE(stored_tensors(*fixture.store, key_of(2, 1)).v.eq(-4.0f).all().item<bool>());
 
     std::vector<line_ids> evicting = allocate_each(fixture.kv, 4).value();
     for (std::size_t layer = 0; layer < 2; layer++) {

@@ -21,11 +21,6 @@ def state_key(state: State) -> StateKey:
     return state.head or NO_PAGES, tuple(state.tail)
 
 
-def page_bytes(page: Page) -> int:
-    k, v = page
-    return v.nbytes if k is v else k.nbytes + v.nbytes
-
-
 @dataclass
 class StoredPage:
     page: Page | None
@@ -150,7 +145,7 @@ class LocalStore:
             new = []
             for h, page in zip(hashes, pages, strict=True):
                 if h not in self._pages:
-                    nbytes = page_bytes(page)
+                    nbytes = page.nbytes
                     self._pages[h] = StoredPage(page, nbytes)
                     self._page_bytes += nbytes
                     self._unreferenced.add(h)
@@ -165,7 +160,7 @@ class LocalStore:
                 self._running[request_id].puts.append(keys)
             if self._file is not None and new:
                 self._file.put(new)
-            self._fit(room=sum(page_bytes(page) for page in pages))
+            self._fit(room=sum(page.nbytes for page in pages))
 
     @contextmanager
     def lease(

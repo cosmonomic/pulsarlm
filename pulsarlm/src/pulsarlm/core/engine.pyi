@@ -5,13 +5,13 @@ from typing import Literal, Protocol
 import torch
 from torch import Tensor
 
-type Page = tuple[Tensor, Tensor]
+type Page = Tensor
 
 class PageStore(Protocol):
     """Called on the engine's loop thread with the GIL held; both return without
-    waiting for the store. A page is one KV layer's (k, v) host tensors, each
-    [1, page_size, n_kv_heads, head_dim], in pageable memory the store owns; k is
-    v for a layer keeping one tensor. A fetch whose call raises, or whose
+    waiting for the store. A page is one KV layer's line as a host uint8 tensor of
+    its bytes, in pageable memory the store owns, laid out as only the engine reads
+    it. A fetch whose call raises, or whose
     future fails, is cancelled, is dropped unfinished or yields a malformed result,
     misses every page it asked for. An exception raised by put goes to
     sys.unraisablehook.

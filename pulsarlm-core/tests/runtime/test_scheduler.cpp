@@ -398,8 +398,12 @@ struct fixture {
         return m;
     }
 
-    const page& stored(const digest& hash, std::size_t layer) const {
-        return store->pages.at(pulsarlm::store_key(hash, layer));
+    // The K and V of layer's page hash in the store.
+    pulsarlm::kv stored(const digest& hash, std::size_t layer) const {
+        return pulsarlm::page_tensors(
+            store->pages.at(pulsarlm::store_key(hash, layer)),
+            page_shapes(model.layers)[layer]
+        );
     }
 };
 
@@ -478,13 +482,13 @@ pulsarlm::state full_layers_state(const std::vector<digest>& hashes, std::size_t
 }
 
 // p holds tokens as K.
-bool keys_hold(const page& p, const token_list& tokens) {
+bool keys_hold(const pulsarlm::kv& p, const token_list& tokens) {
     auto n_tokens = static_cast<std::int64_t>(tokens.size());
     return at::equal(p.k, at::tensor(tokens).to(at::kFloat).view({1, n_tokens, 1, 1}).expand_as(p.k));
 }
 
 // p holds tokens as K and their view indices, from first_index on, as V.
-bool page_holds(const page& p, const token_list& tokens, std::size_t first_index) {
+bool page_holds(const pulsarlm::kv& p, const token_list& tokens, std::size_t first_index) {
     auto n_tokens = static_cast<std::int64_t>(tokens.size());
     auto first = static_cast<std::int64_t>(first_index);
     at::Tensor v = at::arange(first, first + n_tokens).to(at::kFloat).view({1, n_tokens, 1, 1}).expand_as(p.v);

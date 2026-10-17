@@ -66,10 +66,6 @@ std::size_t tensor_count(const page_shape& shape) {
     return shape.values_only ? 1 : 2;
 }
 
-std::size_t tensor_bytes(const page_shape& shape) {
-    return line_bytes(shape) / tensor_count(shape);
-}
-
 at::Tensor make_pool(std::span<const page_shape> shapes, std::size_t pool_bytes, at::Device device) {
     TORCH_CHECK(!shapes.empty(), "kv_cache: no KV layer");
     for (const page_shape& shape : shapes) {
@@ -104,35 +100,24 @@ std::vector<std::int64_t> line_strides(const page_shape& shape) {
     };
 }
 
-// count lines from element first of elements (1-D, in the shape's dtype), each [n_kv_heads, k then v, page_size,
+// count lines from the first element of elements (1-D, in the shape's dtype), each [n_kv_heads, k then v, page_size,
 // head_dim], as K and V views of [count, page_size, n_kv_heads, head_dim]; a recurrent shape's lines are contiguous
 // [count, state_sizes...].
-page line_views(const at::Tensor& elements, const page_shape& shape, std::size_t count, std::size_t first) {
+kv line_views(const at::Tensor& elements, const page_shape& shape, std::size_t count) {
     std::vector<std::int64_t> sizes = page_sizes(shape);
     sizes.front() = static_cast<std::int64_t>(count);
     std::vector<std::int64_t> strides = line_strides(shape);
-    std::int64_t k_first = elements.storage_offset() + static_cast<std::int64_t>(first);
-    at::Tensor k = elements.as_strided(sizes, strides, k_first);
+    at::Tensor k = elements.as_strided(sizes, strides, elements.storage_offset());
     if (shape.values_only) {
-        return page{.k = k, .v = k};
+        return kv{.k = k, .v = k};
     }
-    auto v_first = k_first + static_cast<std::int64_t>(shape.page_size * shape.head_dim);
-    return page{.k = k, .v = elements.as_strided(sizes, strides, v_first)};
-}
-
-// Whether candidate is laid out as a line of shape, so its bytes copy as one block from k's first element.
-bool in_line_layout(const page& candidate, const page_shape& shape) {
-    std::vector<std::int64_t> strides = line_strides(shape);
-    auto v_from_k = static_cast<const std::byte*>(candidate.v.data_ptr()) -
-        static_cast<const std::byte*>(candidate.k.data_ptr());
-    auto expected_v_from_k = shape.values_only ? 0 : static_cast<std::ptrdiff_t>(tensor_bytes(shape));
-    return candidate.k.strides() == at::IntArrayRef(strides) && candidate.v.strides() == at::IntArrayRef(strides) &&
-        v_from_k == expected_v_from_k;
+    auto v_first = elements.storage_offset() + static_cast<std::int64_t>(shape.page_size * shape.head_dim);
+    return kv{.k = k, .v = elements.as_strided(sizes, strides, v_first)};
 }
 
 // line_count lines of the pool, a block apart.
 kv pool_views(const at::Tensor& pool, const page_shape& shape, std::size_t line_count) {
-    page lines = line_views(pool.view(shape.dtype), shape, line_count, 0);
+    kv lines = line_views(pool.view(shape.dtype), shape, line_count);
     auto block_elements = static_cast<std::int64_t>(block_bytes(shape) / c10::elementSize(shape.dtype));
     std::vector<std::int64_t> strides = line_strides(shape);
     strides.front() = block_elements;
@@ -164,10 +149,6 @@ c10::cuda::CUDAStreamGuard guard_stream(const at::Tensor& lines, cudaStream_t st
     return c10::cuda::CUDAStreamGuard(c10::cuda::getStreamFromExternal(stream, lines.device().index()));
 }
 
-at::Tensor line_of(const at::Tensor& lines, std::uint32_t line_id) {
-    return lines.select(0, static_cast<std::int64_t>(line_id));
-}
-
 void append_segment(std::vector<std::int64_t>& segments, std::size_t device, std::size_t host, std::size_t bytes) {
     segments.insert(
         segments.end(),
@@ -184,10 +165,17 @@ at::Tensor pinned_int64(const std::vector<std::int64_t>& values) {
     return pinned;
 }
 
-void check_page(const page_shape& shape, const at::Tensor& source) {
-    std::vector<std::int64_t> sizes = page_sizes(shape);
-    TORCH_CHECK(source.sizes() == at::IntArrayRef(sizes), "kv_cache: page is ", source.sizes(), ", line is ", sizes);
-    TORCH_CHECK(source.scalar_type() == shape.dtype, "kv_cache: page is ", source.dtype(), ", line is ", shape.dtype);
+void check_page(const page_shape& shape, const page& source) {
+    TORCH_CHECK(
+        source.bytes.scalar_type() == at::kByte && source.bytes.dim() == 1 && source.bytes.is_contiguous() &&
+            static_cast<std::size_t>(source.bytes.numel()) == line_bytes(shape),
+        "kv_cache: a page must be contiguous uint8 [",
+        line_bytes(shape),
+        "], got ",
+        source.bytes.dtype(),
+        " ",
+        source.bytes.sizes()
+    );
 }
 
 std::size_t largest_line_bytes(std::span<const page_shape> shapes) {
@@ -215,6 +203,11 @@ std::size_t line_bytes(const page_shape& shape) {
 
 std::size_t block_bytes(const page_shape& shape) {
     return std::bit_ceil(line_bytes(shape));
+}
+
+kv page_tensors(const page& p, const page_shape& shape) {
+    check_page(shape, p);
+    return line_views(p.bytes.view(shape.dtype), shape, shape.n_layers);
 }
 
 digest make_root_digest(std::string_view model, std::span<const page_shape> shapes) {
@@ -365,38 +358,27 @@ kv_cache::copy_from_host(std::span<const layer_line> targets, std::span<const pa
     std::vector<at::Tensor> copies;
     for (std::size_t i = 0; i < targets.size(); i++) {
         auto [layer, line_id] = targets[i];
-        const page_shape& shape = layers[layer].shape;
+        const std::size_t bytes = line_bytes(layers[layer].shape);
         const page& source = pages[i];
-        check_page(shape, source.v);
-        check_page(shape, source.k);
-        std::optional<std::size_t> offset;
-        if (in_line_layout(source, shape)) {
-            offset = host_pages.offset_of(source.k.data_ptr(), line_bytes(shape));
-        }
+        check_page(layers[layer].shape, source);
+        std::optional<std::size_t> offset = host_pages.offset_of(source.bytes.data_ptr(), bytes);
         if (!offset) {
-            auto elements = static_cast<std::int64_t>(line_bytes(shape) / c10::elementSize(shape.dtype));
-            std::optional<at::Tensor> block = host_pages.allocate(elements, shape.dtype);
-            at::Tensor copy = block ? *block : at::empty({elements}, at::TensorOptions().dtype(shape.dtype));
-            page line = line_views(copy, shape, 1, 0);
-            line.v.copy_(source.v);
-            if (!shape.values_only) {
-                line.k.copy_(source.k);
-            }
-            copies.push_back(copy);
-            if (block) {
-                offset = host_pages.offset_of(copy.data_ptr(), line_bytes(shape));
-            } else {
+            std::optional<at::Tensor> block = host_pages.allocate(static_cast<std::int64_t>(bytes), at::kByte);
+            if (!block) {
                 C10_CUDA_CHECK(cudaMemcpyAsync(
                     static_cast<std::byte*>(pool.data_ptr()) + line_offset(layer, line_id),
-                    copy.data_ptr(),
-                    line_bytes(shape),
+                    source.bytes.data_ptr(),
+                    bytes,
                     cudaMemcpyHostToDevice,
                     stream
                 ));
                 continue;
             }
+            block->copy_(source.bytes);
+            copies.push_back(*block);
+            offset = host_pages.offset_of(block->data_ptr(), bytes);
         }
-        append_segment(segments, line_offset(layer, line_id), *offset, line_bytes(shape));
+        append_segment(segments, line_offset(layer, line_id), *offset, bytes);
     }
     if (!segments.empty()) {
         auto guard = guard_stream(pool, stream);
@@ -410,11 +392,11 @@ task<void> kv_cache::copy_to_host(std::span<const layer_line> sources, std::span
     for (std::size_t i = 0; i < sources.size(); i++) {
         auto [layer, line_id] = sources[i];
         const std::size_t bytes = line_bytes(layers[layer].shape);
-        if (std::optional<std::size_t> offset = host_pages.offset_of(pages[i].k.data_ptr(), bytes)) {
+        if (std::optional<std::size_t> offset = host_pages.offset_of(pages[i].bytes.data_ptr(), bytes)) {
             append_segment(segments, line_offset(layer, line_id), *offset, bytes);
         } else {
             C10_CUDA_CHECK(cudaMemcpyAsync(
-                pages[i].k.data_ptr(),
+                pages[i].bytes.data_ptr(),
                 static_cast<const std::byte*>(pool.data_ptr()) + line_offset(layer, line_id),
                 bytes,
                 cudaMemcpyDeviceToHost,
@@ -434,11 +416,9 @@ std::optional<std::vector<page>> kv_cache::allocate_host_pages(std::span<const l
     pages.reserve(sources.size());
     try {
         for (const layer_line& source : sources) {
-            const page_shape& shape = layers[source.layer].shape;
-            auto elements = static_cast<std::int64_t>(line_bytes(shape) / c10::elementSize(shape.dtype));
-            std::optional<at::Tensor> block = host_pages.allocate(elements, shape.dtype);
-            at::Tensor buffer = block ? *block : at::empty({elements}, at::TensorOptions().dtype(shape.dtype));
-            pages.push_back(line_views(buffer, shape, 1, 0));
+            auto bytes = static_cast<std::int64_t>(line_bytes(layers[source.layer].shape));
+            std::optional<at::Tensor> block = host_pages.allocate(bytes, at::kByte);
+            pages.push_back(page{.bytes = block ? *block : at::empty({bytes}, at::TensorOptions().dtype(at::kByte))});
         }
     } catch (const c10::OutOfMemoryError&) {
         return std::nullopt;
@@ -574,13 +554,13 @@ kv_cache::clone(std::size_t layer, std::uint32_t line_id, std::size_t count, cud
     }
     commit(taking, *taken);
     std::vector<std::uint32_t> copies = std::move((*taken)[layer]);
-    const kv& tensors = layers[layer].device_kv;
+    auto bytes = static_cast<std::int64_t>(line_bytes(layers[layer].shape));
+    auto line_at = [&](std::uint32_t id) {
+        return pool.narrow(0, static_cast<std::int64_t>(line_offset(layer, id)), bytes);
+    };
     auto guard = guard_stream(pool, stream);
     for (std::uint32_t copy : copies) {
-        line_of(tensors.v, copy).copy_(line_of(tensors.v, line_id), /*non_blocking=*/true);
-        if (!layers[layer].shape.values_only) {
-            line_of(tensors.k, copy).copy_(line_of(tensors.k, line_id), /*non_blocking=*/true);
-        }
+        line_at(copy).copy_(line_at(line_id), /*non_blocking=*/true);
     }
     return copies;
 }

@@ -17,7 +17,7 @@ from pulsarlm.store import LocalStore
 from pulsarlm.store_file import StoreInUseError
 
 PAGE_SIZE = 4
-# page() makes a page of two one-element float32 tensors.
+# page() makes a page of the bytes of two float32.
 PAGE_BYTES = 8
 ROOMY = 1 << 20
 
@@ -58,11 +58,8 @@ def hashes_of(state: State) -> list[bytes]:
     return [p.hash for p in state.layers[0].pages] if state.layers else []
 
 
-def page(value: float) -> tuple[torch.Tensor, torch.Tensor]:
-    return (
-        torch.full((1,), value, dtype=torch.float32),
-        torch.full((1,), -value, dtype=torch.float32),
-    )
+def page(value: float) -> torch.Tensor:
+    return torch.tensor([value, -value], dtype=torch.float32).view(torch.uint8)
 
 
 REQUEST_IDS = count(1)
@@ -275,14 +272,6 @@ def test_the_newest_state_stays_above_the_capacity():
     assert store.byte_count() == 2 * PAGE_BYTES
 
 
-def test_a_page_keeping_one_tensor_counts_its_bytes_once():
-    store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY)
-    v = torch.full((1,), 1.0, dtype=torch.float32)
-    with request(store, HISTORY) as (request_id, _, _):
-        store.put(page_digests(HISTORY[:4]), [(v, v)], [(request_id, 0)])
-        assert store.byte_count() == PAGE_BYTES // 2
-
-
 def test_a_page_no_request_owns_is_deleted_by_its_put():
     store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY)
     put_pages(store, page_digests(HISTORY))
@@ -327,31 +316,7 @@ def test_states_and_pages_survive_a_restart(tmp_path: Path):
         assert state.tail == [HISTORY[8]]
         fetched = store.fetch(hashes_of(state)[1:]).result()[0]
         assert fetched is not None
-        k, v = fetched
-        assert k.tolist() == [1.0] and v.tolist() == [-1.0]
-
-
-def test_a_page_keeping_one_tensor_is_read_back_as_one(tmp_path: Path):
-    path = tmp_path / "store.sqlite"
-    wrote = in_another_process(
-        path,
-        """
-        store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=store_path)
-        v = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3)
-        with request(store, HISTORY) as (request_id, _, _):
-            store.put(page_digests(HISTORY[:4]), [(v, v)], [(request_id, 0)])
-            write(store, reached(HISTORY[:5]), request_id)
-        """,
-    )
-    assert wrote.returncode == 0, wrote.stderr
-
-    store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=path)
-    fetched = store.fetch(page_digests(HISTORY[:4])).result()[0]
-    assert fetched is not None
-    k, v = fetched
-    assert k is v
-    assert v.dtype == torch.bfloat16
-    assert v.tolist() == [[0, 1, 2], [3, 4, 5]]
+        assert torch.equal(fetched, page(1))
 
 
 def test_a_second_process_cannot_open_the_store(tmp_path: Path):

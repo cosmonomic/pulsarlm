@@ -22,14 +22,14 @@ namespace {
 using fetched_pages = std::vector<std::optional<page>>;
 
 fetched_pages pages_from_python(const py::handle& result, std::size_t count) {
-    auto tensors = result.cast<std::vector<std::optional<std::pair<at::Tensor, at::Tensor>>>>();
+    auto tensors = result.cast<std::vector<std::optional<at::Tensor>>>();
     if (tensors.size() != count) {
         throw std::length_error(std::format("the store returned {} pages for {} hashes", tensors.size(), count));
     }
     fetched_pages pages(count);
     for (std::size_t i = 0; i < count; i++) {
         if (tensors[i]) {
-            pages[i] = page{std::move(tensors[i]->first), std::move(tensors[i]->second)};
+            pages[i] = page{.bytes = std::move(*tensors[i])};
         }
     }
     return pages;
@@ -38,7 +38,7 @@ fetched_pages pages_from_python(const py::handle& result, std::size_t count) {
 py::list pages_to_python(std::vector<page>&& pages) {
     py::list list(pages.size());
     for (std::size_t i = 0; i < pages.size(); i++) {
-        list[i] = py::make_tuple(std::move(pages[i].k), std::move(pages[i].v));
+        list[i] = py::cast(std::move(pages[i].bytes));
     }
     return list;
 }

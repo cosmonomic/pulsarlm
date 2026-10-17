@@ -13,7 +13,7 @@ from torch import Tensor
 
 from pulsarlm.core.engine import ActivePage, LayerSequence, State
 
-type Page = tuple[Tensor, Tensor]
+type Page = Tensor
 type StateKey = tuple[bytes, tuple[int, ...]]
 type SavedState = tuple[StateKey, State, list[bytes], int]
 
@@ -24,11 +24,8 @@ SCHEMA_VERSION = 1
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS pages (
     key BLOB PRIMARY KEY,
-    dtype TEXT NOT NULL,
-    shape TEXT NOT NULL,
     nbytes INTEGER NOT NULL,
-    k BLOB,
-    v BLOB NOT NULL
+    bytes BLOB NOT NULL
 );
 CREATE TABLE IF NOT EXISTS states (
     head BLOB NOT NULL,
@@ -80,21 +77,8 @@ def tail_text(tail: tuple[int, ...]) -> str:
     return json.dumps(list(tail))
 
 
-def tensor_bytes(tensor: Tensor) -> bytes:
-    return tensor.contiguous().view(torch.uint8).numpy().tobytes()
-
-
-def tensor_from(blob: bytes, dtype: str, shape: str) -> Tensor:
-    return (
-        torch.frombuffer(bytearray(blob), dtype=torch.uint8)
-        .view(getattr(torch, dtype))
-        .reshape(json.loads(shape))
-    )
-
-
-def page_from(dtype: str, shape: str, k: bytes | None, v: bytes) -> Page:
-    values = tensor_from(v, dtype, shape)
-    return (values if k is None else tensor_from(k, dtype, shape)), values
+def page_from(blob: bytes) -> Page:
+    return torch.frombuffer(bytearray(blob), dtype=torch.uint8)
 
 
 def report_failure(operation: Future[None]) -> None:
@@ -192,22 +176,10 @@ class StoreFile:
         return pages, states
 
     def _put(self, pages: list[tuple[bytes, Page, int]]) -> None:
-        rows = []
-        for key, (k, v), nbytes in pages:
-            assert k.shape == v.shape and k.dtype == v.dtype
-            rows.append(
-                (
-                    key,
-                    str(v.dtype).removeprefix("torch."),
-                    json.dumps(list(v.shape)),
-                    nbytes,
-                    None if k is v else tensor_bytes(k),
-                    tensor_bytes(v),
-                )
-            )
+        rows = [(key, nbytes, page.numpy().tobytes()) for key, page, nbytes in pages]
         with transaction(self._connection):
             self._connection.executemany(
-                "INSERT OR IGNORE INTO pages VALUES (?, ?, ?, ?, ?, ?)", rows
+                "INSERT OR IGNORE INTO pages VALUES (?, ?, ?)", rows
             )
 
     def _write(
@@ -249,7 +221,7 @@ class StoreFile:
         pages: list[Page | None] = []
         for key in keys:
             row = self._connection.execute(
-                "SELECT dtype, shape, k, v FROM pages WHERE key = ?", (key,)
+                "SELECT bytes FROM pages WHERE key = ?", (key,)
             ).fetchone()
             pages.append(None if row is None else page_from(*row))
         return pages

@@ -21,15 +21,9 @@
 
 namespace pulsarlm {
 
-// A page of a values_only shape holds one tensor, as both k and v. The cache's pages and lines lay a page out head
-// first, [n_kv_heads, k then v, page_size, head_dim], and k and v view it.
-struct page {
-    at::Tensor k;  // [n_layers, page_size, n_kv_heads, head_dim]
-    at::Tensor v;
-};
-
 // With values_only, one tensor per layer serves as both K and V. A recurrent layer's page (state_sizes not empty) is one
-// tensor [n_layers, state_sizes...] with values_only set; page_size, n_kv_heads and head_dim do not apply to it.
+// tensor [n_layers, state_sizes...] with values_only set; page_size, n_kv_heads and head_dim do not apply to it. A line
+// lays a page out head first, [n_kv_heads, k then v, page_size, head_dim].
 struct page_shape {
     std::size_t n_layers;
     std::size_t page_size;
@@ -42,6 +36,15 @@ struct page_shape {
 
 // The device bytes of one line: its K and V in every layer, or its one tensor for values_only.
 std::size_t line_bytes(const page_shape& shape);
+
+// A host copy of one line of a layer: uint8 [line_bytes(shape)], laid out as the line.
+struct page {
+    at::Tensor bytes;
+};
+
+// The K and V of a page of shape, [n_layers, page_size, n_kv_heads, head_dim] views of its bytes, or its one tensor as
+// both for values_only.
+kv page_tensors(const page& p, const page_shape& shape);
 // The bytes of the pool block a line takes: line_bytes rounded up to a power of two.
 std::size_t block_bytes(const page_shape& shape);
 
