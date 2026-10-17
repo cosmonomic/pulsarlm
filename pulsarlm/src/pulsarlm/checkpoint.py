@@ -26,8 +26,9 @@ GEMMA4 = ("gemma4", "gemma4_unified")
 QWEN3_5 = ("qwen3_5", "qwen3_5_moe")
 # Text-only Qwen3.5 checkpoints, whose text weights are named model.* instead of model.language_model.*.
 QWEN3_5_TEXT = ("qwen3_5_text", "qwen3_5_moe_text")
+QWEN4_EXP = ("qwen4_exp",)
 # Multimodal checkpoints whose text model's config is their text_config.
-MULTIMODAL = GEMMA4 + QWEN3_5
+MULTIMODAL = GEMMA4 + QWEN3_5 + QWEN4_EXP
 ARCHITECTURES = DENSE + MULTIMODAL + QWEN3_5_TEXT
 
 

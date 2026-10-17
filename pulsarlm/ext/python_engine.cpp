@@ -27,6 +27,9 @@ make_model(const any_model_config& any_config, const std::unordered_map<std::str
     if (const auto* qwen = std::get_if<qwen3_5_config>(&any_config)) {
         return std::make_unique<Qwen3_5Model>(*qwen, weight_dict);
     }
+    if (const auto* qwen = std::get_if<qwen4_exp_config>(&any_config)) {
+        return std::make_unique<Qwen4ExpModel>(*qwen, weight_dict);
+    }
     const model_config& config = std::get<model_config>(any_config);
     std::unique_ptr<Model> model;
     if (config.architecture == "qwen2") {

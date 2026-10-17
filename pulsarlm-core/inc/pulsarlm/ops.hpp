@@ -21,15 +21,17 @@ at::Tensor rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, double ep
 // state after its first page_end_tokens[s] tokens when page_end_tokens[s] > 0. A pool's lines lie any number of
 // elements apart, a state pool's lines 16-byte aligned.
 
-// silu of the causal depthwise convolution of x [tokens, channels] by weight [channels, 1, kernel], in x's dtype. A
-// line of conv_pool [lines, channels, kernel - 1] holds the kernel - 1 inputs before a sequence's next token.
+// silu of the causal depthwise convolution of x [tokens, channels] by weight [channels, 1, kernel] with its taps
+// dilation tokens apart, in x's dtype. A line of conv_pool [lines, channels, (kernel - 1) * dilation] holds the
+// (kernel - 1) * dilation inputs before a sequence's next token.
 at::Tensor causal_conv_cuda(
     const at::Tensor& x,
     const at::Tensor& weight,
     const at::Tensor& conv_pool,
     const at::Tensor& rows,
     const std::optional<at::Tensor>& cu_seqlens_q,
-    const at::Tensor& page_end_tokens
+    const at::Tensor& page_end_tokens,
+    std::int64_t dilation = 1
 );
 
 // The gated delta rule's outputs [tokens, value heads, value dim] in x's dtype. Each row of x [tokens, 2 * key_heads *
@@ -51,9 +53,17 @@ at::Tensor gated_delta_rule_cuda(
     int64_t key_heads
 );
 
-// weight * RMSNorm(x) * silu(z) over the last axis, the normalized x and its product with weight each rounded to x's
-// dtype. z and weight are in x's dtype.
-at::Tensor gated_rmsnorm_cuda(const at::Tensor& x, const at::Tensor& z, const at::Tensor& weight, double eps);
+enum class gate_activation { silu, sigmoid };
+
+// weight * RMSNorm(x) * activation(z) over the last axis, the normalized x and its product with weight each rounded to
+// x's dtype. z and weight are in x's dtype.
+at::Tensor gated_rmsnorm_cuda(
+    const at::Tensor& x,
+    const at::Tensor& z,
+    const at::Tensor& weight,
+    double eps,
+    gate_activation activation = gate_activation::silu
+);
 
 // Scatter a batch's new K/V rows into paged pools. k_pool/v_pool are [num_pages,
 // page_size, n_kv_heads, head_dim] of one stride, each page packed and 16-byte aligned

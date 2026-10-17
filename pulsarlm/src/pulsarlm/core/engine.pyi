@@ -1,6 +1,6 @@
 import enum
 from concurrent.futures import Future
-from typing import Protocol
+from typing import Literal, Protocol
 
 import torch
 from torch import Tensor
@@ -197,6 +197,34 @@ class Qwen3_5Config:
         num_experts_per_tok: int = 0,
     ) -> None: ...
 
+class Qwen4ExpConfig:
+    ple_layers: list[int]
+    eos_token_id: int
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        hidden_size: int,
+        layer_types: list[str],
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        rope_theta: float,
+        partial_rotary_factor: float,
+        linear_n_key_heads: int,
+        linear_n_value_heads: int,
+        linear_key_head_dim: int,
+        linear_value_head_dim: int,
+        linear_conv_kernel: int,
+        linear_output_gate: Literal["silu", "sigmoid"],
+        rms_norm_eps: float,
+        num_experts_per_tok: int,
+        hc_count: int,
+        ple_layers: list[int],
+        ngram_size: int,
+        eos_token_id: int,
+    ) -> None: ...
+
 class Request:
     def take(
         self,
@@ -209,7 +237,7 @@ class Engine:
     def __init__(
         self,
         store: PageStore,
-        model: ModelConfig | Gemma4Config | Qwen3_5Config,
+        model: ModelConfig | Gemma4Config | Qwen3_5Config | Qwen4ExpConfig,
         weights: dict[str, Tensor],
         *,
         model_name: str,

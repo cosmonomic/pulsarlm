@@ -2,7 +2,7 @@ import pytest
 
 from pulsarlm.checkpoint import PulsarLMModelConfig, PulsarLMModelLoadingError
 from pulsarlm.core.engine import Gemma4Config, ModelConfig, Qwen3_5Config
-from pulsarlm.engine_model import engine_model
+from pulsarlm.engine_model import engine_model, qwen4_exp_config
 
 ROPE = {
     "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
@@ -101,6 +101,55 @@ def test_a_qwen3_5_checkpoint_without_an_output_gate_is_rejected():
 def test_a_qwen3_5_checkpoint_with_a_sigmoid_linear_attention_gate_is_rejected():
     with pytest.raises(PulsarLMModelLoadingError, match="output gate sigmoid"):
         engine_model(qwen3_5(output_gate_type="sigmoid"))
+
+
+def qwen4_exp_text(**text) -> dict:
+    return {
+        "vocab_size": 248320,
+        "hidden_size": 2560,
+        "num_hidden_layers": 8,
+        "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 2,
+        "num_attention_heads": 24,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 48,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "num_experts": 512,
+        "num_experts_per_tok": 10,
+        "hc_count": 4,
+        "ple_layer_ids": [2],
+        "ngram_size": 3,
+        "output_gate_type": "sigmoid",
+        "rope_parameters": {
+            "rope_type": "default",
+            "rope_theta": 10000000,
+            "partial_rotary_factor": 0.25,
+        },
+        "rms_norm_eps": 1e-6,
+        "eos_token_id": 248044,
+    } | text
+
+
+def test_a_qwen4_exp_text_config_maps_its_ple_layers_and_eos():
+    model = qwen4_exp_config(qwen4_exp_text())
+
+    assert model.ple_layers == [1]
+    assert model.eos_token_id == 248044
+
+
+def test_a_qwen4_exp_checkpoint_is_not_loaded_without_sparse_attention():
+    cfg = PulsarLMModelConfig.from_dict(
+        {
+            "model_type": "qwen4_exp",
+            "eos_token_id": [248046, 248044],
+            "text_config": qwen4_exp_text(),
+        }
+    )
+    with pytest.raises(PulsarLMModelLoadingError, match="sparse attention"):
+        engine_model(cfg)
 
 
 def test_a_gemma4_checkpoint_maps_its_text_config():

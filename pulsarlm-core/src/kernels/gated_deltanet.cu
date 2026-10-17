@@ -14,7 +14,7 @@ namespace pulsarlm {
 namespace {
 
 constexpr int kConvThreads = 256;
-constexpr int kMaxConvHistory = 7;
+constexpr int kMaxConvHistory = 9;
 // Value columns per delta rule CTA.
 constexpr int kColumns = 16;
 constexpr size_t kSharedMemoryWithoutOptIn = 48 * 1024;
@@ -72,6 +72,10 @@ __device__ __forceinline__ float silu(float value) {
     return value / (1.0f + expf(-value));
 }
 
+__device__ __forceinline__ float sigmoid(float value) {
+    return 1.0f / (1.0f + expf(-value));
+}
+
 // Sums value over each aligned group of lanes lanes of the warp, lanes a power of two.
 template <int lanes> __device__ __forceinline__ float lane_sum(float value) {
     for (int offset = lanes / 2; offset > 0; offset >>= 1) {
@@ -92,6 +96,7 @@ __global__ void causal_conv_kernel(
     int64_t total,
     int channels,
     int kernel,
+    int dilation,
     scalar_t* __restrict__ out
 ) {
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -102,11 +107,11 @@ __global__ void causal_conv_kernel(
     const int channel = static_cast<int>(index % channels);
     const int s = tokens.sequence_of(token);
     const int first = tokens.first(s);
-    const int history = kernel - 1;
+    const int history = (kernel - 1) * dilation;
     const scalar_t* old = conv_pool + rows.running(s) * line_stride + static_cast<int64_t>(channel) * history;
     float sum = 0.0f;
     for (int j = 0; j < kernel; j++) {
-        const int input = token - first - history + j;
+        const int input = token - first - history + j * dilation;
         const scalar_t value = input >= 0 ? x[static_cast<int64_t>(first + input) * channels + channel]
                                           : old[history + input];
         sum += static_cast<float>(weight[channel * kernel + j]) * static_cast<float>(value);
@@ -124,7 +129,7 @@ __global__ void conv_state_kernel(
     ragged_tokens tokens,
     const int32_t* __restrict__ page_end_tokens,
     int channels,
-    int kernel
+    int history
 ) {
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= static_cast<int64_t>(tokens.num_seqs) * channels) {
@@ -133,7 +138,6 @@ __global__ void conv_state_kernel(
     const int s = static_cast<int>(index / channels);
     const int channel = static_cast<int>(index % channels);
     const int first = tokens.first(s);
-    const int history = kernel - 1;
     const int64_t channel_offset = static_cast<int64_t>(channel) * history;
     scalar_t* running = conv_pool + rows.running(s) * line_stride + channel_offset;
     scalar_t old[kMaxConvHistory];
@@ -207,7 +211,7 @@ __device__ __forceinline__ float log_decay_of(float a, const delta_rule_params& 
 }
 
 template <typename scalar_t> __device__ __forceinline__ float beta_of(scalar_t b) {
-    return rounded<scalar_t>(1.0f / (1.0f + expf(-static_cast<float>(b))));
+    return rounded<scalar_t>(sigmoid(static_cast<float>(b)));
 }
 
 // fn(i) for each i < COUNT, spread over the CTA's THREADS threads, its loop unrolled so that loads issue together.
@@ -640,7 +644,8 @@ __global__ void gated_rmsnorm_kernel(
     const scalar_t* __restrict__ weight,
     scalar_t* __restrict__ y,
     int64_t dim,
-    float eps
+    float eps,
+    gate_activation activation
 ) {
     const int64_t offset = static_cast<int64_t>(blockIdx.x) * dim;
     float local = 0.0f;
@@ -661,7 +666,10 @@ __global__ void gated_rmsnorm_kernel(
     for (int64_t i = threadIdx.x; i < dim; i += blockDim.x) {
         const float normed = rounded<scalar_t>(static_cast<float>(x[offset + i]) * inv_rms);
         const float scaled = rounded<scalar_t>(static_cast<float>(weight[i]) * normed);
-        y[offset + i] = static_cast<scalar_t>(scaled * silu(static_cast<float>(z[offset + i])));
+        const float gate = static_cast<float>(z[offset + i]);
+        y[offset + i] = static_cast<scalar_t>(
+            scaled * (activation == gate_activation::silu ? silu(gate) : sigmoid(gate))
+        );
     }
 }
 
@@ -734,22 +742,28 @@ at::Tensor causal_conv_cuda(
     const at::Tensor& conv_pool,
     const at::Tensor& rows,
     const std::optional<at::Tensor>& cu_seqlens_q,
-    const at::Tensor& page_end_tokens
+    const at::Tensor& page_end_tokens,
+    int64_t dilation
 ) {
     check_ragged("causal_conv", x, rows, cu_seqlens_q, page_end_tokens);
     const int64_t channels = x.size(1);
     TORCH_CHECK(
         weight.scalar_type() == x.scalar_type() && weight.dim() == 3 && weight.size(0) == channels &&
-            weight.size(1) == 1 && weight.size(2) >= 1 && weight.size(2) <= kMaxConvHistory + 1 &&
-            weight.is_contiguous(),
-        "causal_conv: weight must be contiguous [channels, 1, kernel] in x's dtype, kernel at most ",
-        kMaxConvHistory + 1
+            weight.size(1) == 1 && weight.size(2) >= 1 && weight.is_contiguous(),
+        "causal_conv: weight must be contiguous [channels, 1, kernel] in x's dtype"
     );
     const int64_t kernel = weight.size(2);
+    const int64_t history = (kernel - 1) * dilation;
+    TORCH_CHECK(
+        dilation >= 1 && history <= kMaxConvHistory,
+        "causal_conv: (kernel - 1) * dilation must be at most ",
+        kMaxConvHistory,
+        " with dilation at least 1"
+    );
     TORCH_CHECK(
         conv_pool.scalar_type() == x.scalar_type() && conv_pool.dim() == 3 && conv_pool.size(1) == channels &&
-            conv_pool.size(2) == kernel - 1 && conv_pool.stride(2) == 1 && conv_pool.stride(1) == kernel - 1,
-        "causal_conv: conv_pool must be [lines, channels, kernel - 1] in x's dtype, each line packed"
+            conv_pool.size(2) == history && conv_pool.stride(2) == 1 && conv_pool.stride(1) == history,
+        "causal_conv: conv_pool must be [lines, channels, (kernel - 1) * dilation] in x's dtype, each line packed"
     );
     at::Tensor out = at::empty_like(x);
     const int64_t total = x.size(0);
@@ -769,6 +783,7 @@ at::Tensor causal_conv_cuda(
                 total,
                 static_cast<int>(channels),
                 static_cast<int>(kernel),
+                static_cast<int>(dilation),
                 out.mutable_data_ptr<scalar_t>()
             );
             C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -781,7 +796,7 @@ at::Tensor causal_conv_cuda(
             ragged(rows, cu_seqlens_q),
             page_end_tokens.const_data_ptr<int32_t>(),
             static_cast<int>(channels),
-            static_cast<int>(kernel)
+            static_cast<int>(history)
         );
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     });
@@ -888,7 +903,13 @@ at::Tensor gated_delta_rule_cuda(
     return out;
 }
 
-at::Tensor gated_rmsnorm_cuda(const at::Tensor& x, const at::Tensor& z, const at::Tensor& weight, double eps) {
+at::Tensor gated_rmsnorm_cuda(
+    const at::Tensor& x,
+    const at::Tensor& z,
+    const at::Tensor& weight,
+    double eps,
+    gate_activation activation
+) {
     TORCH_CHECK(x.is_cuda() && x.is_contiguous(), "gated_rmsnorm: x must be a contiguous CUDA tensor");
     TORCH_CHECK(
         z.sizes() == x.sizes() && z.scalar_type() == x.scalar_type() && z.is_contiguous(),
@@ -919,7 +940,8 @@ at::Tensor gated_rmsnorm_cuda(const at::Tensor& x, const at::Tensor& z, const at
                 weight.const_data_ptr<scalar_t>(),
                 y.mutable_data_ptr<scalar_t>(),
                 dim,
-                static_cast<float>(eps)
+                static_cast<float>(eps),
+                activation
             );
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     });

@@ -4,6 +4,7 @@ from pulsarlm.checkpoint import (
     GEMMA4,
     QWEN3_5,
     QWEN3_5_TEXT,
+    QWEN4_EXP,
     PulsarLMModelConfig,
     PulsarLMModelLoadingError,
 )
@@ -12,6 +13,7 @@ from pulsarlm.core.engine import (
     Llama3RopeScaling,
     ModelConfig,
     Qwen3_5Config,
+    Qwen4ExpConfig,
     RopeParameters,
 )
 
@@ -128,6 +130,55 @@ def qwen3_5_config(text: dict) -> Qwen3_5Config:
     )
 
 
+def qwen4_exp_config(text: dict) -> Qwen4ExpConfig:
+    """Attends every key of the indexed attention layers, which is QSA's
+    selection only while a query sees at most indexer_budget tokens in complete
+    blocks."""
+    if text.get("attention_bias"):
+        raise PulsarLMModelLoadingError("unsupported attention bias")
+    if text.get("hidden_act", "silu") != "silu":
+        raise PulsarLMModelLoadingError(f"unsupported activation {text['hidden_act']}")
+    if not text.get("norm_topk_prob", True):
+        raise PulsarLMModelLoadingError(
+            "unnormalized top-k router weights are unsupported"
+        )
+    parameters = text.get("rope_parameters") or {}
+    if parameters.get("rope_type", "default") != "default":
+        raise PulsarLMModelLoadingError(f"unsupported RoPE {parameters['rope_type']}")
+    eos = text["eos_token_id"]
+    return Qwen4ExpConfig(
+        vocab_size=text["vocab_size"],
+        hidden_size=text["hidden_size"],
+        layer_types=[
+            FULL if layer == "indexed_attention" else layer
+            for layer in qwen3_5_layer_types(text)
+        ],
+        n_heads=text["num_attention_heads"],
+        n_kv_heads=text["num_key_value_heads"],
+        head_dim=text["head_dim"],
+        rope_theta=float(parameters.get("rope_theta") or text["rope_theta"]),
+        partial_rotary_factor=float(
+            parameters.get(
+                "partial_rotary_factor", text.get("partial_rotary_factor", 1.0)
+            )
+        ),
+        linear_n_key_heads=text["linear_num_key_heads"],
+        linear_n_value_heads=text["linear_num_value_heads"],
+        linear_key_head_dim=text["linear_key_head_dim"],
+        linear_value_head_dim=text["linear_value_head_dim"],
+        linear_conv_kernel=text["linear_conv_kernel_dim"],
+        linear_output_gate="silu"
+        if (gate := text.get("output_gate_type") or "silu") == "swish"
+        else gate,
+        rms_norm_eps=float(text["rms_norm_eps"]),
+        num_experts_per_tok=text["num_experts_per_tok"],
+        hc_count=text["hc_count"],
+        ple_layers=[layer - 1 for layer in text.get("ple_layer_ids") or []],
+        ngram_size=text["ngram_size"],
+        eos_token_id=eos[0] if isinstance(eos, list) else eos,
+    )
+
+
 def rope(text: dict) -> RopeParameters:
     """Reads Hugging Face's rope_parameters, or the rope_scaling and rope_theta
     that preceded it."""
@@ -178,4 +229,8 @@ def engine_model(
         return gemma4_config(cfg.architecture, cfg.text)
     if cfg.architecture in QWEN3_5 + QWEN3_5_TEXT:
         return qwen3_5_config(cfg.text)
+    if cfg.architecture in QWEN4_EXP:
+        raise PulsarLMModelLoadingError(
+            "qwen4_exp's sparse attention is not implemented"
+        )
     return dense_config(cfg.architecture, cfg.text)

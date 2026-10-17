@@ -1,6 +1,7 @@
 #include "pulsarlm/model/qwen3_5.hpp"
 
 #include "pulsarlm/model/paged_forward.hpp"
+#include "pulsarlm/model/partial_rope.hpp"
 #include "pulsarlm/ops.hpp"
 
 #include <ATen/ATen.h>
@@ -35,34 +36,6 @@ at::Tensor need_text(const c10::Dict<std::string, at::Tensor>& weights, const st
 // Hugging Face's Qwen3.5 RMSNorm scales by 1 + weight, in fp32.
 at::Tensor zero_centered(const at::Tensor& weight) {
     return weight.to(at::kFloat) + 1.0;
-}
-
-// Head dim i of the paged ops holds Hugging Face's head dim permutation[i]: the paged ops rotate pairs (j, j + half)
-// for j below rotary_dim / 2, which hold Hugging Face's rotated pairs (j, j + rotary_dim / 2); the dims past rotary_dim
-// fill the rest in order.
-at::Tensor rope_permutation(std::int64_t head_dim, std::int64_t rotary_dim, at::Device device) {
-    std::vector<std::int64_t> permutation(head_dim);
-    std::int64_t half = head_dim / 2;
-    std::int64_t next_unrotated = rotary_dim;
-    for (std::int64_t i = 0; i < head_dim; i++) {
-        std::int64_t pair = i % half;
-        permutation[i] = pair < rotary_dim / 2 ? pair + (i >= half ? rotary_dim / 2 : 0) : next_unrotated++;
-    }
-    return at::tensor(permutation).to(device);
-}
-
-// weight [heads * head_dim, in] with each head's output dims permuted.
-at::Tensor permute_heads(const at::Tensor& weight, std::int64_t heads, const at::Tensor& permutation) {
-    std::int64_t head_dim = permutation.size(0);
-    return weight.view({heads, head_dim, -1}).index_select(1, permutation).reshape(weight.sizes()).contiguous();
-}
-
-// q_proj [heads * 2 * head_dim, in] with the query half of each head permuted and the gate half kept.
-at::Tensor permute_queries(const at::Tensor& weight, std::int64_t heads, const at::Tensor& permutation) {
-    std::int64_t head_dim = permutation.size(0);
-    at::Tensor halves = weight.view({heads, 2, head_dim, -1});
-    at::Tensor queries = halves.select(1, 0).index_select(1, permutation);
-    return at::stack({queries, halves.select(1, 1)}, 1).reshape(weight.sizes()).contiguous();
 }
 
 }  // namespace

@@ -83,8 +83,14 @@ struct conv_expected {
     at::Tensor boundary;
 };
 
-conv_expected reference_conv(const at::Tensor& x_seq, const at::Tensor& weight, const at::Tensor& old, int32_t page_end) {
-    const int64_t history = weight.size(2) - 1;
+conv_expected reference_conv(
+    const at::Tensor& x_seq,
+    const at::Tensor& weight,
+    const at::Tensor& old,
+    int32_t page_end,
+    int64_t dilation
+) {
+    const int64_t history = (weight.size(2) - 1) * dilation;
     const int64_t n = x_seq.size(0);
     at::Tensor window = at::cat({old.to(at::kFloat), x_seq.to(at::kFloat).t()}, -1);
     at::Tensor convolved = at::conv1d(
@@ -93,7 +99,7 @@ conv_expected reference_conv(const at::Tensor& x_seq, const at::Tensor& weight, 
         std::nullopt,
         at::IntArrayRef{1},
         at::IntArrayRef{0},
-        at::IntArrayRef{1},
+        at::IntArrayRef{dilation},
         weight.size(0)
     );
     at::Tensor out = at::silu(convolved.squeeze(0).t().to(x_seq.scalar_type()).to(at::kFloat)).to(x_seq.scalar_type());
@@ -165,29 +171,45 @@ TEST_CASE("causal_conv continues each sequence's inputs and keeps its last ones"
     }
     const auto dtype = GENERATE(at::kFloat, at::kBFloat16);
     const ragged_case batch = GENERATE(prefill_case(), decode_case());
+    const int64_t dilation = GENERATE(1, 3);
     const int64_t channels = 24;
     const int64_t kernel = 4;
     auto opts = at::device(at::kCUDA).dtype(dtype);
     at::Tensor x = at::randn({batch.total(), channels}, opts);
     at::Tensor weight = at::randn({channels, 1, kernel}, opts);
-    at::Tensor pool = spaced_pool({channels, kernel - 1}, dtype);
+    at::Tensor pool = spaced_pool({channels, (kernel - 1) * dilation}, dtype);
     at::Tensor before = pool.clone();
     at::Tensor rows = line_rows(kRunning, kBoundary);
 
-    at::Tensor out = pulsarlm::causal_conv_cuda(x, weight, pool, rows, batch.cu_seqlens_q(), int32_cuda(batch.page_ends));
+    at::Tensor out = pulsarlm::causal_conv_cuda(
+        x,
+        weight,
+        pool,
+        rows,
+        batch.cu_seqlens_q(),
+        int32_cuda(batch.page_ends),
+        dilation
+    );
 
     const double tolerance = output_tolerance(dtype);
     int64_t first = 0;
     for (size_t s = 0; s < batch.counts.size(); s++) {
         const int64_t n = batch.counts[s];
-        conv_expected expected =
-            reference_conv(x.narrow(0, first, n), weight, before.select(0, kRunning[s]), batch.page_ends[s]);
+        conv_expected expected = reference_conv(
+            x.narrow(0, first, n),
+            weight,
+            before.select(0, kRunning[s]),
+            batch.page_ends[s],
+            dilation
+        );
         CHECK(at::allclose(out.narrow(0, first, n), expected.out, tolerance, tolerance));
         CHECK(at::equal(pool.select(0, kRunning[s]), expected.running));
-        CHECK(at::equal(
-            pool.select(0, kBoundary[s]),
-            batch.page_ends[s] > 0 ? expected.boundary : before.select(0, kBoundary[s])
-        ));
+        CHECK(
+            at::equal(
+                pool.select(0, kBoundary[s]),
+                batch.page_ends[s] > 0 ? expected.boundary : before.select(0, kBoundary[s])
+            )
+        );
         first += n;
     }
 }
@@ -244,35 +266,40 @@ TEST_CASE("gated_delta_rule continues each sequence's state and keeps it at its 
         );
         CHECK(at::allclose(out.narrow(0, first, n), expected.out, tolerance, tolerance));
         CHECK(at::allclose(pool.select(0, kRunning[s]), expected.running, 1e-4, 1e-4));
-        CHECK(at::allclose(
-            pool.select(0, kBoundary[s]),
-            expected.boundary.value_or(before.select(0, kBoundary[s])),
-            1e-4,
-            1e-4
-        ));
+        CHECK(
+            at::allclose(
+                pool.select(0, kBoundary[s]),
+                expected.boundary.value_or(before.select(0, kBoundary[s])),
+                1e-4,
+                1e-4
+            )
+        );
         first += n;
     }
 }
 
-TEST_CASE("gated_rmsnorm scales the normalized x by weight and silu(z)", "[ops][cuda]") {
+TEST_CASE("gated_rmsnorm scales the normalized x by weight and the gate of z", "[ops][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
     const auto dtype = GENERATE(at::kFloat, at::kBFloat16);
+    const auto activation = GENERATE(pulsarlm::gate_activation::silu, pulsarlm::gate_activation::sigmoid);
     const double eps = 1e-6;
     auto opts = at::device(at::kCUDA).dtype(dtype);
     at::Tensor x = at::randn({6, 4, 128}, opts);
     at::Tensor z = at::randn({6, 4, 128}, opts);
     at::Tensor weight = at::randn({128}, opts);
 
-    at::Tensor got = pulsarlm::gated_rmsnorm_cuda(x, z, weight, eps);
+    at::Tensor got = pulsarlm::gated_rmsnorm_cuda(x, z, weight, eps, activation);
 
     at::Tensor normed = x.to(at::kFloat);
     normed = normed * at::rsqrt(normed.pow(2).mean(-1, true) + eps);
-    at::Tensor expected = ((weight * normed.to(dtype)).to(at::kFloat) * at::silu(z.to(at::kFloat))).to(dtype);
+    at::Tensor gate = activation == pulsarlm::gate_activation::silu ? at::silu(z.to(at::kFloat))
+                                                                    : at::sigmoid(z.to(at::kFloat));
+    at::Tensor expected = ((weight * normed.to(dtype)).to(at::kFloat) * gate).to(dtype);
     const double tolerance = output_tolerance(dtype);
     CHECK(at::allclose(got, expected, tolerance, tolerance));
 
     at::Tensor zeros = at::zeros_like(x);
-    CHECK(at::equal(pulsarlm::gated_rmsnorm_cuda(zeros, z, weight, eps), zeros));
+    CHECK(at::equal(pulsarlm::gated_rmsnorm_cuda(zeros, z, weight, eps, activation), zeros));
 }
