@@ -22,8 +22,7 @@ struct eviction_policy {
     bool can_evict() const noexcept;
 };
 
-// The density bar, a multiple of uniform attention: tau / (1 - tau), so tau 0.5 is parity with uniform. tau <= 0 bars
-// nothing and tau >= 1 bars everything.
+// The density bar tau / (1 - tau). tau <= 0 bars nothing and tau >= 1 bars everything.
 double evict_bar_from_tau(double tau) noexcept;
 
 // Ages a view's page densities, each an EMA of the attention mass its keys received, by token_count tokens, then adds

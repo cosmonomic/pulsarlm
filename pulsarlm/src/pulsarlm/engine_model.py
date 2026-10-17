@@ -197,7 +197,7 @@ def rope(text: dict) -> RopeParameters:
     """Reads Hugging Face's rope_parameters, or the rope_scaling and rope_theta
     that preceded it."""
     parameters = text.get("rope_parameters") or text.get("rope_scaling") or {}
-    theta = float(parameters.get("rope_theta", text.get("rope_theta")))
+    theta = float(parameters.get("rope_theta") or text["rope_theta"])
     match parameters.get("rope_type", parameters.get("type", "default")):
         case "default":
             return RopeParameters(theta=theta)
@@ -227,18 +227,15 @@ def dense_config(architecture: str, text: dict) -> ModelConfig:
         n_heads=n_heads,
         n_kv_heads=text["num_key_value_heads"],
         head_dim=text.get("head_dim") or text["hidden_size"] // n_heads,
-        hidden=text["hidden_size"],
-        intermediate=text["intermediate_size"],
         vocab_size=text["vocab_size"],
         rope=rope(text),
-        rms_eps=float(text["rms_norm_eps"]),
+        rms_norm_eps=float(text["rms_norm_eps"]),
     )
 
 
 def engine_model(
     cfg: PulsarLMModelConfig,
 ) -> ModelConfig | Gemma4Config | Qwen3_5Config | Qwen3_5MoeConfig | Qwen4ExpConfig:
-    """Measures attention mass on the full-attention layers of the top quarter."""
     if cfg.architecture in GEMMA4:
         return gemma4_config(cfg.architecture, cfg.text)
     if cfg.architecture in QWEN3_5_MOE:

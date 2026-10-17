@@ -13,15 +13,16 @@
 #include <array>
 #include <bit>
 #include <cassert>
-#include <cstring>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
@@ -64,6 +65,11 @@ std::vector<std::int64_t> page_sizes(const page_shape& shape) {
 
 std::size_t tensor_count(const page_shape& shape) {
     return shape.values_only ? 1 : 2;
+}
+
+// The bytes of the pool block a line takes.
+std::size_t block_bytes(const page_shape& shape) {
+    return std::bit_ceil(line_bytes(shape));
 }
 
 at::Tensor make_pool(std::span<const page_shape> shapes, std::size_t pool_bytes, at::Device device) {
@@ -223,13 +229,9 @@ std::size_t line_bytes(const page_shape& shape) {
         }
         return elements * c10::elementSize(shape.dtype);
     }
-    std::size_t tensors = shape.values_only ? 1 : 2;
-    return shape.n_layers * shape.page_size * (tensors * shape.n_kv_heads * shape.head_dim + shape.index_head_dim) *
+    return shape.n_layers * shape.page_size *
+        (tensor_count(shape) * shape.n_kv_heads * shape.head_dim + shape.index_head_dim) *
         c10::elementSize(shape.dtype);
-}
-
-std::size_t block_bytes(const page_shape& shape) {
-    return std::bit_ceil(line_bytes(shape));
 }
 
 kv page_tensors(const page& p, const page_shape& shape) {
@@ -277,12 +279,15 @@ kv_cache::kv_cache(
   allocator(distinct_block_bytes(shapes), pool_bytes),
   store(&store),
   host_pages(host_page_bytes, largest_line_bytes(shapes)) {
-    TORCH_CHECK(
-        pool_bytes >= min_pool_bytes(layer_block_bytes(shapes)),
-        "kv_cache: a pool of ",
-        pool_bytes,
-        " bytes holds no line of every layer"
-    );
+    if (std::size_t needed = min_pool_bytes(layer_block_bytes(shapes)); pool_bytes < needed) {
+        throw std::invalid_argument(
+            std::format(
+                "a KV cache of {} bytes holds no line of every KV layer; a line of each takes {} bytes",
+                pool_bytes,
+                needed
+            )
+        );
+    }
     std::vector<std::size_t> blocks = distinct_block_bytes(shapes);
     for (std::size_t c = 0; c < blocks.size(); c++) {
         classes.push_back(
@@ -391,7 +396,7 @@ kv_cache::copy_from_host(std::span<const layer_line> targets, std::span<const pa
         check_page(layers[layer].shape, source);
         std::optional<std::size_t> offset = host_pages.offset_of(source.bytes.data_ptr(), bytes);
         if (!offset) {
-            std::optional<at::Tensor> block = host_pages.allocate(static_cast<std::int64_t>(bytes), at::kByte);
+            std::optional<at::Tensor> block = host_pages.allocate(bytes);
             if (!block) {
                 C10_CUDA_CHECK(cudaMemcpyAsync(
                     static_cast<std::byte*>(pool.data_ptr()) + line_offset(layer, line_id),
@@ -410,7 +415,7 @@ kv_cache::copy_from_host(std::span<const layer_line> targets, std::span<const pa
     }
     if (!segments.empty()) {
         auto guard = guard_stream(pool, stream);
-        copy_segments_cuda(pool, host_pages.buffer(), pinned_int64(segments), /*to_host=*/false);
+        copy_segments_from_host_cuda(pool, host_pages.buffer(), pinned_int64(segments));
     }
     co_await synchronize(stream);
 }
@@ -434,7 +439,7 @@ task<void> kv_cache::copy_to_host(std::span<const layer_line> sources, std::span
     }
     if (!segments.empty()) {
         auto guard = guard_stream(pool, stream);
-        copy_segments_cuda(pool, host_pages.buffer(), pinned_int64(segments), /*to_host=*/true);
+        copy_segments_to_host_cuda(pool, host_pages.buffer(), pinned_int64(segments));
     }
     co_await synchronize(stream);
 }
@@ -444,9 +449,12 @@ std::optional<std::vector<page>> kv_cache::allocate_host_pages(std::span<const l
     pages.reserve(sources.size());
     try {
         for (const layer_line& source : sources) {
-            auto bytes = static_cast<std::int64_t>(line_bytes(layers[source.layer].shape));
-            std::optional<at::Tensor> block = host_pages.allocate(bytes, at::kByte);
-            pages.push_back(page{.bytes = block ? *block : at::empty({bytes}, at::TensorOptions().dtype(at::kByte))});
+            const std::size_t bytes = line_bytes(layers[source.layer].shape);
+            std::optional<at::Tensor> block = host_pages.allocate(bytes);
+            if (!block) {
+                block = at::empty({static_cast<std::int64_t>(bytes)}, at::TensorOptions().dtype(at::kByte));
+            }
+            pages.push_back(page{.bytes = std::move(*block)});
         }
     } catch (const c10::OutOfMemoryError&) {
         return std::nullopt;

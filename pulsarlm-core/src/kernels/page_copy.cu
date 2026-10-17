@@ -11,19 +11,18 @@ namespace {
 
 constexpr int kCopyThreads = 256;
 
-// One CTA per segment.
-__global__ void copy_segments_kernel(
-    unsigned char* __restrict__ device,
-    unsigned char* __restrict__ host,
-    const int64_t* __restrict__ segments,
-    bool to_host
-) {
-    const int64_t* segment = segments + 3 * static_cast<int64_t>(blockIdx.x);
-    unsigned char* device_bytes = device + segment[0];
-    unsigned char* host_bytes = host + segment[1];
-    const int64_t bytes = segment[2];
-    const unsigned char* from = to_host ? device_bytes : host_bytes;
-    unsigned char* to = to_host ? host_bytes : device_bytes;
+struct segment {
+    int64_t device_offset;
+    int64_t host_offset;
+    int64_t bytes;
+};
+
+__device__ __forceinline__ segment segment_of_block(const int64_t* segments) {
+    const int64_t* row = segments + 3 * static_cast<int64_t>(blockIdx.x);
+    return segment{row[0], row[1], row[2]};
+}
+
+__device__ __forceinline__ void copy_bytes(const unsigned char* from, unsigned char* to, int64_t bytes) {
     const bool vectors = ((reinterpret_cast<uintptr_t>(from) | reinterpret_cast<uintptr_t>(to) | bytes) & 15) == 0;
     if (vectors) {
         const auto* from_vectors = reinterpret_cast<const uint4*>(from);
@@ -38,9 +37,27 @@ __global__ void copy_segments_kernel(
     }
 }
 
-}  // namespace
+// One CTA per segment.
+__global__ void copy_segments_to_host_kernel(
+    const unsigned char* __restrict__ device,
+    unsigned char* __restrict__ host,
+    const int64_t* __restrict__ segments
+) {
+    const segment s = segment_of_block(segments);
+    copy_bytes(device + s.device_offset, host + s.host_offset, s.bytes);
+}
 
-void copy_segments_cuda(const at::Tensor& device, const at::Tensor& host, const at::Tensor& segments, bool to_host) {
+// One CTA per segment.
+__global__ void copy_segments_from_host_kernel(
+    unsigned char* __restrict__ device,
+    const unsigned char* __restrict__ host,
+    const int64_t* __restrict__ segments
+) {
+    const segment s = segment_of_block(segments);
+    copy_bytes(host + s.host_offset, device + s.device_offset, s.bytes);
+}
+
+void check_segments(const at::Tensor& device, const at::Tensor& host, const at::Tensor& segments) {
     TORCH_CHECK(
         device.is_cuda() && device.scalar_type() == at::kByte && device.is_contiguous(),
         "copy_segments: device must be a contiguous CUDA byte tensor"
@@ -54,14 +71,34 @@ void copy_segments_cuda(const at::Tensor& device, const at::Tensor& host, const 
             segments.is_contiguous(),
         "copy_segments: segments must be pinned contiguous int64 [n, 3]"
     );
+}
+
+}  // namespace
+
+void copy_segments_to_host_cuda(const at::Tensor& device, const at::Tensor& host, const at::Tensor& segments) {
+    check_segments(device, host, segments);
     if (segments.size(0) == 0) {
         return;
     }
-    copy_segments_kernel<<<static_cast<int>(segments.size(0)), kCopyThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+    const auto blocks = static_cast<int>(segments.size(0));
+    copy_segments_to_host_kernel<<<blocks, kCopyThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
         device.data_ptr<unsigned char>(),
         host.data_ptr<unsigned char>(),
-        segments.data_ptr<int64_t>(),
-        to_host
+        segments.data_ptr<int64_t>()
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void copy_segments_from_host_cuda(const at::Tensor& device, const at::Tensor& host, const at::Tensor& segments) {
+    check_segments(device, host, segments);
+    if (segments.size(0) == 0) {
+        return;
+    }
+    const auto blocks = static_cast<int>(segments.size(0));
+    copy_segments_from_host_kernel<<<blocks, kCopyThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        device.data_ptr<unsigned char>(),
+        host.data_ptr<unsigned char>(),
+        segments.data_ptr<int64_t>()
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

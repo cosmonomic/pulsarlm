@@ -2,62 +2,25 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import torch
 from fastapi import FastAPI
 
-from pulsarlm import checkpoint
 from pulsarlm.async_engine import AsyncEngine
-from pulsarlm.chat import stop_ids
-from pulsarlm.core.engine import Engine, EvictionPolicy
-from pulsarlm.engine_model import engine_model
-from pulsarlm.paging import PAGE_SIZE, trained_view_pages
+from pulsarlm.served_model import load_served_model
 from pulsarlm.server.openai import ServerState
 from pulsarlm.server.openai import router as openai_router
 from pulsarlm.settings import Settings
-from pulsarlm.store import LocalStore
 
 
 def load_server_state(settings: Settings, path: Path) -> ServerState:
-    model = checkpoint.load(
-        path,
-        device=torch.device(settings.device),
-        dtype=getattr(torch, settings.dtype),
-    )
-    cfg = model.config
-    stops = stop_ids(model.tokenizer, cfg.eos_ids)
-    store = LocalStore(
-        PAGE_SIZE,
-        int(settings.store_gib * 2**30),
-        checkpoint.store_path(settings.data_dir) if settings.persist else None,
-    )
-    engine = Engine(
-        store,
-        engine_model(cfg),
-        model.weights,
-        model_name=f"{settings.model}@{checkpoint.weights_version(path)}",
-        page_size=PAGE_SIZE,
-        kv_dtype=getattr(torch, settings.dtype),
-        kv_cache_gib=settings.kv_cache_gib,
-        store_gib=settings.store_gib,
-        device=torch.device(settings.device),
-        stop_ids=stops,
-        prefill_tokens_per_step=settings.prefill_tokens_per_step,
-    )
+    served = load_served_model(settings, path)
     return ServerState(
-        engine=AsyncEngine(engine),
-        store=store,
-        tokenizer=model.tokenizer,
-        chat_template=model.chat_template,
+        engine=AsyncEngine(served.engine),
+        store=served.store,
+        tokenizer=served.tokenizer,
+        chat_template=served.chat_template,
         model_id=settings.model,
-        page_size=PAGE_SIZE,
-        stop_ids=stops,
-        eviction=EvictionPolicy(
-            n_working=settings.n_working,
-            cycle_tokens=settings.cycle_tokens,
-            max_pages=settings.max_pages
-            or trained_view_pages(cfg.max_position_embeddings, settings.cycle_tokens),
-            evict_tau=settings.evict_tau,
-        ),
+        stop_ids=served.stop_ids,
+        eviction=served.eviction,
     )
 
 

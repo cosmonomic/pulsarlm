@@ -2,7 +2,7 @@
 
 #include "pulsarlm/ops.hpp"
 
-#include "pulsarlm/kernels/mma.cuh"
+#include "mma.cuh"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>

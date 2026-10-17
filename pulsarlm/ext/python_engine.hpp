@@ -13,6 +13,7 @@
 
 #include "pulsarlm/engine.hpp"
 #include "pulsarlm/eviction.hpp"
+#include "pulsarlm/model/dense_config.hpp"
 #include "pulsarlm/model/gemma4.hpp"
 #include "pulsarlm/model/qwen3_5.hpp"
 #include "pulsarlm/model/qwen3_5_moe.hpp"
@@ -23,23 +24,16 @@
 
 namespace pulsarlm {
 
+// architecture is "qwen2", "qwen3" or "llama".
 struct model_config {
     std::string architecture;
-    std::int64_t n_layers;
-    std::int64_t n_heads;
-    std::int64_t n_kv_heads;
-    std::int64_t head_dim;
-    std::int64_t hidden;
-    std::int64_t intermediate;
-    std::int64_t vocab_size;
-    rope_parameters rope;
-    double rms_eps;
+    dense_config dense;
 };
 
 using any_model_config = std::
     variant<model_config, gemma4_config, qwen3_5_config, qwen3_5_moe_config, qwen4_exp_config>;
 
-// A model_config's architecture is "qwen2", "qwen3" or "llama". weights use HF naming and are on the engine's device.
+// weights carry Hugging Face's names and are on the engine's device.
 std::unique_ptr<Model>
 make_model(const any_model_config& config, const std::unordered_map<std::string, at::Tensor>& weights);
 

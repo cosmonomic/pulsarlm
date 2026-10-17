@@ -220,7 +220,7 @@ at::Tensor Qwen3_5MoeModel::deltanet(
         c.linear_n_key_heads
     );
     at::Tensor z = at::linear(h, w.in_proj_z).view(core.sizes());
-    at::Tensor gated = gated_rmsnorm_cuda(core, z, w.norm, c.rms_norm_eps);
+    at::Tensor gated = gated_rmsnorm_cuda(core, z, w.norm, c.rms_norm_eps, gate_activation::silu);
     return at::linear(gated.view({ntok, c.linear_n_value_heads * c.linear_value_head_dim}), w.out_proj);
 }
 

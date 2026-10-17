@@ -47,8 +47,6 @@ struct page {
 // The K and V of a page of shape, [n_layers, page_size, n_kv_heads, head_dim] views of its bytes, or its one tensor as
 // both for values_only, and its index keys [n_layers, page_size, index_head_dim].
 kv page_tensors(const page& p, const page_shape& shape);
-// The bytes of the pool block a line takes: line_bytes rounded up to a power of two.
-std::size_t block_bytes(const page_shape& shape);
 
 // The digest that the page chains of an engine start from. model names the model and its weights version; with the
 // page shape of every KV layer (in KV layer order) and digest_function it covers everything that changes a
@@ -148,8 +146,9 @@ class kv_cache {
     void release_all(std::span<const std::vector<std::uint32_t>> line_ids) noexcept;
 
   public:
-    // shapes holds one page shape per KV layer, each with n_layers 1 and one dtype for all. The pool takes pool_bytes.
-    // The host copies sync hands the store come from a host_page_pool of host_page_bytes. store outlives the cache.
+    // shapes holds one page shape per KV layer, each with n_layers 1 and one dtype for all. The pool takes pool_bytes;
+    // throws std::invalid_argument when that holds no line of every layer. The host copies sync hands the store come
+    // from a host_page_pool of host_page_bytes. store outlives the cache.
     kv_cache(
         std::span<const page_shape> shapes,
         std::size_t pool_bytes,

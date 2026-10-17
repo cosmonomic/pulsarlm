@@ -32,22 +32,6 @@ void check_tokens(std::span<const std::int64_t> tokens, std::size_t vocab_size) 
     }
 }
 
-void check_kv_cache(const engine_config& config, std::span<const page_shape> shapes) {
-    std::vector<std::size_t> blocks;
-    for (const page_shape& shape : shapes) {
-        blocks.push_back(block_bytes(shape));
-    }
-    if (std::size_t needed = min_pool_bytes(blocks); config.kv_cache_bytes < needed) {
-        throw std::invalid_argument(
-            std::format(
-                "a KV cache of {} bytes holds no line of every KV layer; a line of each takes {} bytes",
-                config.kv_cache_bytes,
-                needed
-            )
-        );
-    }
-}
-
 void check_attention(const engine_config& config, std::span<const kv_layer> layers) {
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
         if (layers[layer].state) {
@@ -66,10 +50,37 @@ void check_attention(const engine_config& config, std::span<const kv_layer> laye
     }
 }
 
+void validate(const request& r, std::size_t page_size, std::size_t vocab_size) {
+    if (r.initial_state.tail.size() >= page_size) {
+        throw std::invalid_argument(
+            std::format(
+                "the initial state's tail holds {} tokens; it must be shorter than a page ({})",
+                r.initial_state.tail.size(),
+                page_size
+            )
+        );
+    }
+    if (r.initial_state.tail.empty() && r.tokens.empty()) {
+        throw std::invalid_argument("the request has no token to forward");
+    }
+    check_tokens(r.initial_state.tail, vocab_size);
+    check_tokens(r.tokens, vocab_size);
+    if (r.eviction.n_working < 1) {
+        throw std::invalid_argument("eviction.n_working must be at least 1");
+    }
+    if (r.eviction.cycle_tokens < 1) {
+        throw std::invalid_argument("eviction.cycle_tokens must be at least 1");
+    }
+    if (!(r.eviction.attention_mass_decay > 0.0 && r.eviction.attention_mass_decay <= 1.0)) {
+        throw std::invalid_argument(
+            std::format("eviction.attention_mass_decay {} is outside (0, 1]", r.eviction.attention_mass_decay)
+        );
+    }
+}
+
 kv_cache make_cache(const engine_config& config, std::span<const kv_layer> layers, page_store& store) {
     check_attention(config, layers);
     std::vector<page_shape> shapes = page_shapes(config, layers);
-    check_kv_cache(config, shapes);
     return kv_cache(shapes, config.kv_cache_bytes, config.host_page_bytes, config.device, store);
 }
 
@@ -105,34 +116,6 @@ std::vector<page_shape> page_shapes(const engine_config& config, std::span<const
         );
     }
     return shapes;
-}
-
-void validate(const request& r, std::size_t page_size, std::size_t vocab_size) {
-    if (r.initial_state.tail.size() >= page_size) {
-        throw std::invalid_argument(
-            std::format(
-                "the initial state's tail holds {} tokens; it must be shorter than a page ({})",
-                r.initial_state.tail.size(),
-                page_size
-            )
-        );
-    }
-    if (r.initial_state.tail.empty() && r.tokens.empty()) {
-        throw std::invalid_argument("the request has no token to forward");
-    }
-    check_tokens(r.initial_state.tail, vocab_size);
-    check_tokens(r.tokens, vocab_size);
-    if (r.eviction.n_working < 1) {
-        throw std::invalid_argument("eviction.n_working must be at least 1");
-    }
-    if (r.eviction.cycle_tokens < 1) {
-        throw std::invalid_argument("eviction.cycle_tokens must be at least 1");
-    }
-    if (!(r.eviction.attention_mass_decay > 0.0 && r.eviction.attention_mass_decay <= 1.0)) {
-        throw std::invalid_argument(
-            std::format("eviction.attention_mass_decay {} is outside (0, 1]", r.eviction.attention_mass_decay)
-        );
-    }
 }
 
 engine::engine(std::unique_ptr<Model> model, const engine_config& config, std::unique_ptr<page_store>&& store)

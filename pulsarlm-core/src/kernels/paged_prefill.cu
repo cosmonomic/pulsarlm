@@ -1,7 +1,7 @@
 #include "attn_common.cuh"
 
-#include "pulsarlm/kernels/attn_tuning.hpp"
-#include "pulsarlm/kernels/paged_prefill.cuh"
+#include "attn_tuning.hpp"
+#include "paged_prefill.cuh"
 #include "pulsarlm/ops.hpp"
 
 #include <ATen/ATen.h>
@@ -149,9 +149,7 @@ at::Tensor attn_prefill_cuda(
     const std::optional<at::Tensor>& k_norm_weight,
     const std::optional<at::Tensor>& mass,
     const std::optional<at::Tensor>& cu_view_pages,
-    const std::optional<at::Tensor>& attention_mass_decay,
-    double mass_length_gain,
-    const std::optional<at::Tensor>& lse_capture
+    const std::optional<at::Tensor>& attention_mass_decay
 ) {
     const auto batch = attn::paged_attn_batch(
         "attn_prefill",
@@ -168,9 +166,7 @@ at::Tensor attn_prefill_cuda(
         k_norm_weight,
         mass,
         cu_view_pages,
-        attention_mass_decay,
-        mass_length_gain,
-        lse_capture
+        attention_mass_decay
     );
     return paged_prefill(batch);
 }

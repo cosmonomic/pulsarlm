@@ -128,13 +128,13 @@ dense_output dense_forward(const weights& w, const at::Tensor& tokens) {
 }
 
 // Layer layer's page mass of a step forwarding the queries at positions [first, last): each query's attention weights,
-// graded by the decay over the step's later queries and stated against its own key count, summed over queries,
-// averaged over heads and maxed over each page's slots.
+// graded by the decay over the step's later queries, summed over queries, averaged over heads and maxed over each
+// page's slots.
 at::Tensor dense_page_mass(const dense_output& dense, std::int64_t layer, std::int64_t first, std::int64_t last) {
     std::int64_t view_pages = static_cast<std::int64_t>(view_lines.size());
     auto slot_mass = at::zeros({view_pages * page_size, n_heads}, cuda(at::kFloat));
     for (std::int64_t p = first; p < last; p++) {
-        double graded = mass_decay * std::pow(1.0 - mass_decay, static_cast<double>(last - 1 - p)) * (p + 1);
+        double graded = mass_decay * std::pow(1.0 - mass_decay, static_cast<double>(last - 1 - p));
         auto weights = dense.attention[layer].select(1, p).narrow(1, 0, last).t();
         slot_mass.narrow(0, 0, last).add_(weights * graded);
     }
@@ -176,15 +176,15 @@ double max_relative_error(const at::Tensor& got, const at::Tensor& expected) {
 void check_against_dense(at::ScalarType dtype, double tolerance) {
     weights w(dtype);
     pulsarlm::Qwen3Model model(
-        n_layers,
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        hidden,
-        intermediate,
-        vocab,
-        {.theta = rope_theta},
-        rms_eps,
+        pulsarlm::dense_config{
+            .vocab_size = vocab,
+            .n_layers = n_layers,
+            .n_heads = n_heads,
+            .n_kv_heads = n_kv_heads,
+            .head_dim = head_dim,
+            .rope = {.theta = rope_theta},
+            .rms_norm_eps = rms_eps,
+        },
         w.named
     );
     std::vector<pulsarlm::kv> kv;

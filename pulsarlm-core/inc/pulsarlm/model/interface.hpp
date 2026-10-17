@@ -42,27 +42,25 @@ struct kv {
     at::Tensor index_keys;
 };
 
-// One scheduler group's query tokens + KV placement + attention descriptor.
-// tokens are the group's tokens, concatenated across the group's sequences. Every KV
-// layer has its own view of each sequence: row l of pos holds each token's view index
-// in KV layer l's view, and each KV layer's page_tables row s lists the lines of
-// sequence s's view pages in that layer; a new token is written into its view page's
-// line, at its view index. A prefill group carries cu_seqlens_q; a decode group, whose
-// sequences forward one token each, leaves it undefined.
+// The tokens of one group of a step, concatenated across the group's sequences, and where they sit. Every KV layer has
+// its own view of each sequence: a new token is written into its view page's line, at its view index. A prefill group
+// carries cu_seqlens_q; a decode group, whose sequences forward one token each, leaves it undefined.
 struct GroupBatch {
     at::Tensor tokens;
-    at::Tensor pos;  // int64 [n_kv_layers, ntok]
-    // int32 [n_kv_layers, num_seqs, max_pages]. A recurrent layer's row holds the line whose state the forward starts
-    // from and updates in place, then the line it writes the state after page_end_tokens[s] of the sequence's tokens
-    // into.
+    // int64 [n_kv_layers, ntok]: each token's view index in KV layer l's view.
+    at::Tensor pos;
+    // int32 [n_kv_layers, num_seqs, max_pages]: the lines of sequence s's view pages in KV layer l. A recurrent layer's
+    // row holds the line whose state the forward starts from and updates in place, then the line it writes the state
+    // after page_end_tokens[s] of the sequence's tokens into.
     at::Tensor page_tables;
-    // int32 [num_seqs], defined when a KV layer is recurrent: the number of sequence s's tokens in the group whose last
-    // ends its newest full page, 0 when none of them ends a page.
+    // int32 [num_seqs]: the number of sequence s's tokens in the group whose last ends its newest full page, 0 when none
+    // of them ends a page.
     at::Tensor page_end_tokens;
-    at::Tensor cu_seqlens_q;  // int32 [num_seqs + 1], defined iff prefill
+    // int32 [num_seqs + 1]; prefill groups only.
+    at::Tensor cu_seqlens_q;
     // int32 [n_kv_layers, num_seqs]: the keys in sequence s's view in KV layer l, the group's tokens included.
     at::Tensor key_counts;
-    // int32 [num_seqs, 3], the RoPE position of each key by its view index (see attn_decode_cuda). pos holds each
+    // int32 [num_seqs, 3]: the RoPE position of each key by its view index (see attn_decode_cuda). pos holds each
     // query's position under the same layout.
     at::Tensor rope_layout;
     // int32 [n_kv_layers, num_seqs + 1], defined when the forward measures attention mass: sequence s's view pages in
@@ -70,66 +68,40 @@ struct GroupBatch {
     // keys fill.
     at::Tensor cu_view_pages;
     // Per KV layer, fp32 [total_view_pages of the layer], zeroed by the caller, or undefined for a layer that measures
-    // no mass. The forward sets each view page's mass: the weight the group's queries gave its keys, as the attention
-    // ops scale it, averaged over query heads, then maxed over the page's slots and over the attention layers reading
-    // the KV layer.
+    // no mass. The forward sets each view page's mass: the weight the group's queries gave its keys, each query's
+    // weight scaled as an EMA step at its sequence's attention_mass_decay, averaged over query heads, then maxed over
+    // the page's slots and over the attention layers reading the KV layer.
     std::vector<at::Tensor> page_mass;
-    // fp32 [num_seqs] in the group's row order: each sequence's attention-mass EMA
-    // gain alpha, which the attention kernels index by sequence. Per request, so one
-    // batched forward may carry several rates.
+    // fp32 [num_seqs], defined with cu_view_pages: each sequence's EMA rate.
     at::Tensor attention_mass_decay;
-    // TOKENS: the length the accumulated mass is stated against. <= 0 states it
-    // against each query's own attended key count, which only the attention op can
-    // read. Engine-level, so one value serves every sequence in the group.
-    double mass_length_gain = 0.0;
     // int64 [n]: the rows whose logits the forward returns, in order. Undefined returns every row's.
     at::Tensor logit_rows;
 
     bool is_prefill() const {
-        return this->cu_seqlens_q.defined();
+        return cu_seqlens_q.defined();
     }
 };
 
-// A scheduler step's two groups; either may be absent.
+// A step's two groups; either may be absent.
 struct StepBatch {
     std::optional<GroupBatch> prefill;
     std::optional<GroupBatch> decode;
 };
 
-// Per-group logits [ntok, vocab] (in the model dtype) for the present groups.
+// Each present group's logits [rows, vocab] in the model's dtype.
 struct StepLogits {
     std::optional<at::Tensor> prefill;
     std::optional<at::Tensor> decode;
 };
 
-// tokens + KV + batch -> logits.
-struct Model {
+class Model {
+  public:
+    virtual ~Model() = default;
+
     // The layers that keep KV, in the order forward takes their lines. A layer reading another layer's KV is not one.
     virtual std::vector<kv_layer> kv_layers() const = 0;
-
     // lines holds one kv per entry of kv_layers().
     virtual StepLogits forward(const StepBatch& batch, std::span<const kv> lines) = 0;
-
-    // Pre-RoPE query capture for QK-attention recall. set_capture_layers names the
-    // attention layers whose pre-RoPE Q the next forward should stash; after a
-    // forward, captured_q(is_prefill, layer) returns that group's pre-RoPE Q
-    // [ntok, n_heads, head_dim] in the group's token order (an undefined tensor
-    // when the layer was not captured or the group was absent this step). Default:
-    // no capture (Q discarded).
-    virtual bool supports_capture() const {
-        return false;
-    }
-    virtual void set_capture_layers(const std::vector<int64_t>& layers) {}
-    virtual at::Tensor captured_q(bool is_prefill, int64_t layer) const {
-        return {};
-    }
-    // That group's per-(query row, query head) softmax denominator for the same
-    // layer, fp32 [ntok, n_heads]; undefined when the layer was not captured.
-    virtual at::Tensor captured_lse(bool is_prefill, int64_t layer) const {
-        return {};
-    }
-
-    virtual ~Model() = default;
 };
 
 }  // namespace pulsarlm

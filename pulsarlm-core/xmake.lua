@@ -8,7 +8,6 @@ add_ldflags("-flto=auto")
 add_shflags("-flto=auto")
 
 option("torch_cmake_prefix", {default = "", description = "Torch's CMake prefix path, used to configure libtorch."})
-option("prof", {default = false, description = "Compile the PULSARLM_PROF phase timers into the engine."})
 option("tests", {default = true, description = "Build the Catch2 test binaries."})
 option("cuda_arch", {default = "native", description = "Comma-separated GPU architectures the CUDA kernels are compiled for, such as sm_89,sm_120,compute_120."})
 option("digest", {default = "sha256", values = {"sha256", "blake3"}, description = "Hash function behind page digests."})
@@ -45,9 +44,6 @@ target("pulsarlm_core")
         add_packages("openssl3")
     end
     add_defines("PULSARLM_DIGEST_FUNCTION=\"$(digest)\"", {public = true})
-    if has_config("prof") then
-        add_defines("PULSARLM_PROF", {public = true})
-    end
 target_end()
 
 if has_config("tests") then

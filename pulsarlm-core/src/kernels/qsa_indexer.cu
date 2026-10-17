@@ -1,6 +1,6 @@
 #include "attn_common.cuh"
 
-#include "pulsarlm/kernels/attn_tiles.cuh"
+#include "attn_tiles.cuh"
 #include "pulsarlm/ops.hpp"
 
 #include <ATen/ATen.h>

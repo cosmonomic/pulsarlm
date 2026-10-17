@@ -13,7 +13,9 @@ namespace pulsarlm {
 namespace {
 
 std::size_t order_of(std::size_t bytes, std::size_t min_block_bytes) {
-    return static_cast<std::size_t>(std::countr_zero(std::bit_ceil(std::max(bytes, min_block_bytes)) / min_block_bytes));
+    return static_cast<std::size_t>(
+        std::countr_zero(std::bit_ceil(std::max(bytes, min_block_bytes)) / min_block_bytes)
+    );
 }
 
 }  // namespace
@@ -81,8 +83,7 @@ host_page_pool::host_page_pool(std::size_t capacity_bytes, std::size_t largest_b
     );
 }
 
-std::optional<at::Tensor> host_page_pool::allocate(std::int64_t elements, at::ScalarType dtype) {
-    const std::size_t bytes = static_cast<std::size_t>(elements) * c10::elementSize(dtype);
+std::optional<at::Tensor> host_page_pool::allocate(std::size_t bytes) {
     const std::size_t order = order_of(bytes, min_block_bytes);
     if (order >= state->free_blocks.size()) {
         return std::nullopt;
@@ -97,12 +98,12 @@ std::optional<at::Tensor> host_page_pool::allocate(std::int64_t elements, at::Sc
     }
     return at::from_blob(
         state->data + *offset,
-        {elements},
+        {static_cast<std::int64_t>(bytes)},
         [shared = state, freed = *offset, order](void*) {
             std::lock_guard lock(shared->mutex);
             shared->give_back(freed, order);
         },
-        at::TensorOptions().dtype(dtype)
+        at::TensorOptions().dtype(at::kByte)
     );
 }
 

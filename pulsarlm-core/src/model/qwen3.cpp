@@ -1,13 +1,13 @@
 #include "pulsarlm/model/qwen3.hpp"
 
-#include "pulsarlm/ops.hpp"  // rmsnorm_cuda
-#include "pulsarlm/model/paged_forward.hpp"  // rope_q, paged_attention, paged_group_forward
+#include "pulsarlm/model/paged_forward.hpp"
+#include "pulsarlm/ops.hpp"
 
 #include <ATen/ATen.h>
-#include <ATen/Functions.h>
 
 #include <cmath>
-#include <optional>
+#include <format>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -15,173 +15,92 @@ namespace pulsarlm {
 
 namespace {
 
-at::Tensor need(const c10::Dict<std::string, at::Tensor>& w, const std::string& name) {
-    TORCH_CHECK(w.contains(name), "Qwen3Model: missing weight '", name, "'");
-    return w.at(name);
+at::Tensor need(const c10::Dict<std::string, at::Tensor>& weights, const std::string& name) {
+    if (!weights.contains(name)) {
+        throw std::invalid_argument(std::format("Qwen3Model: missing weight {:?}", name));
+    }
+    return weights.at(name);
 }
 
 }  // namespace
 
-Qwen3Model::Qwen3Model(
-    int64_t n_layers,
-    int64_t n_heads,
-    int64_t n_kv_heads,
-    int64_t head_dim,
-    int64_t hidden,
-    int64_t intermediate,
-    int64_t vocab,
-    rope_parameters rope,
-    double rms_eps,
-    c10::Dict<std::string, at::Tensor> weights
-)
-: n_layers(n_layers),
-  n_heads(n_heads),
-  n_kv_heads(n_kv_heads),
-  head_dim(head_dim),
-  hidden(hidden),
-  intermediate(intermediate),
-  vocab(vocab),
-  rope(rope),
-  rms_eps(rms_eps),
-  scale(1.0 / std::sqrt(static_cast<double>(head_dim))),
+Qwen3Model::Qwen3Model(dense_config config, const c10::Dict<std::string, at::Tensor>& weights)
+: config(std::move(config)),
   embed_tokens(need(weights, "model.embed_tokens.weight")),
-  norm_weight(need(weights, "model.norm.weight")) {
-    // Untied lm_head when the checkpoint ships one, else tied to the token embedding.
-    if (weights.contains("lm_head.weight")) {
-        this->lm_head = weights.at("lm_head.weight");
-    }
-    this->layers.reserve(n_layers);
-    for (int64_t i = 0; i < n_layers; ++i) {
-        const std::string p = "model.layers." + std::to_string(i) + ".";
-        this->layers.push_back(
+  norm(need(weights, "model.norm.weight")) {
+    lm_head = weights.contains("lm_head.weight") ? weights.at("lm_head.weight") : embed_tokens;
+    for (std::int64_t layer = 0; layer < this->config.n_layers; layer++) {
+        const std::string p = "model.layers." + std::to_string(layer) + ".";
+        layers.push_back(
             LayerWeights{
-                need(weights, p + "input_layernorm.weight"),
-                need(weights, p + "post_attention_layernorm.weight"),
-                need(weights, p + "self_attn.q_proj.weight"),
-                need(weights, p + "self_attn.k_proj.weight"),
-                need(weights, p + "self_attn.v_proj.weight"),
-                need(weights, p + "self_attn.o_proj.weight"),
-                need(weights, p + "self_attn.q_norm.weight"),
-                need(weights, p + "self_attn.k_norm.weight"),
-                need(weights, p + "mlp.gate_proj.weight"),
-                need(weights, p + "mlp.up_proj.weight"),
-                need(weights, p + "mlp.down_proj.weight")
+                .input_layernorm = need(weights, p + "input_layernorm.weight"),
+                .post_attention_layernorm = need(weights, p + "post_attention_layernorm.weight"),
+                .q_proj = need(weights, p + "self_attn.q_proj.weight"),
+                .k_proj = need(weights, p + "self_attn.k_proj.weight"),
+                .v_proj = need(weights, p + "self_attn.v_proj.weight"),
+                .o_proj = need(weights, p + "self_attn.o_proj.weight"),
+                .q_norm = need(weights, p + "self_attn.q_norm.weight"),
+                .k_norm = need(weights, p + "self_attn.k_norm.weight"),
+                .gate_proj = need(weights, p + "mlp.gate_proj.weight"),
+                .up_proj = need(weights, p + "mlp.up_proj.weight"),
+                .down_proj = need(weights, p + "mlp.down_proj.weight"),
             }
         );
     }
 }
 
-// Qwen3 block: bias-free QKV projection, per-head QK-Norm before RoPE, then RoPE +
-// paged attention and a SwiGLU MLP.
-at::Tensor Qwen3Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, std::span<const kv> lines) {
-    const LayerWeights& lw = this->layers[layer];
-    const int64_t ntok = x.size(0);
+std::vector<kv_layer> Qwen3Model::kv_layers() const {
+    return std::vector<kv_layer>(
+        config.n_layers,
+        kv_layer{
+            .n_kv_heads = static_cast<std::size_t>(config.n_kv_heads),
+            .head_dim = static_cast<std::size_t>(config.head_dim),
+            .n_q_heads = static_cast<std::size_t>(config.n_heads),
+        }
+    );
+}
 
-    auto h = rmsnorm_cuda(x, lw.input_layernorm, this->rms_eps);
-    auto q = at::linear(h, lw.q_proj_weight);
-    auto k = at::linear(h, lw.k_proj_weight);
-    auto v = at::linear(h, lw.v_proj_weight);
+at::Tensor
+Qwen3Model::attention(const at::Tensor& h, std::int64_t layer, const GroupBatch& g, std::span<const kv> lines) const {
+    const LayerWeights& w = layers[layer];
+    const dense_config& c = config;
+    const std::int64_t ntok = h.size(0);
 
-    // QK-Norm: per-head RMSNorm over head_dim, before RoPE. Reshape so the last
-    // axis is the per-head vector, then flatten q back for rope_q. The lines store K
-    // unrotated, as the paged ops' [tokens, n_kv_heads, head_dim].
-    q = rmsnorm_cuda(q.view({ntok, this->n_heads, this->head_dim}), lw.q_norm_weight, this->rms_eps)
-            .view({ntok, this->n_heads * this->head_dim});
-    k = rmsnorm_cuda(k.view({ntok, this->n_kv_heads, this->head_dim}), lw.k_norm_weight, this->rms_eps);
-
-    // Stash the post-QK-Norm, pre-RoPE Q for QK-attention recall.
-    // [ntok, n_heads, head_dim] in the group's token order.
-    if (this->capture_layers.count(layer)) {
-        at::Tensor q_pre = q.view({ntok, this->n_heads, this->head_dim}).detach();
-        (g.is_prefill() ? this->cap_prefill : this->cap_decode)[layer] = q_pre;
-    }
-
-    q = rope_q(q, g.pos.select(0, layer), this->n_heads, this->head_dim, this->rope);
-    v = v.view({ntok, this->n_kv_heads, this->head_dim}).contiguous();
-    // Capture the softmax denominator on the same layers as Q: the recall score needs
-    // the denominator the attention actually used, not one rebuilt over a subset.
-    at::Tensor lse;
-    if (this->capture_layers.count(layer)) {
-        lse = at::empty({ntok, this->n_heads}, at::device(x.device()).dtype(at::kFloat));
-    }
-    auto o = paged_attention(
+    at::Tensor q = rmsnorm_cuda(at::linear(h, w.q_proj).view({ntok, c.n_heads, c.head_dim}), w.q_norm, c.rms_norm_eps);
+    q = rope_q(q.view({ntok, c.n_heads * c.head_dim}), g.pos.select(0, layer), c.n_heads, c.head_dim, c.rope);
+    at::Tensor k = rmsnorm_cuda(
+        at::linear(h, w.k_proj).view({ntok, c.n_kv_heads, c.head_dim}),
+        w.k_norm,
+        c.rms_norm_eps
+    );
+    at::Tensor v = at::linear(h, w.v_proj).view({ntok, c.n_kv_heads, c.head_dim}).contiguous();
+    at::Tensor o = paged_attention(
         q,
         k,
         v,
         lines[layer],
         static_cast<std::size_t>(layer),
         g,
-        this->scale,
-        this->rope,
-        std::nullopt,
-        std::nullopt,
-        lse
+        1.0 / std::sqrt(static_cast<double>(c.head_dim)),
+        c.rope
     );
-    if (lse.defined()) {
-        (g.is_prefill() ? this->lse_prefill : this->lse_decode)[layer] = lse;
+    return at::linear(o.reshape({ntok, c.n_heads * c.head_dim}), w.o_proj);
+}
+
+at::Tensor Qwen3Model::group_forward(const GroupBatch& g, std::span<const kv> lines) const {
+    const double eps = config.rms_norm_eps;
+    at::Tensor x = embed_tokens.index_select(0, g.tokens);
+    for (std::int64_t layer = 0; layer < config.n_layers; layer++) {
+        const LayerWeights& w = layers[layer];
+        x = x + attention(rmsnorm_cuda(x, w.input_layernorm, eps), layer, g, lines);
+        at::Tensor h = rmsnorm_cuda(x, w.post_attention_layernorm, eps);
+        x = x + at::linear(at::silu(at::linear(h, w.gate_proj)) * at::linear(h, w.up_proj), w.down_proj);
     }
-
-    o = o.reshape({ntok, this->n_heads * this->head_dim});
-    x = x + at::linear(o, lw.o_proj_weight);
-
-    auto h2 = rmsnorm_cuda(x, lw.post_attention_layernorm, this->rms_eps);
-    auto gate = at::linear(h2, lw.gate_proj_weight);
-    auto up = at::linear(h2, lw.up_proj_weight);
-    x = x + at::linear(at::silu(gate) * up, lw.down_proj_weight);
-    return x;
-}
-
-at::Tensor Qwen3Model::head(at::Tensor x) {
-    x = rmsnorm_cuda(x, this->norm_weight, this->rms_eps);
-    // Logits in the weight dtype: untied head weight when present, else tied token
-    // embedding.
-    const at::Tensor& w = this->lm_head.has_value() ? *this->lm_head : this->embed_tokens;
-    return at::matmul(x, w.t());
-}
-
-std::vector<kv_layer> Qwen3Model::kv_layers() const {
-    return std::vector<kv_layer>(
-        this->n_layers,
-        kv_layer{
-            .n_kv_heads = static_cast<std::size_t>(this->n_kv_heads),
-            .head_dim = static_cast<std::size_t>(this->head_dim),
-            .n_q_heads = static_cast<std::size_t>(this->n_heads)
-        }
-    );
+    return at::matmul(rmsnorm_cuda(logit_inputs(x, g), norm, eps), lm_head.t());
 }
 
 StepLogits Qwen3Model::forward(const StepBatch& batch, std::span<const kv> lines) {
-    // Fresh capture each forward: clear both groups' stashes; block() refills the
-    // configured layers.
-    this->lse_prefill.clear();
-    this->lse_decode.clear();
-    this->cap_prefill.clear();
-    this->cap_decode.clear();
-    return paged_forward(batch, [&](const GroupBatch& g) {
-        return paged_group_forward(
-            this->embed_tokens,
-            g,
-            this->n_layers,
-            [&](at::Tensor x, int64_t layer) { return this->block(x, layer, g, lines); },
-            [&](at::Tensor x) { return this->head(x); }
-        );
-    });
-}
-
-void Qwen3Model::set_capture_layers(const std::vector<int64_t>& layers) {
-    this->capture_layers = std::unordered_set<int64_t>(layers.begin(), layers.end());
-}
-
-at::Tensor Qwen3Model::captured_q(bool is_prefill, int64_t layer) const {
-    const auto& cap = is_prefill ? this->cap_prefill : this->cap_decode;
-    auto it = cap.find(layer);
-    return it == cap.end() ? at::Tensor{} : it->second;
-}
-
-at::Tensor Qwen3Model::captured_lse(bool is_prefill, int64_t layer) const {
-    const auto& cap = is_prefill ? this->lse_prefill : this->lse_decode;
-    auto it = cap.find(layer);
-    return it == cap.end() ? at::Tensor{} : it->second;
+    return paged_forward(batch, [&](const GroupBatch& g) { return group_forward(g, lines); });
 }
 
 }  // namespace pulsarlm

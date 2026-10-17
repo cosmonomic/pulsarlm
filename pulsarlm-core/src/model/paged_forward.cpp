@@ -1,6 +1,6 @@
 #include "pulsarlm/model/paged_forward.hpp"
 
-#include "pulsarlm/ops.hpp"  // rope_cuda, write_kv_cuda, attn_prefill/decode_cuda
+#include "pulsarlm/ops.hpp"
 
 #include <ATen/ATen.h>
 
@@ -17,9 +17,8 @@ at::Tensor rope_q(
 ) {
     const int64_t ntok = q_in.size(0);
     // rope_cuda requires [heads, seq, head_dim].
-    auto q = q_in.view({ntok, n_q_heads, head_dim}).transpose(0, 1).contiguous();
-    q = rope_cuda(q, pos, rope);
-    return q.transpose(0, 1).contiguous();  // transpose to paged layout [ntok, n_q_heads, head_dim]
+    at::Tensor by_head = q_in.view({ntok, n_q_heads, head_dim}).transpose(0, 1).contiguous();
+    return rope_cuda(by_head, pos, rope).transpose(0, 1).contiguous();
 }
 
 at::Tensor paged_attention(
@@ -32,8 +31,7 @@ at::Tensor paged_attention(
     double scale,
     const rope_parameters& rope,
     std::optional<int64_t> sliding_window,
-    const std::optional<at::Tensor>& k_norm_weight,
-    const at::Tensor& lse_capture
+    const std::optional<at::Tensor>& k_norm_weight
 ) {
     const at::Tensor& k_pool = lines.k;
     const at::Tensor& v_pool = lines.v;
@@ -51,7 +49,6 @@ at::Tensor paged_attention(
             key_counts
         );
     }
-    const auto lse = lse_capture.defined() ? std::optional<at::Tensor>(lse_capture) : std::nullopt;
     std::optional<at::Tensor> mass, cu_view_pages, mass_decay;
     at::Tensor page_mass = g.page_mass.empty() ? at::Tensor() : g.page_mass[kv_layer];
     if (page_mass.defined()) {
@@ -59,41 +56,41 @@ at::Tensor paged_attention(
         cu_view_pages = g.cu_view_pages.select(0, layer);
         mass_decay = g.attention_mass_decay;
     }
-    at::Tensor o = g.is_prefill() ? attn_prefill_cuda(
-                                        q,
-                                        k_pool,
-                                        v_pool,
-                                        page_tables,
-                                        g.cu_seqlens_q,
-                                        key_counts,
-                                        g.rope_layout,
-                                        rope,
-                                        scale,
-                                        sliding_window,
-                                        k_norm_weight,
-                                        mass,
-                                        cu_view_pages,
-                                        mass_decay,
-                                        g.mass_length_gain,
-                                        lse
-                                    )
-                                  : attn_decode_cuda(
-                                        q,
-                                        k_pool,
-                                        v_pool,
-                                        page_tables,
-                                        key_counts,
-                                        g.rope_layout,
-                                        rope,
-                                        scale,
-                                        sliding_window,
-                                        k_norm_weight,
-                                        mass,
-                                        cu_view_pages,
-                                        mass_decay,
-                                        g.mass_length_gain,
-                                        lse
-                                    );
+    at::Tensor o;
+    if (g.is_prefill()) {
+        o = attn_prefill_cuda(
+            q,
+            k_pool,
+            v_pool,
+            page_tables,
+            g.cu_seqlens_q,
+            key_counts,
+            g.rope_layout,
+            rope,
+            scale,
+            sliding_window,
+            k_norm_weight,
+            mass,
+            cu_view_pages,
+            mass_decay
+        );
+    } else {
+        o = attn_decode_cuda(
+            q,
+            k_pool,
+            v_pool,
+            page_tables,
+            key_counts,
+            g.rope_layout,
+            rope,
+            scale,
+            sliding_window,
+            k_norm_weight,
+            mass,
+            cu_view_pages,
+            mass_decay
+        );
+    }
     if (mass) {
         at::maximum_out(page_mass, page_mass, mass->mean(-1).amax(-1));
     }
@@ -128,29 +125,15 @@ at::Tensor logit_inputs(const at::Tensor& x, const GroupBatch& g) {
     return g.logit_rows.defined() ? x.index_select(0, g.logit_rows) : x;
 }
 
-at::Tensor paged_group_forward(
-    const at::Tensor& embed,
-    const GroupBatch& g,
-    int64_t n_layers,
-    const std::function<at::Tensor(at::Tensor, int64_t)>& layer_fn,
-    const std::function<at::Tensor(at::Tensor)>& head_fn
-) {
-    auto x = embed.index_select(0, g.tokens);  // [ntok, hidden]
-    for (int64_t layer = 0; layer < n_layers; ++layer) {
-        x = layer_fn(x, layer);
+StepLogits paged_forward(const StepBatch& batch, const std::function<at::Tensor(const GroupBatch&)>& group_forward) {
+    StepLogits logits;
+    if (batch.prefill) {
+        logits.prefill = group_forward(*batch.prefill);
     }
-    return head_fn(logit_inputs(x, g));
-}
-
-StepLogits paged_forward(const StepBatch& batch, const std::function<at::Tensor(const GroupBatch&)>& group_fn) {
-    StepLogits out;
-    if (batch.prefill.has_value()) {
-        out.prefill = group_fn(*batch.prefill);
+    if (batch.decode) {
+        logits.decode = group_forward(*batch.decode);
     }
-    if (batch.decode.has_value()) {
-        out.decode = group_fn(*batch.decode);
-    }
-    return out;
+    return logits;
 }
 
 }  // namespace pulsarlm

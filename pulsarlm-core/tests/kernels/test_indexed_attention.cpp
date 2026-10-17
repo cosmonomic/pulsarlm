@@ -120,8 +120,7 @@ void reference(
                 }
             }
             auto attended = at::tensor(keys).to(at::kCUDA);
-            const double graded = kAlpha * std::pow(1.0 - kAlpha, static_cast<double>(view.seq_q - 1 - r)) *
-                static_cast<double>(keys.size());
+            const double graded = kAlpha * std::pow(1.0 - kAlpha, static_cast<double>(view.seq_q - 1 - r));
             for (int64_t h = 0; h < q.size(1); ++h) {
                 const int64_t g = h / group;
                 auto w = at::softmax(
@@ -174,8 +173,7 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
         kBlockSize,
         mass,
         b.cu_view_pages,
-        b.decay,
-        0.0
+        b.decay
     );
     at::Tensor expected_o = at::zeros({b.total_q, n_q, head_dim}, opts.dtype(at::kFloat));
     at::Tensor expected_mass = mass_of();
@@ -199,8 +197,7 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
         std::nullopt,
         dense_mass,
         b.cu_view_pages,
-        b.decay,
-        0.0
+        b.decay
     );
     at::Tensor all_mass = mass_of();
     at::Tensor all = pulsarlm::attn_indexed_cuda(
@@ -217,8 +214,7 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
         kBlockSize,
         all_mass,
         b.cu_view_pages,
-        b.decay,
-        0.0
+        b.decay
     );
     // The scalar kernel sums each output across threads with atomicAdd, and both ops add the mass with atomicAdd, in no
     // fixed order.

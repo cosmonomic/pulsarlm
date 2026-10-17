@@ -38,9 +38,7 @@ template <typename scalar_t> struct PagedAttnParams {
     float* mass;  // [total_view_pages, page_size, n_q_heads]; null skips the mass pass
     const int32_t* cu_view_pages;  // [num_seqs + 1]
     const float* mass_decay;  // [num_seqs]
-    float mass_length_gain;
     scalar_t* o;  // [total_q, n_q_heads, head_dim]
-    float* lse;  // [total_q, n_q_heads]; null when not captured
     int num_seqs;
     int n_q_heads;
     int n_kv_heads;

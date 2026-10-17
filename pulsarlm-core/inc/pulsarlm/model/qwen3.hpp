@@ -1,105 +1,52 @@
 #pragma once
 
+#include "pulsarlm/model/dense_config.hpp"
 #include "pulsarlm/model/interface.hpp"
-#include "pulsarlm/rope.hpp"
-
-#include <ATen/core/Tensor.h>
 
 #include <ATen/core/Dict.h>
+#include <ATen/core/Tensor.h>
 
 #include <cstdint>
-#include <optional>
 #include <span>
 #include <string>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
-// Qwen3 dense transformer forward in C++, the sibling of Qwen2Model over the same
-// paged CUDA ops. Qwen3 differs from Qwen2.5 in two per-layer deltas:
-//   - No QKV bias: q/k/v projections are bias-free.
-//   - QK-Norm: per-head RMSNorm over head_dim on Q and K, applied before RoPE
-//     (weights self_attn.q_norm.weight / k_norm.weight, each [head_dim]).
-// head_dim is explicit in the config (may differ from hidden/n_heads); RoPE theta
-// comes from config. Everything else (GQA, SwiGLU MLP, pre-norm RMSNorm, final
-// norm, tied lm_head, paged-attention ops) matches Qwen2Model.
-//
-// Engine-internal plain C++, not TorchBind-exposed.
+// Qwen3 decoder over the paged CUDA ops: pre-norm RMSNorm, bias-free attention projections with an RMSNorm over each
+// query and key head before RoPE, and a SwiGLU MLP. The head is lm_head.weight when the checkpoint has one, else
+// model.embed_tokens.weight.
 
 namespace pulsarlm {
 
-struct Qwen3Model : Model {
-    // Config scalars + a named-weight dict (HF/Qwen3 naming) already on the lines'
-    // device/dtype. The ctor resolves every name to a tensor once into a per-layer
-    // struct. lm_head is the untied lm_head.weight when present, else tied to
-    // model.embed_tokens.weight.
-    Qwen3Model(
-        int64_t n_layers,
-        int64_t n_heads,
-        int64_t n_kv_heads,
-        int64_t head_dim,
-        int64_t hidden,
-        int64_t intermediate,
-        int64_t vocab,
-        rope_parameters rope,
-        double rms_eps,
-        c10::Dict<std::string, at::Tensor> weights
-    );
-
-    std::vector<kv_layer> kv_layers() const override;
-    StepLogits forward(const StepBatch& batch, std::span<const kv> lines) override;
-
-    bool supports_capture() const override {
-        return true;
-    }
-    void set_capture_layers(const std::vector<int64_t>& layers) override;
-    at::Tensor captured_q(bool is_prefill, int64_t layer) const override;
-    at::Tensor captured_lse(bool is_prefill, int64_t layer) const override;
-
-  private:
-    // One decoder layer's tensors, resolved from the weight dict at construction.
-    // No QKV biases; q_norm/k_norm are the QK-Norm weights.
+class Qwen3Model : public Model {
     struct LayerWeights {
         at::Tensor input_layernorm;
         at::Tensor post_attention_layernorm;
-        at::Tensor q_proj_weight;
-        at::Tensor k_proj_weight;
-        at::Tensor v_proj_weight;
-        at::Tensor o_proj_weight;
-        at::Tensor q_norm_weight;  // [head_dim] per-head RMSNorm on Q
-        at::Tensor k_norm_weight;  // [head_dim] per-head RMSNorm on K
-        at::Tensor gate_proj_weight;
-        at::Tensor up_proj_weight;
-        at::Tensor down_proj_weight;
+        at::Tensor q_proj;
+        at::Tensor k_proj;
+        at::Tensor v_proj;
+        at::Tensor o_proj;
+        at::Tensor q_norm;
+        at::Tensor k_norm;
+        at::Tensor gate_proj;
+        at::Tensor up_proj;
+        at::Tensor down_proj;
     };
 
-    at::Tensor block(at::Tensor x, int64_t layer, const GroupBatch& g, std::span<const kv> lines);
-    at::Tensor head(at::Tensor x);
-
-    int64_t n_layers;
-    int64_t n_heads;
-    int64_t n_kv_heads;
-    int64_t head_dim;
-    int64_t hidden;
-    int64_t intermediate;
-    int64_t vocab;
-    rope_parameters rope;
-    double rms_eps;
-    double scale;  // 1 / sqrt(head_dim)
-    at::Tensor embed_tokens;  // [vocab, hidden]
-    std::optional<at::Tensor> lm_head;  // untied head weight, else tie embed_tokens
-    at::Tensor norm_weight;  // final RMSNorm
+    dense_config config;
+    at::Tensor embed_tokens;
+    at::Tensor lm_head;
+    at::Tensor norm;
     std::vector<LayerWeights> layers;
 
-    // Pre-RoPE Q capture (QK-attention recall). capture_layers is the set to stash;
-    // cap_prefill/cap_decode hold the current forward's per-layer pre-RoPE Q
-    // [ntok, n_heads, head_dim] per group, refilled every forward.
-    std::unordered_set<int64_t> capture_layers;
-    std::unordered_map<int64_t, at::Tensor> cap_prefill;
-    std::unordered_map<int64_t, at::Tensor> cap_decode;
-    // Softmax denominator of the same forward, same layers: fp32 [ntok, n_heads].
-    std::unordered_map<int64_t, at::Tensor> lse_prefill;
-    std::unordered_map<int64_t, at::Tensor> lse_decode;
+    at::Tensor attention(const at::Tensor& h, std::int64_t layer, const GroupBatch& g, std::span<const kv> lines) const;
+    at::Tensor group_forward(const GroupBatch& g, std::span<const kv> lines) const;
+
+  public:
+    // weights are on the lines' device and dtype.
+    Qwen3Model(dense_config config, const c10::Dict<std::string, at::Tensor>& weights);
+
+    std::vector<kv_layer> kv_layers() const override;
+    StepLogits forward(const StepBatch& batch, std::span<const kv> lines) override;
 };
 
 }  // namespace pulsarlm

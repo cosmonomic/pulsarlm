@@ -8,6 +8,7 @@
 #undef CHECK
 #include <catch2/catch_test_macros.hpp>
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -751,7 +752,7 @@ TEST_CASE("an indexed attention line keeps its index keys after K and V, stored 
     pulsarlm::page_shape indexed = shape;
     indexed.index_head_dim = 6;
     REQUIRE(pulsarlm::line_bytes(indexed) == pulsarlm::line_bytes(shape) + shape.page_size * 6 * 4);
-    REQUIRE(pulsarlm::block_bytes(indexed) == 1024);
+    REQUIRE(std::bit_ceil(pulsarlm::line_bytes(indexed)) == 1024);
     cache_fixture fixture(4, {}, host_bytes, {indexed});
     const pulsarlm::kv& lines = fixture.kv.tensors(0);
     REQUIRE((lines.index_keys.sizes().slice(1) == at::IntArrayRef{static_cast<std::int64_t>(shape.page_size), 6}));
@@ -799,7 +800,7 @@ TEST_CASE("a recurrent layer's line is one tensor of its state sizes and dtype, 
     REQUIRE(lines.k.is_same(lines.v));
     REQUIRE(lines.k.scalar_type() == at::kDouble);
     REQUIRE((lines.k.sizes().slice(1) == at::IntArrayRef{3, 5}));
-    REQUIRE(lines.k.stride(0) == static_cast<std::int64_t>(pulsarlm::block_bytes(state) / 8));
+    REQUIRE(lines.k.stride(0) == static_cast<std::int64_t>(std::bit_ceil(pulsarlm::line_bytes(state)) / 8));
 
     std::vector<line_ids> allocated = allocate_each(fixture.kv, 1).value();
     lines.k.select(0, allocated[1].front()).copy_(at::arange(15, at::kDouble).view({3, 5}));

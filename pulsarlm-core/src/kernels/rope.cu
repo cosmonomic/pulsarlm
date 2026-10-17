@@ -1,5 +1,5 @@
 #include "pulsarlm/ops.hpp"
-#include "pulsarlm/rope.hpp"
+#include "rope_tables.hpp"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>

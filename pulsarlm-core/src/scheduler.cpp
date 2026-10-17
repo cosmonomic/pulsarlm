@@ -47,7 +47,6 @@ GroupBatch to_device(const GroupBatch& host, at::Device device) {
         .rope_layout = to_device(host.rope_layout, device),
         .cu_view_pages = to_device(host.cu_view_pages, device),
         .attention_mass_decay = to_device(host.attention_mass_decay, device),
-        .mass_length_gain = host.mass_length_gain,
     };
 }
 
@@ -78,7 +77,118 @@ zero_page_mass(GroupBatch& on_device, const at::Tensor& host_cu_view_pages, cons
 
 }  // namespace
 
-std::vector<std::uint32_t> layer_view::remove(std::span<const std::size_t> indices) {
+// One KV layer's view of a sequence. A layer with pages has one line per view page: its full pages, then the pages of
+// tail and pending, each with the EMA of the attention mass it received, as of the last step that measured it, 0 for a
+// page never measured. A recurrent layer has no pages: its lines are the one its state is updated in, then the one a
+// step writes the state at its newest page end into.
+class scheduler::layer_view {
+  public:
+    std::vector<digest> pages;
+    std::vector<std::uint32_t> lines;
+    std::vector<float> density;
+
+    // Drops the full pages at the ascending view indices and returns their lines.
+    std::vector<std::uint32_t> remove(std::span<const std::size_t> indices);
+    void append_lines(std::span<const std::uint32_t> added);
+};
+
+// A request being served. Its tokens move from pending to tail as steps forward them, and the pages the tail fills
+// join every layer's view, the last of them head.
+class scheduler::sequence {
+    result_writer& writer;
+    std::uint64_t id;
+    sampling_params sampling;
+    std::uint64_t seed;
+    // Tokens sampled so far, each with its own draw of the seed's noise.
+    std::uint64_t draw_count = 0;
+    std::optional<std::size_t> max_tokens;
+    std::size_t generated = 0;
+    std::optional<digest> head;
+    std::vector<std::int64_t> tail;
+    std::vector<std::int64_t> pending;
+    // Per KV layer, whether it is recurrent; the scheduler's.
+    const std::vector<bool>& recurrent;
+    // One per KV layer.
+    std::vector<layer_view> layers;
+    // Whether the recurrent layers' second lines hold the state at head, which the store does not have yet.
+    bool state_pending = false;
+    // int32 [n_kv_layers, capacity] on the device. Columns past those of a layer's lines are unused.
+    at::Tensor table;
+    std::optional<exit_reason> exited;
+    // Set once the sequence leaves the running set.
+    std::optional<event> exit_event;
+    eviction_policy eviction;
+    // covered_count when the eviction cycle began.
+    std::size_t cycle_start = 0;
+    // The request's tokens forwarded so far, which the state covers: the initial state's tail, then the request's
+    // tokens, then sampled tokens.
+    std::size_t covered_count = 0;
+
+    sequence(request&& r, const std::vector<bool>& recurrent, result_writer& writer, at::Device device);
+
+    // The view index of the next token in KV layer layer's view.
+    std::size_t next_index(std::size_t layer, std::size_t page_size) const noexcept;
+    bool may_sample() const noexcept;
+    // Moves the first count pending tokens to tail, then the pages they complete to every layer with pages, and returns
+    // how many pages they complete.
+    std::size_t advance(std::size_t count, std::size_t page_size, const digest& root);
+    void start_cycle() noexcept;
+    // Whether forwarding token_count more tokens ends the eviction cycle.
+    bool ends_cycle(std::size_t token_count) const noexcept;
+    // The tokens the cycle can still forward: no more than its length allows, nor than the request will forward.
+    std::size_t cycle_tokens_left() const noexcept;
+    // The columns of table the lines take.
+    std::size_t table_width() const noexcept;
+    // Queues on stream the upload of the lines from column first_page on into table, all of them when table grows.
+    void upload_table(std::size_t first_page, cudaStream_t stream);
+    // One line per page the cycle's tokens fill, in each KV layer with pages. Called at the start of a cycle, with an
+    // empty tail.
+    std::size_t cycle_lines(std::size_t page_size) const noexcept;
+    // Per KV layer, the lines the sequence lacks to forward every token left in its cycle.
+    std::vector<std::size_t> missing_lines(std::size_t page_size) const;
+
+    friend class scheduler;
+    friend class batch;
+};
+
+// The tokens each running sequence forwards in one step, the model inputs for them, and the tokens sampled from the
+// step's logits.
+class scheduler::batch {
+    struct entry {
+        sequence* seq;
+        std::size_t token_count;
+        bool samples;
+        bool ends_cycle;
+    };
+
+    // decode_count decode entries first, each forwarding its sequence's only pending token.
+    std::vector<entry> entries;
+    std::size_t decode_count = 0;
+    // Pinned host tensors.
+    StepBatch inputs;
+    // Pinned host int64, one token per entry that samples, in entry order.
+    at::Tensor sampled;
+    // Pinned host fp32, defined for a group that measures attention mass: the page mass of each evictable KV layer in
+    // turn, laid out as the layer's row of the group's cu_view_pages.
+    at::Tensor decode_mass;
+    at::Tensor prefill_mass;
+
+    batch(std::span<sequence* const> running, std::size_t page_size, std::size_t prefill_tokens_per_step);
+
+    static GroupBatch make_group(std::span<const entry> group, std::size_t page_size, bool prefill);
+    static bool measures_mass(std::span<const entry> group) noexcept;
+    static at::Tensor page_tables(std::span<const entry> group, std::size_t n_kv_layers);
+    // Queues on stream the inputs' copies, the forward, the copies of the page mass of the evictable KV layers to the
+    // host, the sampling and the copy of the sampled tokens to the host.
+    void enqueue(Model& model, std::span<const kv> lines, const std::vector<bool>& evictable, cudaStream_t stream);
+    // Per KV layer, the attention mass the step gave each of entry index's view pages; empty for a layer that is not
+    // evictable. The entry's group measures mass.
+    std::vector<std::span<const float>> step_mass(std::size_t index, const std::vector<bool>& evictable) const;
+
+    friend class scheduler;
+};
+
+std::vector<std::uint32_t> scheduler::layer_view::remove(std::span<const std::size_t> indices) {
     std::vector<std::uint32_t> removed;
     std::size_t kept = 0;
     std::size_t next_removed = 0;
@@ -100,12 +210,12 @@ std::vector<std::uint32_t> layer_view::remove(std::span<const std::size_t> indic
     return removed;
 }
 
-void layer_view::append_lines(std::span<const std::uint32_t> added) {
+void scheduler::layer_view::append_lines(std::span<const std::uint32_t> added) {
     lines.insert(lines.end(), added.begin(), added.end());
     density.resize(lines.size(), 0.0f);
 }
 
-sequence::sequence(request&& r, const std::vector<bool>& recurrent, result_writer& writer, at::Device device)
+scheduler::sequence::sequence(request&& r, const std::vector<bool>& recurrent, result_writer& writer, at::Device device)
 : writer(writer),
   id(r.id),
   sampling(r.sampling),
@@ -131,15 +241,15 @@ sequence::sequence(request&& r, const std::vector<bool>& recurrent, result_write
     }
 }
 
-std::size_t sequence::next_index(std::size_t layer, std::size_t page_size) const noexcept {
+std::size_t scheduler::sequence::next_index(std::size_t layer, std::size_t page_size) const noexcept {
     return layers[layer].pages.size() * page_size + tail.size();
 }
 
-bool sequence::may_sample() const noexcept {
+bool scheduler::sequence::may_sample() const noexcept {
     return !max_tokens || generated < *max_tokens;
 }
 
-std::size_t sequence::advance(std::size_t count, std::size_t page_size, const digest& root) {
+std::size_t scheduler::sequence::advance(std::size_t count, std::size_t page_size, const digest& root) {
     assert(count <= pending.size());
     tail.insert(tail.end(), pending.begin(), pending.begin() + count);
     pending.erase(pending.begin(), pending.begin() + count);
@@ -163,15 +273,15 @@ std::size_t sequence::advance(std::size_t count, std::size_t page_size, const di
     return completed.size();
 }
 
-void sequence::start_cycle() noexcept {
+void scheduler::sequence::start_cycle() noexcept {
     cycle_start = covered_count;
 }
 
-bool sequence::ends_cycle(std::size_t token_count) const noexcept {
+bool scheduler::sequence::ends_cycle(std::size_t token_count) const noexcept {
     return covered_count + token_count - cycle_start >= eviction.cycle_tokens;
 }
 
-std::size_t sequence::cycle_tokens_left() const noexcept {
+std::size_t scheduler::sequence::cycle_tokens_left() const noexcept {
     std::size_t left = eviction.cycle_tokens - (covered_count - cycle_start);
     if (max_tokens) {
         // Every token sampled from here is forwarded but the last.
@@ -181,7 +291,7 @@ std::size_t sequence::cycle_tokens_left() const noexcept {
     return left;
 }
 
-std::size_t sequence::table_width() const noexcept {
+std::size_t scheduler::sequence::table_width() const noexcept {
     std::size_t width = 0;
     for (const layer_view& view : layers) {
         width = std::max(width, view.lines.size());
@@ -189,7 +299,7 @@ std::size_t sequence::table_width() const noexcept {
     return width;
 }
 
-void sequence::upload_table(std::size_t first_page, cudaStream_t stream) {
+void scheduler::sequence::upload_table(std::size_t first_page, cudaStream_t stream) {
     auto n_layers = static_cast<std::int64_t>(layers.size());
     auto page_count = static_cast<std::int64_t>(table_width());
     if (table.size(1) < page_count) {
@@ -213,12 +323,12 @@ void sequence::upload_table(std::size_t first_page, cudaStream_t stream) {
     table.narrow(1, first, page_count - first).copy_(host, /*non_blocking=*/true);
 }
 
-std::size_t sequence::cycle_lines(std::size_t page_size) const noexcept {
+std::size_t scheduler::sequence::cycle_lines(std::size_t page_size) const noexcept {
     assert(tail.empty());
     return ceil_div(cycle_tokens_left(), page_size);
 }
 
-std::vector<std::size_t> sequence::missing_lines(std::size_t page_size) const {
+std::vector<std::size_t> scheduler::sequence::missing_lines(std::size_t page_size) const {
     std::size_t left = cycle_tokens_left();
     std::vector<std::size_t> missing;
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
@@ -229,11 +339,10 @@ std::vector<std::size_t> sequence::missing_lines(std::size_t page_size) const {
     return missing;
 }
 
-batch::batch(
+scheduler::batch::batch(
     std::span<sequence* const> running,
     std::size_t page_size,
-    std::size_t prefill_tokens_per_step,
-    bool recurrent
+    std::size_t prefill_tokens_per_step
 ) {
     for (sequence* seq : running) {
         assert(!seq->pending.empty());
@@ -269,14 +378,14 @@ batch::batch(
     }
     std::span<const entry> all(entries);
     if (decode_count > 0) {
-        inputs.decode = make_group(all.first(decode_count), page_size, false, recurrent);
+        inputs.decode = make_group(all.first(decode_count), page_size, false);
     }
     if (entries.size() > decode_count) {
-        inputs.prefill = make_group(all.subspan(decode_count), page_size, true, recurrent);
+        inputs.prefill = make_group(all.subspan(decode_count), page_size, true);
     }
 }
 
-GroupBatch batch::make_group(std::span<const entry> group, std::size_t page_size, bool prefill, bool recurrent) {
+GroupBatch scheduler::batch::make_group(std::span<const entry> group, std::size_t page_size, bool prefill) {
     std::size_t token_count = 0;
     for (const entry& e : group) {
         token_count += e.token_count;
@@ -322,14 +431,12 @@ GroupBatch batch::make_group(std::span<const entry> group, std::size_t page_size
     if (prefill) {
         g.cu_seqlens_q = query_starts;
     }
-    if (recurrent) {
-        g.page_end_tokens = pinned({n_seqs}, at::kInt);
-        auto* page_end_tokens = g.page_end_tokens.mutable_data_ptr<std::int32_t>();
-        for (std::size_t s = 0; s < group.size(); s++) {
-            std::size_t start = group[s].seq->tail.size();
-            std::size_t page_end = (start + group[s].token_count) / page_size * page_size;
-            page_end_tokens[s] = static_cast<std::int32_t>(page_end > start ? page_end - start : 0);
-        }
+    g.page_end_tokens = pinned({n_seqs}, at::kInt);
+    auto* page_end_tokens = g.page_end_tokens.mutable_data_ptr<std::int32_t>();
+    for (std::size_t s = 0; s < group.size(); s++) {
+        std::size_t start = group[s].seq->tail.size();
+        std::size_t page_end = (start + group[s].token_count) / page_size * page_size;
+        page_end_tokens[s] = static_cast<std::int32_t>(page_end > start ? page_end - start : 0);
     }
     if (measures_mass(group)) {
         g.cu_view_pages = pinned({n_kv_layers, n_seqs + 1}, at::kInt);
@@ -350,11 +457,11 @@ GroupBatch batch::make_group(std::span<const entry> group, std::size_t page_size
     return g;
 }
 
-bool batch::measures_mass(std::span<const entry> group) noexcept {
+bool scheduler::batch::measures_mass(std::span<const entry> group) noexcept {
     return std::ranges::any_of(group, [](const entry& e) { return e.seq->eviction.can_evict(); });
 }
 
-at::Tensor batch::page_tables(std::span<const entry> group, std::size_t n_kv_layers) {
+at::Tensor scheduler::batch::page_tables(std::span<const entry> group, std::size_t n_kv_layers) {
     std::vector<at::Tensor> tables;
     std::size_t width = 0;
     for (const entry& e : group) {
@@ -364,7 +471,12 @@ at::Tensor batch::page_tables(std::span<const entry> group, std::size_t n_kv_lay
     return gather_page_tables_cuda(tables, static_cast<std::int64_t>(n_kv_layers), static_cast<std::int64_t>(width));
 }
 
-void batch::enqueue(Model& model, std::span<const kv> lines, const std::vector<bool>& evictable, cudaStream_t stream) {
+void scheduler::batch::enqueue(
+    Model& model,
+    std::span<const kv> lines,
+    const std::vector<bool>& evictable,
+    cudaStream_t stream
+) {
     at::Device device = lines.front().k.device();
     c10::cuda::CUDAStreamGuard guard(c10::cuda::getStreamFromExternal(stream, device.index()));
     StepBatch on_device;
@@ -417,7 +529,8 @@ void batch::enqueue(Model& model, std::span<const kv> lines, const std::vector<b
     sampled.copy_(tokens, /*non_blocking=*/true);
 }
 
-std::vector<std::span<const float>> batch::step_mass(std::size_t index, const std::vector<bool>& evictable) const {
+std::vector<std::span<const float>>
+scheduler::batch::step_mass(std::size_t index, const std::vector<bool>& evictable) const {
     const bool decodes = index < decode_count;
     const GroupBatch& group = decodes ? *inputs.decode : *inputs.prefill;
     const float* mass = (decodes ? decode_mass : prefill_mass).const_data_ptr<float>();
@@ -625,11 +738,11 @@ task<void> scheduler::run() {
     }
 }
 
-task<batch> scheduler::build_batch() {
+task<scheduler::batch> scheduler::build_batch() {
     while (running.empty()) {
         co_await next(idle);
     }
-    co_return batch(running, page_size, prefill_tokens_per_step, std::ranges::contains(recurrent, true));
+    co_return batch(running, page_size, prefill_tokens_per_step);
 }
 
 task<void> scheduler::launch(batch& b) {

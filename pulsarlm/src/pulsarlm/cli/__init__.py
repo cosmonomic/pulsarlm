@@ -30,6 +30,88 @@ class DType(StrEnum):
     bfloat16 = "bfloat16"
 
 
+ModelName = Annotated[str, typer.Argument(help="The name of a .pulsarlm model.")]
+SearchedDataDir = Annotated[
+    Path | None,
+    typer.Option(
+        "--data_dir",
+        help="Searched for the model first, then PULSARLM_DATA_DIR, then the XDG "
+        "data directories.",
+    ),
+]
+ArchiveDataDir = Annotated[
+    Path | None,
+    typer.Option(
+        "--data_dir",
+        help="Where the archive goes. Defaults to PULSARLM_DATA_DIR, then the XDG data home.",
+    ),
+]
+Device = Annotated[str, typer.Option(help="Torch device.")]
+WeightDType = Annotated[DType, typer.Option(help="Weight and KV cache dtype.")]
+KvCacheGib = Annotated[
+    float,
+    typer.Option(
+        "--kv_cache_gib", help="KV cache size in GiB.", rich_help_panel="Memory"
+    ),
+]
+PrefillTokensPerStep = Annotated[
+    int,
+    typer.Option(
+        "--prefill_tokens_per_step",
+        help="Prefill tokens a step forwards across requests.",
+        rich_help_panel="Memory",
+    ),
+]
+StoreGib = Annotated[
+    float,
+    typer.Option(
+        "--store_gib",
+        help="Pinned host memory the store keeps pages in, in GiB.",
+        rich_help_panel="Memory",
+    ),
+]
+Persist = Annotated[
+    bool,
+    typer.Option(
+        "--persist/--no_persist",
+        help="Keep the store in store.sqlite under the data directory.",
+        rich_help_panel="Memory",
+    ),
+]
+CycleTokens = Annotated[
+    int,
+    typer.Option(
+        "--cycle_tokens",
+        help="Tokens per eviction cycle.",
+        rich_help_panel="Eviction",
+    ),
+]
+NWorking = Annotated[
+    int,
+    typer.Option(
+        "--n_working",
+        help="Newest pages eviction never touches.",
+        rich_help_panel="Eviction",
+    ),
+]
+EvictTau = Annotated[
+    float,
+    typer.Option(
+        "--evict_tau",
+        help="Eviction bar tau / (1 - tau) on a page's attention mass EMA.",
+        rich_help_panel="Eviction",
+    ),
+]
+MaxPages = Annotated[
+    int | None,
+    typer.Option(
+        "--max_pages",
+        help="View cap in pages. Defaults to the model's trained context.",
+        rich_help_panel="Eviction",
+    ),
+]
+
+
 def _positive(value: float) -> float:
     if value <= 0.0:
         raise typer.BadParameter(f"{value} is not positive.")
@@ -51,83 +133,20 @@ def main() -> None:
 
 @app.command()
 def serve(
-    model: Annotated[str, typer.Argument(help="The name of a .pulsarlm model.")],
+    model: ModelName,
     host: Annotated[str, typer.Option(help="Address to listen on.")] = "127.0.0.1",
     port: Annotated[int, typer.Option(help="Port to listen on.")] = 8000,
-    data_dir: Annotated[
-        Path | None,
-        typer.Option(
-            "--data_dir",
-            help="Searched for the model first, then PULSARLM_DATA_DIR, then the XDG "
-            "data directories.",
-        ),
-    ] = None,
-    device: Annotated[str, typer.Option(help="Torch device.")] = "cuda",
-    dtype: Annotated[
-        DType, typer.Option(help="Weight and KV cache dtype.")
-    ] = DType.bfloat16,
-    kv_cache_gib: Annotated[
-        float,
-        typer.Option(
-            "--kv_cache_gib", help="KV cache size in GiB.", rich_help_panel="Memory"
-        ),
-    ] = 4.0,
-    prefill_tokens_per_step: Annotated[
-        int,
-        typer.Option(
-            "--prefill_tokens_per_step",
-            help="Prefill tokens a step forwards across requests.",
-            rich_help_panel="Memory",
-        ),
-    ] = 256,
-    store_gib: Annotated[
-        float,
-        typer.Option(
-            "--store_gib",
-            help="Pinned host memory the store keeps pages in, in GiB.",
-            rich_help_panel="Memory",
-        ),
-    ] = 4.0,
-    persist: Annotated[
-        bool,
-        typer.Option(
-            "--persist/--no_persist",
-            help="Keep the store in store.sqlite under the data directory.",
-            rich_help_panel="Memory",
-        ),
-    ] = False,
-    cycle_tokens: Annotated[
-        int,
-        typer.Option(
-            "--cycle_tokens",
-            help="Tokens per eviction cycle.",
-            rich_help_panel="Eviction",
-        ),
-    ] = 512,
-    n_working: Annotated[
-        int,
-        typer.Option(
-            "--n_working",
-            help="Newest pages eviction never touches.",
-            rich_help_panel="Eviction",
-        ),
-    ] = 512,
-    evict_tau: Annotated[
-        float,
-        typer.Option(
-            "--evict_tau",
-            help="Eviction bar tau / (1 - tau), a multiple of uniform attention.",
-            rich_help_panel="Eviction",
-        ),
-    ] = 0.3,
-    max_pages: Annotated[
-        int | None,
-        typer.Option(
-            "--max_pages",
-            help="View cap in pages. Defaults to the model's trained context.",
-            rich_help_panel="Eviction",
-        ),
-    ] = None,
+    data_dir: SearchedDataDir = None,
+    device: Device = "cuda",
+    dtype: WeightDType = DType.bfloat16,
+    kv_cache_gib: KvCacheGib = 4.0,
+    prefill_tokens_per_step: PrefillTokensPerStep = 256,
+    store_gib: StoreGib = 4.0,
+    persist: Persist = False,
+    cycle_tokens: CycleTokens = 512,
+    n_working: NWorking = 512,
+    evict_tau: EvictTau = 0.0,
+    max_pages: MaxPages = None,
 ) -> None:
     """Serve a model over the OpenAI Chat Completions API."""
     # Imported here: torch takes seconds to load, which --help does not need.
@@ -158,7 +177,7 @@ def serve(
 
 @app.command()
 def chat(
-    model: Annotated[str, typer.Argument(help="The name of a .pulsarlm model.")],
+    model: ModelName,
     system: Annotated[
         str | None,
         typer.Option(
@@ -196,80 +215,17 @@ def chat(
             help="Print the model's think blocks instead of hiding them.",
         ),
     ] = False,
-    data_dir: Annotated[
-        Path | None,
-        typer.Option(
-            "--data_dir",
-            help="Searched for the model first, then PULSARLM_DATA_DIR, then the XDG "
-            "data directories.",
-        ),
-    ] = None,
-    device: Annotated[str, typer.Option(help="Torch device.")] = "cuda",
-    dtype: Annotated[
-        DType, typer.Option(help="Weight and KV cache dtype.")
-    ] = DType.bfloat16,
-    kv_cache_gib: Annotated[
-        float,
-        typer.Option(
-            "--kv_cache_gib", help="KV cache size in GiB.", rich_help_panel="Memory"
-        ),
-    ] = 4.0,
-    prefill_tokens_per_step: Annotated[
-        int,
-        typer.Option(
-            "--prefill_tokens_per_step",
-            help="Prefill tokens a step forwards across requests.",
-            rich_help_panel="Memory",
-        ),
-    ] = 256,
-    store_gib: Annotated[
-        float,
-        typer.Option(
-            "--store_gib",
-            help="Pinned host memory the store keeps pages in, in GiB.",
-            rich_help_panel="Memory",
-        ),
-    ] = 4.0,
-    persist: Annotated[
-        bool,
-        typer.Option(
-            "--persist/--no_persist",
-            help="Keep the store in store.sqlite under the data directory.",
-            rich_help_panel="Memory",
-        ),
-    ] = False,
-    cycle_tokens: Annotated[
-        int,
-        typer.Option(
-            "--cycle_tokens",
-            help="Tokens per eviction cycle.",
-            rich_help_panel="Eviction",
-        ),
-    ] = 512,
-    n_working: Annotated[
-        int,
-        typer.Option(
-            "--n_working",
-            help="Newest pages eviction never touches.",
-            rich_help_panel="Eviction",
-        ),
-    ] = 512,
-    evict_tau: Annotated[
-        float,
-        typer.Option(
-            "--evict_tau",
-            help="Eviction bar tau / (1 - tau), a multiple of uniform attention.",
-            rich_help_panel="Eviction",
-        ),
-    ] = 0.3,
-    max_pages: Annotated[
-        int | None,
-        typer.Option(
-            "--max_pages",
-            help="View cap in pages. Defaults to the model's trained context.",
-            rich_help_panel="Eviction",
-        ),
-    ] = None,
+    data_dir: SearchedDataDir = None,
+    device: Device = "cuda",
+    dtype: WeightDType = DType.bfloat16,
+    kv_cache_gib: KvCacheGib = 4.0,
+    prefill_tokens_per_step: PrefillTokensPerStep = 256,
+    store_gib: StoreGib = 4.0,
+    persist: Persist = False,
+    cycle_tokens: CycleTokens = 512,
+    n_working: NWorking = 512,
+    evict_tau: EvictTau = 0.0,
+    max_pages: MaxPages = None,
 ) -> None:
     """Chat with a model in the terminal. End input to quit."""
     # Imported here: torch takes seconds to load, which --help does not need.
@@ -328,13 +284,7 @@ def download(
     revision: Annotated[
         str | None, typer.Option(help="A branch, tag or commit of the repository.")
     ] = None,
-    data_dir: Annotated[
-        Path | None,
-        typer.Option(
-            "--data_dir",
-            help="Where the archive goes. Defaults to PULSARLM_DATA_DIR, then the XDG data home.",
-        ),
-    ] = None,
+    data_dir: ArchiveDataDir = None,
 ) -> None:
     """Download a Hugging Face model and pack it into a .pulsarlm archive."""
     # Imported here: torch takes seconds to load, which --help does not need.
@@ -361,13 +311,7 @@ def migrate(
             help="The model's name in pulsarlm. Defaults to the directory's name, lowercased."
         ),
     ] = None,
-    data_dir: Annotated[
-        Path | None,
-        typer.Option(
-            "--data_dir",
-            help="Where the archive goes. Defaults to PULSARLM_DATA_DIR, then the XDG data home.",
-        ),
-    ] = None,
+    data_dir: ArchiveDataDir = None,
 ) -> None:
     """Pack a Hugging Face checkpoint directory into a .pulsarlm archive."""
     # Imported here: torch takes seconds to load, which --help does not need.

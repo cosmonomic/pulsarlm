@@ -189,6 +189,10 @@ Qwen4ExpModel::Qwen4ExpModel(qwen4_exp_config config, const c10::Dict<std::strin
     }
 }
 
+std::vector<kv_layer> Qwen4ExpModel::kv_layers() const {
+    return kv_specs;
+}
+
 bool Qwen4ExpModel::indexed_attention(std::int64_t layer) const {
     return config.layer_types[layer] == qwen4_exp_layer_type::indexed_attention;
 }
@@ -269,10 +273,6 @@ at::Tensor Qwen4ExpModel::selected_blocks(
         ));
     }
     return at::cat(selected);
-}
-
-std::vector<kv_layer> Qwen4ExpModel::kv_layers() const {
-    return kv_specs;
 }
 
 at::Tensor Qwen4ExpModel::stream_norm(const at::Tensor& x, const at::Tensor& weight) const {
@@ -380,8 +380,7 @@ at::Tensor Qwen4ExpModel::attention(
         c.indexer_compress_ratio,
         mass,
         cu_view_pages,
-        mass_decay,
-        g.mass_length_gain
+        mass_decay
     );
     if (mass) {
         at::maximum_out(page_mass, page_mass, mass->mean(-1).amax(-1));

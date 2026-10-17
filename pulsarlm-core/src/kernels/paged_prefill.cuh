@@ -1,7 +1,7 @@
 #pragma once
 
-#include "pulsarlm/kernels/attn_params.cuh"
-#include "pulsarlm/kernels/attn_tiles.cuh"
+#include "attn_params.cuh"
+#include "attn_tiles.cuh"
 
 #include <cuda_runtime.h>
 #include <math_constants.h>
@@ -14,20 +14,19 @@
 // rows 0..tile_rows-1 (rows tile_rows..15 are zero-padded and discarded). The
 // causal key range is streamed KEY_PAGES pages (KEY_PAGES * PAGE_SIZE keys) at a
 // time: keys from rotated_k, the views' keys already rotated to their positions by
-// rotate_view_keys_kernel (kernels/paged_prefill.cu), and values from the pool
+// rotate_view_keys_kernel (paged_prefill.cu), and values from the pool
 // through the page table. The causal and sliding-window masks are applied per
 // (query row, key) in the online softmax; pages before the window of the tile's
 // first row are not read. A second streaming pass recomputes QKᵀ and atomicAdds
 // the per-key mass (summed over this tile's query rows attending the key, all for
 // the ONE q head) into
 // this q head's own column of the key's mass row. The QKᵀ/PV tiles live in
-// attn_tiles.cuh; the op wrapper and the argument shapes are in
-// kernels/paged_prefill.cu.
+// attn_tiles.cuh; the op wrapper and the argument shapes are in paged_prefill.cu.
 //
 // NWARPS, KEY_PAGES and CTAS_PER_SM are launch shape, not geometry: every one of
 // them is device specific and comes from the caller's tuning row
-// (pulsarlm/kernels/attn_tuning.hpp). KEY_PAGES only changes the order in which the online
-// softmax folds keys in, so o, lse and mass move in their last bits with it.
+// (attn_tuning.hpp). KEY_PAGES only changes the order in which the online
+// softmax folds keys in, so o and mass move in their last bits with it.
 // CTAS_PER_SM is the occupancy floor ptxas must fit the register allocation to; 1
 // leaves it unconstrained.
 
@@ -127,11 +126,8 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
     __shared__ float row_rescale[16];
     __shared__ int qpos[16];  // context pos of each MMA row, -1 if padding
     __shared__ int qfirst[16];  // first key each MMA row attends
-    // Per-query multiplier on the mass this row hands out: the within-chunk retention
-    // grading retention^(offset of this row from the chunk end), so a key's accumulated
-    // mass is the per-token EMA of the attention it received (older queries in the
-    // chunk weigh less; retention == 1 -> flat), times the length gain over the
-    // qpos[m] + 1 keys THAT row attends, or over mass_length_gain in their place.
+    // retention^(offset of this row from the chunk end), the multiplier on the mass this row hands out, so a key's
+    // accumulated mass is the per-token EMA of the attention it received.
     __shared__ float mass_weight[16];
 
     // Load Q for this tile's rows into the MMA M dimension; pad rows >= tile_rows.
@@ -160,15 +156,10 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
         const int row_pos = ctx_start + qbase + tid;  // this row's context pos
         qpos[tid] = (tid < tile_rows) ? row_pos : -1;
         qfirst[tid] = first_key(p, row_pos);
-        // Offset from the chunk end: last query in the chunk (seq_q-1) gets
-        // retention^0. The row attends the keys [qfirst, row_pos].
         // __powf(0, 0) is NaN, so the zero exponent is taken directly.
         const int chunk_end_offset = seq_q - 1 - qbase - tid;
-        const float attended_len = p.mass_length_gain > 0.0f ? p.mass_length_gain
-                                                             : static_cast<float>(row_pos + 1 - qfirst[tid]);
-        mass_weight[tid] = (tid < tile_rows)
-            ? (chunk_end_offset == 0 ? 1.0f : __powf(retention, static_cast<float>(chunk_end_offset))) * attended_len
-            : 0.0f;
+        const float graded = chunk_end_offset == 0 ? 1.0f : __powf(retention, static_cast<float>(chunk_end_offset));
+        mass_weight[tid] = tid < tile_rows ? graded : 0.0f;
     }
     // The pages of key tile t, in the pool (lines, for V) and in rotated_k (sequence
     // s's view page b is page s * max_pages + b, for K). The staging address
@@ -313,9 +304,6 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
     // Stash LSE for the mass pass.
     if (tid < tile_rows) {
         LSE[tid] = Mrow[tid] + logf(Lrow[tid]);
-        if (p.lse) {
-            p.lse[static_cast<int64_t>(q_global_base + tid) * p.n_q_heads + h] = LSE[tid];
-        }
     }
     __syncthreads();
 

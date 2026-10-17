@@ -1,6 +1,6 @@
 #pragma once
 
-#include "pulsarlm/kernels/attn_params.cuh"
+#include "attn_params.cuh"
 #include "pulsarlm/rope.hpp"
 
 #include <ATen/core/Tensor.h>
@@ -13,9 +13,8 @@
 #include <optional>
 #include <type_traits>
 
-// The validated batch, launch geometry, block reduction and template-instantiation
-// ladders shared by the paged attention ops (paged_attention.cu, paged_prefill.cu,
-// paged_scalar.cu).
+// The validated batch, launch geometry, block reduction and template-instantiation ladders shared by the paged
+// attention ops (paged_attention.cu, paged_prefill.cu, paged_common.cu, indexed_attention.cu).
 
 namespace pulsarlm {
 namespace attn {
@@ -37,8 +36,6 @@ struct PagedAttnBatch {
     at::Tensor cu_view_pages;
     at::Tensor mass_decay;
     at::Tensor o;
-    at::Tensor lse;
-    double mass_length_gain;
     double scale;
     int64_t sliding_window;
     int64_t num_seqs;
@@ -67,9 +64,7 @@ struct PagedAttnBatch {
             static_cast<float*>(data(this->mass)),
             static_cast<const int32_t*>(data(this->cu_view_pages)),
             static_cast<const float*>(data(this->mass_decay)),
-            static_cast<float>(this->mass_length_gain),
             static_cast<scalar_t*>(data(this->o)),
-            static_cast<float*>(data(this->lse)),
             static_cast<int>(this->num_seqs),
             static_cast<int>(this->n_q_heads),
             static_cast<int>(this->n_kv_heads),
@@ -91,8 +86,8 @@ bool prefill_fits(int64_t page_size, int64_t head_dim);
 // page, token and head starting 16-byte aligned.
 void check_pools(const char* op, const at::Tensor& k_pool, const at::Tensor& v_pool);
 
-// Checks the shared argument contract (see pulsarlm/ops.hpp) and allocates o. op names
-// the caller in every error.
+// Checks the argument contract the attention ops share (pulsarlm/ops.hpp) and allocates o. op names the caller in
+// every error.
 PagedAttnBatch paged_attn_batch(
     const char* op,
     const at::Tensor& q,
@@ -108,9 +103,7 @@ PagedAttnBatch paged_attn_batch(
     const std::optional<at::Tensor>& k_norm_weight,
     const std::optional<at::Tensor>& mass,
     const std::optional<at::Tensor>& cu_view_pages,
-    const std::optional<at::Tensor>& attention_mass_decay,
-    double mass_length_gain,
-    const std::optional<at::Tensor>& lse_capture
+    const std::optional<at::Tensor>& attention_mass_decay
 );
 
 // The scalar kernel over the whole batch: the fallback for shapes the tensor-core

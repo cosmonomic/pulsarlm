@@ -34,50 +34,16 @@ make_model(const any_model_config& any_config, const std::unordered_map<std::str
         return std::make_unique<Qwen4ExpModel>(*qwen, weight_dict);
     }
     const model_config& config = std::get<model_config>(any_config);
-    std::unique_ptr<Model> model;
     if (config.architecture == "qwen2") {
-        model = std::make_unique<Qwen2Model>(
-            config.n_layers,
-            config.n_heads,
-            config.n_kv_heads,
-            config.head_dim,
-            config.hidden,
-            config.intermediate,
-            config.vocab_size,
-            config.rope,
-            config.rms_eps,
-            std::move(weight_dict)
-        );
-    } else if (config.architecture == "qwen3") {
-        model = std::make_unique<Qwen3Model>(
-            config.n_layers,
-            config.n_heads,
-            config.n_kv_heads,
-            config.head_dim,
-            config.hidden,
-            config.intermediate,
-            config.vocab_size,
-            config.rope,
-            config.rms_eps,
-            std::move(weight_dict)
-        );
-    } else if (config.architecture == "llama") {
-        model = std::make_unique<LlamaModel>(
-            config.n_layers,
-            config.n_heads,
-            config.n_kv_heads,
-            config.head_dim,
-            config.hidden,
-            config.intermediate,
-            config.vocab_size,
-            config.rope,
-            config.rms_eps,
-            std::move(weight_dict)
-        );
-    } else {
-        throw std::invalid_argument(std::format("unknown architecture {:?}", config.architecture));
+        return std::make_unique<Qwen2Model>(config.dense, weight_dict);
     }
-    return model;
+    if (config.architecture == "qwen3") {
+        return std::make_unique<Qwen3Model>(config.dense, weight_dict);
+    }
+    if (config.architecture == "llama") {
+        return std::make_unique<LlamaModel>(config.dense, weight_dict);
+    }
+    throw std::invalid_argument(std::format("unknown architecture {:?}", config.architecture));
 }
 
 request_handle::request_handle(std::shared_ptr<request_buffer> buffer) noexcept

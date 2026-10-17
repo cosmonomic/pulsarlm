@@ -37,8 +37,8 @@ class host_page_pool {
   public:
     host_page_pool(std::size_t capacity_bytes, std::size_t largest_bytes);
 
-    // A pinned tensor of elements of dtype in the pool; nullopt when no free block holds it.
-    std::optional<at::Tensor> allocate(std::int64_t elements, at::ScalarType dtype);
+    // A pinned uint8 tensor of bytes in the pool; nullopt when no free block holds it.
+    std::optional<at::Tensor> allocate(std::size_t bytes);
     // The byte offset of [data, data + bytes) in buffer(); nullopt when the range is not inside it.
     std::optional<std::size_t> offset_of(const void* data, std::size_t bytes) const noexcept;
     // The whole buffer as a pinned byte tensor, empty when the pool has no block.

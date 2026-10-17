@@ -34,11 +34,9 @@ MODEL = ModelConfig(
     n_heads=N_HEADS,
     n_kv_heads=N_KV_HEADS,
     head_dim=HEAD_DIM,
-    hidden=HIDDEN,
-    intermediate=INTERMEDIATE,
     vocab_size=VOCAB_SIZE,
     rope=RopeParameters(theta=1e6),
-    rms_eps=1e-6,
+    rms_norm_eps=1e-6,
 )
 
 

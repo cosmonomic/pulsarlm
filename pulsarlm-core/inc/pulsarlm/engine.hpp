@@ -38,10 +38,6 @@ struct engine_config {
     std::size_t prefill_tokens_per_step;
 };
 
-// Throws std::invalid_argument when r breaks a precondition of scheduler::submit or holds a token outside
-// [0, vocab_size).
-void validate(const request& r, std::size_t page_size, std::size_t vocab_size);
-
 // The page shape of each KV layer, one layer each.
 std::vector<page_shape> page_shapes(const engine_config& config, std::span<const kv_layer> layers);
 
@@ -71,8 +67,9 @@ class engine {
     engine& operator=(const engine&) = delete;
     ~engine();
 
-    // Serves r, passing its results to callbacks. Safe to call from any thread. Throws as validate and
-    // scheduler::validate_state do, without calling callbacks.
+    // Serves r, passing its results to callbacks. Safe to call from any thread. Throws std::invalid_argument, without
+    // calling callbacks, when r breaks a precondition of scheduler::submit, holds a token outside [0, vocab_size) or
+    // starts from a state scheduler::validate_state rejects.
     void submit(request&& r, std::unique_ptr<request_callbacks> callbacks);
     // The exception that panicked the loop; null while the loop runs or when it was stopped.
     std::exception_ptr exception() const;

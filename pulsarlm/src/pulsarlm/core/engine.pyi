@@ -10,10 +10,9 @@ type Page = Tensor
 class PageStore(Protocol):
     """Called on the engine's loop thread with the GIL held; both return without
     waiting for the store. A page is one KV layer's line as a host uint8 tensor of
-    its bytes, in pageable memory the store owns, laid out as only the engine reads
-    it. A fetch whose call raises, or whose
-    future fails, is cancelled, is dropped unfinished or yields a malformed result,
-    misses every page it asked for. An exception raised by put goes to
+    its bytes, laid out as only the engine reads it. A fetch whose call raises, or
+    whose future fails, is cancelled, is dropped unfinished or yields a malformed
+    result, misses every page it asked for. An exception raised by put goes to
     sys.unraisablehook.
     """
 
@@ -105,15 +104,13 @@ class ModelConfig:
         self,
         *,
         architecture: str,
+        vocab_size: int,
         n_layers: int,
         n_heads: int,
         n_kv_heads: int,
         head_dim: int,
-        hidden: int,
-        intermediate: int,
-        vocab_size: int,
         rope: RopeParameters,
-        rms_eps: float,
+        rms_norm_eps: float,
     ) -> None: ...
 
 class Llama3RopeScaling:

@@ -13,11 +13,11 @@
 namespace pulsarlm {
 
 // A page_store backed by a Python object with two methods, called on the loop thread with the GIL held:
-//   fetch(hashes: list[bytes]) -> concurrent.futures.Future[list[tuple[Tensor, Tensor] | None]]
-//   put(hashes: list[bytes], pages: list[tuple[Tensor, Tensor]], owners: list[tuple[int, int]]) -> None
-// A page is its (k, v) host tensors; an owner is a (request id, index into pages) pair. Both return without waiting for the store. A fetch whose call raises, or whose
-// future fails, is cancelled, is dropped unfinished or yields a malformed result, misses every page it asked for. An
-// exception raised by put is reported through sys.unraisablehook.
+//   fetch(hashes: list[bytes]) -> concurrent.futures.Future[list[Tensor | None]]
+//   put(hashes: list[bytes], pages: list[Tensor], owners: list[tuple[int, int]]) -> None
+// A page is its host uint8 tensor; an owner is a (request id, index into pages) pair. Both return without waiting for
+// the store. A fetch whose call raises, or whose future fails, is cancelled, is dropped unfinished or yields a malformed
+// result, misses every page it asked for. An exception raised by put is reported through sys.unraisablehook.
 class python_store final : public page_store {
     pybind11::object hooks;
 

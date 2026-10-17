@@ -1,7 +1,7 @@
 #include "attn_common.cuh"
 
-#include "pulsarlm/kernels/attn_tiles.cuh"
-#include "pulsarlm/kernels/attn_tuning.hpp"
+#include "attn_tiles.cuh"
+#include "attn_tuning.hpp"
 #include "pulsarlm/ops.hpp"
 
 #include <ATen/ATen.h>
@@ -364,9 +364,9 @@ __device__ __forceinline__ void tc_attend_tiles(
     }
 }
 
-// Add each attended key's normalized weight exp(score - lse[m]), times the sequence's
-// mass gain, into query head g*group + m's column of the key's mass row. A sequence
-// has one query, so no other thread of the launch writes the same slot.
+// Add each attended key's normalized weight exp(score - lse[m]), times the sequence's EMA rate, into query head
+// g*group + m's column of the key's mass row. A sequence has one query, so no other thread of the launch writes the
+// same slot.
 template <typename scalar_t>
 __device__ __forceinline__ void accumulate_group_mass(
     const PagedAttnParams<scalar_t>& p,
@@ -379,13 +379,12 @@ __device__ __forceinline__ void accumulate_group_mass(
 ) {
     float* mass = attn::seq_mass(p, s, ctx_len, page_size);
     const int first = attn::first_key(p, ctx_len - 1);
-    const float attended = static_cast<float>(ctx_len - first);
-    const float gain = p.mass_decay[s] * (p.mass_length_gain > 0.0f ? p.mass_length_gain : attended);
+    const float rate = p.mass_decay[s];
     for (int j = first + static_cast<int>(threadIdx.x); j < ctx_len; j += blockDim.x) {
         const float* col = seq_scores + static_cast<int64_t>(j) * p.group;
         float* row = mass + static_cast<int64_t>(j) * p.n_q_heads + g * p.group;
         for (int m = 0; m < p.group; ++m) {
-            row[m] += gain * __expf(col[m] - lse[m]);
+            row[m] += rate * __expf(col[m] - lse[m]);
         }
     }
 }
@@ -438,12 +437,7 @@ __global__ void __launch_bounds__(NWARPS * 32) attn_decode_tc_kernel(
         }
     });
     if (tid < p.group) {
-        const int m = tid;
-        const int h = g * p.group + m;
-        LSE[m] = Mrow[m] + logf(Lrow[m]);
-        if (p.lse) {
-            p.lse[static_cast<int64_t>(s) * p.n_q_heads + h] = LSE[m];
-        }
+        LSE[tid] = Mrow[tid] + logf(Lrow[tid]);
     }
     __syncthreads();
 
@@ -671,10 +665,7 @@ void launch_tc_decode(const attn::PagedAttnBatch& b, int64_t forced_splits, cuda
     auto o_partial = at::empty({b.num_seqs, b.n_kv_heads, nsplits, group, b.head_dim}, fopts);
     auto m_partial = at::empty({b.num_seqs, b.n_kv_heads, nsplits, group}, fopts);
     auto l_partial = at::empty({b.num_seqs, b.n_kv_heads, nsplits, group}, fopts);
-    // The combine kernel's [num_seqs, n_kv_heads, group] layout flattens to
-    // [num_seqs, n_q_heads], so a caller-provided capture is written directly.
-    auto lse_out = b.lse.defined() ? b.lse.view({b.num_seqs, b.n_kv_heads, group})
-                                   : at::empty({b.num_seqs, b.n_kv_heads, group}, fopts);
+    auto lse_out = at::empty({b.num_seqs, b.n_kv_heads, group}, fopts);
 
     attn::dispatch_page_head("attn_decode", b.page_size, b.head_dim, [&](auto bs_tag, auto hd_tag) {
         constexpr int BS = decltype(bs_tag)::value;
@@ -857,8 +848,6 @@ at::Tensor attn_decode_cuda(
     const std::optional<at::Tensor>& mass,
     const std::optional<at::Tensor>& cu_view_pages,
     const std::optional<at::Tensor>& attention_mass_decay,
-    double mass_length_gain,
-    const std::optional<at::Tensor>& lse_capture,
     int64_t num_splits
 ) {
     const auto batch = attn::paged_attn_batch(
@@ -876,9 +865,7 @@ at::Tensor attn_decode_cuda(
         k_norm_weight,
         mass,
         cu_view_pages,
-        attention_mass_decay,
-        mass_length_gain,
-        lse_capture
+        attention_mass_decay
     );
     return paged_decode(batch, num_splits);
 }

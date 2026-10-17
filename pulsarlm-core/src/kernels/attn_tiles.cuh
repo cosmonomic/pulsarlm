@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h>
 
-#include "pulsarlm/kernels/mma.cuh"
+#include "mma.cuh"
 
 // Shared m16n8k16 tensor-core attention tiles for the sm_120 paged-attention
 // kernels (decode + prefill). Both GEMMs run on the bf16/fp16 MMA in mma.cuh

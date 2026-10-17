@@ -1,8 +1,8 @@
 #include "attn_common.cuh"
 
-#include "pulsarlm/kernels/attn_tiles.cuh"
-#include "pulsarlm/kernels/attn_tuning.hpp"
-#include "pulsarlm/kernels/paged_prefill.cuh"
+#include "attn_tiles.cuh"
+#include "attn_tuning.hpp"
+#include "paged_prefill.cuh"
 #include "pulsarlm/ops.hpp"
 
 #include <ATen/ATen.h>
@@ -37,20 +37,6 @@ struct Selection {
     __device__ __forceinline__ bool selects(int query, int key) const {
         const int block = key / this->block_size;
         return (this->bits[static_cast<int64_t>(query) * this->words + block / 32] >> (block % 32)) & 1u;
-    }
-
-    // The keys up to query_pos the query attends.
-    __device__ int attended_keys(int query, int query_pos) const {
-        const uint32_t* row = this->bits + static_cast<int64_t>(query) * this->words;
-        const int last_block = query_pos / this->block_size;
-        int blocks = 0;
-        for (int w = 0; w < last_block / 32; ++w) {
-            blocks += __popc(row[w]);
-        }
-        const uint32_t through_last = 0xffffffffu >> (31 - last_block % 32);
-        blocks += __popc(row[last_block / 32] & through_last);
-        const int keys = blocks * this->block_size;
-        return this->selects(query, query_pos) ? keys - (this->block_size - 1 - query_pos % this->block_size) : keys;
     }
 };
 
@@ -160,13 +146,11 @@ __global__ void attn_indexed_scalar_kernel(const attn::PagedAttnParams<scalar_t>
     if (!p.mass) {
         return;
     }
-    // As attn_scalar_kernel's, the length gain stated against the keys this query attends.
+    // As attn_scalar_kernel's.
     const float mass_decay = p.mass_decay[s];
     const int chunk_end_offset = seq_q - 1 - (qtok - q0);
     const float graded = chunk_end_offset == 0 ? 1.0f : __powf(1.0f - mass_decay, static_cast<float>(chunk_end_offset));
-    const float attended_len = p.mass_length_gain > 0.0f ? p.mass_length_gain
-                                                         : static_cast<float>(selection.attended_keys(qtok, query_pos));
-    const float mass_weight = mass_decay * graded * attended_len;
+    const float mass_weight = mass_decay * graded;
     float* mass = attn::seq_mass(p, s, ctx_len, PAGE_SIZE);
     for (int j = tid; j <= query_pos; j += attn::kThreads) {
         if (selection.selects(qtok, j)) {
@@ -321,11 +305,7 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
             // As attn_prefill_tc_kernel's per-query multiplier; every row of the CTA is the one query's.
             const float retention = 1.0f - p.mass_decay[s];
             const int chunk_end_offset = seq_q - 1 - (qtok - q0);
-            const float attended_len = p.mass_length_gain > 0.0f
-                ? p.mass_length_gain
-                : static_cast<float>(selection.attended_keys(qtok, query_pos));
-            mass_weight = (chunk_end_offset == 0 ? 1.0f : __powf(retention, static_cast<float>(chunk_end_offset))) *
-                attended_len;
+            mass_weight = chunk_end_offset == 0 ? 1.0f : __powf(retention, static_cast<float>(chunk_end_offset));
         }
     }
     __syncthreads();
@@ -588,8 +568,7 @@ at::Tensor attn_indexed_cuda(
     int64_t block_size,
     const std::optional<at::Tensor>& mass,
     const std::optional<at::Tensor>& cu_view_pages,
-    const std::optional<at::Tensor>& attention_mass_decay,
-    double mass_length_gain
+    const std::optional<at::Tensor>& attention_mass_decay
 ) {
     const auto b = attn::paged_attn_batch(
         "attn_indexed",
@@ -606,9 +585,7 @@ at::Tensor attn_indexed_cuda(
         std::nullopt,
         mass,
         cu_view_pages,
-        attention_mass_decay,
-        mass_length_gain,
-        std::nullopt
+        attention_mass_decay
     );
     TORCH_CHECK(
         block_size >= 1 && b.page_size % block_size == 0,

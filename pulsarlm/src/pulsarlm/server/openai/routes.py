@@ -1,5 +1,4 @@
 import json
-import math
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator
@@ -32,6 +31,7 @@ from pulsarlm.server.openai.schema import (
     ModelList,
     Usage,
 )
+from pulsarlm.paging import sink_pages
 from pulsarlm.reply import Part, ReplyDecoder, tool_call_marker
 from pulsarlm.store import LocalStore
 from pulsarlm.tools import ToolCallError, parse_tool_call
@@ -44,7 +44,6 @@ class ServerState:
     tokenizer: Tokenizer
     chat_template: ChatTemplate
     model_id: str
-    page_size: int
     stop_ids: list[int]
     eviction: EvictionPolicy
 
@@ -52,7 +51,7 @@ class ServerState:
         """The default policy, sinking the pages the system message touches, or
         the first page without one."""
         return EvictionPolicy(
-            n_sink=math.ceil(system_tokens / self.page_size) if system_tokens else 1,
+            n_sink=sink_pages(system_tokens),
             n_working=self.eviction.n_working,
             cycle_tokens=self.eviction.cycle_tokens,
             max_pages=self.eviction.max_pages,
@@ -286,8 +285,10 @@ def _stream_completion(
         yield chunk(ChatCompletionChunkDelta(role="assistant"))
         try:
             async for part, text in _texts(reply, tokens):
-                if text:
-                    yield chunk(ChatCompletionChunkDelta(**{part: text}))
+                if text and part == "reasoning":
+                    yield chunk(ChatCompletionChunkDelta(reasoning=text))
+                elif text:
+                    yield chunk(ChatCompletionChunkDelta(content=text))
         except (EngineStopped, CompletionError) as error:
             failure = _http_error(error)
             yield f"data: {json.dumps({'error': {'message': failure.detail, 'code': failure.status_code}})}\n\n"

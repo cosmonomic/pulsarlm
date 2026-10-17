@@ -1,5 +1,7 @@
 #include "pulsarlm/rope.hpp"
 
+#include "kernels/rope_tables.hpp"
+
 #include <ATen/ATen.h>
 
 #include <bit>

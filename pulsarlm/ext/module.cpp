@@ -47,7 +47,7 @@ std::size_t vocab_size(const any_model_config& model) {
     if (const auto* qwen = std::get_if<qwen4_exp_config>(&model)) {
         return static_cast<std::size_t>(qwen->vocab_size);
     }
-    return static_cast<std::size_t>(std::get<model_config>(model).vocab_size);
+    return static_cast<std::size_t>(std::get<model_config>(model).dense.vocab_size);
 }
 
 gemma4_layer_type layer_type(const std::string& name) {
@@ -236,41 +236,37 @@ PYBIND11_MODULE(pulsarlm_core, m) {
     py::class_<model_config>(m, "ModelConfig")
         .def(
             py::init([](std::string architecture,
+                        std::int64_t vocab_size,
                         std::int64_t n_layers,
                         std::int64_t n_heads,
                         std::int64_t n_kv_heads,
                         std::int64_t head_dim,
-                        std::int64_t hidden,
-                        std::int64_t intermediate,
-                        std::int64_t vocab_size,
                         const rope_parameters& rope,
-                        double rms_eps) {
+                        double rms_norm_eps) {
                 return model_config{
-                    std::move(architecture),
-                    n_layers,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    hidden,
-                    intermediate,
-                    vocab_size,
-                    rope,
-                    rms_eps,
+                    .architecture = std::move(architecture),
+                    .dense = dense_config{
+                        .vocab_size = vocab_size,
+                        .n_layers = n_layers,
+                        .n_heads = n_heads,
+                        .n_kv_heads = n_kv_heads,
+                        .head_dim = head_dim,
+                        .rope = rope,
+                        .rms_norm_eps = rms_norm_eps,
+                    },
                 };
             }),
             py::kw_only(),
             "architecture"_a,
+            "vocab_size"_a,
             "n_layers"_a,
             "n_heads"_a,
             "n_kv_heads"_a,
             "head_dim"_a,
-            "hidden"_a,
-            "intermediate"_a,
-            "vocab_size"_a,
             "rope"_a,
-            "rms_eps"_a
+            "rms_norm_eps"_a
         )
-        .def_readonly("rope", &model_config::rope);
+        .def_property_readonly("rope", [](const model_config& c) { return c.dense.rope; });
 
     py::class_<llama3_rope_scaling>(m, "Llama3RopeScaling")
         .def(
