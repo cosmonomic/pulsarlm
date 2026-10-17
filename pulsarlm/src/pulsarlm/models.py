@@ -22,6 +22,7 @@ REPOSITORIES = {
     "qwen3.5-2b": "Qwen/Qwen3.5-2B",
     "qwen3.5-4b": "Qwen/Qwen3.5-4B",
     "qwen3.5-9b": "Qwen/Qwen3.5-9B",
+    "qwen3.8-27b": "Qwen/Qwen3.8-27B",
     "llama-3-8b-instruct": "meta-llama/Meta-Llama-3-8B-Instruct",
     "llama-3-70b-instruct": "meta-llama/Meta-Llama-3-70B-Instruct",
     "llama-3.1-8b-instruct": "meta-llama/Llama-3.1-8B-Instruct",

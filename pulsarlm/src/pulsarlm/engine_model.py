@@ -96,6 +96,10 @@ def qwen3_5_config(text: dict) -> Qwen3_5Config:
         raise PulsarLMModelLoadingError(
             "attention without an output gate is not supported"
         )
+    if text.get("output_gate_type", "swish") not in ("swish", "silu"):
+        raise PulsarLMModelLoadingError(
+            f"unsupported linear attention output gate {text['output_gate_type']}"
+        )
     parameters = text.get("rope_parameters") or {}
     if parameters.get("rope_type", "default") != "default":
         raise PulsarLMModelLoadingError(f"unsupported RoPE {parameters['rope_type']}")

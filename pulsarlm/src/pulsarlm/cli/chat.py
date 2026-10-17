@@ -89,8 +89,9 @@ def new_chat(
                     messages,
                     reasoning_effort=reasoning_effort,
                 )
-                if system:
-                    eviction.n_sink = math.ceil(system_tokens / PAGE_SIZE)
+                eviction.n_sink = (
+                    math.ceil(system_tokens / PAGE_SIZE) if system_tokens else 1
+                )
                 decoder = ReplyDecoder(loaded.tokenizer, stops, prompt=prompt)
                 answer = []
                 reasoning_shown = False

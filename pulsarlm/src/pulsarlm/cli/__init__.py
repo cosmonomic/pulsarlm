@@ -21,6 +21,7 @@ class ReasoningEffort(StrEnum):
     low = "low"
     medium = "medium"
     high = "high"
+    xhigh = "xhigh"
 
 
 class DType(StrEnum):

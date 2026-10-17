@@ -101,7 +101,10 @@ FIRST_SAMPLED = len(SPECIAL_TOKENS) + ROLES.index("assistant")
 
 
 def load(
-    stop_ids: list[int] = [IM_END], n_lines: int = 64, embedding_scale: float = 1.0
+    stop_ids: list[int] = [IM_END],
+    n_lines: int = 64,
+    embedding_scale: float = 1.0,
+    chat_template: str = CHATML,
 ) -> ServerState:
     tokenizer = word_tokenizer()
     store = LocalStore(PAGE_SIZE, capacity_bytes=64 * LINE_BYTES)
@@ -122,7 +125,7 @@ def load(
         engine=AsyncEngine(engine),
         store=store,
         tokenizer=tokenizer,
-        chat_template=ChatTemplate(CHATML, {}),
+        chat_template=ChatTemplate(chat_template, {}),
         model_id=MODEL_ID,
         page_size=PAGE_SIZE,
         stop_ids=stop_ids,
@@ -271,6 +274,21 @@ def test_the_view_cap_keeps_positions_within_the_trained_context():
     assert pages * PAGE_SIZE + (PAGE_SIZE - 1) + 512 <= 40960
     assert (pages + 1) * PAGE_SIZE + (PAGE_SIZE - 1) + 512 > 40960
     assert trained_view_pages(0, cycle_tokens=512) is None
+
+
+def test_a_chat_template_error_is_a_bad_request():
+    template = "{{ raise_exception('unsupported effort ' ~ reasoning_effort) }}"
+    with api_client(lambda: load(chat_template=template)) as client:
+        response = post(client, messages=MESSAGES, reasoning_effort="high")
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "chat template: unsupported effort high"
+
+
+def test_without_a_system_message_only_the_first_page_is_sunk(client):
+    state = client.app.state.server_state
+    assert state.eviction_for(0).n_sink == 1
+    assert state.eviction_for(PAGE_SIZE + 1).n_sink == 2
 
 
 def test_an_unknown_model_is_not_found(client):

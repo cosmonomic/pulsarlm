@@ -3,7 +3,7 @@ from datetime import datetime
 import pytest
 from tokenizers import Tokenizer, models, pre_tokenizers
 
-from pulsarlm.chat import ChatTemplate, encode_prompt
+from pulsarlm.chat import ChatTemplate, ChatTemplateError, encode_prompt
 
 TURNS = (
     "{{ bos_token }}{% for m in messages %}<|turn>{{ m.role }}\n{{ m.content | trim }}"
@@ -38,9 +38,28 @@ def test_the_system_message_counts_the_tokens_it_renders_to():
         template,
         [{"role": "system", "content": "a b"}, {"role": "user", "content": "c"}],
     )
-    assert system_tokens == len(tok.encode("<bos><|turn>system\na b<turn|>\n").ids)
+    assert system_tokens == len(
+        tok.encode("<bos><|turn>system\na b<turn|>\n<|turn>user").ids
+    )
     assert ids[0] == SPECIAL.index("<bos>")
     assert ids.count(SPECIAL.index("<bos>")) == 1
+
+
+def test_a_template_rejecting_a_system_message_alone_still_counts_it():
+    tok = tokenizer()
+    template = ChatTemplate(
+        "{% if messages | selectattr('role', 'equalto', 'user') | list | length == 0 %}"
+        "{{ raise_exception('No user query found in messages.') }}{% endif %}" + TURNS,
+        {"bos_token": "<bos>"},
+    )
+    _, system_tokens = encode_prompt(
+        tok,
+        template,
+        [{"role": "system", "content": "a b"}, {"role": "user", "content": "c"}],
+    )
+    assert system_tokens == len(
+        tok.encode("<bos><|turn>system\na b<turn|>\n<|turn>user").ids
+    )
 
 
 def test_a_prompt_without_a_system_message_sinks_nothing():
@@ -72,8 +91,16 @@ def test_reasoning_effort_reaches_the_template_with_enable_thinking(effort, rend
 
 def test_raise_exception_in_a_template_raises():
     template = ChatTemplate("{{ raise_exception('no') }}", {})
-    with pytest.raises(ValueError, match="no"):
+    with pytest.raises(ChatTemplateError, match="no"):
         template.render([], add_generation_prompt=False)
+
+
+def test_tojson_keeps_key_order_and_html_characters():
+    template = ChatTemplate("{{ tools[0] | tojson }}", {})
+    rendered = template.render(
+        [], add_generation_prompt=False, tools=[{"name": "<b>", "type": "é"}]
+    )
+    assert rendered == '{"name": "<b>", "type": "é"}'
 
 
 def test_the_template_can_read_the_date():

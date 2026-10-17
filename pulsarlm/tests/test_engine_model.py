@@ -78,6 +78,11 @@ def test_a_qwen3_5_checkpoint_without_an_output_gate_is_rejected():
         engine_model(qwen3_5(attn_output_gate=False))
 
 
+def test_a_qwen3_5_checkpoint_with_a_sigmoid_linear_attention_gate_is_rejected():
+    with pytest.raises(PulsarLMModelLoadingError, match="output gate sigmoid"):
+        engine_model(qwen3_5(output_gate_type="sigmoid"))
+
+
 def test_a_gemma4_checkpoint_maps_its_text_config():
     cfg = gemma4("gemma4", num_kv_shared_layers=4, hidden_size_per_layer_input=256)
     model = engine_model(cfg)

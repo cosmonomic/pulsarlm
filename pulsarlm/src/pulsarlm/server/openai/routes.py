@@ -13,7 +13,7 @@ from fastapi.routing import APIRouter
 from tokenizers import Tokenizer
 
 from pulsarlm.async_engine import AsyncEngine, EngineStopped
-from pulsarlm.chat import ChatTemplate, Message, encode_prompt
+from pulsarlm.chat import ChatTemplate, ChatTemplateError, Message, encode_prompt
 from pulsarlm.completion import CompletionError, complete
 from pulsarlm.core.engine import EvictionPolicy, RequestError, SamplingParams
 from pulsarlm.server.openai.schema import (
@@ -49,12 +49,10 @@ class ServerState:
     eviction: EvictionPolicy
 
     def eviction_for(self, system_tokens: int) -> EvictionPolicy:
-        """The default policy, sinking the pages the system message touches, if
-        there is one."""
+        """The default policy, sinking the pages the system message touches, or
+        the first page without one."""
         return EvictionPolicy(
-            n_sink=math.ceil(system_tokens / self.page_size)
-            if system_tokens
-            else self.eviction.n_sink,
+            n_sink=math.ceil(system_tokens / self.page_size) if system_tokens else 1,
             n_working=self.eviction.n_working,
             cycle_tokens=self.eviction.cycle_tokens,
             max_pages=self.eviction.max_pages,
@@ -96,13 +94,16 @@ async def create_chat_completion(body: ChatCompletionRequest, state: State):
             400, f"{state.model_id} has no tool call syntax pulsarlm parses"
         )
 
-    prompt, system_tokens = encode_prompt(
-        state.tokenizer,
-        state.chat_template,
-        template_messages(body.messages),
-        reasoning_effort=body.reasoning_effort,
-        tools=tools,
-    )
+    try:
+        prompt, system_tokens = encode_prompt(
+            state.tokenizer,
+            state.chat_template,
+            template_messages(body.messages),
+            reasoning_effort=body.reasoning_effort,
+            tools=tools,
+        )
+    except ChatTemplateError as error:
+        raise HTTPException(400, f"chat template: {error}") from error
     tokens = complete(
         state.engine,
         state.store,
