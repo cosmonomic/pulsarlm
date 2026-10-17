@@ -108,7 +108,10 @@ async def create_chat_completion(body: ChatCompletionRequest, state: State):
         state.store,
         prompt,
         sampling=SamplingParams(
-            temperature=body.temperature, top_p=body.top_p, seed=body.seed
+            temperature=body.temperature,
+            top_p=body.top_p,
+            top_k=body.top_k,
+            seed=body.seed,
         ),
         max_tokens=body.max_tokens,
         eviction=state.eviction_for(system_tokens),

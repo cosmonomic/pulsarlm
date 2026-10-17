@@ -46,6 +46,7 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int | None = Field(default=None, ge=0)
     temperature: float = Field(default=1.0, ge=0.0, le=2.0)
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
+    top_k: int = Field(default=0, ge=0)
     seed: int | None = Field(default=None, ge=0)
     reasoning_effort: ReasoningEffort | None = None
     tools: list[Tool] | None = None

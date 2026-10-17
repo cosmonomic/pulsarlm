@@ -200,6 +200,14 @@ def chat(
             help="Samples from the smallest set of tokens whose probability reaches top_p.",
         ),
     ] = 1.0,
+    top_k: Annotated[
+        int,
+        typer.Option(
+            "--top_k",
+            min=0,
+            help="Samples from the top_k most probable tokens; 0 keeps every token.",
+        ),
+    ] = 0,
     reasoning_effort: Annotated[
         ReasoningEffort,
         typer.Option(
@@ -249,6 +257,7 @@ def chat(
             system=system,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
             reasoning_effort=reasoning_effort.value,
             show_thinking=show_thinking,
         )
