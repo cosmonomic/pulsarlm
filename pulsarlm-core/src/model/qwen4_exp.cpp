@@ -230,24 +230,15 @@ at::Tensor Qwen4ExpModel::selected_blocks(
     const std::int64_t words = max_blocks / 32 + 1;
     const auto longs = queries.options().dtype(at::kLong);
 
-    at::Tensor keys = lines.index_keys.index_select(0, page_tables.flatten().to(at::kLong))
-                          .view({num_seqs, max_blocks, ratio, c.indexer_head_dim});
-    at::Tensor pooled = rmsnorm_cuda(
-        keys.to(at::kFloat).mean(2).to(keys.scalar_type()),
+    at::Tensor blocks = index_blocks_cuda(
+        lines.index_keys,
+        page_tables,
+        rope_layout,
         w.index_k_norm,
+        index_inv_freq,
+        ratio,
         c.rms_norm_eps
     );
-    at::Tensor first_keys = at::arange(max_blocks, longs).unsqueeze(0) * ratio;
-    at::Tensor layout = rope_layout.to(at::kLong);
-    at::Tensor n_sink = layout.select(1, 0).unsqueeze(1);
-    at::Tensor working_lo = layout.select(1, 1).unsqueeze(1);
-    at::Tensor short_offset = layout.select(1, 2).unsqueeze(1);
-    at::Tensor positions = at::where(
-        first_keys < n_sink,
-        first_keys,
-        at::where(first_keys < working_lo, short_offset, short_offset + 1 + first_keys - working_lo)
-    );
-    at::Tensor blocks = index_rope(pooled, positions).contiguous();
 
     at::Tensor starts = cu_seqlens_q.to(at::kLong);
     at::Tensor counts = starts.narrow(0, 1, num_seqs) - starts.narrow(0, 0, num_seqs);
@@ -256,29 +247,26 @@ at::Tensor Qwen4ExpModel::selected_blocks(
         counts.index_select(0, sequence_of) + at::arange(ntok, longs) - starts.index_select(0, sequence_of);
     at::Tensor complete_blocks = at::floor_divide(view_index + 1, ratio);
 
-    const std::int64_t top = std::min(c.indexer_budget / ratio, max_blocks);
     const std::int64_t chunk_rows = std::max<std::int64_t>(1, (std::int64_t{1} << 26) / max_blocks);
-    at::Tensor bit_values = at::pow(2, at::arange(32, longs));
     std::vector<at::Tensor> selected;
     for (std::int64_t first = 0; first < ntok; first += chunk_rows) {
         const std::int64_t rows = std::min(chunk_rows, ntok - first);
-        at::Tensor row_blocks = complete_blocks.narrow(0, first, rows);
+        at::Tensor row_blocks = complete_blocks.narrow(0, first, rows).contiguous();
         at::Tensor scores = index_scores_cuda(
             queries.narrow(0, first, rows).contiguous(),
             blocks,
             sequence_of.narrow(0, first, rows).contiguous(),
-            row_blocks.contiguous(),
+            row_blocks,
             1.0 / std::sqrt(static_cast<double>(c.indexer_head_dim))
         );
-        auto [sorted, order] = at::sort(scores, /*stable=*/true, /*dim=*/-1, /*descending=*/true);
-        at::Tensor bits = at::zeros({rows, words * 32}, longs.dtype(at::kBool));
-        bits.scatter_(1, order.narrow(1, 0, top), sorted.narrow(1, 0, top) > -INFINITY);
-        at::Tensor tail = row_blocks.unsqueeze(1);
-        bits.scatter_(1, tail, tail * ratio <= view_index.narrow(0, first, rows).unsqueeze(1));
-        at::Tensor packed = (bits.view({rows, words, 32}).to(at::kLong) * bit_values).sum(-1);
-        selected.push_back(
-            at::where(packed >= (std::int64_t{1} << 31), packed - (std::int64_t{1} << 32), packed).to(at::kInt)
-        );
+        selected.push_back(select_blocks_cuda(
+            scores,
+            row_blocks,
+            view_index.narrow(0, first, rows).contiguous(),
+            c.indexer_budget / ratio,
+            ratio,
+            words
+        ));
     }
     return at::cat(selected);
 }

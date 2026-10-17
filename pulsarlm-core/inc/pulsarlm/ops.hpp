@@ -227,6 +227,35 @@ at::Tensor attn_indexed_cuda(
     double mass_length_gain
 );
 
+// QSA's blocks [sequences, max_blocks, dim] in index_keys' dtype: block b of sequence s is the mean, in fp32 and
+// rounded, of the raw keys [b * ratio, (b + 1) * ratio) of its view, then its RMSNorm by norm_weight (fp32, 1 + weight)
+// as rmsnorm_cuda computes it, then Hugging Face's partial RoPE of its first 2 * inv_freq.size(0) dims at the position
+// rope_layout[s] gives key b * ratio (see attn_decode_cuda), cos and sin rounded to the dtype. index_keys is [lines,
+// page_size, dim] with each line packed, page_tables int32 [sequences, max_pages] whose view keys are max_pages *
+// page_size, and ratio divides the page size.
+at::Tensor index_blocks_cuda(
+    const at::Tensor& index_keys,
+    const at::Tensor& page_tables,
+    const at::Tensor& rope_layout,
+    const at::Tensor& norm_weight,
+    const at::Tensor& inv_freq,
+    int64_t ratio,
+    double eps
+);
+
+// QSA's selection, int32 [rows, words] as attn_indexed_cuda reads it: row r's top min(top, max_blocks) blocks by scores
+// (index_scores_cuda's), the lower block first among equal scores and no block scoring -inf, then the block
+// row_blocks[r] when it starts at or before view_index[r]. row_blocks and view_index are int64 [rows]; words * 32
+// exceeds max_blocks.
+at::Tensor select_blocks_cuda(
+    const at::Tensor& scores,
+    const at::Tensor& row_blocks,
+    const at::Tensor& view_index,
+    int64_t top,
+    int64_t ratio,
+    int64_t words
+);
+
 // QSA's block scores, fp32 [rows, max_blocks]: for query row r of sequence row_sequence[r], block b below row_blocks[r]
 // scores scale times the sum over its heads of relu(queries[r, h] . blocks[row_sequence[r], b]), dot products in fp32;
 // the blocks past row_blocks[r] score -inf. queries [rows, heads, dim] and blocks [sequences, max_blocks, dim] share a
