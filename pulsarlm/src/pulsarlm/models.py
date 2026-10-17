@@ -28,6 +28,7 @@ REPOSITORIES = {
     "qwen3.6-35b-a3b": "Qwen/Qwen3.6-35B-A3B",
     "qwen3.8-27b": "Qwen/Qwen3.8-27B",
     "qwen3.8-2.4t-a95b": "Qwen/Qwen3.8-2.4T-A95B",
+    "qwen3.8-flash-next": "Qwen/Qwen3.8-Flash-Next",
     "llama-3-8b-instruct": "meta-llama/Meta-Llama-3-8B-Instruct",
     "llama-3-70b-instruct": "meta-llama/Meta-Llama-3-70B-Instruct",
     "llama-3.1-8b-instruct": "meta-llama/Llama-3.1-8B-Instruct",
