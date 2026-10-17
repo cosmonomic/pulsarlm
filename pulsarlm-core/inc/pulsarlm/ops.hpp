@@ -204,7 +204,8 @@ at::Tensor attn_prefill_cuda(
 
 // Indexed attention: attn_prefill_cuda's ragged batch, decode included as one query per sequence, in which the query
 // at view index p attends only the keys j <= p of its selected blocks: bit b of selected's row for the query, word
-// b / 32, bit b % 32, selects the keys [b * block_size, (b + 1) * block_size). selected is int32 [total_q, words] with
+// b / 32, bit b % 32, selects the keys [b * block_size, (b + 1) * block_size), block_size dividing the page size.
+// selected is int32 [total_q, words] with
 // words * 32 * block_size at least the page tables' keys. A query selects at least one key. The mass is
 // attn_prefill_cuda's, the length gain, at mass_length_gain <= 0, stated against the keys each query attends.
 // Returns o [total_q, n_q_heads, head_dim].

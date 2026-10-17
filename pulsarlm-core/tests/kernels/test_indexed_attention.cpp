@@ -220,12 +220,12 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
         b.decay,
         0.0
     );
-    // The scalar kernel sums each output across threads with atomicAdd, in no fixed order.
+    // The scalar kernel sums each output across threads with atomicAdd, and both ops add the mass with atomicAdd, in no
+    // fixed order.
     if (dtype == at::kFloat) {
         CHECK(at::allclose(all, dense, 1e-6, 1e-6));
-        CHECK(at::allclose(all_mass, dense_mass, 1e-6, 1e-6));
     } else {
         CHECK(at::equal(all, dense));
-        CHECK(at::equal(all_mass, dense_mass));
     }
+    CHECK(at::allclose(all_mass, dense_mass, 1e-5, 1e-6));
 }

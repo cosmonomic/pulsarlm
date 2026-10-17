@@ -30,6 +30,10 @@ struct Selection {
     int words;
     int block_size;
 
+    __device__ __forceinline__ uint32_t word(int query, int w) const {
+        return this->bits[static_cast<int64_t>(query) * this->words + w];
+    }
+
     __device__ __forceinline__ bool selects(int query, int key) const {
         const int block = key / this->block_size;
         return (this->bits[static_cast<int64_t>(query) * this->words + block / 32] >> (block % 32)) & 1u;
@@ -172,14 +176,43 @@ __global__ void attn_indexed_scalar_kernel(const attn::PagedAttnParams<scalar_t>
     }
 }
 
-// Copies every key of each sequence's view into rotated_k, rotated to its view position, as rotate_view_keys_kernel.
+// One thread per (query row, selection word): marks the view pages of the row's sequence its selected blocks lie in.
 template <typename scalar_t>
-__global__ void
-rotate_indexed_keys_kernel(const attn::PagedAttnParams<scalar_t> p, int page_size, scalar_t* __restrict__ rotated_k) {
+__global__ void mark_selected_pages_kernel(
+    const attn::PagedAttnParams<scalar_t> p,
+    const Selection selection,
+    int total_q,
+    int page_size,
+    int32_t* __restrict__ selected_pages
+) {
+    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= static_cast<int64_t>(total_q) * selection.words) {
+        return;
+    }
+    const int row = static_cast<int>(index / selection.words);
+    const int w = static_cast<int>(index % selection.words);
+    const int s = sequence_of(p, row);
+    for (uint32_t bits = selection.word(row, w); bits != 0; bits &= bits - 1) {
+        const int page = (w * 32 + __ffs(bits) - 1) * selection.block_size / page_size;
+        if (page < p.max_pages) {
+            selected_pages[static_cast<int64_t>(s) * p.max_pages + page] = 1;
+        }
+    }
+}
+
+// Copies the keys of each sequence's selected view pages into rotated_k, rotated to their view positions, as
+// rotate_view_keys_kernel.
+template <typename scalar_t>
+__global__ void rotate_indexed_keys_kernel(
+    const attn::PagedAttnParams<scalar_t> p,
+    int page_size,
+    const int32_t* __restrict__ selected_pages,
+    scalar_t* __restrict__ rotated_k
+) {
     const int s = blockIdx.x / p.max_pages;
     const int view_page = blockIdx.x % p.max_pages;
     const int keys = min(page_size, p.seqlens_k[s] - view_page * page_size);
-    if (keys <= 0) {
+    if (keys <= 0 || !selected_pages[blockIdx.x]) {
         return;
     }
     const int half = p.head_dim / 2;
@@ -204,7 +237,8 @@ rotate_indexed_keys_kernel(const attn::PagedAttnParams<scalar_t> p, int page_siz
     }
 }
 
-// attn_prefill_tc_kernel, each query row attending its selected keys up to its own view index.
+// One CTA per (query token, KV group): the MMA rows are the group's query heads, up to 16, and each key tile gathers
+// the token's next selected blocks in view order. The tile, sweep and staging arithmetic is attn_prefill_tc_kernel's.
 template <typename scalar_t, int PAGE_SIZE, int HEAD_DIM, bool BF16, int NWARPS, int KEY_PAGES, int CTAS_PER_SM>
 __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kernel(
     const attn::PagedAttnParams<scalar_t> p,
@@ -212,13 +246,7 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
     const scalar_t* __restrict__ rotated_k  // [num_seqs * max_pages, page_size, n_kv_heads, head_dim]
 ) {
     constexpr int KEY_TILE = PAGE_SIZE * KEY_PAGES;
-    // sS row stride. A stride of exactly KEY_TILE puts every row of a column on one
-    // shared bank, and the two warp-0 sweeps below read a whole column at once.
     constexpr int SCORE_STRIDE = KEY_TILE + 1;
-    // The per-row max and denominator sweeps give every query row a group of
-    // kSweepLanes consecutive threads and reduce the group on shuffles. A group's
-    // threads take consecutive score pairs, which keeps the two half-warps of a
-    // warp on disjoint banks at SCORE_STRIDE odd.
     constexpr int kSweepLanes = 4;
     constexpr int kSweepCols = KEY_TILE / kSweepLanes;
     constexpr int kSweepThreads = 16 * kSweepLanes;
@@ -232,25 +260,16 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
     const int lane = tid & 31;
     const int sweep_row = tid / kSweepLanes;
     const int sweep_lane = tid % kSweepLanes;
-    const int blk = blockIdx.x;
-    const int h = blk % p.n_q_heads;
-    const int g = h / p.group;
-    int s, qbase;
-    if (!attn::query_tile(p, blk / p.n_q_heads, s, qbase)) {
-        return;
-    }
-    // This sequence's EMA gain alpha and the retention 1 - alpha it implies.
-    const float mass_decay = p.mass ? p.mass_decay[s] : 0.0f;
-    const float retention = 1.0f - mass_decay;
+    const int qtok = blockIdx.x / p.n_kv_heads;
+    const int g = blockIdx.x % p.n_kv_heads;
+    const int rows = p.group;
+    const int first_head = g * p.group;
+    const int s = sequence_of(p, qtok);
     const int q0 = p.cu_seqlens_q[s];
     const int seq_q = p.cu_seqlens_q[s + 1] - q0;
     const int ctx_len = p.seqlens_k[s];
-    const int ctx_start = ctx_len - seq_q;
-    const int tile_rows = min(16, seq_q - qbase);
-    const int q_global_base = q0 + qbase;
-    // Context pos of MMA row m is ctx_start + qbase + m; the tile's highest.
-    const int max_p = ctx_start + qbase + tile_rows - 1;
-    const int n_key_tiles = max_p / KEY_TILE + 1;  // tiles covering keys [0, max_p]
+    const int query_pos = ctx_len - seq_q + (qtok - q0);
+    const int tile_blocks = KEY_TILE / selection.block_size;
 
     const int32_t* seq_table = p.page_tables + static_cast<int64_t>(s) * p.max_pages;
     const int64_t rotated_token_stride = static_cast<int64_t>(p.n_kv_heads) * HEAD_DIM;
@@ -259,10 +278,8 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
     static_assert(sizeof(scalar_t) == 2, "the tile staging copies 8 elements at a time");
     constexpr int kChunkElems = 16 / sizeof(scalar_t);
     constexpr int kRowChunks = HEAD_DIM / kChunkElems;
-    constexpr int kPageChunks = PAGE_SIZE * kRowChunks;
+    constexpr int kTileChunks = KEY_TILE * kRowChunks;
 
-    // sQ, sK and sV carry their columns permuted by attn::swizzled_offset; sP and sS
-    // are reached by scalar accesses only and stay row-major.
     extern __shared__ __align__(16) unsigned char shared_memory[];
     scalar_t* sQ = reinterpret_cast<scalar_t*>(shared_memory);
     scalar_t* sK = sQ + 16 * HEAD_DIM;
@@ -270,27 +287,23 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
     scalar_t* sP = sV + KEY_TILE * HEAD_DIM;
     float* sS = reinterpret_cast<float*>(sP + 16 * KEY_TILE);
     __shared__ float Mrow[16], Lrow[16], LSE[16];
-    // Online-softmax rescale of the row's running output, published so every warp
-    // can fold it into its own share of the accumulator.
     __shared__ float row_rescale[16];
-    __shared__ int qpos[16];  // context pos of each MMA row, -1 if padding
-    // Per-query multiplier on the mass this row hands out, as attn_prefill_tc_kernel's, the length gain stated against
-    // the keys THAT row attends.
-    __shared__ float mass_weight[16];
+    // The view index of each key of the staged tiles, -1 past the selection or the query: the tile K holds, then the
+    // one V holds, as the pipeline stages K a tile ahead of V.
+    __shared__ int key_index[2][KEY_TILE];
+    // The next selected block, as the selection word holding it and that word's bits from it on.
+    __shared__ int cursor_word;
+    __shared__ uint32_t cursor_bits;
+    __shared__ float mass_weight;
 
-    // Load Q for this tile's rows into the MMA M dimension; pad rows >= tile_rows.
     for (int i = tid; i < 16 * HEAD_DIM; i += NWARPS * 32) {
         const int row = i / HEAD_DIM, col = i % HEAD_DIM;
         scalar_t v = static_cast<scalar_t>(0);
-        if (row < tile_rows) {
-            const int64_t qi = (static_cast<int64_t>(q_global_base + row) * p.n_q_heads + h) * HEAD_DIM;
-            v = p.q[qi + col];
+        if (row < rows) {
+            v = p.q[(static_cast<int64_t>(qtok) * p.n_q_heads + first_head + row) * HEAD_DIM + col];
         }
         sQ[attn::swizzled_offset<HEAD_DIM>(row, col)] = v;
     }
-    // This lane's share of the running output, one attn::kPvSlabAccums block per dim
-    // slab this warp owns. attn::tile_pv_registers states the (row, column) each
-    // entry carries.
     constexpr int kSlabs = attn::pv_slabs_per_warp<HEAD_DIM, NWARPS>();
     float out_acc[kSlabs * attn::kPvSlabAccums] = {};
     for (int i = tid; i < 16 * KEY_TILE; i += NWARPS * 32) {
@@ -299,92 +312,107 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
     if (tid < 16) {
         Mrow[tid] = -CUDART_INF_F;
         Lrow[tid] = 0.0f;
-        // Padding rows never enter the softmax update, so their output must stay put.
         row_rescale[tid] = 1.0f;
-        const int row_pos = ctx_start + qbase + tid;  // this row's context pos
-        qpos[tid] = (tid < tile_rows) ? row_pos : -1;
-        // Offset from the chunk end: last query in the chunk (seq_q-1) gets
-        // retention^0. __powf(0, 0) is NaN, so the zero exponent is taken directly.
-        const int chunk_end_offset = seq_q - 1 - qbase - tid;
-        float attended_len = p.mass_length_gain;
-        if (p.mass && p.mass_length_gain <= 0.0f && tid < tile_rows) {
-            attended_len = static_cast<float>(selection.attended_keys(q_global_base + tid, row_pos));
-        }
-        mass_weight[tid] = (tid < tile_rows)
-            ? (chunk_end_offset == 0 ? 1.0f : __powf(retention, static_cast<float>(chunk_end_offset))) * attended_len
-            : 0.0f;
     }
-    // The pages of key tile t, in the pool (lines, for V) and in rotated_k (sequence
-    // s's view page b is page s * max_pages + b, for K). A tile may reach past the
-    // sequence's last page; seq_table is only read for the pages before it.
-    auto load_pages = [&](int t, int* lines, int* key_pages) {
-#pragma unroll
-        for (int kp = 0; kp < KEY_PAGES; ++kp) {
-            const int page_base = t * KEY_TILE + kp * PAGE_SIZE;
-            const bool in_view = t < n_key_tiles && page_base < ctx_len;
-            lines[kp] = in_view ? seq_table[t * KEY_PAGES + kp] : 0;
-            key_pages[kp] = in_view ? s * p.max_pages + t * KEY_PAGES + kp : 0;
+    if (tid == 0) {
+        cursor_word = 0;
+        cursor_bits = selection.word(qtok, 0);
+        if (p.mass) {
+            // As attn_prefill_tc_kernel's per-query multiplier; every row of the CTA is the one query's.
+            const float retention = 1.0f - p.mass_decay[s];
+            const int chunk_end_offset = seq_q - 1 - (qtok - q0);
+            const float attended_len = p.mass_length_gain > 0.0f
+                ? p.mass_length_gain
+                : static_cast<float>(selection.attended_keys(qtok, query_pos));
+            mass_weight = (chunk_end_offset == 0 ? 1.0f : __powf(retention, static_cast<float>(chunk_end_offset))) *
+                attended_len;
         }
+    }
+    __syncthreads();
+
+    // Fills key_index[slot] with the next tile_blocks selected blocks at or before the query, from the cursor on; false
+    // when none is left. Thread 0 walks the bits; every thread returns the same.
+    __shared__ bool tile_found;
+    auto next_tile = [&](int slot) {
+        if (tid == 0) {
+            int filled = 0;
+            while (filled < tile_blocks && cursor_word < selection.words) {
+                if (cursor_bits == 0) {
+                    if (++cursor_word < selection.words) {
+                        cursor_bits = selection.word(qtok, cursor_word);
+                    }
+                    continue;
+                }
+                const int block = cursor_word * 32 + __ffs(cursor_bits) - 1;
+                if (block * selection.block_size > query_pos) {
+                    cursor_word = selection.words;
+                    break;
+                }
+                cursor_bits &= cursor_bits - 1;
+                for (int k = 0; k < selection.block_size; ++k) {
+                    const int key = block * selection.block_size + k;
+                    key_index[slot][filled * selection.block_size + k] = key <= query_pos ? key : -1;
+                }
+                ++filled;
+            }
+            for (int c = filled * selection.block_size; c < KEY_TILE; ++c) {
+                key_index[slot][c] = -1;
+            }
+            tile_found = filled > 0;
+        }
+        __syncthreads();
+        return tile_found;
     };
 
-    // Stage one key tile into its shared tile. Always commits a group, empty tile
-    // included, so every iteration costs the same number of groups and a wait count
-    // means the same thing throughout.
-    auto stage_tile = [&](const scalar_t* pool,
-                          int64_t page_stride,
-                          int64_t token_stride,
-                          int64_t head_stride,
-                          scalar_t* dst,
-                          int t,
-                          const int* pages) {
-        if (t < n_key_tiles) {
-#pragma unroll
-            for (int kp = 0; kp < KEY_PAGES; ++kp) {
-                const int page_base = t * KEY_TILE + kp * PAGE_SIZE;
-                const int valid = min(PAGE_SIZE, ctx_len - page_base);
-                const int64_t page_first = static_cast<int64_t>(pages[kp]) * page_stride + g * head_stride;
-                for (int c = tid; c < kPageChunks; c += NWARPS * 32) {
-                    const int off = c / kRowChunks;
-                    const int d = (c % kRowChunks) * kChunkElems;
-                    const int64_t idx = page_first + static_cast<int64_t>(off) * token_stride + d;
-                    attn::cp_async_16(
-                        dst + attn::swizzled_offset<HEAD_DIM>(kp * PAGE_SIZE + off, d),
-                        pool + idx,
-                        off < valid ? 16 : 0
-                    );
-                }
-            }
+    // Stages the keys of key_index[slot], K from rotated_k or V from the pool, zeros past the selection. Always commits
+    // a group, as attn_prefill_tc_kernel's stage_tile.
+    auto stage_tile = [&](bool keys, scalar_t* dst, int slot) {
+        for (int c = tid; c < kTileChunks; c += NWARPS * 32) {
+            const int row = c / kRowChunks;
+            const int d = (c % kRowChunks) * kChunkElems;
+            const int key = key_index[slot][row];
+            const int view_page = max(key, 0) / PAGE_SIZE;
+            const int offset = max(key, 0) % PAGE_SIZE;
+            const scalar_t* src = keys
+                ? rotated_k + (static_cast<int64_t>(s) * p.max_pages + view_page) * rotated_page_stride +
+                    offset * rotated_token_stride + static_cast<int64_t>(g) * HEAD_DIM + d
+                : p.v_pool + static_cast<int64_t>(seq_table[view_page]) * p.page_stride + offset * p.token_stride +
+                    g * p.head_stride + d;
+            attn::cp_async_16(dst + attn::swizzled_offset<HEAD_DIM>(row, d), src, key >= 0 ? 16 : 0);
         }
         attn::cp_async_commit();
     };
 
-    // K of tile t is consumed by QKᵀ at the top of the iteration and V only by PV at
-    // the bottom, so each is staged one full iteration ahead of its use.
-    int tile_lines[KEY_PAGES], next_lines[KEY_PAGES], tile_keys[KEY_PAGES], next_keys[KEY_PAGES];
-    auto attends = [&](int m, int key) { return key <= qpos[m] && selection.selects(q_global_base + m, key); };
+    auto attends = [&](int m, int c, int slot) { return m < rows && key_index[slot][c] >= 0; };
 
-    load_pages(0, tile_lines, tile_keys);
-    stage_tile(rotated_k, rotated_page_stride, rotated_token_stride, HEAD_DIM, sK, 0, tile_keys);
-    stage_tile(p.v_pool, p.page_stride, p.token_stride, p.head_stride, sV, 0, tile_lines);
-    __syncthreads();
-
-    // Pass 1: online-softmax attention with per-(row,key) causal and selection masking.
-    for (int t = 0; t < n_key_tiles; ++t) {
-        const int tile_base = t * KEY_TILE;
-        load_pages(t + 1, next_lines, next_keys);
+    // Pass 1: online softmax over the gathered tiles. Slot 0 is the tile in sK, slot 1 the one in sV.
+    bool more = next_tile(0);
+    if (more) {
+        stage_tile(true, sK, 0);
+        for (int i = tid; i < KEY_TILE; i += NWARPS * 32) {
+            key_index[1][i] = key_index[0][i];
+        }
+        __syncthreads();
+        stage_tile(false, sV, 1);
+    }
+    while (more) {
         attn::cp_async_wait<1>();
         __syncthreads();
-
         attn::tile_qkt<scalar_t, KEY_TILE, HEAD_DIM, BF16, SCORE_STRIDE, true>(sQ, sK, sS, warp, NWARPS);
         __syncthreads();
-        stage_tile(rotated_k, rotated_page_stride, rotated_token_stride, HEAD_DIM, sK, t + 1, next_keys);
+        more = next_tile(0);
+        if (more) {
+            stage_tile(true, sK, 0);
+        } else {
+            attn::cp_async_commit();
+        }
 
         if (tid < kSweepThreads) {
             float tmax = -CUDART_INF_F;
 #pragma unroll
             for (int j = 0; j < kSweepCols; ++j) {
                 const int c = sweep_lane * kSweepCols + j;
-                if (attends(sweep_row, tile_base + c)) {
+                if (attends(sweep_row, c, 1)) {
                     tmax = fmaxf(tmax, p.scale * sS[sweep_row * SCORE_STRIDE + c]);
                 }
             }
@@ -392,27 +420,23 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
             for (int off = kSweepLanes / 2; off > 0; off >>= 1) {
                 tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, off));
             }
-            if (sweep_lane == 0 && sweep_row < tile_rows) {
+            if (sweep_lane == 0 && sweep_row < rows) {
                 const float newM = fmaxf(Mrow[sweep_row], tmax);
-                // 1 while the row has attended no key.
                 row_rescale[sweep_row] = newM == -CUDART_INF_F ? 1.0f : __expf(Mrow[sweep_row] - newM);
                 Mrow[sweep_row] = newM;
             }
         }
         __syncthreads();
 
-        // One thread per (query row, key): the exponentials run across the CTA,
-        // and sS carries each row's weight to the sequential sum below.
         for (int i = tid; i < 16 * KEY_TILE; i += NWARPS * 32) {
             const int m = i / KEY_TILE, c = i % KEY_TILE;
             float& score = sS[m * SCORE_STRIDE + c];
-            const float pw = attends(m, tile_base + c) ? __expf(p.scale * score - Mrow[m]) : 0.0f;
+            const float pw = attends(m, c, 1) ? __expf(p.scale * score - Mrow[m]) : 0.0f;
             score = pw;
             sP[i] = static_cast<scalar_t>(pw);
         }
         __syncthreads();
 
-        // Summed as a shuffle tree over the row's group, not in key order.
         if (tid < kSweepThreads) {
             float lsum = 0.0f;
 #pragma unroll
@@ -423,7 +447,7 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
             for (int off = kSweepLanes / 2; off > 0; off >>= 1) {
                 lsum += __shfl_xor_sync(0xffffffffu, lsum, off);
             }
-            if (sweep_lane == 0 && sweep_row < tile_rows) {
+            if (sweep_lane == 0 && sweep_row < rows) {
                 Lrow[sweep_row] = Lrow[sweep_row] * row_rescale[sweep_row] + lsum;
             }
         }
@@ -432,75 +456,84 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
 
         attn::tile_pv_registers<scalar_t, KEY_TILE, HEAD_DIM, BF16, NWARPS, true>(sP, sV, row_rescale, out_acc, warp);
         __syncthreads();
-        stage_tile(p.v_pool, p.page_stride, p.token_stride, p.head_stride, sV, t + 1, next_lines);
+        if (more) {
+            for (int i = tid; i < KEY_TILE; i += NWARPS * 32) {
+                key_index[1][i] = key_index[0][i];
+            }
+            __syncthreads();
+            stage_tile(false, sV, 1);
+        }
     }
+    attn::cp_async_wait<0>();
 
-    // Normalize + write o, each lane over the accumulators it owns.
     {
         const int gid = lane >> 2;
-        // A row past tile_rows has Lrow 0, and its reciprocal is never read.
         const float inv_low = 1.0f / Lrow[gid], inv_high = 1.0f / Lrow[gid + 8];
         attn::for_each_pv_register<HEAD_DIM, NWARPS>(out_acc, warp, [&](int row, int col, float value) {
-            if (row < tile_rows) {
-                p.o[(static_cast<int64_t>(q_global_base + row) * p.n_q_heads + h) * HEAD_DIM +
+            if (row < rows) {
+                p.o[(static_cast<int64_t>(qtok) * p.n_q_heads + first_head + row) * HEAD_DIM +
                     col] = static_cast<scalar_t>(value * (row < 8 ? inv_low : inv_high));
             }
         });
     }
 
-    if (tid < tile_rows) {
-        LSE[tid] = Mrow[tid] + logf(Lrow[tid]);
-    }
-    __syncthreads();
-
-    // Pass 2: recompute QKᵀ and accumulate per-key mass into this q head's own column of each key's mass row.
     if (!p.mass) {
         return;
     }
+    if (tid < rows) {
+        LSE[tid] = Mrow[tid] + logf(Lrow[tid]);
+    }
+    if (tid == 0) {
+        cursor_word = 0;
+        cursor_bits = selection.word(qtok, 0);
+    }
+    __syncthreads();
+
+    // Pass 2: recompute QKᵀ over the same tiles and add each (head, key) weight into the head's column of the key's mass
+    // row.
+    const float mass_decay = p.mass_decay[s];
     float* mass = attn::seq_mass(p, s, ctx_len, PAGE_SIZE);
-    load_pages(0, tile_lines, tile_keys);
-    stage_tile(rotated_k, rotated_page_stride, rotated_token_stride, HEAD_DIM, sK, 0, tile_keys);
-    for (int t = 0; t < n_key_tiles; ++t) {
-        const int tile_base = t * KEY_TILE;
-        load_pages(t + 1, next_lines, next_keys);
+    for (bool found = next_tile(0); found;) {
+        stage_tile(true, sK, 0);
         attn::cp_async_wait<0>();
         __syncthreads();
-
         attn::tile_qkt<scalar_t, KEY_TILE, HEAD_DIM, BF16, SCORE_STRIDE, true>(sQ, sK, sS, warp, NWARPS);
         __syncthreads();
-        stage_tile(rotated_k, rotated_page_stride, rotated_token_stride, HEAD_DIM, sK, t + 1, next_keys);
-
         for (int i = tid; i < 16 * KEY_TILE; i += NWARPS * 32) {
             const int m = i / KEY_TILE, c = i % KEY_TILE;
-            float& score = sS[m * SCORE_STRIDE + c];
-            score = attends(m, tile_base + c) ? mass_weight[m] * __expf(p.scale * score - LSE[m]) : 0.0f;
-        }
-        __syncthreads();
-
-        // Summed in row order, so the accumulation is the sequential one.
-        for (int c = tid; c < KEY_TILE; c += NWARPS * 32) {
-            float ms = 0.0f;
-            for (int m = 0; m < tile_rows; ++m) {
-                ms += sS[m * SCORE_STRIDE + c];
-            }
-            if (ms > 0.0f) {
-                atomicAdd(&mass[static_cast<int64_t>(tile_base + c) * p.n_q_heads + h], mass_decay * ms);
+            if (attends(m, c, 0)) {
+                const float weight = mass_weight * __expf(p.scale * sS[m * SCORE_STRIDE + c] - LSE[m]);
+                atomicAdd(
+                    &mass[static_cast<int64_t>(key_index[0][c]) * p.n_q_heads + first_head + m],
+                    mass_decay * weight
+                );
             }
         }
         __syncthreads();
+        found = next_tile(0);
     }
 }
 
 template <typename scalar_t, bool BF16>
 void launch_indexed_tc(const attn::PagedAttnBatch& b, const Selection& selection, cudaStream_t stream) {
-    // A sequence of n queries takes ceil(n / 16) query tiles, at most n / 16 + 1; the CTAs past the last tile exit.
-    const int64_t grid = (b.total_q / 16 + b.num_seqs) * b.n_q_heads;
+    const int64_t grid = b.total_q * b.n_kv_heads;
     const auto params = b.params<scalar_t>();
     const int64_t view_pages = b.num_seqs * b.max_pages;
+    auto selected_pages = at::zeros({view_pages}, b.page_tables.options());
+    const int64_t marks = b.total_q * selection.words;
+    mark_selected_pages_kernel<scalar_t><<<static_cast<int>((marks + 255) / 256), 256, 0, stream>>>(
+        params,
+        selection,
+        static_cast<int>(b.total_q),
+        static_cast<int>(b.page_size),
+        selected_pages.data_ptr<int32_t>()
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     auto rotated_k = at::empty({view_pages, b.page_size, b.n_kv_heads, b.head_dim}, b.k_pool.options());
     rotate_indexed_keys_kernel<scalar_t><<<static_cast<int>(view_pages), 256, 0, stream>>>(
         params,
         static_cast<int>(b.page_size),
+        selected_pages.const_data_ptr<int32_t>(),
         rotated_k.data_ptr<scalar_t>()
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -577,7 +610,10 @@ at::Tensor attn_indexed_cuda(
         mass_length_gain,
         std::nullopt
     );
-    TORCH_CHECK(block_size >= 1, "attn_indexed: block_size must be at least 1");
+    TORCH_CHECK(
+        block_size >= 1 && b.page_size % block_size == 0,
+        "attn_indexed: block_size must be at least 1 and divide the page size"
+    );
     TORCH_CHECK(
         selected.is_cuda() && selected.scalar_type() == at::kInt && selected.dim() == 2 &&
             selected.size(0) == b.total_q && selected.is_contiguous() &&
