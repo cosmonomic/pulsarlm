@@ -100,6 +100,7 @@ std::vector<page_shape> page_shapes(const engine_config& config, std::span<const
                 .head_dim = layer.head_dim,
                 .dtype = config.kv_dtype,
                 .values_only = layer.values_only,
+                .index_head_dim = layer.index_head_dim,
             }
         );
     }

@@ -72,6 +72,10 @@ at::Tensor make_pool(std::span<const page_shape> shapes, std::size_t pool_bytes,
         TORCH_CHECK(shape.n_layers == 1, "kv_cache: a KV layer's page shape has n_layers 1");
         TORCH_CHECK(shape.state_sizes.empty() || shape.values_only, "kv_cache: a recurrent page is values_only");
         TORCH_CHECK(
+            shape.index_head_dim == 0 || (shape.state_sizes.empty() && !shape.values_only),
+            "kv_cache: an indexed attention page keeps K and V apart"
+        );
+        TORCH_CHECK(
             pool_bytes / block_bytes(shape) < std::numeric_limits<std::uint32_t>::max(),
             "kv_cache: too many lines in a pool of ",
             pool_bytes,
@@ -93,7 +97,8 @@ std::vector<std::int64_t> line_strides(const page_shape& shape) {
     auto tensor_elements = static_cast<std::int64_t>(shape.page_size * shape.head_dim);
     auto head_elements = static_cast<std::int64_t>(tensor_count(shape)) * tensor_elements;
     return {
-        head_elements * static_cast<std::int64_t>(shape.n_kv_heads),
+        head_elements * static_cast<std::int64_t>(shape.n_kv_heads) +
+            static_cast<std::int64_t>(shape.page_size * shape.index_head_dim),
         static_cast<std::int64_t>(shape.head_dim),
         head_elements,
         1,
@@ -101,8 +106,8 @@ std::vector<std::int64_t> line_strides(const page_shape& shape) {
 }
 
 // count lines from the first element of elements (1-D, in the shape's dtype), each [n_kv_heads, k then v, page_size,
-// head_dim], as K and V views of [count, page_size, n_kv_heads, head_dim]; a recurrent shape's lines are contiguous
-// [count, state_sizes...].
+// head_dim] then [page_size, index_head_dim], as K and V views of [count, page_size, n_kv_heads, head_dim] and index
+// key views of [count, page_size, index_head_dim]; a recurrent shape's lines are contiguous [count, state_sizes...].
 kv line_views(const at::Tensor& elements, const page_shape& shape, std::size_t count) {
     std::vector<std::int64_t> sizes = page_sizes(shape);
     sizes.front() = static_cast<std::int64_t>(count);
@@ -112,7 +117,19 @@ kv line_views(const at::Tensor& elements, const page_shape& shape, std::size_t c
         return kv{.k = k, .v = k};
     }
     auto v_first = elements.storage_offset() + static_cast<std::int64_t>(shape.page_size * shape.head_dim);
-    return kv{.k = k, .v = elements.as_strided(sizes, strides, v_first)};
+    kv lines{.k = k, .v = elements.as_strided(sizes, strides, v_first)};
+    if (shape.index_head_dim > 0) {
+        auto index_first = elements.storage_offset() +
+            static_cast<std::int64_t>(2 * shape.page_size * shape.head_dim * shape.n_kv_heads);
+        lines.index_keys = elements.as_strided(
+            {static_cast<std::int64_t>(count),
+             static_cast<std::int64_t>(shape.page_size),
+             static_cast<std::int64_t>(shape.index_head_dim)},
+            {strides.front(), static_cast<std::int64_t>(shape.index_head_dim), 1},
+            index_first
+        );
+    }
+    return lines;
 }
 
 // line_count lines of the pool, a block apart.
@@ -122,10 +139,20 @@ kv pool_views(const at::Tensor& pool, const page_shape& shape, std::size_t line_
     std::vector<std::int64_t> strides = line_strides(shape);
     strides.front() = block_elements;
     at::Tensor k = lines.k.as_strided(lines.k.sizes(), strides, lines.k.storage_offset());
-    return kv{
+    kv pool_lines{
         .k = k,
         .v = shape.values_only ? k : lines.v.as_strided(lines.v.sizes(), strides, lines.v.storage_offset())
     };
+    if (lines.index_keys.defined()) {
+        std::vector<std::int64_t> index_strides = lines.index_keys.strides().vec();
+        index_strides.front() = block_elements;
+        pool_lines.index_keys = lines.index_keys.as_strided(
+            lines.index_keys.sizes(),
+            index_strides,
+            lines.index_keys.storage_offset()
+        );
+    }
+    return pool_lines;
 }
 
 std::vector<std::size_t> layer_block_bytes(std::span<const page_shape> shapes) {
@@ -197,7 +224,7 @@ std::size_t line_bytes(const page_shape& shape) {
         return elements * c10::elementSize(shape.dtype);
     }
     std::size_t tensors = shape.values_only ? 1 : 2;
-    return tensors * shape.n_layers * shape.page_size * shape.n_kv_heads * shape.head_dim *
+    return shape.n_layers * shape.page_size * (tensors * shape.n_kv_heads * shape.head_dim + shape.index_head_dim) *
         c10::elementSize(shape.dtype);
 }
 
@@ -222,6 +249,7 @@ digest make_root_digest(std::string_view model, std::span<const page_shape> shap
         append_u64(seed, shape.n_kv_heads);
         append_u64(seed, shape.head_dim);
         append_u64(seed, shape.values_only);
+        append_u64(seed, shape.index_head_dim);
         append_u64(seed, shape.state_sizes.size());
         for (std::int64_t size : shape.state_sizes) {
             append_u64(seed, static_cast<std::uint64_t>(size));

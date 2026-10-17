@@ -19,8 +19,9 @@ struct recurrent_state {
 };
 
 // With values_only, one tensor serves as both K and V. A layer with a sliding window attends only its last
-// sliding_window keys. A recurrent layer (state set) keeps no keys: its page is the state after the page's last token,
-// and a state reaches only its newest full page; head counts and values_only do not apply to it.
+// sliding_window keys. An indexed attention layer (index_head_dim above 0) also keeps each token's index key, which its
+// queries select the keys they attend by. A recurrent layer (state set) keeps no keys: its page is the state after the
+// page's last token, and a state reaches only its newest full page; head counts and values_only do not apply to it.
 struct kv_layer {
     std::size_t n_kv_heads;
     std::size_t head_dim;
@@ -28,14 +29,17 @@ struct kv_layer {
     std::size_t n_q_heads = 0;
     bool values_only = false;
     std::optional<std::size_t> sliding_window;
+    std::size_t index_head_dim = 0;
     std::optional<recurrent_state> state;
 };
 
 // One KV layer's lines, [n_lines, page_size, n_kv_heads, head_dim] each; k and v are one tensor for a values_only
-// layer. K is stored unrotated. A recurrent layer's lines are one tensor [n_lines, state sizes...] as both.
+// layer. K is stored unrotated, as are an indexed attention layer's index keys [n_lines, page_size, index_head_dim],
+// undefined for other layers. A recurrent layer's lines are one tensor [n_lines, state sizes...] as both k and v.
 struct kv {
     at::Tensor k;
     at::Tensor v;
+    at::Tensor index_keys;
 };
 
 // One scheduler group's query tokens + KV placement + attention descriptor.

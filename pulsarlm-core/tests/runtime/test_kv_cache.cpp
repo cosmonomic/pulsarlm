@@ -747,6 +747,42 @@ TEST_CASE("lines of several sizes pack into regions of the largest size") {
     aligned.release(1, held[1]);
 }
 
+TEST_CASE("an indexed attention line keeps its index keys after K and V, stored and fetched with them") {
+    pulsarlm::page_shape indexed = shape;
+    indexed.index_head_dim = 6;
+    REQUIRE(pulsarlm::line_bytes(indexed) == pulsarlm::line_bytes(shape) + shape.page_size * 6 * 4);
+    REQUIRE(pulsarlm::block_bytes(indexed) == 1024);
+    cache_fixture fixture(4, {}, host_bytes, {indexed});
+    const pulsarlm::kv& lines = fixture.kv.tensors(0);
+    REQUIRE((lines.index_keys.sizes().slice(1) == at::IntArrayRef{static_cast<std::int64_t>(shape.page_size), 6}));
+    REQUIRE(lines.index_keys.stride(0) == lines.k.stride(0));
+    REQUIRE(
+        lines.index_keys.data_ptr<float>() - lines.k.data_ptr<float>() ==
+        static_cast<std::int64_t>(2 * shape.page_size * shape.n_kv_heads * shape.head_dim)
+    );
+
+    line_ids allocated = allocate(fixture.kv, 1).value();
+    fill_line(fixture.kv, allocated.front(), 1.0f);
+    at::Tensor index_keys = at::arange(static_cast<std::int64_t>(shape.page_size) * 6, at::kFloat)
+                                .view({static_cast<std::int64_t>(shape.page_size), 6});
+    lines.index_keys.select(0, allocated.front()).copy_(index_keys);
+    REQUIRE(run_to_completion(sync_one_layer(fixture.kv, {hash_of(1)}, allocated)).has_value());
+    release(fixture.kv, allocated);
+    pulsarlm::kv stored = stored_tensors(*fixture.store, key_of(1), indexed);
+    REQUIRE(stored.k.eq(1.0f).all().item<bool>());
+    REQUIRE(stored.v.eq(-1.0f).all().item<bool>());
+    REQUIRE(stored.index_keys.select(0, 0).equal(index_keys));
+
+    line_ids evicting = allocate(fixture.kv, 2).value();
+    lines.index_keys.zero_();
+    release(fixture.kv, evicting);
+    lines_result got = run_get(fixture.kv, {hash_of(1)});
+    REQUIRE(got.has_value());
+    REQUIRE(line_filled_with(fixture.kv, got->front(), 1.0f));
+    REQUIRE(lines.index_keys.select(0, got->front()).equal(index_keys.cuda()));
+    release(fixture.kv, *got);
+}
+
 TEST_CASE("a recurrent layer's line is one tensor of its state sizes and dtype, stored and fetched as one") {
     pulsarlm::page_shape state{
         .n_layers = 1,
