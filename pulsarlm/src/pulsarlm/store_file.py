@@ -48,14 +48,19 @@ def split_digests(joined: bytes) -> list[bytes]:
 
 
 def layers_bytes(layers: list[LayerSequence]) -> bytes:
-    """Per layer, its page count as 4 little-endian bytes, its page hashes, then
-    its densities as little-endian fp32."""
+    """Per layer, its page count and its densities per page as 4 little-endian
+    bytes each, its page hashes, then its densities as little-endian fp32, page by
+    page. Every page of a layer holds as many densities."""
     parts = []
     for layer in layers:
         pages = layer.pages
-        parts.append(struct.pack("<I", len(pages)))
+        per_page = len(pages[0].density) if pages else 0
+        if any(len(page.density) != per_page for page in pages):
+            raise ValueError("every page of a layer must hold as many densities")
+        parts.append(struct.pack("<II", len(pages), per_page))
         parts.extend(page.hash for page in pages)
-        parts.append(struct.pack(f"<{len(pages)}f", *(page.density for page in pages)))
+        densities = [d for page in pages for d in page.density]
+        parts.append(struct.pack(f"<{len(densities)}f", *densities))
     return b"".join(parts)
 
 
@@ -63,13 +68,16 @@ def layers_from(blob: bytes) -> list[LayerSequence]:
     layers = []
     offset = 0
     while offset < len(blob):
-        (count,) = struct.unpack_from("<I", blob, offset)
-        offset += 4
+        count, per_page = struct.unpack_from("<II", blob, offset)
+        offset += 8
         hashes = split_digests(blob[offset : offset + count * DIGEST_BYTES])
         offset += count * DIGEST_BYTES
-        densities = struct.unpack_from(f"<{count}f", blob, offset)
-        offset += count * DENSITY_BYTES
-        pages = [ActivePage(h, d) for h, d in zip(hashes, densities, strict=True)]
+        densities = struct.unpack_from(f"<{count * per_page}f", blob, offset)
+        offset += count * per_page * DENSITY_BYTES
+        pages = [
+            ActivePage(h, list(densities[i * per_page : (i + 1) * per_page]))
+            for i, h in enumerate(hashes)
+        ]
         layers.append(LayerSequence(pages))
     return layers
 

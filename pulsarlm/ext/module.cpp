@@ -101,7 +101,8 @@ std::unique_ptr<python_engine> make_engine(
     double store_gib,
     at::Device device,
     std::vector<std::int64_t> stop_ids,
-    std::size_t prefill_tokens_per_step
+    std::size_t prefill_tokens_per_step,
+    std::optional<std::size_t> max_context
 ) {
     if (!(kv_cache_gib > 0.0) || !(store_gib >= 0.0)) {
         throw std::invalid_argument("kv_cache_gib must be positive and store_gib not negative");
@@ -116,6 +117,7 @@ std::unique_ptr<python_engine> make_engine(
         std::move(stop_ids),
         vocab_size(model),
         prefill_tokens_per_step,
+        max_context,
     };
     auto adapter = std::make_unique<python_store>(std::move(store));
     py::gil_scoped_release nogil;
@@ -132,11 +134,11 @@ PYBIND11_MODULE(pulsarlm_core, m) {
 
     py::class_<active_page>(m, "ActivePage")
         .def(
-            py::init([](const py::bytes& hash, float density) {
-                return active_page{.hash = digest_from_bytes(hash), .density = density};
+            py::init([](const py::bytes& hash, std::vector<float> density) {
+                return active_page{.hash = digest_from_bytes(hash), .density = std::move(density)};
             }),
             "hash"_a,
-            "density"_a = 0.0f
+            "density"_a = std::vector<float>{}
         )
         .def_property(
             "hash",
@@ -214,23 +216,30 @@ PYBIND11_MODULE(pulsarlm_core, m) {
                         std::size_t n_working,
                         std::size_t cycle_tokens,
                         std::optional<std::size_t> max_pages,
-                        double evict_tau,
+                        double eviction_target,
                         double attention_mass_decay) {
-                return eviction_policy{n_sink, n_working, cycle_tokens, max_pages, evict_tau, attention_mass_decay};
+                return eviction_policy{
+                    n_sink,
+                    n_working,
+                    cycle_tokens,
+                    max_pages,
+                    eviction_target,
+                    attention_mass_decay
+                };
             }),
             py::kw_only(),
             "n_sink"_a = eviction_policy{}.n_sink,
             "n_working"_a = eviction_policy{}.n_working,
             "cycle_tokens"_a = eviction_policy{}.cycle_tokens,
             "max_pages"_a = eviction_policy{}.max_pages,
-            "evict_tau"_a = eviction_policy{}.evict_tau,
+            "eviction_target"_a = eviction_policy{}.eviction_target,
             "attention_mass_decay"_a = eviction_policy{}.attention_mass_decay
         )
         .def_readwrite("n_sink", &eviction_policy::n_sink)
         .def_readwrite("n_working", &eviction_policy::n_working)
         .def_readwrite("cycle_tokens", &eviction_policy::cycle_tokens)
         .def_readwrite("max_pages", &eviction_policy::max_pages)
-        .def_readwrite("evict_tau", &eviction_policy::evict_tau)
+        .def_readwrite("eviction_target", &eviction_policy::eviction_target)
         .def_readwrite("attention_mass_decay", &eviction_policy::attention_mass_decay);
 
     py::class_<model_config>(m, "ModelConfig")
@@ -623,7 +632,8 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "store_gib"_a,
             "device"_a,
             "stop_ids"_a,
-            "prefill_tokens_per_step"_a
+            "prefill_tokens_per_step"_a,
+            "max_context"_a = py::none()
         )
         .def(
             "submit",

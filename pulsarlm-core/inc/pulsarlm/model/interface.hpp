@@ -67,13 +67,12 @@ struct GroupBatch {
     // KV layer l are the rows [cu_view_pages[l, s], cu_view_pages[l, s + 1]) of page_mass[l], at least as many as its
     // keys fill.
     at::Tensor cu_view_pages;
-    // Per KV layer, fp32 [total_view_pages of the layer], zeroed by the caller, or undefined for a layer that measures
-    // no mass. The forward sets each view page's mass: the weight the group's queries gave its keys, each query's
-    // weight scaled as an EMA step at its sequence's attention_mass_decay, averaged over query heads, then maxed over
-    // the page's slots and over the attention layers reading the KV layer.
+    // Per KV layer, fp32 [total_view_pages of the layer, n_q_heads of the layer], zeroed by the caller, or undefined
+    // for a layer that measures no mass. The forward sets each view page's mass in each query head, as
+    // attn_prefill_cuda measures it with mass_weights, maxed over the attention layers reading the KV layer.
     std::vector<at::Tensor> page_mass;
-    // fp32 [num_seqs], defined with cu_view_pages: each sequence's EMA rate.
-    at::Tensor attention_mass_decay;
+    // fp32 [ntok], defined with cu_view_pages: each token's mass weight.
+    at::Tensor mass_weights;
     // int64 [n]: the rows whose logits the forward returns, in order. Undefined returns every row's.
     at::Tensor logit_rows;
 

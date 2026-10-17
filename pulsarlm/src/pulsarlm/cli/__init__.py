@@ -94,11 +94,11 @@ NWorking = Annotated[
         rich_help_panel="Eviction",
     ),
 ]
-EvictTau = Annotated[
+EvictionTarget = Annotated[
     float,
     typer.Option(
-        "--evict_tau",
-        help="Eviction bar tau / (1 - tau) on a page's attention mass EMA.",
+        "--eviction_target",
+        help="Fraction of the model's context a layer's pages settle under; 1 is off.",
         rich_help_panel="Eviction",
     ),
 ]
@@ -145,7 +145,7 @@ def serve(
     persist: Persist = False,
     cycle_tokens: CycleTokens = 512,
     n_working: NWorking = 512,
-    evict_tau: EvictTau = 0.0,
+    eviction_target: EvictionTarget = 0.8,
     max_pages: MaxPages = None,
 ) -> None:
     """Serve a model over the OpenAI Chat Completions API."""
@@ -164,7 +164,7 @@ def serve(
                 persist=persist,
                 cycle_tokens=cycle_tokens,
                 n_working=n_working,
-                evict_tau=evict_tau,
+                eviction_target=eviction_target,
                 max_pages=max_pages,
             ),
             host=host,
@@ -224,7 +224,7 @@ def chat(
     persist: Persist = False,
     cycle_tokens: CycleTokens = 512,
     n_working: NWorking = 512,
-    evict_tau: EvictTau = 0.0,
+    eviction_target: EvictionTarget = 0.8,
     max_pages: MaxPages = None,
 ) -> None:
     """Chat with a model in the terminal. End input to quit."""
@@ -243,7 +243,7 @@ def chat(
                 persist=persist,
                 cycle_tokens=cycle_tokens,
                 n_working=n_working,
-                evict_tau=evict_tau,
+                eviction_target=eviction_target,
                 max_pages=max_pages,
             ),
             system=system,

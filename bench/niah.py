@@ -414,7 +414,7 @@ def run(
         ]
         if not todo:
             continue
-        server_args = ["--evict_tau", "0"]
+        server_args = ["--eviction_target", "1"]
         if setting.evict:
             server_args = [
                 "--max_pages",

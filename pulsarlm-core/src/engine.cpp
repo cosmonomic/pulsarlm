@@ -50,7 +50,7 @@ void check_attention(const engine_config& config, std::span<const kv_layer> laye
     }
 }
 
-void validate(const request& r, std::size_t page_size, std::size_t vocab_size) {
+void validate(const request& r, std::size_t page_size, std::size_t vocab_size, std::optional<std::size_t> max_context) {
     if (r.initial_state.tail.size() >= page_size) {
         throw std::invalid_argument(
             std::format(
@@ -75,6 +75,14 @@ void validate(const request& r, std::size_t page_size, std::size_t vocab_size) {
         throw std::invalid_argument(
             std::format("eviction.attention_mass_decay {} is outside (0, 1]", r.eviction.attention_mass_decay)
         );
+    }
+    if (!(r.eviction.eviction_target > 0.0 && r.eviction.eviction_target <= 1.0)) {
+        throw std::invalid_argument(
+            std::format("eviction.eviction_target {} is outside (0, 1]", r.eviction.eviction_target)
+        );
+    }
+    if (r.eviction.eviction_target < 1.0 && !max_context) {
+        throw std::invalid_argument("eviction.eviction_target below 1 needs the model's max context");
     }
 }
 
@@ -124,6 +132,7 @@ engine::engine(std::unique_ptr<Model> model, const engine_config& config, std::u
   stream(c10::cuda::getStreamFromPool(false, config.device.index()).stream()),
   page_size(config.page_size),
   vocab_size(config.vocab_size),
+  max_context(config.max_context),
   root(make_root_digest(config.model_name, page_shapes(config, this->model->kv_layers()))),
   store(std::move(store)),
   sched(
@@ -132,7 +141,8 @@ engine::engine(std::unique_ptr<Model> model, const engine_config& config, std::u
       stream,
       root,
       std::vector<std::int64_t>(config.stop_ids),
-      config.prefill_tokens_per_step
+      config.prefill_tokens_per_step,
+      config.max_context
   ) {
     std::latch started(1);
     loop_thread = std::thread([this, &started] { run_loop(started); });
@@ -173,7 +183,7 @@ void engine::run_loop(std::latch& started) {
 
 // A submit racing the loop's exit finds loop null; its writer then ends the callbacks with loop_exited.
 void engine::submit(request&& r, std::unique_ptr<request_callbacks> callbacks) {
-    validate(r, page_size, vocab_size);
+    validate(r, page_size, vocab_size, max_context);
     sched.validate_state(r.initial_state);
     result_writer writer(std::move(callbacks));
     std::lock_guard lock(mutex);

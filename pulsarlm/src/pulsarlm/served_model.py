@@ -49,6 +49,7 @@ def load_served_model(settings: Settings, path: Path) -> ServedModel:
         device=device,
         stop_ids=stops,
         prefill_tokens_per_step=settings.prefill_tokens_per_step,
+        max_context=cfg.max_position_embeddings or None,
     )
     max_pages = settings.max_pages or trained_view_pages(
         cfg.max_position_embeddings, settings.cycle_tokens
@@ -63,6 +64,6 @@ def load_served_model(settings: Settings, path: Path) -> ServedModel:
             n_working=settings.n_working,
             cycle_tokens=settings.cycle_tokens,
             max_pages=max_pages,
-            evict_tau=settings.evict_tau,
+            eviction_target=settings.eviction_target,
         ),
     )

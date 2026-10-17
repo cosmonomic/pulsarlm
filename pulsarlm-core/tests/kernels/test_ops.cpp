@@ -38,8 +38,9 @@ TEST_CASE("rmsnorm matches ATen reference", "[ops][cuda]") {
     REQUIRE(at::allclose(pulsarlm::rmsnorm_cuda(zeros, w, eps), zeros));
 }
 
-// The mass side output adds each attended key's softmax weight, times its sequence's EMA rate. fp32 runs the scalar
-// kernels, bf16 the tensor-core ones, so each case covers both.
+// The mass side output sets each view page's W exp(S / W) per query head, with S the sum over the queries attending the
+// page of their mass weight times the log of their max share of its keys, and W the sum of those weights. fp32 runs the
+// scalar kernels, bf16 the tensor-core ones, so each case covers both.
 namespace {
 
 constexpr int64_t kPageSize = 16;
@@ -51,7 +52,7 @@ at::Tensor int32_cuda(const std::vector<int32_t>& v) {
     return at::tensor(v, at::dtype(at::kInt)).to(at::kCUDA);
 }
 
-at::Tensor mass_decay(const std::vector<float>& v) {
+at::Tensor fp32_cuda(const std::vector<float>& v) {
     return at::tensor(v, at::dtype(at::kFloat)).to(at::kCUDA);
 }
 
@@ -68,12 +69,7 @@ at::Tensor zero_pool(int64_t num_pages, at::ScalarType dt) {
 }
 
 at::Tensor zero_mass(int64_t num_pages) {
-    return at::zeros({num_pages, kPageSize, 1}, at::device(at::kCUDA).dtype(at::kFloat));
-}
-
-// Per-page max mass.
-double page_mass(const at::Tensor& mass, int64_t page) {
-    return mass.select(0, page).max().item<double>();
+    return at::zeros({num_pages, 1}, at::device(at::kCUDA).dtype(at::kFloat));
 }
 
 // Every sequence's view is page_tables row s, its mass rows one view page per table
@@ -83,6 +79,41 @@ at::Tensor row_view_pages(const at::Tensor& page_tables) {
     return at::arange(0, (num_seqs + 1) * max_pages, max_pages, at::device(at::kCUDA).dtype(at::kInt));
 }
 
+// The ops' mass, built from each query's attention weights in each head.
+class mass_reference {
+    at::Tensor log_sum;  // [view pages, heads]
+    at::Tensor weight_sum;  // [view pages, 1]
+    int64_t page_size;
+
+  public:
+    mass_reference(int64_t view_pages, int64_t heads, int64_t page_size)
+    : log_sum(at::zeros({view_pages, heads}, at::device(at::kCUDA).dtype(at::kFloat))),
+      weight_sum(at::zeros({view_pages, 1}, at::device(at::kCUDA).dtype(at::kFloat))),
+      page_size(page_size) {}
+
+    // A query of mass weight w whose head h gave the keys [first_key, first_key + shares.size(0)) of the view whose
+    // page 0 is mass row first_row the weights shares. Each query adds its weight to W once, with its head 0.
+    void add(int64_t first_row, int64_t first_key, const at::Tensor& shares, int64_t h, double w) {
+        const int64_t first_page = first_key / this->page_size;
+        const int64_t pages = (first_key + shares.size(0) - 1) / this->page_size - first_page + 1;
+        auto padded = at::zeros({pages * this->page_size}, shares.options());
+        padded.narrow(0, first_key - first_page * this->page_size, shares.size(0)).copy_(shares);
+        auto page_max = padded.view({pages, this->page_size}).amax(-1);
+        this->log_sum.narrow(0, first_row + first_page, pages).select(1, h).add_(at::log(page_max) * w);
+        if (h == 0) {
+            this->weight_sum.narrow(0, first_row + first_page, pages).add_(w);
+        }
+    }
+
+    at::Tensor mass() const {
+        return at::where(
+            this->weight_sum > 0,
+            this->weight_sum * at::exp(this->log_sum / this->weight_sum),
+            at::zeros_like(this->log_sum)
+        );
+    }
+};
+
 at::Tensor prefill(
     const at::Tensor& q,
     const at::Tensor& k_pool,
@@ -91,7 +122,7 @@ at::Tensor prefill(
     const at::Tensor& cu_seqlens_q,
     const at::Tensor& seqlens_k,
     const at::Tensor& mass,
-    const at::Tensor& decay
+    const at::Tensor& mass_weights
 ) {
     return pulsarlm::attn_prefill_cuda(
         q,
@@ -107,7 +138,7 @@ at::Tensor prefill(
         std::nullopt,
         mass,
         row_view_pages(page_tables),
-        decay
+        mass_weights
     );
 }
 
@@ -118,7 +149,7 @@ at::Tensor decode(
     const at::Tensor& page_tables,
     const at::Tensor& context_lens,
     const at::Tensor& mass,
-    const at::Tensor& decay,
+    const at::Tensor& mass_weights,
     int64_t num_splits = 0
 ) {
     return pulsarlm::attn_decode_cuda(
@@ -134,19 +165,24 @@ at::Tensor decode(
         std::nullopt,
         mass,
         row_view_pages(page_tables),
-        decay,
+        mass_weights,
         num_splits
     );
 }
 
 }  // namespace
 
-TEST_CASE("prefill mass is the EMA of each key's softmax weight", "[ops][cuda]") {
+// Query i attends keys [0, i] uniformly, so its share of every page it reaches is 1 / (i + 1), and page b is attended
+// by the queries from b * page_size on.
+TEST_CASE("prefill mass is the weighted geometric mean share of the queries attending each page", "[ops][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
     const int64_t ntok = 64, num_pages = ntok / kPageSize;
-    const double alpha = 0.05, retention = 1.0 - alpha;
+    std::vector<float> weights;
+    for (int64_t i = 0; i < ntok; ++i) {
+        weights.push_back(static_cast<float>(0.05 * std::pow(0.95, static_cast<double>(ntok - 1 - i))));
+    }
 
     for (auto dt : {at::kFloat, at::kBFloat16}) {
         auto k_pool = zero_pool(num_pages, dt);
@@ -156,30 +192,31 @@ TEST_CASE("prefill mass is the EMA of each key's softmax weight", "[ops][cuda]")
         auto cu_seqlens_q = int32_cuda({0, static_cast<int32_t>(ntok)});
         auto seqlens_k = int32_cuda({static_cast<int32_t>(ntok)});
 
-        // Query i attends keys [0, i] uniformly and hands each alpha * retention^(ntok - 1 - i) / (i + 1).
         auto mass = zero_mass(num_pages);
-        prefill(q, k_pool, v_pool, page_tables, cu_seqlens_q, seqlens_k, mass, mass_decay({static_cast<float>(alpha)}));
+        prefill(q, k_pool, v_pool, page_tables, cu_seqlens_q, seqlens_k, mass, fp32_cuda(weights));
         auto got = mass.view({-1}).to(at::kCPU);
-        for (int64_t j = 0; j < ntok; ++j) {
-            double want = 0.0;
-            for (int64_t i = j; i < ntok; ++i) {
-                want += alpha * std::pow(retention, static_cast<double>(ntok - 1 - i)) / static_cast<double>(i + 1);
+        for (int64_t b = 0; b < num_pages; ++b) {
+            double log_sum = 0.0, weight_sum = 0.0;
+            for (int64_t i = b * kPageSize; i < ntok; ++i) {
+                log_sum += weights[i] * std::log(1.0 / static_cast<double>(i + 1));
+                weight_sum += weights[i];
             }
-            REQUIRE(std::abs(got[j].item<double>() - want) < 1e-3 * want);
+            const double want = weight_sum * std::exp(log_sum / weight_sum);
+            REQUIRE(std::abs(got[b].item<double>() - want) < 1e-3 * want);
         }
     }
 }
 
-TEST_CASE("decode mass is each key's softmax weight", "[ops][cuda]") {
+// Two sequences over disjoint pages, both with uniform attention, so every page holds 1 / its context of its
+// sequence's one query: 16 keys for sequence 0, 128 for sequence 1.
+TEST_CASE("decode mass is the query's weight times its share of each page", "[ops][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
-    // Two sequences over disjoint pages, both with uniform attention, so every key holds 1 / its context: 16 keys for
-    // sequence 0, 128 for sequence 1.
     const int64_t short_ctx = 16, long_ctx = 128;
     const int64_t max_pages = long_ctx / kPageSize;
     const int64_t num_pages = 2 * max_pages;
-    const int64_t long_page = max_pages;
+    const std::vector<float> weights{1.0f, 0.25f};
 
     std::vector<int32_t> tables;
     for (int32_t p = 0; p < 2 * max_pages; ++p) {
@@ -187,101 +224,33 @@ TEST_CASE("decode mass is each key's softmax weight", "[ops][cuda]") {
     }
     auto page_tables = int32_cuda(tables).view({2, max_pages});
     auto context_lens = int32_cuda({static_cast<int32_t>(short_ctx), static_cast<int32_t>(long_ctx)});
+    auto check = [&](const at::Tensor& mass) {
+        auto got = mass.view({2, max_pages}).to(at::kCPU);
+        REQUIRE(std::abs(got[0][0].item<double>() - weights[0] / short_ctx) < 1e-5);
+        for (int64_t b = 1; b < max_pages; ++b) {
+            REQUIRE(got[0][b].item<double>() == 0.0);
+        }
+        for (int64_t b = 0; b < max_pages; ++b) {
+            REQUIRE(std::abs(got[1][b].item<double>() - weights[1] / long_ctx) < 1e-5);
+        }
+    };
 
     for (auto dt : {at::kFloat, at::kBFloat16}) {
         auto k_pool = zero_pool(num_pages, dt);
         auto v_pool = zero_pool(num_pages, dt);
         auto q = at::zeros({2, 1, kHeadDim}, at::device(at::kCUDA).dtype(dt));
         auto mass = zero_mass(num_pages);
-        decode(q, k_pool, v_pool, page_tables, context_lens, mass, mass_decay({1.0f, 1.0f}));
-        REQUIRE(std::abs(page_mass(mass, 0) - 1.0 / short_ctx) < 1e-4);
-        REQUIRE(std::abs(page_mass(mass, long_page) - 1.0 / long_ctx) < 1e-4);
+        decode(q, k_pool, v_pool, page_tables, context_lens, mass, fp32_cuda(weights));
+        check(mass);
     }
 
-    // The split (flash-decode) path runs its own mass kernel.
+    // The split (flash-decode) path finishes the pages in its combine.
     auto k_pool = zero_pool(num_pages, at::kBFloat16);
     auto v_pool = zero_pool(num_pages, at::kBFloat16);
     auto q = at::zeros({2, 1, kHeadDim}, at::device(at::kCUDA).dtype(at::kBFloat16));
     auto split = zero_mass(num_pages);
-    decode(q, k_pool, v_pool, page_tables, context_lens, split, mass_decay({1.0f, 1.0f}), /*num_splits=*/2);
-    REQUIRE(std::abs(page_mass(split, 0) - 1.0 / short_ctx) < 1e-4);
-    REQUIRE(std::abs(page_mass(split, long_page) - 1.0 / long_ctx) < 1e-4);
-}
-
-// The EMA rate alpha is per sequence: two sequences in one batched forward accumulate mass at their own rate. Zero Q
-// and K make every query's attention uniform, so prefill key j of a chunk of n queries receives
-// alpha * sum_{i >= j} (1 - alpha)^(n - 1 - i) / (i + 1). alpha 1 (retention 0) keeps the chunk's last query alone.
-TEST_CASE("prefill mass decays at each sequence's own rate", "[ops][cuda]") {
-    if (c10::cuda::device_count() == 0) {
-        SKIP("no CUDA device");
-    }
-    const int64_t n = kPageSize;  // one full page of queries per sequence
-    const std::vector<float> alphas = {1.0f, 0.5f};
-
-    for (auto dt : {at::kFloat, at::kBFloat16}) {  // scalar then tensor-core kernel
-        auto k_pool = zero_pool(2, dt);
-        auto v_pool = zero_pool(2, dt);
-        auto q = at::zeros({2 * n, 1, kHeadDim}, at::device(at::kCUDA).dtype(dt));
-        auto page_tables = int32_cuda({0, 1}).view({2, 1});
-        auto cu_seqlens_q = int32_cuda({0, static_cast<int32_t>(n), static_cast<int32_t>(2 * n)});
-        auto seqlens_k = int32_cuda({static_cast<int32_t>(n), static_cast<int32_t>(n)});
-
-        auto mass = zero_mass(2);
-        prefill(q, k_pool, v_pool, page_tables, cu_seqlens_q, seqlens_k, mass, mass_decay(alphas));
-        auto got = mass.view({2, n}).to(at::kCPU);
-        for (int64_t s = 0; s < 2; ++s) {
-            const double alpha = alphas[s];
-            for (int64_t j = 0; j < n; ++j) {
-                double graded = 0.0;
-                for (int64_t i = j; i < n; ++i) {
-                    graded += std::pow(1.0 - alpha, static_cast<double>(n - 1 - i)) / static_cast<double>(i + 1);
-                }
-                const double want = alpha * graded;
-                REQUIRE(std::abs(got[s][j].item<double>() - want) < 1e-3 * want);
-            }
-        }
-        // The newest key ends up 2x apart.
-        const double newest_0 = got[0][n - 1].item<double>();
-        const double newest_1 = got[1][n - 1].item<double>();
-        CHECK(std::abs(newest_0 - 2.0 * newest_1) < 1e-3 * newest_0);
-    }
-}
-
-// The decode counterpart has one query per sequence, so there is no within-chunk grading and each key of sequence s
-// lands at alpha_s / ctx.
-TEST_CASE("decode mass decays at each sequence's own rate", "[ops][cuda]") {
-    if (c10::cuda::device_count() == 0) {
-        SKIP("no CUDA device");
-    }
-    const int64_t ctx = kPageSize;
-    const std::vector<float> alphas = {1.0f, 0.25f};
-    auto page_tables = int32_cuda({0, 1}).view({2, 1});
-    auto context_lens = int32_cuda({static_cast<int32_t>(ctx), static_cast<int32_t>(ctx)});
-
-    for (auto dt : {at::kFloat, at::kBFloat16}) {  // scalar then tensor-core kernel
-        auto k_pool = zero_pool(2, dt);
-        auto v_pool = zero_pool(2, dt);
-        auto q = at::zeros({2, 1, kHeadDim}, at::device(at::kCUDA).dtype(dt));
-        auto mass = zero_mass(2);
-        decode(q, k_pool, v_pool, page_tables, context_lens, mass, mass_decay(alphas));
-        auto got = mass.view({2, ctx}).to(at::kCPU);
-        for (int64_t s = 0; s < 2; ++s) {
-            for (int64_t j = 0; j < ctx; ++j) {
-                REQUIRE(std::abs(got[s][j].item<double>() - alphas[s] / ctx) < 1e-5);
-            }
-        }
-    }
-
-    // The split (flash-decode) path runs its own mass kernel.
-    auto k_pool = zero_pool(2, at::kBFloat16);
-    auto v_pool = zero_pool(2, at::kBFloat16);
-    auto q = at::zeros({2, 1, kHeadDim}, at::device(at::kCUDA).dtype(at::kBFloat16));
-    auto split = zero_mass(2);
-    decode(q, k_pool, v_pool, page_tables, context_lens, split, mass_decay(alphas), /*num_splits=*/2);
-    auto got = split.view({2, ctx}).to(at::kCPU);
-    for (int64_t s = 0; s < 2; ++s) {
-        REQUIRE(std::abs(got[s][0].item<double>() - alphas[s] / ctx) < 1e-5);
-    }
+    decode(q, k_pool, v_pool, page_tables, context_lens, split, fp32_cuda(weights), /*num_splits=*/2);
+    check(split);
 }
 
 namespace {
@@ -307,7 +276,8 @@ struct View {
 // ATen reference for one view: its keys rotated to their layout positions by
 // rope_rotate and rounded to the pool dtype as the kernels store them, then causal
 // softmax attention for the query rows at view indices [ctx - rows, ctx). Fills o
-// rows and adds alpha-graded mass into the view's own rows.
+// rows and adds each row's weights, at mass weight alpha * (1 - alpha)^(rows after it),
+// to the view's mass rows from first_row on.
 void reference_view(
     const View& view,
     const at::Tensor& q,
@@ -317,7 +287,8 @@ void reference_view(
     int64_t q_offset,
     double alpha,
     at::Tensor& o,
-    at::Tensor& mass_rows
+    mass_reference& mass,
+    int64_t first_row
 ) {
     const int64_t n_kv = k_pool.size(2), head_dim = k_pool.size(3);
     const int64_t group = q.size(1) / n_kv;
@@ -340,7 +311,7 @@ void reference_view(
             auto values = v.slice(0, 0, p + 1).select(1, g);
             auto w = at::softmax(at::mv(keys, q[q_offset + r][h].to(at::kFloat)) * kScale, 0);
             o[q_offset + r][h] = at::mv(values.t(), w);
-            mass_rows.slice(0, 0, p + 1).select(1, h).add_(w * graded);
+            mass.add(first_row, 0, w, h, graded);
         }
     }
 }
@@ -379,10 +350,17 @@ TEST_CASE("views sharing a line rotate and accumulate apart", "[ops][cuda]") {
     auto seqlens_k = int32_cuda(seqlens);
     auto cu_seqlens_q = int32_cuda(cu_q);
     auto cu_view_pages = int32_cuda(cu_view);
-    auto decay = mass_decay({static_cast<float>(alpha), static_cast<float>(alpha)});
-    auto new_mass = [&] {
-        return at::zeros({total_view_pages, kPageSize, n_q}, at::device(at::kCUDA).dtype(at::kFloat));
-    };
+    std::vector<float> pre_weights;
+    for (const View& view : views) {
+        for (int64_t r = 0; r < view.seq_q; ++r) {
+            pre_weights.push_back(
+                static_cast<float>(alpha * std::pow(1.0 - alpha, static_cast<double>(view.seq_q - 1 - r)))
+            );
+        }
+    }
+    auto prefill_weights = fp32_cuda(pre_weights);
+    auto decode_weights = fp32_cuda({static_cast<float>(alpha), static_cast<float>(alpha)});
+    auto new_mass = [&] { return at::zeros({total_view_pages, n_q}, at::device(at::kCUDA).dtype(at::kFloat)); };
 
     for (auto dt : {at::kFloat, at::kBFloat16}) {  // scalar then tensor-core kernels
         at::manual_seed(7);
@@ -393,16 +371,28 @@ TEST_CASE("views sharing a line rotate and accumulate apart", "[ops][cuda]") {
 
         auto q_pre = at::randn({cu_q.back(), n_q, kHeadDim}, opts);
         auto o_pre = at::zeros({cu_q.back(), n_q, kHeadDim}, at::device(at::kCUDA).dtype(at::kFloat));
-        auto mass_pre = new_mass();
+        mass_reference reference_pre(total_view_pages, n_q, kPageSize);
         auto q_dec = at::randn({2, n_q, kHeadDim}, opts);
         auto o_dec = at::zeros({2, n_q, kHeadDim}, at::device(at::kCUDA).dtype(at::kFloat));
-        auto mass_dec = new_mass();
+        mass_reference reference_dec(total_view_pages, n_q, kPageSize);
         for (size_t s = 0; s < views.size(); ++s) {
-            auto pre_rows = mass_pre.slice(0, s * max_pages, (s + 1) * max_pages).view({-1, n_q});
-            reference_view(views[s], q_pre, k_pool, v_pool, views[s].seq_q, cu_q[s], alpha, o_pre, pre_rows);
-            auto dec_rows = mass_dec.slice(0, s * max_pages, (s + 1) * max_pages).view({-1, n_q});
-            reference_view(views[s], q_dec, k_pool, v_pool, 1, s, alpha, o_dec, dec_rows);
+            const int64_t first_row = static_cast<int64_t>(s) * max_pages;
+            reference_view(
+                views[s],
+                q_pre,
+                k_pool,
+                v_pool,
+                views[s].seq_q,
+                cu_q[s],
+                alpha,
+                o_pre,
+                reference_pre,
+                first_row
+            );
+            reference_view(views[s], q_dec, k_pool, v_pool, 1, s, alpha, o_dec, reference_dec, first_row);
         }
+        auto mass_pre = reference_pre.mass();
+        auto mass_dec = reference_dec.mass();
 
         auto mass = new_mass();
         auto o = pulsarlm::attn_prefill_cuda(
@@ -419,7 +409,7 @@ TEST_CASE("views sharing a line rotate and accumulate apart", "[ops][cuda]") {
             std::nullopt,
             mass,
             cu_view_pages,
-            decay
+            prefill_weights
         );
         CHECK(at::allclose(o.to(at::kFloat), o_pre, o_tol, o_tol));
         CHECK(at::allclose(mass, mass_pre, 1e-3, 1e-3));
@@ -439,7 +429,7 @@ TEST_CASE("views sharing a line rotate and accumulate apart", "[ops][cuda]") {
                 std::nullopt,
                 dec_mass,
                 cu_view_pages,
-                decay,
+                decode_weights,
                 num_splits
             );
             CHECK(at::allclose(dec_o.to(at::kFloat), o_dec, o_tol, o_tol));
@@ -537,7 +527,8 @@ void reference_windowed(
     double scale,
     double alpha,
     at::Tensor& o,
-    at::Tensor& mass_rows
+    mass_reference& mass,
+    int64_t first_row
 ) {
     const int64_t n_kv = v_pool.size(2), head_dim = v_pool.size(3);
     const int64_t group = q.size(1) / n_kv;
@@ -557,7 +548,7 @@ void reference_windowed(
             auto values = v.slice(0, first, p + 1).select(1, g);
             auto w = at::softmax(at::mv(k, q[q_offset + r][h].to(at::kFloat)) * scale, 0);
             o[q_offset + r][h] = at::mv(values.t(), w);
-            mass_rows.slice(0, first, p + 1).select(1, h).add_(w * graded);
+            mass.add(first_row, first, w, h, graded);
         }
     }
 }
@@ -606,12 +597,21 @@ TEST_CASE(
                         auto seqlens_k = int32_cuda(seqlens);
                         auto cu_seqlens_q = int32_cuda(cu_q);
                         auto cu_view_pages = int32_cuda(cu_view);
-                        auto decay = mass_decay({static_cast<float>(alpha), static_cast<float>(alpha)});
+                        const int64_t total_view_pages = static_cast<int64_t>(views.size()) * max_pages;
+                        std::vector<float> pre_weights;
+                        for (const WindowedView& view : views) {
+                            for (int64_t r = 0; r < view.seq_q; ++r) {
+                                pre_weights.push_back(
+                                    static_cast<float>(
+                                        alpha * std::pow(1.0 - alpha, static_cast<double>(view.seq_q - 1 - r))
+                                    )
+                                );
+                            }
+                        }
+                        auto prefill_weights = fp32_cuda(pre_weights);
+                        auto decode_weights = fp32_cuda(std::vector<float>(views.size(), static_cast<float>(alpha)));
                         auto new_mass = [&] {
-                            return at::zeros(
-                                {static_cast<int64_t>(views.size()) * max_pages, page_size, n_q},
-                                at::device(at::kCUDA).dtype(at::kFloat)
-                            );
+                            return at::zeros({total_view_pages, n_q}, at::device(at::kCUDA).dtype(at::kFloat));
                         };
 
                         for (auto dt : {at::kFloat, at::kBFloat16}) {
@@ -639,14 +639,11 @@ TEST_CASE(
                                 auto f32 = at::device(at::kCUDA).dtype(at::kFloat);
                                 auto o_pre = at::zeros({cu_q.back(), n_q, head_dim}, f32);
                                 auto o_dec = at::zeros({static_cast<int64_t>(views.size()), n_q, head_dim}, f32);
-                                auto mass_pre = new_mass();
-                                auto mass_dec = new_mass();
+                                mass_reference reference_pre(total_view_pages, n_q, page_size);
+                                mass_reference reference_dec(total_view_pages, n_q, page_size);
                                 for (size_t s = 0; s < views.size(); ++s) {
                                     auto keys = reference_keys(views[s], k_pool, rope, k_norm_weight);
-                                    auto rows = [&](at::Tensor& mass) {
-                                        return mass.slice(0, s * max_pages, (s + 1) * max_pages).view({-1, n_q});
-                                    };
-                                    auto pre_rows = rows(mass_pre);
+                                    const int64_t first_row = static_cast<int64_t>(s) * max_pages;
                                     reference_windowed(
                                         views[s],
                                         keys,
@@ -658,9 +655,9 @@ TEST_CASE(
                                         scale,
                                         alpha,
                                         o_pre,
-                                        pre_rows
+                                        reference_pre,
+                                        first_row
                                     );
-                                    auto dec_rows = rows(mass_dec);
                                     reference_windowed(
                                         views[s],
                                         keys,
@@ -672,9 +669,12 @@ TEST_CASE(
                                         scale,
                                         alpha,
                                         o_dec,
-                                        dec_rows
+                                        reference_dec,
+                                        first_row
                                     );
                                 }
+                                auto mass_pre = reference_pre.mass();
+                                auto mass_dec = reference_dec.mass();
 
                                 auto mass = new_mass();
                                 auto o = pulsarlm::attn_prefill_cuda(
@@ -691,7 +691,7 @@ TEST_CASE(
                                     k_norm_weight,
                                     mass,
                                     cu_view_pages,
-                                    decay
+                                    prefill_weights
                                 );
                                 CHECK(at::allclose(o.to(at::kFloat), o_pre, o_tol, o_tol));
                                 CHECK(at::allclose(mass, mass_pre, 1e-3, 1e-3));
@@ -711,7 +711,7 @@ TEST_CASE(
                                         k_norm_weight,
                                         dec_mass,
                                         cu_view_pages,
-                                        decay,
+                                        decode_weights,
                                         num_splits
                                     );
                                     CHECK(at::allclose(dec_o.to(at::kFloat), o_dec, o_tol, o_tol));

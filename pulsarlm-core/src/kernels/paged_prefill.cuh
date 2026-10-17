@@ -17,16 +17,17 @@
 // rotate_view_keys_kernel (paged_prefill.cu), and values from the pool
 // through the page table. The causal and sliding-window masks are applied per
 // (query row, key) in the online softmax; pages before the window of the tile's
-// first row are not read. A second streaming pass recomputes QKᵀ and atomicAdds
-// the per-key mass (summed over this tile's query rows attending the key, all for
-// the ONE q head) into
-// this q head's own column of the key's mass row. The QKᵀ/PV tiles live in
-// attn_tiles.cuh; the op wrapper and the argument shapes are in paged_prefill.cu.
+// first row are not read. A key tile holds whole pages, so each tile adds, per page,
+// the sum over the rows attending it of the row's mass weight times its max score
+// over the page's attended keys into the page's S in this q head's column, and the
+// rows' weights into its W. Once the rows' LSEs are known, the CTA takes each attended
+// page's weighted LSEs off its S. The QKᵀ/PV tiles live in attn_tiles.cuh; the op
+// wrapper and the argument shapes are in paged_prefill.cu.
 //
 // NWARPS, KEY_PAGES and CTAS_PER_SM are launch shape, not geometry: every one of
 // them is device specific and comes from the caller's tuning row
 // (attn_tuning.hpp). KEY_PAGES only changes the order in which the online
-// softmax folds keys in, so o and mass move in their last bits with it.
+// softmax folds keys in, so o moves in its last bits with it.
 // CTAS_PER_SM is the occupancy floor ptxas must fit the register allocation to; 1
 // leaves it unconstrained.
 
@@ -88,9 +89,6 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
     if (!query_tile(p, blk / p.n_q_heads, s, qbase)) {
         return;
     }
-    // This sequence's EMA gain alpha and the retention 1 - alpha it implies.
-    const float mass_decay = p.mass ? p.mass_decay[s] : 0.0f;
-    const float retention = 1.0f - mass_decay;
     const int q0 = p.cu_seqlens_q[s];
     const int seq_q = p.cu_seqlens_q[s + 1] - q0;
     const int ctx_len = p.seqlens_k[s];
@@ -126,9 +124,9 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
     __shared__ float row_rescale[16];
     __shared__ int qpos[16];  // context pos of each MMA row, -1 if padding
     __shared__ int qfirst[16];  // first key each MMA row attends
-    // retention^(offset of this row from the chunk end), the multiplier on the mass this row hands out, so a key's
-    // accumulated mass is the per-token EMA of the attention it received.
-    __shared__ float mass_weight[16];
+    __shared__ float row_weight[16];  // each MMA row's mass weight, 0 if padding
+    // Each (MMA row, page) of the key tile: the row's max scaled score over the page's keys it attends, -inf for none.
+    __shared__ float page_max_rows[16 * KEY_PAGES];
 
     // Load Q for this tile's rows into the MMA M dimension; pad rows >= tile_rows.
     for (int i = tid; i < 16 * HEAD_DIM; i += NWARPS * 32) {
@@ -156,10 +154,7 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
         const int row_pos = ctx_start + qbase + tid;  // this row's context pos
         qpos[tid] = (tid < tile_rows) ? row_pos : -1;
         qfirst[tid] = first_key(p, row_pos);
-        // __powf(0, 0) is NaN, so the zero exponent is taken directly.
-        const int chunk_end_offset = seq_q - 1 - qbase - tid;
-        const float graded = chunk_end_offset == 0 ? 1.0f : __powf(retention, static_cast<float>(chunk_end_offset));
-        mass_weight[tid] = tid < tile_rows ? graded : 0.0f;
+        row_weight[tid] = p.mass && tid < tile_rows ? p.mass_weights[q_global_base + tid] : 0.0f;
     }
     // The pages of key tile t, in the pool (lines, for V) and in rotated_k (sequence
     // s's view page b is page s * max_pages + b, for K). The staging address
@@ -252,7 +247,38 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
                 Mrow[sweep_row] = newM;
             }
         }
+        if (p.mass) {
+            for (int i = tid; i < 16 * KEY_PAGES; i += NWARPS * 32) {
+                const int m = i / KEY_PAGES, kp = i % KEY_PAGES;
+                float page_max = -CUDART_INF_F;
+                for (int c = kp * PAGE_SIZE; c < (kp + 1) * PAGE_SIZE; ++c) {
+                    if (attends(m, tile_base + c)) {
+                        page_max = fmaxf(page_max, p.scale * sS[m * SCORE_STRIDE + c]);
+                    }
+                }
+                page_max_rows[i] = page_max;
+            }
+        }
         __syncthreads();
+
+        if (p.mass && tid < KEY_PAGES) {
+            float page_sum = 0.0f;
+            float page_weight = 0.0f;
+            for (int m = 0; m < tile_rows; ++m) {
+                const float page_max = page_max_rows[m * KEY_PAGES + tid];
+                if (page_max > -CUDART_INF_F) {
+                    page_sum += row_weight[m] * page_max;
+                    page_weight += row_weight[m];
+                }
+            }
+            if (page_weight > 0.0f) {
+                const int64_t row = mass_row(p, s, t * KEY_PAGES + tid);
+                atomicAdd(&p.mass[row * p.n_q_heads + h], page_sum);
+                if (h == 0) {
+                    atomicAdd(&p.attended_weight[row], page_weight);
+                }
+            }
+        }
 
         // One thread per (query row, key): the exponentials run across the CTA,
         // and sS carries each row's weight to the sequential sum below.
@@ -301,60 +327,31 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
         });
     }
 
-    // Stash LSE for the mass pass.
+    if (!p.mass) {
+        return;
+    }
     if (tid < tile_rows) {
         LSE[tid] = Mrow[tid] + logf(Lrow[tid]);
     }
     __syncthreads();
-
-    // Pass 2: recompute QKᵀ and accumulate per-key mass (summed over this tile's
-    // query rows with p >= kp, this ONE q head), atomicAdd into this q head's own
-    // column of each key's mass row. Nothing else in the kernel touches mass, so a
-    // layer whose mass is never read stops here.
-    if (!p.mass) {
-        return;
-    }
-    float* mass = seq_mass(p, s, ctx_len, PAGE_SIZE);
-    // Only K is re-streamed here, so one tile is in flight and QKᵀ frees the shared
-    // tile for the next one.
-    load_pages(first_key_tile, tile_lines, tile_keys);
-    stage_tile(rotated_k, rotated_page_stride, rotated_token_stride, HEAD_DIM, sK, first_key_tile, tile_keys);
-    for (int t = first_key_tile; t < n_key_tiles; ++t) {
-        const int tile_base = t * KEY_TILE;
-        load_pages(t + 1, next_lines, next_keys);
-        attn::cp_async_wait<0>();
-        __syncthreads();
-
-        attn::tile_qkt<scalar_t, KEY_TILE, HEAD_DIM, BF16, SCORE_STRIDE, true>(sQ, sK, sS, warp, NWARPS);
-        __syncthreads();
-        stage_tile(rotated_k, rotated_page_stride, rotated_token_stride, HEAD_DIM, sK, t + 1, next_keys);
-
-        // One thread per (query row, key): the exponentials run across the CTA,
-        // and sS carries each row's weighted share to the per-key sum below.
-        for (int i = tid; i < 16 * KEY_TILE; i += NWARPS * 32) {
-            const int m = i / KEY_TILE, c = i % KEY_TILE;
-            float& score = sS[m * SCORE_STRIDE + c];
-            score = attends(m, tile_base + c) ? mass_weight[m] * __expf(p.scale * score - LSE[m]) : 0.0f;
-        }
-        __syncthreads();
-
-        // Summed in row order, so the accumulation is the sequential one.
-        for (int c = tid; c < KEY_TILE; c += NWARPS * 32) {
-            float ms = 0.0f;
-            for (int m = 0; m < tile_rows; ++m) {
-                ms += sS[m * SCORE_STRIDE + c];
-            }
-            if (ms > 0.0f) {
-                atomicAdd(&mass[static_cast<int64_t>(tile_base + c) * p.n_q_heads + h], mass_decay * ms);
+    for (int page = tile_first_key / PAGE_SIZE + tid; page <= max_p / PAGE_SIZE; page += NWARPS * 32) {
+        float lse_sum = 0.0f;
+        bool attended = false;
+        for (int m = 0; m < tile_rows; ++m) {
+            if (qfirst[m] < (page + 1) * PAGE_SIZE && qpos[m] >= page * PAGE_SIZE) {
+                lse_sum += row_weight[m] * LSE[m];
+                attended = true;
             }
         }
-        __syncthreads();
+        if (attended) {
+            atomicAdd(&p.mass[mass_row(p, s, page) * p.n_q_heads + h], -lse_sum);
+        }
     }
 }
 
 // Dynamic and static shared bytes of one CTA of attn_prefill_tc_kernel.
 template <typename scalar_t, int PAGE_SIZE, int HEAD_DIM, int KEY_PAGES> constexpr size_t prefill_smem_bytes() {
-    return prefill_tile_bytes<scalar_t, PAGE_SIZE, HEAD_DIM, KEY_PAGES>() + sizeof(float) * 5 * 16 +
+    return prefill_tile_bytes<scalar_t, PAGE_SIZE, HEAD_DIM, KEY_PAGES>() + sizeof(float) * (5 * 16 + 16 * KEY_PAGES) +
         sizeof(int) * 2 * 16;
 }
 

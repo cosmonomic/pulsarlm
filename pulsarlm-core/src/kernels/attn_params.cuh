@@ -8,8 +8,8 @@
 #include <cstdint>
 
 // The per-batch inputs every paged attention kernel reads, and the per-key arithmetic
-// they share: a key's RoPE position in its sequence's view, its rotation, and its slot
-// in the mass output.
+// they share: a key's RoPE position in its sequence's view, its rotation, and its page's
+// row in the mass output.
 //
 // The pool holds UNROTATED keys. A key's position is a function of its index j in the
 // sequence's view (page table order) alone, so a line shared by several views takes
@@ -35,9 +35,13 @@ template <typename scalar_t> struct PagedAttnParams {
     const int32_t* rope_layout;  // [num_seqs, 3], see KeyLayout
     const uint64_t* rope_turns;  // [head_dim / 2], see rope_turns_per_position
     const float* k_norm_weight;  // [head_dim] or null
-    float* mass;  // [total_view_pages, page_size, n_q_heads]; null skips the mass pass
+    // [total_view_pages, n_q_heads]; null measures no mass. The kernels leave each attended page's S there, the sum
+    // over its queries of mass_weights times the log share, and the decode kernels its max score until the LSE.
+    float* mass;
     const int32_t* cu_view_pages;  // [num_seqs + 1]
-    const float* mass_decay;  // [num_seqs]
+    const float* mass_weights;  // [total_q]
+    float* attended_weight;  // [total_view_pages], each page's W: the sum of mass_weights over its queries
+
     scalar_t* o;  // [total_q, n_q_heads, head_dim]
     int num_seqs;
     int n_q_heads;
@@ -135,14 +139,12 @@ __device__ __forceinline__ RotatedPair<scalar_t> rope_rotate(float lo, float hi,
     };
 }
 
-// Sequence s's rows of the mass output: key index j's row is cu_view_pages[s] *
-// page_size + j, so two views sharing a line accumulate apart.
+// The row of sequence s's view page b in mass and attended_weight, so two views sharing a line accumulate apart.
 template <typename scalar_t>
-__device__ __forceinline__ float* seq_mass(const PagedAttnParams<scalar_t>& p, int s, int ctx_len, int page_size) {
-    const int first = p.cu_view_pages[s];
-    const int end = p.cu_view_pages[s + 1];
-    CUDA_KERNEL_ASSERT(first >= 0 && (end - first) * page_size >= ctx_len && end <= p.total_view_pages);
-    return p.mass + static_cast<int64_t>(first) * page_size * p.n_q_heads;
+__device__ __forceinline__ int64_t mass_row(const PagedAttnParams<scalar_t>& p, int s, int view_page) {
+    const int row = p.cu_view_pages[s] + view_page;
+    CUDA_KERNEL_ASSERT(row < p.cu_view_pages[s + 1] && row < p.total_view_pages);
+    return row;
 }
 
 }  // namespace attn

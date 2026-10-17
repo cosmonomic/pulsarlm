@@ -14,5 +14,5 @@ class Settings:
     persist: bool
     cycle_tokens: int
     n_working: int
-    evict_tau: float
+    eviction_target: float
     max_pages: int | None

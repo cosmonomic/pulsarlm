@@ -38,7 +38,7 @@ using pulsarlm::task;
 using token_list = std::vector<std::int64_t>;
 
 constexpr std::size_t page_size = 4;
-const std::vector<pulsarlm::kv_layer> one_layer{pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2}};
+const std::vector<pulsarlm::kv_layer> one_layer{pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .n_q_heads = 1}};
 constexpr std::size_t vocab = 100;
 constexpr auto end_timeout = std::chrono::seconds(30);
 
@@ -159,7 +159,7 @@ bool ended_with(const request_results& recorded, request_error error) {
 
 // A state of one_layer's model whose one page is hash.
 pulsarlm::state one_page_state(const digest& hash, float density) {
-    return pulsarlm::state{.head = hash, .layers = {{.pages = {{.hash = hash, .density = density}}}}};
+    return pulsarlm::state{.head = hash, .layers = {{.pages = {{.hash = hash, .density = {density}}}}}};
 }
 
 digest root() {
@@ -194,7 +194,10 @@ TEST_CASE("a submitted request passes its tokens and its end state to its callba
     REQUIRE(recorded->end->has_value());
     std::vector<digest> hashes = pulsarlm::make_page_digests(root(), token_list{1, 2, 3, 4}, page_size);
     REQUIRE(((*recorded->end)->head == hashes.back()));
-    REQUIRE(((*recorded->end)->layers == std::vector{pulsarlm::layer_sequence{.pages = {{.hash = hashes[0]}}}}));
+    REQUIRE(
+        ((*recorded->end)->layers ==
+         std::vector{pulsarlm::layer_sequence{.pages = {{.hash = hashes[0], .density = {0.0f}}}}})
+    );
     REQUIRE((*recorded->end)->tail == token_list{5, 6});
     REQUIRE(e.exception() == nullptr);
 }
@@ -242,6 +245,19 @@ TEST_CASE("submit rejects an invalid request without calling its callbacks") {
     );
     REQUIRE_THROWS_AS(
         e.submit(request{.tokens = {1}, .eviction = {.attention_mass_decay = 1.5}}, record_into(recorded)),
+        std::invalid_argument
+    );
+    REQUIRE_THROWS_AS(
+        e.submit(request{.tokens = {1}, .eviction = {.eviction_target = 0.0}}, record_into(recorded)),
+        std::invalid_argument
+    );
+    REQUIRE_THROWS_AS(
+        e.submit(request{.tokens = {1}, .eviction = {.eviction_target = 1.5}}, record_into(recorded)),
+        std::invalid_argument
+    );
+    // The config states no max context.
+    REQUIRE_THROWS_AS(
+        e.submit(request{.tokens = {1}, .eviction = {.eviction_target = 0.5}}, record_into(recorded)),
         std::invalid_argument
     );
     REQUIRE(recorded->tokens.empty());

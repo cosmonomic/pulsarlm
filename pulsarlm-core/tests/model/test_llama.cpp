@@ -33,7 +33,6 @@ const pulsarlm::llama3_rope_scaling scaling{
 };
 constexpr double rms_eps = 1e-6;
 constexpr std::int64_t page_size = 16;
-constexpr double mass_decay = 0.25;
 const std::vector<std::int32_t> view_lines{3, 0, 5};
 constexpr std::int64_t n_lines = 6;
 
@@ -147,18 +146,27 @@ dense_output dense_forward(const weights& w, const at::Tensor& tokens) {
     return out;
 }
 
-// Layer layer's page mass of a step forwarding the queries at positions [first, last): each query's attention weights,
-// graded by the decay over the step's later queries, summed over queries, averaged over heads and maxed over each
-// page's slots.
+// The mass weight of the query at position p of a step forwarding the queries at positions [first, last).
+double mass_weight(std::int64_t p, std::int64_t last) {
+    return 0.25 * std::pow(0.75, static_cast<double>(last - 1 - p));
+}
+
+// Layer layer's page mass [view pages, n_heads] of a step forwarding the queries at positions [first, last): per page
+// and head, W exp(S / W), with S the sum over the queries attending the page of their mass weight times the log of
+// their max attention weight over its keys, and W the sum of those mass weights.
 at::Tensor dense_page_mass(const dense_output& dense, std::int64_t layer, std::int64_t first, std::int64_t last) {
     std::int64_t view_pages = static_cast<std::int64_t>(view_lines.size());
-    auto slot_mass = at::zeros({view_pages * page_size, n_heads}, cuda(at::kFloat));
+    auto log_sum = at::zeros({view_pages, n_heads}, cuda(at::kFloat));
+    auto weight_sum = at::zeros({view_pages, 1}, cuda(at::kFloat));
     for (std::int64_t p = first; p < last; p++) {
-        double graded = mass_decay * std::pow(1.0 - mass_decay, static_cast<double>(last - 1 - p));
-        auto weights = dense.attention[layer].select(1, p).narrow(1, 0, last).t();
-        slot_mass.narrow(0, 0, last).add_(weights * graded);
+        std::int64_t attended_pages = p / page_size + 1;
+        auto weights = at::zeros({n_heads, view_pages * page_size}, cuda(at::kFloat));
+        weights.narrow(1, 0, p + 1).copy_(dense.attention[layer].select(1, p).narrow(1, 0, p + 1));
+        auto page_max = weights.view({n_heads, view_pages, page_size}).amax(-1).t().narrow(0, 0, attended_pages);
+        log_sum.narrow(0, 0, attended_pages).add_(at::log(page_max) * mass_weight(p, last));
+        weight_sum.narrow(0, 0, attended_pages).add_(mass_weight(p, last));
     }
-    return slot_mass.mean(-1).view({view_pages, page_size}).amax(-1);
+    return at::where(weight_sum > 0, weight_sum * at::exp(log_sum / weight_sum), at::zeros_like(log_sum));
 }
 
 // t for every layer: [n_layers, t's sizes...].
@@ -177,10 +185,14 @@ pulsarlm::GroupBatch step(const at::Tensor& tokens, std::int64_t first, std::int
         .page_tables = every_layer(int32_cuda(view_lines).view({1, -1})),
         .rope_layout = int32_cuda({0, 0, -1}).view({1, 3}),
         .cu_view_pages = every_layer(int32_cuda({0, static_cast<std::int32_t>(view_lines.size())})),
-        .attention_mass_decay = at::full({1}, mass_decay, cuda(at::kFloat)),
     };
+    std::vector<float> weights;
+    for (std::int64_t p = first; p < last; p++) {
+        weights.push_back(static_cast<float>(mass_weight(p, last)));
+    }
+    g.mass_weights = at::tensor(weights).to(at::kCUDA);
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
-        g.page_mass.push_back(at::zeros({static_cast<std::int64_t>(view_lines.size())}, cuda(at::kFloat)));
+        g.page_mass.push_back(at::zeros({static_cast<std::int64_t>(view_lines.size()), n_heads}, cuda(at::kFloat)));
     }
     g.key_counts = key_count;
     if (prefill) {

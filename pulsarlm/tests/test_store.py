@@ -36,7 +36,7 @@ def reached(history: list[int], evicted: set[int] = set()) -> State:
     """A state of two layers: one keeping every page not evicted, one the newest."""
     full = len(history) // PAGE_SIZE * PAGE_SIZE
     pages = [
-        ActivePage(h, i / 4)
+        ActivePage(h, [i / 4, i / 8])
         for i, h in enumerate(page_digests(history))
         if i not in evicted
     ]

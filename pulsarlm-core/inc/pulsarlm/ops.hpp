@@ -124,14 +124,16 @@ std::optional<std::string> attention_unsupported_reason(
 // ops read no page table entry whose page lies wholly before the window of the sequence's first query, so those
 // entries may hold any value.
 //
-// mass, cu_view_pages and attention_mass_decay are passed together or not at all; without them the ops skip their
-// mass pass. Each attended key's softmax weight, times the sequence's EMA rate attention_mass_decay[s], is added into
-// the query head's own column of the key's view row: key j of sequence s accumulates into
-// mass[cu_view_pages[s] + j / page_size, j % page_size, h], so views never share mass, whatever lines they share.
-//   mass                 fp32 [total_view_pages, page_size, n_q_heads], added to in place
-//   cu_view_pages        int32 [num_seqs + 1]; sequence s owns view pages [cu_view_pages[s], cu_view_pages[s + 1]), at
-//                        least its keys'
-//   attention_mass_decay fp32 [num_seqs]
+// mass, cu_view_pages and mass_weights are passed together or not at all; without them the ops measure no mass. Query
+// i attends view page b of its sequence when it attends one of b's keys; its log share of b in query head h is the max
+// over b's attended keys of the scaled score minus the query's LSE in h. With S the sum of mass_weights[i] times the
+// log share and W the sum of mass_weights[i], over the queries attending b, mass[cu_view_pages[s] + b, h] is set to
+// W * exp(S / W), the weighted geometric mean share times W, and to 0 for a page no query attends. Views never share
+// mass, whatever lines they share.
+//   mass          fp32 [total_view_pages, n_q_heads], zeroed by the caller
+//   cu_view_pages int32 [num_seqs + 1]; sequence s owns view pages [cu_view_pages[s], cu_view_pages[s + 1]), at least
+//                 its keys'
+//   mass_weights  fp32 [total_q], positive
 
 // Decode: one query per sequence, q [num_seqs, n_q_heads, head_dim], at view index context_lens[s] - 1, attending the
 // keys [0, context_lens[s]) or its window of them. num_splits above 0 forces the split (flash-decode) path with that
@@ -149,16 +151,14 @@ at::Tensor attn_decode_cuda(
     const std::optional<at::Tensor>& k_norm_weight,
     const std::optional<at::Tensor>& mass = std::nullopt,
     const std::optional<at::Tensor>& cu_view_pages = std::nullopt,
-    const std::optional<at::Tensor>& attention_mass_decay = std::nullopt,
+    const std::optional<at::Tensor>& mass_weights = std::nullopt,
     int64_t num_splits = 0
 );
 
 // Prefill: a ragged batch of query chunks, causal over each view. Sequence i's queries are
 // q[cu_seqlens_q[i] : cu_seqlens_q[i + 1]] (q [total_q, n_q_heads, head_dim]) at view indices
 // [seqlens_k[i] - seq_q_i, seqlens_k[i]), and the query at view index p attends the keys [0, p] or its window of them.
-// The query at offset o from its chunk's end adds its weight to the mass times attention_mass_decay[i] *
-// (1 - attention_mass_decay[i])^o, so the mass is the EMA over the chunk's tokens. Returns o [total_q, n_q_heads,
-// head_dim].
+// Returns o [total_q, n_q_heads, head_dim].
 at::Tensor attn_prefill_cuda(
     const at::Tensor& q,
     const at::Tensor& k_pool,
@@ -173,14 +173,14 @@ at::Tensor attn_prefill_cuda(
     const std::optional<at::Tensor>& k_norm_weight,
     const std::optional<at::Tensor>& mass = std::nullopt,
     const std::optional<at::Tensor>& cu_view_pages = std::nullopt,
-    const std::optional<at::Tensor>& attention_mass_decay = std::nullopt
+    const std::optional<at::Tensor>& mass_weights = std::nullopt
 );
 
 // Indexed attention: attn_prefill_cuda's ragged batch, decode included as one query per sequence, in which the query
 // at view index p attends only the keys j <= p of its selected blocks: bit b of selected's row for the query, word
 // b / 32, bit b % 32, selects the keys [b * block_size, (b + 1) * block_size), block_size dividing the page size.
 // selected is int32 [total_q, words] with words * 32 * block_size at least the page tables' keys. A query selects at
-// least one key. The mass is attn_prefill_cuda's. Returns o [total_q, n_q_heads, head_dim].
+// least one key, and attends only the pages of its selected keys. Returns o [total_q, n_q_heads, head_dim].
 at::Tensor attn_indexed_cuda(
     const at::Tensor& q,
     const at::Tensor& k_pool,
@@ -195,7 +195,7 @@ at::Tensor attn_indexed_cuda(
     int64_t block_size,
     const std::optional<at::Tensor>& mass,
     const std::optional<at::Tensor>& cu_view_pages,
-    const std::optional<at::Tensor>& attention_mass_decay
+    const std::optional<at::Tensor>& mass_weights
 );
 
 // QSA's blocks [sequences, max_blocks, dim] in index_keys' dtype: block b of sequence s is the mean, in fp32 and

@@ -7,6 +7,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -37,7 +38,9 @@ struct Batch {
     at::Tensor seqlens_k;
     at::Tensor rope_layout;
     at::Tensor cu_view_pages;
-    at::Tensor decay;
+    // Query row r of a view of seq_q queries weighs kAlpha * (1 - kAlpha)^(seq_q - 1 - r).
+    std::vector<double> weights;
+    at::Tensor mass_weights;
     int64_t total_q = 0;
 };
 
@@ -57,7 +60,12 @@ Batch make_batch(int64_t page_size) {
     b.seqlens_k = int32_cuda(seqlens);
     b.rope_layout = int32_cuda({0, 0, -1}).repeat({num_seqs, 1});
     b.cu_view_pages = int32_cuda(cu_view);
-    b.decay = at::full({num_seqs}, kAlpha, at::device(at::kCUDA).dtype(at::kFloat));
+    for (const View& view : b.views) {
+        for (int64_t r = 0; r < view.seq_q; ++r) {
+            b.weights.push_back(kAlpha * std::pow(1.0 - kAlpha, static_cast<double>(view.seq_q - 1 - r)));
+        }
+    }
+    b.mass_weights = at::tensor(std::vector<float>(b.weights.begin(), b.weights.end())).to(at::kCUDA);
     b.total_q = cu_q.back();
     return b;
 }
@@ -88,7 +96,8 @@ bool selected(const at::Tensor& host_bits, int64_t row, int64_t key) {
 }
 
 // The dense reference: each query's keys j <= p of its selected blocks, the keys rotated to their view index and
-// rounded to the pool dtype as the kernels stage them.
+// rounded to the pool dtype as the kernels stage them. mass is [view pages, heads]: per page and head, W exp(S / W)
+// over the queries attending one of the page's keys.
 void reference(
     const Batch& b,
     const at::Tensor& q,
@@ -102,6 +111,11 @@ void reference(
 ) {
     const int64_t n_kv = k_pool.size(2), head_dim = k_pool.size(3), group = q.size(1) / n_kv;
     at::Tensor host_bits = selection.cpu();
+    std::vector<std::vector<std::vector<double>>> log_sum(
+        b.views.size(),
+        std::vector<std::vector<double>>(kMaxPages, std::vector<double>(q.size(1), 0.0))
+    );
+    std::vector<std::vector<double>> weight_sum(b.views.size(), std::vector<double>(kMaxPages, 0.0));
     int64_t row = 0;
     for (size_t s = 0; s < b.views.size(); ++s) {
         const View& view = b.views[s];
@@ -110,7 +124,7 @@ void reference(
         auto pos = at::arange(view.ctx, at::device(at::kCUDA).dtype(at::kLong)).view({-1, 1});
         k = pulsarlm::rope_rotate(k, pos, rope).to(k_pool.scalar_type()).to(at::kFloat);
         auto v = v_pool.index_select(0, lines).view({-1, n_kv, head_dim}).slice(0, 0, view.ctx).to(at::kFloat);
-        at::Tensor seq_mass = mass.narrow(0, static_cast<int64_t>(s) * kMaxPages, kMaxPages).flatten(0, 1);
+        const int64_t page_size = k_pool.size(1);
         for (int64_t r = 0; r < view.seq_q; ++r, ++row) {
             const int64_t p = view.ctx - view.seq_q + r;
             std::vector<int64_t> keys;
@@ -120,7 +134,7 @@ void reference(
                 }
             }
             auto attended = at::tensor(keys).to(at::kCUDA);
-            const double graded = kAlpha * std::pow(1.0 - kAlpha, static_cast<double>(view.seq_q - 1 - r));
+            const double weight = b.weights[row];
             for (int64_t h = 0; h < q.size(1); ++h) {
                 const int64_t g = h / group;
                 auto w = at::softmax(
@@ -128,10 +142,34 @@ void reference(
                     0
                 );
                 o[row][h] = at::mv(v.index_select(0, attended).select(1, g).t(), w);
-                seq_mass.select(1, h).index_add_(0, attended, w * graded);
+                at::Tensor shares = w.cpu();
+                std::vector<double> page_max(kMaxPages, 0.0);
+                for (size_t i = 0; i < keys.size(); ++i) {
+                    double& max = page_max[keys[i] / page_size];
+                    max = std::max(max, static_cast<double>(shares[static_cast<int64_t>(i)].item<float>()));
+                }
+                for (int64_t page = 0; page < kMaxPages; ++page) {
+                    if (page_max[page] > 0.0) {
+                        log_sum[s][page][h] += weight * std::log(page_max[page]);
+                        if (h == 0) {
+                            weight_sum[s][page] += weight;
+                        }
+                    }
+                }
             }
         }
     }
+    at::Tensor host_mass = at::zeros(mass.sizes(), at::kFloat);
+    for (size_t s = 0; s < b.views.size(); ++s) {
+        for (int64_t page = 0; page < kMaxPages; ++page) {
+            const double total = weight_sum[s][page];
+            for (int64_t h = 0; h < q.size(1); ++h) {
+                const double value = total > 0.0 ? total * std::exp(log_sum[s][page][h] / total) : 0.0;
+                host_mass[static_cast<int64_t>(s) * kMaxPages + page][h] = static_cast<float>(value);
+            }
+        }
+    }
+    mass.copy_(host_mass);
 }
 
 }  // namespace
@@ -155,7 +193,7 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
     const int64_t words = (kMaxPages * page_size / kBlockSize + 31) / 32;
     at::Tensor selection = random_selection(b, page_size, words);
     auto mass_of = [&] {
-        return at::zeros({static_cast<int64_t>(b.views.size()) * kMaxPages, page_size, n_q}, opts.dtype(at::kFloat));
+        return at::zeros({static_cast<int64_t>(b.views.size()) * kMaxPages, n_q}, opts.dtype(at::kFloat));
     };
 
     at::Tensor mass = mass_of();
@@ -173,7 +211,7 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
         kBlockSize,
         mass,
         b.cu_view_pages,
-        b.decay
+        b.mass_weights
     );
     at::Tensor expected_o = at::zeros({b.total_q, n_q, head_dim}, opts.dtype(at::kFloat));
     at::Tensor expected_mass = mass_of();
@@ -197,7 +235,7 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
         std::nullopt,
         dense_mass,
         b.cu_view_pages,
-        b.decay
+        b.mass_weights
     );
     at::Tensor all_mass = mass_of();
     at::Tensor all = pulsarlm::attn_indexed_cuda(
@@ -214,7 +252,7 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
         kBlockSize,
         all_mass,
         b.cu_view_pages,
-        b.decay
+        b.mass_weights
     );
     // The scalar kernel sums each output across threads with atomicAdd, and both ops add the mass with atomicAdd, in no
     // fixed order.

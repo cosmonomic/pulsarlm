@@ -49,12 +49,12 @@ at::Tensor paged_attention(
             key_counts
         );
     }
-    std::optional<at::Tensor> mass, cu_view_pages, mass_decay;
+    std::optional<at::Tensor> mass, cu_view_pages, mass_weights;
     at::Tensor page_mass = g.page_mass.empty() ? at::Tensor() : g.page_mass[kv_layer];
     if (page_mass.defined()) {
-        mass = at::zeros({page_mass.size(0), k_pool.size(1), q.size(1)}, q.options().dtype(at::kFloat));
+        mass = at::zeros_like(page_mass);
         cu_view_pages = g.cu_view_pages.select(0, layer);
-        mass_decay = g.attention_mass_decay;
+        mass_weights = g.mass_weights;
     }
     at::Tensor o;
     if (g.is_prefill()) {
@@ -72,7 +72,7 @@ at::Tensor paged_attention(
             k_norm_weight,
             mass,
             cu_view_pages,
-            mass_decay
+            mass_weights
         );
     } else {
         o = attn_decode_cuda(
@@ -88,11 +88,11 @@ at::Tensor paged_attention(
             k_norm_weight,
             mass,
             cu_view_pages,
-            mass_decay
+            mass_weights
         );
     }
     if (mass) {
-        at::maximum_out(page_mass, page_mass, mass->mean(-1).amax(-1));
+        at::maximum_out(page_mass, page_mass, *mass);
     }
     return o;
 }

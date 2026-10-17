@@ -38,6 +38,16 @@ struct Selection {
         const int block = key / this->block_size;
         return (this->bits[static_cast<int64_t>(query) * this->words + block / 32] >> (block % 32)) & 1u;
     }
+
+    // Whether the query at view index query_pos attends a key of view page page.
+    __device__ __forceinline__ bool attends_page(int query, int query_pos, int page, int page_size) const {
+        for (int key = page * page_size; key < (page + 1) * page_size && key <= query_pos; key += this->block_size) {
+            if (this->selects(query, key)) {
+                return true;
+            }
+        }
+        return false;
+    }
 };
 
 // The sequence of query token qtok, by binary search over cu_seqlens_q.
@@ -54,7 +64,7 @@ template <typename scalar_t> __device__ int sequence_of(const attn::PagedAttnPar
     return lo;
 }
 
-// One CTA per (query token, query head), as attn_scalar_kernel.
+// One CTA per (query token, query head), as attn_scalar_kernel, its threads striding over pages up to the query's.
 template <typename scalar_t, int PAGE_SIZE>
 __global__ void attn_indexed_scalar_kernel(const attn::PagedAttnParams<scalar_t> p, const Selection selection) {
     const int tid = threadIdx.x;
@@ -103,27 +113,39 @@ __global__ void attn_indexed_scalar_kernel(const attn::PagedAttnParams<scalar_t>
         return sc * p.scale;
     };
 
+    const float weight = p.mass ? p.mass_weights[qtok] : 0.0f;
     float m = -CUDART_INF_F;
     float l = 0.0f;
     float acc[attn::kMaxHeadDim];
     for (int d = 0; d < head_dim; ++d) {
         acc[d] = 0.0f;
     }
-    for (int j = tid; j <= query_pos; j += attn::kThreads) {
-        if (!selection.selects(qtok, j)) {
-            continue;
+    for (int page = tid; page <= query_pos / PAGE_SIZE; page += attn::kThreads) {
+        float page_max = -CUDART_INF_F;
+        for (int j = page * PAGE_SIZE; j < min((page + 1) * PAGE_SIZE, query_pos + 1); ++j) {
+            if (!selection.selects(qtok, j)) {
+                continue;
+            }
+            const int64_t offset = key_offset(j);
+            const float sc = score(j, offset);
+            const float new_m = fmaxf(m, sc);
+            const float corr = __expf(m - new_m);  // 0 when m == -inf
+            const float pw = __expf(sc - new_m);
+            l = l * corr + pw;
+            const scalar_t* vrow = p.v_pool + offset;
+            for (int d = 0; d < head_dim; ++d) {
+                acc[d] = acc[d] * corr + pw * static_cast<float>(vrow[d]);
+            }
+            m = new_m;
+            page_max = fmaxf(page_max, sc);
         }
-        const int64_t offset = key_offset(j);
-        const float sc = score(j, offset);
-        const float new_m = fmaxf(m, sc);
-        const float corr = __expf(m - new_m);  // 0 when m == -inf
-        const float pw = __expf(sc - new_m);
-        l = l * corr + pw;
-        const scalar_t* vrow = p.v_pool + offset;
-        for (int d = 0; d < head_dim; ++d) {
-            acc[d] = acc[d] * corr + pw * static_cast<float>(vrow[d]);
+        if (p.mass && page_max > -CUDART_INF_F) {
+            const int64_t row = attn::mass_row(p, s, page);
+            atomicAdd(&p.mass[row * p.n_q_heads + h], weight * page_max);
+            if (h == 0) {
+                atomicAdd(&p.attended_weight[row], weight);
+            }
         }
-        m = new_m;
     }
 
     const float M = attn::block_reduce_max<attn::kThreads>(red, tid, m);
@@ -146,16 +168,10 @@ __global__ void attn_indexed_scalar_kernel(const attn::PagedAttnParams<scalar_t>
     if (!p.mass) {
         return;
     }
-    // As attn_scalar_kernel's.
-    const float mass_decay = p.mass_decay[s];
-    const int chunk_end_offset = seq_q - 1 - (qtok - q0);
-    const float graded = chunk_end_offset == 0 ? 1.0f : __powf(1.0f - mass_decay, static_cast<float>(chunk_end_offset));
-    const float mass_weight = mass_decay * graded;
-    float* mass = attn::seq_mass(p, s, ctx_len, PAGE_SIZE);
-    for (int j = tid; j <= query_pos; j += attn::kThreads) {
-        if (selection.selects(qtok, j)) {
-            const float pw = __expf(score(j, key_offset(j)) - M) * inv_denom;
-            atomicAdd(&mass[static_cast<int64_t>(j) * p.n_q_heads + h], mass_weight * pw);
+    const float lse = M + logf(denom);
+    for (int page = tid; page <= query_pos / PAGE_SIZE; page += attn::kThreads) {
+        if (selection.attends_page(qtok, query_pos, page, PAGE_SIZE)) {
+            atomicAdd(&p.mass[attn::mass_row(p, s, page) * p.n_q_heads + h], -weight * lse);
         }
     }
 }
@@ -278,7 +294,20 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
     // The next selected block, as the selection word holding it and that word's bits from it on.
     __shared__ int cursor_word;
     __shared__ uint32_t cursor_bits;
-    __shared__ float mass_weight;
+    // Each row's max scaled score over the page its tiles are in; selected blocks come in view order, so a page's
+    // keys are consecutive across tiles.
+    __shared__ int run_page[16];
+    __shared__ float run_max[16];
+    const float weight = p.mass ? p.mass_weights[qtok] : 0.0f;
+    auto flush_page = [&](int m) {
+        if (run_page[m] >= 0) {
+            const int64_t row = attn::mass_row(p, s, run_page[m]);
+            atomicAdd(&p.mass[row * p.n_q_heads + first_head + m], weight * run_max[m]);
+            if (g == 0 && m == 0) {
+                atomicAdd(&p.attended_weight[row], weight);
+            }
+        }
+    };
 
     for (int i = tid; i < 16 * HEAD_DIM; i += NWARPS * 32) {
         const int row = i / HEAD_DIM, col = i % HEAD_DIM;
@@ -297,16 +326,11 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
         Mrow[tid] = -CUDART_INF_F;
         Lrow[tid] = 0.0f;
         row_rescale[tid] = 1.0f;
+        run_page[tid] = -1;
     }
     if (tid == 0) {
         cursor_word = 0;
         cursor_bits = selection.word(qtok, 0);
-        if (p.mass) {
-            // As attn_prefill_tc_kernel's per-query multiplier; every row of the CTA is the one query's.
-            const float retention = 1.0f - p.mass_decay[s];
-            const int chunk_end_offset = seq_q - 1 - (qtok - q0);
-            mass_weight = chunk_end_offset == 0 ? 1.0f : __powf(retention, static_cast<float>(chunk_end_offset));
-        }
     }
     __syncthreads();
 
@@ -406,6 +430,22 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
                 Mrow[sweep_row] = newM;
             }
         }
+        if (p.mass && tid < rows) {
+            for (int c = 0; c < KEY_TILE; ++c) {
+                const int key = key_index[1][c];
+                if (key < 0) {
+                    continue;
+                }
+                const float score = p.scale * sS[tid * SCORE_STRIDE + c];
+                if (key / PAGE_SIZE != run_page[tid]) {
+                    flush_page(tid);
+                    run_page[tid] = key / PAGE_SIZE;
+                    run_max[tid] = score;
+                } else {
+                    run_max[tid] = fmaxf(run_max[tid], score);
+                }
+            }
+        }
         __syncthreads();
 
         for (int i = tid; i < 16 * KEY_TILE; i += NWARPS * 32) {
@@ -461,36 +501,17 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
         return;
     }
     if (tid < rows) {
+        flush_page(tid);
         LSE[tid] = Mrow[tid] + logf(Lrow[tid]);
     }
-    if (tid == 0) {
-        cursor_word = 0;
-        cursor_bits = selection.word(qtok, 0);
-    }
     __syncthreads();
-
-    // Pass 2: recompute QKᵀ over the same tiles and add each (head, key) weight into the head's column of the key's mass
-    // row.
-    const float mass_decay = p.mass_decay[s];
-    float* mass = attn::seq_mass(p, s, ctx_len, PAGE_SIZE);
-    for (bool found = next_tile(0); found;) {
-        stage_tile(true, sK, 0);
-        attn::cp_async_wait<0>();
-        __syncthreads();
-        attn::tile_qkt<scalar_t, KEY_TILE, HEAD_DIM, BF16, SCORE_STRIDE, true>(sQ, sK, sS, warp, NWARPS);
-        __syncthreads();
-        for (int i = tid; i < 16 * KEY_TILE; i += NWARPS * 32) {
-            const int m = i / KEY_TILE, c = i % KEY_TILE;
-            if (attends(m, c, 0)) {
-                const float weight = mass_weight * __expf(p.scale * sS[m * SCORE_STRIDE + c] - LSE[m]);
-                atomicAdd(
-                    &mass[static_cast<int64_t>(key_index[0][c]) * p.n_q_heads + first_head + m],
-                    mass_decay * weight
-                );
+    for (int page = tid; page <= query_pos / PAGE_SIZE; page += NWARPS * 32) {
+        if (selection.attends_page(qtok, query_pos, page, PAGE_SIZE)) {
+            const int64_t row = attn::mass_row(p, s, page);
+            for (int m = 0; m < rows; ++m) {
+                atomicAdd(&p.mass[row * p.n_q_heads + first_head + m], -weight * LSE[m]);
             }
         }
-        __syncthreads();
-        found = next_tile(0);
     }
 }
 
@@ -568,7 +589,7 @@ at::Tensor attn_indexed_cuda(
     int64_t block_size,
     const std::optional<at::Tensor>& mass,
     const std::optional<at::Tensor>& cu_view_pages,
-    const std::optional<at::Tensor>& attention_mass_decay
+    const std::optional<at::Tensor>& mass_weights
 ) {
     const auto b = attn::paged_attn_batch(
         "attn_indexed",
@@ -585,7 +606,7 @@ at::Tensor attn_indexed_cuda(
         std::nullopt,
         mass,
         cu_view_pages,
-        attention_mass_decay
+        mass_weights
     );
     TORCH_CHECK(
         block_size >= 1 && b.page_size % block_size == 0,
@@ -609,6 +630,7 @@ at::Tensor attn_indexed_cuda(
     auto stream = at::cuda::getCurrentCUDAStream();
     if (b.q.scalar_type() == at::kFloat) {
         launch_indexed_scalar(b, selection, stream);
+        attn::finish_mass(b, stream);
         return b.o;
     }
     std::optional<std::string> unsupported = attention_unsupported_reason(
@@ -623,6 +645,7 @@ at::Tensor attn_indexed_cuda(
         using scalar_t = typename decltype(type_tag)::type;
         launch_indexed_tc<scalar_t, decltype(bf16_tag)::value>(b, selection, stream);
     });
+    attn::finish_mass(b, stream);
     return b.o;
 }
 

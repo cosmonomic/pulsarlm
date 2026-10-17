@@ -22,12 +22,13 @@ class PageStore(Protocol):
     ) -> None: ...
 
 class ActivePage:
-    """A page of a sequence: its 16-byte hash and its eviction density, 0 for a
-    page never measured."""
+    """A page of a sequence: its 16-byte hash and its eviction density in each
+    query head its layer measures mass in, 0 for a page never measured. A state the
+    engine reaches holds one per head; an initial state may hold none."""
 
     hash: bytes
-    density: float
-    def __init__(self, hash: bytes, density: float = 0.0) -> None: ...
+    density: list[float]
+    def __init__(self, hash: bytes, density: list[float] = ...) -> None: ...
 
 class LayerSequence:
     """One KV layer's active pages, in view order."""
@@ -85,7 +86,7 @@ class EvictionPolicy:
     n_working: int
     cycle_tokens: int
     max_pages: int | None
-    evict_tau: float
+    eviction_target: float
     attention_mass_decay: float
     def __init__(
         self,
@@ -94,8 +95,8 @@ class EvictionPolicy:
         n_working: int = 512,
         cycle_tokens: int = 512,
         max_pages: int | None = None,
-        evict_tau: float = 0.0,
-        attention_mass_decay: float = 1.0 / 512,
+        eviction_target: float = 1.0,
+        attention_mass_decay: float = 1.0 / 16,
     ) -> None: ...
 
 class ModelConfig:
@@ -275,6 +276,7 @@ class Engine:
         device: torch.device,
         stop_ids: list[int],
         prefill_tokens_per_step: int,
+        max_context: int | None = None,
     ) -> None: ...
     def submit(
         self,

@@ -20,8 +20,8 @@ namespace pulsarlm {
 namespace attn {
 
 // One validated call of a paged attention op. cu_seqlens_q is undefined for decode,
-// where sequence s has the one query row s. mass, cu_view_pages and mass_decay are all
-// defined or all undefined.
+// where sequence s has the one query row s. mass, cu_view_pages, mass_weights and
+// attended_weight are all defined or all undefined.
 struct PagedAttnBatch {
     at::Tensor q;
     at::Tensor k_pool;
@@ -34,7 +34,8 @@ struct PagedAttnBatch {
     at::Tensor k_norm_weight;
     at::Tensor mass;
     at::Tensor cu_view_pages;
-    at::Tensor mass_decay;
+    at::Tensor mass_weights;
+    at::Tensor attended_weight;
     at::Tensor o;
     double scale;
     int64_t sliding_window;
@@ -63,7 +64,8 @@ struct PagedAttnBatch {
             static_cast<const float*>(data(this->k_norm_weight)),
             static_cast<float*>(data(this->mass)),
             static_cast<const int32_t*>(data(this->cu_view_pages)),
-            static_cast<const float*>(data(this->mass_decay)),
+            static_cast<const float*>(data(this->mass_weights)),
+            static_cast<float*>(data(this->attended_weight)),
             static_cast<scalar_t*>(data(this->o)),
             static_cast<int>(this->num_seqs),
             static_cast<int>(this->n_q_heads),
@@ -86,8 +88,8 @@ bool prefill_fits(int64_t page_size, int64_t head_dim);
 // page, token and head starting 16-byte aligned.
 void check_pools(const char* op, const at::Tensor& k_pool, const at::Tensor& v_pool);
 
-// Checks the argument contract the attention ops share (pulsarlm/ops.hpp) and allocates o. op names the caller in
-// every error.
+// Checks the argument contract the attention ops share (pulsarlm/ops.hpp) and allocates o, and attended_weight when
+// the op measures mass. op names the caller in every error.
 PagedAttnBatch paged_attn_batch(
     const char* op,
     const at::Tensor& q,
@@ -103,8 +105,12 @@ PagedAttnBatch paged_attn_batch(
     const std::optional<at::Tensor>& k_norm_weight,
     const std::optional<at::Tensor>& mass,
     const std::optional<at::Tensor>& cu_view_pages,
-    const std::optional<at::Tensor>& attention_mass_decay
+    const std::optional<at::Tensor>& mass_weights
 );
+
+// Sets each page's mass from its S and W, as the ops' contract states, once the kernels have run; nothing without
+// mass.
+void finish_mass(const PagedAttnBatch& batch, cudaStream_t stream);
 
 // The scalar kernel over the whole batch: the fallback for shapes the tensor-core
 // kernels are not compiled for, and the reference both are checked against.

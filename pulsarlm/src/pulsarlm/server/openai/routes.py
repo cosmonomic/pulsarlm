@@ -55,7 +55,7 @@ class ServerState:
             n_working=self.eviction.n_working,
             cycle_tokens=self.eviction.cycle_tokens,
             max_pages=self.eviction.max_pages,
-            evict_tau=self.eviction.evict_tau,
+            eviction_target=self.eviction.eviction_target,
             attention_mass_decay=self.eviction.attention_mass_decay,
         )
 

@@ -76,12 +76,13 @@ result_writer make_writer(const std::shared_ptr<request_results>& recorded) {
 }
 
 constexpr std::size_t page_size = 4;
+constexpr std::size_t max_context = 4 * page_size;
 constexpr std::int64_t vocab = 1000;
 // sum_model predicts tokens below vocab only.
 
 const std::vector<pulsarlm::kv_layer> two_full_layers{
-    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2},
-    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2},
+    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .n_q_heads = 1},
+    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .n_q_heads = 1},
 };
 
 struct store_contents {
@@ -121,7 +122,7 @@ struct memory_store final : pulsarlm::page_store {
 // Writes each token's id as its K and its view index as its V in every attention KV layer. The token after a query is
 // the sum of the K of every key the query attends in the first full-attention layer, mod vocab; with a recurrent layer,
 // whose state is the sum of every token forwarded, evicted or not, it is that sum mod vocab instead. A full-attention
-// layer's view page has mass 1 when it holds a key important accepts for that layer, else 0. While the first
+// layer's view page has mass 1 in its one query head when it holds a key important accepts for that layer, else 0. While the first
 // full-attention layer has evicted nothing, every key a sliding layer reads must equal that layer's key at the same
 // distance from the query.
 class sum_model final : public pulsarlm::Model {
@@ -268,14 +269,14 @@ class sum_model final : public pulsarlm::Model {
                 }
                 auto layer_key = keys[layer].accessor<float, 2>();
                 auto layer_table = tables[layer].accessor<std::int32_t, 2>();
-                at::Tensor page_mass = at::zeros({layer_mass.size(0)});
-                auto mass = page_mass.accessor<float, 1>();
+                at::Tensor page_mass = at::zeros(layer_mass.sizes());
+                auto mass = page_mass.accessor<float, 2>();
                 for (std::size_t s = 0; s < n_seqs; s++) {
                     for (std::size_t j = 0; j < static_cast<std::size_t>(key_count[layer][s]); j++) {
                         std::size_t page = j / page_size;
                         auto token = static_cast<std::int64_t>(layer_key[layer_table[s][page]][j % page_size]);
                         if (important(layer, token)) {
-                            mass[first_page[layer][s] + page] = 1.0f;
+                            mass[first_page[layer][s] + page][0] = 1.0f;
                         }
                     }
                 }
@@ -371,7 +372,8 @@ struct fixture {
     sum_model model;
     pulsarlm::scheduler sched;
 
-    // The pool has room for n_lines lines of every KV layer unless pool_bytes sizes it.
+    // The pool has room for n_lines lines of every KV layer unless pool_bytes sizes it. The model's context of
+    // max_context tokens puts the bar of eviction_target 0.5 at density 0.5 in a layer of one query head.
     explicit fixture(
         std::size_t n_lines,
         std::size_t prefill_tokens_per_step = 64,
@@ -389,7 +391,8 @@ struct fixture {
           compute_stream(),
           root(),
           std::move(stop_ids),
-          prefill_tokens_per_step
+          prefill_tokens_per_step,
+          max_context
       ) {}
 
     static sum_model with_layers(std::vector<pulsarlm::kv_layer> layers) {
@@ -461,10 +464,12 @@ std::vector<digest> hashes_of(const pulsarlm::state& s, std::size_t layer = 0) {
     return hashes;
 }
 
+// Each page's density in the layer's one query head.
 std::vector<float> densities_of(const pulsarlm::state& s, std::size_t layer = 0) {
     std::vector<float> densities;
     for (const pulsarlm::active_page& page : s.layers[layer].pages) {
-        densities.push_back(page.density);
+        REQUIRE(page.density.size() == 1);
+        densities.push_back(page.density[0]);
     }
     return densities;
 }
@@ -804,7 +809,7 @@ TEST_CASE("a cycle's end evicts the pages below the bar outside the sink and wor
         {request{
             .tokens = prompt,
             .max_tokens = 2,
-            .eviction = {.n_sink = 1, .n_working = 1, .cycle_tokens = 16, .evict_tau = 0.4},
+            .eviction = {.n_sink = 1, .n_working = 1, .cycle_tokens = 16, .eviction_target = 0.5},
         }}
     );
 
@@ -834,7 +839,7 @@ TEST_CASE("a page's density carries over from the cycles before") {
             .tokens = prompt,
             .max_tokens = 2,
             .eviction =
-                {.n_sink = 1, .n_working = 1, .cycle_tokens = 8, .evict_tau = 0.4, .attention_mass_decay = 0.01},
+                {.n_sink = 1, .n_working = 1, .cycle_tokens = 8, .eviction_target = 0.5, .attention_mass_decay = 0.01},
         }}
     );
 
@@ -845,7 +850,7 @@ TEST_CASE("a page's density carries over from the cycles before") {
     REQUIRE((hashes_of(reached) == std::vector{chain[0], chain[1], chain[3]}));
     REQUIRE(densities_of(reached).size() == 3);
     REQUIRE(densities_of(reached)[0] == 0.0f);
-    REQUIRE(densities_of(reached)[1] == static_cast<float>(std::pow(0.99, 8)));
+    REQUIRE(densities_of(reached)[1] == static_cast<float>(std::pow(0.99, 2)));
     REQUIRE(densities_of(reached)[2] == 0.0f);
 }
 
@@ -853,13 +858,13 @@ TEST_CASE("a request resumes with the density of its initial state") {
     fixture f(16);
     f.model.important = [](std::size_t, std::int64_t token) { return token == 7; };
     token_list prompt{100, 101, 102, 103, 7, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114};
-    pulsarlm::eviction_policy policy{.n_sink = 1, .n_working = 1, .cycle_tokens = 4, .evict_tau = 0.4};
+    pulsarlm::eviction_policy policy{.n_sink = 1, .n_working = 1, .cycle_tokens = 4, .eviction_target = 0.5};
     std::vector<request_results> results = serve_in_turn(
         f.sched,
         request{
             .tokens = prompt,
             .max_tokens = 1,
-            .eviction = {.n_sink = 1, .n_working = 4, .cycle_tokens = 16, .evict_tau = 0.4}
+            .eviction = {.n_sink = 1, .n_working = 4, .cycle_tokens = 16, .eviction_target = 0.5}
         },
         [&](const request_results& first) {
             f.model.important = [](std::size_t, std::int64_t) { return false; };
@@ -947,7 +952,7 @@ TEST_CASE("running requests are forwarded in one step") {
 }
 
 const std::vector<pulsarlm::kv_layer> full_and_sliding{
-    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2},
+    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .n_q_heads = 1},
     pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .sliding_window = 5},
 };
 
@@ -980,7 +985,7 @@ TEST_CASE("a sliding layer holds only the pages its window reaches") {
 }
 
 const std::vector<pulsarlm::kv_layer> full_and_wide_sliding{
-    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2},
+    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .n_q_heads = 1},
     pulsarlm::kv_layer{.n_kv_heads = 2, .head_dim = 2, .sliding_window = 5},
 };
 
@@ -1043,11 +1048,14 @@ TEST_CASE("validate_state accepts the states the scheduler reaches and rejects o
     REQUIRE_THROWS_AS(f.sched.validate_state(headless_view), std::invalid_argument);
     pulsarlm::state evicted_view = end;
     evicted_view.layers[0].pages.erase(evicted_view.layers[0].pages.begin() + 1);
-    evicted_view.layers[0].pages[0].density = 1.0f;
+    evicted_view.layers[0].pages[0].density = {1.0f};
     f.sched.validate_state(evicted_view);
     pulsarlm::state negative = end;
-    negative.layers[0].pages[0].density = -1.0f;
+    negative.layers[0].pages[0].density = {-1.0f};
     REQUIRE_THROWS_AS(f.sched.validate_state(negative), std::invalid_argument);
+    pulsarlm::state too_many_heads = end;
+    too_many_heads.layers[0].pages[0].density = {0.0f, 0.0f};
+    REQUIRE_THROWS_AS(f.sched.validate_state(too_many_heads), std::invalid_argument);
 }
 
 TEST_CASE("a request resumed on another cache fetches only the window's pages of a sliding layer") {
@@ -1074,7 +1082,7 @@ TEST_CASE("a request resumed on another cache fetches only the window's pages of
 
 TEST_CASE("a sliding layer keeps the pages its window reaches whatever the full-attention layer evicts") {
     std::vector<pulsarlm::kv_layer> layers{
-        pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2},
+        pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .n_q_heads = 1},
         pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .sliding_window = 9},
     };
     fixture f(16, 64, {}, {}, layers);
@@ -1108,7 +1116,7 @@ TEST_CASE("each full-attention layer evicts by its own attention mass") {
         {request{
             .tokens = prompt,
             .max_tokens = 3,
-            .eviction = {.n_sink = 1, .n_working = 1, .cycle_tokens = 16, .evict_tau = 0.4},
+            .eviction = {.n_sink = 1, .n_working = 1, .cycle_tokens = 16, .eviction_target = 0.5},
         }}
     );
 
@@ -1136,7 +1144,7 @@ const std::vector<pulsarlm::kv_layer> recurrent_and_full{
         .head_dim = 2,
         .state = pulsarlm::recurrent_state{.sizes = {1}, .dtype = at::kFloat},
     },
-    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2},
+    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .n_q_heads = 1},
 };
 
 std::int64_t sum_of_first(const token_list& tokens, std::size_t count) {

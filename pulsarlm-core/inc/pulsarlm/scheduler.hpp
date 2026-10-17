@@ -45,8 +45,11 @@ class scheduler {
     std::vector<kv> lines;
     std::vector<std::optional<std::size_t>> sliding_windows;
     std::vector<bool> recurrent;
-    // Per KV layer, whether it evicts pages by its own attention mass: a full-attention layer.
-    std::vector<bool> evictable;
+    // Per KV layer, the query heads it measures mass and evicts pages in: those reading a full-attention layer, 0 for
+    // other layers.
+    std::vector<std::size_t> mass_heads;
+    // The model's context in pages, which eviction_target is a fraction of.
+    std::optional<std::size_t> max_context_pages;
     cudaStream_t stream;
     std::size_t page_size;
     digest root;
@@ -77,14 +80,15 @@ class scheduler {
   public:
     // cache holds one layer per entry of model.kv_layers(). root is the digest the page chains of a state with no
     // pages start from. A step forwards every decoding sequence and at most prefill_tokens_per_step tokens of the
-    // others.
+    // others. max_context is the model's context in tokens, without which a request's eviction_target must be 1.
     scheduler(
         Model& model,
         kv_cache cache,
         cudaStream_t stream,
         digest root,
         std::vector<std::int64_t>&& stop_ids,
-        std::size_t prefill_tokens_per_step
+        std::size_t prefill_tokens_per_step,
+        std::optional<std::size_t> max_context
     );
 
     // Serves r, then ends writer with its final state, which leaves out the last sampled token, or an error. Appends
@@ -96,8 +100,8 @@ class scheduler {
     task<void> run();
     // Throws std::invalid_argument unless s is a state the scheduler reaches: with one sequence per KV layer, a
     // full-attention layer's ending with head, a sliding layer's ending with head and holding no more pages than its
-    // window reaches, a recurrent layer's head alone, and every density finite and non-negative. Safe to call from any
-    // thread.
+    // window reaches, a recurrent layer's head alone, and each page holding no density or one per query head its layer
+    // measures, every density finite and non-negative. Safe to call from any thread.
     void validate_state(const state& s) const;
 };
 
