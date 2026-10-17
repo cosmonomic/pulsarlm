@@ -62,7 +62,11 @@ def qwen3_5(**text) -> PulsarLMModelConfig:
         "rms_norm_eps": 1e-6,
     }
     return PulsarLMModelConfig.from_dict(
-        {"model_type": "qwen3_5", "eos_token_id": [248044], "text_config": base | text}
+        {
+            "model_type": "qwen3_5_moe" if "num_experts" in text else "qwen3_5",
+            "eos_token_id": [248044],
+            "text_config": base | text,
+        }
     )
 
 
@@ -71,6 +75,22 @@ def test_a_qwen3_5_checkpoint_maps_its_text_config():
 
     assert isinstance(model, Qwen3_5Config)
     assert model.layer_types == (["linear_attention"] * 3 + ["full_attention"]) * 2
+
+
+def test_a_qwen3_5_checkpoint_has_dense_mlps():
+    model = engine_model(qwen3_5())
+
+    assert isinstance(model, Qwen3_5Config)
+    assert model.num_experts_per_tok == 0
+
+
+def test_a_qwen3_5_moe_checkpoint_maps_its_experts_per_token():
+    model = engine_model(
+        qwen3_5(num_experts=256, num_experts_per_tok=8, moe_intermediate_size=512)
+    )
+
+    assert isinstance(model, Qwen3_5Config)
+    assert model.num_experts_per_tok == 8
 
 
 def test_a_qwen3_5_checkpoint_without_an_output_gate_is_rejected():

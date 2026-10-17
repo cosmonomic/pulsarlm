@@ -11,8 +11,8 @@
 #include <vector>
 
 // Qwen3_5Model's paged forward against a dense ATen Qwen3.5 written from Hugging Face's code, with the delta rule run
-// token by token: chunked prefill then decode, checking the logits, the states the recurrent lines hold at the end and
-// at the newest page end, and the K the attention lines hold.
+// token by token and qwen3_5_moe's experts run one by one: chunked prefill then decode, checking the logits, the states
+// the recurrent lines hold at the end and at the newest page end, and the K the attention lines hold.
 
 namespace {
 
@@ -20,6 +20,8 @@ using pulsarlm::qwen3_5_layer_type;
 
 constexpr std::int64_t hidden = 64;
 constexpr std::int64_t intermediate = 128;
+constexpr std::int64_t n_experts = 8;
+constexpr std::int64_t moe_intermediate = 32;
 constexpr std::int64_t vocab = 300;
 constexpr std::int64_t n_heads = 4;
 constexpr std::int64_t n_kv_heads = 2;
@@ -62,7 +64,7 @@ bool full(std::size_t layer) {
 struct weights {
     c10::Dict<std::string, at::Tensor> named;
 
-    explicit weights(at::ScalarType dtype) {
+    weights(at::ScalarType dtype, bool moe) {
         at::manual_seed(13);
         auto add = [&](const std::string& name, at::Tensor t) { named.insert(name, t.to(cuda(dtype))); };
         auto projection = [](std::int64_t out, std::int64_t in) { return at::randn({out, in}) / std::sqrt(in); };
@@ -75,9 +77,18 @@ struct weights {
             std::string l = p + "layers." + std::to_string(layer) + ".";
             add(l + "input_layernorm.weight", norm(hidden));
             add(l + "post_attention_layernorm.weight", norm(hidden));
-            add(l + "mlp.gate_proj.weight", projection(intermediate, hidden));
-            add(l + "mlp.up_proj.weight", projection(intermediate, hidden));
-            add(l + "mlp.down_proj.weight", projection(hidden, intermediate));
+            std::string mlp = moe ? l + "mlp.shared_expert." : l + "mlp.";
+            add(mlp + "gate_proj.weight", projection(intermediate, hidden));
+            add(mlp + "up_proj.weight", projection(intermediate, hidden));
+            add(mlp + "down_proj.weight", projection(hidden, intermediate));
+            if (moe) {
+                add(l + "mlp.gate.weight", projection(n_experts, hidden));
+                add(l + "mlp.shared_expert_gate.weight", projection(1, hidden));
+                add(l + "mlp.experts.gate_up_proj",
+                    at::randn({n_experts, 2 * moe_intermediate, hidden}) / std::sqrt(hidden));
+                add(l + "mlp.experts.down_proj",
+                    at::randn({n_experts, hidden, moe_intermediate}) / std::sqrt(moe_intermediate));
+            }
             if (full(layer)) {
                 add(l + "self_attn.q_proj.weight", projection(2 * n_heads * head_dim, hidden));
                 add(l + "self_attn.k_proj.weight", projection(n_kv_heads * head_dim, hidden));
@@ -211,7 +222,37 @@ at::Tensor attention(const weights& w, std::size_t layer, const at::Tensor& h, d
     return at::linear(o * at::sigmoid(gate), w.layer(layer, "self_attn.o_proj.weight"));
 }
 
-dense_output dense_forward(const weights& w, const at::Tensor& tokens) {
+at::Tensor swiglu(const weights& w, std::size_t layer, const std::string& mlp, const at::Tensor& h) {
+    auto gated = at::silu(at::linear(h, w.layer(layer, mlp + "gate_proj.weight"))) *
+        at::linear(h, w.layer(layer, mlp + "up_proj.weight"));
+    return at::linear(gated, w.layer(layer, mlp + "down_proj.weight"));
+}
+
+// Hugging Face's qwen3_5_moe block, each expert over the tokens that chose it.
+at::Tensor sparse_moe(const weights& w, std::size_t layer, const at::Tensor& h, std::int64_t top_k) {
+    auto probabilities = at::softmax(at::linear(h, w.layer(layer, "mlp.gate.weight")), -1);
+    auto [top_weights, top_experts] = at::topk(probabilities, top_k, -1);
+    top_weights = top_weights / top_weights.sum(-1, true);
+    auto gate_up = w.layer(layer, "mlp.experts.gate_up_proj");
+    auto down = w.layer(layer, "mlp.experts.down_proj");
+    auto out = at::zeros_like(h);
+    for (std::int64_t expert = 0; expert < n_experts; expert++) {
+        auto chosen = top_experts.eq(expert);
+        auto tokens_of = chosen.any(-1).nonzero().squeeze(-1);
+        if (tokens_of.numel() == 0) {
+            continue;
+        }
+        auto weight = (top_weights * chosen).sum(-1).index_select(0, tokens_of).unsqueeze(-1);
+        auto halves = at::linear(h.index_select(0, tokens_of), gate_up[expert]).chunk(2, -1);
+        out.index_add_(0, tokens_of, at::linear(at::silu(halves[0]) * halves[1], down[expert]) * weight);
+    }
+    auto shared = at::sigmoid(at::linear(h, w.layer(layer, "mlp.shared_expert_gate.weight"))) *
+        swiglu(w, layer, "mlp.shared_expert.", h);
+    return out + shared;
+}
+
+// top_k 0 is a dense MLP.
+dense_output dense_forward(const weights& w, const at::Tensor& tokens, std::int64_t top_k) {
     dense_output out{
         .k = std::vector<at::Tensor>(layer_types.size()),
         .states = std::vector<at::Tensor>(layer_types.size()),
@@ -222,9 +263,7 @@ dense_output dense_forward(const weights& w, const at::Tensor& tokens) {
         auto h = rms_norm(x, w.layer(layer, "input_layernorm.weight"));
         x = x + (full(layer) ? attention(w, layer, h, out) : deltanet(w, layer, h, out));
         auto h2 = rms_norm(x, w.layer(layer, "post_attention_layernorm.weight"));
-        auto mlp = at::silu(at::linear(h2, w.layer(layer, "mlp.gate_proj.weight"))) *
-            at::linear(h2, w.layer(layer, "mlp.up_proj.weight"));
-        x = x + at::linear(mlp, w.layer(layer, "mlp.down_proj.weight"));
+        x = x + (top_k > 0 ? sparse_moe(w, layer, h2, top_k) : swiglu(w, layer, "mlp.", h2));
     }
     out.logits = at::linear(rms_norm(x, w("model.language_model.norm.weight")), w("lm_head.weight"));
     return out;
@@ -286,13 +325,13 @@ double max_relative_error(const at::Tensor& got, const at::Tensor& expected) {
     return ((got.to(at::kFloat) - expected).abs().max() / expected.abs().max()).item<double>();
 }
 
-void check_against_dense(at::ScalarType dtype, double tolerance) {
-    weights w(dtype);
+// top_k 0 is a dense MLP.
+void check_against_dense(at::ScalarType dtype, double tolerance, std::int64_t top_k = 0) {
+    weights w(dtype, top_k > 0);
     pulsarlm::Qwen3_5Model model(
         pulsarlm::qwen3_5_config{
             .vocab_size = vocab,
             .hidden_size = hidden,
-            .intermediate_size = intermediate,
             .layer_types = layer_types,
             .n_heads = n_heads,
             .n_kv_heads = n_kv_heads,
@@ -305,6 +344,7 @@ void check_against_dense(at::ScalarType dtype, double tolerance) {
             .linear_value_head_dim = value_head_dim,
             .linear_conv_kernel = conv_kernel,
             .rms_norm_eps = rms_eps,
+            .num_experts_per_tok = top_k,
         },
         w.named
     );
@@ -328,7 +368,7 @@ void check_against_dense(at::ScalarType dtype, double tolerance) {
     }
 
     auto tokens = at::randint(vocab, {n_tokens}, cuda(at::kLong));
-    dense_output dense = dense_forward(w, tokens);
+    dense_output dense = dense_forward(w, tokens, top_k);
 
     struct chunk {
         std::int64_t first;
@@ -382,4 +422,18 @@ TEST_CASE("Qwen3.5 matches a dense forward in bf16", "[model][cuda]") {
         SKIP("no CUDA device");
     }
     check_against_dense(at::kBFloat16, 5e-2);
+}
+
+TEST_CASE("Qwen3.5 with sparse MoE blocks matches a dense forward", "[model][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    SECTION("top 2 experts in fp32") {
+        check_against_dense(at::kFloat, 1e-4, 2);
+    }
+    // A token's top experts change with bf16's rounding of its router logits, so in bf16 every token takes every
+    // expert.
+    SECTION("every expert in bf16") {
+        check_against_dense(at::kBFloat16, 5e-2, n_experts);
+    }
 }

@@ -7,7 +7,7 @@ import torch
 from safetensors.torch import load, save_file
 from tokenizers import Tokenizer, models
 
-from pulsarlm.checkpoint import PulsarLMModelLoadingError
+from pulsarlm.checkpoint import PulsarLMModelLoadingError, load as load_archive
 from pulsarlm.migrate import migrate
 
 TEMPLATE = "{% for m in messages %}{{ m.content }}{% endfor %}"
@@ -17,8 +17,11 @@ def write_source(
     src: Path, model_type: str, tensors: dict[str, torch.Tensor], tokenizer_config: dict
 ) -> None:
     config = {"model_type": model_type, "eos_token_id": 1}
-    if model_type.startswith(("gemma4", "qwen3_5")):
-        config["text_config"] = {"vocab_size": 8, "num_hidden_layers": 1}
+    text = {"vocab_size": 8, "num_hidden_layers": 1}
+    if model_type.endswith("_text"):
+        config |= text
+    elif model_type.startswith(("gemma4", "qwen3_5")):
+        config["text_config"] = text
     (src / "config.json").write_text(json.dumps(config))
     (src / "tokenizer.json").write_text(
         Tokenizer(models.WordLevel({"a": 0, "<end>": 2}, unk_token="a")).to_str()
@@ -83,6 +86,36 @@ def test_a_qwen3_5_checkpoint_keeps_its_text_weights_and_untied_head(tmp_path: P
             "lm_head.weight",
             "model.language_model.norm.weight",
         ]
+
+
+def test_a_text_only_qwen3_5_checkpoint_loads_under_the_multimodal_names(
+    tmp_path: Path,
+):
+    src = tmp_path / "src"
+    src.mkdir()
+    write_source(
+        src,
+        "qwen3_5_moe_text",
+        {
+            "model.norm.weight": torch.ones(2),
+            "lm_head.weight": torch.ones(3),
+            "mtp.fc.weight": torch.zeros(3),
+        },
+        {"chat_template": TEMPLATE},
+    )
+    dst = tmp_path / "model.pulsarlm"
+    migrate(src, dst)
+
+    with zipfile.ZipFile(dst) as archive:
+        assert sorted(archived_weights(archive)) == [
+            "lm_head.weight",
+            "model.norm.weight",
+        ]
+    loaded = load_archive(dst, device=torch.device("cpu"))
+    assert sorted(loaded.weights) == [
+        "lm_head.weight",
+        "model.language_model.norm.weight",
+    ]
 
 
 def test_eos_ids_fall_back_to_the_text_config_and_take_the_tokenizer_eos(

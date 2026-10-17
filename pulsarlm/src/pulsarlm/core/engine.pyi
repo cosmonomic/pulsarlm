@@ -176,12 +176,12 @@ class Gemma4Config:
 
 class Qwen3_5Config:
     layer_types: list[str]
+    num_experts_per_tok: int
     def __init__(
         self,
         *,
         vocab_size: int,
         hidden_size: int,
-        intermediate_size: int,
         layer_types: list[str],
         n_heads: int,
         n_kv_heads: int,
@@ -194,6 +194,7 @@ class Qwen3_5Config:
         linear_value_head_dim: int,
         linear_conv_kernel: int,
         rms_norm_eps: float,
+        num_experts_per_tok: int = 0,
     ) -> None: ...
 
 class Request:

@@ -3,6 +3,7 @@
 from pulsarlm.checkpoint import (
     GEMMA4,
     QWEN3_5,
+    QWEN3_5_TEXT,
     PulsarLMModelConfig,
     PulsarLMModelLoadingError,
 )
@@ -107,7 +108,6 @@ def qwen3_5_config(text: dict) -> Qwen3_5Config:
     return Qwen3_5Config(
         vocab_size=text["vocab_size"],
         hidden_size=text["hidden_size"],
-        intermediate_size=text["intermediate_size"],
         layer_types=layer_types,
         n_heads=text["num_attention_heads"],
         n_kv_heads=text["num_key_value_heads"],
@@ -124,6 +124,7 @@ def qwen3_5_config(text: dict) -> Qwen3_5Config:
         linear_value_head_dim=text["linear_value_head_dim"],
         linear_conv_kernel=text["linear_conv_kernel_dim"],
         rms_norm_eps=float(text["rms_norm_eps"]),
+        num_experts_per_tok=text.get("num_experts_per_tok", 0),
     )
 
 
@@ -175,6 +176,6 @@ def engine_model(
     """Measures attention mass on the full-attention layers of the top quarter."""
     if cfg.architecture in GEMMA4:
         return gemma4_config(cfg.architecture, cfg.text)
-    if cfg.architecture in QWEN3_5:
+    if cfg.architecture in QWEN3_5 + QWEN3_5_TEXT:
         return qwen3_5_config(cfg.text)
     return dense_config(cfg.architecture, cfg.text)

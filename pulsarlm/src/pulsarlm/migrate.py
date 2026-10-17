@@ -34,6 +34,7 @@ from pulsarlm.chat import special_token
 from pulsarlm.checkpoint import (
     GEMMA4,
     QWEN3_5,
+    QWEN3_5_TEXT,
     PulsarLMModelConfig,
     PulsarLMModelLoadingError,
 )
@@ -105,6 +106,8 @@ def is_text_weight(architecture: str, name: str) -> bool:
         return name.startswith("model.language_model.")
     if architecture in QWEN3_5:
         return name.startswith("model.language_model.") or name == "lm_head.weight"
+    if architecture in QWEN3_5_TEXT:
+        return name.startswith("model.") or name == "lm_head.weight"
     return True
 
 

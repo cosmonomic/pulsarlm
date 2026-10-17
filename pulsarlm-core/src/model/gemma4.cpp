@@ -197,33 +197,25 @@ Gemma4Model::attention(const at::Tensor& h, std::int64_t layer, const GroupBatch
     return at::linear(o.reshape({ntok, config.n_heads * head_dim}), w.o_proj);
 }
 
-// Assignments are sorted by expert and counted on the device, so routing never waits for the host.
 at::Tensor Gemma4Model::experts(const at::Tensor& x, std::int64_t layer) const {
     const LayerWeights& w = layers[layer];
     const double eps = config.rms_norm_eps;
-    const std::int64_t n_experts = w.router_proj.size(0);
-    const std::int64_t top_k = config.top_k_experts;
 
     at::Tensor routed = rmsnorm_cuda(x, hidden_ones, eps) * w.router_scale *
         std::pow(static_cast<double>(config.hidden_size), -0.5);
     at::Tensor probabilities = at::softmax(at::linear(routed, w.router_proj), -1, at::kFloat);
-    auto [top_weights, top_experts] = at::topk(probabilities, top_k, -1);
+    auto [top_weights, top_experts] = at::topk(probabilities, config.top_k_experts, -1);
     at::Tensor expert_scale = w.router_per_expert_scale.index_select(0, top_experts.flatten())
                                   .view(top_experts.sizes());
     top_weights = top_weights / top_weights.sum(-1, true) * expert_scale.to(at::kFloat);
-
-    at::Tensor assigned_experts = top_experts.flatten();
-    at::Tensor order = at::argsort(assigned_experts, /*stable=*/true);
-    at::Tensor assigned_tokens = at::floor_divide(order, top_k);
-    at::Tensor counts = at::zeros({n_experts}, x.options().dtype(at::kInt))
-                            .index_add_(0, assigned_experts.index_select(0, order), at::ones_like(order, at::kInt));
-    at::Tensor offsets = at::cumsum(counts, 0, at::kInt);
-
-    at::Tensor h = rmsnorm_cuda(x, w.pre_feedforward_layernorm_2, eps).index_select(0, assigned_tokens);
-    std::vector<at::Tensor> gate_up = at::_grouped_mm(h, w.experts_gate_up_proj.transpose(1, 2), offsets).chunk(2, -1);
-    at::Tensor down = at::_grouped_mm(gelu_tanh(gate_up[0]) * gate_up[1], w.experts_down_proj.transpose(1, 2), offsets);
-    at::Tensor weighted = down * top_weights.flatten().index_select(0, order).unsqueeze(1).to(down.scalar_type());
-    return at::zeros_like(x).index_add_(0, assigned_tokens, weighted);
+    return routed_experts(
+        rmsnorm_cuda(x, w.pre_feedforward_layernorm_2, eps),
+        top_experts,
+        top_weights,
+        w.experts_gate_up_proj,
+        w.experts_down_proj,
+        gelu_tanh
+    );
 }
 
 at::Tensor Gemma4Model::block(

@@ -45,6 +45,19 @@ at::Tensor paged_attention(
     const at::Tensor& lse_capture = {}
 );
 
+// Each token's sum over its top_k experts of top_weights times down_proj(activation(gate) * up) of its row of h
+// [ntok, hidden], with top_experts and top_weights (fp32) [ntok, top_k], gate_up_proj
+// [num_experts, 2 * intermediate, hidden] and down_proj [num_experts, hidden, intermediate]. The assignments are sorted
+// by expert and counted on the device, so routing never waits for the host.
+at::Tensor routed_experts(
+    const at::Tensor& h,
+    const at::Tensor& top_experts,
+    const at::Tensor& top_weights,
+    const at::Tensor& gate_up_proj,
+    const at::Tensor& down_proj,
+    const std::function<at::Tensor(const at::Tensor&)>& activation
+);
+
 // The rows of x whose logits g asks for.
 at::Tensor logit_inputs(const at::Tensor& x, const GroupBatch& g);
 

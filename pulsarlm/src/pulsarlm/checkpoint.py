@@ -23,10 +23,12 @@ class PulsarLMModelLoadingError(RuntimeError):
 
 DENSE = ("qwen2", "qwen3", "llama")
 GEMMA4 = ("gemma4", "gemma4_unified")
-QWEN3_5 = ("qwen3_5",)
+QWEN3_5 = ("qwen3_5", "qwen3_5_moe")
+# Text-only Qwen3.5 checkpoints, whose text weights are named model.* instead of model.language_model.*.
+QWEN3_5_TEXT = ("qwen3_5_text", "qwen3_5_moe_text")
 # Multimodal checkpoints whose text model's config is their text_config.
 MULTIMODAL = GEMMA4 + QWEN3_5
-ARCHITECTURES = DENSE + MULTIMODAL
+ARCHITECTURES = DENSE + MULTIMODAL + QWEN3_5_TEXT
 
 
 @dataclass
@@ -178,6 +180,21 @@ def load_weights(
     return out
 
 
+def text_model_weights(
+    architecture: str, weights: dict[str, Tensor]
+) -> dict[str, Tensor]:
+    """A text-only Qwen3.5 checkpoint's weights under the multimodal names the
+    model reads."""
+    if architecture not in QWEN3_5_TEXT:
+        return weights
+    return {
+        "model.language_model." + name.removeprefix("model.")
+        if name.startswith("model.")
+        else name: tensor
+        for name, tensor in weights.items()
+    }
+
+
 def load(
     path: Path,
     *,
@@ -190,7 +207,9 @@ def load(
         config = load_config(archive_path)
         tokenizer = load_tokenizer(archive_path)
         chat_template = load_chat_template(archive_path)
-        weights = load_weights(archive, device=device, dtype=dtype)
+        weights = text_model_weights(
+            config.architecture, load_weights(archive, device=device, dtype=dtype)
+        )
 
     return PulsarLMModel(
         config=config,

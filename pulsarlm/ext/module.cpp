@@ -365,7 +365,6 @@ PYBIND11_MODULE(pulsarlm_core, m) {
         .def(
             py::init([](std::int64_t vocab_size,
                         std::int64_t hidden_size,
-                        std::int64_t intermediate_size,
                         const std::vector<std::string>& layer_types,
                         std::int64_t n_heads,
                         std::int64_t n_kv_heads,
@@ -377,7 +376,8 @@ PYBIND11_MODULE(pulsarlm_core, m) {
                         std::int64_t linear_key_head_dim,
                         std::int64_t linear_value_head_dim,
                         std::int64_t linear_conv_kernel,
-                        double rms_norm_eps) {
+                        double rms_norm_eps,
+                        std::int64_t num_experts_per_tok) {
                 std::vector<qwen3_5_layer_type> types;
                 for (const std::string& name : layer_types) {
                     types.push_back(qwen3_5_layer(name));
@@ -385,7 +385,6 @@ PYBIND11_MODULE(pulsarlm_core, m) {
                 return qwen3_5_config{
                     .vocab_size = vocab_size,
                     .hidden_size = hidden_size,
-                    .intermediate_size = intermediate_size,
                     .layer_types = std::move(types),
                     .n_heads = n_heads,
                     .n_kv_heads = n_kv_heads,
@@ -398,12 +397,12 @@ PYBIND11_MODULE(pulsarlm_core, m) {
                     .linear_value_head_dim = linear_value_head_dim,
                     .linear_conv_kernel = linear_conv_kernel,
                     .rms_norm_eps = rms_norm_eps,
+                    .num_experts_per_tok = num_experts_per_tok,
                 };
             }),
             py::kw_only(),
             "vocab_size"_a,
             "hidden_size"_a,
-            "intermediate_size"_a,
             "layer_types"_a,
             "n_heads"_a,
             "n_kv_heads"_a,
@@ -415,8 +414,10 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "linear_key_head_dim"_a,
             "linear_value_head_dim"_a,
             "linear_conv_kernel"_a,
-            "rms_norm_eps"_a
+            "rms_norm_eps"_a,
+            "num_experts_per_tok"_a = 0
         )
+        .def_readonly("num_experts_per_tok", &qwen3_5_config::num_experts_per_tok)
         .def_property_readonly("layer_types", [](const qwen3_5_config& c) {
             std::vector<std::string> names;
             for (qwen3_5_layer_type type : c.layer_types) {
