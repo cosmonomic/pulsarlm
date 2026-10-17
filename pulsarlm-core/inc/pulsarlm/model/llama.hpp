@@ -11,7 +11,6 @@
 #include <optional>
 #include <span>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 // Llama transformer forward over the paged CUDA ops: pre-norm RMSNorm, bias-free QKV projection, SwiGLU MLP, and an
@@ -35,8 +34,6 @@ struct LlamaModel : Model {
 
     std::vector<kv_layer> kv_layers() const override;
     StepLogits forward(const StepBatch& batch, std::span<const kv> lines) override;
-
-    void set_relevance_layers(const std::vector<int64_t>& layers) override;
 
   private:
     struct LayerWeights {
@@ -68,7 +65,6 @@ struct LlamaModel : Model {
     std::optional<at::Tensor> lm_head;
     at::Tensor norm_weight;
     std::vector<LayerWeights> layers;
-    std::unordered_set<int64_t> relevance_layers;
 };
 
 }  // namespace pulsarlm

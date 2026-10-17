@@ -69,7 +69,6 @@ Qwen3Model::Qwen3Model(
             }
         );
     }
-    this->relevance_layers = default_relevance_layers(n_layers);
 }
 
 // Qwen3 block: bias-free QKV projection, per-head QK-Norm before RoPE, then RoPE +
@@ -97,7 +96,7 @@ at::Tensor Qwen3Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, s
         (g.is_prefill() ? this->cap_prefill : this->cap_decode)[layer] = q_pre;
     }
 
-    q = rope_q(q, g.pos, this->n_heads, this->head_dim, this->rope);
+    q = rope_q(q, g.pos.select(0, layer), this->n_heads, this->head_dim, this->rope);
     v = v.view({ntok, this->n_kv_heads, this->head_dim}).contiguous();
     // Capture the softmax denominator on the same layers as Q: the recall score needs
     // the denominator the attention actually used, not one rebuilt over a subset.
@@ -112,7 +111,6 @@ at::Tensor Qwen3Model::block(at::Tensor x, int64_t layer, const GroupBatch& g, s
         lines[layer],
         static_cast<std::size_t>(layer),
         g,
-        this->relevance_layers.contains(layer),
         this->scale,
         this->rope,
         std::nullopt,
@@ -172,10 +170,6 @@ StepLogits Qwen3Model::forward(const StepBatch& batch, std::span<const kv> lines
 
 void Qwen3Model::set_capture_layers(const std::vector<int64_t>& layers) {
     this->capture_layers = std::unordered_set<int64_t>(layers.begin(), layers.end());
-}
-
-void Qwen3Model::set_relevance_layers(const std::vector<int64_t>& layers) {
-    this->relevance_layers = std::unordered_set<int64_t>(layers.begin(), layers.end());
 }
 
 at::Tensor Qwen3Model::captured_q(bool is_prefill, int64_t layer) const {

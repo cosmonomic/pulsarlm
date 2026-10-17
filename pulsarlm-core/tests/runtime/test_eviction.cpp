@@ -1,7 +1,5 @@
 #include "pulsarlm/eviction.hpp"
 
-#include <ATen/ATen.h>
-
 #undef CHECK
 #include <catch2/catch_test_macros.hpp>
 
@@ -57,25 +55,14 @@ TEST_CASE("the cap counts the pages the bar evicted") {
     REQUIRE(evicted({0.3f, 0.1f, 0.2f, 0.1f, 0.5f, 0.4f, 0.25f, 0.0f}, policy) == page_list{1, 2, 3});
 }
 
-TEST_CASE("a page density ages its pages and grows with the view") {
-    pulsarlm::page_density density;
-    REQUIRE(!density.by_page().defined());
+TEST_CASE("adding step mass ages the densities, then adds the mass") {
+    std::vector<float> density{4.0f, 8.0f, 0.0f};
+    std::vector<float> step_mass{1.0f, 0.0f, 3.0f};
+    pulsarlm::add_step_mass(density, step_mass, 1, 0.5);
+    REQUIRE(density == std::vector<float>{3.0f, 4.0f, 3.0f});
 
-    density.add(at::tensor({1.0f, 2.0f}), 1, 0.5);
-    density.add(at::tensor({0.0f, 0.0f, 5.0f}), 2, 0.5);
-    REQUIRE(at::equal(density.by_page(), at::tensor({0.25f, 0.5f, 5.0f})));
-}
-
-TEST_CASE("a page density starts from its initial densities") {
-    pulsarlm::page_density density(at::tensor({4.0f, 8.0f}));
-    density.add(at::tensor({1.0f, 0.0f, 3.0f}), 1, 0.5);
-    REQUIRE(at::equal(density.by_page(), at::tensor({3.0f, 4.0f, 3.0f})));
-}
-
-TEST_CASE("removing pages from a page density keeps the others in order") {
-    pulsarlm::page_density density(at::tensor({1.0f, 2.0f, 3.0f, 4.0f, 5.0f}));
-    density.remove(page_list{1, 3});
-    REQUIRE(at::equal(density.by_page(), at::tensor({1.0f, 3.0f, 5.0f})));
+    pulsarlm::add_step_mass(density, std::vector<float>(3, 0.0f), 2, 0.5);
+    REQUIRE(density == std::vector<float>{0.75f, 1.0f, 0.75f});
 }
 
 }  // namespace

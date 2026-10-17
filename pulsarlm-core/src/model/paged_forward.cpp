@@ -20,14 +20,6 @@ at::Tensor rope_q(
     return q.transpose(0, 1).contiguous();  // transpose to paged layout [ntok, n_q_heads, head_dim]
 }
 
-std::unordered_set<int64_t> default_relevance_layers(int64_t n_layers) {
-    std::unordered_set<int64_t> layers;
-    for (int64_t layer = 3 * n_layers / 4; layer < n_layers; ++layer) {
-        layers.insert(layer);
-    }
-    return layers;
-}
-
 at::Tensor paged_attention(
     const at::Tensor& q,
     const at::Tensor& k,
@@ -35,7 +27,6 @@ at::Tensor paged_attention(
     const kv& lines,
     std::size_t kv_layer,
     const GroupBatch& g,
-    bool relevance_layer,
     double scale,
     const rope_parameters& rope,
     std::optional<int64_t> sliding_window,
@@ -44,8 +35,9 @@ at::Tensor paged_attention(
 ) {
     const at::Tensor& k_pool = lines.k;
     const at::Tensor& v_pool = lines.v;
-    at::Tensor page_tables = g.page_tables.select(0, static_cast<int64_t>(kv_layer));
-    const at::Tensor& seqlens_k = g.is_prefill() ? g.seqlens_k : g.context_lens;
+    const auto layer = static_cast<int64_t>(kv_layer);
+    at::Tensor page_tables = g.page_tables.select(0, layer);
+    at::Tensor key_counts = g.key_counts.select(0, layer);
     if (k.defined()) {
         write_kv_cuda(
             k_pool,
@@ -54,14 +46,15 @@ at::Tensor paged_attention(
             v,
             page_tables,
             g.is_prefill() ? std::optional<at::Tensor>(g.cu_seqlens_q) : std::nullopt,
-            seqlens_k
+            key_counts
         );
     }
     const auto lse = lse_capture.defined() ? std::optional<at::Tensor>(lse_capture) : std::nullopt;
     std::optional<at::Tensor> mass, cu_view_pages, mass_decay;
-    if (relevance_layer && g.cu_view_pages.defined()) {
-        mass = at::zeros({g.page_mass.size(0), k_pool.size(1), q.size(1)}, q.options().dtype(at::kFloat));
-        cu_view_pages = g.cu_view_pages;
+    at::Tensor page_mass = g.page_mass.empty() ? at::Tensor() : g.page_mass[kv_layer];
+    if (page_mass.defined()) {
+        mass = at::zeros({page_mass.size(0), k_pool.size(1), q.size(1)}, q.options().dtype(at::kFloat));
+        cu_view_pages = g.cu_view_pages.select(0, layer);
         mass_decay = g.attention_mass_decay;
     }
     at::Tensor o = g.is_prefill() ? attn_prefill_cuda(
@@ -70,7 +63,7 @@ at::Tensor paged_attention(
                                         v_pool,
                                         page_tables,
                                         g.cu_seqlens_q,
-                                        g.seqlens_k,
+                                        key_counts,
                                         g.rope_layout,
                                         rope,
                                         scale,
@@ -87,7 +80,7 @@ at::Tensor paged_attention(
                                         k_pool,
                                         v_pool,
                                         page_tables,
-                                        g.context_lens,
+                                        key_counts,
                                         g.rope_layout,
                                         rope,
                                         scale,
@@ -100,7 +93,6 @@ at::Tensor paged_attention(
                                         lse
                                     );
     if (mass) {
-        at::Tensor page_mass = g.page_mass;
         at::maximum_out(page_mass, page_mass, mass->mean(-1).amax(-1));
     }
     return o;

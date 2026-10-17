@@ -10,7 +10,6 @@
 #include <cstdint>
 #include <span>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 // Qwen2.5 transformer forward in C++ over the pulsarlm CUDA ops.
@@ -46,8 +45,6 @@ struct Qwen2Model : Model {
     // dtype (fp32 or bf16).
     std::vector<kv_layer> kv_layers() const override;
     StepLogits forward(const StepBatch& batch, std::span<const kv> lines) override;
-
-    void set_relevance_layers(const std::vector<int64_t>& layers) override;
 
   private:
     // One decoder layer's tensors, resolved from the weight dict at construction.
@@ -85,7 +82,6 @@ struct Qwen2Model : Model {
     at::Tensor embed_tokens;  // [vocab, hidden]; tied lm_head
     at::Tensor norm_weight;  // final RMSNorm
     std::vector<LayerWeights> layers;
-    std::unordered_set<int64_t> relevance_layers;
 };
 
 }  // namespace pulsarlm

@@ -71,7 +71,6 @@ def test_a_qwen3_5_checkpoint_maps_its_text_config():
 
     assert isinstance(model, Qwen3_5Config)
     assert model.layer_types == (["linear_attention"] * 3 + ["full_attention"]) * 2
-    assert model.relevance_layers == [7]
 
 
 def test_a_qwen3_5_checkpoint_without_an_output_gate_is_rejected():
@@ -91,7 +90,6 @@ def test_a_gemma4_checkpoint_maps_its_text_config():
     assert model.full_rope.partial_rotary_factor == 0.25
     assert model.full_rope.theta == 1e6
     assert model.sliding_rope.theta == 1e4
-    assert model.relevance_layers == [11]
 
 
 def test_k_eq_v_takes_the_global_kv_heads_and_the_last_layer_is_full():

@@ -18,10 +18,6 @@ SLIDING = "sliding_attention"
 FULL = "full_attention"
 
 
-def top_quarter(n_layers: int) -> list[int]:
-    return list(range(n_layers - max(1, n_layers // 4), n_layers))
-
-
 def gemma4_layer_types(text: dict) -> list[str]:
     """Hugging Face's default is five sliding layers to one full layer, and the last
     layer is full in any case."""
@@ -57,7 +53,6 @@ def gemma4_config(architecture: str, text: dict) -> Gemma4Config:
     per_layer_input = text.get(
         "hidden_size_per_layer_input", 256 if architecture == "gemma4" else 0
     )
-    full_layers = [i for i, t in enumerate(layer_types) if t == FULL]
     return Gemma4Config(
         vocab_size=text["vocab_size"],
         hidden_size=text["hidden_size"],
@@ -79,7 +74,6 @@ def gemma4_config(architecture: str, text: dict) -> Gemma4Config:
         hidden_size_per_layer_input=per_layer_input or 0,
         enable_moe_block=bool(text.get("enable_moe_block", False)),
         top_k_experts=text.get("top_k_experts") or 0,
-        relevance_layers=[i for i in top_quarter(len(layer_types)) if i in full_layers],
     )
 
 
@@ -106,7 +100,6 @@ def qwen3_5_config(text: dict) -> Qwen3_5Config:
     if parameters.get("rope_type", "default") != "default":
         raise PulsarLMModelLoadingError(f"unsupported RoPE {parameters['rope_type']}")
     layer_types = qwen3_5_layer_types(text)
-    full_layers = [i for i, t in enumerate(layer_types) if t == FULL]
     return Qwen3_5Config(
         vocab_size=text["vocab_size"],
         hidden_size=text["hidden_size"],
@@ -127,7 +120,6 @@ def qwen3_5_config(text: dict) -> Qwen3_5Config:
         linear_value_head_dim=text["linear_value_head_dim"],
         linear_conv_kernel=text["linear_conv_kernel_dim"],
         rms_norm_eps=float(text["rms_norm_eps"]),
-        relevance_layers=[i for i in top_quarter(len(layer_types)) if i in full_layers],
     )
 
 
@@ -170,7 +162,6 @@ def dense_config(architecture: str, text: dict) -> ModelConfig:
         vocab_size=text["vocab_size"],
         rope=rope(text),
         rms_eps=float(text["rms_norm_eps"]),
-        relevance_layers=top_quarter(text["num_hidden_layers"]),
     )
 
 

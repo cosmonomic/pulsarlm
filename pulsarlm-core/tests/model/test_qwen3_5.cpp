@@ -266,19 +266,18 @@ pulsarlm::GroupBatch step(
         }
     }
     std::int64_t page_end = last / page_size * page_size;
-    auto key_count = int32_cuda({static_cast<std::int32_t>(last)});
+    auto n_kv_layers = static_cast<std::int64_t>(specs.size());
+    auto key_count = int32_cuda({static_cast<std::int32_t>(last)}).expand({n_kv_layers, 1}).contiguous();
     pulsarlm::GroupBatch g{
         .tokens = tokens.narrow(0, first, last - first),
-        .pos = at::arange(first, last, cuda(at::kLong)),
-        .page_tables = int32_cuda(rows).view({static_cast<std::int64_t>(specs.size()), 1, -1}),
+        .pos = at::arange(first, last, cuda(at::kLong)).expand({n_kv_layers, -1}).contiguous(),
+        .page_tables = int32_cuda(rows).view({n_kv_layers, 1, -1}),
         .page_end_tokens = int32_cuda({static_cast<std::int32_t>(page_end > first ? page_end - first : 0)}),
         .rope_layout = int32_cuda({0, 0, -1}).view({1, 3}),
     };
+    g.key_counts = key_count;
     if (prefill) {
         g.cu_seqlens_q = int32_cuda({0, static_cast<std::int32_t>(last - first)});
-        g.seqlens_k = key_count;
-    } else {
-        g.context_lens = key_count;
     }
     return g;
 }

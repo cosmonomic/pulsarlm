@@ -35,11 +35,11 @@ py::tuple take_to_python(request_handle& handle) {
 }
 
 std::size_t vocab_size(const any_model_config& model) {
-    if (const auto* gemma = std::get_if<gemma4_model_config>(&model)) {
-        return static_cast<std::size_t>(gemma->text.vocab_size);
+    if (const auto* gemma = std::get_if<gemma4_config>(&model)) {
+        return static_cast<std::size_t>(gemma->vocab_size);
     }
-    if (const auto* qwen = std::get_if<qwen3_5_model_config>(&model)) {
-        return static_cast<std::size_t>(qwen->text.vocab_size);
+    if (const auto* qwen = std::get_if<qwen3_5_config>(&model)) {
+        return static_cast<std::size_t>(qwen->vocab_size);
     }
     return static_cast<std::size_t>(std::get<model_config>(model).vocab_size);
 }
@@ -218,8 +218,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
                         std::int64_t intermediate,
                         std::int64_t vocab_size,
                         const rope_parameters& rope,
-                        double rms_eps,
-                        std::vector<std::int64_t> relevance_layers) {
+                        double rms_eps) {
                 return model_config{
                     std::move(architecture),
                     n_layers,
@@ -231,7 +230,6 @@ PYBIND11_MODULE(pulsarlm_core, m) {
                     vocab_size,
                     rope,
                     rms_eps,
-                    std::move(relevance_layers),
                 };
             }),
             py::kw_only(),
@@ -244,8 +242,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "intermediate"_a,
             "vocab_size"_a,
             "rope"_a,
-            "rms_eps"_a,
-            "relevance_layers"_a
+            "rms_eps"_a
         )
         .def_readonly("rope", &model_config::rope);
 
@@ -282,7 +279,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
         .def_readonly("partial_rotary_factor", &rope_parameters::partial_rotary_factor)
         .def_readonly("llama3_scaling", &rope_parameters::llama3_scaling);
 
-    py::class_<gemma4_model_config>(m, "Gemma4Config")
+    py::class_<gemma4_config>(m, "Gemma4Config")
         .def(
             py::init([](std::int64_t vocab_size,
                         std::int64_t hidden_size,
@@ -301,34 +298,30 @@ PYBIND11_MODULE(pulsarlm_core, m) {
                         std::int64_t num_kv_shared_layers,
                         std::int64_t hidden_size_per_layer_input,
                         bool enable_moe_block,
-                        std::int64_t top_k_experts,
-                        std::vector<std::int64_t> relevance_layers) {
+                        std::int64_t top_k_experts) {
                 std::vector<gemma4_layer_type> types;
                 for (const std::string& name : layer_types) {
                     types.push_back(layer_type(name));
                 }
-                return gemma4_model_config{
-                    gemma4_config{
-                        vocab_size,
-                        hidden_size,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        global_n_kv_heads,
-                        global_head_dim,
-                        attention_k_eq_v,
-                        std::move(types),
-                        sliding_window,
-                        sliding_rope,
-                        full_rope,
-                        rms_norm_eps,
-                        final_logit_softcapping,
-                        num_kv_shared_layers,
-                        hidden_size_per_layer_input,
-                        enable_moe_block,
-                        top_k_experts,
-                    },
-                    std::move(relevance_layers),
+                return gemma4_config{
+                    vocab_size,
+                    hidden_size,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    global_n_kv_heads,
+                    global_head_dim,
+                    attention_k_eq_v,
+                    std::move(types),
+                    sliding_window,
+                    sliding_rope,
+                    full_rope,
+                    rms_norm_eps,
+                    final_logit_softcapping,
+                    num_kv_shared_layers,
+                    hidden_size_per_layer_input,
+                    enable_moe_block,
+                    top_k_experts,
                 };
             }),
             py::kw_only(),
@@ -349,14 +342,13 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "num_kv_shared_layers"_a,
             "hidden_size_per_layer_input"_a,
             "enable_moe_block"_a,
-            "top_k_experts"_a,
-            "relevance_layers"_a
+            "top_k_experts"_a
         )
         .def_property_readonly(
             "layer_types",
-            [](const gemma4_model_config& c) {
+            [](const gemma4_config& c) {
                 std::vector<std::string> names;
-                for (gemma4_layer_type type : c.text.layer_types) {
+                for (gemma4_layer_type type : c.layer_types) {
                     names.push_back(
                         type == gemma4_layer_type::sliding_attention ? "sliding_attention" : "full_attention"
                     );
@@ -364,19 +356,12 @@ PYBIND11_MODULE(pulsarlm_core, m) {
                 return names;
             }
         )
-        .def_property_readonly(
-            "global_n_kv_heads",
-            [](const gemma4_model_config& c) { return c.text.global_n_kv_heads; }
-        )
-        .def_property_readonly(
-            "hidden_size_per_layer_input",
-            [](const gemma4_model_config& c) { return c.text.hidden_size_per_layer_input; }
-        )
-        .def_property_readonly("sliding_rope", [](const gemma4_model_config& c) { return c.text.sliding_rope; })
-        .def_property_readonly("full_rope", [](const gemma4_model_config& c) { return c.text.full_rope; })
-        .def_readonly("relevance_layers", &gemma4_model_config::relevance_layers);
+        .def_readonly("global_n_kv_heads", &gemma4_config::global_n_kv_heads)
+        .def_readonly("hidden_size_per_layer_input", &gemma4_config::hidden_size_per_layer_input)
+        .def_readonly("sliding_rope", &gemma4_config::sliding_rope)
+        .def_readonly("full_rope", &gemma4_config::full_rope);
 
-    py::class_<qwen3_5_model_config>(m, "Qwen3_5Config")
+    py::class_<qwen3_5_config>(m, "Qwen3_5Config")
         .def(
             py::init([](std::int64_t vocab_size,
                         std::int64_t hidden_size,
@@ -392,31 +377,27 @@ PYBIND11_MODULE(pulsarlm_core, m) {
                         std::int64_t linear_key_head_dim,
                         std::int64_t linear_value_head_dim,
                         std::int64_t linear_conv_kernel,
-                        double rms_norm_eps,
-                        std::vector<std::int64_t> relevance_layers) {
+                        double rms_norm_eps) {
                 std::vector<qwen3_5_layer_type> types;
                 for (const std::string& name : layer_types) {
                     types.push_back(qwen3_5_layer(name));
                 }
-                return qwen3_5_model_config{
-                    qwen3_5_config{
-                        .vocab_size = vocab_size,
-                        .hidden_size = hidden_size,
-                        .intermediate_size = intermediate_size,
-                        .layer_types = std::move(types),
-                        .n_heads = n_heads,
-                        .n_kv_heads = n_kv_heads,
-                        .head_dim = head_dim,
-                        .rope_theta = rope_theta,
-                        .partial_rotary_factor = partial_rotary_factor,
-                        .linear_n_key_heads = linear_n_key_heads,
-                        .linear_n_value_heads = linear_n_value_heads,
-                        .linear_key_head_dim = linear_key_head_dim,
-                        .linear_value_head_dim = linear_value_head_dim,
-                        .linear_conv_kernel = linear_conv_kernel,
-                        .rms_norm_eps = rms_norm_eps,
-                    },
-                    std::move(relevance_layers),
+                return qwen3_5_config{
+                    .vocab_size = vocab_size,
+                    .hidden_size = hidden_size,
+                    .intermediate_size = intermediate_size,
+                    .layer_types = std::move(types),
+                    .n_heads = n_heads,
+                    .n_kv_heads = n_kv_heads,
+                    .head_dim = head_dim,
+                    .rope_theta = rope_theta,
+                    .partial_rotary_factor = partial_rotary_factor,
+                    .linear_n_key_heads = linear_n_key_heads,
+                    .linear_n_value_heads = linear_n_value_heads,
+                    .linear_key_head_dim = linear_key_head_dim,
+                    .linear_value_head_dim = linear_value_head_dim,
+                    .linear_conv_kernel = linear_conv_kernel,
+                    .rms_norm_eps = rms_norm_eps,
                 };
             }),
             py::kw_only(),
@@ -434,22 +415,15 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "linear_key_head_dim"_a,
             "linear_value_head_dim"_a,
             "linear_conv_kernel"_a,
-            "rms_norm_eps"_a,
-            "relevance_layers"_a
+            "rms_norm_eps"_a
         )
-        .def_property_readonly(
-            "layer_types",
-            [](const qwen3_5_model_config& c) {
-                std::vector<std::string> names;
-                for (qwen3_5_layer_type type : c.text.layer_types) {
-                    names.push_back(
-                        type == qwen3_5_layer_type::linear_attention ? "linear_attention" : "full_attention"
-                    );
-                }
-                return names;
+        .def_property_readonly("layer_types", [](const qwen3_5_config& c) {
+            std::vector<std::string> names;
+            for (qwen3_5_layer_type type : c.layer_types) {
+                names.push_back(type == qwen3_5_layer_type::linear_attention ? "linear_attention" : "full_attention");
             }
-        )
-        .def_readonly("relevance_layers", &qwen3_5_model_config::relevance_layers);
+            return names;
+        });
 
     py::class_<request_handle>(m, "Request").def("take", &take_to_python).def("cancel", &request_handle::cancel);
 

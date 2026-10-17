@@ -126,11 +126,6 @@ Gemma4Model::Gemma4Model(gemma4_config config, const c10::Dict<std::string, at::
     sliding_ones = at::ones({c.head_dim}, embed_tokens.options());
     full_ones = at::ones({c.global_head_dim}, embed_tokens.options());
     hidden_ones = at::ones({c.hidden_size}, embed_tokens.options());
-    for (std::int64_t layer = 3 * n_layers / 4; layer < n_layers; layer++) {
-        if (!sliding(layer)) {
-            relevance_layers.insert(layer);
-        }
-    }
 }
 
 bool Gemma4Model::sliding(std::int64_t layer) const {
@@ -139,15 +134,6 @@ bool Gemma4Model::sliding(std::int64_t layer) const {
 
 std::vector<kv_layer> Gemma4Model::kv_layers() const {
     return kv_specs;
-}
-
-void Gemma4Model::set_relevance_layers(const std::vector<std::int64_t>& layers) {
-    for (std::int64_t layer : layers) {
-        if (layer < 0 || layer >= n_layers || sliding(layer)) {
-            throw std::invalid_argument(std::format("Gemma4Model: layer {} is not a full-attention layer", layer));
-        }
-    }
-    relevance_layers = std::unordered_set<std::int64_t>(layers.begin(), layers.end());
 }
 
 // [ntok, n_layers, hidden_size_per_layer_input].
@@ -180,7 +166,13 @@ Gemma4Model::attention(const at::Tensor& h, std::int64_t layer, const GroupBatch
         w.q_norm,
         config.rms_norm_eps
     );
-    q = rope_q(q.view({ntok, config.n_heads * head_dim}), g.pos, config.n_heads, head_dim, rope);
+    q = rope_q(
+        q.view({ntok, config.n_heads * head_dim}),
+        g.pos.select(0, static_cast<std::int64_t>(kv_index)),
+        config.n_heads,
+        head_dim,
+        rope
+    );
 
     at::Tensor k, v;
     std::optional<at::Tensor> k_norm_weight;
@@ -201,19 +193,7 @@ Gemma4Model::attention(const at::Tensor& h, std::int64_t layer, const GroupBatch
     if (spec.sliding_window) {
         window = static_cast<std::int64_t>(*spec.sliding_window);
     }
-    at::Tensor o = paged_attention(
-        q,
-        k,
-        v,
-        lines[kv_index],
-        kv_index,
-        g,
-        relevance_layers.contains(layer),
-        1.0,
-        rope,
-        window,
-        k_norm_weight
-    );
+    at::Tensor o = paged_attention(q, k, v, lines[kv_index], kv_index, g, 1.0, rope, window, k_norm_weight);
     return at::linear(o.reshape({ntok, config.n_heads * head_dim}), w.o_proj);
 }
 

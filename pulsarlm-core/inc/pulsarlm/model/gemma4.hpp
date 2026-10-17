@@ -11,7 +11,6 @@
 #include <optional>
 #include <span>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 // Gemma 4 text decoder, gemma4 (E2B, E4B) and gemma4_unified (12B), over the paged CUDA ops. Weights carry Hugging
@@ -94,7 +93,6 @@ class Gemma4Model : public Model {
     at::Tensor sliding_ones;
     at::Tensor full_ones;
     at::Tensor hidden_ones;
-    std::unordered_set<std::int64_t> relevance_layers;
 
     bool sliding(std::int64_t layer) const;
     at::Tensor per_layer_inputs(const at::Tensor& tokens, const at::Tensor& embedded) const;
@@ -117,8 +115,6 @@ class Gemma4Model : public Model {
 
     std::vector<kv_layer> kv_layers() const override;
     StepLogits forward(const StepBatch& batch, std::span<const kv> lines) override;
-    // Throws std::invalid_argument for a sliding-attention layer: its mass covers its window only.
-    void set_relevance_layers(const std::vector<std::int64_t>& layers) override;
 };
 
 }  // namespace pulsarlm

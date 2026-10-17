@@ -66,11 +66,6 @@ LlamaModel::LlamaModel(
             }
         );
     }
-    this->relevance_layers = default_relevance_layers(n_layers);
-}
-
-void LlamaModel::set_relevance_layers(const std::vector<int64_t>& layers) {
-    this->relevance_layers = std::unordered_set<int64_t>(layers.begin(), layers.end());
 }
 
 at::Tensor LlamaModel::block(at::Tensor x, int64_t layer, const GroupBatch& g, std::span<const kv> lines) {
@@ -82,21 +77,11 @@ at::Tensor LlamaModel::block(at::Tensor x, int64_t layer, const GroupBatch& g, s
     auto k = at::linear(h, lw.k_proj_weight);
     auto v = at::linear(h, lw.v_proj_weight);
 
-    q = rope_q(q, g.pos, this->n_heads, this->head_dim, this->rope);
+    q = rope_q(q, g.pos.select(0, layer), this->n_heads, this->head_dim, this->rope);
     // The lines store K and V unrotated, as the paged ops' [tokens, n_kv_heads, head_dim].
     k = k.view({ntok, this->n_kv_heads, this->head_dim}).contiguous();
     v = v.view({ntok, this->n_kv_heads, this->head_dim}).contiguous();
-    auto o = paged_attention(
-        q,
-        k,
-        v,
-        lines[layer],
-        static_cast<std::size_t>(layer),
-        g,
-        this->relevance_layers.contains(layer),
-        this->scale,
-        this->rope
-    );
+    auto o = paged_attention(q, k, v, lines[layer], static_cast<std::size_t>(layer), g, this->scale, this->rope);
 
     o = o.reshape({ntok, this->n_heads * this->head_dim});
     x = x + at::linear(o, lw.o_proj_weight);

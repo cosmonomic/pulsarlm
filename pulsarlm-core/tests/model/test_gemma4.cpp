@@ -328,18 +328,16 @@ dense_output dense_forward(const gemma4_config& c, const weights& w, const at::T
 // A step of the single sequence forwarding the tokens at positions [first, last), every KV layer over the same lines.
 pulsarlm::GroupBatch
 step(const at::Tensor& tokens, std::int64_t n_kv_layers, std::int64_t first, std::int64_t last, bool prefill) {
-    auto key_count = int32_cuda({static_cast<std::int32_t>(last)});
+    auto key_count = int32_cuda({static_cast<std::int32_t>(last)}).expand({n_kv_layers, 1}).contiguous();
     pulsarlm::GroupBatch g{
         .tokens = tokens.narrow(0, first, last - first),
-        .pos = at::arange(first, last, cuda(at::kLong)),
+        .pos = at::arange(first, last, cuda(at::kLong)).expand({n_kv_layers, -1}).contiguous(),
         .page_tables = int32_cuda(view_lines).view({1, 1, -1}).expand({n_kv_layers, 1, -1}).contiguous(),
         .rope_layout = int32_cuda({0, 0, -1}).view({1, 3}),
     };
+    g.key_counts = key_count;
     if (prefill) {
         g.cu_seqlens_q = int32_cuda({0, static_cast<std::int32_t>(last - first)});
-        g.seqlens_k = key_count;
-    } else {
-        g.context_lens = key_count;
     }
     return g;
 }
@@ -440,16 +438,6 @@ TEST_CASE("Gemma 4 with K=V full layers matches a dense forward", "[model][cuda]
     SECTION("bf16") {
         check_against_dense(k_eq_v_config(), at::kBFloat16, 5e-2);
     }
-}
-
-TEST_CASE("Gemma 4 measures attention mass on full-attention layers only", "[model][cuda]") {
-    if (c10::cuda::device_count() == 0) {
-        SKIP("no CUDA device");
-    }
-    gemma4_config c = k_eq_v_config();
-    pulsarlm::Gemma4Model model(c, weights(c, at::kFloat).named);
-    REQUIRE_THROWS_AS(model.set_relevance_layers({0}), std::invalid_argument);
-    model.set_relevance_layers({2, 5});
 }
 
 TEST_CASE("Gemma 4 with experts beside every MLP matches a dense forward", "[model][cuda]") {

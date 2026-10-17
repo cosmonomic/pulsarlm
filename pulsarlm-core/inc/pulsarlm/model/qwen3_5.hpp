@@ -11,7 +11,6 @@
 #include <optional>
 #include <span>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 // Qwen3.5 text decoder (qwen3_5), over the paged CUDA ops: Gated DeltaNet layers and gated full-attention layers.
@@ -88,7 +87,6 @@ class Qwen3_5Model : public Model {
     at::Tensor lm_head;
     at::Tensor norm;  // fp32 1 + weight
     std::vector<LayerWeights> layers;
-    std::unordered_set<std::int64_t> relevance_layers;
 
     bool full_attention(std::int64_t layer) const;
     at::Tensor attention(const at::Tensor& h, std::int64_t layer, const GroupBatch& g, std::span<const kv> lines) const;
@@ -101,8 +99,6 @@ class Qwen3_5Model : public Model {
 
     std::vector<kv_layer> kv_layers() const override;
     StepLogits forward(const StepBatch& batch, std::span<const kv> lines) override;
-    // Throws std::invalid_argument for a Gated DeltaNet layer, which measures no attention mass.
-    void set_relevance_layers(const std::vector<std::int64_t>& layers) override;
 };
 
 }  // namespace pulsarlm

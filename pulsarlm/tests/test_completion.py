@@ -39,7 +39,6 @@ MODEL = ModelConfig(
     vocab_size=VOCAB_SIZE,
     rope=RopeParameters(theta=1e6),
     rms_eps=1e-6,
-    relevance_layers=[N_LAYERS - 1],
 )
 
 

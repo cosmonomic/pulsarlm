@@ -12,7 +12,6 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -151,11 +150,6 @@ Qwen3_5Model::Qwen3_5Model(qwen3_5_config config, const c10::Dict<std::string, a
         }
         layers.push_back(std::move(w));
     }
-    for (std::int64_t layer = 3 * n_layers / 4; layer < n_layers; layer++) {
-        if (full_attention(layer)) {
-            relevance_layers.insert(layer);
-        }
-    }
 }
 
 bool Qwen3_5Model::full_attention(std::int64_t layer) const {
@@ -164,15 +158,6 @@ bool Qwen3_5Model::full_attention(std::int64_t layer) const {
 
 std::vector<kv_layer> Qwen3_5Model::kv_layers() const {
     return kv_specs;
-}
-
-void Qwen3_5Model::set_relevance_layers(const std::vector<std::int64_t>& layers) {
-    for (std::int64_t layer : layers) {
-        if (layer < 0 || layer >= n_layers || !full_attention(layer)) {
-            throw std::invalid_argument(std::format("Qwen3_5Model: layer {} is not a full-attention layer", layer));
-        }
-    }
-    relevance_layers = std::unordered_set<std::int64_t>(layers.begin(), layers.end());
 }
 
 at::Tensor
@@ -185,7 +170,13 @@ Qwen3_5Model::attention(const at::Tensor& h, std::int64_t layer, const GroupBatc
     at::Tensor query_gate = at::linear(h, w.q_proj).view({ntok, c.n_heads, 2 * c.head_dim});
     at::Tensor q = rmsnorm_cuda(query_gate.narrow(-1, 0, c.head_dim), w.q_norm, c.rms_norm_eps);
     at::Tensor gate = query_gate.narrow(-1, c.head_dim, c.head_dim).reshape({ntok, c.n_heads * c.head_dim});
-    q = rope_q(q.view({ntok, c.n_heads * c.head_dim}), g.pos, c.n_heads, c.head_dim, rope);
+    q = rope_q(
+        q.view({ntok, c.n_heads * c.head_dim}),
+        g.pos.select(0, static_cast<std::int64_t>(kv_index)),
+        c.n_heads,
+        c.head_dim,
+        rope
+    );
     at::Tensor k = rmsnorm_cuda(
         at::linear(h, w.k_proj).view({ntok, c.n_kv_heads, c.head_dim}),
         w.k_norm,
@@ -199,7 +190,6 @@ Qwen3_5Model::attention(const at::Tensor& h, std::int64_t layer, const GroupBatc
         lines[kv_index],
         kv_index,
         g,
-        relevance_layers.contains(layer),
         1.0 / std::sqrt(static_cast<double>(c.head_dim)),
         rope
     );

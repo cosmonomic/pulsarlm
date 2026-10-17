@@ -1,7 +1,5 @@
 #pragma once
 
-#include <ATen/core/Tensor.h>
-
 #include <cstddef>
 #include <optional>
 #include <span>
@@ -28,22 +26,14 @@ struct eviction_policy {
 // nothing and tau >= 1 bars everything.
 double evict_bar_from_tau(double tau) noexcept;
 
-// The density of a view's pages: per page, an EMA of the attention mass its keys received. A page joins at 0.
-class page_density {
-    // fp32 [pages]; undefined while it holds no page.
-    at::Tensor values;
-
-  public:
-    page_density() = default;
-    explicit page_density(at::Tensor initial) noexcept;
-
-    // Ages the densities by token_count tokens, then adds step_mass, each page's mass over those tokens. step_mass may
-    // cover pages that joined the view since the last add.
-    void add(const at::Tensor& step_mass, std::size_t token_count, double attention_mass_decay);
-    // Drops the pages at the ascending view indices pages.
-    void remove(std::span<const std::size_t> pages);
-    const at::Tensor& by_page() const noexcept;
-};
+// Ages a view's page densities, each an EMA of the attention mass its keys received, by token_count tokens, then adds
+// step_mass, each page's mass over those tokens. A page joins at 0.
+void add_step_mass(
+    std::span<float> density,
+    std::span<const float> step_mass,
+    std::size_t token_count,
+    double attention_mass_decay
+) noexcept;
 
 // The view indices of the full pages a cycle's end evicts, ascending. density holds the density of each full page.
 std::vector<std::size_t> pages_to_evict(std::span<const float> density, const eviction_policy& policy);

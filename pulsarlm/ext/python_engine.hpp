@@ -32,22 +32,9 @@ struct model_config {
     std::int64_t vocab_size;
     rope_parameters rope;
     double rms_eps;
-    std::vector<std::int64_t> relevance_layers;
 };
 
-// The Gemma 4 text config and the layers whose attention mass the engine measures.
-struct gemma4_model_config {
-    gemma4_config text;
-    std::vector<std::int64_t> relevance_layers;
-};
-
-// The Qwen3.5 text config and the layers whose attention mass the engine measures.
-struct qwen3_5_model_config {
-    qwen3_5_config text;
-    std::vector<std::int64_t> relevance_layers;
-};
-
-using any_model_config = std::variant<model_config, gemma4_model_config, qwen3_5_model_config>;
+using any_model_config = std::variant<model_config, gemma4_config, qwen3_5_config>;
 
 // A model_config's architecture is "qwen2", "qwen3" or "llama". weights use HF naming and are on the engine's device.
 std::unique_ptr<Model>

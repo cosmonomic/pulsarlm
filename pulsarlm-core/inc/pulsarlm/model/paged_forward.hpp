@@ -9,7 +9,6 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
-#include <unordered_set>
 
 // Model-agnostic primitives of the paged transformer forward, shared by every
 // native `*Model`. The per-layer arithmetic (norm placement, projection bias, MLP
@@ -23,16 +22,13 @@ namespace pulsarlm {
 at::Tensor
 rope_q(const at::Tensor& q, const at::Tensor& pos, int64_t n_q_heads, int64_t head_dim, const rope_parameters& rope);
 
-// [3 * n_layers / 4, n_layers).
-std::unordered_set<int64_t> default_relevance_layers(int64_t n_layers);
-
 // write_kv the group's new K/V into lines, KV layer kv_layer's, then run the group's
 // paged attention (prefill vs decode by g.is_prefill()) and return o
 // [ntok, n_q_heads, head_dim]. q/k/v are already projected and q roped in the
 // group's [ntok, heads, head_dim] layout; k is unrotated. Undefined k and v leave the
 // lines as they are, for a layer reading another layer's KV. sliding_window and
-// k_norm_weight are as attn_prefill_cuda takes them. A relevance layer of a group that
-// measures attention mass maxes its mass into g.page_mass.
+// k_norm_weight are as attn_prefill_cuda takes them. When g.page_mass[kv_layer] is
+// defined, the layer maxes its attention mass into it.
 // lse_capture, when defined, receives this group's per-(query row, query head)
 // logsumexp -- the softmax denominator the attention used. fp32 [ntok, n_q_heads].
 at::Tensor paged_attention(
@@ -42,7 +38,6 @@ at::Tensor paged_attention(
     const kv& lines,
     std::size_t kv_layer,
     const GroupBatch& g,
-    bool relevance_layer,
     double scale,
     const rope_parameters& rope,
     std::optional<int64_t> sliding_window = std::nullopt,

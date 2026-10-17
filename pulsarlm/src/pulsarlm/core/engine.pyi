@@ -114,7 +114,6 @@ class ModelConfig:
         vocab_size: int,
         rope: RopeParameters,
         rms_eps: float,
-        relevance_layers: list[int],
     ) -> None: ...
 
 class Llama3RopeScaling:
@@ -152,7 +151,6 @@ class Gemma4Config:
     hidden_size_per_layer_input: int
     sliding_rope: RopeParameters
     full_rope: RopeParameters
-    relevance_layers: list[int]
     def __init__(
         self,
         *,
@@ -174,12 +172,10 @@ class Gemma4Config:
         hidden_size_per_layer_input: int,
         enable_moe_block: bool,
         top_k_experts: int,
-        relevance_layers: list[int],
     ) -> None: ...
 
 class Qwen3_5Config:
     layer_types: list[str]
-    relevance_layers: list[int]
     def __init__(
         self,
         *,
@@ -198,7 +194,6 @@ class Qwen3_5Config:
         linear_value_head_dim: int,
         linear_conv_kernel: int,
         rms_norm_eps: float,
-        relevance_layers: list[int],
     ) -> None: ...
 
 class Request:

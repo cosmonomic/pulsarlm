@@ -53,7 +53,6 @@ struct Qwen3Model : Model {
         return true;
     }
     void set_capture_layers(const std::vector<int64_t>& layers) override;
-    void set_relevance_layers(const std::vector<int64_t>& layers) override;
     at::Tensor captured_q(bool is_prefill, int64_t layer) const override;
     at::Tensor captured_lse(bool is_prefill, int64_t layer) const override;
 
@@ -91,7 +90,6 @@ struct Qwen3Model : Model {
     std::optional<at::Tensor> lm_head;  // untied head weight, else tie embed_tokens
     at::Tensor norm_weight;  // final RMSNorm
     std::vector<LayerWeights> layers;
-    std::unordered_set<int64_t> relevance_layers;
 
     // Pre-RoPE Q capture (QK-attention recall). capture_layers is the set to stash;
     // cap_prefill/cap_decode hold the current forward's per-layer pre-RoPE Q

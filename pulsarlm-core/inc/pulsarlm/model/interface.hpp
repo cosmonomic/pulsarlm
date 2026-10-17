@@ -39,35 +39,37 @@ struct kv {
 };
 
 // One scheduler group's query tokens + KV placement + attention descriptor.
-// tokens/pos are the group's tokens and their pos, concatenated across the group's
-// sequences. Each KV layer's page_tables row s lists the lines of sequence s's view
-// pages; a new token is written into its view page's line, at its view index. The
-// group kind is distinguished by which descriptor is defined: a prefill group carries
-// cu_seqlens_q/seqlens_k, a decode group carries context_lens. The other
-// descriptor(s) are left undefined.
+// tokens are the group's tokens, concatenated across the group's sequences. Every KV
+// layer has its own view of each sequence: row l of pos holds each token's view index
+// in KV layer l's view, and each KV layer's page_tables row s lists the lines of
+// sequence s's view pages in that layer; a new token is written into its view page's
+// line, at its view index. A prefill group carries cu_seqlens_q; a decode group, whose
+// sequences forward one token each, leaves it undefined.
 struct GroupBatch {
     at::Tensor tokens;
-    at::Tensor pos;
-    // int32 [n_kv_layers, num_seqs, max_pages]. A sliding layer's entries before the window of the sequence's first
-    // query hold no line. A recurrent layer's row holds the line whose state the forward starts from and updates in
-    // place, then the line it writes the state after page_end_tokens[s] of the sequence's tokens into.
+    at::Tensor pos;  // int64 [n_kv_layers, ntok]
+    // int32 [n_kv_layers, num_seqs, max_pages]. A recurrent layer's row holds the line whose state the forward starts
+    // from and updates in place, then the line it writes the state after page_end_tokens[s] of the sequence's tokens
+    // into.
     at::Tensor page_tables;
     // int32 [num_seqs], defined when a KV layer is recurrent: the number of sequence s's tokens in the group whose last
     // ends its newest full page, 0 when none of them ends a page.
     at::Tensor page_end_tokens;
     at::Tensor cu_seqlens_q;  // int32 [num_seqs + 1], defined iff prefill
-    at::Tensor seqlens_k;  // int32 [num_seqs],     defined iff prefill
-    at::Tensor context_lens;  // int32 [num_seqs],     defined iff decode
+    // int32 [n_kv_layers, num_seqs]: the keys in sequence s's view in KV layer l, the group's tokens included.
+    at::Tensor key_counts;
     // int32 [num_seqs, 3], the RoPE position of each key by its view index (see attn_decode_cuda). pos holds each
     // query's position under the same layout.
     at::Tensor rope_layout;
-    // int32 [num_seqs + 1]. When defined, the forward measures attention mass: sequence s's view pages are the rows
-    // [cu_view_pages[s], cu_view_pages[s + 1]) of page_mass, at least as many as its keys fill.
+    // int32 [n_kv_layers, num_seqs + 1], defined when the forward measures attention mass: sequence s's view pages in
+    // KV layer l are the rows [cu_view_pages[l, s], cu_view_pages[l, s + 1]) of page_mass[l], at least as many as its
+    // keys fill.
     at::Tensor cu_view_pages;
-    // fp32 [total_view_pages], zeroed by the caller. The forward sets each view page's mass: the weight the group's
-    // queries gave its keys, as the attention ops scale it, averaged over query heads, then maxed over the page's slots
-    // and over the relevance layers.
-    at::Tensor page_mass;
+    // Per KV layer, fp32 [total_view_pages of the layer], zeroed by the caller, or undefined for a layer that measures
+    // no mass. The forward sets each view page's mass: the weight the group's queries gave its keys, as the attention
+    // ops scale it, averaged over query heads, then maxed over the page's slots and over the attention layers reading
+    // the KV layer.
+    std::vector<at::Tensor> page_mass;
     // fp32 [num_seqs] in the group's row order: each sequence's attention-mass EMA
     // gain alpha, which the attention kernels index by sequence. Per request, so one
     // batched forward may carry several rates.
@@ -122,9 +124,6 @@ struct Model {
     virtual at::Tensor captured_lse(bool is_prefill, int64_t layer) const {
         return {};
     }
-
-    // The layers whose attention mass fills GroupBatch::page_mass. A model that measures no mass ignores them.
-    virtual void set_relevance_layers(const std::vector<int64_t>& layers) {}
 
     virtual ~Model() = default;
 };
