@@ -257,7 +257,8 @@ at::Tensor select_blocks_cuda(
 );
 
 // QSA's block scores, fp32 [rows, max_blocks]: for query row r of sequence row_sequence[r], block b below row_blocks[r]
-// scores scale times the sum over its heads of relu(queries[r, h] . blocks[row_sequence[r], b]), dot products in fp32;
+// scores scale times the sum over its heads of relu(queries[r, h] . blocks[row_sequence[r], b]), dot products
+// accumulated in fp32, on the tensor cores for fp16 and bf16 with heads dividing 16 and a dim of 64, 128 or 256;
 // the blocks past row_blocks[r] score -inf. queries [rows, heads, dim] and blocks [sequences, max_blocks, dim] share a
 // dtype; row_sequence and row_blocks are int64 [rows].
 at::Tensor index_scores_cuda(

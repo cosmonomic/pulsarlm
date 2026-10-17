@@ -91,10 +91,12 @@ TEST_CASE("index_scores_cuda sums the relu of each head's score over a row's com
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
+    // fp32 runs the scalar kernel, bf16 the tensor-core one, whose CTAs hold four rows here, of both sequences.
+    const auto dtype = GENERATE(at::kFloat, at::kBFloat16);
     at::manual_seed(5);
-    const int64_t rows = 5, heads = 4, sequences = 2, max_blocks = 300;
-    auto queries = at::randn({rows, heads, kDim}, at::device(at::kCUDA));
-    auto blocks = at::randn({sequences, max_blocks, kDim}, at::device(at::kCUDA));
+    const int64_t rows = 5, heads = 4, sequences = 2, max_blocks = 300, dim = 128;
+    auto queries = at::randn({rows, heads, dim}, at::device(at::kCUDA).dtype(dtype));
+    auto blocks = at::randn({sequences, max_blocks, dim}, at::device(at::kCUDA).dtype(dtype));
     auto longs = at::device(at::kCUDA).dtype(at::kLong);
     auto row_sequence = at::tensor(std::vector<int64_t>{0, 0, 1, 1, 1}).to(at::kCUDA);
     auto row_blocks = at::tensor(std::vector<int64_t>{0, 7, 300, 129, 1}).to(at::kCUDA);
@@ -102,11 +104,14 @@ TEST_CASE("index_scores_cuda sums the relu of each head's score over a row's com
 
     at::Tensor scores = pulsarlm::index_scores_cuda(queries, blocks, row_sequence, row_blocks, scale);
 
-    auto dots = at::matmul(queries.unsqueeze(1), blocks.index_select(0, row_sequence).transpose(1, 2).unsqueeze(1));
+    auto dots = at::matmul(
+        queries.to(at::kFloat).unsqueeze(1),
+        blocks.to(at::kFloat).index_select(0, row_sequence).transpose(1, 2).unsqueeze(1)
+    );
     auto expected = at::relu(dots.squeeze(1)).sum(1) * scale;
     auto visible = at::arange(max_blocks, longs).unsqueeze(0) < row_blocks.unsqueeze(1);
     expected = at::where(visible, expected, -INFINITY);
-    CHECK(at::allclose(scores, expected, 1e-5, 1e-5));
+    CHECK(at::allclose(scores, expected, 1e-4, 1e-4));
 }
 
 TEST_CASE("select_blocks_cuda takes a stable descending sort's top blocks and the tail block", "[ops][cuda]") {

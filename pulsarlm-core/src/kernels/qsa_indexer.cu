@@ -1,3 +1,6 @@
+#include "attn_common.cuh"
+
+#include "pulsarlm/kernels/attn_tiles.cuh"
 #include "pulsarlm/ops.hpp"
 
 #include <ATen/ATen.h>
@@ -215,6 +218,108 @@ __global__ void select_blocks_kernel(
         }
     }
 }
+
+constexpr int kScoreTileBlocks = 64;
+constexpr int kScoreChunkTiles = 4;
+constexpr int kScoreWarps = 4;
+
+// One CTA per (16 / heads consecutive rows, run of kScoreChunkTiles * kScoreTileBlocks blocks). The MMA rows are the
+// rows' (row, head) pairs, row-major; rows of different sequences take one pass each with the others' rows zeroed.
+// The dots are attn::tile_qkt's, fp32 accumulated, and a row's score sums its heads' relu in head order.
+template <typename scalar_t, bool BF16, int DIM>
+__global__ void __launch_bounds__(kScoreWarps * 32) index_scores_tc_kernel(
+    const scalar_t* __restrict__ queries,
+    const scalar_t* __restrict__ blocks,
+    const int64_t* __restrict__ row_sequence,
+    const int64_t* __restrict__ row_blocks,
+    int64_t rows,
+    int heads,
+    int64_t max_blocks,
+    float scale,
+    float* __restrict__ scores
+) {
+    constexpr int SCORE_STRIDE = kScoreTileBlocks + 1;
+    constexpr int kChunkElems = 16 / sizeof(scalar_t);
+    constexpr int kRowChunks = DIM / kChunkElems;
+    __shared__ __align__(16) scalar_t sQ[16 * DIM];
+    __shared__ __align__(16) scalar_t sK[kScoreTileBlocks * DIM];
+    __shared__ float sS[16 * SCORE_STRIDE];
+    __shared__ int64_t sequences[16];
+    __shared__ int sequence_count;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int tile_rows = 16 / heads;
+    const int64_t first_row = static_cast<int64_t>(blockIdx.x) * tile_rows;
+    const int rows_here = rows - first_row < tile_rows ? static_cast<int>(rows - first_row) : tile_rows;
+    const int64_t first_block = static_cast<int64_t>(blockIdx.y) * kScoreChunkTiles * kScoreTileBlocks;
+    if (tid == 0) {
+        int count = 0;
+        for (int r = 0; r < rows_here; ++r) {
+            const int64_t sequence = row_sequence[first_row + r];
+            bool seen = false;
+            for (int i = 0; i < count; ++i) {
+                seen |= sequences[i] == sequence;
+            }
+            if (!seen) {
+                sequences[count++] = sequence;
+            }
+        }
+        sequence_count = count;
+    }
+    __syncthreads();
+
+    for (int pass = 0; pass < sequence_count; ++pass) {
+        const int64_t sequence = sequences[pass];
+        for (int i = tid; i < 16 * DIM; i += kScoreWarps * 32) {
+            const int m = i / DIM, d = i % DIM;
+            const int r = m / heads;
+            scalar_t value = static_cast<scalar_t>(0);
+            if (r < rows_here && row_sequence[first_row + r] == sequence) {
+                value = queries[((first_row + r) * heads + m % heads) * DIM + d];
+            }
+            sQ[attn::swizzled_offset<DIM>(m, d)] = value;
+        }
+        for (int t = 0; t < kScoreChunkTiles; ++t) {
+            const int64_t tile_first = first_block + static_cast<int64_t>(t) * kScoreTileBlocks;
+            if (tile_first >= max_blocks) {
+                break;
+            }
+            for (int c = tid; c < kScoreTileBlocks * kRowChunks; c += kScoreWarps * 32) {
+                const int n = c / kRowChunks;
+                const int d = (c % kRowChunks) * kChunkElems;
+                const int64_t block = min(tile_first + n, max_blocks - 1);
+                attn::cp_async_16(
+                    sK + attn::swizzled_offset<DIM>(n, d),
+                    blocks + (sequence * max_blocks + block) * DIM + d,
+                    tile_first + n < max_blocks ? 16 : 0
+                );
+            }
+            attn::cp_async_commit();
+            attn::cp_async_wait<0>();
+            __syncthreads();
+            attn::tile_qkt<scalar_t, kScoreTileBlocks, DIM, BF16, SCORE_STRIDE, true>(sQ, sK, sS, warp, kScoreWarps);
+            __syncthreads();
+            for (int i = tid; i < rows_here * kScoreTileBlocks; i += kScoreWarps * 32) {
+                const int r = i / kScoreTileBlocks, n = i % kScoreTileBlocks;
+                const int64_t row = first_row + r;
+                const int64_t block = tile_first + n;
+                if (row_sequence[row] != sequence || block >= max_blocks) {
+                    continue;
+                }
+                float score = -CUDART_INF_F;
+                if (block < row_blocks[row]) {
+                    score = 0.0f;
+                    for (int h = 0; h < heads; ++h) {
+                        score += fmaxf(sS[(r * heads + h) * SCORE_STRIDE + n], 0.0f);
+                    }
+                    score *= scale;
+                }
+                scores[row * max_blocks + block] = score;
+            }
+            __syncthreads();
+        }
+    }
+}
 }  // namespace
 
 at::Tensor index_scores_cuda(
@@ -248,6 +353,44 @@ at::Tensor index_scores_cuda(
     }
     const auto heads = static_cast<int>(queries.size(1));
     const auto dim = static_cast<int>(queries.size(2));
+    const bool tensor_cores = queries.scalar_type() != at::kFloat && heads <= 16 && 16 % heads == 0 &&
+        (dim == 64 || dim == 128 || dim == 256);
+    if (tensor_cores) {
+        const int tile_rows = 16 / heads;
+        const dim3 tc_grid(
+            static_cast<unsigned>((rows + tile_rows - 1) / tile_rows),
+            static_cast<unsigned>(
+                (max_blocks + kScoreChunkTiles * kScoreTileBlocks - 1) / (kScoreChunkTiles * kScoreTileBlocks)
+            )
+        );
+        auto tc_stream = at::cuda::getCurrentCUDAStream();
+        attn::dispatch_tensor_core_dtype(queries.scalar_type(), [&](auto type_tag, auto bf16_tag) {
+            using scalar_t = typename decltype(type_tag)::type;
+            auto launch = [&](auto dim_tag) {
+                index_scores_tc_kernel<scalar_t, decltype(bf16_tag)::value, decltype(dim_tag)::value>
+                    <<<tc_grid, kScoreWarps * 32, 0, tc_stream>>>(
+                        queries.const_data_ptr<scalar_t>(),
+                        blocks.const_data_ptr<scalar_t>(),
+                        row_sequence.const_data_ptr<int64_t>(),
+                        row_blocks.const_data_ptr<int64_t>(),
+                        rows,
+                        heads,
+                        max_blocks,
+                        static_cast<float>(scale),
+                        scores.mutable_data_ptr<float>()
+                    );
+            };
+            if (dim == 64) {
+                launch(std::integral_constant<int, 64>{});
+            } else if (dim == 128) {
+                launch(std::integral_constant<int, 128>{});
+            } else {
+                launch(std::integral_constant<int, 256>{});
+            }
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        });
+        return scores;
+    }
     const dim3 grid(
         static_cast<unsigned>(rows),
         static_cast<unsigned>((max_blocks + kBlocksPerCta - 1) / kBlocksPerCta)
