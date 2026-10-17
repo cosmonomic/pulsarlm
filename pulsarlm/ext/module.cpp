@@ -41,6 +41,9 @@ std::size_t vocab_size(const any_model_config& model) {
     if (const auto* qwen = std::get_if<qwen3_5_config>(&model)) {
         return static_cast<std::size_t>(qwen->vocab_size);
     }
+    if (const auto* qwen = std::get_if<qwen3_5_moe_config>(&model)) {
+        return static_cast<std::size_t>(qwen->vocab_size);
+    }
     if (const auto* qwen = std::get_if<qwen4_exp_config>(&model)) {
         return static_cast<std::size_t>(qwen->vocab_size);
     }
@@ -389,13 +392,74 @@ PYBIND11_MODULE(pulsarlm_core, m) {
                         std::int64_t linear_key_head_dim,
                         std::int64_t linear_value_head_dim,
                         std::int64_t linear_conv_kernel,
+                        double rms_norm_eps) {
+                std::vector<qwen3_5_layer_type> types;
+                for (const std::string& name : layer_types) {
+                    types.push_back(qwen3_5_layer(name));
+                }
+                return qwen3_5_config{
+                    .vocab_size = vocab_size,
+                    .hidden_size = hidden_size,
+                    .layer_types = std::move(types),
+                    .n_heads = n_heads,
+                    .n_kv_heads = n_kv_heads,
+                    .head_dim = head_dim,
+                    .rope_theta = rope_theta,
+                    .partial_rotary_factor = partial_rotary_factor,
+                    .linear_n_key_heads = linear_n_key_heads,
+                    .linear_n_value_heads = linear_n_value_heads,
+                    .linear_key_head_dim = linear_key_head_dim,
+                    .linear_value_head_dim = linear_value_head_dim,
+                    .linear_conv_kernel = linear_conv_kernel,
+                    .rms_norm_eps = rms_norm_eps,
+                };
+            }),
+            py::kw_only(),
+            "vocab_size"_a,
+            "hidden_size"_a,
+            "layer_types"_a,
+            "n_heads"_a,
+            "n_kv_heads"_a,
+            "head_dim"_a,
+            "rope_theta"_a,
+            "partial_rotary_factor"_a,
+            "linear_n_key_heads"_a,
+            "linear_n_value_heads"_a,
+            "linear_key_head_dim"_a,
+            "linear_value_head_dim"_a,
+            "linear_conv_kernel"_a,
+            "rms_norm_eps"_a
+        )
+        .def_property_readonly("layer_types", [](const qwen3_5_config& c) {
+            std::vector<std::string> names;
+            for (qwen3_5_layer_type type : c.layer_types) {
+                names.push_back(type == qwen3_5_layer_type::linear_attention ? "linear_attention" : "full_attention");
+            }
+            return names;
+        });
+
+    py::class_<qwen3_5_moe_config>(m, "Qwen3_5MoeConfig")
+        .def(
+            py::init([](std::int64_t vocab_size,
+                        std::int64_t hidden_size,
+                        const std::vector<std::string>& layer_types,
+                        std::int64_t n_heads,
+                        std::int64_t n_kv_heads,
+                        std::int64_t head_dim,
+                        double rope_theta,
+                        double partial_rotary_factor,
+                        std::int64_t linear_n_key_heads,
+                        std::int64_t linear_n_value_heads,
+                        std::int64_t linear_key_head_dim,
+                        std::int64_t linear_value_head_dim,
+                        std::int64_t linear_conv_kernel,
                         double rms_norm_eps,
                         std::int64_t num_experts_per_tok) {
                 std::vector<qwen3_5_layer_type> types;
                 for (const std::string& name : layer_types) {
                     types.push_back(qwen3_5_layer(name));
                 }
-                return qwen3_5_config{
+                return qwen3_5_moe_config{
                     .vocab_size = vocab_size,
                     .hidden_size = hidden_size,
                     .layer_types = std::move(types),
@@ -428,10 +492,10 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "linear_value_head_dim"_a,
             "linear_conv_kernel"_a,
             "rms_norm_eps"_a,
-            "num_experts_per_tok"_a = 0
+            "num_experts_per_tok"_a
         )
-        .def_readonly("num_experts_per_tok", &qwen3_5_config::num_experts_per_tok)
-        .def_property_readonly("layer_types", [](const qwen3_5_config& c) {
+        .def_readonly("num_experts_per_tok", &qwen3_5_moe_config::num_experts_per_tok)
+        .def_property_readonly("layer_types", [](const qwen3_5_moe_config& c) {
             std::vector<std::string> names;
             for (qwen3_5_layer_type type : c.layer_types) {
                 names.push_back(type == qwen3_5_layer_type::linear_attention ? "linear_attention" : "full_attention");

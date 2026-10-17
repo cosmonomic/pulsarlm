@@ -15,6 +15,7 @@
 #include "pulsarlm/eviction.hpp"
 #include "pulsarlm/model/gemma4.hpp"
 #include "pulsarlm/model/qwen3_5.hpp"
+#include "pulsarlm/model/qwen3_5_moe.hpp"
 #include "pulsarlm/model/qwen4_exp.hpp"
 #include "pulsarlm/sampling.hpp"
 #include "request_buffer.hpp"
@@ -35,7 +36,8 @@ struct model_config {
     double rms_eps;
 };
 
-using any_model_config = std::variant<model_config, gemma4_config, qwen3_5_config, qwen4_exp_config>;
+using any_model_config = std::
+    variant<model_config, gemma4_config, qwen3_5_config, qwen3_5_moe_config, qwen4_exp_config>;
 
 // A model_config's architecture is "qwen2", "qwen3" or "llama". weights use HF naming and are on the engine's device.
 std::unique_ptr<Model>

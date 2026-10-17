@@ -64,27 +64,13 @@ Qwen3_5Model::Qwen3_5Model(qwen3_5_config config, const c10::Dict<std::string, a
 
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
         const std::string p = "layers." + std::to_string(layer) + ".";
-        const std::string mlp_prefix = c.num_experts_per_tok > 0 ? p + "mlp.shared_expert." : p + "mlp.";
         LayerWeights w{
             .input_layernorm = zero_centered(need_text(weights, p + "input_layernorm.weight")),
             .post_attention_layernorm = zero_centered(need_text(weights, p + "post_attention_layernorm.weight")),
-            .mlp = MlpWeights{
-                .gate_proj = need_text(weights, mlp_prefix + "gate_proj.weight"),
-                .up_proj = need_text(weights, mlp_prefix + "up_proj.weight"),
-                .down_proj = need_text(weights, mlp_prefix + "down_proj.weight"),
-            },
+            .gate_proj = need_text(weights, p + "mlp.gate_proj.weight"),
+            .up_proj = need_text(weights, p + "mlp.up_proj.weight"),
+            .down_proj = need_text(weights, p + "mlp.down_proj.weight"),
         };
-        if (c.num_experts_per_tok > 0) {
-            w.moe = MoeWeights{
-                .router = need_text(weights, p + "mlp.gate.weight"),
-                .experts_gate_up_proj = need_text(weights, p + "mlp.experts.gate_up_proj"),
-                .experts_down_proj = need_text(weights, p + "mlp.experts.down_proj"),
-                .shared_expert_gate = need_text(weights, p + "mlp.shared_expert_gate.weight"),
-            };
-            if (w.moe->router.size(0) < c.num_experts_per_tok) {
-                throw std::invalid_argument("Qwen3_5Model: num_experts_per_tok exceeds the experts");
-            }
-        }
         kv_layer_of.push_back(kv_specs.size());
         if (full_attention(layer)) {
             w.attention = AttentionWeights{
@@ -201,7 +187,8 @@ Qwen3_5Model::deltanet(const at::Tensor& h, std::int64_t layer, const GroupBatch
         lines[conv_layer].k,
         g.page_tables.select(0, static_cast<std::int64_t>(conv_layer)),
         cu_seqlens_q,
-        g.page_end_tokens
+        g.page_end_tokens,
+        /*dilation=*/1
     );
     at::Tensor core = gated_delta_rule_cuda(
         convolved,
@@ -220,30 +207,6 @@ Qwen3_5Model::deltanet(const at::Tensor& h, std::int64_t layer, const GroupBatch
     return at::linear(gated.view({ntok, c.linear_n_value_heads * c.linear_value_head_dim}), w.out_proj);
 }
 
-at::Tensor Qwen3_5Model::mlp(const at::Tensor& h, std::int64_t layer) const {
-    const LayerWeights& w = layers[layer];
-    at::Tensor dense = at::linear(
-        at::silu(at::linear(h, w.mlp.gate_proj)) * at::linear(h, w.mlp.up_proj),
-        w.mlp.down_proj
-    );
-    if (!w.moe) {
-        return dense;
-    }
-    const MoeWeights& m = *w.moe;
-    at::Tensor probabilities = at::softmax(at::linear(h, m.router), -1, at::kFloat);
-    auto [top_weights, top_experts] = at::topk(probabilities, config.num_experts_per_tok, -1);
-    top_weights = top_weights / top_weights.sum(-1, true);
-    at::Tensor routed = routed_experts(
-        h,
-        top_experts,
-        top_weights,
-        m.experts_gate_up_proj,
-        m.experts_down_proj,
-        [](const at::Tensor& x) { return at::silu(x); }
-    );
-    return routed + at::sigmoid(at::linear(h, m.shared_expert_gate)) * dense;
-}
-
 at::Tensor Qwen3_5Model::group_forward(const GroupBatch& g, std::span<const kv> lines) const {
     const double eps = config.rms_norm_eps;
     at::Tensor x = embed_tokens.index_select(0, g.tokens);
@@ -251,7 +214,8 @@ at::Tensor Qwen3_5Model::group_forward(const GroupBatch& g, std::span<const kv> 
         const LayerWeights& w = layers[layer];
         at::Tensor h = rmsnorm_cuda(x, w.input_layernorm, eps);
         x = x + (full_attention(layer) ? attention(h, layer, g, lines) : deltanet(h, layer, g, lines));
-        x = x + mlp(rmsnorm_cuda(x, w.post_attention_layernorm, eps), layer);
+        at::Tensor h2 = rmsnorm_cuda(x, w.post_attention_layernorm, eps);
+        x = x + at::linear(at::silu(at::linear(h2, w.gate_proj)) * at::linear(h2, w.up_proj), w.down_proj);
     }
     return at::matmul(rmsnorm_cuda(logit_inputs(x, g), norm, eps), lm_head.t());
 }

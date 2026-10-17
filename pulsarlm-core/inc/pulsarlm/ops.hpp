@@ -31,7 +31,7 @@ at::Tensor causal_conv_cuda(
     const at::Tensor& rows,
     const std::optional<at::Tensor>& cu_seqlens_q,
     const at::Tensor& page_end_tokens,
-    std::int64_t dilation = 1
+    std::int64_t dilation
 );
 
 // The gated delta rule's outputs [tokens, value heads, value dim] in x's dtype. Each row of x [tokens, 2 * key_heads *

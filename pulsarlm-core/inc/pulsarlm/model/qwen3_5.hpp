@@ -13,17 +13,15 @@
 #include <string>
 #include <vector>
 
-// Qwen3.5 text decoder (qwen3_5, qwen3_5_moe), over the paged CUDA ops: Gated DeltaNet layers and gated full-attention
-// layers. Weights carry Hugging Face's names under model.language_model., the untied head lm_head.weight.
+// Qwen3.5 text decoder (qwen3_5), over the paged CUDA ops: Gated DeltaNet layers and gated full-attention layers.
+// Weights carry Hugging Face's names under model.language_model., the untied head lm_head.weight.
 
 namespace pulsarlm {
 
 enum class qwen3_5_layer_type { linear_attention, full_attention };
 
 // Hugging Face's text config. The first partial_rotary_factor * head_dim dims of a query or key head rotate, in
-// rotate_half pairs among themselves at the frequencies of a head of that many dims; the rest pass through. With
-// num_experts_per_tok 0 every layer's MLP is dense; otherwise it is qwen3_5_moe's sparse block, each token's top
-// num_experts_per_tok routed experts plus a shared expert scaled by its sigmoid gate.
+// rotate_half pairs among themselves at the frequencies of a head of that many dims; the rest pass through.
 struct qwen3_5_config {
     std::int64_t vocab_size;
     std::int64_t hidden_size;
@@ -39,7 +37,6 @@ struct qwen3_5_config {
     std::int64_t linear_value_head_dim;
     std::int64_t linear_conv_kernel;
     double rms_norm_eps;
-    std::int64_t num_experts_per_tok = 0;
 };
 
 // A Gated DeltaNet layer keeps two recurrent KV layers: its delta rule state S, fp32 [value heads, key head dim, value
@@ -69,24 +66,12 @@ class Qwen3_5Model : public Model {
         at::Tensor out_proj;
     };
 
-    struct MlpWeights {
-        at::Tensor gate_proj;
-        at::Tensor up_proj;
-        at::Tensor down_proj;
-    };
-
-    struct MoeWeights {
-        at::Tensor router;  // [num_experts, hidden]
-        at::Tensor experts_gate_up_proj;  // [num_experts, 2 * moe_intermediate_size, hidden]
-        at::Tensor experts_down_proj;  // [num_experts, hidden, moe_intermediate_size]
-        at::Tensor shared_expert_gate;  // [1, hidden]
-    };
-
     struct LayerWeights {
         at::Tensor input_layernorm;  // fp32 1 + weight
         at::Tensor post_attention_layernorm;
-        MlpWeights mlp;  // the shared expert with MoE
-        std::optional<MoeWeights> moe;
+        at::Tensor gate_proj;
+        at::Tensor up_proj;
+        at::Tensor down_proj;
         std::optional<AttentionWeights> attention;
         std::optional<DeltaNetWeights> deltanet;
     };
@@ -105,7 +90,6 @@ class Qwen3_5Model : public Model {
     bool full_attention(std::int64_t layer) const;
     at::Tensor attention(const at::Tensor& h, std::int64_t layer, const GroupBatch& g, std::span<const kv> lines) const;
     at::Tensor deltanet(const at::Tensor& h, std::int64_t layer, const GroupBatch& g, std::span<const kv> lines) const;
-    at::Tensor mlp(const at::Tensor& h, std::int64_t layer) const;
     at::Tensor group_forward(const GroupBatch& g, std::span<const kv> lines) const;
 
   public:

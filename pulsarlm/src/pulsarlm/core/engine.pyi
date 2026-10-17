@@ -176,6 +176,27 @@ class Gemma4Config:
 
 class Qwen3_5Config:
     layer_types: list[str]
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        hidden_size: int,
+        layer_types: list[str],
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        rope_theta: float,
+        partial_rotary_factor: float,
+        linear_n_key_heads: int,
+        linear_n_value_heads: int,
+        linear_key_head_dim: int,
+        linear_value_head_dim: int,
+        linear_conv_kernel: int,
+        rms_norm_eps: float,
+    ) -> None: ...
+
+class Qwen3_5MoeConfig:
+    layer_types: list[str]
     num_experts_per_tok: int
     def __init__(
         self,
@@ -194,7 +215,7 @@ class Qwen3_5Config:
         linear_value_head_dim: int,
         linear_conv_kernel: int,
         rms_norm_eps: float,
-        num_experts_per_tok: int = 0,
+        num_experts_per_tok: int,
     ) -> None: ...
 
 class Qwen4ExpConfig:
@@ -237,7 +258,11 @@ class Engine:
     def __init__(
         self,
         store: PageStore,
-        model: ModelConfig | Gemma4Config | Qwen3_5Config | Qwen4ExpConfig,
+        model: ModelConfig
+        | Gemma4Config
+        | Qwen3_5Config
+        | Qwen3_5MoeConfig
+        | Qwen4ExpConfig,
         weights: dict[str, Tensor],
         *,
         model_name: str,

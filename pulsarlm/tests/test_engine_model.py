@@ -1,7 +1,12 @@
 import pytest
 
 from pulsarlm.checkpoint import PulsarLMModelConfig, PulsarLMModelLoadingError
-from pulsarlm.core.engine import Gemma4Config, ModelConfig, Qwen3_5Config
+from pulsarlm.core.engine import (
+    Gemma4Config,
+    ModelConfig,
+    Qwen3_5Config,
+    Qwen3_5MoeConfig,
+)
 from pulsarlm.engine_model import engine_model, qwen4_exp_config
 
 ROPE = {
@@ -77,19 +82,12 @@ def test_a_qwen3_5_checkpoint_maps_its_text_config():
     assert model.layer_types == (["linear_attention"] * 3 + ["full_attention"]) * 2
 
 
-def test_a_qwen3_5_checkpoint_has_dense_mlps():
-    model = engine_model(qwen3_5())
-
-    assert isinstance(model, Qwen3_5Config)
-    assert model.num_experts_per_tok == 0
-
-
 def test_a_qwen3_5_moe_checkpoint_maps_its_experts_per_token():
     model = engine_model(
         qwen3_5(num_experts=256, num_experts_per_tok=8, moe_intermediate_size=512)
     )
 
-    assert isinstance(model, Qwen3_5Config)
+    assert isinstance(model, Qwen3_5MoeConfig)
     assert model.num_experts_per_tok == 8
 
 

@@ -13,11 +13,13 @@ from pulsarlm.core.engine import (
     Llama3RopeScaling,
     ModelConfig,
     Qwen3_5Config,
+    Qwen3_5MoeConfig,
     Qwen4ExpConfig,
     RopeParameters,
 )
 
 SLIDING = "sliding_attention"
+QWEN3_5_MOE = ("qwen3_5_moe", "qwen3_5_moe_text")
 FULL = "full_attention"
 
 
@@ -90,7 +92,8 @@ def qwen3_5_layer_types(text: dict) -> list[str]:
     ]
 
 
-def qwen3_5_config(text: dict) -> Qwen3_5Config:
+def qwen3_5_fields(text: dict) -> dict:
+    """The fields Qwen3_5Config and Qwen3_5MoeConfig share."""
     if text.get("attention_bias"):
         raise PulsarLMModelLoadingError("unsupported attention bias")
     if text.get("hidden_act", "silu") != "silu":
@@ -106,11 +109,10 @@ def qwen3_5_config(text: dict) -> Qwen3_5Config:
     parameters = text.get("rope_parameters") or {}
     if parameters.get("rope_type", "default") != "default":
         raise PulsarLMModelLoadingError(f"unsupported RoPE {parameters['rope_type']}")
-    layer_types = qwen3_5_layer_types(text)
-    return Qwen3_5Config(
+    return dict(
         vocab_size=text["vocab_size"],
         hidden_size=text["hidden_size"],
-        layer_types=layer_types,
+        layer_types=qwen3_5_layer_types(text),
         n_heads=text["num_attention_heads"],
         n_kv_heads=text["num_key_value_heads"],
         head_dim=text["head_dim"],
@@ -126,7 +128,16 @@ def qwen3_5_config(text: dict) -> Qwen3_5Config:
         linear_value_head_dim=text["linear_value_head_dim"],
         linear_conv_kernel=text["linear_conv_kernel_dim"],
         rms_norm_eps=float(text["rms_norm_eps"]),
-        num_experts_per_tok=text.get("num_experts_per_tok", 0),
+    )
+
+
+def qwen3_5_config(text: dict) -> Qwen3_5Config:
+    return Qwen3_5Config(**qwen3_5_fields(text))
+
+
+def qwen3_5_moe_config(text: dict) -> Qwen3_5MoeConfig:
+    return Qwen3_5MoeConfig(
+        **qwen3_5_fields(text), num_experts_per_tok=text["num_experts_per_tok"]
     )
 
 
@@ -223,10 +234,12 @@ def dense_config(architecture: str, text: dict) -> ModelConfig:
 
 def engine_model(
     cfg: PulsarLMModelConfig,
-) -> ModelConfig | Gemma4Config | Qwen3_5Config:
+) -> ModelConfig | Gemma4Config | Qwen3_5Config | Qwen3_5MoeConfig:
     """Measures attention mass on the full-attention layers of the top quarter."""
     if cfg.architecture in GEMMA4:
         return gemma4_config(cfg.architecture, cfg.text)
+    if cfg.architecture in QWEN3_5_MOE:
+        return qwen3_5_moe_config(cfg.text)
     if cfg.architecture in QWEN3_5 + QWEN3_5_TEXT:
         return qwen3_5_config(cfg.text)
     if cfg.architecture in QWEN4_EXP:

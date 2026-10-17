@@ -84,11 +84,15 @@ class Qwen4ExpModel : public Model {
         at::Tensor shared_expert_gate;  // [1, hidden]
     };
 
-    struct HyperConnectionWeights {
+    struct MixerWeights {
         at::Tensor hc_norm;  // fp32 1 + weight, [hc_count * hidden], one RMSNorm per stream
         at::Tensor input_mix_weight_down;
         at::Tensor input_mix_weight_up;
-        at::Tensor block_inject_weight;  // undefined for the final mixer
+    };
+
+    struct HyperConnectionWeights {
+        MixerWeights mixer;
+        at::Tensor block_inject_weight;
     };
 
     struct PleWeights {
@@ -126,12 +130,15 @@ class Qwen4ExpModel : public Model {
     std::vector<kv_layer> kv_specs;
     at::Tensor embed_tokens;
     at::Tensor lm_head;
-    HyperConnectionWeights hyper_connection_mixer;
+    MixerWeights hyper_connection_mixer;
     std::vector<LayerWeights> layers;
 
     bool full_attention(std::int64_t layer) const;
     at::Tensor stream_norm(const at::Tensor& x, const at::Tensor& weight) const;
+    // The mix of the normed streams [ntok, hc_count * hidden] a sublayer or the head reads.
+    at::Tensor mixed_streams(const at::Tensor& normed, const MixerWeights& w) const;
     MixedInput mix(const at::Tensor& x, const HyperConnectionWeights& w) const;
+    at::Tensor final_mix(const at::Tensor& x) const;
     at::Tensor attention(const at::Tensor& h, std::int64_t layer, const GroupBatch& g, std::span<const kv> lines) const;
     at::Tensor deltanet(const at::Tensor& h, std::int64_t layer, const GroupBatch& g, std::span<const kv> lines) const;
     at::Tensor moe(const at::Tensor& h, std::int64_t layer) const;

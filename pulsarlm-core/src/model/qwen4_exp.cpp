@@ -77,15 +77,20 @@ Qwen4ExpModel::Qwen4ExpModel(qwen4_exp_config config, const c10::Dict<std::strin
     at::Tensor permutation = rope_permutation(c.head_dim, rotary_dim, embed_tokens.device());
     const std::int64_t conv_channels = 2 * c.linear_n_key_heads * c.linear_key_head_dim +
         c.linear_n_value_heads * c.linear_value_head_dim;
-    auto hyper_connection = [&](const std::string& p, bool injects) {
-        return HyperConnectionWeights{
+    auto mixer = [&](const std::string& p) {
+        return MixerWeights{
             .hc_norm = zero_centered(need(weights, p + "hc_norm.weight")),
             .input_mix_weight_down = need(weights, p + "input_mix_weight_down.weight"),
             .input_mix_weight_up = need(weights, p + "input_mix_weight_up.weight"),
-            .block_inject_weight = injects ? need(weights, p + "block_inject_weight.weight") : at::Tensor(),
         };
     };
-    hyper_connection_mixer = hyper_connection("hyper_connection_mixer.", false);
+    auto hyper_connection = [&](const std::string& p) {
+        return HyperConnectionWeights{
+            .mixer = mixer(p),
+            .block_inject_weight = need(weights, p + "block_inject_weight.weight"),
+        };
+    };
+    hyper_connection_mixer = mixer("hyper_connection_mixer.");
     auto recurrent = [](std::vector<std::int64_t> sizes, at::ScalarType dtype) {
         return kv_layer{
             .n_kv_heads = 0,
@@ -97,8 +102,8 @@ Qwen4ExpModel::Qwen4ExpModel(qwen4_exp_config config, const c10::Dict<std::strin
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
         const std::string p = "layers." + std::to_string(layer) + ".";
         LayerWeights w{
-            .attn_hyper_connection = hyper_connection(p + "attn_hyper_connection.", true),
-            .mlp_hyper_connection = hyper_connection(p + "mlp_hyper_connection.", true),
+            .attn_hyper_connection = hyper_connection(p + "attn_hyper_connection."),
+            .mlp_hyper_connection = hyper_connection(p + "mlp_hyper_connection."),
             .moe = MoeWeights{
                 .router = need(weights, p + "mlp.gate.weight"),
                 .experts_gate_up_proj = need(weights, p + "mlp.experts.gate_up_proj"),
@@ -186,18 +191,25 @@ at::Tensor Qwen4ExpModel::stream_norm(const at::Tensor& x, const at::Tensor& wei
     return (normed.flatten(1) * weight).to(x.scalar_type());
 }
 
-Qwen4ExpModel::MixedInput Qwen4ExpModel::mix(const at::Tensor& x, const HyperConnectionWeights& w) const {
-    const std::int64_t ntok = x.size(0);
+at::Tensor Qwen4ExpModel::mixed_streams(const at::Tensor& normed, const MixerWeights& w) const {
     const auto hc = static_cast<double>(config.hc_count);
-    at::Tensor normed = stream_norm(x, w.hc_norm);
     at::Tensor mix_weights = at::silu(at::linear(normed, w.input_mix_weight_down) / hc);
     mix_weights = at::sigmoid(at::linear(mix_weights, w.input_mix_weight_up));
-    at::Tensor streams = normed.view({ntok, config.hc_count, config.hidden_size});
-    MixedInput mixed{.input = (mix_weights.view(streams.sizes()) * streams).mean(-2)};
-    if (w.block_inject_weight.defined()) {
-        mixed.injection_weights = 2 * at::sigmoid(at::linear(normed, w.block_inject_weight) / hc);
-    }
-    return mixed;
+    at::Tensor streams = normed.view({normed.size(0), config.hc_count, config.hidden_size});
+    return (mix_weights.view(streams.sizes()) * streams).mean(-2);
+}
+
+Qwen4ExpModel::MixedInput Qwen4ExpModel::mix(const at::Tensor& x, const HyperConnectionWeights& w) const {
+    at::Tensor normed = stream_norm(x, w.mixer.hc_norm);
+    return MixedInput{
+        .input = mixed_streams(normed, w.mixer),
+        .injection_weights = 2 *
+            at::sigmoid(at::linear(normed, w.block_inject_weight) / static_cast<double>(config.hc_count)),
+    };
+}
+
+at::Tensor Qwen4ExpModel::final_mix(const at::Tensor& x) const {
+    return mixed_streams(stream_norm(x, hyper_connection_mixer.hc_norm), hyper_connection_mixer);
 }
 
 at::Tensor Qwen4ExpModel::attention(
@@ -258,7 +270,8 @@ Qwen4ExpModel::deltanet(const at::Tensor& h, std::int64_t layer, const GroupBatc
         lines[conv_layer].k,
         g.page_tables.select(0, static_cast<std::int64_t>(conv_layer)),
         cu_seqlens_q,
-        g.page_end_tokens
+        g.page_end_tokens,
+        /*dilation=*/1
     );
     at::Tensor core = gated_delta_rule_cuda(
         convolved,
@@ -407,7 +420,7 @@ at::Tensor Qwen4ExpModel::group_forward(const GroupBatch& g, std::span<const kv>
         mixed = mix(x, w.mlp_hyper_connection);
         x = inject(x, moe(mixed.input, layer), mixed);
     }
-    return at::matmul(mix(logit_inputs(x, g), hyper_connection_mixer).input, lm_head.t());
+    return at::matmul(final_mix(logit_inputs(x, g)), lm_head.t());
 }
 
 StepLogits Qwen4ExpModel::forward(const StepBatch& batch, std::span<const kv> lines) {
