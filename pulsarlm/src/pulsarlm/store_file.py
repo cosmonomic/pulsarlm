@@ -1,3 +1,4 @@
+import importlib.metadata
 import json
 import sqlite3
 import struct
@@ -19,7 +20,7 @@ type SavedState = tuple[StateKey, State, list[bytes], int]
 
 DIGEST_BYTES = 16
 DENSITY_BYTES = 4
-SCHEMA_VERSION = 1
+VERSION = importlib.metadata.version("pulsarlm")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS pages (
@@ -98,15 +99,16 @@ def transaction(connection: sqlite3.Connection) -> Iterator[None]:
     connection.execute("COMMIT")
 
 
-def discard_other_schema(connection: sqlite3.Connection) -> None:
-    """Drops every page and state of a file written in another format."""
-    (version,) = connection.execute("PRAGMA user_version").fetchone()
-    if version == SCHEMA_VERSION:
+def discard_other_version(connection: sqlite3.Connection) -> None:
+    """Drops every page and state of a file another pulsarlm version wrote."""
+    connection.execute("CREATE TABLE IF NOT EXISTS version (version TEXT NOT NULL)")
+    if connection.execute("SELECT version FROM version").fetchall() == [(VERSION,)]:
         return
     connection.execute("DROP TABLE IF EXISTS states")
     connection.execute("DROP TABLE IF EXISTS pages")
+    connection.execute("DELETE FROM version")
+    connection.execute("INSERT INTO version VALUES (?)", (VERSION,))
     connection.execute("VACUUM")
-    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -115,7 +117,7 @@ def connect(path: Path) -> sqlite3.Connection:
     try:
         connection.execute("PRAGMA locking_mode = EXCLUSIVE")
         connection.execute("PRAGMA journal_mode = WAL")
-        discard_other_schema(connection)
+        discard_other_version(connection)
         connection.executescript(SCHEMA)
         # A write takes the exclusive lock, which EXCLUSIVE locking mode keeps until the connection closes.
         connection.execute("BEGIN EXCLUSIVE")

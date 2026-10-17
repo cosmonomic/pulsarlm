@@ -366,7 +366,7 @@ def test_a_restart_drops_a_state_missing_a_page(tmp_path: Path):
     assert store.page_count() == 0
 
 
-def test_a_file_in_another_format_is_emptied(tmp_path: Path):
+def test_a_file_another_version_wrote_is_emptied(tmp_path: Path):
     path = tmp_path / "store.sqlite"
     wrote = in_another_process(
         path,
@@ -377,7 +377,7 @@ def test_a_file_in_another_format_is_emptied(tmp_path: Path):
     )
     assert wrote.returncode == 0, wrote.stderr
     with closing(sqlite3.connect(path)) as connection, connection:
-        connection.execute("PRAGMA user_version = 0")
+        connection.execute("UPDATE version SET version = '0.0.0'")
 
     store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=path)
     assert len(store) == 0
