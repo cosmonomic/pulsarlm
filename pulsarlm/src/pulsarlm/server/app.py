@@ -5,22 +5,29 @@ from pathlib import Path
 from fastapi import FastAPI
 
 from pulsarlm.async_engine import AsyncEngine
+from pulsarlm.eviction_log import EvictionLog
 from pulsarlm.served_model import load_served_model
 from pulsarlm.server.openai import ServerState
 from pulsarlm.server.openai import router as openai_router
 from pulsarlm.settings import Settings
 
 
-def load_server_state(settings: Settings, path: Path) -> ServerState:
+def load_server_state(
+    settings: Settings, path: Path, eviction_log: Path | None
+) -> ServerState:
     served = load_served_model(settings, path)
+    engine = AsyncEngine(served.engine)
     return ServerState(
-        engine=AsyncEngine(served.engine),
+        engine=engine,
         store=served.store,
         tokenizer=served.tokenizer,
         chat_template=served.chat_template,
         model_id=settings.model,
         stop_ids=served.stop_ids,
         eviction=served.eviction,
+        eviction_log=None
+        if eviction_log is None
+        else EvictionLog(eviction_log, engine),
     )
 
 

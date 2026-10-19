@@ -2,6 +2,8 @@
 
 import json
 from collections.abc import Callable
+from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import torch
@@ -11,6 +13,7 @@ from tokenizers import Tokenizer, models, pre_tokenizers
 from pulsarlm.async_engine import AsyncEngine
 from pulsarlm.chat import ChatTemplate, encode_prompt
 from pulsarlm.core.engine import Engine, EvictionPolicy, ModelConfig, RopeParameters
+from pulsarlm.eviction_log import EvictionLog, prompt_sha256
 from pulsarlm.server import create_app
 from pulsarlm.server.openai import ServerState
 from pulsarlm.server.openai.routes import template_messages
@@ -126,6 +129,7 @@ def load(
         model_id=MODEL_ID,
         stop_ids=stop_ids,
         eviction=EvictionPolicy(cycle_tokens=PAGE_SIZE),
+        eviction_log=None,
     )
 
 
@@ -285,3 +289,58 @@ def test_an_unknown_model_is_not_found(client):
         json={"model": "other", "messages": MESSAGES},
     )
     assert response.status_code == 404
+
+
+def logging_eviction(log: Path, eviction: EvictionPolicy) -> Callable[[], ServerState]:
+    def load_state() -> ServerState:
+        state = load(stop_ids=[])
+        state.eviction = eviction
+        state.eviction_log = EvictionLog(log, state.engine)
+        return state
+
+    return load_state
+
+
+def read_log(log: Path) -> list[dict[str, Any]]:
+    with log.open() as f:
+        return [json.loads(line) for line in f]
+
+
+def test_the_eviction_log_without_eviction_views_every_full_page(tmp_path):
+    log = tmp_path / "eviction.jsonl"
+    eviction = EvictionPolicy(cycle_tokens=PAGE_SIZE)
+    with api_client(logging_eviction(log, eviction)) as client:
+        body = post(client, messages=MESSAGES, max_tokens=40).json()
+        prompt = encode(cast(Any, client.app).state.server_state, MESSAGES)
+
+    [line] = read_log(log)
+    assert line["id"] == body["id"]
+    assert line["prompt_tokens"] == len(prompt)
+    assert line["prompt_sha256"] == prompt_sha256(prompt)
+    end = line["states"][-1]
+    assert [layer["layer"] for layer in end["layers"]] == list(range(N_LAYERS))
+    full = end["tokens"] // PAGE_SIZE * PAGE_SIZE
+    assert all(layer["ranges"] == [[0, full]] for layer in end["layers"])
+
+
+def test_the_eviction_log_leaves_out_evicted_pages(tmp_path):
+    log = tmp_path / "eviction.jsonl"
+    eviction = EvictionPolicy(
+        n_working=PAGE_SIZE,
+        cycle_tokens=PAGE_SIZE,
+        max_context_window=7 * PAGE_SIZE,
+    )
+    with api_client(logging_eviction(log, eviction)) as client:
+        post(client, messages=MESSAGES, max_tokens=120)
+
+    [line] = read_log(log)
+    end = line["states"][-1]
+    full = end["tokens"] // PAGE_SIZE * PAGE_SIZE
+    assert [layer["layer"] for layer in end["layers"]] == list(range(N_LAYERS))
+    for layer in end["layers"]:
+        bounds = [bound for start_end in layer["ranges"] for bound in start_end]
+        assert bounds == sorted(set(bounds))
+        assert all(bound % PAGE_SIZE == 0 for bound in bounds)
+        assert bounds[0] == 0
+        assert bounds[-1] == full
+        assert len(layer["ranges"]) > 1

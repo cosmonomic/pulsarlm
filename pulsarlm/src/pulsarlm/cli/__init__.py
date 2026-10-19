@@ -147,6 +147,15 @@ def serve(
     n_working: NWorking = 8192,
     eviction_target: EvictionTarget = 0.8,
     max_context_window: MaxContextWindow = None,
+    eviction_log: Annotated[
+        Path | None,
+        typer.Option(
+            "--eviction_log",
+            help="Appends each request's views, as page indices of its history, "
+            "to this JSON lines file.",
+            rich_help_panel="Eviction",
+        ),
+    ] = None,
 ) -> None:
     """Serve a model over the OpenAI Chat Completions API."""
     # Imported here: torch takes seconds to load, which --help does not need.
@@ -169,6 +178,7 @@ def serve(
             ),
             host=host,
             port=port,
+            eviction_log=eviction_log,
         )
     except server.PulsarLMModelLoadingError as error:
         typer.secho(f"error: {error}", err=True, fg=typer.colors.RED)

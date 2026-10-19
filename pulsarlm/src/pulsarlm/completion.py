@@ -1,6 +1,6 @@
 """Completes a token prompt from the newest stored state that reaches a prefix of it."""
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from itertools import count
 
 from pulsarlm.async_engine import AsyncEngine
@@ -24,13 +24,20 @@ async def complete(
     sampling: SamplingParams,
     max_tokens: int | None,
     eviction: EvictionPolicy,
+    on_state: Callable[[State], None] | None = None,
 ) -> AsyncGenerator[int]:
     """Yields the sampled tokens and writes every state the request reaches to
-    store. Raises CompletionError when the engine ends the request with an error,
-    and EngineStopped when its loop exited. Closing the iterator early cancels the
-    request."""
+    store, passing each to on_state too. Raises CompletionError when the engine
+    ends the request with an error, and EngineStopped when its loop exited.
+    Closing the iterator early cancels the request."""
     request_id = next(_request_ids)
     digests = engine.page_digests(prompt)
+
+    def reach(state: State) -> None:
+        store.write(state, engine.page_keys(state), request_id=request_id)
+        if on_state is not None:
+            on_state(state)
+
     with store.lease(prompt, digests, request_id=request_id) as (state, covered):
         stream = engine.submit(
             state,
@@ -44,15 +51,11 @@ async def complete(
             while True:
                 tokens, cycle_ends, end = await stream.take()
                 for cycle_end in cycle_ends:
-                    store.write(
-                        cycle_end.reached,
-                        engine.page_keys(cycle_end.reached),
-                        request_id=request_id,
-                    )
+                    reach(cycle_end.reached)
                 for token in tokens:
                     yield token
                 if isinstance(end, State):
-                    store.write(end, engine.page_keys(end), request_id=request_id)
+                    reach(end)
                     return
                 if end is not None:
                     raise CompletionError(end)

@@ -15,6 +15,8 @@ from pulsarlm.async_engine import AsyncEngine, EngineStopped
 from pulsarlm.chat import ChatTemplate, ChatTemplateError, Message, encode_prompt
 from pulsarlm.completion import CompletionError, complete
 from pulsarlm.core.engine import EvictionPolicy, RequestError, SamplingParams
+from pulsarlm.core.engine import State as EngineState
+from pulsarlm.eviction_log import EvictionLog
 from pulsarlm.server.openai.schema import (
     ChatCompletionChoice,
     ChatCompletionChunk,
@@ -46,6 +48,7 @@ class ServerState:
     model_id: str
     stop_ids: list[int]
     eviction: EvictionPolicy
+    eviction_log: EvictionLog | None
 
     def eviction_for(self, system_tokens: int) -> EvictionPolicy:
         """The default policy, sinking the system message's tokens, or the first
@@ -103,6 +106,8 @@ async def create_chat_completion(body: ChatCompletionRequest, state: State):
         )
     except ChatTemplateError as error:
         raise HTTPException(400, f"chat template: {error}") from error
+    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+    states: list[EngineState] = []
     tokens = complete(
         state.engine,
         state.store,
@@ -115,11 +120,14 @@ async def create_chat_completion(body: ChatCompletionRequest, state: State):
         ),
         max_tokens=body.max_tokens,
         eviction=state.eviction_for(system_tokens),
+        on_state=None if state.eviction_log is None else states.append,
     )
+    if state.eviction_log is not None:
+        tokens = state.eviction_log.record(completion_id, prompt, tokens, states)
     reply = _Reply(state, body.max_tokens, prompt, tool_calls=tools is not None)
     if body.stream:
-        return _stream_completion(body, reply, tokens)
-    return await _full_completion(body, reply, tokens, len(prompt))
+        return _stream_completion(body, completion_id, reply, tokens)
+    return await _full_completion(body, completion_id, reply, tokens, len(prompt))
 
 
 def template_messages(messages: list[ChatMessage]) -> list[Message]:
@@ -226,6 +234,7 @@ def _http_error(error: EngineStopped | CompletionError) -> HTTPException:
 
 async def _full_completion(
     body: ChatCompletionRequest,
+    completion_id: str,
     reply: _Reply,
     tokens: AsyncGenerator[int],
     prompt_tokens: int,
@@ -240,7 +249,7 @@ async def _full_completion(
     content = "".join(texts["content"]) + unparsed
 
     return ChatCompletionResponse(
-        id=f"chatcmpl-{uuid.uuid4().hex}",
+        id=completion_id,
         created=int(time.time()),
         model=body.model,
         choices=[
@@ -265,10 +274,10 @@ async def _full_completion(
 
 def _stream_completion(
     body: ChatCompletionRequest,
+    completion_id: str,
     reply: _Reply,
     tokens: AsyncGenerator[int],
 ) -> StreamingResponse:
-    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
 
     def chunk(

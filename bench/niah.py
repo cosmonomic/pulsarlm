@@ -5,6 +5,7 @@ Apache-2.0).
 """
 
 import asyncio
+import hashlib
 import importlib
 import json
 import math
@@ -33,6 +34,7 @@ from tokenizers import Tokenizer
 from wonderwords import RandomWord
 
 from pulsarlm import checkpoint
+from pulsarlm.chat import ChatTemplate, ReasoningEffort
 
 NOISE = "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again."
 
@@ -77,6 +79,7 @@ class Item:
     lines: list[str]
     queries: list[str]
     answers: list[str]
+    answer_needles: list[str]
     kind: str
     haystack_tokens: int
     seed: int
@@ -158,6 +161,7 @@ def make_item(
         lines=lines,
         queries=queries,
         answers=[v for q in queries for v in values[q]],
+        answer_needles=[needle(variant.kind, q, v) for q in queries for v in values[q]],
         kind=variant.kind,
         haystack_tokens=total,
         seed=rng.getrandbits(31),
@@ -224,6 +228,123 @@ def score(answer: str | None, expected: list[str]) -> float:
     return sum(value.lower() in answer.lower() for value in expected) / len(expected)
 
 
+@dataclass(frozen=True)
+class Prompt:
+    sha256: str
+    needle_spans: list[list[tuple[int, int]]]
+
+
+def template_messages(
+    messages: list[ChatCompletionMessageParam],
+) -> list[dict[str, Any]]:
+    """The messages as the server passes them to the chat template."""
+    rendered = []
+    for m in cast(list[dict[str, Any]], messages):
+        message: dict[str, Any] = {"role": m["role"], "content": m["content"] or ""}
+        if m.get("reasoning") is not None:
+            message["reasoning"] = message["reasoning_content"] = m["reasoning"]
+        if m.get("tool_calls"):
+            message["tool_calls"] = [
+                {
+                    "id": call["id"],
+                    "type": call["type"],
+                    "function": {
+                        "name": call["function"]["name"],
+                        "arguments": json.loads(call["function"]["arguments"]),
+                    },
+                }
+                for call in m["tool_calls"]
+            ]
+        if m.get("tool_call_id") is not None:
+            message["tool_call_id"] = m["tool_call_id"]
+        rendered.append(message)
+    return rendered
+
+
+def locate_needles(
+    messages: list[ChatCompletionMessageParam],
+    item: Item,
+    *,
+    reasoning_effort: str,
+    tokenizer: Tokenizer,
+    template: ChatTemplate,
+) -> Prompt:
+    """The prompt's SHA-256 as the eviction log takes it, and per answer the
+    [start, end) token span of each occurrence of its needle in the prompt."""
+    text = template.render(
+        template_messages(messages),
+        add_generation_prompt=True,
+        reasoning_effort=cast(ReasoningEffort, reasoning_effort),
+        tools=[cast(dict[str, Any], READ_TOOL)],
+    )
+    encoding = tokenizer.encode(text, add_special_tokens=False)
+    needle_spans: list[list[tuple[int, int]]] = []
+    for line in item.answer_needles:
+        spans = []
+        start = text.find(line)
+        while start >= 0:
+            first = encoding.char_to_token(start)
+            last = encoding.char_to_token(start + len(line) - 1)
+            assert first is not None and last is not None
+            spans.append((first, last + 1))
+            start = text.find(line, start + len(line))
+        needle_spans.append(spans)
+    sha256 = hashlib.sha256(json.dumps(encoding.ids).encode()).hexdigest()
+    return Prompt(sha256, needle_spans)
+
+
+class EvictionLog:
+    """A server's --eviction_log, read as the server appends to it."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._offset = 0
+        self._lines: dict[str, dict[str, Any]] = {}
+
+    def line(self, completion_id: str) -> dict[str, Any]:
+        if completion_id not in self._lines:
+            with self._path.open() as f:
+                f.seek(self._offset)
+                while (raw := f.readline()).endswith("\n"):
+                    line = json.loads(raw)
+                    self._lines[line["id"]] = line
+                    self._offset = f.tell()
+        return self._lines.pop(completion_id)
+
+
+def eviction_view(line: dict[str, Any], prompt: Prompt) -> dict[str, Any]:
+    """Over the layers eviction acts on, at the request's end: the fraction of
+    the history in view, and per answer the fraction of layers holding one of
+    its needle's occurrences wholly in view; None for a needle not read yet."""
+    if line["prompt_sha256"] != prompt.sha256:
+        raise RuntimeError(f"{line['id']}: the server rendered another prompt")
+    end = line["states"][-1]
+    views = [in_view(layer["ranges"], end["tokens"]) for layer in end["layers"]]
+
+    def kept(spans: list[tuple[int, int]]) -> float | None:
+        if not spans:
+            return None
+        return sum(
+            any(r0 <= a and b <= r1 for a, b in spans for r0, r1 in view)
+            for view in views
+        ) / len(views)
+
+    return {
+        "in_view": sum(r1 - r0 for view in views for r0, r1 in view)
+        / (len(views) * end["tokens"]),
+        "needles_kept": [kept(spans) for spans in prompt.needle_spans],
+    }
+
+
+def in_view(ranges: list[list[int]], tokens: int) -> list[tuple[int, int]]:
+    """A layer's ranges with the tokens after the last, which follow it."""
+    view = [(r0, r1) for r0, r1 in ranges]
+    if not view:
+        return [(0, tokens)]
+    view[-1] = (view[-1][0], tokens)
+    return view
+
+
 async def run_item(
     client: AsyncOpenAI,
     model: str,
@@ -232,6 +353,9 @@ async def run_item(
     recap: bool,
     max_read_lines: int,
     reasoning_effort: str,
+    tokenizer: Tokenizer,
+    template: ChatTemplate,
+    eviction_log: EvictionLog,
 ) -> dict[str, Any]:
     messages: list[ChatCompletionMessageParam] = [
         {"role": "system", "content": system_prompt(item, max_read_lines, recap)},
@@ -239,6 +363,7 @@ async def run_item(
     ]
     max_turns = 2 * math.ceil(len(item.lines) / max_read_lines) + 4
     turns = tool_calls = generated_tokens = 0
+    replies: list[dict[str, Any]] = []
     answer: str | None = None
     error: str | None = None
     try:
@@ -260,18 +385,42 @@ async def run_item(
                 await asyncio.sleep(1)
                 continue
             turns += 1
-            if response.usage is not None:
-                generated_tokens += response.usage.completion_tokens
-            message = response.choices[0].message
+            prompt = locate_needles(
+                messages,
+                item,
+                reasoning_effort=reasoning_effort,
+                tokenizer=tokenizer,
+                template=template,
+            )
+            view = eviction_view(eviction_log.line(response.id), prompt)
+            completion_tokens = (
+                0 if response.usage is None else response.usage.completion_tokens
+            )
+            generated_tokens += completion_tokens
+            choice = response.choices[0]
+            message = choice.message
             calls = [
                 call
                 for call in message.tool_calls or []
                 if isinstance(call, ChatCompletionMessageFunctionToolCall)
             ]
+            reasoning = (message.model_extra or {}).get("reasoning")
+            replies.append(
+                {
+                    "id": response.id,
+                    **view,
+                    "finish_reason": choice.finish_reason,
+                    "completion_tokens": completion_tokens,
+                    "reasoning": reasoning,
+                    "content": message.content,
+                    "tool_calls": [call.function.arguments for call in calls],
+                }
+            )
             if not calls:
                 answer = message.content
+                if choice.finish_reason == "length":
+                    error = "length"
                 break
-            reasoning = (message.model_extra or {}).get("reasoning")
             messages.append(
                 cast(
                     ChatCompletionMessageParam,
@@ -317,6 +466,7 @@ async def run_item(
         "tool_calls": tool_calls,
         "generated_tokens": generated_tokens,
         "error": error,
+        "replies": replies,
     }
 
 
@@ -348,9 +498,10 @@ def server(
             process.wait()
 
 
-def load_tokenizer(model: str) -> Tokenizer:
+def load_chat(model: str) -> tuple[Tokenizer, ChatTemplate]:
     with zipfile.ZipFile(checkpoint.model_path(model)) as archive:
-        return checkpoint.load_tokenizer(zipfile.Path(archive))
+        path = zipfile.Path(archive)
+        return checkpoint.load_tokenizer(path), checkpoint.load_chat_template(path)
 
 
 def done_keys(results: Path) -> set[tuple[str, str, int, int]]:
@@ -393,7 +544,7 @@ def run(
         raise typer.BadParameter(f"unknown settings or variants: {sorted(unknown)}")
     if not 0 <= shard < shards:
         raise typer.BadParameter("shard must be in [0, shards)")
-    tokenizer = load_tokenizer(model)
+    tokenizer, template = load_chat(model)
     words = Words()
     all_items = [
         make_item(v, n, i, seed=seed, words=words, tokenizer=tokenizer)
@@ -424,7 +575,9 @@ def run(
             ]
         if kv_cache_gib is not None:
             server_args += ["--kv_cache_gib", str(kv_cache_gib)]
+        eviction_log = out / name / "eviction.jsonl"
         server_args += ["--store_gib", str(store_gib)]
+        server_args += ["--eviction_log", str(eviction_log)]
         with server(model, out / name, port, server_args) as base_url:
             asyncio.run(
                 run_setting(
@@ -437,6 +590,9 @@ def run(
                     max_read_lines=max_read_lines,
                     reasoning_effort=reasoning_effort,
                     concurrency=concurrency,
+                    tokenizer=tokenizer,
+                    template=template,
+                    eviction_log=EvictionLog(eviction_log),
                 )
             )
 
@@ -452,12 +608,14 @@ async def run_setting(
     max_read_lines: int,
     reasoning_effort: str,
     concurrency: int,
+    tokenizer: Tokenizer,
+    template: ChatTemplate,
+    eviction_log: EvictionLog,
 ) -> None:
-    client = AsyncOpenAI(base_url=base_url, api_key="none", timeout=3600)
     slots = asyncio.Semaphore(concurrency)
     finished = 0
 
-    async def one(item: Item) -> None:
+    async def one(client: AsyncOpenAI, item: Item) -> None:
         nonlocal finished
         async with slots:
             row = await run_item(
@@ -467,6 +625,9 @@ async def run_setting(
                 recap=setting.recap,
                 max_read_lines=max_read_lines,
                 reasoning_effort=reasoning_effort,
+                tokenizer=tokenizer,
+                template=template,
+                eviction_log=eviction_log,
             )
         row = {"setting": name, **row}
         with results.open("a") as f:
@@ -479,7 +640,12 @@ async def run_setting(
             flush=True,
         )
 
-    await asyncio.gather(*(one(item) for item in todo))
+    async with AsyncOpenAI(base_url=base_url, api_key="none", timeout=3600) as client:
+        await asyncio.gather(*(one(client, item) for item in todo))
+
+
+def mean(values: list[float]) -> str:
+    return f"{sum(values) / len(values):.2f}" if values else "-"
 
 
 SERIES_COLORS = {
@@ -500,7 +666,9 @@ def plot(
     out: Path = Path("bench/niah.svg"),
 ) -> None:
     """Prints accuracy, tool calls and generated tokens per setting and length,
-    and plots accuracy against haystack length."""
+    and over each item's last reply, the fraction of the history in view and of
+    the layers keeping a needle read so far; plots accuracy against haystack
+    length."""
     pyplot = importlib.import_module("matplotlib.pyplot")
     with results.open() as f:
         rows = [json.loads(line) for line in f]
@@ -511,15 +679,25 @@ def plot(
     print(
         f"{'setting':<16}{'length':>8}{'items':>7}{'accuracy':>10}"
         f"{'tool calls':>12}{'generated':>11}{'errors':>8}"
+        f"{'in view':>9}{'kept':>7}"
     )
     for (name, length), group in sorted(groups.items()):
         n = len(group)
+        last_replies = [r["replies"][-1] for r in group if r.get("replies")]
+        in_view = [reply["in_view"] for reply in last_replies]
+        kept = [
+            fraction
+            for reply in last_replies
+            for fraction in reply["needles_kept"]
+            if fraction is not None
+        ]
         print(
             f"{name:<16}{length:>8}{n:>7}"
             f"{sum(r['score'] for r in group) / n:>10.3f}"
             f"{sum(r['tool_calls'] for r in group) / n:>12.1f}"
             f"{sum(r['generated_tokens'] for r in group) / n:>11.0f}"
             f"{sum(r['error'] is not None for r in group):>8}"
+            f"{mean(in_view):>9}{mean(kept):>7}"
         )
 
     surface, ink, muted, grid = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
