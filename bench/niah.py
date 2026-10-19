@@ -589,7 +589,7 @@ def run(
     shard: int = 0,
     shards: int = 1,
     seed: int = 0,
-    max_read_lines: int = 100,
+    max_read_lines: int = 25,
     max_context_window: int = 4624,
     n_working: int = 1024,
     kv_cache_gib: float | None = None,
