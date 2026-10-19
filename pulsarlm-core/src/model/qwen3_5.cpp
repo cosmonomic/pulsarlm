@@ -143,13 +143,7 @@ Qwen3_5Model::attention(const at::Tensor& h, std::int64_t layer, const GroupBatc
     at::Tensor query_gate = at::linear(h, w.q_proj).view({ntok, c.n_heads, 2 * c.head_dim});
     at::Tensor q = rmsnorm_cuda(query_gate.narrow(-1, 0, c.head_dim), w.q_norm, c.rms_norm_eps);
     at::Tensor gate = query_gate.narrow(-1, c.head_dim, c.head_dim).reshape({ntok, c.n_heads * c.head_dim});
-    q = rope_q(
-        q.view({ntok, c.n_heads * c.head_dim}),
-        g.pos.select(0, static_cast<std::int64_t>(kv_index)),
-        c.n_heads,
-        c.head_dim,
-        rope
-    );
+    q = rope_q(q.view({ntok, c.n_heads * c.head_dim}), g.pos, c.n_heads, c.head_dim, rope);
     at::Tensor k = rmsnorm_cuda(
         at::linear(h, w.k_proj).view({ntok, c.n_kv_heads, c.head_dim}),
         w.k_norm,

@@ -161,9 +161,11 @@ pulsarlm::GroupBatch step(const at::Tensor& tokens, std::int64_t first, std::int
     auto key_count = every_layer(int32_cuda({static_cast<std::int32_t>(last)}));
     pulsarlm::GroupBatch g{
         .tokens = tokens.narrow(0, first, last - first),
-        .pos = every_layer(at::arange(first, last, cuda(at::kLong))),
+        .pos = at::arange(first, last, cuda(at::kLong)),
         .page_tables = every_layer(int32_cuda(view_lines).view({1, -1})),
-        .rope_layout = int32_cuda({0, 0, -1}).view({1, 3}),
+        .page_positions = every_layer(
+            (at::arange(static_cast<std::int64_t>(view_lines.size()), cuda(at::kInt)) * page_size).view({1, -1})
+        ),
         .cu_view_pages = every_layer(int32_cuda({0, static_cast<std::int32_t>(view_lines.size())})),
     };
     std::vector<float> weights;

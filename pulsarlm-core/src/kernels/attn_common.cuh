@@ -29,7 +29,7 @@ struct PagedAttnBatch {
     at::Tensor page_tables;
     at::Tensor cu_seqlens_q;
     at::Tensor seqlens_k;
-    at::Tensor rope_layout;
+    at::Tensor page_positions;
     at::Tensor rope_turns;
     at::Tensor k_norm_weight;
     at::Tensor mass;
@@ -59,7 +59,7 @@ struct PagedAttnBatch {
             static_cast<const int32_t*>(data(this->page_tables)),
             static_cast<const int32_t*>(data(this->cu_seqlens_q)),
             static_cast<const int32_t*>(data(this->seqlens_k)),
-            static_cast<const int32_t*>(data(this->rope_layout)),
+            static_cast<const int32_t*>(data(this->page_positions)),
             static_cast<const uint64_t*>(data(this->rope_turns)),
             static_cast<const float*>(data(this->k_norm_weight)),
             static_cast<float*>(data(this->mass)),
@@ -98,7 +98,7 @@ PagedAttnBatch paged_attn_batch(
     const at::Tensor& page_tables,
     const std::optional<at::Tensor>& cu_seqlens_q,
     const at::Tensor& seqlens_k,
-    const at::Tensor& rope_layout,
+    const at::Tensor& page_positions,
     const rope_parameters& rope,
     double scale,
     std::optional<int64_t> sliding_window,

@@ -67,7 +67,7 @@ __global__ void index_blocks_kernel(
     const int32_t* __restrict__ page_tables,
     int max_pages,
     int page_size,
-    const int32_t* __restrict__ rope_layout,
+    const int32_t* __restrict__ page_positions,
     const float* __restrict__ norm_weight,
     const float* __restrict__ inv_freq,
     int rotary_dim,
@@ -106,10 +106,8 @@ __global__ void index_blocks_kernel(
     pooled[d] = normed;
     __syncthreads();
 
-    const int32_t* layout = rope_layout + 3 * static_cast<int64_t>(s);
-    const int position = first_key < layout[0] ? first_key
-        : first_key < layout[1]                ? layout[2]
-                                               : layout[2] + 1 + first_key - layout[1];
+    const int position = page_positions[static_cast<int64_t>(s) * max_pages + first_key / page_size] +
+        first_key % page_size;
     scalar_t out = static_cast<scalar_t>(normed);
     if (d < rotary_dim) {
         const int half = rotary_dim / 2;
@@ -417,7 +415,7 @@ at::Tensor index_scores_cuda(
 at::Tensor index_blocks_cuda(
     const at::Tensor& index_keys,
     const at::Tensor& page_tables,
-    const at::Tensor& rope_layout,
+    const at::Tensor& page_positions,
     const at::Tensor& norm_weight,
     const at::Tensor& inv_freq,
     int64_t ratio,
@@ -438,9 +436,9 @@ at::Tensor index_blocks_cuda(
         "index_blocks: page_tables must be contiguous int32 CUDA [sequences, max_pages]"
     );
     TORCH_CHECK(
-        rope_layout.is_cuda() && rope_layout.scalar_type() == at::kInt && rope_layout.is_contiguous() &&
-            rope_layout.dim() == 2 && rope_layout.size(0) == page_tables.size(0) && rope_layout.size(1) == 3,
-        "index_blocks: rope_layout must be contiguous int32 CUDA [sequences, 3]"
+        page_positions.is_cuda() && page_positions.scalar_type() == at::kInt && page_positions.is_contiguous() &&
+            page_positions.sizes() == page_tables.sizes(),
+        "index_blocks: page_positions must be contiguous int32 CUDA [sequences, max_pages], as page_tables"
     );
     TORCH_CHECK(
         norm_weight.is_cuda() && norm_weight.scalar_type() == at::kFloat && norm_weight.numel() == dim &&
@@ -467,7 +465,7 @@ at::Tensor index_blocks_cuda(
                 page_tables.const_data_ptr<int32_t>(),
                 static_cast<int>(page_tables.size(1)),
                 static_cast<int>(page_size),
-                rope_layout.const_data_ptr<int32_t>(),
+                page_positions.const_data_ptr<int32_t>(),
                 norm_weight.const_data_ptr<float>(),
                 inv_freq.const_data_ptr<float>(),
                 static_cast<int>(2 * inv_freq.size(0)),

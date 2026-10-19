@@ -222,7 +222,7 @@ at::Tensor Qwen4ExpModel::selected_blocks(
     const at::Tensor& page_tables,
     const at::Tensor& cu_seqlens_q,
     const at::Tensor& key_counts,
-    const at::Tensor& rope_layout
+    const at::Tensor& page_positions
 ) const {
     const qwen4_exp_config& c = config;
     const std::int64_t ratio = c.indexer_compress_ratio;
@@ -237,7 +237,7 @@ at::Tensor Qwen4ExpModel::selected_blocks(
     at::Tensor blocks = index_blocks_cuda(
         lines.index_keys,
         page_tables,
-        rope_layout,
+        page_positions,
         w.index_k_norm,
         index_inv_freq,
         ratio,
@@ -316,13 +316,7 @@ at::Tensor Qwen4ExpModel::attention(
     at::Tensor query_gate = at::linear(h, w.q_proj).view({ntok, c.n_heads, 2 * c.head_dim});
     at::Tensor q = rmsnorm_cuda(query_gate.narrow(-1, 0, c.head_dim), w.q_norm, c.rms_norm_eps);
     at::Tensor gate = query_gate.narrow(-1, c.head_dim, c.head_dim).reshape({ntok, c.n_heads * c.head_dim});
-    q = rope_q(
-        q.view({ntok, c.n_heads * c.head_dim}),
-        g.pos.select(0, static_cast<std::int64_t>(kv_index)),
-        c.n_heads,
-        c.head_dim,
-        rope
-    );
+    q = rope_q(q.view({ntok, c.n_heads * c.head_dim}), g.pos, c.n_heads, c.head_dim, rope);
     at::Tensor k = rmsnorm_cuda(
         at::linear(h, w.k_proj).view({ntok, c.n_kv_heads, c.head_dim}),
         w.k_norm,
@@ -333,6 +327,7 @@ at::Tensor Qwen4ExpModel::attention(
     const kv& line = lines[kv_index];
     const auto layer_row = static_cast<std::int64_t>(kv_index);
     at::Tensor page_tables = g.page_tables.select(0, layer_row);
+    at::Tensor page_positions = g.page_positions.select(0, layer_row);
     at::Tensor key_counts = g.key_counts.select(0, layer_row);
     std::optional<at::Tensor> cu_seqlens_write;
     at::Tensor cu_seqlens_q;
@@ -351,13 +346,14 @@ at::Tensor Qwen4ExpModel::attention(
         w.index_q_norm,
         c.rms_norm_eps
     );
-    index_queries = index_rope(index_queries, g.pos.select(0, layer_row));
+    index_queries = index_rope(index_queries, g.pos);
     at::Tensor index_keys = index_qk.narrow(1, c.indexer_n_heads * c.indexer_head_dim, c.indexer_head_dim)
                                 .contiguous()
                                 .view({ntok, 1, -1});
     at::Tensor index_pool = line.index_keys.unsqueeze(2);
     write_kv_cuda(index_pool, index_pool, index_keys, index_keys, page_tables, cu_seqlens_write, key_counts);
-    at::Tensor selected = selected_blocks(w, index_queries, line, page_tables, cu_seqlens_q, key_counts, g.rope_layout);
+    at::Tensor
+        selected = selected_blocks(w, index_queries, line, page_tables, cu_seqlens_q, key_counts, page_positions);
 
     std::optional<at::Tensor> mass, cu_view_pages, mass_weights;
     at::Tensor page_mass = g.page_mass.empty() ? at::Tensor() : g.page_mass[kv_index];
@@ -373,7 +369,7 @@ at::Tensor Qwen4ExpModel::attention(
         page_tables,
         cu_seqlens_q,
         key_counts,
-        g.rope_layout,
+        page_positions,
         rope,
         1.0 / std::sqrt(static_cast<double>(c.head_dim)),
         selected,

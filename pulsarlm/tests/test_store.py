@@ -36,7 +36,7 @@ def reached(history: list[int], evicted: set[int] = set()) -> State:
     """A state of two layers: one keeping every page not evicted, one the newest."""
     full = len(history) // PAGE_SIZE * PAGE_SIZE
     pages = [
-        ActivePage(h, [i / 4, i / 8])
+        ActivePage(h, i, [i / 4, i / 8])
         for i, h in enumerate(page_digests(history))
         if i not in evicted
     ]
@@ -50,7 +50,8 @@ def reached(history: list[int], evicted: set[int] = set()) -> State:
 def state_of(hashes: list[bytes]) -> State:
     """A state of one layer keeping hashes."""
     return State(
-        head=hashes[-1], layers=[LayerSequence([ActivePage(h) for h in hashes])]
+        head=hashes[-1],
+        layers=[LayerSequence([ActivePage(h, i) for i, h in enumerate(hashes)])],
     )
 
 

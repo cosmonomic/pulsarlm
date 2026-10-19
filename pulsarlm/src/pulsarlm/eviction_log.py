@@ -8,7 +8,6 @@ from contextlib import aclosing
 from pathlib import Path
 from typing import Any
 
-from pulsarlm.async_engine import AsyncEngine
 from pulsarlm.core.engine import EvictionPolicy, State, density_threshold
 from pulsarlm.paging import PAGE_SIZE
 
@@ -28,14 +27,9 @@ class EvictionLog:
     context in tokens, as the engine has it."""
 
     def __init__(
-        self,
-        path: Path,
-        engine: AsyncEngine,
-        eviction: EvictionPolicy,
-        max_context: int | None,
+        self, path: Path, eviction: EvictionPolicy, max_context: int | None
     ) -> None:
         self._path = path
-        self._engine = engine
         self._eviction = eviction
         self._max_context = max_context
 
@@ -48,19 +42,15 @@ class EvictionLog:
     ) -> AsyncGenerator[int]:
         """Yields tokens, then writes the request's line once they end; states
         holds the states the request reached by then."""
-        sampled: list[int] = []
         async with aclosing(tokens):
             async for token in tokens:
-                sampled.append(token)
                 yield token
-        history = prompt + sampled
-        pages = {h: i for i, h in enumerate(self._engine.page_digests(history))}
         line = {
             "id": completion_id,
             "prompt_tokens": len(prompt),
             "prompt_sha256": prompt_sha256(prompt),
             "cap_tokens": self._cap_tokens(),
-            "states": [self._view(state, pages) for state in states],
+            "states": [self._view(state) for state in states],
         }
         with self._path.open("a") as f:
             f.write(json.dumps(line) + "\n")
@@ -85,8 +75,15 @@ class EvictionLog:
             self._eviction.eviction_target, n_q_heads, max_context_pages
         )
 
-    def _view(self, state: State, pages: dict[bytes, int]) -> dict[str, Any]:
-        full_pages = 0 if state.head is None else pages[state.head] + 1
+    def _view(self, state: State) -> dict[str, Any]:
+        full_pages = max(
+            (
+                sequence.pages[-1].index + 1
+                for sequence in state.layers
+                if sequence.pages
+            ),
+            default=0,
+        )
         return {
             "tokens": full_pages * PAGE_SIZE + len(state.tail),
             "layers": [
@@ -95,8 +92,8 @@ class EvictionLog:
                     "threshold": self._threshold(len(sequence.pages[0].density)),
                     "pages": [
                         [
-                            pages[page.hash] * PAGE_SIZE,
-                            (pages[page.hash] + 1) * PAGE_SIZE,
+                            page.index * PAGE_SIZE,
+                            (page.index + 1) * PAGE_SIZE,
                             max(page.density),
                         ]
                         for page in sequence.pages

@@ -37,6 +37,7 @@ at::Tensor paged_attention(
     const at::Tensor& v_pool = lines.v;
     const auto layer = static_cast<int64_t>(kv_layer);
     at::Tensor page_tables = g.page_tables.select(0, layer);
+    at::Tensor page_positions = g.page_positions.select(0, layer);
     at::Tensor key_counts = g.key_counts.select(0, layer);
     if (k.defined()) {
         write_kv_cuda(
@@ -65,7 +66,7 @@ at::Tensor paged_attention(
             page_tables,
             g.cu_seqlens_q,
             key_counts,
-            g.rope_layout,
+            page_positions,
             rope,
             scale,
             sliding_window,
@@ -81,7 +82,7 @@ at::Tensor paged_attention(
             v_pool,
             page_tables,
             key_counts,
-            g.rope_layout,
+            page_positions,
             rope,
             scale,
             sliding_window,

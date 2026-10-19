@@ -166,13 +166,7 @@ Gemma4Model::attention(const at::Tensor& h, std::int64_t layer, const GroupBatch
         w.q_norm,
         config.rms_norm_eps
     );
-    q = rope_q(
-        q.view({ntok, config.n_heads * head_dim}),
-        g.pos.select(0, static_cast<std::int64_t>(kv_index)),
-        config.n_heads,
-        head_dim,
-        rope
-    );
+    q = rope_q(q.view({ntok, config.n_heads * head_dim}), g.pos, config.n_heads, head_dim, rope);
 
     at::Tensor k, v;
     std::optional<at::Tensor> k_norm_weight;

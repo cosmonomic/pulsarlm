@@ -43,7 +43,7 @@
 namespace pulsarlm {
 namespace {
 
-using attn::KeyLayout;
+using attn::KeyPositions;
 using attn::kThreads;
 using attn::PagedAttnParams;
 
@@ -198,7 +198,7 @@ __device__ __forceinline__ void tc_attend_tiles(
     int g,
     int ctx_len,
     int first,
-    const KeyLayout& layout,
+    const KeyPositions& layout,
     float* __restrict__ group_mass,
     int t_start,
     int t_end,
@@ -463,7 +463,7 @@ __global__ void __launch_bounds__(NWARPS * 32) attn_decode_tc_kernel(const Paged
         g,
         ctx_len,
         first,
-        attn::key_layout(p.rope_layout, s),
+        attn::key_positions(p, s, PAGE_SIZE),
         group_mass,
         0,
         std::numeric_limits<int>::max(),
@@ -525,7 +525,7 @@ __global__ void __launch_bounds__(NWARPS * 32) paged_decode_split_kernel(
         g,
         ctx_len,
         first,
-        attn::key_layout(p.rope_layout, s),
+        attn::key_positions(p, s, PAGE_SIZE),
         group_mass,
         t_start,
         t_start + tiles_per_split,
@@ -852,7 +852,7 @@ at::Tensor attn_decode_cuda(
     const at::Tensor& v_pool,
     const at::Tensor& page_tables,
     const at::Tensor& context_lens,
-    const at::Tensor& rope_layout,
+    const at::Tensor& page_positions,
     const rope_parameters& rope,
     double scale,
     std::optional<int64_t> sliding_window,
@@ -870,7 +870,7 @@ at::Tensor attn_decode_cuda(
         page_tables,
         std::nullopt,
         context_lens,
-        rope_layout,
+        page_positions,
         rope,
         scale,
         sliding_window,

@@ -158,7 +158,7 @@ class Qwen4ExpModel : public Model {
         const at::Tensor& page_tables,
         const at::Tensor& cu_seqlens_q,
         const at::Tensor& key_counts,
-        const at::Tensor& rope_layout
+        const at::Tensor& page_positions
     ) const;
     at::Tensor stream_norm(const at::Tensor& x, const at::Tensor& weight) const;
     // The mix of the normed streams [ntok, hc_count * hidden] a sublayer or the head reads.

@@ -16,9 +16,8 @@ def load_server_state(
     settings: Settings, path: Path, eviction_log: Path | None
 ) -> ServerState:
     served = load_served_model(settings, path)
-    engine = AsyncEngine(served.engine)
     return ServerState(
-        engine=engine,
+        engine=AsyncEngine(served.engine),
         store=served.store,
         tokenizer=served.tokenizer,
         chat_template=served.chat_template,
@@ -27,7 +26,7 @@ def load_server_state(
         eviction=served.eviction,
         eviction_log=None
         if eviction_log is None
-        else EvictionLog(eviction_log, engine, served.eviction, served.max_context),
+        else EvictionLog(eviction_log, served.eviction, served.max_context),
     )
 
 

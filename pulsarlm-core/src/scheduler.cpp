@@ -44,7 +44,6 @@ GroupBatch to_device(const GroupBatch& host, at::Device device) {
         .page_end_tokens = to_device(host.page_end_tokens, device),
         .cu_seqlens_q = to_device(host.cu_seqlens_q, device),
         .key_counts = to_device(host.key_counts, device),
-        .rope_layout = to_device(host.rope_layout, device),
         .cu_view_pages = to_device(host.cu_view_pages, device),
         .mass_weights = to_device(host.mass_weights, device),
     };
@@ -82,20 +81,21 @@ at::Tensor zero_page_mass(
 
 }  // namespace
 
-// One KV layer's view of a sequence. A layer with pages has one line per view page: its full pages, then the pages of
-// tail and pending. A layer that measures mass keeps mass_heads densities per line, each a query head's EMA of the
-// shares the page received, as of the last step that measured it, 0 for a page never measured. A recurrent layer has
-// no pages: its lines are the one its state is updated in, then the one a step writes the state at its newest page end
-// into.
+// One KV layer's view of a sequence. A layer with pages has one line per view page: its full pages, each with its index
+// in the history, then the pages of tail and pending. A layer that measures mass keeps mass_heads densities per line,
+// each a query head's EMA of the shares the page received, as of the last step that measured it, 0 for a page never
+// measured. A recurrent layer has no pages: its lines are the one its state is updated in, then the one a step writes
+// the state at its newest page end into.
 class scheduler::layer_view {
   public:
     std::vector<digest> pages;
+    std::vector<std::size_t> indices;
     std::vector<std::uint32_t> lines;
     std::size_t mass_heads = 0;
     std::vector<float> density;
 
     // Drops the full pages at the ascending view indices and returns their lines.
-    std::vector<std::uint32_t> remove(std::span<const std::size_t> indices);
+    std::vector<std::uint32_t> remove(std::span<const std::size_t> view_indices);
     void append_lines(std::span<const std::uint32_t> added);
 };
 
@@ -111,16 +111,23 @@ class scheduler::sequence {
     std::optional<std::size_t> max_tokens;
     std::size_t generated = 0;
     std::optional<digest> head;
+    // The full pages of the history, head the last.
+    std::size_t history_pages = 0;
     std::vector<std::int64_t> tail;
     std::vector<std::int64_t> pending;
     // Per KV layer, whether it is recurrent; the scheduler's.
     const std::vector<bool>& recurrent;
     // One per KV layer.
     std::vector<layer_view> layers;
+    // The ascending history indices of the full pages some layer with pages holds. A full page's RoPE position is its
+    // rank here times the page size, in every layer; the pages of tail and pending follow the last.
+    std::vector<std::size_t> held;
     // Whether the recurrent layers' second lines hold the state at head, which the store does not have yet.
     bool state_pending = false;
-    // int32 [n_kv_layers, capacity] on the device. Columns past those of a layer's lines are unused.
+    // int32 [n_kv_layers, capacity] on the device: each view page's line, and the RoPE position of its first key.
+    // Columns past those of a layer's lines are unused.
     at::Tensor table;
+    at::Tensor position_table;
     std::optional<exit_reason> exited;
     // Set once the sequence leaves the running set.
     std::optional<event> exit_event;
@@ -142,6 +149,12 @@ class scheduler::sequence {
 
     // The view index of the next token in KV layer layer's view.
     std::size_t next_index(std::size_t layer, std::size_t page_size) const noexcept;
+    // The RoPE position of the next token, the same in every layer.
+    std::size_t next_position(std::size_t page_size) const noexcept;
+    // The RoPE position of the first key of view page page in KV layer layer.
+    std::size_t page_position(std::size_t layer, std::size_t page, std::size_t page_size) const;
+    // Sets held from the layers' indices, after pages left them.
+    void update_held();
     bool may_sample() const noexcept;
     // Moves the first count pending tokens to tail, then the pages they complete to every layer with pages, and returns
     // how many pages they complete.
@@ -153,8 +166,9 @@ class scheduler::sequence {
     std::size_t cycle_tokens_left() const noexcept;
     // The columns of table the lines take.
     std::size_t table_width() const noexcept;
-    // Queues on stream the upload of the lines from column first_page on into table, all of them when table grows.
-    void upload_table(std::size_t first_page, cudaStream_t stream);
+    // Queues on stream the upload of the lines and positions from column first_page on into table and position_table,
+    // all of them when the tables grow.
+    void upload_table(std::size_t first_page, std::size_t page_size, cudaStream_t stream);
     // One line per page the cycle's tokens fill, in each KV layer with pages. Called at the start of a cycle, with an
     // empty tail.
     std::size_t cycle_lines(std::size_t page_size) const noexcept;
@@ -191,7 +205,8 @@ class scheduler::batch {
 
     static GroupBatch make_group(std::span<const entry> group, std::size_t page_size, bool prefill);
     static bool measures_mass(std::span<const entry> group) noexcept;
-    static at::Tensor page_tables(std::span<const entry> group, std::size_t n_kv_layers);
+    // The group's tables of lines, or of positions with positions, as GroupBatch lays them out.
+    static at::Tensor page_tables(std::span<const entry> group, std::size_t n_kv_layers, bool positions);
     // Queues on stream the inputs' copies, the forward, the copies of the page mass to the host, the sampling and the
     // copy of the sampled tokens to the host. mass_heads is the scheduler's.
     void
@@ -203,25 +218,27 @@ class scheduler::batch {
     friend class scheduler;
 };
 
-std::vector<std::uint32_t> scheduler::layer_view::remove(std::span<const std::size_t> indices) {
+std::vector<std::uint32_t> scheduler::layer_view::remove(std::span<const std::size_t> view_indices) {
     std::vector<std::uint32_t> removed;
     std::size_t kept = 0;
     std::size_t next_removed = 0;
     for (std::size_t page = 0; page < pages.size(); page++) {
-        if (next_removed < indices.size() && indices[next_removed] == page) {
+        if (next_removed < view_indices.size() && view_indices[next_removed] == page) {
             removed.push_back(lines[page]);
             next_removed++;
             continue;
         }
         pages[kept] = pages[page];
+        indices[kept] = indices[page];
         lines[kept] = lines[page];
         std::copy_n(density.begin() + page * mass_heads, mass_heads, density.begin() + kept * mass_heads);
         kept++;
     }
-    assert(next_removed == indices.size());
+    assert(next_removed == view_indices.size());
     pages.erase(pages.begin() + kept, pages.end());
-    lines.erase(lines.begin() + kept, lines.begin() + kept + indices.size());
-    density.erase(density.begin() + kept * mass_heads, density.begin() + (kept + indices.size()) * mass_heads);
+    indices.erase(indices.begin() + kept, indices.end());
+    lines.erase(lines.begin() + kept, lines.begin() + kept + view_indices.size());
+    density.erase(density.begin() + kept * mass_heads, density.begin() + (kept + view_indices.size()) * mass_heads);
     return removed;
 }
 
@@ -250,6 +267,7 @@ scheduler::sequence::sequence(
   table(
       at::zeros({static_cast<std::int64_t>(recurrent.size()), 0}, at::TensorOptions().dtype(at::kInt).device(device))
   ),
+  position_table(at::zeros_like(table)),
   eviction(to_pages(r.eviction, page_size)) {
     pending.insert(pending.end(), r.tokens.begin(), r.tokens.end());
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
@@ -262,6 +280,7 @@ scheduler::sequence::sequence(
         layer_view& view = layers[layer];
         for (const active_page& page : r.initial_state.layers[layer].pages) {
             view.pages.push_back(page.hash);
+            view.indices.push_back(page.index);
             if (page.density.empty()) {
                 view.density.resize(view.density.size() + view.mass_heads, 0.0f);
             } else {
@@ -269,10 +288,40 @@ scheduler::sequence::sequence(
             }
         }
     }
+    for (const layer_sequence& sequence : r.initial_state.layers) {
+        if (!sequence.pages.empty()) {
+            history_pages = sequence.pages.back().index + 1;
+        }
+    }
+    update_held();
 }
 
 std::size_t scheduler::sequence::next_index(std::size_t layer, std::size_t page_size) const noexcept {
     return layers[layer].pages.size() * page_size + tail.size();
+}
+
+std::size_t scheduler::sequence::next_position(std::size_t page_size) const noexcept {
+    return held.size() * page_size + tail.size();
+}
+
+std::size_t scheduler::sequence::page_position(std::size_t layer, std::size_t page, std::size_t page_size) const {
+    const layer_view& view = layers[layer];
+    if (page >= view.pages.size()) {
+        return (held.size() + page - view.pages.size()) * page_size;
+    }
+    auto rank = std::ranges::lower_bound(held, view.indices[page]) - held.begin();
+    return static_cast<std::size_t>(rank) * page_size;
+}
+
+void scheduler::sequence::update_held() {
+    held.clear();
+    for (std::size_t layer = 0; layer < layers.size(); layer++) {
+        if (!recurrent[layer]) {
+            held.insert(held.end(), layers[layer].indices.begin(), layers[layer].indices.end());
+        }
+    }
+    std::ranges::sort(held);
+    held.erase(std::ranges::unique(held).begin(), held.end());
 }
 
 bool scheduler::sequence::may_sample() const noexcept {
@@ -295,9 +344,19 @@ std::size_t scheduler::sequence::advance(std::size_t count, std::size_t page_siz
     );
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
         if (!recurrent[layer]) {
-            layers[layer].pages.insert(layers[layer].pages.end(), completed.begin(), completed.end());
+            layer_view& view = layers[layer];
+            view.pages.insert(view.pages.end(), completed.begin(), completed.end());
+            for (std::size_t i = 0; i < completed.size(); i++) {
+                view.indices.push_back(history_pages + i);
+            }
         }
     }
+    if (std::ranges::contains(recurrent, false)) {
+        for (std::size_t i = 0; i < completed.size(); i++) {
+            held.push_back(history_pages + i);
+        }
+    }
+    history_pages += completed.size();
     head = completed.back();
     tail.erase(tail.begin(), tail.begin() + completed_tokens);
     return completed.size();
@@ -329,28 +388,37 @@ std::size_t scheduler::sequence::table_width() const noexcept {
     return width;
 }
 
-void scheduler::sequence::upload_table(std::size_t first_page, cudaStream_t stream) {
+void scheduler::sequence::upload_table(std::size_t first_page, std::size_t page_size, cudaStream_t stream) {
     auto n_layers = static_cast<std::int64_t>(layers.size());
     auto page_count = static_cast<std::int64_t>(table_width());
     if (table.size(1) < page_count) {
         std::int64_t capacity = std::max<std::int64_t>(page_count, 2 * table.size(1));
         table = at::empty({n_layers, capacity}, table.options());
+        position_table = at::empty_like(table);
         first_page = 0;
     }
     auto first = static_cast<std::int64_t>(first_page);
     if (first == page_count) {
         return;
     }
-    at::Tensor host = pinned({n_layers, page_count - first}, at::kInt);
-    auto* entries = host.mutable_data_ptr<std::int32_t>();
-    for (const layer_view& view : layers) {
+    at::Tensor host_lines = pinned({n_layers, page_count - first}, at::kInt);
+    at::Tensor host_positions = pinned({n_layers, page_count - first}, at::kInt);
+    auto* line_entries = host_lines.mutable_data_ptr<std::int32_t>();
+    auto* position_entries = host_positions.mutable_data_ptr<std::int32_t>();
+    for (std::size_t layer = 0; layer < layers.size(); layer++) {
+        const layer_view& view = layers[layer];
         for (std::int64_t page = first; page < page_count; page++) {
             auto index = static_cast<std::size_t>(page);
-            *entries++ = index < view.lines.size() ? static_cast<std::int32_t>(view.lines[index]) : 0;
+            bool used = index < view.lines.size();
+            *line_entries++ = used ? static_cast<std::int32_t>(view.lines[index]) : 0;
+            *position_entries++ = used && !recurrent[layer]
+                ? static_cast<std::int32_t>(page_position(layer, index, page_size))
+                : 0;
         }
     }
     c10::cuda::CUDAStreamGuard guard(c10::cuda::getStreamFromExternal(stream, table.device().index()));
-    table.narrow(1, first, page_count - first).copy_(host, /*non_blocking=*/true);
+    table.narrow(1, first, page_count - first).copy_(host_lines, /*non_blocking=*/true);
+    position_table.narrow(1, first, page_count - first).copy_(host_positions, /*non_blocking=*/true);
 }
 
 std::size_t scheduler::sequence::cycle_lines(std::size_t page_size) const noexcept {
@@ -426,36 +494,30 @@ GroupBatch scheduler::batch::make_group(std::span<const entry> group, std::size_
     auto n_kv_layers = static_cast<std::int64_t>(n_layers);
     GroupBatch g{
         .tokens = pinned({n_tokens}, at::kLong),
-        .pos = pinned({n_kv_layers, n_tokens}, at::kLong),
-        .rope_layout = pinned({n_seqs, 3}, at::kInt),
+        .pos = pinned({n_tokens}, at::kLong),
     };
     at::Tensor key_counts = pinned({n_kv_layers, n_seqs}, at::kInt);
     at::Tensor query_starts = pinned({n_seqs + 1}, at::kInt);
 
     auto* tokens = g.tokens.mutable_data_ptr<std::int64_t>();
     auto* positions = g.pos.mutable_data_ptr<std::int64_t>();
-    auto* rope_layout = g.rope_layout.mutable_data_ptr<std::int32_t>();
     auto* key_count = key_counts.mutable_data_ptr<std::int32_t>();
     auto* query_start = query_starts.mutable_data_ptr<std::int32_t>();
     std::size_t first_row = 0;
     query_start[0] = 0;
     for (std::size_t s = 0; s < group.size(); s++) {
         const sequence& seq = *group[s].seq;
+        std::size_t first_position = seq.next_position(page_size);
         for (std::size_t i = 0; i < group[s].token_count; i++) {
             tokens[first_row + i] = seq.pending[i];
+            positions[first_row + i] = static_cast<std::int64_t>(first_position + i);
         }
         for (std::size_t layer = 0; layer < n_layers; layer++) {
             std::size_t start = seq.next_index(layer, page_size);
-            for (std::size_t i = 0; i < group[s].token_count; i++) {
-                positions[layer * token_count + first_row + i] = static_cast<std::int64_t>(start + i);
-            }
             key_count[layer * group.size() + s] = static_cast<std::int32_t>(start + group[s].token_count);
         }
         first_row += group[s].token_count;
         query_start[s + 1] = static_cast<std::int32_t>(first_row);
-        rope_layout[3 * s] = 0;
-        rope_layout[3 * s + 1] = 0;
-        rope_layout[3 * s + 2] = -1;
     }
     g.key_counts = key_counts;
     if (prefill) {
@@ -498,11 +560,11 @@ bool scheduler::batch::measures_mass(std::span<const entry> group) noexcept {
     return std::ranges::any_of(group, [](const entry& e) { return e.seq->eviction.can_evict(); });
 }
 
-at::Tensor scheduler::batch::page_tables(std::span<const entry> group, std::size_t n_kv_layers) {
+at::Tensor scheduler::batch::page_tables(std::span<const entry> group, std::size_t n_kv_layers, bool positions) {
     std::vector<at::Tensor> tables;
     std::size_t width = 0;
     for (const entry& e : group) {
-        tables.push_back(e.seq->table);
+        tables.push_back(positions ? e.seq->position_table : e.seq->table);
         width = std::max(width, e.seq->table_width());
     }
     return gather_page_tables_cuda(tables, static_cast<std::int64_t>(n_kv_layers), static_cast<std::int64_t>(width));
@@ -521,14 +583,16 @@ void scheduler::batch::enqueue(
     at::Tensor decode_on_device, prefill_on_device;
     if (inputs.decode) {
         on_device.decode = to_device(*inputs.decode, device);
-        on_device.decode->page_tables = page_tables(all.first(decode_count), lines.size());
+        on_device.decode->page_tables = page_tables(all.first(decode_count), lines.size(), false);
+        on_device.decode->page_positions = page_tables(all.first(decode_count), lines.size(), true);
         if (inputs.decode->cu_view_pages.defined()) {
             decode_on_device = zero_page_mass(*on_device.decode, inputs.decode->cu_view_pages, mass_heads);
         }
     }
     if (inputs.prefill) {
         on_device.prefill = to_device(*inputs.prefill, device);
-        on_device.prefill->page_tables = page_tables(all.subspan(decode_count), lines.size());
+        on_device.prefill->page_tables = page_tables(all.subspan(decode_count), lines.size(), false);
+        on_device.prefill->page_positions = page_tables(all.subspan(decode_count), lines.size(), true);
         const at::Tensor& cu_seqlens_q = on_device.prefill->cu_seqlens_q;
         on_device.prefill->logit_rows = cu_seqlens_q.narrow(0, 1, cu_seqlens_q.size(0) - 1).to(at::kLong) - 1;
         if (inputs.prefill->cu_view_pages.defined()) {
@@ -668,7 +732,7 @@ task<void> scheduler::submit(request r, result_writer writer) {
         writer.end(std::unexpected(taken.error() == page_error::miss ? request_error::miss : request_error::oom));
         co_return;
     }
-    seq.upload_table(0, stream);
+    seq.upload_table(0, page_size, stream);
 
     seq.exit_event.emplace();
     running.push_back(&seq);
@@ -906,6 +970,7 @@ task<void> scheduler::write_back(batch& b) {
         }
         std::optional<std::size_t> first_stale_page;
         if (views_changed) {
+            seq.update_held();
             first_stale_page = 0;
         }
         std::vector<std::size_t> missing = seq.missing_lines(page_size);
@@ -924,7 +989,7 @@ task<void> scheduler::write_back(batch& b) {
             }
         }
         if (first_stale_page) {
-            seq.upload_table(*first_stale_page, stream);
+            seq.upload_table(*first_stale_page, page_size, stream);
         }
     }
 
@@ -946,7 +1011,9 @@ bool scheduler::end_cycle(sequence& seq) {
                 continue;
             }
             layer_view& view = seq.layers[layer];
-            double threshold = max_context_pages ? density_threshold(seq.eviction.eviction_target, heads, *max_context_pages) : 0.0;
+            double threshold = max_context_pages
+                ? density_threshold(seq.eviction.eviction_target, heads, *max_context_pages)
+                : 0.0;
             std::vector<std::size_t> pages = pages_to_evict(
                 std::span(view.density).first(view.pages.size() * heads),
                 heads,
@@ -971,14 +1038,20 @@ state scheduler::reached(const sequence& seq) const {
         std::vector<active_page>& pages = s.layers[layer].pages;
         if (recurrent[layer]) {
             if (seq.head) {
-                pages.push_back(active_page{.hash = *seq.head});
+                pages.push_back(active_page{.hash = *seq.head, .index = seq.history_pages - 1});
             }
             continue;
         }
         const layer_view& view = seq.layers[layer];
         for (std::size_t page = passed_pages(layer, view.pages.size() * page_size); page < view.pages.size(); page++) {
             auto density = std::span(view.density).subspan(page * view.mass_heads, view.mass_heads);
-            pages.push_back(active_page{.hash = view.pages[page], .density = {density.begin(), density.end()}});
+            pages.push_back(
+                active_page{
+                    .hash = view.pages[page],
+                    .index = view.indices[page],
+                    .density = {density.begin(), density.end()},
+                }
+            );
         }
     }
     return s;
@@ -993,6 +1066,7 @@ void scheduler::validate_state(const state& s) const {
             std::format("the state holds {} sequences for {} KV layers", s.layers.size(), cache.layer_count())
         );
     }
+    std::optional<std::size_t> head_index;
     for (std::size_t layer = 0; layer < s.layers.size(); layer++) {
         std::span<const active_page> pages = s.layers[layer].pages;
         std::size_t heads = mass_heads[layer];
@@ -1015,6 +1089,19 @@ void scheduler::validate_state(const state& s) const {
             throw std::invalid_argument(
                 std::format("the sequence of KV layer {} must end with the state's head", layer)
             );
+        }
+        for (std::size_t page = 1; page < pages.size(); page++) {
+            if (pages[page].index <= pages[page - 1].index) {
+                throw std::invalid_argument(
+                    std::format("the page indices of KV layer {} must ascend in view order", layer)
+                );
+            }
+        }
+        if (!pages.empty() && pages.back().index != head_index.value_or(pages.back().index)) {
+            throw std::invalid_argument("every KV layer's sequence must give the head the same index");
+        }
+        if (!pages.empty()) {
+            head_index = pages.back().index;
         }
         std::size_t max_pages = std::numeric_limits<std::size_t>::max();
         if (recurrent[layer]) {

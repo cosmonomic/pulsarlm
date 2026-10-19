@@ -270,10 +270,12 @@ pulsarlm::GroupBatch step(
     auto key_count = int32_cuda({static_cast<std::int32_t>(last)}).expand({n_kv_layers, 1}).contiguous();
     pulsarlm::GroupBatch g{
         .tokens = tokens.narrow(0, first, last - first),
-        .pos = at::arange(first, last, cuda(at::kLong)).expand({n_kv_layers, -1}).contiguous(),
+        .pos = at::arange(first, last, cuda(at::kLong)),
         .page_tables = int32_cuda(rows).view({n_kv_layers, 1, -1}),
         .page_end_tokens = int32_cuda({static_cast<std::int32_t>(page_end > first ? page_end - first : 0)}),
-        .rope_layout = int32_cuda({0, 0, -1}).view({1, 3}),
+        .page_positions = (at::arange(static_cast<std::int64_t>(rows.size()) / n_kv_layers, cuda(at::kInt)) * page_size)
+                              .expand({n_kv_layers, 1, -1})
+                              .contiguous(),
     };
     g.key_counts = key_count;
     if (prefill) {

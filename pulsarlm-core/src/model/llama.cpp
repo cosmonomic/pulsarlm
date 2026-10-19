@@ -64,7 +64,7 @@ LlamaModel::attention(const at::Tensor& h, std::int64_t layer, const GroupBatch&
     const dense_config& c = config;
     const std::int64_t ntok = h.size(0);
 
-    at::Tensor q = rope_q(at::linear(h, w.q_proj), g.pos.select(0, layer), c.n_heads, c.head_dim, c.rope);
+    at::Tensor q = rope_q(at::linear(h, w.q_proj), g.pos, c.n_heads, c.head_dim, c.rope);
     at::Tensor k = at::linear(h, w.k_proj).view({ntok, c.n_kv_heads, c.head_dim}).contiguous();
     at::Tensor v = at::linear(h, w.v_proj).view({ntok, c.n_kv_heads, c.head_dim}).contiguous();
     at::Tensor o = paged_attention(

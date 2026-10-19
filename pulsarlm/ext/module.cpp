@@ -134,10 +134,11 @@ PYBIND11_MODULE(pulsarlm_core, m) {
 
     py::class_<active_page>(m, "ActivePage")
         .def(
-            py::init([](const py::bytes& hash, std::vector<float> density) {
-                return active_page{.hash = digest_from_bytes(hash), .density = std::move(density)};
+            py::init([](const py::bytes& hash, std::size_t index, std::vector<float> density) {
+                return active_page{.hash = digest_from_bytes(hash), .index = index, .density = std::move(density)};
             }),
             "hash"_a,
+            "index"_a,
             "density"_a = std::vector<float>{}
         )
         .def_property(
@@ -145,6 +146,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             [](const active_page& p) { return to_bytes(p.hash); },
             [](active_page& p, const py::bytes& hash) { p.hash = digest_from_bytes(hash); }
         )
+        .def_readwrite("index", &active_page::index)
         .def_readwrite("density", &active_page::density)
         .def(py::self == py::self);
 

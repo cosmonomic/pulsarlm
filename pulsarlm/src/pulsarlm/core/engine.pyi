@@ -22,13 +22,15 @@ class PageStore(Protocol):
     ) -> None: ...
 
 class ActivePage:
-    """A page of a sequence: its 16-byte hash and its eviction density in each
-    query head its layer measures mass in, 0 for a page never measured. A state the
-    engine reaches holds one per head; an initial state may hold none."""
+    """A page of a sequence: its 16-byte hash, its index among the history's full
+    pages, and its eviction density in each query head its layer measures mass in,
+    0 for a page never measured. A state the engine reaches holds one per head; an
+    initial state may hold none."""
 
     hash: bytes
+    index: int
     density: list[float]
-    def __init__(self, hash: bytes, density: list[float] = ...) -> None: ...
+    def __init__(self, hash: bytes, index: int, density: list[float] = ...) -> None: ...
 
 class LayerSequence:
     """One KV layer's active pages, in view order."""

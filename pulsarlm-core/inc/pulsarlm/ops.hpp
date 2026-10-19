@@ -111,14 +111,11 @@ std::optional<std::string> attention_unsupported_reason(
 // of the pools, laid out as write_kv_cuda's. Key j of sequence s lives at slot j % page_size of line
 // page_tables[s][j / page_size], and a line may appear in several views.
 //
-// The pools hold unrotated keys. The ops rotate key j of sequence s to the RoPE position rope_layout[s] gives index j,
-// in the rotate_half convention with the frequencies rope states. k_norm_weight, when given, is fp32 [head_dim] and
-// multiplies each stored key before rotation. rope_layout is int32 [num_seqs, 3] holding {n_sink, working_lo,
-// short_offset}:
-//   j < n_sink                 -> j
-//   n_sink <= j < working_lo   -> short_offset
-//   j >= working_lo            -> short_offset + 1 + j - working_lo
-// so {0, 0, -1} is the identity. Queries arrive rotated to the position of their own view index under the same layout.
+// The pools hold unrotated keys. The ops rotate key j of sequence s to the RoPE position
+// page_positions[s][j / page_size] + j % page_size, in the rotate_half convention with the frequencies rope states.
+// page_positions is int32 [num_seqs, max_pages], laid out as page_tables. k_norm_weight, when given, is fp32 [head_dim]
+// and multiplies each stored key before rotation. Queries arrive rotated to their own positions, which the caller
+// gives under the same page positions.
 //
 // sliding_window, when given, limits the query at view index p to the keys [max(0, p - sliding_window + 1), p]. The
 // ops read no page table entry whose page lies wholly before the window of the sequence's first query, so those
@@ -144,7 +141,7 @@ at::Tensor attn_decode_cuda(
     const at::Tensor& v_pool,
     const at::Tensor& page_tables,
     const at::Tensor& context_lens,
-    const at::Tensor& rope_layout,
+    const at::Tensor& page_positions,
     const rope_parameters& rope,
     double scale,
     std::optional<int64_t> sliding_window,
@@ -166,7 +163,7 @@ at::Tensor attn_prefill_cuda(
     const at::Tensor& page_tables,
     const at::Tensor& cu_seqlens_q,
     const at::Tensor& seqlens_k,
-    const at::Tensor& rope_layout,
+    const at::Tensor& page_positions,
     const rope_parameters& rope,
     double scale,
     std::optional<int64_t> sliding_window,
@@ -188,7 +185,7 @@ at::Tensor attn_indexed_cuda(
     const at::Tensor& page_tables,
     const at::Tensor& cu_seqlens_q,
     const at::Tensor& seqlens_k,
-    const at::Tensor& rope_layout,
+    const at::Tensor& page_positions,
     const rope_parameters& rope,
     double scale,
     const at::Tensor& selected,
@@ -201,13 +198,13 @@ at::Tensor attn_indexed_cuda(
 // QSA's blocks [sequences, max_blocks, dim] in index_keys' dtype: block b of sequence s is the mean, in fp32 and
 // rounded, of the raw keys [b * ratio, (b + 1) * ratio) of its view, then its RMSNorm by norm_weight (fp32, 1 + weight)
 // as rmsnorm_cuda computes it, then Hugging Face's partial RoPE of its first 2 * inv_freq.size(0) dims at the position
-// rope_layout[s] gives key b * ratio (see attn_decode_cuda), cos and sin rounded to the dtype. index_keys is [lines,
-// page_size, dim] with each line packed, page_tables int32 [sequences, max_pages] whose view keys are max_pages *
-// page_size, and ratio divides the page size.
+// page_positions gives key b * ratio (see attn_decode_cuda), cos and sin rounded to the dtype. index_keys is [lines,
+// page_size, dim] with each line packed, page_tables and page_positions int32 [sequences, max_pages] whose view keys
+// are max_pages * page_size, and ratio divides the page size.
 at::Tensor index_blocks_cuda(
     const at::Tensor& index_keys,
     const at::Tensor& page_tables,
-    const at::Tensor& rope_layout,
+    const at::Tensor& page_positions,
     const at::Tensor& norm_weight,
     const at::Tensor& inv_freq,
     int64_t ratio,

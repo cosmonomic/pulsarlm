@@ -40,7 +40,7 @@ rotate_view_keys_kernel(const attn::PagedAttnParams<scalar_t> p, int page_size, 
     const int half = p.head_dim / 2;
     const int pairs_per_key = p.n_kv_heads * half;
     const int64_t page_elems = static_cast<int64_t>(page_size) * p.n_kv_heads * p.head_dim;
-    const attn::KeyLayout layout = attn::key_layout(p.rope_layout, s);
+    const attn::KeyPositions layout = attn::key_positions(p, s, page_size);
     const int line = p.page_tables[static_cast<int64_t>(s) * p.max_pages + view_page];
     const scalar_t* src = p.k_pool + line * p.page_stride;
     scalar_t* dst = rotated_k + blockIdx.x * page_elems;
@@ -144,7 +144,7 @@ at::Tensor attn_prefill_cuda(
     const at::Tensor& page_tables,
     const at::Tensor& cu_seqlens_q,
     const at::Tensor& seqlens_k,
-    const at::Tensor& rope_layout,
+    const at::Tensor& page_positions,
     const rope_parameters& rope,
     double scale,
     std::optional<int64_t> sliding_window,
@@ -161,7 +161,7 @@ at::Tensor attn_prefill_cuda(
         page_tables,
         cu_seqlens_q,
         seqlens_k,
-        rope_layout,
+        page_positions,
         rope,
         scale,
         sliding_window,

@@ -80,7 +80,7 @@ __global__ void attn_indexed_scalar_kernel(const attn::PagedAttnParams<scalar_t>
     const int seq_q = p.cu_seqlens_q[s + 1] - q0;
     const int ctx_len = p.seqlens_k[s];
     const int query_pos = ctx_len - seq_q + (qtok - q0);
-    const attn::KeyLayout layout = attn::key_layout(p.rope_layout, s);
+    const attn::KeyPositions layout = attn::key_positions(p, s, PAGE_SIZE);
     const int32_t* seq_table = p.page_tables + static_cast<int64_t>(s) * p.max_pages;
 
     // Dynamic shared: [ qsh(head_dim) | out_acc(head_dim) | red(kThreads) ]
@@ -218,7 +218,7 @@ __global__ void rotate_indexed_keys_kernel(
     const int half = p.head_dim / 2;
     const int pairs_per_key = p.n_kv_heads * half;
     const int64_t page_elems = static_cast<int64_t>(page_size) * p.n_kv_heads * p.head_dim;
-    const attn::KeyLayout layout = attn::key_layout(p.rope_layout, s);
+    const attn::KeyPositions layout = attn::key_positions(p, s, page_size);
     const int line = p.page_tables[static_cast<int64_t>(s) * p.max_pages + view_page];
     const scalar_t* src = p.k_pool + line * p.page_stride;
     scalar_t* dst = rotated_k + blockIdx.x * page_elems;
@@ -582,7 +582,7 @@ at::Tensor attn_indexed_cuda(
     const at::Tensor& page_tables,
     const at::Tensor& cu_seqlens_q,
     const at::Tensor& seqlens_k,
-    const at::Tensor& rope_layout,
+    const at::Tensor& page_positions,
     const rope_parameters& rope,
     double scale,
     const at::Tensor& selected,
@@ -599,7 +599,7 @@ at::Tensor attn_indexed_cuda(
         page_tables,
         cu_seqlens_q,
         seqlens_k,
-        rope_layout,
+        page_positions,
         rope,
         scale,
         std::nullopt,

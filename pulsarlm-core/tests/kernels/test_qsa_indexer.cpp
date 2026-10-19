@@ -60,14 +60,14 @@ TEST_CASE("index_blocks_cuda pools, norms and ropes each view block", "[ops][cud
     const int64_t lines = 6, max_pages = 3;
     auto index_keys = at::randn({lines, kPageSize, kDim}, opts);
     auto page_tables = int32_cuda({4, 1, 5, 2, 0, 3}).view({2, max_pages});
-    // The second view compacts the keys [16, 32) onto position 20.
-    auto rope_layout = int32_cuda({0, 0, -1, 16, 32, 20}).view({2, 3});
+    // The second view's pages sit at positions with gaps between them.
+    auto page_positions = int32_cuda({0, 16, 32, 0, 48, 112}).view({2, max_pages});
     auto norm_weight = (1.0 + 0.1 * at::randn({kDim})).to(at::kCUDA);
 
     at::Tensor blocks = pulsarlm::index_blocks_cuda(
         index_keys,
         page_tables,
-        rope_layout,
+        page_positions,
         norm_weight,
         inv_freq(),
         kRatio,
@@ -79,9 +79,8 @@ TEST_CASE("index_blocks_cuda pools, norms and ropes each view block", "[ops][cud
     auto pooled = keys.to(at::kFloat).mean(2).to(dtype).to(at::kFloat);
     auto normed = (pooled * at::rsqrt(pooled.pow(2).mean(-1, true) + kEps) * norm_weight).to(dtype);
     auto first_keys = at::arange(max_blocks, at::device(at::kCUDA).dtype(at::kLong)) * kRatio;
-    auto positions = at::stack(
-        {first_keys, at::where(first_keys < 16, first_keys, at::where(first_keys < 32, 20, 21 + first_keys - 32))}
-    );
+    auto positions = page_positions.to(at::kLong).index_select(1, at::floor_divide(first_keys, kPageSize)) +
+        at::remainder(first_keys, kPageSize);
     auto expected = reference_rope(normed, positions);
     const double tolerance = dtype == at::kFloat ? 1e-5 : 1e-2;
     CHECK(at::allclose(blocks.to(at::kFloat), expected.to(at::kFloat), tolerance, tolerance));

@@ -36,7 +36,7 @@ struct Batch {
     at::Tensor page_tables;
     at::Tensor cu_seqlens_q;
     at::Tensor seqlens_k;
-    at::Tensor rope_layout;
+    at::Tensor page_positions;
     at::Tensor cu_view_pages;
     // Query row r of a view of seq_q queries weighs kAlpha * (1 - kAlpha)^(seq_q - 1 - r).
     std::vector<double> weights;
@@ -58,7 +58,9 @@ Batch make_batch(int64_t page_size) {
     b.page_tables = int32_cuda(tables).view({num_seqs, kMaxPages});
     b.cu_seqlens_q = int32_cuda(cu_q);
     b.seqlens_k = int32_cuda(seqlens);
-    b.rope_layout = int32_cuda({0, 0, -1}).repeat({num_seqs, 1});
+    b.page_positions = (at::arange(kMaxPages, b.page_tables.options()) * page_size)
+                           .expand_as(b.page_tables)
+                           .contiguous();
     b.cu_view_pages = int32_cuda(cu_view);
     for (const View& view : b.views) {
         for (int64_t r = 0; r < view.seq_q; ++r) {
@@ -204,7 +206,7 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
         b.page_tables,
         b.cu_seqlens_q,
         b.seqlens_k,
-        b.rope_layout,
+        b.page_positions,
         rope,
         scale,
         selection,
@@ -228,7 +230,7 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
         b.page_tables,
         b.cu_seqlens_q,
         b.seqlens_k,
-        b.rope_layout,
+        b.page_positions,
         rope,
         scale,
         std::nullopt,
@@ -245,7 +247,7 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
         b.page_tables,
         b.cu_seqlens_q,
         b.seqlens_k,
-        b.rope_layout,
+        b.page_positions,
         rope,
         scale,
         full_selection(b, words),

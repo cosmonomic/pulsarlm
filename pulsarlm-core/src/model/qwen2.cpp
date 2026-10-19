@@ -66,8 +66,7 @@ Qwen2Model::attention(const at::Tensor& h, std::int64_t layer, const GroupBatch&
     const dense_config& c = config;
     const std::int64_t ntok = h.size(0);
 
-    at::Tensor
-        q = rope_q(at::linear(h, w.q_proj, w.q_proj_bias), g.pos.select(0, layer), c.n_heads, c.head_dim, c.rope);
+    at::Tensor q = rope_q(at::linear(h, w.q_proj, w.q_proj_bias), g.pos, c.n_heads, c.head_dim, c.rope);
     at::Tensor k = at::linear(h, w.k_proj, w.k_proj_bias).view({ntok, c.n_kv_heads, c.head_dim}).contiguous();
     at::Tensor v = at::linear(h, w.v_proj, w.v_proj_bias).view({ntok, c.n_kv_heads, c.head_dim}).contiguous();
     at::Tensor o = paged_attention(

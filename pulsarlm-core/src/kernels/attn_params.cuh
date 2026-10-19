@@ -11,8 +11,8 @@
 // they share: a key's RoPE position in its sequence's view, its rotation, and its page's
 // row in the mass output.
 //
-// The pool holds UNROTATED keys. A key's position is a function of its index j in the
-// sequence's view (page table order) alone, so a line shared by several views takes
+// The pool holds UNROTATED keys. A key's position is its view page's entry in
+// page_positions plus its offset in the page, so a line shared by several views takes
 // each view's own position, and the kernels rotate every key as they read it. Queries
 // arrive already rotated.
 
@@ -32,7 +32,7 @@ template <typename scalar_t> struct PagedAttnParams {
     const int32_t* page_tables;  // [num_seqs, max_pages]
     const int32_t* cu_seqlens_q;  // [num_seqs + 1]; null when each sequence has one query
     const int32_t* seqlens_k;  // [num_seqs]
-    const int32_t* rope_layout;  // [num_seqs, 3], see KeyLayout
+    const int32_t* page_positions;  // [num_seqs, max_pages]: each view page's first RoPE position
     const uint64_t* rope_turns;  // [head_dim / 2], see rope_turns_per_position
     const float* k_norm_weight;  // [head_dim] or null
     // [total_view_pages, n_q_heads]; null measures no mass. The kernels leave each attended page's S there, the sum
@@ -73,30 +73,19 @@ stored_key_pair(const PagedAttnParams<scalar_t>& p, const scalar_t* key, int pai
     hi = stored_key(p, key[pair + half], pair + half);
 }
 
-// The RoPE position of key index j in one sequence's view:
-//   j < n_sink                 -> j
-//   n_sink <= j < working_lo   -> short_offset
-//   j >= working_lo            -> short_offset + 1 + j - working_lo
-// {0, 0, -1} is the identity.
-struct KeyLayout {
-    int n_sink;
-    int working_lo;
-    int short_offset;
+// The RoPE positions of one sequence's keys by their view index.
+struct KeyPositions {
+    const int32_t* page_positions;
+    int page_size;
 
     __device__ __forceinline__ int position(int j) const {
-        if (j < this->n_sink) {
-            return j;
-        }
-        if (j < this->working_lo) {
-            return this->short_offset;
-        }
-        return this->short_offset + 1 + j - this->working_lo;
+        return this->page_positions[j / this->page_size] + j % this->page_size;
     }
 };
 
-__device__ __forceinline__ KeyLayout key_layout(const int32_t* rope_layout, int s) {
-    const int32_t* row = rope_layout + 3 * static_cast<int64_t>(s);
-    return KeyLayout{row[0], row[1], row[2]};
+template <typename scalar_t>
+__device__ __forceinline__ KeyPositions key_positions(const PagedAttnParams<scalar_t>& p, int s, int page_size) {
+    return KeyPositions{p.page_positions + static_cast<int64_t>(s) * p.max_pages, page_size};
 }
 
 // cos/sin of the RoPE angle position * turns_per_position, rounded to fp32.

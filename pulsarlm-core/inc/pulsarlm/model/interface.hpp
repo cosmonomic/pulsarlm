@@ -43,11 +43,12 @@ struct kv {
 };
 
 // The tokens of one group of a step, concatenated across the group's sequences, and where they sit. Every KV layer has
-// its own view of each sequence: a new token is written into its view page's line, at its view index. A prefill group
-// carries cu_seqlens_q; a decode group, whose sequences forward one token each, leaves it undefined.
+// its own view of each sequence: a new token is written into its view page's line, at its view index. A token's RoPE
+// position is the same in every KV layer. A prefill group carries cu_seqlens_q; a decode group, whose sequences forward
+// one token each, leaves it undefined.
 struct GroupBatch {
     at::Tensor tokens;
-    // int64 [n_kv_layers, ntok]: each token's view index in KV layer l's view.
+    // int64 [ntok]: each token's RoPE position.
     at::Tensor pos;
     // int32 [n_kv_layers, num_seqs, max_pages]: the lines of sequence s's view pages in KV layer l. A recurrent layer's
     // row holds the line whose state the forward starts from and updates in place, then the line it writes the state
@@ -60,9 +61,9 @@ struct GroupBatch {
     at::Tensor cu_seqlens_q;
     // int32 [n_kv_layers, num_seqs]: the keys in sequence s's view in KV layer l, the group's tokens included.
     at::Tensor key_counts;
-    // int32 [num_seqs, 3]: the RoPE position of each key by its view index (see attn_decode_cuda). pos holds each
-    // query's position under the same layout.
-    at::Tensor rope_layout;
+    // int32 [n_kv_layers, num_seqs, max_pages], laid out as page_tables: the RoPE position of the first key of sequence
+    // s's view pages in KV layer l (see attn_decode_cuda).
+    at::Tensor page_positions;
     // int32 [n_kv_layers, num_seqs + 1], defined when the forward measures attention mass: sequence s's view pages in
     // KV layer l are the rows [cu_view_pages[l, s], cu_view_pages[l, s + 1]) of page_mass[l], at least as many as its
     // keys fill.

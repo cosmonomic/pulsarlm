@@ -57,8 +57,9 @@ at::Tensor fp32_cuda(const std::vector<float>& v) {
 }
 
 // {0, 0, -1} per sequence: every key at its own view index.
-at::Tensor identity_layout(int64_t num_seqs) {
-    return int32_cuda({0, 0, -1}).repeat({num_seqs, 1});
+// Each view page's position in a view laid out contiguously: its view index times the page size.
+at::Tensor identity_positions(const at::Tensor& page_tables, int64_t page_size = kPageSize) {
+    return (at::arange(page_tables.size(1), page_tables.options()) * page_size).expand_as(page_tables).contiguous();
 }
 
 // A key pool of num_pages zeroed pages. Every score is q.k == 0 at any rotation, so a
@@ -131,7 +132,7 @@ at::Tensor prefill(
         page_tables,
         cu_seqlens_q,
         seqlens_k,
-        identity_layout(seqlens_k.size(0)),
+        identity_positions(page_tables),
         pulsarlm::rope_parameters{.theta = kTheta},
         kScale,
         std::nullopt,
@@ -158,7 +159,7 @@ at::Tensor decode(
         v_pool,
         page_tables,
         context_lens,
-        identity_layout(context_lens.size(0)),
+        identity_positions(page_tables),
         pulsarlm::rope_parameters{.theta = kTheta},
         kScale,
         std::nullopt,
@@ -255,25 +256,19 @@ TEST_CASE("decode mass is the query's weight times its share of each page", "[op
 
 namespace {
 
-// One sequence of the shared-line case: its view over the pool and its RoPE layout.
+// One sequence of the shared-line case: its view over the pool and its pages' positions.
 struct View {
     std::vector<int32_t> lines;
     int64_t ctx;
     int64_t seq_q;  // prefill queries, the last seq_q view indices
-    std::array<int32_t, 3> layout;  // {n_sink, working_lo, short_offset}
+    std::vector<int32_t> page_positions;
 
     int64_t position(int64_t j) const {
-        if (j < this->layout[0]) {
-            return j;
-        }
-        if (j < this->layout[1]) {
-            return this->layout[2];
-        }
-        return this->layout[2] + 1 + j - this->layout[1];
+        return this->page_positions[j / kPageSize] + j % kPageSize;
     }
 };
 
-// ATen reference for one view: its keys rotated to their layout positions by
+// ATen reference for one view: its keys rotated to their page positions by
 // rope_rotate and rounded to the pool dtype as the kernels store them, then causal
 // softmax attention for the query rows at view indices [ctx - rows, ctx). Fills o
 // rows and adds each row's weights, at mass weight alpha * (1 - alpha)^(rows after it),
@@ -319,8 +314,8 @@ void reference_view(
 }  // namespace
 
 // Two views share line 2: a full page of the second view, the partial tail of the
-// first. The first view is laid out contiguously, the second compacted, so the shared
-// line's keys sit at different positions in each and must be rotated per view, and its
+// first. The first view's pages sit at contiguous positions, the second's with gaps, so
+// the shared line's keys sit at different positions in each and must be rotated per view, and its
 // mass must land in each view's own rows. The reference rotates the unrotated pool with
 // the ATen rope_rotate.
 TEST_CASE("views sharing a line rotate and accumulate apart", "[ops][cuda]") {
@@ -329,24 +324,24 @@ TEST_CASE("views sharing a line rotate and accumulate apart", "[ops][cuda]") {
     }
     const int64_t n_q = 4, n_kv = 2, num_lines = 3;
     const std::vector<View> views = {
-        View{{0, 2}, kPageSize + 5, 5, {0, 0, -1}},
-        View{{1, 2, 0}, 2 * kPageSize + 7, 20, {4, 2 * kPageSize + 7 - 18, 6}},
+        View{{0, 2}, kPageSize + 5, 5, {0, kPageSize, 2 * kPageSize}},
+        View{{1, 2, 0}, 2 * kPageSize + 7, 20, {0, 3 * kPageSize, 5 * kPageSize}},
     };
     const double alpha = 0.5;
     const int64_t max_pages = 3, total_view_pages = 2 * max_pages;
 
     std::vector<int32_t> tables(views.size() * max_pages, 0);
-    std::vector<int32_t> layouts, seqlens, cu_q{0}, cu_view;
+    std::vector<int32_t> positions, seqlens, cu_q{0}, cu_view;
     for (size_t s = 0; s < views.size(); ++s) {
         std::copy(views[s].lines.begin(), views[s].lines.end(), tables.begin() + s * max_pages);
-        layouts.insert(layouts.end(), views[s].layout.begin(), views[s].layout.end());
+        positions.insert(positions.end(), views[s].page_positions.begin(), views[s].page_positions.end());
         seqlens.push_back(static_cast<int32_t>(views[s].ctx));
         cu_q.push_back(cu_q.back() + static_cast<int32_t>(views[s].seq_q));
         cu_view.push_back(static_cast<int32_t>(s * max_pages));
     }
     cu_view.push_back(static_cast<int32_t>(total_view_pages));
     auto page_tables = int32_cuda(tables).view({2, max_pages});
-    auto rope_layout = int32_cuda(layouts).view({2, 3});
+    auto page_positions = int32_cuda(positions).view({2, max_pages});
     auto seqlens_k = int32_cuda(seqlens);
     auto cu_seqlens_q = int32_cuda(cu_q);
     auto cu_view_pages = int32_cuda(cu_view);
@@ -402,7 +397,7 @@ TEST_CASE("views sharing a line rotate and accumulate apart", "[ops][cuda]") {
             page_tables,
             cu_seqlens_q,
             seqlens_k,
-            rope_layout,
+            page_positions,
             pulsarlm::rope_parameters{.theta = kTheta},
             kScale,
             std::nullopt,
@@ -422,7 +417,7 @@ TEST_CASE("views sharing a line rotate and accumulate apart", "[ops][cuda]") {
                 v_pool,
                 page_tables,
                 seqlens_k,
-                rope_layout,
+                page_positions,
                 pulsarlm::rope_parameters{.theta = kTheta},
                 kScale,
                 std::nullopt,
@@ -593,7 +588,7 @@ TEST_CASE(
                         }
                         cu_view.push_back(static_cast<int32_t>(views.size() * max_pages));
                         auto page_tables = int32_cuda(tables).view({static_cast<int64_t>(views.size()), max_pages});
-                        auto rope_layout = identity_layout(static_cast<int64_t>(views.size()));
+                        auto page_positions = identity_positions(page_tables, page_size);
                         auto seqlens_k = int32_cuda(seqlens);
                         auto cu_seqlens_q = int32_cuda(cu_q);
                         auto cu_view_pages = int32_cuda(cu_view);
@@ -684,7 +679,7 @@ TEST_CASE(
                                     page_tables,
                                     cu_seqlens_q,
                                     seqlens_k,
-                                    rope_layout,
+                                    page_positions,
                                     rope,
                                     scale,
                                     window,
@@ -704,7 +699,7 @@ TEST_CASE(
                                         v_pool,
                                         page_tables,
                                         seqlens_k,
-                                        rope_layout,
+                                        page_positions,
                                         rope,
                                         scale,
                                         window,
@@ -763,7 +758,7 @@ TEST_CASE("bfloat16 attention of a shape the tensor-core kernels lack fails inst
             pool,
             int32_cuda({0}).view({1, 1}),
             int32_cuda({4}),
-            identity_layout(1),
+            identity_positions(int32_cuda({0}).view({1, 1})),
             pulsarlm::rope_parameters{.theta = kTheta},
             kScale,
             std::nullopt,

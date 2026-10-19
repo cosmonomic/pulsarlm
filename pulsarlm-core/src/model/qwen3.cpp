@@ -67,7 +67,7 @@ Qwen3Model::attention(const at::Tensor& h, std::int64_t layer, const GroupBatch&
     const std::int64_t ntok = h.size(0);
 
     at::Tensor q = rmsnorm_cuda(at::linear(h, w.q_proj).view({ntok, c.n_heads, c.head_dim}), w.q_norm, c.rms_norm_eps);
-    q = rope_q(q.view({ntok, c.n_heads * c.head_dim}), g.pos.select(0, layer), c.n_heads, c.head_dim, c.rope);
+    q = rope_q(q.view({ntok, c.n_heads * c.head_dim}), g.pos, c.n_heads, c.head_dim, c.rope);
     at::Tensor k = rmsnorm_cuda(
         at::linear(h, w.k_proj).view({ntok, c.n_kv_heads, c.head_dim}),
         w.k_norm,

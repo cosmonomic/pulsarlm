@@ -52,7 +52,7 @@ template <typename scalar_t, int PAGE_SIZE> __global__ void attn_scalar_kernel(c
     const int first = first_key(p, query_pos);
     const int first_page = first / PAGE_SIZE;
     const int last_page = query_pos / PAGE_SIZE;
-    const KeyLayout layout = key_layout(p.rope_layout, s);
+    const KeyPositions layout = key_positions(p, s, PAGE_SIZE);
     const int32_t* seq_table = p.page_tables + static_cast<int64_t>(s) * p.max_pages;
     const float weight = p.mass ? p.mass_weights[qtok] : 0.0f;
 
@@ -180,7 +180,7 @@ PagedAttnBatch paged_attn_batch(
     const at::Tensor& page_tables,
     const std::optional<at::Tensor>& cu_seqlens_q,
     const at::Tensor& seqlens_k,
-    const at::Tensor& rope_layout,
+    const at::Tensor& page_positions,
     const rope_parameters& rope,
     double scale,
     std::optional<int64_t> sliding_window,
@@ -194,7 +194,7 @@ PagedAttnBatch paged_attn_batch(
 
     TORCH_CHECK(
         on_cuda(q) && on_cuda(k_pool) && on_cuda(v_pool) && on_cuda(page_tables) && on_cuda(seqlens_k) &&
-            on_cuda(rope_layout),
+            on_cuda(page_positions),
         op,
         ": all inputs must be CUDA tensors"
     );
@@ -231,9 +231,9 @@ PagedAttnBatch paged_attn_batch(
         ": page_tables must be int32 [num_seqs, max_pages]"
     );
     TORCH_CHECK(
-        int32_dims(rope_layout, 2) && rope_layout.size(0) == b.num_seqs && rope_layout.size(1) == 3,
+        int32_dims(page_positions, 2) && page_positions.sizes() == page_tables.sizes(),
         op,
-        ": rope_layout must be int32 [num_seqs, 3]"
+        ": page_positions must be int32 [num_seqs, max_pages], as page_tables"
     );
     if (cu_seqlens_q.has_value()) {
         TORCH_CHECK(
@@ -294,7 +294,7 @@ PagedAttnBatch paged_attn_batch(
     b.v_pool = v_pool;
     b.page_tables = page_tables.contiguous();
     b.seqlens_k = seqlens_k.contiguous();
-    b.rope_layout = rope_layout.contiguous();
+    b.page_positions = page_positions.contiguous();
     b.rope_turns = rope_turns_per_position(rope, b.head_dim, q.device());
     b.o = at::empty_like(b.q);
     return b;

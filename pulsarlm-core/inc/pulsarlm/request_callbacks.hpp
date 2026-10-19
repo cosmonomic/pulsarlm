@@ -11,10 +11,12 @@
 
 namespace pulsarlm {
 
-// A page of a sequence: its hash and its eviction density in each query head its layer measures mass in, 0 for a page
-// never measured. A state the scheduler reaches holds one per head; an initial state may hold none, which reads as 0.
+// A page of a sequence: its hash, its index among the history's full pages, and its eviction density in each query head
+// its layer measures mass in, 0 for a page never measured. A state the scheduler reaches holds one per head; an initial
+// state may hold none, which reads as 0.
 struct active_page {
     digest hash;
+    std::size_t index;
     std::vector<float> density;
 
     bool operator==(const active_page&) const = default;

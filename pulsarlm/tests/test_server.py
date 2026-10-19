@@ -295,7 +295,7 @@ def logging_eviction(log: Path, eviction: EvictionPolicy) -> Callable[[], Server
     def load_state() -> ServerState:
         state = load(stop_ids=[])
         state.eviction = eviction
-        state.eviction_log = EvictionLog(log, state.engine, eviction, None)
+        state.eviction_log = EvictionLog(log, eviction, None)
         return state
 
     return load_state
