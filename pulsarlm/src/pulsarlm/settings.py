@@ -15,4 +15,4 @@ class Settings:
     cycle_tokens: int
     n_working: int
     eviction_target: float
-    max_pages: int | None
+    max_context_window: int | None

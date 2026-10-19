@@ -809,7 +809,7 @@ TEST_CASE("a cycle's end evicts the pages below the bar outside the sink and wor
         {request{
             .tokens = prompt,
             .max_tokens = 2,
-            .eviction = {.n_sink = 1, .n_working = 1, .cycle_tokens = 16, .eviction_target = 0.5},
+            .eviction = {.n_sink = 4, .n_working = 4, .cycle_tokens = 16, .eviction_target = 0.5},
         }}
     );
 
@@ -839,7 +839,7 @@ TEST_CASE("a page's density carries over from the cycles before") {
             .tokens = prompt,
             .max_tokens = 2,
             .eviction =
-                {.n_sink = 1, .n_working = 1, .cycle_tokens = 8, .eviction_target = 0.5, .attention_mass_decay = 0.01},
+                {.n_sink = 4, .n_working = 4, .cycle_tokens = 8, .eviction_target = 0.5, .attention_mass_decay = 0.01},
         }}
     );
 
@@ -850,7 +850,8 @@ TEST_CASE("a page's density carries over from the cycles before") {
     REQUIRE((hashes_of(reached) == std::vector{chain[0], chain[1], chain[3]}));
     REQUIRE(densities_of(reached).size() == 3);
     REQUIRE(densities_of(reached)[0] == 0.0f);
-    REQUIRE(densities_of(reached)[1] == static_cast<float>(std::pow(0.99, 2)));
+    double page_decay = 1.0 - std::pow(0.99, static_cast<double>(page_size));
+    REQUIRE(densities_of(reached)[1] == static_cast<float>(std::pow(1.0 - page_decay, 2)));
     REQUIRE(densities_of(reached)[2] == 0.0f);
 }
 
@@ -858,13 +859,13 @@ TEST_CASE("a request resumes with the density of its initial state") {
     fixture f(16);
     f.model.important = [](std::size_t, std::int64_t token) { return token == 7; };
     token_list prompt{100, 101, 102, 103, 7, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114};
-    pulsarlm::eviction_policy policy{.n_sink = 1, .n_working = 1, .cycle_tokens = 4, .eviction_target = 0.5};
+    pulsarlm::eviction_policy policy{.n_sink = 4, .n_working = 4, .cycle_tokens = 4, .eviction_target = 0.5};
     std::vector<request_results> results = serve_in_turn(
         f.sched,
         request{
             .tokens = prompt,
             .max_tokens = 1,
-            .eviction = {.n_sink = 1, .n_working = 4, .cycle_tokens = 16, .eviction_target = 0.5}
+            .eviction = {.n_sink = 4, .n_working = 16, .cycle_tokens = 16, .eviction_target = 0.5}
         },
         [&](const request_results& first) {
             f.model.important = [](std::size_t, std::int64_t) { return false; };
@@ -894,7 +895,7 @@ TEST_CASE("a cycle's end evicts down to max_pages, the oldest first on ties") {
         {request{
             .tokens = prompt,
             .max_tokens = 2,
-            .eviction = {.n_sink = 0, .n_working = 1, .cycle_tokens = 16, .max_pages = 2}
+            .eviction = {.n_sink = 0, .n_working = 4, .cycle_tokens = 16, .max_context_window = 28}
         }}
     );
 
@@ -914,7 +915,7 @@ TEST_CASE("a prompt longer than the cache fits when each cycle evicts down to ma
         {request{
             .tokens = prompt,
             .max_tokens = 2,
-            .eviction = {.n_sink = 0, .n_working = 1, .cycle_tokens = 8, .max_pages = 2}
+            .eviction = {.n_sink = 0, .n_working = 4, .cycle_tokens = 8, .max_context_window = 20}
         }}
     );
 
@@ -1093,7 +1094,7 @@ TEST_CASE("a sliding layer keeps the pages its window reaches whatever the full-
         {request{
             .tokens = prompt,
             .max_tokens = 2,
-            .eviction = {.n_sink = 0, .n_working = 1, .cycle_tokens = 16, .max_pages = 1}
+            .eviction = {.n_sink = 0, .n_working = 4, .cycle_tokens = 16, .max_context_window = 24}
         }}
     );
 
@@ -1116,7 +1117,7 @@ TEST_CASE("each full-attention layer evicts by its own attention mass") {
         {request{
             .tokens = prompt,
             .max_tokens = 3,
-            .eviction = {.n_sink = 1, .n_working = 1, .cycle_tokens = 16, .eviction_target = 0.5},
+            .eviction = {.n_sink = 4, .n_working = 4, .cycle_tokens = 16, .eviction_target = 0.5},
         }}
     );
 
@@ -1207,7 +1208,7 @@ TEST_CASE("a recurrent layer's state covers the pages eviction drops") {
         {request{
             .tokens = prompt,
             .max_tokens = 2,
-            .eviction = {.n_sink = 0, .n_working = 1, .cycle_tokens = 16, .max_pages = 2}
+            .eviction = {.n_sink = 0, .n_working = 4, .cycle_tokens = 16, .max_context_window = 28}
         }}
     );
 

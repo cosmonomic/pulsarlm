@@ -215,14 +215,14 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             py::init([](std::size_t n_sink,
                         std::size_t n_working,
                         std::size_t cycle_tokens,
-                        std::optional<std::size_t> max_pages,
+                        std::optional<std::size_t> max_context_window,
                         double eviction_target,
                         double attention_mass_decay) {
                 return eviction_policy{
                     n_sink,
                     n_working,
                     cycle_tokens,
-                    max_pages,
+                    max_context_window,
                     eviction_target,
                     attention_mass_decay
                 };
@@ -231,14 +231,14 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "n_sink"_a = eviction_policy{}.n_sink,
             "n_working"_a = eviction_policy{}.n_working,
             "cycle_tokens"_a = eviction_policy{}.cycle_tokens,
-            "max_pages"_a = eviction_policy{}.max_pages,
+            "max_context_window"_a = eviction_policy{}.max_context_window,
             "eviction_target"_a = eviction_policy{}.eviction_target,
             "attention_mass_decay"_a = eviction_policy{}.attention_mass_decay
         )
         .def_readwrite("n_sink", &eviction_policy::n_sink)
         .def_readwrite("n_working", &eviction_policy::n_working)
         .def_readwrite("cycle_tokens", &eviction_policy::cycle_tokens)
-        .def_readwrite("max_pages", &eviction_policy::max_pages)
+        .def_readwrite("max_context_window", &eviction_policy::max_context_window)
         .def_readwrite("eviction_target", &eviction_policy::eviction_target)
         .def_readwrite("attention_mass_decay", &eviction_policy::attention_mass_decay);
 

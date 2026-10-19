@@ -31,7 +31,7 @@ from pulsarlm.server.openai.schema import (
     ModelList,
     Usage,
 )
-from pulsarlm.paging import sink_pages
+from pulsarlm.paging import sink_tokens
 from pulsarlm.reply import Part, ReplyDecoder, tool_call_marker
 from pulsarlm.store import LocalStore
 from pulsarlm.tools import ToolCallError, parse_tool_call
@@ -48,13 +48,13 @@ class ServerState:
     eviction: EvictionPolicy
 
     def eviction_for(self, system_tokens: int) -> EvictionPolicy:
-        """The default policy, sinking the pages the system message touches, or
-        the first page without one."""
+        """The default policy, sinking the system message's tokens, or the first
+        token without one."""
         return EvictionPolicy(
-            n_sink=sink_pages(system_tokens),
+            n_sink=sink_tokens(system_tokens),
             n_working=self.eviction.n_working,
             cycle_tokens=self.eviction.cycle_tokens,
-            max_pages=self.eviction.max_pages,
+            max_context_window=self.eviction.max_context_window,
             eviction_target=self.eviction.eviction_target,
             attention_mass_decay=self.eviction.attention_mass_decay,
         )

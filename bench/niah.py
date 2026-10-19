@@ -376,8 +376,8 @@ def run(
     shards: int = 1,
     seed: int = 0,
     max_read_lines: int = 100,
-    view_pages: int = 256,
-    n_working: int = 64,
+    max_context_window: int = 4624,
+    n_working: int = 1024,
     kv_cache_gib: float | None = None,
     store_gib: float = 4.0,
     concurrency: int = 4,
@@ -417,8 +417,8 @@ def run(
         server_args = ["--eviction_target", "1"]
         if setting.evict:
             server_args = [
-                "--max_pages",
-                str(view_pages),
+                "--max_context_window",
+                str(max_context_window),
                 "--n_working",
                 str(n_working),
             ]

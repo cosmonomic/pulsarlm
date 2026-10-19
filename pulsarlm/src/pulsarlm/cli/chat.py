@@ -11,7 +11,7 @@ from pulsarlm.chat import Message, ReasoningEffort, encode_prompt
 from pulsarlm.checkpoint import PulsarLMModelLoadingError
 from pulsarlm.completion import CompletionError, complete
 from pulsarlm.core.engine import SamplingParams
-from pulsarlm.paging import sink_pages
+from pulsarlm.paging import sink_tokens
 from pulsarlm.reply import ReplyDecoder
 from pulsarlm.served_model import load_served_model
 from pulsarlm.settings import Settings
@@ -57,7 +57,7 @@ def new_chat(
                     messages,
                     reasoning_effort=reasoning_effort,
                 )
-                served.eviction.n_sink = sink_pages(system_tokens)
+                served.eviction.n_sink = sink_tokens(system_tokens)
                 decoder = ReplyDecoder(served.tokenizer, served.stop_ids, prompt=prompt)
                 answer = []
                 reasoning_shown = False

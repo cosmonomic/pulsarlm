@@ -10,7 +10,7 @@ from pulsarlm import checkpoint
 from pulsarlm.chat import ChatTemplate, stop_ids
 from pulsarlm.core.engine import Engine, EvictionPolicy
 from pulsarlm.engine_model import engine_model
-from pulsarlm.paging import PAGE_SIZE, trained_view_pages
+from pulsarlm.paging import PAGE_SIZE
 from pulsarlm.settings import Settings
 from pulsarlm.store import LocalStore
 
@@ -51,9 +51,6 @@ def load_served_model(settings: Settings, path: Path) -> ServedModel:
         prefill_tokens_per_step=settings.prefill_tokens_per_step,
         max_context=cfg.max_position_embeddings or None,
     )
-    max_pages = settings.max_pages or trained_view_pages(
-        cfg.max_position_embeddings, settings.cycle_tokens
-    )
     return ServedModel(
         engine=engine,
         store=store,
@@ -63,7 +60,9 @@ def load_served_model(settings: Settings, path: Path) -> ServedModel:
         eviction=EvictionPolicy(
             n_working=settings.n_working,
             cycle_tokens=settings.cycle_tokens,
-            max_pages=max_pages,
+            max_context_window=settings.max_context_window
+            or cfg.max_position_embeddings
+            or None,
             eviction_target=settings.eviction_target,
         ),
     )

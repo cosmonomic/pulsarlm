@@ -85,18 +85,18 @@ class EvictionPolicy:
     n_sink: int
     n_working: int
     cycle_tokens: int
-    max_pages: int | None
+    max_context_window: int | None
     eviction_target: float
     attention_mass_decay: float
     def __init__(
         self,
         *,
-        n_sink: int = 64,
-        n_working: int = 512,
+        n_sink: int = 1024,
+        n_working: int = 8192,
         cycle_tokens: int = 512,
-        max_pages: int | None = None,
+        max_context_window: int | None = None,
         eviction_target: float = 1.0,
-        attention_mass_decay: float = 1.0 / 16,
+        attention_mass_decay: float = 1.0 / 256,
     ) -> None: ...
 
 class ModelConfig:

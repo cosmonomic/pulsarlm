@@ -124,7 +124,7 @@ class scheduler::sequence {
     std::optional<exit_reason> exited;
     // Set once the sequence leaves the running set.
     std::optional<event> exit_event;
-    eviction_policy eviction;
+    page_eviction_policy eviction;
     // covered_count when the eviction cycle began.
     std::size_t cycle_start = 0;
     // The request's tokens forwarded so far, which the state covers: the initial state's tail, then the request's
@@ -136,7 +136,8 @@ class scheduler::sequence {
         const std::vector<bool>& recurrent,
         const std::vector<std::size_t>& mass_heads,
         result_writer& writer,
-        at::Device device
+        at::Device device,
+        std::size_t page_size
     );
 
     // The view index of the next token in KV layer layer's view.
@@ -234,7 +235,8 @@ scheduler::sequence::sequence(
     const std::vector<bool>& recurrent,
     const std::vector<std::size_t>& mass_heads,
     result_writer& writer,
-    at::Device device
+    at::Device device,
+    std::size_t page_size
 )
 : writer(writer),
   id(r.id),
@@ -248,7 +250,7 @@ scheduler::sequence::sequence(
   table(
       at::zeros({static_cast<std::int64_t>(recurrent.size()), 0}, at::TensorOptions().dtype(at::kInt).device(device))
   ),
-  eviction(r.eviction) {
+  eviction(to_pages(r.eviction, page_size)) {
     pending.insert(pending.end(), r.tokens.begin(), r.tokens.end());
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
         layers[layer].mass_heads = mass_heads[layer];
@@ -655,7 +657,7 @@ task<void> scheduler::submit(request r, result_writer writer) {
     assert(r.eviction.attention_mass_decay > 0.0 && r.eviction.attention_mass_decay <= 1.0);
     assert(r.eviction.eviction_target > 0.0 && r.eviction.eviction_target <= 1.0);
     assert(r.eviction.eviction_target == 1.0 || max_context_pages);
-    sequence seq(std::move(r), recurrent, mass_heads, writer, lines.front().k.device());
+    sequence seq(std::move(r), recurrent, mass_heads, writer, lines.front().k.device(), page_size);
     seq.start_cycle();
     if (writer.cancelled()) {
         writer.end(std::unexpected(request_error::cancelled));
@@ -949,6 +951,7 @@ bool scheduler::end_cycle(sequence& seq) {
                 std::span(view.density).first(view.pages.size() * heads),
                 heads,
                 bar,
+                page_size,
                 seq.eviction
             );
             if (!pages.empty()) {

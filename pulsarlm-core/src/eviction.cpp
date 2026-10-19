@@ -18,7 +18,22 @@ std::size_t ceil_div(std::size_t n, std::size_t d) {
 
 }  // namespace
 
-bool eviction_policy::can_evict() const noexcept {
+page_eviction_policy to_pages(const eviction_policy& policy, std::size_t page_size) noexcept {
+    std::optional<std::size_t> max_pages;
+    if (policy.max_context_window) {
+        max_pages = *policy.max_context_window / page_size;
+    }
+    return page_eviction_policy{
+        .n_sink = ceil_div(policy.n_sink, page_size),
+        .n_working = ceil_div(policy.n_working, page_size),
+        .cycle_tokens = policy.cycle_tokens,
+        .max_pages = max_pages,
+        .eviction_target = policy.eviction_target,
+        .attention_mass_decay = 1.0 - std::pow(1.0 - policy.attention_mass_decay, static_cast<double>(page_size)),
+    };
+}
+
+bool page_eviction_policy::can_evict() const noexcept {
     return eviction_target < 1.0 || max_pages.has_value();
 }
 
@@ -37,14 +52,13 @@ void mass_weights(
     std::span<float> weights,
     std::size_t first_offset,
     std::size_t page_size,
-    double attention_mass_decay
+    double page_mass_decay
 ) noexcept {
     std::size_t last_page = (first_offset + weights.size() - 1) / page_size;
     for (std::size_t i = 0; i < weights.size(); i++) {
         std::size_t age = last_page - (first_offset + i) / page_size;
         weights[i] = static_cast<float>(
-            attention_mass_decay / static_cast<double>(page_size) *
-            std::pow(1.0 - attention_mass_decay, static_cast<double>(age))
+            page_mass_decay / static_cast<double>(page_size) * std::pow(1.0 - page_mass_decay, static_cast<double>(age))
         );
     }
 }
@@ -53,17 +67,22 @@ void add_step_mass(
     std::span<float> density,
     std::span<const float> step_mass,
     std::size_t page_advance,
-    double attention_mass_decay
+    double page_mass_decay
 ) noexcept {
     assert(density.size() == step_mass.size());
-    auto retained = static_cast<float>(std::pow(1.0 - attention_mass_decay, static_cast<double>(page_advance)));
+    auto retained = static_cast<float>(std::pow(1.0 - page_mass_decay, static_cast<double>(page_advance)));
     for (std::size_t i = 0; i < density.size(); i++) {
         density[i] = density[i] * retained + step_mass[i];
     }
 }
 
-std::vector<std::size_t>
-pages_to_evict(std::span<const float> density, std::size_t n_q_heads, double bar, const eviction_policy& policy) {
+std::vector<std::size_t> pages_to_evict(
+    std::span<const float> density,
+    std::size_t n_q_heads,
+    double bar,
+    std::size_t page_size,
+    const page_eviction_policy& policy
+) {
     assert(policy.n_working >= 1 && n_q_heads >= 1 && density.size() % n_q_heads == 0);
     std::size_t page_count = density.size() / n_q_heads;
     if (page_count <= policy.n_sink + policy.n_working) {
@@ -86,8 +105,12 @@ pages_to_evict(std::span<const float> density, std::size_t n_q_heads, double bar
         }
     }
 
-    if (policy.max_pages && page_count - evicted.size() > *policy.max_pages) {
-        std::size_t excess = std::min(page_count - evicted.size() - *policy.max_pages, kept.size());
+    std::size_t next_cycle_pages = ceil_div(policy.cycle_tokens + page_size - 1, page_size);
+    std::size_t full_page_cap = policy.max_pages && *policy.max_pages > next_cycle_pages
+        ? *policy.max_pages - next_cycle_pages
+        : 0;
+    if (policy.max_pages && page_count - evicted.size() > full_page_cap) {
+        std::size_t excess = std::min(page_count - evicted.size() - full_page_cap, kept.size());
         std::sort(kept.begin(), kept.end(), [](const candidate& a, const candidate& b) {
             return std::tie(a.density, a.page) < std::tie(b.density, b.page);
         });

@@ -12,7 +12,6 @@ from pulsarlm.async_engine import AsyncEngine
 from pulsarlm.chat import ChatTemplate, encode_prompt
 from pulsarlm.core.engine import Engine, EvictionPolicy, ModelConfig, RopeParameters
 from pulsarlm.server import create_app
-from pulsarlm.paging import trained_view_pages
 from pulsarlm.server.openai import ServerState
 from pulsarlm.server.openai.routes import template_messages
 from pulsarlm.server.openai.schema import ChatMessage
@@ -265,14 +264,6 @@ def test_an_error_after_a_stream_started_is_an_error_event():
     assert error["code"] == 503
 
 
-def test_the_view_cap_keeps_positions_within_the_trained_context():
-    pages = trained_view_pages(40960, cycle_tokens=512)
-    assert pages is not None
-    assert pages * PAGE_SIZE + (PAGE_SIZE - 1) + 512 <= 40960
-    assert (pages + 1) * PAGE_SIZE + (PAGE_SIZE - 1) + 512 > 40960
-    assert trained_view_pages(0, cycle_tokens=512) is None
-
-
 def test_a_chat_template_error_is_a_bad_request():
     template = "{{ raise_exception('unsupported effort ' ~ reasoning_effort) }}"
     with api_client(lambda: load(chat_template=template)) as client:
@@ -282,10 +273,10 @@ def test_a_chat_template_error_is_a_bad_request():
     assert response.json()["detail"] == "chat template: unsupported effort high"
 
 
-def test_without_a_system_message_only_the_first_page_is_sunk(client):
+def test_without_a_system_message_only_the_first_token_is_sunk(client):
     state = client.app.state.server_state
     assert state.eviction_for(0).n_sink == 1
-    assert state.eviction_for(PAGE_SIZE + 1).n_sink == 2
+    assert state.eviction_for(PAGE_SIZE + 1).n_sink == PAGE_SIZE + 1
 
 
 def test_an_unknown_model_is_not_found(client):

@@ -90,7 +90,7 @@ NWorking = Annotated[
     int,
     typer.Option(
         "--n_working",
-        help="Newest pages eviction never touches.",
+        help="Newest tokens eviction never touches.",
         rich_help_panel="Eviction",
     ),
 ]
@@ -102,11 +102,11 @@ EvictionTarget = Annotated[
         rich_help_panel="Eviction",
     ),
 ]
-MaxPages = Annotated[
+MaxContextWindow = Annotated[
     int | None,
     typer.Option(
-        "--max_pages",
-        help="View cap in pages. Defaults to the model's trained context.",
+        "--max_context_window",
+        help="Most tokens a view holds. Defaults to the model's trained context.",
         rich_help_panel="Eviction",
     ),
 ]
@@ -144,9 +144,9 @@ def serve(
     store_gib: StoreGib = 4.0,
     persist: Persist = False,
     cycle_tokens: CycleTokens = 512,
-    n_working: NWorking = 512,
+    n_working: NWorking = 8192,
     eviction_target: EvictionTarget = 0.8,
-    max_pages: MaxPages = None,
+    max_context_window: MaxContextWindow = None,
 ) -> None:
     """Serve a model over the OpenAI Chat Completions API."""
     # Imported here: torch takes seconds to load, which --help does not need.
@@ -165,7 +165,7 @@ def serve(
                 cycle_tokens=cycle_tokens,
                 n_working=n_working,
                 eviction_target=eviction_target,
-                max_pages=max_pages,
+                max_context_window=max_context_window,
             ),
             host=host,
             port=port,
@@ -231,9 +231,9 @@ def chat(
     store_gib: StoreGib = 4.0,
     persist: Persist = False,
     cycle_tokens: CycleTokens = 512,
-    n_working: NWorking = 512,
+    n_working: NWorking = 8192,
     eviction_target: EvictionTarget = 0.8,
-    max_pages: MaxPages = None,
+    max_context_window: MaxContextWindow = None,
 ) -> None:
     """Chat with a model in the terminal. End input to quit."""
     # Imported here: torch takes seconds to load, which --help does not need.
@@ -252,7 +252,7 @@ def chat(
                 cycle_tokens=cycle_tokens,
                 n_working=n_working,
                 eviction_target=eviction_target,
-                max_pages=max_pages,
+                max_context_window=max_context_window,
             ),
             system=system,
             temperature=temperature,
