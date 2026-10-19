@@ -169,35 +169,50 @@ def make_item(
     )
 
 
-READ_TOOL: ChatCompletionToolParam = {
-    "type": "function",
-    "function": {
-        "name": "read",
-        "description": "Returns lines start to end - 1 of the document, each prefixed "
-        "with its line number.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "start": {"type": "integer", "description": "First line to read."},
-                "end": {"type": "integer", "description": "Line after the last."},
+def read_tool(max_read_lines: int) -> ChatCompletionToolParam:
+    return {
+        "type": "function",
+        "function": {
+            "name": "read",
+            "description": "Returns lines start to end - 1 of the document, each "
+            f"prefixed with its line number, at most {max_read_lines} lines per call.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "integer", "description": "First line to read."},
+                    "end": {"type": "integer", "description": "Line after the last."},
+                },
+                "required": ["start", "end"],
             },
-            "required": ["start", "end"],
         },
-    },
-}
+    }
 
 
-def system_prompt(item: Item, max_read_lines: int, recap: bool) -> str:
-    queries = ", ".join(item.queries)
+def system_prompt(item: Item, recap: bool) -> str:
+    singular = item.kind.removesuffix("s")
+    per_key = len(item.answers) // len(item.queries)
+    per_key_kind = singular if per_key == 1 else item.kind
+    if len(item.queries) == 1:
+        wanted = f"{per_key} special magic {per_key_kind} for the key {item.queries[0]}"
+        keys = "that key"
+    else:
+        keys = ", ".join(item.queries)
+        wanted = f"{per_key} special magic {per_key_kind} for each of the keys {keys}"
+        keys = "those keys"
+    if len(item.answers) == 1:
+        question = f"What is the special magic {singular} for {keys}? Answer with the {singular} only."
+    else:
+        question = (
+            f"What are the special magic {item.kind} for {keys}? Answer with the "
+            f"{item.kind} only, separated by commas."
+        )
+    format = needle(item.kind, "<key>", f"<{singular}>")
     prompt = (
-        f"A document of {len(item.lines)} lines is available through the read tool, "
-        f"at most {max_read_lines} lines per call, numbered from 0. Some special "
-        f"magic {item.kind} "
-        "are hidden within it.\n"
-        f"Question: What are all the special magic {item.kind} for {queries} "
-        "mentioned in the document?\n"
-        "Read the document until you can answer, then answer with the "
-        f"{item.kind} only, separated by commas."
+        f"You are given a document of {len(item.lines)} lines, accessible through the "
+        "read tool. It contains special "
+        f'magic {item.kind}, each in this format: "{format}"\n'
+        f"The document has {wanted}.\n"
+        f"Question: {question}"
     )
     if recap:
         prompt += (
@@ -266,6 +281,7 @@ def locate_needles(
     messages: list[ChatCompletionMessageParam],
     item: Item,
     *,
+    max_read_lines: int,
     reasoning_effort: str,
     tokenizer: Tokenizer,
     template: ChatTemplate,
@@ -276,7 +292,7 @@ def locate_needles(
         template_messages(messages),
         add_generation_prompt=True,
         reasoning_effort=cast(ReasoningEffort, reasoning_effort),
-        tools=[cast(dict[str, Any], READ_TOOL)],
+        tools=[cast(dict[str, Any], read_tool(max_read_lines))],
     )
     encoding = tokenizer.encode(text, add_special_tokens=False)
     needle_spans: list[list[tuple[int, int]]] = []
@@ -418,7 +434,7 @@ async def run_item(
     eviction_log: EvictionLog,
 ) -> dict[str, Any]:
     messages: list[ChatCompletionMessageParam] = [
-        {"role": "system", "content": system_prompt(item, max_read_lines, recap)},
+        {"role": "system", "content": system_prompt(item, recap)},
         {"role": "user", "content": "Answer the question."},
     ]
     max_turns = 2 * math.ceil(len(item.lines) / max_read_lines) + 4
@@ -433,7 +449,7 @@ async def run_item(
                 response = await client.chat.completions.create(
                     model=model,
                     messages=messages,
-                    tools=[READ_TOOL],
+                    tools=[read_tool(max_read_lines)],
                     temperature=1.0,
                     top_p=0.95,
                     seed=item.seed,
@@ -449,6 +465,7 @@ async def run_item(
             prompt = locate_needles(
                 messages,
                 item,
+                max_read_lines=max_read_lines,
                 reasoning_effort=reasoning_effort,
                 tokenizer=tokenizer,
                 template=template,
@@ -595,7 +612,7 @@ def run(
     kv_cache_gib: float | None = None,
     store_gib: float = 4.0,
     concurrency: int = 4,
-    reasoning_effort: str = "medium",
+    reasoning_effort: str = "low",
     port: int = 18090,
 ) -> None:
     """Runs every item in every setting and appends the results to
