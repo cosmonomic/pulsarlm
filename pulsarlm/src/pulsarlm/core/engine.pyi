@@ -99,6 +99,12 @@ class EvictionPolicy:
         attention_mass_decay: float = 1.0 / 256,
     ) -> None: ...
 
+def density_threshold(
+    eviction_target: float, n_q_heads: int, max_context_pages: int
+) -> float:
+    """The density threshold of a KV layer read by n_q_heads query heads, in a model
+    whose context holds max_context_pages pages; 0 at eviction_target 1."""
+
 class ModelConfig:
     rope: RopeParameters
     def __init__(

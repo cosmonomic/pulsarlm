@@ -295,7 +295,7 @@ def logging_eviction(log: Path, eviction: EvictionPolicy) -> Callable[[], Server
     def load_state() -> ServerState:
         state = load(stop_ids=[])
         state.eviction = eviction
-        state.eviction_log = EvictionLog(log, state.engine)
+        state.eviction_log = EvictionLog(log, state.engine, eviction, None)
         return state
 
     return load_state
@@ -317,10 +317,15 @@ def test_the_eviction_log_without_eviction_views_every_full_page(tmp_path):
     assert line["id"] == body["id"]
     assert line["prompt_tokens"] == len(prompt)
     assert line["prompt_sha256"] == prompt_sha256(prompt)
+    assert line["cap_tokens"] is None
     end = line["states"][-1]
     assert [layer["layer"] for layer in end["layers"]] == list(range(N_LAYERS))
     full = end["tokens"] // PAGE_SIZE * PAGE_SIZE
-    assert all(layer["ranges"] == [[0, full]] for layer in end["layers"])
+    for layer in end["layers"]:
+        assert layer["threshold"] == 0.0
+        assert [page[:2] for page in layer["pages"]] == [
+            [start, start + PAGE_SIZE] for start in range(0, full, PAGE_SIZE)
+        ]
 
 
 def test_the_eviction_log_leaves_out_evicted_pages(tmp_path):
@@ -334,13 +339,17 @@ def test_the_eviction_log_leaves_out_evicted_pages(tmp_path):
         post(client, messages=MESSAGES, max_tokens=120)
 
     [line] = read_log(log)
-    end = line["states"][-1]
+    assert line["cap_tokens"] == 5 * PAGE_SIZE
+    *cycle_ends, end = line["states"]
+    for state in cycle_ends:
+        for layer in state["layers"]:
+            in_view = sum(stop - start for start, stop, _ in layer["pages"])
+            assert in_view <= line["cap_tokens"]
     full = end["tokens"] // PAGE_SIZE * PAGE_SIZE
     assert [layer["layer"] for layer in end["layers"]] == list(range(N_LAYERS))
     for layer in end["layers"]:
-        bounds = [bound for start_end in layer["ranges"] for bound in start_end]
-        assert bounds == sorted(set(bounds))
-        assert all(bound % PAGE_SIZE == 0 for bound in bounds)
-        assert bounds[0] == 0
-        assert bounds[-1] == full
-        assert len(layer["ranges"]) > 1
+        starts = [start for start, _, _ in layer["pages"]]
+        assert starts == sorted(set(starts))
+        assert starts[0] == 0
+        assert layer["pages"][-1][1] == full
+        assert len(starts) < full // PAGE_SIZE

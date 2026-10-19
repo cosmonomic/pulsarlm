@@ -14,6 +14,7 @@ from pulsarlm.core.engine import (
     RequestError,
     RopeParameters,
     State,
+    density_threshold,
 )
 
 N_LAYERS = 2
@@ -269,3 +270,8 @@ def test_a_cache_without_a_line_or_a_negative_store_is_rejected(
 def test_a_digest_is_16_bytes():
     with pytest.raises(ValueError, match="16 bytes"):
         State(head=b"short")
+
+
+def test_density_threshold_divides_the_heads_by_the_targeted_pages():
+    assert density_threshold(0.5, 2, 100) == 2 / 50
+    assert density_threshold(1.0, 2, 100) == 0.0

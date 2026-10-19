@@ -7,6 +7,7 @@ Apache-2.0).
 import asyncio
 import hashlib
 import importlib
+import itertools
 import json
 import math
 import random
@@ -312,37 +313,96 @@ class EvictionLog:
         return self._lines.pop(completion_id)
 
 
-def eviction_view(line: dict[str, Any], prompt: Prompt) -> dict[str, Any]:
-    """Over the layers eviction acts on, at the request's end: the fraction of
-    the history in view, and per answer the fraction of layers holding one of
-    its needle's occurrences wholly in view; None for a needle not read yet."""
+type Span = tuple[int, int]
+
+
+def eviction_view(
+    line: dict[str, Any], prompt: Prompt, previous: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Over the layers eviction acts on: at the request's end, the fraction of
+    the history in view and per answer the fraction of layers holding one of its
+    needle's occurrences wholly in view, None for a needle not read yet; and per
+    answer each layer's eviction of an occurrence since previous, the state the
+    previous request ended with."""
     if line["prompt_sha256"] != prompt.sha256:
         raise RuntimeError(f"{line['id']}: the server rendered another prompt")
     end = line["states"][-1]
-    views = [in_view(layer["ranges"], end["tokens"]) for layer in end["layers"]]
+    views = [in_view(layer, end["tokens"]) for layer in end["layers"]]
 
-    def kept(spans: list[tuple[int, int]]) -> float | None:
+    def kept(spans: list[Span]) -> float | None:
         if not spans:
             return None
-        return sum(
-            any(r0 <= a and b <= r1 for a, b in spans for r0, r1 in view)
-            for view in views
-        ) / len(views)
+        held = sum(any(wholly_in(view, span) for span in spans) for view in views)
+        return held / len(views)
 
+    states = ([previous] if previous else []) + line["states"]
     return {
-        "in_view": sum(r1 - r0 for view in views for r0, r1 in view)
+        "in_view": sum(b - a for view in views for a, b in view)
         / (len(views) * end["tokens"]),
         "needles_kept": [kept(spans) for spans in prompt.needle_spans],
+        "needle_evictions": [
+            evictions(states, spans, line["cap_tokens"])
+            for spans in prompt.needle_spans
+        ],
     }
 
 
-def in_view(ranges: list[list[int]], tokens: int) -> list[tuple[int, int]]:
-    """A layer's ranges with the tokens after the last, which follow it."""
-    view = [(r0, r1) for r0, r1 in ranges]
+def evictions(
+    states: list[dict[str, Any]], spans: list[Span], cap_tokens: int | None
+) -> list[dict[str, Any]]:
+    """Each layer's eviction of a needle occurrence between consecutive states:
+    the tokens of the state after it, the highest density the occurrence's
+    evicted pages had in the state before it, the layer's threshold, and whether the
+    cap trimmed the layer's view."""
+    found = []
+    for before, after in itertools.pairwise(states):
+        layers_after = {layer["layer"]: layer for layer in after["layers"]}
+        for layer in before["layers"]:
+            if (kept_layer := layers_after.get(layer["layer"])) is None:
+                continue
+            view_before = in_view(layer, before["tokens"])
+            view_after = in_view(kept_layer, after["tokens"])
+            kept_starts = {start for start, _, _ in kept_layer["pages"]}
+            for a, b in spans:
+                if not wholly_in(view_before, (a, b)) or wholly_in(view_after, (a, b)):
+                    continue
+                densities = [
+                    density
+                    for start, stop, density in layer["pages"]
+                    if start < b and a < stop and start not in kept_starts
+                ]
+                full_tokens = sum(
+                    stop - start for start, stop, _ in kept_layer["pages"]
+                )
+                found.append(
+                    {
+                        "layer": layer["layer"],
+                        "tokens": after["tokens"],
+                        "density": max(densities),
+                        "threshold": layer["threshold"],
+                        "cap_acted": full_tokens == cap_tokens,
+                    }
+                )
+    return found
+
+
+def in_view(layer: dict[str, Any], tokens: int) -> list[Span]:
+    """A layer's in-view tokens as ascending spans, adjacent pages merged, with
+    the tokens after its last page."""
+    view: list[Span] = []
+    for start, stop, _ in layer["pages"]:
+        if view and view[-1][1] == start:
+            view[-1] = (view[-1][0], stop)
+        else:
+            view.append((start, stop))
     if not view:
         return [(0, tokens)]
     view[-1] = (view[-1][0], tokens)
     return view
+
+
+def wholly_in(view: list[Span], span: Span) -> bool:
+    return any(a <= span[0] and span[1] <= b for a, b in view)
 
 
 async def run_item(
@@ -364,6 +424,7 @@ async def run_item(
     max_turns = 2 * math.ceil(len(item.lines) / max_read_lines) + 4
     turns = tool_calls = generated_tokens = 0
     replies: list[dict[str, Any]] = []
+    previous: dict[str, Any] | None = None
     answer: str | None = None
     error: str | None = None
     try:
@@ -392,7 +453,9 @@ async def run_item(
                 tokenizer=tokenizer,
                 template=template,
             )
-            view = eviction_view(eviction_log.line(response.id), prompt)
+            line = eviction_log.line(response.id)
+            view = eviction_view(line, prompt, previous)
+            previous = line["states"][-1]
             completion_tokens = (
                 0 if response.usage is None else response.usage.completion_tokens
             )

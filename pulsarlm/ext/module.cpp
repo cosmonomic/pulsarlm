@@ -242,6 +242,8 @@ PYBIND11_MODULE(pulsarlm_core, m) {
         .def_readwrite("eviction_target", &eviction_policy::eviction_target)
         .def_readwrite("attention_mass_decay", &eviction_policy::attention_mass_decay);
 
+    m.def("density_threshold", &density_threshold, "eviction_target"_a, "n_q_heads"_a, "max_context_pages"_a);
+
     py::class_<model_config>(m, "ModelConfig")
         .def(
             py::init([](std::string architecture,

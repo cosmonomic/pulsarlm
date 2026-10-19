@@ -18,3 +18,4 @@ RopeParameters = pulsarlm_core.RopeParameters
 RequestError = pulsarlm_core.RequestError
 SamplingParams = pulsarlm_core.SamplingParams
 State = pulsarlm_core.State
+density_threshold = pulsarlm_core.density_threshold

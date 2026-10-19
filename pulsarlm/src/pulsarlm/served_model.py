@@ -23,6 +23,7 @@ class ServedModel:
     chat_template: ChatTemplate
     stop_ids: list[int]
     eviction: EvictionPolicy
+    max_context: int | None
 
 
 def load_served_model(settings: Settings, path: Path) -> ServedModel:
@@ -31,6 +32,7 @@ def load_served_model(settings: Settings, path: Path) -> ServedModel:
     dtype = getattr(torch, settings.dtype)
     model = checkpoint.load(path, device=device, dtype=dtype)
     cfg = model.config
+    max_context = cfg.max_position_embeddings or None
     stops = stop_ids(model.tokenizer, cfg.eos_ids)
     store = LocalStore(
         PAGE_SIZE,
@@ -49,7 +51,7 @@ def load_served_model(settings: Settings, path: Path) -> ServedModel:
         device=device,
         stop_ids=stops,
         prefill_tokens_per_step=settings.prefill_tokens_per_step,
-        max_context=cfg.max_position_embeddings or None,
+        max_context=max_context,
     )
     return ServedModel(
         engine=engine,
@@ -60,9 +62,8 @@ def load_served_model(settings: Settings, path: Path) -> ServedModel:
         eviction=EvictionPolicy(
             n_working=settings.n_working,
             cycle_tokens=settings.cycle_tokens,
-            max_context_window=settings.max_context_window
-            or cfg.max_position_embeddings
-            or None,
+            max_context_window=settings.max_context_window or max_context,
             eviction_target=settings.eviction_target,
         ),
+        max_context=max_context,
     )
