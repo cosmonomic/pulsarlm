@@ -37,7 +37,7 @@ bool page_eviction_policy::can_evict() const noexcept {
     return eviction_target < 1.0 || max_pages.has_value();
 }
 
-double density_bar(double eviction_target, std::size_t n_q_heads, std::size_t max_context_pages) noexcept {
+double density_threshold(double eviction_target, std::size_t n_q_heads, std::size_t max_context_pages) noexcept {
     if (eviction_target >= 1.0) {
         return 0.0;
     }
@@ -79,7 +79,7 @@ void add_step_mass(
 std::vector<std::size_t> pages_to_evict(
     std::span<const float> density,
     std::size_t n_q_heads,
-    double bar,
+    double threshold,
     std::size_t page_size,
     const page_eviction_policy& policy
 ) {
@@ -98,7 +98,7 @@ std::vector<std::size_t> pages_to_evict(
     for (std::size_t page = policy.n_sink; page < page_count - policy.n_working; page++) {
         std::span<const float> heads = density.subspan(page * n_q_heads, n_q_heads);
         double highest = *std::ranges::max_element(heads);
-        if (highest < bar) {
+        if (highest < threshold) {
             evicted.push_back(page);
         } else {
             kept.push_back(candidate{.page = page, .density = highest});

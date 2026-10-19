@@ -946,11 +946,11 @@ bool scheduler::end_cycle(sequence& seq) {
                 continue;
             }
             layer_view& view = seq.layers[layer];
-            double bar = max_context_pages ? density_bar(seq.eviction.eviction_target, heads, *max_context_pages) : 0.0;
+            double threshold = max_context_pages ? density_threshold(seq.eviction.eviction_target, heads, *max_context_pages) : 0.0;
             std::vector<std::size_t> pages = pages_to_evict(
                 std::span(view.density).first(view.pages.size() * heads),
                 heads,
-                bar,
+                threshold,
                 page_size,
                 seq.eviction
             );

@@ -373,7 +373,7 @@ struct fixture {
     pulsarlm::scheduler sched;
 
     // The pool has room for n_lines lines of every KV layer unless pool_bytes sizes it. The model's context of
-    // max_context tokens puts the bar of eviction_target 0.5 at density 0.5 in a layer of one query head.
+    // max_context tokens puts the threshold of eviction_target 0.5 at density 0.5 in a layer of one query head.
     explicit fixture(
         std::size_t n_lines,
         std::size_t prefill_tokens_per_step = 64,
@@ -800,7 +800,7 @@ TEST_CASE("a cycle ends every cycle_tokens tokens with the state it reached") {
     REQUIRE(cycle_ends[1].reached.tail.empty());
 }
 
-TEST_CASE("a cycle's end evicts the pages below the bar outside the sink and working pages") {
+TEST_CASE("a cycle's end evicts the pages below the threshold outside the sink and working pages") {
     fixture f(16);
     f.model.important = [](std::size_t, std::int64_t token) { return token == 7; };
     token_list prompt{100, 101, 102, 103, 7, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114};
