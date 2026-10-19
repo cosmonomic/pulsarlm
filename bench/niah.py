@@ -67,7 +67,6 @@ class Setting:
 
 SETTINGS = {
     "full_kv": Setting(evict=False, recap=False),
-    "eviction": Setting(evict=True, recap=False),
     "eviction_recap": Setting(evict=True, recap=True),
 }
 
@@ -211,7 +210,7 @@ def system_prompt(item: Item, recap: bool) -> str:
         f"You are given a document of {len(item.lines)} lines, accessible through the "
         "read tool. It contains special "
         f'magic {item.kind}, each in this format: "{format}"\n'
-        f"The document has {wanted}.\n"
+        f"The document has {wanted}. Read it in order from line 0.\n"
         f"Question: {question}"
     )
     if recap:
@@ -730,12 +729,10 @@ def mean(values: list[float]) -> str:
 
 SERIES_COLORS = {
     "full_kv": "#2a78d6",
-    "eviction": "#eb6834",
     "eviction_recap": "#1baf7a",
 }
 SERIES_LABELS = {
     "full_kv": "Full KV",
-    "eviction": "Eviction",
     "eviction_recap": "Eviction + recap",
 }
 
