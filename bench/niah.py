@@ -61,13 +61,15 @@ VARIANTS = {
 
 @dataclass(frozen=True)
 class Setting:
-    evict: bool
+    max_context_window: int | None
     recap: bool
 
 
 SETTINGS = {
-    "full_kv": Setting(evict=False, recap=False),
-    "eviction_recap": Setting(evict=True, recap=True),
+    "full_kv": Setting(max_context_window=None, recap=False),
+    "cap_4k": Setting(max_context_window=4096, recap=True),
+    "cap_8k": Setting(max_context_window=8192, recap=True),
+    "cap_16k": Setting(max_context_window=16384, recap=True),
 }
 
 
@@ -606,7 +608,6 @@ def run(
     shards: int = 1,
     seed: int = 0,
     max_read_lines: int = 25,
-    max_context_window: int = 4624,
     n_working: int = 1024,
     kv_cache_gib: float | None = None,
     store_gib: float = 4.0,
@@ -645,10 +646,10 @@ def run(
         if not todo:
             continue
         server_args = ["--eviction_target", "1"]
-        if setting.evict:
+        if setting.max_context_window is not None:
             server_args = [
                 "--max_context_window",
-                str(max_context_window),
+                str(setting.max_context_window),
                 "--n_working",
                 str(n_working),
             ]
@@ -727,13 +728,18 @@ def mean(values: list[float]) -> str:
     return f"{sum(values) / len(values):.2f}" if values else "-"
 
 
-SERIES_COLORS = {
-    "full_kv": "#2a78d6",
-    "eviction_recap": "#1baf7a",
-}
-SERIES_LABELS = {
-    "full_kv": "Full KV",
-    "eviction_recap": "Eviction + recap",
+@dataclass(frozen=True)
+class Series:
+    label: str
+    color: str
+    linestyle: str = "-"
+
+
+SERIES = {
+    "full_kv": Series("Full KV", "#52514e", "--"),
+    "cap_4k": Series("Cap 4k", "#86b6ef"),
+    "cap_8k": Series("Cap 8k", "#2a78d6"),
+    "cap_16k": Series("Cap 16k", "#104281"),
 }
 
 
@@ -782,7 +788,7 @@ def plot(
     figure.patch.set_facecolor(surface)
     axes.set_facecolor(surface)
     lengths = sorted({length for _, length in groups})
-    for name, color in SERIES_COLORS.items():
+    for name, series in SERIES.items():
         points = [
             (length, 100 * sum(r["score"] for r in group) / len(group))
             for length in lengths
@@ -794,16 +800,17 @@ def plot(
         axes.plot(
             xs,
             ys,
-            color=color,
+            color=series.color,
+            linestyle=series.linestyle,
             linewidth=2,
             marker="o",
             markersize=8,
             markeredgecolor=surface,
             markeredgewidth=2,
-            label=SERIES_LABELS[name],
+            label=series.label,
         )
         axes.annotate(
-            SERIES_LABELS[name],
+            series.label,
             (xs[-1], ys[-1]),
             xytext=(10, 0),
             textcoords="offset points",
