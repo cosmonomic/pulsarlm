@@ -3,6 +3,8 @@
 #include "pulsarlm/event_loop.hpp"
 
 #include <ATen/ATen.h>
+#include <ATen/core/CachingHostAllocator.h>
+#include <ATen/cuda/Sleep.h>
 #include <c10/cuda/CUDAStream.h>
 
 #undef CHECK
@@ -235,6 +237,21 @@ task<void> sync_into(
     if (--*remaining == 0) {
         event_loop::current()->stop();
     }
+}
+
+// About a third of a second of GPU time, so kernels queued after it are still pending while the loop runs other tasks.
+constexpr std::int64_t stream_delay_cycles = 1'000'000'000;
+
+at::Tensor pinned_segments(std::int64_t rows) {
+    return at::empty({rows, 3}, at::TensorOptions().dtype(at::kLong).pinned_memory(true));
+}
+
+// With one cached pinned block of a segment table's size, takes and zeroes it, so a segment table freed before its copy
+// has run then holds only 0-byte segments.
+task<void> zero_freed_segments(std::int64_t rows, at::Tensor* reused) {
+    *reused = pinned_segments(rows);
+    reused->zero_();
+    co_return;
 }
 
 lines_result run_get(pulsarlm::kv_cache& kv, std::vector<digest> hashes) {
@@ -507,6 +524,71 @@ TEST_CASE("a get and a sync run together") {
     REQUIRE(stored_tensors(*fixture.store, key_of(5)).k.eq(5.0f).all().item<bool>());
     release(fixture.kv, *got);
     release(fixture.kv, synced);
+}
+
+TEST_CASE("sync keeps its pinned segments until its copy has run") {
+    cache_fixture fixture(6);
+    // The warm-up sync loads the copy kernel's module and leaves the only cached pinned block of the segment table's
+    // size, which the delayed sync's table takes; done during the delayed sync, either would wait for the device.
+    at::getHostAllocator(at::kCUDA)->empty_cache();
+    line_ids warm = allocate(fixture.kv, 3).value();
+    REQUIRE(run_to_completion(sync_one_layer(fixture.kv, {hash_of(4), hash_of(5), hash_of(6)}, warm)).has_value());
+    release(fixture.kv, warm);
+
+    line_ids synced = allocate(fixture.kv, 3).value();
+    for (std::size_t j = 0; j < synced.size(); j++) {
+        fill_line(fixture.kv, synced[j], static_cast<float>(j + 1));
+    }
+
+    std::expected<void, page_error> sync_result;
+    std::size_t remaining = 1;
+    at::Tensor reused;
+    {
+        event_loop loop;
+        at::cuda::sleep(stream_delay_cycles);
+        loop.spawn(sync_into(&fixture.kv, {hash_of(1), hash_of(2), hash_of(3)}, synced, &sync_result, &remaining));
+        loop.spawn(zero_freed_segments(3, &reused));
+        REQUIRE(loop.run() == nullptr);
+    }
+
+    REQUIRE(sync_result.has_value());
+    for (std::uint64_t n = 1; n <= 3; n++) {
+        REQUIRE(stored_tensors(*fixture.store, key_of(n)).k.eq(static_cast<float>(n)).all().item<bool>());
+    }
+    release(fixture.kv, synced);
+}
+
+TEST_CASE("get keeps its pinned segments until its copy has run") {
+    cache_fixture fixture(6);
+    for (std::uint64_t n = 1; n <= 6; n++) {
+        fixture.store->pages.emplace(key_of(n), host_page(static_cast<float>(n)));
+    }
+    // The warm-up get loads the copy kernel's module and leaves the only cached pinned block of the segment table's
+    // size, which the delayed get's table takes; done during the delayed get, either would wait for the device.
+    at::getHostAllocator(at::kCUDA)->empty_cache();
+    lines_result warm = run_get(fixture.kv, {hash_of(4), hash_of(5), hash_of(6)});
+    REQUIRE(warm.has_value());
+    release(fixture.kv, *warm);
+    // The pool may reuse device memory whose lines already hold the fetched values.
+    fixture.kv.tensors(0).k.zero_();
+    fixture.kv.tensors(0).v.zero_();
+
+    lines_result got;
+    std::size_t remaining = 1;
+    at::Tensor reused;
+    {
+        event_loop loop;
+        at::cuda::sleep(stream_delay_cycles);
+        loop.spawn(get_into(&fixture.kv, {hash_of(1), hash_of(2), hash_of(3)}, &got, &remaining));
+        loop.spawn(zero_freed_segments(3, &reused));
+        REQUIRE(loop.run() == nullptr);
+    }
+
+    REQUIRE(got.has_value());
+    for (std::size_t j = 0; j < got->size(); j++) {
+        REQUIRE(line_filled_with(fixture.kv, (*got)[j], static_cast<float>(j + 1)));
+    }
+    release(fixture.kv, *got);
 }
 
 TEST_CASE("pages past the host pool's room are pageable and still reach the store and come back") {

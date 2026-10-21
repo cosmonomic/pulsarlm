@@ -413,9 +413,11 @@ kv_cache::copy_from_host(std::span<const layer_line> targets, std::span<const pa
         }
         append_segment(segments, line_offset(layer, line_id), *offset, bytes);
     }
+    at::Tensor pinned_segments;
     if (!segments.empty()) {
+        pinned_segments = pinned_int64(segments);
         auto guard = guard_stream(pool, stream);
-        copy_segments_from_host_cuda(pool, host_pages.buffer(), pinned_int64(segments));
+        copy_segments_from_host_cuda(pool, host_pages.buffer(), pinned_segments);
     }
     co_await synchronize(stream);
 }
@@ -437,9 +439,11 @@ task<void> kv_cache::copy_to_host(std::span<const layer_line> sources, std::span
             ));
         }
     }
+    at::Tensor pinned_segments;
     if (!segments.empty()) {
+        pinned_segments = pinned_int64(segments);
         auto guard = guard_stream(pool, stream);
-        copy_segments_to_host_cuda(pool, host_pages.buffer(), pinned_int64(segments));
+        copy_segments_to_host_cuda(pool, host_pages.buffer(), pinned_segments);
     }
     co_await synchronize(stream);
 }
