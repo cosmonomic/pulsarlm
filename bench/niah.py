@@ -25,7 +25,7 @@ from typing import Annotated, Any, Literal, cast
 
 import httpx
 import typer
-from openai import APIStatusError, AsyncOpenAI, OpenAIError
+from openai import APIStatusError, AsyncOpenAI
 from openai.types.chat import (
     ChatCompletionMessageFunctionToolCall,
     ChatCompletionMessageParam,
@@ -540,7 +540,7 @@ async def run_item(
                 )
         else:
             error = "turn limit"
-    except OpenAIError as failure:
+    except APIStatusError as failure:
         error = str(failure)
     return {
         "variant": item.variant,
