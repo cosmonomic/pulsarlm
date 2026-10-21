@@ -743,9 +743,9 @@ class Series:
 
 SERIES = {
     "full_kv": Series("Full KV", "#52514e", "--"),
-    "cap_4k": Series("Cap 4k", "#86b6ef"),
-    "cap_8k": Series("Cap 8k", "#2a78d6"),
-    "cap_16k": Series("Cap 16k", "#104281"),
+    "cap_4k": Series("Capped @ 4k", "#86b6ef"),
+    "cap_8k": Series("Capped @ 8k", "#2a78d6"),
+    "cap_16k": Series("Capped @ 16k", "#104281"),
 }
 
 
@@ -789,7 +789,7 @@ def plot(
             f"{mean(in_view):>9}{mean(kept):>7}"
         )
 
-    surface, ink, muted, grid = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
+    surface, ink, muted, grid = "#ffffff", "#0b0b0b", "#52514e", "#e4e3df"
     figure, axes = pyplot.subplots(figsize=(7, 4), dpi=150)
     figure.patch.set_facecolor(surface)
     axes.set_facecolor(surface)
@@ -813,6 +813,7 @@ def plot(
             markersize=8,
             markeredgecolor=surface,
             markeredgewidth=2,
+            clip_on=False,
             label=series.label,
         )
         axes.annotate(
@@ -827,7 +828,7 @@ def plot(
     axes.set_xscale("log", base=2)
     axes.set_xticks(lengths, [f"{length // 1024}k" for length in lengths])
     axes.set_ylim(0, 100)
-    axes.set_xlabel("Haystack tokens", color=muted)
+    axes.set_xlabel("Haystack Size (tokens)", color=muted)
     axes.set_ylabel("Accuracy (%)", color=muted)
     axes.tick_params(colors=muted)
     axes.grid(axis="y", color=grid, linewidth=1)
@@ -836,7 +837,6 @@ def plot(
     for side in ("left", "bottom"):
         axes.spines[side].set_color(grid)
     axes.legend(frameon=False, labelcolor=ink, loc="lower left")
-    axes.set_title("NIAH through a read tool", color=ink, loc="left")
     figure.tight_layout()
     out.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(out, facecolor=surface)

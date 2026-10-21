@@ -48,6 +48,12 @@ Prefill is measured on a 5k-token prompt.
 Decode is one request generating 512 tokens,
 and 16 concurrent requests generating 256 tokens each.
 
+## Accuracy under eviction
+
+![NIAH accuracy against haystack length, full KV and eviction](bench/niah.svg)
+
+Needle in a haystack, Gemma 4 12B.
+
 ## Quickstart
 
 ```sh
