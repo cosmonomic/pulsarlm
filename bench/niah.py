@@ -189,7 +189,12 @@ def read_tool(max_read_lines: int) -> ChatCompletionToolParam:
     }
 
 
-def system_prompt(item: Item, recap: bool) -> str:
+def turn_limit(item: Item, max_read_lines: int) -> int:
+    """One in-order pass of reads, plus 4 turns."""
+    return math.ceil(len(item.lines) / max_read_lines) + 4
+
+
+def system_prompt(item: Item, recap: bool, turns: int) -> str:
     singular = item.kind.removesuffix("s")
     per_key = len(item.answers) // len(item.queries)
     per_key_kind = singular if per_key == 1 else item.kind
@@ -212,7 +217,8 @@ def system_prompt(item: Item, recap: bool) -> str:
         f"You are given a document of {len(item.lines)} lines, accessible through the "
         "read tool. It contains special "
         f'magic {item.kind}, each in this format: "{format}"\n'
-        f"The document has {wanted}. Read it in order from line 0.\n"
+        f"The document has {wanted}. Read it in order from line 0. You have {turns} "
+        "turns, your answer included.\n"
         f"Question: {question}"
     )
     if recap:
@@ -434,11 +440,11 @@ async def run_item(
     template: ChatTemplate,
     eviction_log: EvictionLog,
 ) -> dict[str, Any]:
+    max_turns = turn_limit(item, max_read_lines)
     messages: list[ChatCompletionMessageParam] = [
-        {"role": "system", "content": system_prompt(item, recap)},
+        {"role": "system", "content": system_prompt(item, recap, max_turns)},
         {"role": "user", "content": "Answer the question."},
     ]
-    max_turns = 2 * math.ceil(len(item.lines) / max_read_lines) + 4
     turns = tool_calls = generated_tokens = 0
     replies: list[dict[str, Any]] = []
     previous: dict[str, Any] | None = None
