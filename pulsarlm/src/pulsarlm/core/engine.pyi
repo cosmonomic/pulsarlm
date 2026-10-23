@@ -131,7 +131,7 @@ class EvictionPolicy:
         cycle_tokens: int = 512,
         max_context_window: int | None = None,
         eviction_threshold: float = 0.0,
-        eviction_warmup: int = 4096,
+        eviction_warmup: int = 1,
         attention_mass_decay: float = 1.0 / 256,
     ) -> None: ...
 

@@ -53,7 +53,9 @@ TEST_CASE("the sink and working tokens round up to pages and the context window 
     REQUIRE(pulsarlm::to_pages(eviction_policy{.attention_mass_decay = 0.5}, page_size).attention_mass_decay == 0.5);
     REQUIRE(!pulsarlm::to_pages(eviction_policy{}, page_size).max_pages);
     REQUIRE(pulsarlm::to_pages(eviction_policy{.eviction_threshold = 0.2}, page_size).can_evict());
-    REQUIRE(pulsarlm::to_pages(eviction_policy{.eviction_warmup = 9}, page_size).eviction_warmup == 3);
+    REQUIRE(
+        pulsarlm::to_pages(eviction_policy{.cycle_tokens = 9, .eviction_warmup = 2}, page_size).eviction_warmup == 6
+    );
 }
 
 TEST_CASE("samples add to their count, mean and sum of squared deviations") {

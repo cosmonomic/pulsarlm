@@ -64,7 +64,9 @@ class EvictionLog:
         return max(max_pages - next_cycle_pages, 0) * PAGE_SIZE
 
     def _warmup_pages(self) -> int:
-        return _ceil_div(self._eviction.eviction_warmup, PAGE_SIZE)
+        return self._eviction.eviction_warmup * _ceil_div(
+            self._eviction.cycle_tokens, PAGE_SIZE
+        )
 
     def _view(self, state: State) -> dict[str, Any]:
         full_pages = max(

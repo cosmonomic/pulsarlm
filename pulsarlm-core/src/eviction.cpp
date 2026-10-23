@@ -86,7 +86,7 @@ page_eviction_policy to_pages(const eviction_policy& policy, std::size_t page_si
         .cycle_tokens = policy.cycle_tokens,
         .max_pages = max_pages,
         .eviction_threshold = policy.eviction_threshold,
-        .eviction_warmup = ceil_div(policy.eviction_warmup, page_size),
+        .eviction_warmup = policy.eviction_warmup * ceil_div(policy.cycle_tokens, page_size),
         .attention_mass_decay = policy.attention_mass_decay,
     };
 }

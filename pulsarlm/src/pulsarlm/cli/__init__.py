@@ -110,8 +110,8 @@ EvictionWarmup = Annotated[
     typer.Option(
         "--eviction_warmup",
         min=0,
-        help="Tokens of pages leaving a layer's working set before it samples "
-        "scores, and as many again before it evicts by score.",
+        help="Eviction cycles of pages leaving a layer's working set before it "
+        "samples scores, and as many again before it evicts by score.",
         rich_help_panel="Eviction",
     ),
 ]
@@ -159,7 +159,7 @@ def serve(
     cycle_tokens: CycleTokens = 512,
     n_working: NWorking = 8192,
     eviction_threshold: EvictionThreshold = 0.0,
-    eviction_warmup: EvictionWarmup = 4096,
+    eviction_warmup: EvictionWarmup = 1,
     max_context_window: MaxContextWindow = None,
     eviction_log: Annotated[
         Path | None,
@@ -258,7 +258,7 @@ def chat(
     cycle_tokens: CycleTokens = 512,
     n_working: NWorking = 8192,
     eviction_threshold: EvictionThreshold = 0.0,
-    eviction_warmup: EvictionWarmup = 4096,
+    eviction_warmup: EvictionWarmup = 1,
     max_context_window: MaxContextWindow = None,
 ) -> None:
     """Chat with a model in the terminal. End input to quit."""

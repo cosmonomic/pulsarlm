@@ -12,21 +12,21 @@ namespace pulsarlm {
 // began. Its end evicts, in each KV layer, the full pages outside those holding the first n_sink tokens and the last
 // n_working tokens of the full pages whose page_score is below score_threshold at eviction_threshold, then the oldest
 // ones until the view holds at most max_context_window tokens through the next cycle. eviction_threshold is in [0, 1],
-// and 0 evicts nothing by score. A layer evicts by score once the pages of eviction_warmup tokens have left its working
-// set twice over: its density moments need that many samples before it samples scores, and its score moments as many
-// before it evicts. attention_mass_decay is the density EMA's rate per token. The defaults evict nothing.
+// and 0 evicts nothing by score. eviction_warmup counts cycles: a layer evicts by score once the pages of that many
+// cycles' tokens have left its working set twice over, as its density moments need that many samples before it samples
+// scores, and its score moments as many before it evicts. attention_mass_decay is the density EMA's rate per token. The defaults evict nothing.
 struct eviction_policy {
     std::size_t n_sink = 1024;
     std::size_t n_working = 8192;
     std::size_t cycle_tokens = 512;
     std::optional<std::size_t> max_context_window;
     double eviction_threshold = 0.0;
-    std::size_t eviction_warmup = 4096;
+    std::size_t eviction_warmup = 1;
     double attention_mass_decay = 1.0 / 256;
 };
 
-// An eviction_policy with its sink, working set, warm-up and context window in pages: n_sink, n_working and
-// eviction_warmup round up and max_pages rounds down. A cycle's end keeps the full pages and the pages a partial tail page and the next cycle's
+// An eviction_policy with its sink, working set, warm-up and context window in pages: n_sink and n_working round up,
+// eviction_warmup is its cycles times the pages a cycle's tokens fill, rounded up, and max_pages rounds down. A cycle's end keeps the full pages and the pages a partial tail page and the next cycle's
 // tokens fill within max_pages.
 struct page_eviction_policy {
     std::size_t n_sink;
