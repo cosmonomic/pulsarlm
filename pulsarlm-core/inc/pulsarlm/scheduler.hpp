@@ -72,9 +72,9 @@ class scheduler {
     task<batch> build_batch();
     task<void> launch(batch& b);
     task<void> write_back(batch& b);
-    // Adds to the moments of each layer that measures mass the full pages outside the sinks that seq's newest completed
-    // full pages moved out of its working set.
-    void add_leaving_pages(sequence& seq, std::size_t completed);
+    // Adds to the moments of each layer that measures mass the full pages outside the sinks that cycle_tokens tokens
+    // now follow, given that seq's newest completed full pages just completed.
+    void add_sampled_pages(sequence& seq, std::size_t completed);
     // Returns whether a view changed.
     bool end_cycle(sequence& seq);
 

@@ -90,8 +90,8 @@ at::Tensor zero_page_mass(
 // One KV layer's view of a sequence. A layer with pages has one line per view page: its full pages, each with its index
 // in the history, then the pages of tail and pending. A layer that measures mass keeps, per line, mass_heads mass_sum
 // values and one weight_sum (add_step_mass), as of the last step that measured them, 0 for a page never measured, and
-// the moments of the pages that left its working set (add_leaving_page). A recurrent layer has no pages: its lines are the one its state is updated in, then the one a step writes
-// the state at its newest page end into.
+// the moments of the pages it sampled (add_sampled_page). A recurrent layer has no pages: its lines are the one its
+// state is updated in, then the one a step writes the state at its newest page end into.
 class scheduler::layer_view {
   public:
     std::vector<digest> pages;
@@ -912,7 +912,7 @@ task<void> scheduler::write_back(batch& b) {
         }
         std::size_t completed = seq.advance(e.token_count, page_size, root);
         if (seq.eviction.can_evict() && completed > 0) {
-            add_leaving_pages(seq, completed);
+            add_sampled_pages(seq, completed);
         }
         if (completed > 0) {
             for (std::size_t layer = 0; layer < n_layers; layer++) {
@@ -1023,9 +1023,11 @@ task<void> scheduler::write_back(batch& b) {
     }
 }
 
-void scheduler::add_leaving_pages(sequence& seq, std::size_t completed) {
+// The pages after a full page fill at least cycle_tokens tokens once cycle_pages full pages follow it in the view, while
+// eviction drops only pages older than those, as it does when n_working is at least cycle_tokens.
+void scheduler::add_sampled_pages(sequence& seq, std::size_t completed) {
     std::size_t n_sink = seq.eviction.n_sink;
-    std::size_t n_working = seq.eviction.n_working;
+    std::size_t cycle_pages = ceil_div(seq.eviction.cycle_tokens, page_size);
     for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
         std::size_t heads = mass_heads[layer];
         if (heads == 0) {
@@ -1034,10 +1036,10 @@ void scheduler::add_leaving_pages(sequence& seq, std::size_t completed) {
         layer_view& view = seq.layers[layer];
         std::size_t after = view.pages.size();
         std::size_t before = after - completed;
-        std::size_t first = std::max(n_sink, before > n_working ? before - n_working : 0);
-        std::size_t last = after > n_working ? after - n_working : 0;
+        std::size_t first = std::max(n_sink, before > cycle_pages ? before - cycle_pages : 0);
+        std::size_t last = after > cycle_pages ? after - cycle_pages : 0;
         for (std::size_t page = first; page < last; page++) {
-            add_leaving_page(
+            add_sampled_page(
                 view.density_moments,
                 view.score_moments,
                 std::span(view.mass_sum).subspan(page * heads, heads),

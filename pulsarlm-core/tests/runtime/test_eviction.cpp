@@ -106,19 +106,19 @@ TEST_CASE("a page no query token attended scores lowest") {
     );
 }
 
-TEST_CASE("a leaving page adds its densities, then its score once the heads can standardize it") {
+TEST_CASE("a sampled page adds its densities, then its score once the heads can standardize it") {
     std::vector<moments> density_moments(1);
     moments score_moments;
-    pulsarlm::add_leaving_page(density_moments, score_moments, std::vector<float>{2.0f}, 2.0f, 2);
+    pulsarlm::add_sampled_page(density_moments, score_moments, std::vector<float>{2.0f}, 2.0f, 2);
     REQUIRE(density_moments[0] == moments{.count = 1, .mean = 1.0, .m2 = 0.0});
     REQUIRE(score_moments.count == 0);
 
-    pulsarlm::add_leaving_page(density_moments, score_moments, std::vector<float>{3.0f}, 1.0f, 2);
+    pulsarlm::add_sampled_page(density_moments, score_moments, std::vector<float>{3.0f}, 1.0f, 2);
     REQUIRE(density_moments[0].count == 2);
     REQUIRE(score_moments.count == 1);
     REQUIRE_THAT(score_moments.mean, WithinAbs(1.0 / std::sqrt(2.0), 1e-12));
 
-    pulsarlm::add_leaving_page(density_moments, score_moments, std::vector<float>{7.0f}, 0.0f, 2);
+    pulsarlm::add_sampled_page(density_moments, score_moments, std::vector<float>{7.0f}, 0.0f, 2);
     REQUIRE(density_moments[0].count == 2);
     REQUIRE(score_moments.count == 1);
 }
@@ -129,10 +129,10 @@ TEST_CASE("heads and scores count once they hold the warm-up's samples") {
     REQUIRE(pulsarlm::page_score(std::vector<float>{1.0f}, 1.0f, density_moments, 3) == 1.0);
 
     moments score_moments;
-    pulsarlm::add_leaving_page(density_moments, score_moments, std::vector<float>{0.0f}, 1.0f, 5);
+    pulsarlm::add_sampled_page(density_moments, score_moments, std::vector<float>{0.0f}, 1.0f, 5);
     REQUIRE(density_moments[0].count == 4);
     REQUIRE(score_moments.count == 0);
-    pulsarlm::add_leaving_page(density_moments, score_moments, std::vector<float>{0.0f}, 1.0f, 5);
+    pulsarlm::add_sampled_page(density_moments, score_moments, std::vector<float>{0.0f}, 1.0f, 5);
     REQUIRE(score_moments.count == 1);
 
     moments scores = two_samples(1.0, 2.0);

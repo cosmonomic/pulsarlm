@@ -51,8 +51,8 @@ class ActivePage:
 
 class LayerSequence:
     """One KV layer's active pages, in view order, and the moments of the pages
-    that left its working set: of their densities, one per query head the layer
-    measures mass in or none, and of their scores."""
+    it sampled, each once a cycle's tokens followed it: of their densities, one
+    per query head the layer measures mass in or none, and of their scores."""
 
     pages: list[ActivePage]
     density_moments: list[Moments]

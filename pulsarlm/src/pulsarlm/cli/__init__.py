@@ -110,8 +110,8 @@ EvictionWarmup = Annotated[
     typer.Option(
         "--eviction_warmup",
         min=0,
-        help="Eviction cycles of pages leaving a layer's working set before it "
-        "samples scores, and as many again before it evicts by score.",
+        help="Eviction cycles of pages a layer samples before it samples scores, "
+        "and as many again before it evicts by score.",
         rich_help_panel="Eviction",
     ),
 ]

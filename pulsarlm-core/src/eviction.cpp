@@ -149,7 +149,7 @@ std::optional<double> page_score(
     return score;
 }
 
-void add_leaving_page(
+void add_sampled_page(
     std::span<moments> density_moments,
     moments& score_moments,
     std::span<const float> mass_sum,

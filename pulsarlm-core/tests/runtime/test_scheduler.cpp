@@ -851,18 +851,21 @@ TEST_CASE("a cycle's end evicts the pages scoring below the threshold outside th
             .tokens = eight_pages,
             .max_tokens = 2,
             .eviction =
-                {.n_sink = 4, .n_working = 4, .cycle_tokens = 32, .eviction_threshold = 0.5, .eviction_warmup = 0},
+                {.n_sink = 4, .n_working = 4, .cycle_tokens = 4, .eviction_threshold = 0.5, .eviction_warmup = 0},
         }}
     );
 
+    // Each page is sampled once the next one completes. Pages 2 and 3 go once page 5 completes, page 5 once page 6
+    // does, so the last prefill step attends pages 0, 1, 4 and 6 and its own page 7, and page 6 goes at its end.
     std::vector<digest> chain = pulsarlm::make_page_digests(root(), eight_pages, page_size);
+    std::int64_t first = continuation(pages_of(eight_pages, {0, 1, 4, 6, 7}), 1)[0];
     token_list kept = pages_of(eight_pages, {0, 1, 4, 7});
-    std::int64_t first = continuation(eight_pages, 1)[0];
     REQUIRE(results[0].tokens == token_list{first, continuation(concat(kept, {first}), 1)[0]});
-    REQUIRE(results[0].cycle_ends.size() == 1);
-    REQUIRE((hashes_of(results[0].cycle_ends[0].reached) == std::vector{chain[0], chain[1], chain[4], chain[7]}));
-    REQUIRE(results[0].cycle_ends[0].reached.tail.empty());
-    REQUIRE(results[0].cycle_ends[0].token_count == 32);
+    REQUIRE(results[0].cycle_ends.size() == 8);
+    const pulsarlm::cycle_end& prefill_end = results[0].cycle_ends[7];
+    REQUIRE((hashes_of(prefill_end.reached) == std::vector{chain[0], chain[1], chain[4], chain[7]}));
+    REQUIRE(prefill_end.reached.tail.empty());
+    REQUIRE(prefill_end.token_count == 32);
     pulsarlm::state end = ended_state(results[0]);
     REQUIRE((hashes_of(end) == std::vector{chain[0], chain[1], chain[4], chain[7]}));
     REQUIRE(end.tail == token_list{first});
@@ -876,12 +879,14 @@ TEST_CASE("a layer evicts nothing by score during its warm-up") {
         {request{
             .tokens = eight_pages,
             .max_tokens = 2,
-            .eviction = {.n_sink = 4, .n_working = 4, .cycle_tokens = 32, .eviction_threshold = 0.5},
+            .eviction =
+                {.n_sink = 4, .n_working = 4, .cycle_tokens = 4, .eviction_threshold = 0.5, .eviction_warmup = 4},
         }}
     );
 
+    // The prompt's 6 sampled pages are fewer than the warm-up's 4 density samples then 4 score samples.
     REQUIRE(
-        (hashes_of(results[0].cycle_ends[0].reached) == pulsarlm::make_page_digests(root(), eight_pages, page_size))
+        (hashes_of(results[0].cycle_ends.back().reached) == pulsarlm::make_page_digests(root(), eight_pages, page_size))
     );
 }
 
@@ -1211,15 +1216,16 @@ TEST_CASE("each full-attention layer evicts by its own attention mass") {
             .tokens = eight_pages,
             .max_tokens = 3,
             .eviction =
-                {.n_sink = 4, .n_working = 4, .cycle_tokens = 32, .eviction_threshold = 0.5, .eviction_warmup = 0},
+                {.n_sink = 4, .n_working = 4, .cycle_tokens = 4, .eviction_threshold = 0.5, .eviction_warmup = 0},
         }}
     );
 
+    // Layer 0, which predicts, evicts as in the single-layer case: its last prefill step attends pages 0, 1, 4, 6 and 7.
     std::vector<digest> chain = pulsarlm::make_page_digests(root(), eight_pages, page_size);
+    std::int64_t first = continuation(pages_of(eight_pages, {0, 1, 4, 6, 7}), 1)[0];
     token_list kept = pages_of(eight_pages, {0, 1, 4, 7});
-    std::int64_t first = continuation(eight_pages, 1)[0];
     REQUIRE(results[0].tokens == concat({first}, continuation(concat(kept, {first}), 2)));
-    const pulsarlm::state& reached = results[0].cycle_ends[0].reached;
+    const pulsarlm::state& reached = results[0].cycle_ends[7].reached;
     REQUIRE((hashes_of(reached, 0) == std::vector{chain[0], chain[1], chain[4], chain[7]}));
     REQUIRE((densities_of(reached, 0) == std::vector{0.0f, 1.0f, 1.0f, 0.0f}));
     REQUIRE((hashes_of(reached, 1) == std::vector{chain[0], chain[2], chain[5], chain[7]}));
@@ -1242,7 +1248,7 @@ TEST_CASE("a page takes the same position in every layer, its rank among the pag
             .tokens = eight_pages,
             .max_tokens = 2,
             .eviction =
-                {.n_sink = 4, .n_working = 4, .cycle_tokens = 32, .eviction_threshold = 0.5, .eviction_warmup = 0},
+                {.n_sink = 4, .n_working = 4, .cycle_tokens = 4, .eviction_threshold = 0.5, .eviction_warmup = 0},
         }}
     );
 
@@ -1267,7 +1273,7 @@ TEST_CASE("a request resumed from a state with different views per layer keeps t
     fixture f(16);
     f.model.important = each_layers_own;
     pulsarlm::eviction_policy
-        policy{.n_sink = 4, .n_working = 4, .cycle_tokens = 32, .eviction_threshold = 0.5, .eviction_warmup = 0};
+        policy{.n_sink = 4, .n_working = 4, .cycle_tokens = 4, .eviction_threshold = 0.5, .eviction_warmup = 0};
     std::vector<request_results> results = serve_in_turn(
         f.sched,
         request{.tokens = eight_pages, .max_tokens = 2, .eviction = policy},

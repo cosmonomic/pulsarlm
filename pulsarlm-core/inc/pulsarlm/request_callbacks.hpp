@@ -24,8 +24,8 @@ struct active_page {
     bool operator==(const active_page&) const = default;
 };
 
-// One KV layer's active pages, in view order, and the moments of the pages that left its working set
-// (add_leaving_page): of their densities, one per query head the layer measures mass in, or none for a layer that
+// One KV layer's active pages, in view order, and the moments of the pages it sampled (add_sampled_page): of their
+// densities, one per query head the layer measures mass in, or none for a layer that
 // measures none or an initial state without them, and of their scores.
 struct layer_sequence {
     std::vector<active_page> pages;
