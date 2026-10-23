@@ -5,6 +5,7 @@ from pulsarlm.core import pulsarlm_core
 ActivePage = pulsarlm_core.ActivePage
 CycleEnd = pulsarlm_core.CycleEnd
 Engine = pulsarlm_core.Engine
+EngineStat = pulsarlm_core.EngineStat
 EvictionPolicy = pulsarlm_core.EvictionPolicy
 Gemma4Config = pulsarlm_core.Gemma4Config
 LayerSequence = pulsarlm_core.LayerSequence

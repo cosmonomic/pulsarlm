@@ -1057,6 +1057,10 @@ state scheduler::reached(const sequence& seq) const {
     return s;
 }
 
+std::size_t scheduler::kv_cache_bytes() const noexcept {
+    return cache.used_bytes();
+}
+
 void scheduler::validate_state(const state& s) const {
     if (s.layers.empty() && !s.head) {
         return;

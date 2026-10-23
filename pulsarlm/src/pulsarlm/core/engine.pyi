@@ -69,6 +69,12 @@ class RequestError(enum.Enum):
     CANCELLED = ...
     LOOP_EXITED = ...
 
+class EngineStat:
+    @property
+    def kv_cache_bytes(self) -> int:
+        """The bytes of the KV cache's pool that lines in use take: those of
+        running requests, not those only caching a page."""
+
 class SamplingParams:
     temperature: float
     top_p: float
@@ -304,6 +310,7 @@ class Engine:
     def page_keys(self, state: State) -> list[bytes]:
         """The store keys of the pages of state's sequences, which a request
         resuming from state reads."""
+    def stat(self) -> EngineStat: ...
     def fileno(self) -> int:
         """An eventfd that becomes readable when a request has results to take."""
     def clear_wake(self) -> None:

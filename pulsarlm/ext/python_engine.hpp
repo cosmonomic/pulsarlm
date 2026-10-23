@@ -75,6 +75,7 @@ class python_engine {
     );
     std::vector<digest> page_digests(const std::vector<std::int64_t>& tokens) const;
     std::vector<digest> page_keys(const state& s) const;
+    engine_stat stat() const;
     int fileno() const noexcept;
     void clear_wake() noexcept;
     // The message of the exception that panicked the loop; nullopt while the loop runs or when it was stopped.

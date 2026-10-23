@@ -101,6 +101,10 @@ std::vector<digest> python_engine::page_keys(const state& s) const {
     return served->page_keys(s);
 }
 
+engine_stat python_engine::stat() const {
+    return served->stat();
+}
+
 int python_engine::fileno() const noexcept {
     return wake->fileno();
 }

@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from pulsarlm.async_engine import AsyncEngine
 from pulsarlm.eviction_log import EvictionLog
 from pulsarlm.served_model import load_served_model
+from pulsarlm.server.metrics import router as metrics_router
 from pulsarlm.server.openai import ServerState
 from pulsarlm.server.openai import router as openai_router
 from pulsarlm.settings import Settings
@@ -44,4 +45,5 @@ def create_app(load: Callable[[], ServerState]) -> FastAPI:
 
     app = FastAPI(lifespan=lifespan)
     app.include_router(openai_router, prefix="/api/openai/v1")
+    app.include_router(metrics_router)
     return app

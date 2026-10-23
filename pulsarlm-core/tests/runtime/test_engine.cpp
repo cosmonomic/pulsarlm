@@ -144,7 +144,7 @@ pulsarlm::engine_config config(std::size_t n_lines) {
         .model_name = "successor",
         .page_size = page_size,
         .kv_dtype = at::kFloat,
-        .kv_cache_bytes = n_lines * line_bytes,
+        .kv_cache_pool_bytes = n_lines * line_bytes,
         .host_page_bytes = 64 * line_bytes,
         .device = at::Device(at::kCUDA, 0),
         .stop_ids = {},
@@ -168,7 +168,7 @@ digest root() {
 
 TEST_CASE("an engine whose KV cache holds no line is rejected") {
     pulsarlm::engine_config sized = config(16);
-    sized.kv_cache_bytes = pulsarlm::line_bytes(pulsarlm::page_shapes(sized, one_layer)[0]) - 1;
+    sized.kv_cache_pool_bytes = pulsarlm::line_bytes(pulsarlm::page_shapes(sized, one_layer)[0]) - 1;
     REQUIRE_THROWS_AS(
         pulsarlm::engine(std::make_unique<successor_model>(), sized, std::make_unique<stalling_store>()),
         std::invalid_argument

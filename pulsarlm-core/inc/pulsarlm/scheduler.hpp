@@ -103,6 +103,8 @@ class scheduler {
     // window reaches, a recurrent layer's head alone, and each page holding no density or one per query head its layer
     // measures, every density finite and non-negative. Safe to call from any thread.
     void validate_state(const state& s) const;
+    // kv_cache::used_bytes of the scheduler's cache. Safe to call from any thread.
+    std::size_t kv_cache_bytes() const noexcept;
 };
 
 }  // namespace pulsarlm

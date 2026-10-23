@@ -3,6 +3,7 @@
 #include <ATen/core/Tensor.h>
 #include <cuda_runtime_api.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -123,6 +124,9 @@ class kv_cache {
     line_allocator allocator;
     page_store* store;
     host_page_pool host_pages;
+    // The block bytes of the lines in use, read and written through std::atomic_ref so used_bytes is safe from any
+    // thread.
+    alignas(std::atomic_ref<std::size_t>::required_alignment) mutable std::size_t used_line_bytes = 0;
 
     cache_line& line(std::size_t layer, std::uint32_t line_id) noexcept;
     const cache_line& line(std::size_t layer, std::uint32_t line_id) const noexcept;
@@ -134,6 +138,8 @@ class kv_cache {
     take_lines(line_allocator::transaction& taking, std::span<const std::size_t> counts);
     // Commits taking: drops the pages of the regions it reclaimed, then names taken, empty and held, by their layers.
     void commit(line_allocator::transaction& taking, std::span<const std::vector<std::uint32_t>> taken);
+    void count_used(std::size_t layer) noexcept;
+    void count_unused(std::size_t layer) noexcept;
     void assign_hash(std::size_t layer, std::uint32_t line_id, const digest& hash);
     std::size_t line_offset(std::size_t layer, std::uint32_t line_id) const noexcept;
     // The transfers complete once the stream has finished them. Pages in the host pool copy in one launch; a page
@@ -187,6 +193,9 @@ class kv_cache {
 
     // The largest count for which allocate gives count lines of every layer now.
     std::size_t free_count();
+    // The bytes of the pool that lines in use take: lines get, allocate or clone gave and release has not taken back,
+    // not lines only caching a page. Safe to call from any thread.
+    std::size_t used_bytes() const noexcept;
     std::size_t layer_count() const noexcept;
     // [n_lines, page_size, n_kv_heads, head_dim] views of the pool, indexed by line id, lines a block apart.
     const kv& tensors(std::size_t layer) const noexcept;

@@ -6,6 +6,7 @@ import weakref
 from pulsarlm.core.engine import (
     CycleEnd,
     Engine,
+    EngineStat,
     EvictionPolicy,
     Request,
     RequestError,
@@ -88,6 +89,9 @@ class AsyncEngine:
 
     def page_keys(self, state: State) -> list[bytes]:
         return self._engine.page_keys(state)
+
+    def stat(self) -> EngineStat:
+        return self._engine.stat()
 
     def close(self) -> None:
         self._loop.remove_reader(self._engine.fileno())

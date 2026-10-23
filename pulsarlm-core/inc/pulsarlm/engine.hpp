@@ -24,7 +24,7 @@
 namespace pulsarlm {
 
 // model_name names the model and its weights version; with the KV layers' page shapes it makes the root digest. The KV
-// layers' lines share one pool of kv_cache_bytes, which must hold a line of every KV layer. The host copies of the
+// layers' lines share one pool of kv_cache_pool_bytes, which must hold a line of every KV layer. The host copies of the
 // pages handed to the store come from a pinned host_page_pool of host_page_bytes. A step forwards every decoding
 // sequence and at most prefill_tokens_per_step tokens of the others. max_context is the model's context in tokens,
 // which a request's eviction_target is a fraction of; without it, eviction_target must be 1.
@@ -32,13 +32,19 @@ struct engine_config {
     std::string model_name;
     std::size_t page_size;
     at::ScalarType kv_dtype;
-    std::size_t kv_cache_bytes;
+    std::size_t kv_cache_pool_bytes;
     std::size_t host_page_bytes = 0;
     at::Device device;
     std::vector<std::int64_t> stop_ids;
     std::size_t vocab_size;
     std::size_t prefill_tokens_per_step;
     std::optional<std::size_t> max_context;
+};
+
+// kv_cache_bytes is the bytes of the KV cache's pool that lines in use take: those of running requests, not those only
+// caching a page.
+struct engine_stat {
+    std::size_t kv_cache_bytes;
 };
 
 // The page shape of each KV layer, one layer each.
@@ -82,6 +88,8 @@ class engine {
     std::vector<digest> page_digests(std::span<const std::int64_t> tokens) const;
     // The store keys of the pages of s's sequences, which a request resuming from s reads. Safe to call from any thread.
     std::vector<digest> page_keys(const state& s) const;
+    // Safe to call from any thread.
+    engine_stat stat() const;
 };
 
 }  // namespace pulsarlm

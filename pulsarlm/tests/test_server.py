@@ -353,3 +353,12 @@ def test_the_eviction_log_leaves_out_evicted_pages(tmp_path):
         assert starts[0] == 0
         assert layer["pages"][-1][1] == full
         assert len(starts) < full // PAGE_SIZE
+
+
+def test_metrics_count_no_kv_cache_bytes_once_requests_end(client):
+    post(client, messages=MESSAGES, max_tokens=4)
+
+    response = client.get("http://testserver/metrics")
+
+    assert response.status_code == 200
+    assert f'pulsarlm:kv_cache_bytes{{model_name="{MODEL_ID}"}} 0\n' in response.text

@@ -89,7 +89,7 @@ void validate(const request& r, std::size_t page_size, std::size_t vocab_size, s
 kv_cache make_cache(const engine_config& config, std::span<const kv_layer> layers, page_store& store) {
     check_attention(config, layers);
     std::vector<page_shape> shapes = page_shapes(config, layers);
-    return kv_cache(shapes, config.kv_cache_bytes, config.host_page_bytes, config.device, store);
+    return kv_cache(shapes, config.kv_cache_pool_bytes, config.host_page_bytes, config.device, store);
 }
 
 }  // namespace
@@ -199,6 +199,10 @@ std::exception_ptr engine::exception() const {
 
 std::vector<digest> engine::page_digests(std::span<const std::int64_t> tokens) const {
     return make_page_digests(root, tokens, page_size);
+}
+
+engine_stat engine::stat() const {
+    return engine_stat{.kv_cache_bytes = sched.kv_cache_bytes()};
 }
 
 std::vector<digest> engine::page_keys(const state& s) const {

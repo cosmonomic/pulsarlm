@@ -290,6 +290,37 @@ TEST_CASE("allocate fails with oom holding nothing when lines run out") {
     require_all_free(fixture.kv, 4);
 }
 
+TEST_CASE("used_bytes counts each line in use once and no line only caching a page") {
+    cache_fixture fixture(4);
+    std::size_t block = std::bit_ceil(pulsarlm::line_bytes(shape));
+    REQUIRE(fixture.kv.used_bytes() == 0);
+    sync_page(fixture.kv, hash_of(1), 1.0f);
+    REQUIRE(fixture.kv.used_bytes() == 0);
+
+    line_ids allocated = allocate(fixture.kv, 2).value();
+    REQUIRE(fixture.kv.used_bytes() == 2 * block);
+    lines_result got = run_get(fixture.kv, {hash_of(1)});
+    lines_result got_again = run_get(fixture.kv, {hash_of(1)});
+    REQUIRE(got.has_value());
+    REQUIRE(got_again.has_value());
+    REQUIRE(fixture.kv.used_bytes() == 3 * block);
+
+    release(fixture.kv, *got);
+    REQUIRE(fixture.kv.used_bytes() == 3 * block);
+    release(fixture.kv, *got_again);
+    release(fixture.kv, allocated);
+    REQUIRE(fixture.kv.used_bytes() == 0);
+}
+
+TEST_CASE("a get failing with oom leaves used_bytes as it was") {
+    cache_fixture fixture(1);
+    sync_page(fixture.kv, hash_of(1), 1.0f);
+    fixture.store->pages.emplace(key_of(2), host_page(2.0f));
+
+    REQUIRE(run_get(fixture.kv, {hash_of(1), hash_of(2)}) == oom);
+    REQUIRE(fixture.kv.used_bytes() == 0);
+}
+
 TEST_CASE("sync stores host copies and get finds the page without fetching") {
     cache_fixture fixture(4);
     sync_page(fixture.kv, hash_of(1), 3.0f);

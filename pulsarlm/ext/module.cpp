@@ -189,6 +189,8 @@ PYBIND11_MODULE(pulsarlm_core, m) {
         .def_readonly("reached", &cycle_end::reached)
         .def_readonly("token_count", &cycle_end::token_count);
 
+    py::class_<engine_stat>(m, "EngineStat").def_readonly("kv_cache_bytes", &engine_stat::kv_cache_bytes);
+
     py::native_enum<request_error>(m, "RequestError", "enum.Enum")
         .value("MISS", request_error::miss)
         .value("OOM", request_error::oom)
@@ -662,6 +664,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             [](const python_engine& e, const state& s) { return to_bytes_list(e.page_keys(s)); },
             "state"_a
         )
+        .def("stat", &python_engine::stat)
         .def("fileno", &python_engine::fileno)
         .def("clear_wake", &python_engine::clear_wake)
         .def("exception", &python_engine::exception);
