@@ -126,7 +126,7 @@ async def create_chat_completion(body: ChatCompletionRequest, state: State):
         tokens = state.eviction_log.record(completion_id, prompt, tokens, states)
     reply = _Reply(state, body.max_tokens, prompt, tool_calls=tools is not None)
     if body.stream:
-        return _stream_completion(body, completion_id, reply, tokens)
+        return _stream_completion(body, completion_id, reply, tokens, len(prompt))
     return await _full_completion(body, completion_id, reply, tokens, len(prompt))
 
 
@@ -277,6 +277,7 @@ def _stream_completion(
     completion_id: str,
     reply: _Reply,
     tokens: AsyncGenerator[int],
+    prompt_tokens: int,
 ) -> StreamingResponse:
     created = int(time.time())
 
@@ -318,6 +319,19 @@ def _stream_completion(
                     )
                 )
             yield chunk(ChatCompletionChunkDelta(), reply.final_finish_reason(calls))
+            if body.stream_options is not None and body.stream_options.include_usage:
+                usage = ChatCompletionChunk(
+                    id=completion_id,
+                    created=created,
+                    model=body.model,
+                    choices=[],
+                    usage=Usage(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=reply.token_count,
+                        total_tokens=prompt_tokens + reply.token_count,
+                    ),
+                )
+                yield f"data: {usage.model_dump_json()}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(events(), media_type="text/event-stream")

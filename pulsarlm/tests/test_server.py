@@ -194,6 +194,26 @@ def test_a_streamed_completion_ends_with_done(client):
     assert last["choices"][0]["finish_reason"] == "length"
 
 
+def test_a_stream_with_include_usage_ends_with_a_usage_chunk(client):
+    response = post(
+        client,
+        messages=MESSAGES,
+        max_tokens=4,
+        stream=True,
+        stream_options={"include_usage": True},
+    )
+
+    events = [line for line in response.text.split("\n\n") if line]
+    assert events[-1] == "data: [DONE]"
+    last = json.loads(events[-2].removeprefix("data: "))
+    assert last["choices"] == []
+    assert last["usage"] == {
+        "prompt_tokens": 41,
+        "completion_tokens": 4,
+        "total_tokens": 45,
+    }
+
+
 def test_a_follow_up_continues_from_a_stored_state(client):
     first = post(client, messages=MESSAGES, max_tokens=4).json()
     reply = first["choices"][0]["message"]["content"]

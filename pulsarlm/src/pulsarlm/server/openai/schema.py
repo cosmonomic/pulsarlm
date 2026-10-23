@@ -39,10 +39,15 @@ class Tool(BaseModel):
     function: FunctionDefinition
 
 
+class StreamOptions(BaseModel):
+    include_usage: bool = False
+
+
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[ChatMessage]
     stream: bool = False
+    stream_options: StreamOptions | None = None
     max_tokens: int | None = Field(default=None, ge=0)
     temperature: float = Field(default=1.0, ge=0.0, le=2.0)
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
@@ -97,6 +102,7 @@ class ChatCompletionChunk(BaseModel):
     created: int
     model: str
     choices: list[ChatCompletionChunkChoice]
+    usage: Usage | None = None
 
 
 class ModelCard(BaseModel):
