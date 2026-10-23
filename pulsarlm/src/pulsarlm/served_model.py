@@ -23,7 +23,6 @@ class ServedModel:
     chat_template: ChatTemplate
     stop_ids: list[int]
     eviction: EvictionPolicy
-    max_context: int | None
 
 
 def load_served_model(settings: Settings, path: Path) -> ServedModel:
@@ -51,7 +50,6 @@ def load_served_model(settings: Settings, path: Path) -> ServedModel:
         device=device,
         stop_ids=stops,
         prefill_tokens_per_step=settings.prefill_tokens_per_step,
-        max_context=max_context,
     )
     return ServedModel(
         engine=engine,
@@ -63,7 +61,7 @@ def load_served_model(settings: Settings, path: Path) -> ServedModel:
             n_working=settings.n_working,
             cycle_tokens=settings.cycle_tokens,
             max_context_window=settings.max_context_window or max_context,
-            eviction_target=settings.eviction_target,
+            eviction_threshold=settings.eviction_threshold,
+            eviction_warmup=settings.eviction_warmup,
         ),
-        max_context=max_context,
     )

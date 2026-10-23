@@ -94,11 +94,24 @@ NWorking = Annotated[
         rich_help_panel="Eviction",
     ),
 ]
-EvictionTarget = Annotated[
+EvictionThreshold = Annotated[
     float,
     typer.Option(
-        "--eviction_target",
-        help="Fraction of the model's context a layer's pages settle under; 1 is off.",
+        "--eviction_threshold",
+        min=0.0,
+        max=1.0,
+        help="Evicts the pages whose score, the mean of their densities over the "
+        "query heads, is below it; 0 is off.",
+        rich_help_panel="Eviction",
+    ),
+]
+EvictionWarmup = Annotated[
+    int,
+    typer.Option(
+        "--eviction_warmup",
+        min=0,
+        help="Tokens of pages leaving a layer's working set before it samples "
+        "scores, and as many again before it evicts by score.",
         rich_help_panel="Eviction",
     ),
 ]
@@ -145,7 +158,8 @@ def serve(
     persist: Persist = False,
     cycle_tokens: CycleTokens = 512,
     n_working: NWorking = 8192,
-    eviction_target: EvictionTarget = 0.8,
+    eviction_threshold: EvictionThreshold = 0.0,
+    eviction_warmup: EvictionWarmup = 4096,
     max_context_window: MaxContextWindow = None,
     eviction_log: Annotated[
         Path | None,
@@ -173,7 +187,8 @@ def serve(
                 persist=persist,
                 cycle_tokens=cycle_tokens,
                 n_working=n_working,
-                eviction_target=eviction_target,
+                eviction_threshold=eviction_threshold,
+                eviction_warmup=eviction_warmup,
                 max_context_window=max_context_window,
             ),
             host=host,
@@ -242,7 +257,8 @@ def chat(
     persist: Persist = False,
     cycle_tokens: CycleTokens = 512,
     n_working: NWorking = 8192,
-    eviction_target: EvictionTarget = 0.8,
+    eviction_threshold: EvictionThreshold = 0.0,
+    eviction_warmup: EvictionWarmup = 4096,
     max_context_window: MaxContextWindow = None,
 ) -> None:
     """Chat with a model in the terminal. End input to quit."""
@@ -261,7 +277,8 @@ def chat(
                 persist=persist,
                 cycle_tokens=cycle_tokens,
                 n_working=n_working,
-                eviction_target=eviction_target,
+                eviction_threshold=eviction_threshold,
+                eviction_warmup=eviction_warmup,
                 max_context_window=max_context_window,
             ),
             system=system,

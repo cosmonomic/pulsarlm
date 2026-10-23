@@ -54,6 +54,7 @@ Gemma4Model::Gemma4Model(gemma4_config config, const c10::Dict<std::string, at::
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
         if (layer < first_shared) {
             kv_layer_of.push_back(kv_specs.size());
+            reader_of.push_back(0);
             bool full = !sliding(layer);
             kv_specs.push_back(
                 kv_layer{
@@ -77,6 +78,7 @@ Gemma4Model::Gemma4Model(gemma4_config config, const c10::Dict<std::string, at::
             );
         }
         kv_layer_of.push_back(kv_layer_of[source]);
+        reader_of.push_back(kv_specs[kv_layer_of[source]].n_readers++);
     }
 
     if (c.hidden_size_per_layer_input > 0) {
@@ -187,7 +189,8 @@ Gemma4Model::attention(const at::Tensor& h, std::int64_t layer, const GroupBatch
     if (spec.sliding_window) {
         window = static_cast<std::int64_t>(*spec.sliding_window);
     }
-    at::Tensor o = paged_attention(q, k, v, lines[kv_index], kv_index, g, 1.0, rope, window, k_norm_weight);
+    at::Tensor
+        o = paged_attention(q, k, v, lines[kv_index], kv_index, reader_of[layer], g, 1.0, rope, window, k_norm_weight);
     return at::linear(o.reshape({ntok, config.n_heads * head_dim}), w.o_proj);
 }
 

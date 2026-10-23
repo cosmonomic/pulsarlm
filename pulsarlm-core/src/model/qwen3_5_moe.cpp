@@ -169,6 +169,7 @@ at::Tensor Qwen3_5MoeModel::attention(
         v,
         lines[kv_index],
         kv_index,
+        0,
         g,
         1.0 / std::sqrt(static_cast<double>(c.head_dim)),
         rope

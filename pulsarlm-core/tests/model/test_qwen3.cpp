@@ -92,7 +92,7 @@ at::Tensor rope(const at::Tensor& x) {
 struct dense_output {
     at::Tensor logits;  // [tokens, vocab]
     std::vector<at::Tensor> unrotated_k;  // per layer [tokens, n_kv_heads, head_dim]
-    std::vector<at::Tensor> attention;  // per layer [n_heads, tokens, tokens], query by key
+    std::vector<at::Tensor> scores;  // per layer [n_heads, tokens, tokens], query by key, -inf for unattended keys
 };
 
 dense_output dense_forward(const weights& w, const at::Tensor& tokens) {
@@ -113,8 +113,9 @@ dense_output dense_forward(const weights& w, const at::Tensor& tokens) {
         auto k_heads = rope(k).repeat_interleave(group, 1).transpose(0, 1);
         auto v_heads = v.repeat_interleave(group, 1).transpose(0, 1);
         auto scores = at::matmul(q_heads, k_heads.transpose(1, 2)) / std::sqrt(static_cast<double>(head_dim));
-        auto probabilities = at::softmax(scores.masked_fill(causal.logical_not(), -INFINITY), -1);
-        out.attention.push_back(probabilities);
+        auto attended_scores = scores.masked_fill(causal.logical_not(), -INFINITY);
+        out.scores.push_back(attended_scores);
+        auto probabilities = at::softmax(attended_scores, -1);
         auto o = at::matmul(probabilities, v_heads).transpose(0, 1).reshape({n, n_heads * head_dim});
         x = x + at::linear(o, w.layer(layer, "self_attn.o_proj.weight"));
         auto h2 = rms_norm(x, w.layer(layer, "post_attention_layernorm.weight"));
@@ -126,27 +127,34 @@ dense_output dense_forward(const weights& w, const at::Tensor& tokens) {
     return out;
 }
 
-// The mass weight of the query at position p of a step forwarding the queries at positions [first, last).
-double mass_weight(std::int64_t p, std::int64_t last) {
+// The query weight of the query at position p of a step forwarding the queries at positions [first, last).
+double query_weight(std::int64_t p, std::int64_t last) {
     return 0.25 * std::pow(0.75, static_cast<double>(last - 1 - p));
 }
 
-// Layer layer's page mass [view pages, n_heads] of a step forwarding the queries at positions [first, last): per page
-// and head, W exp(S / W), with S the sum over the queries attending the page of their mass weight times the log of
-// their max attention weight over its keys, and W the sum of those mass weights.
-at::Tensor dense_page_mass(const dense_output& dense, std::int64_t layer, std::int64_t first, std::int64_t last) {
+// Layer layer's page mass_sum [view pages, n_heads] and weight_sum [view pages] of a step forwarding the queries at
+// positions [first, last): per page and head, the sum over the queries attending the page of their query weight times
+// their max scaled score over its keys, and per page the sum of those weights.
+struct dense_mass {
+    at::Tensor mass_sum;
+    at::Tensor weight_sum;
+};
+
+dense_mass dense_page_mass(const dense_output& dense, std::int64_t layer, std::int64_t first, std::int64_t last) {
     std::int64_t view_pages = static_cast<std::int64_t>(view_lines.size());
-    auto log_sum = at::zeros({view_pages, n_heads}, cuda(at::kFloat));
-    auto weight_sum = at::zeros({view_pages, 1}, cuda(at::kFloat));
+    dense_mass mass{
+        .mass_sum = at::zeros({view_pages, n_heads}, cuda(at::kFloat)),
+        .weight_sum = at::zeros({view_pages}, cuda(at::kFloat)),
+    };
     for (std::int64_t p = first; p < last; p++) {
         std::int64_t attended_pages = p / page_size + 1;
-        auto weights = at::zeros({n_heads, view_pages * page_size}, cuda(at::kFloat));
-        weights.narrow(1, 0, p + 1).copy_(dense.attention[layer].select(1, p).narrow(1, 0, p + 1));
-        auto page_max = weights.view({n_heads, view_pages, page_size}).amax(-1).t().narrow(0, 0, attended_pages);
-        log_sum.narrow(0, 0, attended_pages).add_(at::log(page_max) * mass_weight(p, last));
-        weight_sum.narrow(0, 0, attended_pages).add_(mass_weight(p, last));
+        auto scores = at::full({n_heads, view_pages * page_size}, -INFINITY, cuda(at::kFloat));
+        scores.narrow(1, 0, p + 1).copy_(dense.scores[layer].select(1, p).narrow(1, 0, p + 1));
+        auto page_max = scores.view({n_heads, view_pages, page_size}).amax(-1).t().narrow(0, 0, attended_pages);
+        mass.mass_sum.narrow(0, 0, attended_pages).add_(page_max * query_weight(p, last));
+        mass.weight_sum.narrow(0, 0, attended_pages).add_(query_weight(p, last));
     }
-    return at::where(weight_sum > 0, weight_sum * at::exp(log_sum / weight_sum), at::zeros_like(log_sum));
+    return mass;
 }
 
 // t for every layer: [n_layers, t's sizes...].
@@ -170,11 +178,12 @@ pulsarlm::GroupBatch step(const at::Tensor& tokens, std::int64_t first, std::int
     };
     std::vector<float> weights;
     for (std::int64_t p = first; p < last; p++) {
-        weights.push_back(static_cast<float>(mass_weight(p, last)));
+        weights.push_back(static_cast<float>(query_weight(p, last)));
     }
-    g.mass_weights = at::tensor(weights).to(at::kCUDA);
+    g.query_weights = at::tensor(weights).to(at::kCUDA);
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
-        g.page_mass.push_back(at::zeros({static_cast<std::int64_t>(view_lines.size()), n_heads}, cuda(at::kFloat)));
+        g.page_mass_sum.push_back(at::zeros({static_cast<std::int64_t>(view_lines.size()), n_heads}, cuda(at::kFloat)));
+        g.page_weight_sum.push_back(at::zeros({static_cast<std::int64_t>(view_lines.size())}, cuda(at::kFloat)));
     }
     g.key_counts = key_count;
     if (prefill) {
@@ -231,7 +240,9 @@ void check_against_dense(at::ScalarType dtype, double tolerance) {
         auto expected_logits = dense.logits.narrow(0, c.first, c.last - c.first);
         CHECK(max_relative_error(*(c.prefill ? logits.prefill : logits.decode), expected_logits) < tolerance);
         for (std::int64_t layer = 0; layer < n_layers; layer++) {
-            CHECK(max_relative_error(g.page_mass[layer], dense_page_mass(dense, layer, c.first, c.last)) < tolerance);
+            dense_mass expected = dense_page_mass(dense, layer, c.first, c.last);
+            CHECK(max_relative_error(g.page_mass_sum[layer], expected.mass_sum) < tolerance);
+            CHECK(max_relative_error(g.page_weight_sum[layer], expected.weight_sum) < 1e-5);
         }
     }
 

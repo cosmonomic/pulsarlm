@@ -27,6 +27,7 @@ at::Tensor paged_attention(
     const at::Tensor& v,
     const kv& lines,
     std::size_t kv_layer,
+    std::size_t reader,
     const GroupBatch& g,
     double scale,
     const rope_parameters& rope,
@@ -50,12 +51,16 @@ at::Tensor paged_attention(
             key_counts
         );
     }
-    std::optional<at::Tensor> mass, cu_view_pages, mass_weights;
-    at::Tensor page_mass = g.page_mass.empty() ? at::Tensor() : g.page_mass[kv_layer];
-    if (page_mass.defined()) {
-        mass = at::zeros_like(page_mass);
+    std::optional<at::Tensor> mass_sum, weight_sum, cu_view_pages, query_weights;
+    at::Tensor reader_columns;
+    if (!g.page_mass_sum.empty() && g.page_mass_sum[kv_layer].defined()) {
+        const int64_t heads = q.size(1);
+        reader_columns = g.page_mass_sum[kv_layer].narrow(1, static_cast<int64_t>(reader) * heads, heads);
+        mass_sum = reader_columns.is_contiguous() ? reader_columns : at::zeros_like(reader_columns);
+        const at::Tensor& page_weight_sum = g.page_weight_sum[kv_layer];
+        weight_sum = reader == 0 ? page_weight_sum : at::zeros_like(page_weight_sum);
         cu_view_pages = g.cu_view_pages.select(0, layer);
-        mass_weights = g.mass_weights;
+        query_weights = g.query_weights;
     }
     at::Tensor o;
     if (g.is_prefill()) {
@@ -71,9 +76,10 @@ at::Tensor paged_attention(
             scale,
             sliding_window,
             k_norm_weight,
-            mass,
+            mass_sum,
+            weight_sum,
             cu_view_pages,
-            mass_weights
+            query_weights
         );
     } else {
         o = attn_decode_cuda(
@@ -87,13 +93,14 @@ at::Tensor paged_attention(
             scale,
             sliding_window,
             k_norm_weight,
-            mass,
+            mass_sum,
+            weight_sum,
             cu_view_pages,
-            mass_weights
+            query_weights
         );
     }
-    if (mass) {
-        at::maximum_out(page_mass, page_mass, *mass);
+    if (mass_sum && !mass_sum->is_same(reader_columns)) {
+        reader_columns.copy_(*mass_sum);
     }
     return o;
 }

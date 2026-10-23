@@ -156,6 +156,7 @@ Qwen3_5Model::attention(const at::Tensor& h, std::int64_t layer, const GroupBatc
         v,
         lines[kv_index],
         kv_index,
+        0,
         g,
         1.0 / std::sqrt(static_cast<double>(c.head_dim)),
         rope

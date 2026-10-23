@@ -73,6 +73,7 @@ LlamaModel::attention(const at::Tensor& h, std::int64_t layer, const GroupBatch&
         v,
         lines[layer],
         static_cast<std::size_t>(layer),
+        0,
         g,
         1.0 / std::sqrt(static_cast<double>(c.head_dim)),
         c.rope

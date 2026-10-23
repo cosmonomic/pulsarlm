@@ -82,6 +82,8 @@ class Gemma4Model : public Model {
     std::int64_t n_layers;
     // The KV layer each layer writes or reads. A layer keeping KV is KV layer of its own index.
     std::vector<std::size_t> kv_layer_of;
+    // Each layer's index among the layers reading its KV layer, the one keeping it first.
+    std::vector<std::size_t> reader_of;
     std::vector<kv_layer> kv_specs;
     at::Tensor embed_tokens;
     at::Tensor norm;

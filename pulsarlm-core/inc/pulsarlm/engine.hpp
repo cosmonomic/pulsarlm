@@ -9,7 +9,6 @@
 #include <latch>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <span>
 #include <string>
 #include <thread>
@@ -26,8 +25,7 @@ namespace pulsarlm {
 // model_name names the model and its weights version; with the KV layers' page shapes it makes the root digest. The KV
 // layers' lines share one pool of kv_cache_pool_bytes, which must hold a line of every KV layer. The host copies of the
 // pages handed to the store come from a pinned host_page_pool of host_page_bytes. A step forwards every decoding
-// sequence and at most prefill_tokens_per_step tokens of the others. max_context is the model's context in tokens,
-// which a request's eviction_target is a fraction of; without it, eviction_target must be 1.
+// sequence and at most prefill_tokens_per_step tokens of the others.
 struct engine_config {
     std::string model_name;
     std::size_t page_size;
@@ -38,7 +36,6 @@ struct engine_config {
     std::vector<std::int64_t> stop_ids;
     std::size_t vocab_size;
     std::size_t prefill_tokens_per_step;
-    std::optional<std::size_t> max_context;
 };
 
 // kv_cache_bytes is the bytes of the KV cache's pool that lines in use take: those of running requests, not those only
@@ -59,7 +56,6 @@ class engine {
     cudaStream_t stream;
     std::size_t page_size;
     std::size_t vocab_size;
-    std::optional<std::size_t> max_context;
     digest root;
     std::unique_ptr<page_store> store;
     scheduler sched;
@@ -78,9 +74,8 @@ class engine {
     ~engine();
 
     // Serves r, passing its results to callbacks. Safe to call from any thread. Throws std::invalid_argument, without
-    // calling callbacks, when r breaks a precondition of scheduler::submit, holds a token outside [0, vocab_size),
-    // sets an eviction_target below 1 without the config's max_context, or starts from a state
-    // scheduler::validate_state rejects.
+    // calling callbacks, when r breaks a precondition of scheduler::submit, holds a token outside [0, vocab_size), or
+    // starts from a state scheduler::validate_state rejects.
     void submit(request&& r, std::unique_ptr<request_callbacks> callbacks);
     // The exception that panicked the loop; null while the loop runs or when it was stopped.
     std::exception_ptr exception() const;

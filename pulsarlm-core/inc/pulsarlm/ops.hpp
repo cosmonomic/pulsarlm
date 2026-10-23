@@ -121,16 +121,17 @@ std::optional<std::string> attention_unsupported_reason(
 // ops read no page table entry whose page lies wholly before the window of the sequence's first query, so those
 // entries may hold any value.
 //
-// mass, cu_view_pages and mass_weights are passed together or not at all; without them the ops measure no mass. Query
-// i attends view page b of its sequence when it attends one of b's keys; its log share of b in query head h is the max
-// over b's attended keys of the scaled score minus the query's LSE in h. With S the sum of mass_weights[i] times the
-// log share and W the sum of mass_weights[i], over the queries attending b, mass[cu_view_pages[s] + b, h] is set to
-// W * exp(S / W), the weighted geometric mean share times W, and to 0 for a page no query attends. Views never share
-// mass, whatever lines they share.
-//   mass          fp32 [total_view_pages, n_q_heads], zeroed by the caller
+// mass_sum, weight_sum, cu_view_pages and query_weights are passed together or not at all; without them the ops measure
+// no mass. Query token i attends view page b of its sequence when it attends one of b's key tokens; its mass on b in
+// query head h is the max over b's key tokens it attends of the scaled score. Over the query tokens attending b,
+// mass_sum[cu_view_pages[s] + b, h] is set to the sum of query_weights[i] times the mass, and
+// weight_sum[cu_view_pages[s] + b] to the sum of query_weights[i]; both stay 0 for a page no query token attends.
+// Views never share mass, whatever lines they share.
+//   mass_sum      fp32 [total_view_pages, n_q_heads], zeroed by the caller
+//   weight_sum    fp32 [total_view_pages], zeroed by the caller
 //   cu_view_pages int32 [num_seqs + 1]; sequence s owns view pages [cu_view_pages[s], cu_view_pages[s + 1]), at least
 //                 its keys'
-//   mass_weights  fp32 [total_q], positive
+//   query_weights fp32 [total_q], non-negative
 
 // Decode: one query per sequence, q [num_seqs, n_q_heads, head_dim], at view index context_lens[s] - 1, attending the
 // keys [0, context_lens[s]) or its window of them. num_splits above 0 forces the split (flash-decode) path with that
@@ -146,9 +147,10 @@ at::Tensor attn_decode_cuda(
     double scale,
     std::optional<int64_t> sliding_window,
     const std::optional<at::Tensor>& k_norm_weight,
-    const std::optional<at::Tensor>& mass = std::nullopt,
+    const std::optional<at::Tensor>& mass_sum = std::nullopt,
+    const std::optional<at::Tensor>& weight_sum = std::nullopt,
     const std::optional<at::Tensor>& cu_view_pages = std::nullopt,
-    const std::optional<at::Tensor>& mass_weights = std::nullopt,
+    const std::optional<at::Tensor>& query_weights = std::nullopt,
     int64_t num_splits = 0
 );
 
@@ -168,9 +170,10 @@ at::Tensor attn_prefill_cuda(
     double scale,
     std::optional<int64_t> sliding_window,
     const std::optional<at::Tensor>& k_norm_weight,
-    const std::optional<at::Tensor>& mass = std::nullopt,
+    const std::optional<at::Tensor>& mass_sum = std::nullopt,
+    const std::optional<at::Tensor>& weight_sum = std::nullopt,
     const std::optional<at::Tensor>& cu_view_pages = std::nullopt,
-    const std::optional<at::Tensor>& mass_weights = std::nullopt
+    const std::optional<at::Tensor>& query_weights = std::nullopt
 );
 
 // Indexed attention: attn_prefill_cuda's ragged batch, decode included as one query per sequence, in which the query
@@ -190,9 +193,10 @@ at::Tensor attn_indexed_cuda(
     double scale,
     const at::Tensor& selected,
     int64_t block_size,
-    const std::optional<at::Tensor>& mass,
+    const std::optional<at::Tensor>& mass_sum,
+    const std::optional<at::Tensor>& weight_sum,
     const std::optional<at::Tensor>& cu_view_pages,
-    const std::optional<at::Tensor>& mass_weights
+    const std::optional<at::Tensor>& query_weights
 );
 
 // QSA's blocks [sequences, max_blocks, dim] in index_keys' dtype: block b of sequence s is the mean, in fp32 and

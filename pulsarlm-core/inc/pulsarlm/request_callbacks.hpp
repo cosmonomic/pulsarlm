@@ -8,23 +8,29 @@
 #include <vector>
 
 #include "pulsarlm/digest.hpp"
+#include "pulsarlm/eviction.hpp"
 
 namespace pulsarlm {
 
-// A page of a sequence: its hash, its index among the history's full pages, and its eviction density in each query head
-// its layer measures mass in, 0 for a page never measured. A state the scheduler reaches holds one per head; an initial
-// state may hold none, which reads as 0.
+// A page of a sequence: its hash, its index among the history's full pages, and the sums its eviction densities come
+// from (add_step_mass): mass_sum in each query head its layer measures mass in, and weight_sum. A state the scheduler
+// reaches holds a mass_sum per head; an initial state may hold none, which reads as 0, with weight_sum 0.
 struct active_page {
     digest hash;
     std::size_t index;
-    std::vector<float> density;
+    std::vector<float> mass_sum;
+    float weight_sum = 0.0f;
 
     bool operator==(const active_page&) const = default;
 };
 
-// One KV layer's active pages, in view order.
+// One KV layer's active pages, in view order, and the moments of the pages that left its working set
+// (add_leaving_page): of their densities, one per query head the layer measures mass in, or none for a layer that
+// measures none or an initial state without them, and of their scores.
 struct layer_sequence {
     std::vector<active_page> pages;
+    std::vector<moments> density_moments;
+    moments score_moments;
 
     bool operator==(const layer_sequence&) const = default;
 };

@@ -101,8 +101,7 @@ std::unique_ptr<python_engine> make_engine(
     double store_gib,
     at::Device device,
     std::vector<std::int64_t> stop_ids,
-    std::size_t prefill_tokens_per_step,
-    std::optional<std::size_t> max_context
+    std::size_t prefill_tokens_per_step
 ) {
     if (!(kv_cache_gib > 0.0) || !(store_gib >= 0.0)) {
         throw std::invalid_argument("kv_cache_gib must be positive and store_gib not negative");
@@ -117,7 +116,6 @@ std::unique_ptr<python_engine> make_engine(
         std::move(stop_ids),
         vocab_size(model),
         prefill_tokens_per_step,
-        max_context,
     };
     auto adapter = std::make_unique<python_store>(std::move(store));
     py::gil_scoped_release nogil;
@@ -132,14 +130,34 @@ PYBIND11_MODULE(pulsarlm_core, m) {
     using namespace pulsarlm;
     using namespace py::literals;
 
+    py::class_<moments>(m, "Moments")
+        .def(
+            py::init([](std::uint64_t count, double mean, double m2) {
+                return moments{.count = count, .mean = mean, .m2 = m2};
+            }),
+            "count"_a = 0,
+            "mean"_a = 0.0,
+            "m2"_a = 0.0
+        )
+        .def_readwrite("count", &moments::count)
+        .def_readwrite("mean", &moments::mean)
+        .def_readwrite("m2", &moments::m2)
+        .def(py::self == py::self);
+
     py::class_<active_page>(m, "ActivePage")
         .def(
-            py::init([](const py::bytes& hash, std::size_t index, std::vector<float> density) {
-                return active_page{.hash = digest_from_bytes(hash), .index = index, .density = std::move(density)};
+            py::init([](const py::bytes& hash, std::size_t index, std::vector<float> mass_sum, float weight_sum) {
+                return active_page{
+                    .hash = digest_from_bytes(hash),
+                    .index = index,
+                    .mass_sum = std::move(mass_sum),
+                    .weight_sum = weight_sum,
+                };
             }),
             "hash"_a,
             "index"_a,
-            "density"_a = std::vector<float>{}
+            "mass_sum"_a = std::vector<float>{},
+            "weight_sum"_a = 0.0f
         )
         .def_property(
             "hash",
@@ -147,15 +165,26 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             [](active_page& p, const py::bytes& hash) { p.hash = digest_from_bytes(hash); }
         )
         .def_readwrite("index", &active_page::index)
-        .def_readwrite("density", &active_page::density)
+        .def_readwrite("mass_sum", &active_page::mass_sum)
+        .def_readwrite("weight_sum", &active_page::weight_sum)
         .def(py::self == py::self);
 
     py::class_<layer_sequence>(m, "LayerSequence")
         .def(
-            py::init([](std::vector<active_page> pages) { return layer_sequence{.pages = std::move(pages)}; }),
-            "pages"_a = std::vector<active_page>()
+            py::init([](std::vector<active_page> pages, std::vector<moments> density_moments, moments score_moments) {
+                return layer_sequence{
+                    .pages = std::move(pages),
+                    .density_moments = std::move(density_moments),
+                    .score_moments = score_moments,
+                };
+            }),
+            "pages"_a = std::vector<active_page>(),
+            "density_moments"_a = std::vector<moments>(),
+            "score_moments"_a = moments{}
         )
         .def_readwrite("pages", &layer_sequence::pages)
+        .def_readwrite("density_moments", &layer_sequence::density_moments)
+        .def_readwrite("score_moments", &layer_sequence::score_moments)
         .def(py::self == py::self);
 
     py::class_<state>(m, "State")
@@ -220,14 +249,16 @@ PYBIND11_MODULE(pulsarlm_core, m) {
                         std::size_t n_working,
                         std::size_t cycle_tokens,
                         std::optional<std::size_t> max_context_window,
-                        double eviction_target,
+                        double eviction_threshold,
+                        std::size_t eviction_warmup,
                         double attention_mass_decay) {
                 return eviction_policy{
                     n_sink,
                     n_working,
                     cycle_tokens,
                     max_context_window,
-                    eviction_target,
+                    eviction_threshold,
+                    eviction_warmup,
                     attention_mass_decay
                 };
             }),
@@ -236,17 +267,30 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "n_working"_a = eviction_policy{}.n_working,
             "cycle_tokens"_a = eviction_policy{}.cycle_tokens,
             "max_context_window"_a = eviction_policy{}.max_context_window,
-            "eviction_target"_a = eviction_policy{}.eviction_target,
+            "eviction_threshold"_a = eviction_policy{}.eviction_threshold,
+            "eviction_warmup"_a = eviction_policy{}.eviction_warmup,
             "attention_mass_decay"_a = eviction_policy{}.attention_mass_decay
         )
         .def_readwrite("n_sink", &eviction_policy::n_sink)
         .def_readwrite("n_working", &eviction_policy::n_working)
         .def_readwrite("cycle_tokens", &eviction_policy::cycle_tokens)
         .def_readwrite("max_context_window", &eviction_policy::max_context_window)
-        .def_readwrite("eviction_target", &eviction_policy::eviction_target)
+        .def_readwrite("eviction_threshold", &eviction_policy::eviction_threshold)
+        .def_readwrite("eviction_warmup", &eviction_policy::eviction_warmup)
         .def_readwrite("attention_mass_decay", &eviction_policy::attention_mass_decay);
 
-    m.def("density_threshold", &density_threshold, "eviction_target"_a, "n_q_heads"_a, "max_context_pages"_a);
+    m.def(
+        "page_score",
+        [](const std::vector<float>& mass_sum,
+           float weight_sum,
+           const std::vector<moments>& density_moments,
+           std::size_t min_samples) { return page_score(mass_sum, weight_sum, density_moments, min_samples); },
+        "mass_sum"_a,
+        "weight_sum"_a,
+        "density_moments"_a,
+        "min_samples"_a
+    );
+    m.def("score_threshold", &score_threshold, "score_moments"_a, "threshold"_a, "min_samples"_a);
 
     py::class_<model_config>(m, "ModelConfig")
         .def(
@@ -638,8 +682,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "store_gib"_a,
             "device"_a,
             "stop_ids"_a,
-            "prefill_tokens_per_step"_a,
-            "max_context"_a = py::none()
+            "prefill_tokens_per_step"_a
         )
         .def(
             "submit",

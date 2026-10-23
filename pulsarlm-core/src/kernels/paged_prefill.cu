@@ -99,7 +99,6 @@ at::Tensor paged_prefill(const attn::PagedAttnBatch& b) {
     auto stream = at::cuda::getCurrentCUDAStream();
     if (b.q.scalar_type() == at::kFloat) {
         attn::launch_attn_scalar(b, stream);
-        attn::finish_mass(b, stream);
         return b.o;
     }
     std::optional<std::string> unsupported = attention_unsupported_reason(
@@ -114,7 +113,6 @@ at::Tensor paged_prefill(const attn::PagedAttnBatch& b) {
         using scalar_t = typename decltype(type_tag)::type;
         launch_tc_prefill<scalar_t, decltype(bf16_tag)::value>(b, stream);
     });
-    attn::finish_mass(b, stream);
     return b.o;
 }
 
@@ -149,9 +147,10 @@ at::Tensor attn_prefill_cuda(
     double scale,
     std::optional<int64_t> sliding_window,
     const std::optional<at::Tensor>& k_norm_weight,
-    const std::optional<at::Tensor>& mass,
+    const std::optional<at::Tensor>& mass_sum,
+    const std::optional<at::Tensor>& weight_sum,
     const std::optional<at::Tensor>& cu_view_pages,
-    const std::optional<at::Tensor>& mass_weights
+    const std::optional<at::Tensor>& query_weights
 ) {
     const auto batch = attn::paged_attn_batch(
         "attn_prefill",
@@ -166,9 +165,10 @@ at::Tensor attn_prefill_cuda(
         scale,
         sliding_window,
         k_norm_weight,
-        mass,
+        mass_sum,
+        weight_sum,
         cu_view_pages,
-        mass_weights
+        query_weights
     );
     return paged_prefill(batch);
 }

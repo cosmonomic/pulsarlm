@@ -12,7 +12,7 @@ from pathlib import Path
 
 import torch
 
-from pulsarlm.core.engine import ActivePage, LayerSequence, State
+from pulsarlm.core.engine import ActivePage, LayerSequence, Moments, State
 from pulsarlm.store import LocalStore
 from pulsarlm.store_file import StoreInUseError
 
@@ -36,13 +36,17 @@ def reached(history: list[int], evicted: set[int] = set()) -> State:
     """A state of two layers: one keeping every page not evicted, one the newest."""
     full = len(history) // PAGE_SIZE * PAGE_SIZE
     pages = [
-        ActivePage(h, i, [i / 4, i / 8])
+        ActivePage(h, i, [i / 4, -i / 8], i / 2)
         for i, h in enumerate(page_digests(history))
         if i not in evicted
     ]
+    density_moments = [Moments(3, -0.5, 2.0), Moments(2, 1.0, 0.25)]
     return State(
         head=pages[-1].hash if pages else None,
-        layers=[LayerSequence(pages), LayerSequence(pages[-1:])],
+        layers=[
+            LayerSequence(pages, density_moments, Moments(4, 0.125, 1.5)),
+            LayerSequence(pages[-1:]),
+        ],
         tail=history[full:],
     )
 

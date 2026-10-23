@@ -157,9 +157,12 @@ bool ended_with(const request_results& recorded, request_error error) {
     return recorded.end && !recorded.end->has_value() && recorded.end->error() == error;
 }
 
-// A state of one_layer's model whose one page is hash.
-pulsarlm::state one_page_state(const digest& hash, float density) {
-    return pulsarlm::state{.head = hash, .layers = {{.pages = {{.hash = hash, .density = {density}}}}}};
+// A state of one_layer's model whose one page is hash, with mass sum 0 and weight_sum.
+pulsarlm::state one_page_state(const digest& hash, float weight_sum) {
+    return pulsarlm::state{
+        .head = hash,
+        .layers = {{.pages = {{.hash = hash, .mass_sum = {0.0f}, .weight_sum = weight_sum}}}},
+    };
 }
 
 digest root() {
@@ -196,7 +199,10 @@ TEST_CASE("a submitted request passes its tokens and its end state to its callba
     REQUIRE(((*recorded->end)->head == hashes.back()));
     REQUIRE(
         ((*recorded->end)->layers ==
-         std::vector{pulsarlm::layer_sequence{.pages = {{.hash = hashes[0], .density = {0.0f}}}}})
+         std::vector{pulsarlm::layer_sequence{
+             .pages = {{.hash = hashes[0], .mass_sum = {0.0f}}},
+             .density_moments = {pulsarlm::moments{}},
+         }})
     );
     REQUIRE((*recorded->end)->tail == token_list{5, 6});
     REQUIRE(e.exception() == nullptr);
@@ -248,16 +254,11 @@ TEST_CASE("submit rejects an invalid request without calling its callbacks") {
         std::invalid_argument
     );
     REQUIRE_THROWS_AS(
-        e.submit(request{.tokens = {1}, .eviction = {.eviction_target = 0.0}}, record_into(recorded)),
+        e.submit(request{.tokens = {1}, .eviction = {.eviction_threshold = -0.5}}, record_into(recorded)),
         std::invalid_argument
     );
     REQUIRE_THROWS_AS(
-        e.submit(request{.tokens = {1}, .eviction = {.eviction_target = 1.5}}, record_into(recorded)),
-        std::invalid_argument
-    );
-    // The config states no max context.
-    REQUIRE_THROWS_AS(
-        e.submit(request{.tokens = {1}, .eviction = {.eviction_target = 0.5}}, record_into(recorded)),
+        e.submit(request{.tokens = {1}, .eviction = {.eviction_threshold = 1.5}}, record_into(recorded)),
         std::invalid_argument
     );
     REQUIRE(recorded->tokens.empty());

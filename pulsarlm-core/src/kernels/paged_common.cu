@@ -11,8 +11,8 @@
 #include <optional>
 #include <string>
 
-// The argument contract the paged attention ops share, the scalar kernel float32 runs
-// on, and the step that turns each page's S and W into its mass. Decode is the case of one query per sequence at the context's last
+// The argument contract the paged attention ops share, and the scalar kernel float32
+// runs on. Decode is the case of one query per sequence at the context's last
 // position, so one kernel serves both.
 
 namespace pulsarlm {
@@ -21,8 +21,8 @@ namespace {
 
 // One CTA per (query token, query head). Threads stride over the view pages the query
 // attends, each running an online softmax over its pages' keys and adding weight times
-// each page's max score into the page's S; the softmaxes combine with the flash rescale,
-// and the LSE they give is then taken off every attended page's S.
+// each page's max score into the page's mass_sum; the softmaxes combine with the flash
+// rescale.
 template <typename scalar_t, int PAGE_SIZE> __global__ void attn_scalar_kernel(const PagedAttnParams<scalar_t> p) {
     const int tid = threadIdx.x;
     const int blk = blockIdx.x;
@@ -54,7 +54,7 @@ template <typename scalar_t, int PAGE_SIZE> __global__ void attn_scalar_kernel(c
     const int last_page = query_pos / PAGE_SIZE;
     const KeyPositions layout = key_positions(p, s, PAGE_SIZE);
     const int32_t* seq_table = p.page_tables + static_cast<int64_t>(s) * p.max_pages;
-    const float weight = p.mass ? p.mass_weights[qtok] : 0.0f;
+    const float weight = p.mass_sum ? p.query_weights[qtok] : 0.0f;
 
     // Dynamic shared: [ qsh(head_dim) | out_acc(head_dim) | red(kThreads) ]
     extern __shared__ float smem[];
@@ -109,11 +109,11 @@ template <typename scalar_t, int PAGE_SIZE> __global__ void attn_scalar_kernel(c
             m = new_m;
             page_max = fmaxf(page_max, sc);
         }
-        if (p.mass) {
+        if (p.mass_sum) {
             const int64_t row = mass_row(p, s, page);
-            atomicAdd(&p.mass[row * p.n_q_heads + h], weight * page_max);
+            atomicAdd(&p.mass_sum[row * p.n_q_heads + h], weight * page_max);
             if (h == 0) {
-                atomicAdd(&p.attended_weight[row], weight);
+                atomicAdd(&p.weight_sum[row], weight);
             }
         }
     }
@@ -134,24 +134,6 @@ template <typename scalar_t, int PAGE_SIZE> __global__ void attn_scalar_kernel(c
     for (int d = tid; d < head_dim; d += kThreads) {
         orow[d] = static_cast<scalar_t>(out_acc[d] * inv_denom);
     }
-
-    if (!p.mass) {
-        return;
-    }
-    const float lse = M + logf(denom);
-    for (int page = first_page + tid; page <= last_page; page += kThreads) {
-        atomicAdd(&p.mass[mass_row(p, s, page) * p.n_q_heads + h], -weight * lse);
-    }
-}
-
-// One thread per (view page, query head) of the batch.
-__global__ void finish_mass_kernel(float* mass, const float* attended_weight, int64_t pages, int n_q_heads) {
-    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= pages * n_q_heads) {
-        return;
-    }
-    const float total = attended_weight[i / n_q_heads];
-    mass[i] = total > 0.0f ? total * expf(mass[i] / total) : 0.0f;
 }
 
 }  // namespace
@@ -185,9 +167,10 @@ PagedAttnBatch paged_attn_batch(
     double scale,
     std::optional<int64_t> sliding_window,
     const std::optional<at::Tensor>& k_norm_weight,
-    const std::optional<at::Tensor>& mass,
+    const std::optional<at::Tensor>& mass_sum,
+    const std::optional<at::Tensor>& weight_sum,
     const std::optional<at::Tensor>& cu_view_pages,
-    const std::optional<at::Tensor>& mass_weights
+    const std::optional<at::Tensor>& query_weights
 ) {
     auto on_cuda = [](const at::Tensor& t) { return t.is_cuda(); };
     auto int32_dims = [](const at::Tensor& t, int64_t dims) { return t.scalar_type() == at::kInt && t.dim() == dims; };
@@ -247,23 +230,30 @@ PagedAttnBatch paged_attn_batch(
     }
     b.max_pages = page_tables.size(1);
 
-    const bool measures = mass.has_value();
+    const bool measures = mass_sum.has_value();
     TORCH_CHECK(
-        cu_view_pages.has_value() == measures && mass_weights.has_value() == measures,
+        weight_sum.has_value() == measures && cu_view_pages.has_value() == measures &&
+            query_weights.has_value() == measures,
         op,
-        ": mass, cu_view_pages and mass_weights are passed together or not at all"
+        ": mass_sum, weight_sum, cu_view_pages and query_weights are passed together or not at all"
     );
     if (measures) {
         TORCH_CHECK(
-            on_cuda(*mass) && on_cuda(*cu_view_pages) && on_cuda(*mass_weights),
+            on_cuda(*mass_sum) && on_cuda(*weight_sum) && on_cuda(*cu_view_pages) && on_cuda(*query_weights),
             op,
             ": all inputs must be CUDA tensors"
         );
         TORCH_CHECK(
-            mass->scalar_type() == at::kFloat && mass->dim() == 2 && mass->size(1) == b.n_q_heads &&
-                mass->is_contiguous(),
+            mass_sum->scalar_type() == at::kFloat && mass_sum->dim() == 2 && mass_sum->size(1) == b.n_q_heads &&
+                mass_sum->is_contiguous(),
             op,
-            ": mass must be contiguous fp32 [total_view_pages, n_q_heads]"
+            ": mass_sum must be contiguous fp32 [total_view_pages, n_q_heads]"
+        );
+        TORCH_CHECK(
+            weight_sum->scalar_type() == at::kFloat && weight_sum->dim() == 1 &&
+                weight_sum->size(0) == mass_sum->size(0) && weight_sum->is_contiguous(),
+            op,
+            ": weight_sum must be contiguous fp32 [total_view_pages]"
         );
         TORCH_CHECK(
             int32_dims(*cu_view_pages, 1) && cu_view_pages->size(0) == b.num_seqs + 1,
@@ -271,14 +261,15 @@ PagedAttnBatch paged_attn_batch(
             ": cu_view_pages must be int32 [num_seqs + 1]"
         );
         TORCH_CHECK(
-            mass_weights->scalar_type() == at::kFloat && mass_weights->dim() == 1 && mass_weights->size(0) == b.total_q,
+            query_weights->scalar_type() == at::kFloat && query_weights->dim() == 1 &&
+                query_weights->size(0) == b.total_q,
             op,
-            ": mass_weights must be fp32 [total_q]"
+            ": query_weights must be fp32 [total_q]"
         );
-        b.mass = *mass;
+        b.mass_sum = *mass_sum;
+        b.weight_sum = *weight_sum;
         b.cu_view_pages = cu_view_pages->contiguous();
-        b.mass_weights = mass_weights->contiguous();
-        b.attended_weight = at::zeros({mass->size(0)}, mass->options());
+        b.query_weights = query_weights->contiguous();
     }
     if (k_norm_weight.has_value()) {
         TORCH_CHECK(
@@ -313,19 +304,6 @@ void launch_attn_scalar(const PagedAttnBatch& batch, cudaStream_t stream) {
                 <<<static_cast<int>(blocks), kThreads, smem, stream>>>(batch.params<scalar_t>());
         });
     });
-}
-
-void finish_mass(const PagedAttnBatch& batch, cudaStream_t stream) {
-    if (!batch.mass.defined() || batch.mass.numel() == 0) {
-        return;
-    }
-    const int64_t count = batch.mass.numel();
-    finish_mass_kernel<<<static_cast<int>((count + 255) / 256), 256, 0, stream>>>(
-        batch.mass.data_ptr<float>(),
-        batch.attended_weight.const_data_ptr<float>(),
-        batch.mass.size(0),
-        static_cast<int>(batch.n_q_heads)
-    );
 }
 
 }  // namespace attn

@@ -1,6 +1,7 @@
 """The engine binding on a small random Qwen3, with an in-memory page store."""
 
 import asyncio
+import math
 from concurrent.futures import Future
 
 import pytest
@@ -11,10 +12,12 @@ from pulsarlm.core.engine import (
     Engine,
     LayerSequence,
     ModelConfig,
+    Moments,
     RequestError,
     RopeParameters,
     State,
-    density_threshold,
+    page_score,
+    score_threshold,
 )
 
 N_LAYERS = 2
@@ -274,6 +277,15 @@ def test_a_digest_is_16_bytes():
         State(head=b"short")
 
 
-def test_density_threshold_divides_the_heads_by_the_targeted_pages():
-    assert density_threshold(0.5, 2, 100) == 2 / 50
-    assert density_threshold(1.0, 2, 100) == 0.0
+def test_a_page_scores_its_highest_standardized_density():
+    density_moments = [Moments(2, 1.0, 4.0), Moments(2, 0.0, 0.25)]
+    assert page_score([6.0, 1.0], 2.0, density_moments, 2) == 1.0
+    assert page_score([1.0, 1.0], 0.0, density_moments, 2) == -math.inf
+    assert page_score([1.0], 1.0, [Moments()], 2) is None
+
+
+def test_the_score_threshold_is_the_normal_quantile_of_the_scores():
+    assert score_threshold(Moments(2, 1.0, 4.0), 0.5, 2) == 1.0
+    assert score_threshold(Moments(2, 1.0, 4.0), 0.0, 2) == -math.inf
+    assert score_threshold(Moments(1, 1.0, 0.0), 0.5, 2) == -math.inf
+    assert score_threshold(Moments(2, 1.0, 4.0), 0.5, 3) == -math.inf

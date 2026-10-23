@@ -14,5 +14,6 @@ class Settings:
     persist: bool
     cycle_tokens: int
     n_working: int
-    eviction_target: float
+    eviction_threshold: float
+    eviction_warmup: int
     max_context_window: int | None

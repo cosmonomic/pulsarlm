@@ -25,8 +25,9 @@ struct recurrent_state {
 struct kv_layer {
     std::size_t n_kv_heads;
     std::size_t head_dim;
-    // The query heads of each attention layer reading this KV layer.
+    // The query heads of each attention layer reading this KV layer, and the number of those layers.
     std::size_t n_q_heads = 0;
+    std::size_t n_readers = 1;
     bool values_only = false;
     std::optional<std::size_t> sliding_window;
     std::size_t index_head_dim = 0;
@@ -65,15 +66,18 @@ struct GroupBatch {
     // s's view pages in KV layer l (see attn_decode_cuda).
     at::Tensor page_positions;
     // int32 [n_kv_layers, num_seqs + 1], defined when the forward measures attention mass: sequence s's view pages in
-    // KV layer l are the rows [cu_view_pages[l, s], cu_view_pages[l, s + 1]) of page_mass[l], at least as many as its
-    // keys fill.
+    // KV layer l are the rows [cu_view_pages[l, s], cu_view_pages[l, s + 1]) of page_mass_sum[l] and
+    // page_weight_sum[l], at least as many as its keys fill.
     at::Tensor cu_view_pages;
-    // Per KV layer, fp32 [total_view_pages of the layer, n_q_heads of the layer], zeroed by the caller, or undefined
-    // for a layer that measures no mass. The forward sets each view page's mass in each query head, as
-    // attn_prefill_cuda measures it with mass_weights, maxed over the attention layers reading the KV layer.
-    std::vector<at::Tensor> page_mass;
-    // fp32 [ntok], defined with cu_view_pages: each token's mass weight.
-    at::Tensor mass_weights;
+    // Per KV layer, fp32 [total_view_pages of the layer, n_readers * n_q_heads of the layer] and [total_view_pages of
+    // the layer], zeroed by the caller, or undefined for a layer that measures no mass. The forward sets each view
+    // page's mass_sum in each query head of each attention layer reading the KV layer, and its weight_sum, as
+    // attn_prefill_cuda measures them with query_weights: reader r's heads are the columns [r * n_q_heads,
+    // (r + 1) * n_q_heads). Every reader attends the same pages, so weight_sum is the same for all of them.
+    std::vector<at::Tensor> page_mass_sum;
+    std::vector<at::Tensor> page_weight_sum;
+    // fp32 [ntok], defined with cu_view_pages: each token's query weight.
+    at::Tensor query_weights;
     // int64 [n]: the rows whose logits the forward returns, in order. Undefined returns every row's.
     at::Tensor logit_rows;
 

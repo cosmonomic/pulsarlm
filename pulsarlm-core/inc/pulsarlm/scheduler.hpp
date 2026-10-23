@@ -45,11 +45,9 @@ class scheduler {
     std::vector<kv> lines;
     std::vector<std::optional<std::size_t>> sliding_windows;
     std::vector<bool> recurrent;
-    // Per KV layer, the query heads it measures mass and evicts pages in: those reading a full-attention layer, 0 for
-    // other layers.
+    // Per KV layer, the query heads it measures mass and evicts pages in: those of every attention layer reading a
+    // full-attention layer, 0 for other layers.
     std::vector<std::size_t> mass_heads;
-    // The model's context in pages, which eviction_target is a fraction of.
-    std::optional<std::size_t> max_context_pages;
     cudaStream_t stream;
     std::size_t page_size;
     digest root;
@@ -74,21 +72,23 @@ class scheduler {
     task<batch> build_batch();
     task<void> launch(batch& b);
     task<void> write_back(batch& b);
+    // Adds to the moments of each layer that measures mass the full pages outside the sinks that seq's newest completed
+    // full pages moved out of its working set.
+    void add_leaving_pages(sequence& seq, std::size_t completed);
     // Returns whether a view changed.
     bool end_cycle(sequence& seq);
 
   public:
     // cache holds one layer per entry of model.kv_layers(). root is the digest the page chains of a state with no
     // pages start from. A step forwards every decoding sequence and at most prefill_tokens_per_step tokens of the
-    // others. max_context is the model's context in tokens, without which a request's eviction_target must be 1.
+    // others.
     scheduler(
         Model& model,
         kv_cache cache,
         cudaStream_t stream,
         digest root,
         std::vector<std::int64_t>&& stop_ids,
-        std::size_t prefill_tokens_per_step,
-        std::optional<std::size_t> max_context
+        std::size_t prefill_tokens_per_step
     );
 
     // Serves r, then ends writer with its final state, which leaves out the last sampled token, or an error. Appends
@@ -100,8 +100,10 @@ class scheduler {
     task<void> run();
     // Throws std::invalid_argument unless s is a state the scheduler reaches: with one sequence per KV layer, a
     // full-attention layer's ending with head, a sliding layer's ending with head and holding no more pages than its
-    // window reaches, a recurrent layer's head alone, and each page holding no density or one per query head its layer
-    // measures, every density finite and non-negative. Safe to call from any thread.
+    // window reaches, a recurrent layer's head alone; each page holding no mass sum or one per query head its layer
+    // measures, all finite, and a finite non-negative weight sum, 0 without mass sums; each sequence holding no density
+    // moments or one per such head; every moments with a finite mean and a finite non-negative m2, 0 below 2 samples.
+    // Safe to call from any thread.
     void validate_state(const state& s) const;
     // kv_cache::used_bytes of the scheduler's cache. Safe to call from any thread.
     std::size_t kv_cache_bytes() const noexcept;

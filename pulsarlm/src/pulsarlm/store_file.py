@@ -12,7 +12,7 @@ from pathlib import Path
 import torch
 from torch import Tensor
 
-from pulsarlm.core.engine import ActivePage, LayerSequence, State
+from pulsarlm.core.engine import ActivePage, LayerSequence, Moments, State
 
 type Page = Tensor
 type StateKey = tuple[bytes, tuple[int, ...]]
@@ -20,7 +20,8 @@ type SavedState = tuple[StateKey, State, list[bytes], int]
 
 DIGEST_BYTES = 16
 INDEX_BYTES = 8
-DENSITY_BYTES = 4
+FLOAT_BYTES = 4
+MOMENTS = struct.Struct("<Qdd")
 VERSION = importlib.metadata.version("pulsarlm")
 
 SCHEMA = """
@@ -49,21 +50,30 @@ def split_digests(joined: bytes) -> list[bytes]:
 
 
 def layers_bytes(layers: list[LayerSequence]) -> bytes:
-    """Per layer, its page count and its densities per page as 4 little-endian
-    bytes each, its page hashes, its page indices as 8 little-endian bytes each,
-    then its densities as little-endian fp32, page by page. Every page of a layer
-    holds as many densities."""
+    """Per layer, its page count, its mass sums per page and its density moments
+    as 4 little-endian bytes each, its page hashes, its page indices as 8
+    little-endian bytes each, its mass sums then its weight sums as little-endian
+    fp32, page by page, then its density moments and its score moments, each as
+    count (8 little-endian bytes), mean and m2 (little-endian fp64). Every page of
+    a layer holds as many mass sums."""
     parts = []
     for layer in layers:
         pages = layer.pages
-        per_page = len(pages[0].density) if pages else 0
-        if any(len(page.density) != per_page for page in pages):
-            raise ValueError("every page of a layer must hold as many densities")
-        parts.append(struct.pack("<II", len(pages), per_page))
+        per_page = len(pages[0].mass_sum) if pages else 0
+        if any(len(page.mass_sum) != per_page for page in pages):
+            raise ValueError("every page of a layer must hold as many mass sums")
+        parts.append(
+            struct.pack("<III", len(pages), per_page, len(layer.density_moments))
+        )
         parts.extend(page.hash for page in pages)
         parts.append(struct.pack(f"<{len(pages)}Q", *(page.index for page in pages)))
-        densities = [d for page in pages for d in page.density]
-        parts.append(struct.pack(f"<{len(densities)}f", *densities))
+        mass_sums = [m for page in pages for m in page.mass_sum]
+        parts.append(struct.pack(f"<{len(mass_sums)}f", *mass_sums))
+        parts.append(
+            struct.pack(f"<{len(pages)}f", *(page.weight_sum for page in pages))
+        )
+        for moments in [*layer.density_moments, layer.score_moments]:
+            parts.append(MOMENTS.pack(moments.count, moments.mean, moments.m2))
     return b"".join(parts)
 
 
@@ -71,21 +81,30 @@ def layers_from(blob: bytes) -> list[LayerSequence]:
     layers = []
     offset = 0
     while offset < len(blob):
-        count, per_page = struct.unpack_from("<II", blob, offset)
-        offset += 8
+        count, per_page, heads = struct.unpack_from("<III", blob, offset)
+        offset += 12
         hashes = split_digests(blob[offset : offset + count * DIGEST_BYTES])
         offset += count * DIGEST_BYTES
         indices = struct.unpack_from(f"<{count}Q", blob, offset)
         offset += count * INDEX_BYTES
-        densities = struct.unpack_from(f"<{count * per_page}f", blob, offset)
-        offset += count * per_page * DENSITY_BYTES
+        mass_sums = struct.unpack_from(f"<{count * per_page}f", blob, offset)
+        offset += count * per_page * FLOAT_BYTES
+        weight_sums = struct.unpack_from(f"<{count}f", blob, offset)
+        offset += count * FLOAT_BYTES
+        moments = []
+        for _ in range(heads + 1):
+            moments.append(Moments(*MOMENTS.unpack_from(blob, offset)))
+            offset += MOMENTS.size
         pages = [
             ActivePage(
-                h, indices[i], list(densities[i * per_page : (i + 1) * per_page])
+                h,
+                indices[i],
+                list(mass_sums[i * per_page : (i + 1) * per_page]),
+                weight_sums[i],
             )
             for i, h in enumerate(hashes)
         ]
-        layers.append(LayerSequence(pages))
+        layers.append(LayerSequence(pages, moments[:-1], moments[-1]))
     return layers
 
 

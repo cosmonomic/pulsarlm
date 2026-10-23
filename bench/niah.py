@@ -374,9 +374,9 @@ def evictions(
     states: list[dict[str, Any]], spans: list[Span], cap_tokens: int | None
 ) -> list[dict[str, Any]]:
     """Each layer's eviction of a needle occurrence between consecutive states:
-    the tokens of the state after it, the highest density the occurrence's
-    evicted pages had in the state before it, the layer's threshold, and whether the
-    cap trimmed the layer's view."""
+    the tokens of the state after it, the highest score the occurrence's evicted
+    pages had in the state before it (None when none had one), the layer's
+    threshold, and whether the cap trimmed the layer's view."""
     found = []
     for before, after in itertools.pairwise(states):
         layers_after = {layer["layer"]: layer for layer in after["layers"]}
@@ -389,10 +389,13 @@ def evictions(
             for a, b in spans:
                 if not wholly_in(view_before, (a, b)) or wholly_in(view_after, (a, b)):
                     continue
-                densities = [
-                    density
-                    for start, stop, density in layer["pages"]
-                    if start < b and a < stop and start not in kept_starts
+                scores = [
+                    score
+                    for start, stop, score in layer["pages"]
+                    if start < b
+                    and a < stop
+                    and start not in kept_starts
+                    and score is not None
                 ]
                 full_tokens = sum(
                     stop - start for start, stop, _ in kept_layer["pages"]
@@ -401,7 +404,7 @@ def evictions(
                     {
                         "layer": layer["layer"],
                         "tokens": after["tokens"],
-                        "density": max(densities),
+                        "score": max(scores, default=None),
                         "threshold": layer["threshold"],
                         "cap_acted": full_tokens == cap_tokens,
                     }
@@ -651,7 +654,7 @@ def run(
         ]
         if not todo:
             continue
-        server_args = ["--eviction_target", "1"]
+        server_args = ["--eviction_threshold", "0"]
         if setting.max_context_window is not None:
             server_args = [
                 "--max_context_window",

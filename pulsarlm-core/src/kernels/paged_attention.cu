@@ -24,17 +24,17 @@
 // the page size) at a time, each key rotated to its position once staged. Online
 // softmax runs per query row across the CTA between the two MMAs, the running output
 // stays in the registers of the warps that own its dim slabs. When the op measures mass,
-// each query row's max score over each view page is written to the page's mass entry,
-// and once the row's LSE is known the entry becomes the page's S, the query's mass weight
-// times (max - LSE). The QKᵀ/PV tiles and their fragment layout live in attn_tiles.cuh.
+// each query row's max score over each view page, times the query's weight, is written to
+// the page's mass_sum entry. The QKᵀ/PV tiles and their fragment layout live in
+// attn_tiles.cuh.
 //
 // The split (flash-decode) path spreads one (s, g)'s view over nsplits CTAs, each
 // holding whole pages:
 //   split kernel   : grid num_seqs * n_kv_heads * nsplits; each CTA runs the online
-//                    softmax over one slice and writes its RAW state and page maxima.
+//                    softmax over one slice and writes its RAW state and its pages'
+//                    mass_sum entries.
 //   combine kernel : grid num_seqs * n_q_heads; reduces one query row's partials
-//                    with the flash rescale into o and LSE, and turns the row's page
-//                    maxima into S.
+//                    with the flash rescale into o and LSE.
 // Partial buffers (fp32), for (seq s, kv head g, split i, row m):
 //   o_partial [num_seqs, n_kv_heads, nsplits, group, head_dim]
 //   m_partial, l_partial [num_seqs, n_kv_heads, nsplits, group]
@@ -121,11 +121,10 @@ template <typename scalar_t, int HEAD_DIM, int NWARPS> struct DecodeTiles {
     float* Mrow;  // [16]
     float* Lrow;  // [16]
     float* row_rescale;  // [16]
-    float* LSE;  // [16]
 
     static constexpr size_t bytes() {
         return sizeof(scalar_t) * (16 * HEAD_DIM + 2 * 2 * TILE_ELEMS + 16 * KEY_TILE) +
-            sizeof(float) * (QKT_PARTS * 16 * KEY_TILE + 4 * 16);
+            sizeof(float) * (QKT_PARTS * 16 * KEY_TILE + 3 * 16);
     }
 
     __device__ static DecodeTiles carve(unsigned char* base) {
@@ -137,7 +136,6 @@ template <typename scalar_t, int HEAD_DIM, int NWARPS> struct DecodeTiles {
         tiles.Mrow = tiles.sS + QKT_PARTS * 16 * KEY_TILE;
         tiles.Lrow = tiles.Mrow + 16;
         tiles.row_rescale = tiles.Lrow + 16;
-        tiles.LSE = tiles.row_rescale + 16;
         return tiles;
     }
 
@@ -181,9 +179,10 @@ begin_group(const PagedAttnParams<scalar_t>& p, int s, int g, scalar_t* sQ, floa
 // Accumulates the RAW, UNNORMALIZED state: out (this lane's tile_pv_registers share of
 // the sum of exp(scale*q.k - Mrow)*V per query row), Mrow (running row max), Lrow
 // (running denominator); the caller owns normalization and LSE. When group_mass is
-// non-null, each row m's max scaled score over each view page b the tiles attend is
-// written to group_mass[b * n_q_heads + m]; a page must not straddle two calls. A slice
-// past the view leaves out = 0, Mrow = -inf, Lrow = 0.
+// non-null, each row m's max scaled score over each view page b the tiles attend, times
+// the query's weight, is written to group_mass[b * n_q_heads + m], and the weight to
+// page_weight[b] when page_weight is non-null; a page must not straddle two calls. A
+// slice past the view leaves out = 0, Mrow = -inf, Lrow = 0.
 //
 // Raw K and V tiles stream through two slots each by cp.async: a tile's keys are
 // staged once QKᵀ frees their slot, two tiles ahead, and its values once PV frees
@@ -200,6 +199,7 @@ __device__ __forceinline__ void tc_attend_tiles(
     int first,
     const KeyPositions& layout,
     float* __restrict__ group_mass,
+    float* __restrict__ page_weight,
     int t_start,
     int t_end,
     const DecodeTiles<scalar_t, HEAD_DIM, NWARPS>& tiles,
@@ -310,9 +310,13 @@ __device__ __forceinline__ void tc_attend_tiles(
     // The row's max score over the page the tiles are in, every lane of the row holding it.
     int run_page = -1;
     float run_max = -CUDART_INF_F;
+    const float weight = group_mass ? p.query_weights[s] : 0.0f;
     auto flush_page = [&]() {
         if (run_page >= 0 && row_lane == 0 && row < p.group) {
-            group_mass[static_cast<int64_t>(run_page) * p.n_q_heads + row] = run_max;
+            group_mass[static_cast<int64_t>(run_page) * p.n_q_heads + row] = weight * run_max;
+            if (page_weight && row == 0) {
+                page_weight[run_page] = weight;
+            }
         }
     };
     for (int t = t_first; t < t_last; ++t) {
@@ -410,35 +414,19 @@ __device__ __forceinline__ void tc_attend_tiles(
     }
 }
 
-// Turns each attended page's max score of group g's query rows, in mass, into the page's S, weight * (max - lse[m]),
-// and sets its W. Threads stride over (page, row); every row is one query head of sequence s's one query.
+// Sequence s's mass_sum entries for kv head g's query rows, and its weight_sum entries for kv head 0; null for both
+// when the op measures no mass.
 template <typename scalar_t>
-__device__ __forceinline__ void finish_group_pages(
-    const PagedAttnParams<scalar_t>& p,
-    int page_size,
-    int s,
-    int g,
-    int first_row,
-    int rows,
-    const float* lse
-) {
-    const int ctx_len = p.seqlens_k[s];
-    const int first_page = attn::first_key(p, ctx_len - 1) / page_size;
-    const int pages = (ctx_len - 1) / page_size - first_page + 1;
-    const float weight = p.mass_weights[s];
-    for (int i = threadIdx.x; i < pages * rows; i += blockDim.x) {
-        const int m = i % rows;
-        const int64_t row = attn::mass_row(p, s, first_page + i / rows);
-        float& entry = p.mass[row * p.n_q_heads + g * p.group + first_row + m];
-        entry = weight * (entry - lse[m]);
-        if (g == 0 && first_row + m == 0) {
-            p.attended_weight[row] = weight;
-        }
-    }
+__device__ __forceinline__ float* group_mass_entries(const PagedAttnParams<scalar_t>& p, int s, int g) {
+    return p.mass_sum ? p.mass_sum + attn::mass_row(p, s, 0) * p.n_q_heads + g * p.group : nullptr;
 }
 
-// Single-CTA tensor-core decode: one CTA per (seq s, kv head g) attends the whole view,
-// then finishes its rows' page entries.
+template <typename scalar_t>
+__device__ __forceinline__ float* page_weight_entries(const PagedAttnParams<scalar_t>& p, int s, int g) {
+    return p.mass_sum && g == 0 ? p.weight_sum + attn::mass_row(p, s, 0) : nullptr;
+}
+
+// Single-CTA tensor-core decode: one CTA per (seq s, kv head g) attends the whole view.
 template <typename scalar_t, int PAGE_SIZE, int HEAD_DIM, bool BF16, int NWARPS>
 __global__ void __launch_bounds__(NWARPS * 32) attn_decode_tc_kernel(const PagedAttnParams<scalar_t> p) {
     const int tid = threadIdx.x;
@@ -446,13 +434,10 @@ __global__ void __launch_bounds__(NWARPS * 32) attn_decode_tc_kernel(const Paged
     const int g = blockIdx.x % p.n_kv_heads;
     const int ctx_len = p.seqlens_k[s];
     const int first = attn::first_key(p, ctx_len - 1);
-    float* group_mass = p.mass ? p.mass + attn::mass_row(p, s, 0) * p.n_q_heads + g * p.group : nullptr;
 
     extern __shared__ __align__(16) unsigned char shared_memory[];
     const auto tiles = DecodeTiles<scalar_t, HEAD_DIM, NWARPS>::carve(shared_memory);
-    const float* Mrow = tiles.Mrow;
     const float* Lrow = tiles.Lrow;
-    float* LSE = tiles.LSE;
     float out[attn::pv_slabs_per_warp<HEAD_DIM, NWARPS>() * attn::kPvSlabAccums] = {};
 
     begin_group<scalar_t, HEAD_DIM, NWARPS>(p, s, g, tiles.sQ, tiles.Mrow, tiles.Lrow);
@@ -464,7 +449,8 @@ __global__ void __launch_bounds__(NWARPS * 32) attn_decode_tc_kernel(const Paged
         ctx_len,
         first,
         attn::key_positions(p, s, PAGE_SIZE),
-        group_mass,
+        group_mass_entries(p, s, g),
+        page_weight_entries(p, s, g),
         0,
         std::numeric_limits<int>::max(),
         tiles,
@@ -479,14 +465,6 @@ __global__ void __launch_bounds__(NWARPS * 32) attn_decode_tc_kernel(const Paged
             o_group[row * HEAD_DIM + col] = static_cast<scalar_t>(value * (row < 8 ? inv_low : inv_high));
         }
     });
-    if (tid < p.group) {
-        LSE[tid] = Mrow[tid] + logf(Lrow[tid]);
-    }
-    __syncthreads();
-
-    if (p.mass) {
-        finish_group_pages(p, PAGE_SIZE, s, g, 0, p.group, LSE);
-    }
 }
 
 template <typename scalar_t, int PAGE_SIZE, int HEAD_DIM, bool BF16, int NWARPS>
@@ -505,7 +483,6 @@ __global__ void __launch_bounds__(NWARPS * 32) paged_decode_split_kernel(
     const int s = sg / p.n_kv_heads;
     const int ctx_len = p.seqlens_k[s];
     const int first = attn::first_key(p, ctx_len - 1);
-    float* group_mass = p.mass ? p.mass + attn::mass_row(p, s, 0) * p.n_q_heads + g * p.group : nullptr;
 
     extern __shared__ __align__(16) unsigned char shared_memory[];
     const auto tiles = DecodeTiles<scalar_t, HEAD_DIM, NWARPS>::carve(shared_memory);
@@ -526,7 +503,8 @@ __global__ void __launch_bounds__(NWARPS * 32) paged_decode_split_kernel(
         ctx_len,
         first,
         attn::key_positions(p, s, PAGE_SIZE),
-        group_mass,
+        group_mass_entries(p, s, g),
+        page_weight_entries(p, s, g),
         t_start,
         t_start + tiles_per_split,
         tiles,
@@ -549,7 +527,7 @@ __global__ void __launch_bounds__(NWARPS * 32) paged_decode_split_kernel(
 }
 
 // One CTA per (seq, query head). Shared memory: kThreads reduction floats, then one
-// weight per split. Finishes the query head's page entries once its LSE is known.
+// weight per split.
 template <typename scalar_t>
 __global__ void paged_decode_combine_kernel(
     const PagedAttnParams<scalar_t> p,
@@ -557,8 +535,7 @@ __global__ void paged_decode_combine_kernel(
     const float* __restrict__ o_partial,
     const float* __restrict__ m_partial,
     const float* __restrict__ l_partial,
-    int nsplits,
-    int page_size
+    int nsplits
 ) {
     extern __shared__ float combine_shared[];
     float* scratch = combine_shared;
@@ -601,10 +578,6 @@ __global__ void paged_decode_combine_kernel(
     }
     if (tid == 0) {
         lse_out[static_cast<int64_t>(s) * p.n_q_heads + h] = bad ? -CUDART_INF_F : (M + logf(l));
-    }
-    if (p.mass && !bad) {
-        const float lse = M + logf(l);
-        finish_group_pages(p, page_size, s, h / group, m, 1, &lse);
     }
 }
 
@@ -715,8 +688,7 @@ void launch_tc_decode(const attn::PagedAttnBatch& b, int64_t forced_splits, cuda
             o_partial.data_ptr<float>(),
             m_partial.data_ptr<float>(),
             l_partial.data_ptr<float>(),
-            nsplits,
-            static_cast<int>(b.page_size)
+            nsplits
         );
 }
 
@@ -743,7 +715,6 @@ at::Tensor paged_decode(const attn::PagedAttnBatch& b, int64_t num_splits) {
     auto stream = at::cuda::getCurrentCUDAStream();
     if (b.q.scalar_type() == at::kFloat) {
         attn::launch_attn_scalar(b, stream);
-        attn::finish_mass(b, stream);
         return b.o;
     }
     std::optional<std::string> unsupported = attention_unsupported_reason(
@@ -758,7 +729,6 @@ at::Tensor paged_decode(const attn::PagedAttnBatch& b, int64_t num_splits) {
         using scalar_t = typename decltype(type_tag)::type;
         launch_tc_decode<scalar_t, decltype(bf16_tag)::value>(b, num_splits, stream);
     });
-    attn::finish_mass(b, stream);
     return b.o;
 }
 
@@ -857,9 +827,10 @@ at::Tensor attn_decode_cuda(
     double scale,
     std::optional<int64_t> sliding_window,
     const std::optional<at::Tensor>& k_norm_weight,
-    const std::optional<at::Tensor>& mass,
+    const std::optional<at::Tensor>& mass_sum,
+    const std::optional<at::Tensor>& weight_sum,
     const std::optional<at::Tensor>& cu_view_pages,
-    const std::optional<at::Tensor>& mass_weights,
+    const std::optional<at::Tensor>& query_weights,
     int64_t num_splits
 ) {
     const auto batch = attn::paged_attn_batch(
@@ -875,9 +846,10 @@ at::Tensor attn_decode_cuda(
         scale,
         sliding_window,
         k_norm_weight,
-        mass,
+        mass_sum,
+        weight_sum,
         cu_view_pages,
-        mass_weights
+        query_weights
     );
     return paged_decode(batch, num_splits);
 }

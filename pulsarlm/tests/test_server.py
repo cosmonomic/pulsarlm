@@ -1,6 +1,7 @@
 """The Chat Completions route on a small random Qwen3 and a word-level tokenizer."""
 
 import json
+import math
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -315,7 +316,7 @@ def logging_eviction(log: Path, eviction: EvictionPolicy) -> Callable[[], Server
     def load_state() -> ServerState:
         state = load(stop_ids=[])
         state.eviction = eviction
-        state.eviction_log = EvictionLog(log, eviction, None)
+        state.eviction_log = EvictionLog(log, eviction)
         return state
 
     return load_state
@@ -342,7 +343,7 @@ def test_the_eviction_log_without_eviction_views_every_full_page(tmp_path):
     assert [layer["layer"] for layer in end["layers"]] == list(range(N_LAYERS))
     full = end["tokens"] // PAGE_SIZE * PAGE_SIZE
     for layer in end["layers"]:
-        assert layer["threshold"] == 0.0
+        assert layer["threshold"] == -math.inf
         assert [page[:2] for page in layer["pages"]] == [
             [start, start + PAGE_SIZE] for start in range(0, full, PAGE_SIZE)
         ]

@@ -113,7 +113,12 @@ def pulsarlm_server(
     command += ["--prefill_tokens_per_step", str(prefill_tokens_per_step)]
     if setting.max_context_window is None:
         # The view would otherwise be capped at the model's trained context.
-        command += ["--eviction_target", "1", "--max_context_window", str(max_context)]
+        command += [
+            "--eviction_threshold",
+            "0",
+            "--max_context_window",
+            str(max_context),
+        ]
     else:
         command += ["--max_context_window", str(setting.max_context_window)]
         command += ["--n_working", str(n_working)]

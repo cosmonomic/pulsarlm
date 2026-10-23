@@ -27,7 +27,7 @@ def load_server_state(
         eviction=served.eviction,
         eviction_log=None
         if eviction_log is None
-        else EvictionLog(eviction_log, served.eviction, served.max_context),
+        else EvictionLog(eviction_log, served.eviction),
     )
 
 

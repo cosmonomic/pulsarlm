@@ -38,16 +38,6 @@ struct Selection {
         const int block = key / this->block_size;
         return (this->bits[static_cast<int64_t>(query) * this->words + block / 32] >> (block % 32)) & 1u;
     }
-
-    // Whether the query at view index query_pos attends a key of view page page.
-    __device__ __forceinline__ bool attends_page(int query, int query_pos, int page, int page_size) const {
-        for (int key = page * page_size; key < (page + 1) * page_size && key <= query_pos; key += this->block_size) {
-            if (this->selects(query, key)) {
-                return true;
-            }
-        }
-        return false;
-    }
 };
 
 // The sequence of query token qtok, by binary search over cu_seqlens_q.
@@ -113,7 +103,7 @@ __global__ void attn_indexed_scalar_kernel(const attn::PagedAttnParams<scalar_t>
         return sc * p.scale;
     };
 
-    const float weight = p.mass ? p.mass_weights[qtok] : 0.0f;
+    const float weight = p.mass_sum ? p.query_weights[qtok] : 0.0f;
     float m = -CUDART_INF_F;
     float l = 0.0f;
     float acc[attn::kMaxHeadDim];
@@ -139,11 +129,11 @@ __global__ void attn_indexed_scalar_kernel(const attn::PagedAttnParams<scalar_t>
             m = new_m;
             page_max = fmaxf(page_max, sc);
         }
-        if (p.mass && page_max > -CUDART_INF_F) {
+        if (p.mass_sum && page_max > -CUDART_INF_F) {
             const int64_t row = attn::mass_row(p, s, page);
-            atomicAdd(&p.mass[row * p.n_q_heads + h], weight * page_max);
+            atomicAdd(&p.mass_sum[row * p.n_q_heads + h], weight * page_max);
             if (h == 0) {
-                atomicAdd(&p.attended_weight[row], weight);
+                atomicAdd(&p.weight_sum[row], weight);
             }
         }
     }
@@ -163,16 +153,6 @@ __global__ void attn_indexed_scalar_kernel(const attn::PagedAttnParams<scalar_t>
     const float inv_denom = 1.0f / denom;
     for (int d = tid; d < head_dim; d += attn::kThreads) {
         orow[d] = static_cast<scalar_t>(out_acc[d] * inv_denom);
-    }
-
-    if (!p.mass) {
-        return;
-    }
-    const float lse = M + logf(denom);
-    for (int page = tid; page <= query_pos / PAGE_SIZE; page += attn::kThreads) {
-        if (selection.attends_page(qtok, query_pos, page, PAGE_SIZE)) {
-            atomicAdd(&p.mass[attn::mass_row(p, s, page) * p.n_q_heads + h], -weight * lse);
-        }
     }
 }
 
@@ -286,7 +266,7 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
     scalar_t* sV = sK + KEY_TILE * HEAD_DIM;
     scalar_t* sP = sV + KEY_TILE * HEAD_DIM;
     float* sS = reinterpret_cast<float*>(sP + 16 * KEY_TILE);
-    __shared__ float Mrow[16], Lrow[16], LSE[16];
+    __shared__ float Mrow[16], Lrow[16];
     __shared__ float row_rescale[16];
     // The view index of each key of the staged tiles, -1 past the selection or the query: the tile K holds, then the
     // one V holds, as the pipeline stages K a tile ahead of V.
@@ -298,13 +278,13 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
     // keys are consecutive across tiles.
     __shared__ int run_page[16];
     __shared__ float run_max[16];
-    const float weight = p.mass ? p.mass_weights[qtok] : 0.0f;
+    const float weight = p.mass_sum ? p.query_weights[qtok] : 0.0f;
     auto flush_page = [&](int m) {
         if (run_page[m] >= 0) {
             const int64_t row = attn::mass_row(p, s, run_page[m]);
-            atomicAdd(&p.mass[row * p.n_q_heads + first_head + m], weight * run_max[m]);
+            atomicAdd(&p.mass_sum[row * p.n_q_heads + first_head + m], weight * run_max[m]);
             if (g == 0 && m == 0) {
-                atomicAdd(&p.attended_weight[row], weight);
+                atomicAdd(&p.weight_sum[row], weight);
             }
         }
     };
@@ -430,7 +410,7 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
                 Mrow[sweep_row] = newM;
             }
         }
-        if (p.mass && tid < rows) {
+        if (p.mass_sum && tid < rows) {
             for (int c = 0; c < KEY_TILE; ++c) {
                 const int key = key_index[1][c];
                 if (key < 0) {
@@ -497,21 +477,8 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
         });
     }
 
-    if (!p.mass) {
-        return;
-    }
-    if (tid < rows) {
+    if (p.mass_sum && tid < rows) {
         flush_page(tid);
-        LSE[tid] = Mrow[tid] + logf(Lrow[tid]);
-    }
-    __syncthreads();
-    for (int page = tid; page <= query_pos / PAGE_SIZE; page += NWARPS * 32) {
-        if (selection.attends_page(qtok, query_pos, page, PAGE_SIZE)) {
-            const int64_t row = attn::mass_row(p, s, page);
-            for (int m = 0; m < rows; ++m) {
-                atomicAdd(&p.mass[row * p.n_q_heads + first_head + m], -weight * LSE[m]);
-            }
-        }
     }
 }
 
@@ -587,9 +554,10 @@ at::Tensor attn_indexed_cuda(
     double scale,
     const at::Tensor& selected,
     int64_t block_size,
-    const std::optional<at::Tensor>& mass,
+    const std::optional<at::Tensor>& mass_sum,
+    const std::optional<at::Tensor>& weight_sum,
     const std::optional<at::Tensor>& cu_view_pages,
-    const std::optional<at::Tensor>& mass_weights
+    const std::optional<at::Tensor>& query_weights
 ) {
     const auto b = attn::paged_attn_batch(
         "attn_indexed",
@@ -604,9 +572,10 @@ at::Tensor attn_indexed_cuda(
         scale,
         std::nullopt,
         std::nullopt,
-        mass,
+        mass_sum,
+        weight_sum,
         cu_view_pages,
-        mass_weights
+        query_weights
     );
     TORCH_CHECK(
         block_size >= 1 && b.page_size % block_size == 0,
@@ -630,7 +599,6 @@ at::Tensor attn_indexed_cuda(
     auto stream = at::cuda::getCurrentCUDAStream();
     if (b.q.scalar_type() == at::kFloat) {
         launch_indexed_scalar(b, selection, stream);
-        attn::finish_mass(b, stream);
         return b.o;
     }
     std::optional<std::string> unsupported = attention_unsupported_reason(
@@ -645,7 +613,6 @@ at::Tensor attn_indexed_cuda(
         using scalar_t = typename decltype(type_tag)::type;
         launch_indexed_tc<scalar_t, decltype(bf16_tag)::value>(b, selection, stream);
     });
-    attn::finish_mass(b, stream);
     return b.o;
 }
 

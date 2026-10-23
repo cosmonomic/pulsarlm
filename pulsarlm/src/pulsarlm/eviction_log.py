@@ -1,4 +1,4 @@
-"""Each request's views, page by page with their densities, for measuring
+"""Each request's views, page by page with their scores, for measuring
 eviction."""
 
 import hashlib
@@ -8,7 +8,7 @@ from contextlib import aclosing
 from pathlib import Path
 from typing import Any
 
-from pulsarlm.core.engine import EvictionPolicy, State, density_threshold
+from pulsarlm.core.engine import EvictionPolicy, State, page_score, score_threshold
 from pulsarlm.paging import PAGE_SIZE
 
 
@@ -20,18 +20,14 @@ class EvictionLog:
     """Appends one JSON line per finished request to path: its completion id, its
     prompt's length and prompt_sha256, cap_tokens, and each state it reached, in
     order, with the tokens the state covers and, per layer eviction measures, the
-    layer's threshold and the [start, end, density] of each full page in view, density
-    being the page's highest among the layer's heads. The tokens after the last
-    page are in view too. cap_tokens is the most full-page tokens a view keeps at
-    a cycle's end, None without max_context_window. max_context is the model's
-    context in tokens, as the engine has it."""
+    layer's score_threshold and the [start, end, score] of each full page in view,
+    score being page_score (None without one). The tokens after the last page are in
+    view too. cap_tokens is the most full-page tokens a view keeps at a cycle's end,
+    None without max_context_window."""
 
-    def __init__(
-        self, path: Path, eviction: EvictionPolicy, max_context: int | None
-    ) -> None:
+    def __init__(self, path: Path, eviction: EvictionPolicy) -> None:
         self._path = path
         self._eviction = eviction
-        self._max_context = max_context
 
     async def record(
         self,
@@ -55,8 +51,8 @@ class EvictionLog:
         with self._path.open("a") as f:
             f.write(json.dumps(line) + "\n")
 
-    # _cap_tokens and _threshold compute what to_pages, pages_to_evict and the scheduler
-    # compute in pulsarlm-core.
+    # _cap_tokens and _warmup_pages compute what to_pages and pages_to_evict compute in
+    # pulsarlm-core.
     def _cap_tokens(self) -> int | None:
         window = self._eviction.max_context_window
         if window is None:
@@ -67,13 +63,8 @@ class EvictionLog:
         )
         return max(max_pages - next_cycle_pages, 0) * PAGE_SIZE
 
-    def _threshold(self, n_q_heads: int) -> float:
-        if self._max_context is None:
-            return 0.0
-        max_context_pages = max(self._max_context // PAGE_SIZE, 1)
-        return density_threshold(
-            self._eviction.eviction_target, n_q_heads, max_context_pages
-        )
+    def _warmup_pages(self) -> int:
+        return _ceil_div(self._eviction.eviction_warmup, PAGE_SIZE)
 
     def _view(self, state: State) -> dict[str, Any]:
         full_pages = max(
@@ -89,18 +80,27 @@ class EvictionLog:
             "layers": [
                 {
                     "layer": layer,
-                    "threshold": self._threshold(len(sequence.pages[0].density)),
+                    "threshold": score_threshold(
+                        sequence.score_moments,
+                        self._eviction.eviction_threshold,
+                        self._warmup_pages(),
+                    ),
                     "pages": [
                         [
                             page.index * PAGE_SIZE,
                             (page.index + 1) * PAGE_SIZE,
-                            max(page.density),
+                            page_score(
+                                page.mass_sum,
+                                page.weight_sum,
+                                sequence.density_moments,
+                                self._warmup_pages(),
+                            ),
                         ]
                         for page in sequence.pages
                     ],
                 }
                 for layer, sequence in enumerate(state.layers)
-                if sequence.pages and sequence.pages[0].density
+                if sequence.pages and sequence.pages[0].mass_sum
             ],
         }
 

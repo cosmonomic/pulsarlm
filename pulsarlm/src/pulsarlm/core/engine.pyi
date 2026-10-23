@@ -21,22 +21,48 @@ class PageStore(Protocol):
         self, hashes: list[bytes], pages: list[Page], owners: list[tuple[int, int]]
     ) -> None: ...
 
+class Moments:
+    """The running count, mean and sum of squared deviations from the mean
+    (Welford) of a layer's samples."""
+
+    count: int
+    mean: float
+    m2: float
+    def __init__(self, count: int = 0, mean: float = 0.0, m2: float = 0.0) -> None: ...
+
 class ActivePage:
     """A page of a sequence: its 16-byte hash, its index among the history's full
-    pages, and its eviction density in each query head its layer measures mass in,
-    0 for a page never measured. A state the engine reaches holds one per head; an
-    initial state may hold none."""
+    pages, and the sums its eviction densities come from: mass_sum in each query
+    head its layer measures mass in, and weight_sum. A state the engine reaches
+    holds a mass_sum per head; an initial state may hold none, which reads as 0,
+    with weight_sum 0."""
 
     hash: bytes
     index: int
-    density: list[float]
-    def __init__(self, hash: bytes, index: int, density: list[float] = ...) -> None: ...
+    mass_sum: list[float]
+    weight_sum: float
+    def __init__(
+        self,
+        hash: bytes,
+        index: int,
+        mass_sum: list[float] = ...,
+        weight_sum: float = 0.0,
+    ) -> None: ...
 
 class LayerSequence:
-    """One KV layer's active pages, in view order."""
+    """One KV layer's active pages, in view order, and the moments of the pages
+    that left its working set: of their densities, one per query head the layer
+    measures mass in or none, and of their scores."""
 
     pages: list[ActivePage]
-    def __init__(self, pages: list[ActivePage] = []) -> None: ...
+    density_moments: list[Moments]
+    score_moments: Moments
+    def __init__(
+        self,
+        pages: list[ActivePage] = [],
+        density_moments: list[Moments] = [],
+        score_moments: Moments = ...,
+    ) -> None: ...
 
 class State:
     """head is the 16-byte hash of the newest full page of the history, which every
@@ -94,7 +120,8 @@ class EvictionPolicy:
     n_working: int
     cycle_tokens: int
     max_context_window: int | None
-    eviction_target: float
+    eviction_threshold: float
+    eviction_warmup: int
     attention_mass_decay: float
     def __init__(
         self,
@@ -103,15 +130,29 @@ class EvictionPolicy:
         n_working: int = 8192,
         cycle_tokens: int = 512,
         max_context_window: int | None = None,
-        eviction_target: float = 1.0,
+        eviction_threshold: float = 0.0,
+        eviction_warmup: int = 4096,
         attention_mass_decay: float = 1.0 / 256,
     ) -> None: ...
 
-def density_threshold(
-    eviction_target: float, n_q_heads: int, max_context_pages: int
+def page_score(
+    mass_sum: list[float],
+    weight_sum: float,
+    density_moments: list[Moments],
+    min_samples: int,
+) -> float | None:
+    """The max over the query heads of the page's density standardized by the
+    head's density_moments, leaving out heads with fewer than max(2, min_samples)
+    samples or no spread; -inf when no query token attended the page, None when no
+    head is left."""
+
+def score_threshold(
+    score_moments: Moments, threshold: float, min_samples: int
 ) -> float:
-    """The density threshold of a KV layer read by n_q_heads query heads, in a model
-    whose context holds max_context_pages pages; 0 at eviction_target 1."""
+    """The score at quantile threshold of a normal distribution with score_moments'
+    mean and sample variance; -inf at threshold 0 or below max(2, min_samples)
+    samples, +inf at threshold 1. A cycle's end evicts the unprotected pages scoring
+    below it."""
 
 class ModelConfig:
     rope: RopeParameters
@@ -290,7 +331,6 @@ class Engine:
         device: torch.device,
         stop_ids: list[int],
         prefill_tokens_per_step: int,
-        max_context: int | None = None,
     ) -> None: ...
     def submit(
         self,

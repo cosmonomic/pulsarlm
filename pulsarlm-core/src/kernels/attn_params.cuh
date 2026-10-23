@@ -9,7 +9,7 @@
 
 // The per-batch inputs every paged attention kernel reads, and the per-key arithmetic
 // they share: a key's RoPE position in its sequence's view, its rotation, and its page's
-// row in the mass output.
+// row in the mass outputs.
 //
 // The pool holds UNROTATED keys. A key's position is its view page's entry in
 // page_positions plus its offset in the page, so a line shared by several views takes
@@ -35,12 +35,12 @@ template <typename scalar_t> struct PagedAttnParams {
     const int32_t* page_positions;  // [num_seqs, max_pages]: each view page's first RoPE position
     const uint64_t* rope_turns;  // [head_dim / 2], see rope_turns_per_position
     const float* k_norm_weight;  // [head_dim] or null
-    // [total_view_pages, n_q_heads]; null measures no mass. The kernels leave each attended page's S there, the sum
-    // over its queries of mass_weights times the log share, and the decode kernels its max score until the LSE.
-    float* mass;
+    // [total_view_pages, n_q_heads]; null measures no mass. Each attended page's sum over its queries of
+    // query_weights times the query's max score over the page's keys.
+    float* mass_sum;
+    float* weight_sum;  // [total_view_pages]: each page's sum of query_weights over its queries
     const int32_t* cu_view_pages;  // [num_seqs + 1]
-    const float* mass_weights;  // [total_q]
-    float* attended_weight;  // [total_view_pages], each page's W: the sum of mass_weights over its queries
+    const float* query_weights;  // [total_q]
 
     scalar_t* o;  // [total_q, n_q_heads, head_dim]
     int num_seqs;
@@ -128,7 +128,7 @@ __device__ __forceinline__ RotatedPair<scalar_t> rope_rotate(float lo, float hi,
     };
 }
 
-// The row of sequence s's view page b in mass and attended_weight, so two views sharing a line accumulate apart.
+// The row of sequence s's view page b in mass_sum and weight_sum, so two views sharing a line accumulate apart.
 template <typename scalar_t>
 __device__ __forceinline__ int64_t mass_row(const PagedAttnParams<scalar_t>& p, int s, int view_page) {
     const int row = p.cu_view_pages[s] + view_page;

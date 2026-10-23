@@ -355,12 +355,12 @@ at::Tensor Qwen4ExpModel::attention(
     at::Tensor
         selected = selected_blocks(w, index_queries, line, page_tables, cu_seqlens_q, key_counts, page_positions);
 
-    std::optional<at::Tensor> mass, cu_view_pages, mass_weights;
-    at::Tensor page_mass = g.page_mass.empty() ? at::Tensor() : g.page_mass[kv_index];
-    if (page_mass.defined()) {
-        mass = at::zeros_like(page_mass);
+    std::optional<at::Tensor> mass_sum, weight_sum, cu_view_pages, query_weights;
+    if (!g.page_mass_sum.empty() && g.page_mass_sum[kv_index].defined()) {
+        mass_sum = g.page_mass_sum[kv_index];
+        weight_sum = g.page_weight_sum[kv_index];
         cu_view_pages = g.cu_view_pages.select(0, layer_row);
-        mass_weights = g.mass_weights;
+        query_weights = g.query_weights;
     }
     at::Tensor o = attn_indexed_cuda(
         q,
@@ -374,13 +374,11 @@ at::Tensor Qwen4ExpModel::attention(
         1.0 / std::sqrt(static_cast<double>(c.head_dim)),
         selected,
         c.indexer_compress_ratio,
-        mass,
+        mass_sum,
+        weight_sum,
         cu_view_pages,
-        mass_weights
+        query_weights
     );
-    if (mass) {
-        at::maximum_out(page_mass, page_mass, *mass);
-    }
     return at::linear(o.reshape({ntok, c.n_heads * c.head_dim}) * at::sigmoid(gate), w.o_proj);
 }
 
