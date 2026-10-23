@@ -19,7 +19,7 @@ from typing import Annotated, Any, Literal
 
 import httpx
 import typer
-from openai import APIStatusError, AsyncOpenAI
+from openai import APIConnectionError, APIError, APIStatusError, AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from tokenizers import Tokenizer
 from wonderwords import RandomWord
@@ -197,12 +197,22 @@ async def peak_kv_cache_bytes(
     return peak
 
 
-def is_oom(error: APIStatusError) -> bool:
-    """pulsarlm answers 503 when a request does not fit its KV cache; vLLM
-    answers 400 when it is longer than the context its KV pool holds."""
-    if error.status_code == 503:
+def error_code(error: APIError) -> object:
+    """The HTTP status of an error response, or the code of an error event
+    sent after the stream started."""
+    if isinstance(error, APIStatusError):
+        return error.status_code
+    return error.body.get("code") if isinstance(error.body, dict) else None
+
+
+def is_oom(error: APIError) -> bool:
+    """pulsarlm answers 503 when a request does not fit its KV cache, before or
+    after its stream starts; vLLM answers 400 when it is longer than the context
+    its KV pool holds."""
+    code = error_code(error)
+    if code == 503:
         return "does not fit in the KV cache" in error.message
-    return error.status_code == 400 and "context length" in error.message
+    return code == 400 and "context length" in error.message
 
 
 async def stream_request(
@@ -249,10 +259,12 @@ async def stream_request(
                 last_token_s = time.perf_counter() - start
                 if first_token_s is None:
                     first_token_s = last_token_s
-    except APIStatusError as error:
+    except APIConnectionError:
+        raise
+    except APIError as error:
         if is_oom(error):
             return {"error": "oom"}
-        return {"error": f"{error.status_code}: {error.message}"}
+        return {"error": f"{error_code(error)}: {error.message}"}
     if usage is None or first_token_s is None:
         return {"error": "the stream ended without text or usage"}
     return {
