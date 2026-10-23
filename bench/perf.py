@@ -297,12 +297,34 @@ def load_tokenizer(model: str) -> Tokenizer:
         return checkpoint.load_tokenizer(zipfile.Path(archive))
 
 
-def done_runs(results: Path) -> set[tuple[str, int]]:
+def ended(last: dict[str, Any], *, max_context: int, max_tokens: int) -> bool:
+    """Whether a run's last turn failed or no further turn fits max_context."""
+    context = last["context_tokens"]
+    return context is None or context + last["turn_tokens"] + max_tokens > max_context
+
+
+def finished_runs(
+    results: Path, *, max_context: int, max_tokens: int
+) -> set[tuple[str, int]]:
+    """The settings and concurrencies whose sessions ended. Removes the rows of
+    the others from results, as their sessions cannot be resumed."""
     if not results.exists():
         return set()
     with results.open() as f:
         rows = [json.loads(line) for line in f]
-    return {(r["setting"], r["concurrency"]) for r in rows}
+    last: dict[tuple[str, int], dict[str, Any]] = {}
+    for row in rows:
+        last[(row["setting"], row["concurrency"])] = row
+    finished = {
+        key
+        for key, row in last.items()
+        if ended(row, max_context=max_context, max_tokens=max_tokens)
+    }
+    kept = [row for row in rows if (row["setting"], row["concurrency"]) in finished]
+    if len(kept) < len(rows):
+        with results.open("w") as f:
+            f.writelines(json.dumps(row) + "\n" for row in kept)
+    return finished
 
 
 @contextmanager
@@ -377,7 +399,8 @@ def run(
     adding a user message of turn_tokens random words and a reply of at most
     max_tokens, until a session would pass max_context or a request fails, and
     appends a row per turn to out/results.jsonl. A request that does not fit the
-    KV cache fails with oom. Skips the settings and concurrencies already there.
+    KV cache fails with oom. Skips the settings and concurrencies whose sessions
+    ended there, and runs the others again from their first turn.
     Every setting is sent the same user messages. Both engines forward at most
     prefill_tokens_per_step prompt tokens per step, and full KV and vLLM may run
     past the model's trained context up to max_context."""
@@ -388,7 +411,7 @@ def run(
     vocabulary = words()
     out.mkdir(parents=True, exist_ok=True)
     results = out / "results.jsonl"
-    done = done_runs(results)
+    done = finished_runs(results, max_context=max_context, max_tokens=max_tokens)
     pool_bytes = int(kv_cache_gib * 2**30)
 
     def message(sessions: int, session: int, turn: int) -> str:
