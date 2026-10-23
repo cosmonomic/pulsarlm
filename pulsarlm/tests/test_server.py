@@ -275,7 +275,7 @@ def test_a_temperature_outside_the_api_range_is_rejected(client):
 def test_a_request_larger_than_the_cache_fails():
     with api_client(lambda: load(n_lines=2)) as client:
         response = post(client, messages=MESSAGES)
-        assert response.status_code == 503
+        assert response.status_code == 400
 
 
 def test_an_error_after_a_stream_started_is_an_error_event():
@@ -286,7 +286,7 @@ def test_an_error_after_a_stream_started_is_an_error_event():
     events = [line for line in response.text.split("\n\n") if line]
     assert events[-1] == "data: [DONE]"
     error = json.loads(events[-2].removeprefix("data: "))["error"]
-    assert error["code"] == 503
+    assert error["code"] == 400
 
 
 def test_a_chat_template_error_is_a_bad_request():

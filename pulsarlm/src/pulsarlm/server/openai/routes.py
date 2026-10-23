@@ -229,7 +229,7 @@ def _http_error(error: EngineStopped | CompletionError) -> HTTPException:
     if isinstance(error, EngineStopped):
         return HTTPException(503, f"engine stopped: {error}")
     if isinstance(error, CompletionError) and error.error == RequestError.OOM:
-        return HTTPException(503, "the request does not fit in the KV cache")
+        return HTTPException(400, "the request does not fit in the KV cache")
     return HTTPException(500, f"request failed: {error}")
 
 

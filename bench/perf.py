@@ -206,13 +206,13 @@ def error_code(error: APIError) -> object:
 
 
 def is_oom(error: APIError) -> bool:
-    """pulsarlm answers 503 when a request does not fit its KV cache, before or
+    """pulsarlm answers 400 when a request does not fit its KV cache, before or
     after its stream starts; vLLM answers 400 when it is longer than the context
     its KV pool holds."""
-    code = error_code(error)
-    if code == 503:
-        return "does not fit in the KV cache" in error.message
-    return code == 400 and "context length" in error.message
+    return error_code(error) == 400 and (
+        "does not fit in the KV cache" in error.message
+        or "context length" in error.message
+    )
 
 
 async def stream_request(
