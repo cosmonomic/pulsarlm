@@ -210,8 +210,7 @@ def is_oom(error: APIError) -> bool:
     after its stream starts; vLLM answers 400 when it is longer than the context
     its KV pool holds."""
     return error_code(error) == 400 and (
-        "does not fit in the KV cache" in error.message
-        or "context length" in error.message
+        "out of device memory" in error.message or "context length" in error.message
     )
 
 
