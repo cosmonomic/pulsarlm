@@ -104,6 +104,7 @@ def pulsarlm_server(
     store_gib: float,
     n_working: int,
     prefill_tokens_per_step: int,
+    max_context: int,
 ) -> Iterator[Server]:
     executable = Path(sys.executable).parent / "pulsarlm"
     command = [str(executable), "serve", model, "--data_dir", str(data_dir)]
@@ -111,7 +112,8 @@ def pulsarlm_server(
     command += ["--kv_cache_gib", str(kv_cache_gib), "--store_gib", str(store_gib)]
     command += ["--prefill_tokens_per_step", str(prefill_tokens_per_step)]
     if setting.max_context_window is None:
-        command += ["--eviction_target", "1"]
+        # The view would otherwise be capped at the model's trained context.
+        command += ["--eviction_target", "1", "--max_context_window", str(max_context)]
     else:
         command += ["--max_context_window", str(setting.max_context_window)]
         command += ["--n_working", str(n_working)]
@@ -134,13 +136,17 @@ def vllm_server(
     vllm: str,
     kv_cache_bytes: int,
     prefill_tokens_per_step: int,
+    max_context: int,
 ) -> Iterator[Server]:
     command = ["uvx", "--python", "3.12", "--from", vllm, "vllm", "serve"]
     command += [REPOSITORIES[model], "--served-model-name", model]
     command += ["--port", str(port), "--dtype", "bfloat16"]
     command += ["--kv-cache-memory-bytes", str(kv_cache_bytes)]
-    # The longest context the KV pool holds, so a longer request is rejected.
+    # The longest context up to max_context that the KV pool holds, so a longer
+    # request is rejected; auto searches up to max_position_embeddings.
     command += ["--max-model-len", "auto"]
+    overrides = {"text_config": {"max_position_embeddings": max_context}}
+    command += ["--hf-overrides", json.dumps(overrides)]
     command += ["--max-num-batched-tokens", str(prefill_tokens_per_step)]
     # Without the vision encoder, as pulsarlm serves text only; it also drops the
     # floor vLLM puts on max_num_batched_tokens to fit one video.
@@ -305,6 +311,7 @@ def server_for(
     store_gib: float,
     n_working: int,
     prefill_tokens_per_step: int,
+    max_context: int,
     vllm: str,
 ) -> Iterator[Server]:
     setting = SETTINGS[name]
@@ -316,6 +323,7 @@ def server_for(
             vllm=vllm,
             kv_cache_bytes=int(kv_cache_gib * 2**30),
             prefill_tokens_per_step=prefill_tokens_per_step,
+            max_context=max_context,
         ) as server:
             yield server
     else:
@@ -328,6 +336,7 @@ def server_for(
             store_gib=store_gib,
             n_working=n_working,
             prefill_tokens_per_step=prefill_tokens_per_step,
+            max_context=max_context,
         ) as server:
             yield server
 
@@ -348,7 +357,7 @@ def run(
     out: Path = Path("bench/results/perf"),
     settings: Annotated[list[str], typer.Option()] = list(SETTINGS),
     concurrency: Annotated[list[int], typer.Option()] = [1, 4],
-    max_context: int = 131072,
+    max_context: int = 1048576,
     turn_tokens: int = 4096,
     max_tokens: int = 256,
     seed: int = 0,
@@ -365,7 +374,8 @@ def run(
     appends a row per turn to out/results.jsonl. A request that does not fit the
     KV cache fails with oom. Skips the settings and concurrencies already there.
     Every setting is sent the same user messages. Both engines forward at most
-    prefill_tokens_per_step prompt tokens per step."""
+    prefill_tokens_per_step prompt tokens per step, and full KV and vLLM may run
+    past the model's trained context up to max_context."""
     unknown = set(settings) - set(SETTINGS)
     if unknown:
         raise typer.BadParameter(f"unknown settings: {sorted(unknown)}")
@@ -394,6 +404,7 @@ def run(
             store_gib=store_gib,
             n_working=n_working,
             prefill_tokens_per_step=prefill_tokens_per_step,
+            max_context=max_context,
             vllm=vllm,
         ) as server:
             warmup = message(0, 0, 0)
