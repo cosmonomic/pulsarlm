@@ -33,7 +33,7 @@ async def complete(
     request_id = next(_request_ids)
     digests = engine.page_digests(prompt)
 
-    def reach(state: State) -> None:
+    def write_state(state: State) -> None:
         store.write(state, engine.page_keys(state), request_id=request_id)
         if on_state is not None:
             on_state(state)
@@ -51,11 +51,11 @@ async def complete(
             while True:
                 tokens, cycle_ends, end = await stream.take()
                 for cycle_end in cycle_ends:
-                    reach(cycle_end.reached)
+                    write_state(cycle_end.reached)
                 for token in tokens:
                     yield token
                 if isinstance(end, State):
-                    reach(end)
+                    write_state(end)
                     return
                 if end is not None:
                     raise CompletionError(end)
