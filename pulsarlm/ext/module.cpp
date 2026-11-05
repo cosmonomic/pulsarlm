@@ -4,6 +4,7 @@
 #include <pybind11/operators.h>
 #include <pybind11/stl.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -111,15 +112,27 @@ std::unique_ptr<python_engine> make_engine(
         page_size,
         kv_dtype,
         static_cast<std::size_t>(kv_cache_gib * (1ull << 30)),
-        static_cast<std::size_t>(store_gib * (1ull << 30)),
         device,
         std::move(stop_ids),
         vocab_size(model),
         prefill_tokens_per_step,
     };
-    auto adapter = std::make_unique<python_store>(std::move(store));
+    std::unique_ptr<Model> served_model;
+    {
+        py::gil_scoped_release nogil;
+        served_model = make_model(model, weights);
+    }
+    std::size_t largest_page_bytes = 0;
+    for (const page_shape& shape : page_shapes(config, served_model->kv_layers())) {
+        largest_page_bytes = std::max(largest_page_bytes, line_bytes(shape));
+    }
+    auto adapter = std::make_unique<python_store>(
+        std::move(store),
+        static_cast<std::size_t>(store_gib * (1ull << 30)),
+        largest_page_bytes
+    );
     py::gil_scoped_release nogil;
-    return std::make_unique<python_engine>(make_model(model, weights), config, std::move(adapter));
+    return std::make_unique<python_engine>(std::move(served_model), config, std::move(adapter));
 }
 
 }  // namespace

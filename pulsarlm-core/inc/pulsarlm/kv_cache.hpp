@@ -16,7 +16,6 @@
 
 #include "pulsarlm/digest.hpp"
 #include "pulsarlm/event_loop.hpp"
-#include "pulsarlm/host_page_pool.hpp"
 #include "pulsarlm/line_allocator.hpp"
 #include "pulsarlm/model/interface.hpp"
 
@@ -40,7 +39,8 @@ struct page_shape {
 // The device bytes of one line: its K and V in every layer, or its one tensor for values_only, and its index keys.
 std::size_t line_bytes(const page_shape& shape);
 
-// A host copy of one line of a layer: uint8 [line_bytes(shape)], laid out as the line.
+// One line of a layer as uint8 [line_bytes(shape)], laid out as the line: a host copy, or in fetch and put a device
+// view of the line.
 struct page {
     at::Tensor bytes;
 };
@@ -67,18 +67,27 @@ struct page_owner {
     std::size_t page;
 };
 
+enum class page_error { miss, oom };
+
 class page_store {
   public:
     virtual ~page_store() = default;
 
-    // The pages in the order of hashes, nullopt for those it does not have.
-    virtual task<std::vector<std::optional<page>>> fetch(std::span<const digest> hashes) = 0;
-    // Takes host pages and their hashes, matched by index, and returns without waiting for the write. A page has an
-    // owner for every request that produced it.
-    virtual void put(std::vector<digest>&& hashes, std::vector<page>&& pages, std::vector<page_owner>&& owners) = 0;
+    // Copies the page of hashes[i] into lines[i] on stream, and completes once the copies are done with true for each
+    // page it had.
+    virtual task<std::vector<bool>>
+    fetch(std::span<const digest> hashes, std::vector<page>&& lines, cudaStream_t stream) = 0;
+    // Takes the pages of hashes, matched by index, and copies the ones it keeps on stream, completing once the copies
+    // are done. A page has an owner for every request that produced it. Fails with oom when it has no host memory for
+    // a page it keeps.
+    virtual task<std::expected<void, page_error>> put(
+        std::vector<digest>&& hashes,
+        std::vector<page>&& pages,
+        std::vector<page_owner>&& owners,
+        cudaStream_t stream
+    ) = 0;
 };
 
-enum class page_error { miss, oom };
 
 // The lines of every KV layer, in one device pool of bytes. A line holds one page of one layer, in a block of the pool
 // a line_allocator gives it; the layers whose lines take blocks of one size share their line ids. A line is free when
@@ -123,7 +132,6 @@ class kv_cache {
     std::vector<cache_layer> layers;
     line_allocator allocator;
     page_store* store;
-    host_page_pool host_pages;
     // The block bytes of the lines in use, read and written through std::atomic_ref so used_bytes is safe from any
     // thread.
     alignas(std::atomic_ref<std::size_t>::required_alignment) mutable std::size_t used_line_bytes = 0;
@@ -142,26 +150,13 @@ class kv_cache {
     void count_unused(std::size_t layer) noexcept;
     void assign_hash(std::size_t layer, std::uint32_t line_id, const digest& hash);
     std::size_t line_offset(std::size_t layer, std::uint32_t line_id) const noexcept;
-    // The transfers complete once the stream has finished them. Pages in the host pool copy in one launch; a page
-    // outside it is copied into a pool block first, and without one goes through a blocking cudaMemcpyAsync.
-    task<void> copy_from_host(std::span<const layer_line> targets, std::span<const page> pages, cudaStream_t stream);
-    task<void> copy_to_host(std::span<const layer_line> sources, std::span<page> pages, cudaStream_t stream);
-    // Host pages laid out as lines, one for each line of sources, in the host pool or, past its room, pageable.
-    // nullopt when host memory runs out.
-    std::optional<std::vector<page>> allocate_host_pages(std::span<const layer_line> sources);
+    page device_page(const layer_line& line_of_layer) const;
     void release_all(std::span<const std::vector<std::uint32_t>> line_ids) noexcept;
 
   public:
     // shapes holds one page shape per KV layer, each with n_layers 1 and one dtype for all. The pool takes pool_bytes;
-    // throws std::invalid_argument when that holds no line of every layer. The host copies sync hands the store come
-    // from a host_page_pool of host_page_bytes. store outlives the cache.
-    kv_cache(
-        std::span<const page_shape> shapes,
-        std::size_t pool_bytes,
-        std::size_t host_page_bytes,
-        at::Device device,
-        page_store& store
-    );
+    // throws std::invalid_argument when that holds no line of every layer. store outlives the cache.
+    kv_cache(std::span<const page_shape> shapes, std::size_t pool_bytes, at::Device device, page_store& store);
 
     // Copies run on stream. Callers release lines only after the GPU work using them completes. get, allocate and
     // clone never wait for lines; without enough of them the call fails with oom, holding nothing in any layer and
@@ -178,11 +173,10 @@ class kv_cache {
     // Gives count unmapped lines of layer holding a copy of the page at its held line_id, held until release.
     std::expected<std::vector<std::uint32_t>, page_error>
     clone(std::size_t layer, std::uint32_t line_id, std::size_t count, cudaStream_t stream);
-    // Names the page at line_ids[layer][i], held and unmapped, by hashes[layer][i] and hands a host copy of each
-    // distinct page of a layer, owned by every owners[layer][i] of its hash, to the store in one put, also when another
-    // line caches its hash: the store may have dropped that page. A hash already cached at another line leaves its line
-    // unmapped. Completes once the copies are handed to the store. Fails with oom, caching nothing, when host memory for
-    // the copies cannot be allocated.
+    // Names the page at line_ids[layer][i], held and unmapped, by hashes[layer][i] and hands each distinct page of a
+    // layer, owned by every owners[layer][i] of its hash, to the store in one put, also when another line caches its
+    // hash: the store may have dropped that page. A hash already cached at another line leaves its line unmapped.
+    // Completes once the put does, and fails as it does.
     task<std::expected<void, page_error>> sync(
         const std::vector<std::vector<digest>>& hashes,
         const std::vector<std::vector<std::uint64_t>>& owners,

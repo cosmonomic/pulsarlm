@@ -183,22 +183,6 @@ c10::cuda::CUDAStreamGuard guard_stream(const at::Tensor& lines, cudaStream_t st
     return c10::cuda::CUDAStreamGuard(c10::cuda::getStreamFromExternal(stream, lines.device().index()));
 }
 
-void append_segment(std::vector<std::int64_t>& segments, std::size_t device, std::size_t host, std::size_t bytes) {
-    segments.insert(
-        segments.end(),
-        {static_cast<std::int64_t>(device), static_cast<std::int64_t>(host), static_cast<std::int64_t>(bytes)}
-    );
-}
-
-at::Tensor pinned_int64(const std::vector<std::int64_t>& values) {
-    at::Tensor pinned = at::empty(
-        {static_cast<std::int64_t>(values.size() / 3), 3},
-        at::TensorOptions().dtype(at::kLong).pinned_memory(true)
-    );
-    std::ranges::copy(values, pinned.data_ptr<std::int64_t>());
-    return pinned;
-}
-
 void check_page(const page_shape& shape, const page& source) {
     TORCH_CHECK(
         source.bytes.scalar_type() == at::kByte && source.bytes.dim() == 1 && source.bytes.is_contiguous() &&
@@ -210,14 +194,6 @@ void check_page(const page_shape& shape, const page& source) {
         " ",
         source.bytes.sizes()
     );
-}
-
-std::size_t largest_line_bytes(std::span<const page_shape> shapes) {
-    std::size_t largest = 0;
-    for (const page_shape& shape : shapes) {
-        largest = std::max(largest, line_bytes(shape));
-    }
-    return largest;
 }
 
 }  // namespace
@@ -269,17 +245,10 @@ digest store_key(const digest& page, std::size_t layer) {
     return make_digest(seed);
 }
 
-kv_cache::kv_cache(
-    std::span<const page_shape> shapes,
-    std::size_t pool_bytes,
-    std::size_t host_page_bytes,
-    at::Device device,
-    page_store& store
-)
+kv_cache::kv_cache(std::span<const page_shape> shapes, std::size_t pool_bytes, at::Device device, page_store& store)
 : pool(make_pool(shapes, pool_bytes, device)),
   allocator(distinct_block_bytes(shapes), pool_bytes),
-  store(&store),
-  host_pages(host_page_bytes, largest_line_bytes(shapes)) {
+  store(&store) {
     if (std::size_t needed = min_pool_bytes(layer_block_bytes(shapes)); pool_bytes < needed) {
         throw std::invalid_argument(
             std::format(
@@ -398,85 +367,15 @@ std::size_t kv_cache::line_offset(std::size_t layer, std::uint32_t line_id) cons
     return line_id * classes[layers[layer].block_class].block_bytes;
 }
 
-task<void>
-kv_cache::copy_from_host(std::span<const layer_line> targets, std::span<const page> pages, cudaStream_t stream) {
-    std::vector<std::int64_t> segments;
-    std::vector<at::Tensor> copies;
-    for (std::size_t i = 0; i < targets.size(); i++) {
-        auto [layer, line_id] = targets[i];
-        const std::size_t bytes = line_bytes(layers[layer].shape);
-        const page& source = pages[i];
-        check_page(layers[layer].shape, source);
-        std::optional<std::size_t> offset = host_pages.offset_of(source.bytes.data_ptr(), bytes);
-        if (!offset) {
-            std::optional<at::Tensor> block = host_pages.allocate(bytes);
-            if (!block) {
-                C10_CUDA_CHECK(cudaMemcpyAsync(
-                    static_cast<std::byte*>(pool.data_ptr()) + line_offset(layer, line_id),
-                    source.bytes.data_ptr(),
-                    bytes,
-                    cudaMemcpyHostToDevice,
-                    stream
-                ));
-                continue;
-            }
-            block->copy_(source.bytes);
-            copies.push_back(*block);
-            offset = host_pages.offset_of(block->data_ptr(), bytes);
-        }
-        append_segment(segments, line_offset(layer, line_id), *offset, bytes);
-    }
-    at::Tensor pinned_segments;
-    if (!segments.empty()) {
-        pinned_segments = pinned_int64(segments);
-        auto guard = guard_stream(pool, stream);
-        copy_segments_from_host_cuda(pool, host_pages.buffer(), pinned_segments);
-    }
-    co_await synchronize(stream);
-}
-
-task<void> kv_cache::copy_to_host(std::span<const layer_line> sources, std::span<page> pages, cudaStream_t stream) {
-    std::vector<std::int64_t> segments;
-    for (std::size_t i = 0; i < sources.size(); i++) {
-        auto [layer, line_id] = sources[i];
-        const std::size_t bytes = line_bytes(layers[layer].shape);
-        if (std::optional<std::size_t> offset = host_pages.offset_of(pages[i].bytes.data_ptr(), bytes)) {
-            append_segment(segments, line_offset(layer, line_id), *offset, bytes);
-        } else {
-            C10_CUDA_CHECK(cudaMemcpyAsync(
-                pages[i].bytes.data_ptr(),
-                static_cast<const std::byte*>(pool.data_ptr()) + line_offset(layer, line_id),
-                bytes,
-                cudaMemcpyDeviceToHost,
-                stream
-            ));
-        }
-    }
-    at::Tensor pinned_segments;
-    if (!segments.empty()) {
-        pinned_segments = pinned_int64(segments);
-        auto guard = guard_stream(pool, stream);
-        copy_segments_to_host_cuda(pool, host_pages.buffer(), pinned_segments);
-    }
-    co_await synchronize(stream);
-}
-
-std::optional<std::vector<page>> kv_cache::allocate_host_pages(std::span<const layer_line> sources) {
-    std::vector<page> pages;
-    pages.reserve(sources.size());
-    try {
-        for (const layer_line& source : sources) {
-            const std::size_t bytes = line_bytes(layers[source.layer].shape);
-            std::optional<at::Tensor> block = host_pages.allocate(bytes);
-            if (!block) {
-                block = at::empty({static_cast<std::int64_t>(bytes)}, at::TensorOptions().dtype(at::kByte));
-            }
-            pages.push_back(page{.bytes = std::move(*block)});
-        }
-    } catch (const c10::OutOfMemoryError&) {
-        return std::nullopt;
-    }
-    return pages;
+page kv_cache::device_page(const layer_line& line_of_layer) const {
+    auto [layer, line_id] = line_of_layer;
+    return page{
+        .bytes = pool.narrow(
+            0,
+            static_cast<std::int64_t>(line_offset(layer, line_id)),
+            static_cast<std::int64_t>(line_bytes(layers[layer].shape))
+        )
+    };
 }
 
 void kv_cache::release_all(std::span<const std::vector<std::uint32_t>> line_ids) noexcept {
@@ -544,20 +443,16 @@ kv_cache::get(std::span<const std::span<const digest>> hashes, cudaStream_t stre
     }
 
     if (!fetch_keys.empty()) {
-        std::vector<std::optional<page>> pages = co_await store->fetch(fetch_keys);
-        assert(pages.size() == fetch_keys.size());
-        std::vector<layer_line> arrived_lines;
-        std::vector<page> arrived;
-        for (std::size_t j = 0; j < pages.size(); j++) {
-            if (pages[j]) {
-                arrived_lines.push_back(fetch_lines[j]);
-                arrived.push_back(std::move(*pages[j]));
-            }
+        std::vector<page> targets;
+        targets.reserve(fetch_lines.size());
+        for (const layer_line& target : fetch_lines) {
+            targets.push_back(device_page(target));
         }
-        co_await copy_from_host(arrived_lines, arrived, stream);
-        for (std::size_t j = 0; j < pages.size(); j++) {
+        std::vector<bool> found = co_await store->fetch(fetch_keys, std::move(targets), stream);
+        assert(found.size() == fetch_keys.size());
+        for (std::size_t j = 0; j < found.size(); j++) {
             auto [layer, line_id] = fetch_lines[j];
-            if (pages[j]) {
+            if (found[j]) {
                 assign_hash(layer, line_id, fetch_hashes[j]);
             }
             layers[layer].fetches.extract(fetch_hashes[j]).mapped().done_event.set();
@@ -650,16 +545,15 @@ task<std::expected<void, page_error>> kv_cache::sync(
         co_return {};
     }
 
-    std::optional<std::vector<page>> copies = allocate_host_pages(sources);
-    if (!copies) {
-        co_return std::unexpected(page_error::oom);
+    std::vector<page> pages;
+    pages.reserve(sources.size());
+    for (const layer_line& source : sources) {
+        pages.push_back(device_page(source));
     }
     for (const auto& [target, hash] : named) {
         assign_hash(target.layer, target.line_id, hash);
     }
-    co_await copy_to_host(sources, *copies, stream);
-    store->put(std::move(keys), std::move(*copies), std::move(page_owners));
-    co_return {};
+    co_return co_await store->put(std::move(keys), std::move(pages), std::move(page_owners), stream);
 }
 
 void kv_cache::release(std::size_t layer, std::span<const std::uint32_t> line_ids) noexcept {

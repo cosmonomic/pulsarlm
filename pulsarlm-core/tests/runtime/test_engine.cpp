@@ -46,14 +46,17 @@ constexpr auto end_timeout = std::chrono::seconds(30);
 struct stalling_store final : pulsarlm::page_store {
     std::shared_ptr<std::latch> fetch_start_latch = std::make_shared<std::latch>(1);
 
-    task<std::vector<std::optional<page>>> fetch(std::span<const digest>) override {
+    task<std::vector<bool>> fetch(std::span<const digest>, std::vector<page>&&, cudaStream_t) override {
         auto [never, resolver] = pulsarlm::external_task<>::make();
         fetch_start_latch->count_down();
         co_await std::move(never);
         co_return {};
     }
 
-    void put(std::vector<digest>&&, std::vector<page>&&, std::vector<pulsarlm::page_owner>&&) override {}
+    task<std::expected<void, pulsarlm::page_error>>
+    put(std::vector<digest>&&, std::vector<page>&&, std::vector<pulsarlm::page_owner>&&, cudaStream_t) override {
+        co_return {};
+    }
 };
 
 // Predicts each token's successor, mod vocab.
@@ -145,7 +148,6 @@ pulsarlm::engine_config config(std::size_t n_lines) {
         .page_size = page_size,
         .kv_dtype = at::kFloat,
         .kv_cache_pool_bytes = n_lines * line_bytes,
-        .host_page_bytes = 64 * line_bytes,
         .device = at::Device(at::kCUDA, 0),
         .stop_ids = {},
         .vocab_size = vocab,

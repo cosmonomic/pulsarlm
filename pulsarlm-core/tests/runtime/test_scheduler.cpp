@@ -1,5 +1,7 @@
 #include "pulsarlm/digest.hpp"
 #include "pulsarlm/event_loop.hpp"
+#include "pulsarlm/host_copy.hpp"
+#include "pulsarlm/host_page_pool.hpp"
 #include "pulsarlm/kv_cache.hpp"
 #include "pulsarlm/model/interface.hpp"
 #include "pulsarlm/model/paged_forward.hpp"
@@ -93,30 +95,52 @@ struct store_contents {
     std::vector<std::pair<std::uint64_t, digest>> owners;
 };
 
+// Keeps every page it is put, copied into its host pool.
 struct memory_store final : pulsarlm::page_store {
     std::shared_ptr<store_contents> contents = std::make_shared<store_contents>();
+    std::shared_ptr<pulsarlm::host_page_pool> host_pages;
 
-    task<std::vector<std::optional<page>>> fetch(std::span<const digest> hashes) override {
+    task<std::vector<bool>>
+    fetch(std::span<const digest> hashes, std::vector<page>&& lines, cudaStream_t stream) override {
         std::shared_ptr<store_contents> shared = contents;
         std::vector<digest> requested(hashes.begin(), hashes.end());
+        std::vector<page> targets = std::move(lines);
         shared->fetches.push_back(requested);
-        std::vector<std::optional<page>> found;
-        for (const digest& hash : requested) {
-            auto it = shared->pages.find(hash);
-            found.push_back(it == shared->pages.end() ? std::nullopt : std::optional<page>(it->second));
+        std::vector<bool> found(requested.size());
+        std::vector<page> found_targets;
+        std::vector<page> found_pages;
+        for (std::size_t i = 0; i < requested.size(); i++) {
+            if (auto it = shared->pages.find(requested[i]); it != shared->pages.end()) {
+                found[i] = true;
+                found_targets.push_back(targets[i]);
+                found_pages.push_back(it->second);
+            }
         }
+        co_await pulsarlm::copy_from_host(*host_pages, found_targets, found_pages, stream);
         co_return found;
     }
 
-    void
-    put(std::vector<digest>&& keys, std::vector<page>&& pages, std::vector<pulsarlm::page_owner>&& owners) override {
-        contents->puts++;
+    task<std::expected<void, pulsarlm::page_error>> put(
+        std::vector<digest>&& keys,
+        std::vector<page>&& pages,
+        std::vector<pulsarlm::page_owner>&& owners,
+        cudaStream_t stream
+    ) override {
+        std::shared_ptr<store_contents> shared = contents;
+        std::vector<digest> put_keys = std::move(keys);
+        std::vector<page> sources = std::move(pages);
+        shared->puts++;
         for (const pulsarlm::page_owner& owner : owners) {
-            contents->owners.emplace_back(owner.request, keys[owner.page]);
+            shared->owners.emplace_back(owner.request, put_keys[owner.page]);
         }
-        for (std::size_t i = 0; i < keys.size(); i++) {
-            contents->pages.insert_or_assign(keys[i], std::move(pages[i]));
+        std::optional<std::vector<page>> copies = co_await pulsarlm::copy_to_host(*host_pages, sources, stream);
+        if (!copies) {
+            co_return std::unexpected(pulsarlm::page_error::oom);
         }
+        for (std::size_t i = 0; i < put_keys.size(); i++) {
+            shared->pages.insert_or_assign(put_keys[i], std::move((*copies)[i]));
+        }
+        co_return {};
     }
 };
 
@@ -368,22 +392,19 @@ pulsarlm::kv_cache make_cache(
     const std::vector<pulsarlm::kv_layer>& layers,
     std::size_t n_lines,
     std::optional<std::size_t> pool_bytes,
-    pulsarlm::page_store& store
+    memory_store& store
 ) {
     std::vector<pulsarlm::page_shape> shapes = page_shapes(layers);
     std::size_t host_page_bytes = 0;
     std::size_t lines_bytes = 0;
+    std::size_t largest = 0;
     for (const pulsarlm::page_shape& shape : shapes) {
         host_page_bytes += 64 * pulsarlm::line_bytes(shape);
         lines_bytes += n_lines * pulsarlm::line_bytes(shape);
+        largest = std::max(largest, pulsarlm::line_bytes(shape));
     }
-    return pulsarlm::kv_cache(
-        shapes,
-        pool_bytes.value_or(lines_bytes),
-        host_page_bytes,
-        at::Device(at::kCUDA, 0),
-        store
-    );
+    store.host_pages = std::make_shared<pulsarlm::host_page_pool>(host_page_bytes, largest);
+    return pulsarlm::kv_cache(shapes, pool_bytes.value_or(lines_bytes), at::Device(at::kCUDA, 0), store);
 }
 
 struct fixture {

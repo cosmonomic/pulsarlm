@@ -9,9 +9,11 @@
 #include <format>
 #include <memory>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
 
 #include "digest_bytes.hpp"
+#include "pulsarlm/host_copy.hpp"
 
 namespace pulsarlm {
 
@@ -74,10 +76,19 @@ class fetch_resolver {
     }
 };
 
+py::list owners_to_python(std::span<const page_owner> owners) {
+    py::list list(owners.size());
+    for (std::size_t i = 0; i < owners.size(); i++) {
+        list[i] = py::make_tuple(owners[i].request, owners[i].page);
+    }
+    return list;
+}
+
 }  // namespace
 
-python_store::python_store(py::object&& hooks) noexcept
-: hooks(std::move(hooks)) {}
+python_store::python_store(py::object&& hooks, std::size_t host_page_bytes, std::size_t largest_page_bytes)
+: hooks(std::move(hooks)),
+  host_pages(host_page_bytes, largest_page_bytes) {}
 
 python_store::~python_store() {
     if (hooks) {
@@ -86,10 +97,23 @@ python_store::~python_store() {
     }
 }
 
-task<fetched_pages> python_store::fetch(std::span<const digest> hashes) {
+task<std::vector<bool>>
+python_store::fetch(std::span<const digest> hashes, std::vector<page>&& lines, cudaStream_t stream) {
     auto [fetched, resolver] = external_task<fetched_pages>::make();
     start_fetch(hashes, std::move(resolver));
-    co_return co_await std::move(fetched);
+    fetched_pages pages = co_await std::move(fetched);
+    std::vector<bool> found(pages.size());
+    std::vector<page> targets;
+    std::vector<page> arrived;
+    for (std::size_t i = 0; i < pages.size(); i++) {
+        if (pages[i]) {
+            found[i] = true;
+            targets.push_back(std::move(lines[i]));
+            arrived.push_back(std::move(*pages[i]));
+        }
+    }
+    co_await copy_from_host(host_pages, targets, arrived, stream);
+    co_return found;
 }
 
 // A callback added to a finished future runs inside add_done_callback.
@@ -105,17 +129,58 @@ void python_store::start_fetch(std::span<const digest> hashes, external_task<fet
     }
 }
 
-void python_store::put(std::vector<digest>&& hashes, std::vector<page>&& pages, std::vector<page_owner>&& owners) {
+std::vector<std::size_t> python_store::keep(std::span<const digest> hashes, std::span<const page_owner> owners) {
     py::gil_scoped_acquire gil;
     try {
-        py::list owner_list(owners.size());
-        for (std::size_t i = 0; i < owners.size(); i++) {
-            owner_list[i] = py::make_tuple(owners[i].request, owners[i].page);
+        return hooks.attr("keep")(to_bytes_list(hashes), owners_to_python(owners)).cast<std::vector<std::size_t>>();
+    } catch (py::error_already_set& e) {
+        e.discard_as_unraisable("pulsarlm page store keep");
+    } catch (const py::cast_error&) {
+    }
+    return {};
+}
+
+task<std::expected<void, page_error>> python_store::put(
+    std::vector<digest>&& hashes,
+    std::vector<page>&& pages,
+    std::vector<page_owner>&& owners,
+    cudaStream_t stream
+) {
+    std::vector<std::size_t> kept = keep(hashes, owners);
+    std::erase_if(kept, [&](std::size_t i) { return i >= hashes.size(); });
+    if (kept.empty()) {
+        co_return {};
+    }
+    std::vector<page> sources;
+    std::vector<digest> kept_hashes;
+    std::unordered_map<std::size_t, std::size_t> kept_index;
+    for (std::size_t i : kept) {
+        if (kept_index.try_emplace(i, sources.size()).second) {
+            sources.push_back(std::move(pages[i]));
+            kept_hashes.push_back(hashes[i]);
         }
-        hooks.attr("put")(to_bytes_list(hashes), pages_to_python(std::move(pages)), owner_list);
+    }
+    std::optional<std::vector<page>> copies = co_await copy_to_host(host_pages, sources, stream);
+    if (!copies) {
+        co_return std::unexpected(page_error::oom);
+    }
+    std::vector<page_owner> kept_owners;
+    for (const page_owner& owner : owners) {
+        if (auto it = kept_index.find(owner.page); it != kept_index.end()) {
+            kept_owners.push_back(page_owner{.request = owner.request, .page = it->second});
+        }
+    }
+    py::gil_scoped_acquire gil;
+    try {
+        hooks.attr("put")(
+            to_bytes_list(kept_hashes),
+            pages_to_python(std::move(*copies)),
+            owners_to_python(kept_owners)
+        );
     } catch (py::error_already_set& e) {
         e.discard_as_unraisable("pulsarlm page store put");
     }
+    co_return {};
 }
 
 }  // namespace pulsarlm

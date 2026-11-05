@@ -1,6 +1,8 @@
 #include "pulsarlm/kv_cache.hpp"
 #include "pulsarlm/digest.hpp"
 #include "pulsarlm/event_loop.hpp"
+#include "pulsarlm/host_copy.hpp"
+#include "pulsarlm/host_page_pool.hpp"
 
 #include <ATen/ATen.h>
 #include <ATen/core/CachingHostAllocator.h>
@@ -10,6 +12,7 @@
 #undef CHECK
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -50,35 +53,58 @@ struct store_state {
     std::vector<external_task<>::resolver> gates;
 };
 
+// Keeps every page it is put, copied into its host pool.
 struct memory_store final : pulsarlm::page_store {
     std::shared_ptr<store_state> state = std::make_shared<store_state>();
+    std::shared_ptr<pulsarlm::host_page_pool> host_pages;
 
-    task<std::vector<std::optional<page>>> fetch(std::span<const digest> hashes) override {
+    task<std::vector<bool>>
+    fetch(std::span<const digest> hashes, std::vector<page>&& lines, cudaStream_t stream) override {
         std::shared_ptr<store_state> shared = state;
+        std::shared_ptr<pulsarlm::host_page_pool> pool = host_pages;
         std::vector<digest> requested(hashes.begin(), hashes.end());
+        std::vector<page> targets = std::move(lines);
         shared->fetches.push_back(requested);
         if (shared->gated) {
             auto [gate, opener] = external_task<>::make();
             shared->gates.push_back(opener);
             co_await std::move(gate);
         }
-        std::vector<std::optional<page>> found;
-        for (const digest& hash : requested) {
-            auto it = shared->pages.find(hash);
-            found.push_back(it == shared->pages.end() ? std::nullopt : std::optional<page>(it->second));
+        std::vector<bool> found(requested.size());
+        std::vector<page> found_targets;
+        std::vector<page> found_pages;
+        for (std::size_t i = 0; i < requested.size(); i++) {
+            if (auto it = shared->pages.find(requested[i]); it != shared->pages.end()) {
+                found[i] = true;
+                found_targets.push_back(targets[i]);
+                found_pages.push_back(it->second);
+            }
         }
+        co_await pulsarlm::copy_from_host(*pool, found_targets, found_pages, stream);
         co_return found;
     }
 
-    void
-    put(std::vector<digest>&& keys, std::vector<page>&& pages, std::vector<pulsarlm::page_owner>&& owners) override {
-        state->puts++;
+    task<std::expected<void, page_error>> put(
+        std::vector<digest>&& keys,
+        std::vector<page>&& pages,
+        std::vector<pulsarlm::page_owner>&& owners,
+        cudaStream_t stream
+    ) override {
+        std::shared_ptr<store_state> shared = state;
+        std::vector<digest> put_keys = std::move(keys);
+        std::vector<page> sources = std::move(pages);
+        shared->puts++;
         for (const pulsarlm::page_owner& owner : owners) {
-            state->owners.emplace_back(owner.request, keys[owner.page]);
+            shared->owners.emplace_back(owner.request, put_keys[owner.page]);
         }
-        for (std::size_t i = 0; i < keys.size(); i++) {
-            state->pages.insert_or_assign(keys[i], std::move(pages[i]));
+        std::optional<std::vector<page>> copies = co_await pulsarlm::copy_to_host(*host_pages, sources, stream);
+        if (!copies) {
+            co_return std::unexpected(page_error::oom);
         }
+        for (std::size_t i = 0; i < put_keys.size(); i++) {
+            shared->pages.insert_or_assign(put_keys[i], std::move((*copies)[i]));
+        }
+        co_return {};
     }
 };
 
@@ -96,22 +122,35 @@ std::size_t lines_bytes(const std::vector<pulsarlm::page_shape>& shapes) {
 
 constexpr std::size_t host_bytes = std::size_t{1} << 16;
 
+memory_store with_host_pages(
+    memory_store store,
+    std::size_t host_page_bytes,
+    const std::vector<pulsarlm::page_shape>& shapes
+) {
+    std::size_t largest = 0;
+    for (const pulsarlm::page_shape& layer_shape : shapes) {
+        largest = std::max(largest, pulsarlm::line_bytes(layer_shape));
+    }
+    store.host_pages = std::make_shared<pulsarlm::host_page_pool>(host_page_bytes, largest);
+    return store;
+}
+
 struct cache_fixture {
     memory_store backing;
     std::shared_ptr<store_state> store;
     pulsarlm::kv_cache kv;
 
     // One layer of shape unless shapes gives one per layer. The pool has room for n_lines lines of every layer, and the
-    // host pool takes host_page_bytes.
+    // store's host pool takes host_page_bytes.
     explicit cache_fixture(
         std::size_t n_lines,
         memory_store backing_store = {},
         std::size_t host_page_bytes = host_bytes,
         const std::vector<pulsarlm::page_shape>& shapes = {shape}
     )
-    : backing(std::move(backing_store)),
+    : backing(with_host_pages(std::move(backing_store), host_page_bytes, shapes)),
       store(backing.state),
-      kv(shapes, n_lines * lines_bytes(shapes), host_page_bytes, at::Device(at::kCUDA, 0), backing) {}
+      kv(shapes, n_lines * lines_bytes(shapes), at::Device(at::kCUDA, 0), backing) {}
 };
 
 digest hash_of(std::uint64_t n) {
@@ -797,14 +836,9 @@ TEST_CASE("a layer's line reclaims the region whose cached page is oldest, which
 TEST_CASE("a large line reclaims a region of cached small pages and drops them all") {
     pulsarlm::page_shape wide = shape;
     wide.n_kv_heads = 2 * shape.n_kv_heads;
-    memory_store backing;
-    pulsarlm::kv_cache kv(
-        std::vector<pulsarlm::page_shape>{shape, wide},
-        2 * pulsarlm::line_bytes(wide),
-        host_bytes,
-        at::Device(at::kCUDA, 0),
-        backing
-    );
+    std::vector<pulsarlm::page_shape> shapes{shape, wide};
+    memory_store backing = with_host_pages({}, host_bytes, shapes);
+    pulsarlm::kv_cache kv(shapes, 2 * pulsarlm::line_bytes(wide), at::Device(at::kCUDA, 0), backing);
     std::vector<digest> narrow_hashes;
     for (std::uint64_t n = 1; n <= 4; n++) {
         backing.state->pages.emplace(key_of(n, 0), host_page(static_cast<float>(n)));
@@ -840,12 +874,12 @@ TEST_CASE("lines of several sizes pack into regions of the largest size") {
     pulsarlm::page_shape wide = shape;
     wide.n_kv_heads = 2 * shape.n_kv_heads;
     std::vector<pulsarlm::page_shape> shapes{shape, wide};
-    memory_store backing;
     std::size_t narrow_bytes = pulsarlm::line_bytes(shape);
+    memory_store backing = with_host_pages({}, 2 * narrow_bytes, shapes);
 
-    REQUIRE_THROWS(pulsarlm::kv_cache(shapes, 3 * narrow_bytes, 2 * narrow_bytes, at::Device(at::kCUDA, 0), backing));
+    REQUIRE_THROWS(pulsarlm::kv_cache(shapes, 3 * narrow_bytes, at::Device(at::kCUDA, 0), backing));
 
-    pulsarlm::kv_cache aligned(shapes, 4 * narrow_bytes, 2 * narrow_bytes, at::Device(at::kCUDA, 0), backing);
+    pulsarlm::kv_cache aligned(shapes, 4 * narrow_bytes, at::Device(at::kCUDA, 0), backing);
     REQUIRE(aligned.free_count() == 1);
     std::vector<line_ids> held = allocate_each(aligned, 1).value();
     fill_line(aligned, held[0].front(), 1.0f, 0);

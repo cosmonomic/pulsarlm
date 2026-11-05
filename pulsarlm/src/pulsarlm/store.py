@@ -80,6 +80,8 @@ class LocalStore:
         self._tails: dict[bytes, set[tuple[int, ...]]] = {}
         self._unreferenced_pages: set[bytes] = set()
         self._leases: dict[int, Lease] = {}
+        # By request id, the put of a step's pages that keep began and put ends.
+        self._step_puts: dict[int, list[bytes]] = {}
         self._clock = count()
         self._file = None if path is None else StoreFile(path)
         if self._file is not None:
@@ -139,16 +141,38 @@ class LocalStore:
         self._file.read([hashes[i] for i in in_file]).add_done_callback(keep)
         return future
 
+    def keep(self, hashes: list[bytes], owners: Sequence[tuple[int, int]]) -> list[int]:
+        """The indices of the pages of hashes that an open lease owns and the store
+        lacks, which the engine copies and hands to put. owners pairs a request id
+        with the index of a page its step produced. The pages the store has are
+        referenced for the leases owning them now, so none is deleted before put."""
+        with self._lock:
+            kept: set[int] = set()
+            owned: dict[int, list[bytes]] = {}
+            for request_id, index in owners:
+                if request_id not in self._leases:
+                    continue
+                keys = owned.setdefault(request_id, [])
+                if hashes[index] in self._pages:
+                    self._reference(hashes[index])
+                    keys.append(hashes[index])
+                else:
+                    kept.add(index)
+            for request_id, keys in owned.items():
+                self._leases[request_id]._puts.append(keys)
+            self._step_puts = owned
+            return sorted(kept)
+
     def put(
         self,
         hashes: list[bytes],
         pages: list[Page],
         owners: Sequence[tuple[int, int]] = (),
     ) -> None:
-        """owners pairs a request id with the index of a page its step produced. The
-        store then fits with room for another put of these pages' size: the engine
-        takes a step's host pages from memory the store's capacity bounds before
-        it puts them."""
+        """owners pairs a request id with the index of a page its step produced; a
+        lease's pages join the put keep began for its step. The store then fits with
+        room for another put of these pages' size: the engine takes a step's host
+        pages from memory the store's capacity bounds before it puts them."""
         with self._lock:
             new = []
             for h, page in zip(hashes, pages, strict=True):
@@ -165,7 +189,11 @@ class LocalStore:
             for request_id, keys in owned.items():
                 for h in keys:
                     self._reference(h)
-                self._leases[request_id]._puts.append(keys)
+                if request_id in self._step_puts:
+                    self._step_puts[request_id].extend(keys)
+                else:
+                    self._leases[request_id]._puts.append(keys)
+            self._step_puts = {}
             if self._file is not None and new:
                 self._file.put(new)
             self._fit(room=sum(page.nbytes for page in pages))
