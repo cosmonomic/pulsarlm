@@ -118,9 +118,9 @@ async def collect(
 def covered_by_lookup(engine: AsyncEngine, store: LocalStore, prompt: list[int]) -> int:
     with store.lease(prompt, engine.page_digests(prompt), request_id=0, cache=True) as (
         _,
-        covered,
+        token_count,
     ):
-        return covered
+        return token_count
 
 
 PROMPT = [(7 * i + 3) % VOCAB_SIZE for i in range(40)]
@@ -184,12 +184,9 @@ def test_another_engine_fetches_the_state_pages_from_the_store():
         second = make_engine(store)
         with store.lease(
             follow_up, second.page_digests(follow_up), request_id=0, cache=True
-        ) as (
-            state,
-            _,
-        ):
-            assert len(state.layers[0].pages) == 2
-            keys = second.page_keys(state)
+        ) as (lease, _):
+            assert len(lease.state.layers[0].pages) == 2
+            keys = second.page_keys(lease.state)
         assert len(await collect(second, store, follow_up)) == 8
         assert store.fetched_hashes == keys
 

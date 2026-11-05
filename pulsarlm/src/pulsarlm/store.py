@@ -5,7 +5,7 @@ from collections import OrderedDict
 from collections.abc import Iterator, Sequence
 from concurrent.futures import Future
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from itertools import count
 from pathlib import Path
 
@@ -34,14 +34,25 @@ class StoredState:
     page_keys: list[bytes]
 
 
-@dataclass
-class RunningRequest:
-    """What a running request references: the pages of its newest snapshot, the
-    state it resumed or last wrote, which its next state builds on, and the pages
-    each of its puts brought that no state it wrote covers yet."""
+class Lease:
+    """A running request's references in the store: the pages of its state, the
+    one it resumed or last moved to, which its next state builds on, and the pages
+    its puts brought that no such state covers yet. Leaving the store's lease
+    context releases them all."""
 
-    snapshot_keys: list[bytes]
-    puts: list[list[bytes]] = field(default_factory=list)
+    def __init__(
+        self, store: "LocalStore", state: State, page_keys: list[bytes]
+    ) -> None:
+        self.state = state
+        self._store = store
+        self._page_keys = page_keys
+        self._puts: list[list[bytes]] = []
+
+    def move_to(self, state: State, page_keys: list[bytes]) -> None:
+        """The request reached state, whose pages are page_keys: the lease
+        references them in place of its previous state's pages, and releases its
+        puts that state covers."""
+        self._store._move(self, state, page_keys)
 
 
 class LocalStore:
@@ -49,12 +60,9 @@ class LocalStore:
 
     fetch and put run on the engine's loop thread, the rest on the server's, so a
     lock guards everything. A page is deleted once neither a stored state nor a
-    running request references it. A running request references the pages of its
-    newest snapshot, which the LRU may drop from the stored states, and the pages
-    its puts own until a state it writes covers their step. While the pages take
-    more than capacity_bytes, the least recently used states are dropped, down to
-    the newest one; pages running requests reference can keep the store above its
-    capacity.
+    running request's lease references it. While the pages take more than
+    capacity_bytes, the least recently used states are dropped, down to the newest
+    one; pages leases reference can keep the store above its capacity.
 
     With a path, the file holds a copy of every page and state, read at
     construction; a page only in the file is read into RAM when fetched.
@@ -71,7 +79,7 @@ class LocalStore:
         self._states: OrderedDict[StateKey, StoredState] = OrderedDict()
         self._tails: dict[bytes, set[tuple[int, ...]]] = {}
         self._unreferenced_pages: set[bytes] = set()
-        self._requests: dict[int, RunningRequest] = {}
+        self._leases: dict[int, Lease] = {}
         self._clock = count()
         self._file = None if path is None else StoreFile(path)
         if self._file is not None:
@@ -152,12 +160,12 @@ class LocalStore:
                     new.append((h, page, nbytes))
             owned: dict[int, list[bytes]] = {}
             for request_id, index in owners:
-                if request_id in self._requests:
+                if request_id in self._leases:
                     owned.setdefault(request_id, []).append(hashes[index])
             for request_id, keys in owned.items():
                 for h in keys:
                     self._reference(h)
-                self._requests[request_id].puts.append(keys)
+                self._leases[request_id]._puts.append(keys)
             if self._file is not None and new:
                 self._file.put(new)
             self._fit(room=sum(page.nbytes for page in pages))
@@ -170,12 +178,12 @@ class LocalStore:
         *,
         request_id: int,
         cache: bool,
-    ) -> Iterator[tuple[State, int]]:
-        """The newest stored state reaching a proper prefix of prompt, and how many
-        of prompt's tokens it covers; an empty state and 0 when there is none or
-        cache is false. page_digests are prompt's full page hashes. request_id,
-        distinct among open leases, names the request to put and write while the
-        lease is open."""
+    ) -> Iterator[tuple[Lease, int]]:
+        """A lease on the newest stored state reaching a proper prefix of prompt,
+        and how many of prompt's tokens it covers; on an empty state and 0 when
+        there is none or cache is false. page_digests are prompt's full page
+        hashes. request_id, distinct among open leases, names the request whose
+        puts the lease references."""
         with self._lock:
             found, covered = (
                 self._find(prompt, page_digests)
@@ -184,25 +192,24 @@ class LocalStore:
             )
             for h in found.page_keys:
                 self._reference(h)
-            self._requests[request_id] = RunningRequest(found.page_keys)
+            lease = Lease(self, found.state, found.page_keys)
+            self._leases[request_id] = lease
         try:
-            yield found.state, covered
+            yield lease, covered
         finally:
             with self._lock:
-                running = self._requests.pop(request_id)
-                self._dereference(running.snapshot_keys)
-                for keys in running.puts:
+                del self._leases[request_id]
+                self._dereference(lease._page_keys)
+                for keys in lease._puts:
                     self._dereference(keys)
                 self._fit()
 
-    def write(
-        self, state: State, page_keys: list[bytes], *, request_id: int | None = None
-    ) -> None:
-        """Makes state findable. page_keys are the keys of the pages a request
-        resuming from it reads, all in the store: the engine puts them before it
-        reports the state, and the writing request references them until then."""
-        key = state_key(state)
+    def write(self, lease: Lease) -> None:
+        """Makes lease's state findable."""
         with self._lock:
+            state = lease.state
+            key = state_key(state)
+            page_keys = lease._page_keys
             for h in page_keys:
                 self._reference(h)
             if (replaced := self._states.pop(key, None)) is not None:
@@ -212,13 +219,16 @@ class LocalStore:
             self._states[key] = StoredState(state, page_keys)
             if self._file is not None:
                 self._file.write(key, state, page_keys, next(self._clock))
-            if request_id is not None and request_id in self._requests:
-                running = self._requests[request_id]
-                for h in page_keys:
-                    self._reference(h)
-                self._dereference(running.snapshot_keys)
-                running.snapshot_keys = page_keys
-                self._release_covered(running, set(page_keys))
+            self._fit()
+
+    def _move(self, lease: Lease, state: State, page_keys: list[bytes]) -> None:
+        with self._lock:
+            for h in page_keys:
+                self._reference(h)
+            self._dereference(lease._page_keys)
+            lease.state = state
+            lease._page_keys = page_keys
+            self._release_covered(lease, set(page_keys))
             self._fit()
 
     def __len__(self) -> int:
@@ -270,17 +280,17 @@ class LocalStore:
             if page.references == 0:
                 self._unreferenced_pages.add(h)
 
-    def _release_covered(self, running: RunningRequest, covered: set[bytes]) -> None:
-        """Releases the puts up to the last one holding a page of the written state:
-        its step, and every earlier one, are behind the state, as a request puts
+    def _release_covered(self, lease: Lease, covered: set[bytes]) -> None:
+        """Releases the puts up to the last one holding a page of the state moved
+        to: its step, and every earlier one, are behind the state, as a request puts
         its pages in step order and a state ends at a step's end."""
         last = max(
-            (i for i, keys in enumerate(running.puts) if not covered.isdisjoint(keys)),
+            (i for i, keys in enumerate(lease._puts) if not covered.isdisjoint(keys)),
             default=-1,
         )
-        for keys in running.puts[: last + 1]:
+        for keys in lease._puts[: last + 1]:
             self._dereference(keys)
-        del running.puts[: last + 1]
+        del lease._puts[: last + 1]
 
     def _fit(self, room: int = 0) -> None:
         """Drops the least recently used states, down to the newest one, until the

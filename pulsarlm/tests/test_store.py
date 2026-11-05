@@ -13,7 +13,7 @@ from pathlib import Path
 import torch
 
 from pulsarlm.core.engine import ActivePage, LayerSequence, Moments, State
-from pulsarlm.store import LocalStore
+from pulsarlm.store import Lease, LocalStore
 from pulsarlm.store_file import StoreInUseError
 
 PAGE_SIZE = 4
@@ -71,25 +71,28 @@ REQUEST_IDS = count(1)
 
 
 @contextmanager
-def request(store: LocalStore, prompt: list[int]) -> Iterator[tuple[int, State, int]]:
-    """A lease on prompt under a fresh request id."""
+def request(store: LocalStore, prompt: list[int]) -> Iterator[tuple[int, Lease, int]]:
+    """A lease on prompt under a fresh request id, and how many of prompt's tokens
+    its state covers."""
     request_id = next(REQUEST_IDS)
     digests = page_digests(prompt)
     with store.lease(prompt, digests, request_id=request_id, cache=True) as (
-        state,
-        covered,
+        lease,
+        token_count,
     ):
-        yield request_id, state, covered
+        yield request_id, lease, token_count
 
 
 @contextmanager
 def lookup(store: LocalStore, prompt: list[int]) -> Iterator[tuple[State, int]]:
-    with request(store, prompt) as (_, state, covered):
-        yield state, covered
+    with request(store, prompt) as (_, lease, token_count):
+        yield lease.state, token_count
 
 
-def write(store: LocalStore, state: State, request_id: int | None = None) -> None:
-    store.write(state, hashes_of(state), request_id=request_id)
+def write(store: LocalStore, state: State, lease: Lease) -> None:
+    """Moves lease to state and stores it, as a request reaching it does."""
+    lease.move_to(state, hashes_of(state))
+    store.write(lease)
 
 
 def put_pages(
@@ -102,10 +105,10 @@ def put_pages(
 
 def run_request(store: LocalStore, prompt: list[int], *states: list[int]) -> None:
     """A request on prompt that reaches each history in states, in order."""
-    with request(store, prompt) as (request_id, _, _):
+    with request(store, prompt) as (request_id, lease, _):
         for history in states:
             put_pages(store, page_digests(history), request_id)
-            write(store, current_state(history), request_id)
+            write(store, current_state(history), lease)
 
 
 def stored(store: LocalStore, h: bytes) -> bool:
@@ -136,9 +139,9 @@ def test_a_lease_without_cache_gives_an_empty_state_and_keeps_writing():
     run_request(store, HISTORY, HISTORY[:10])
     with store.lease(
         HISTORY, page_digests(HISTORY), request_id=next(REQUEST_IDS), cache=False
-    ) as (state, covered):
-        assert state.layers == [] and state.tail == []
-        assert covered == 0
+    ) as (lease, token_count):
+        assert lease.state.layers == [] and lease.state.tail == []
+        assert token_count == 0
     with lookup(store, HISTORY) as (_, covered):
         assert covered == 10
 
@@ -160,9 +163,9 @@ def test_lookup_leaves_a_token_to_forward():
 def test_a_state_with_evicted_pages_is_found_by_its_last_page():
     store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY)
     history = HISTORY[:13]
-    with request(store, history) as (request_id, _, _):
+    with request(store, history) as (request_id, lease, _):
         put_pages(store, page_digests(history), request_id)
-        write(store, current_state(history, evicted={1}), request_id)
+        write(store, current_state(history, evicted={1}), lease)
     with lookup(store, HISTORY) as (state, covered):
         assert covered == 13
         assert len(hashes_of(state)) == 2
@@ -199,7 +202,7 @@ def test_a_request_keeps_the_pages_of_the_state_it_resumed_until_its_lease_close
 
 def test_the_pages_a_request_puts_stay_until_its_lease_closes():
     store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY)
-    with request(store, HISTORY) as (request_id, _, _):
+    with request(store, HISTORY) as (request_id, lease, _):
         put_pages(store, page_digests(HISTORY), request_id)
         run_request(store, [7, 7, 7, 7, 7], [7, 7, 7, 7, 7])
         assert all(stored(store, h) for h in page_digests(HISTORY))
@@ -210,29 +213,29 @@ def test_an_open_lease_does_not_keep_the_pages_another_request_put():
     store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY)
     other = [7] * 9
     with lookup(store, HISTORY):
-        with request(store, other) as (request_id, _, _):
+        with request(store, other) as (request_id, lease, _):
             put_pages(store, page_digests(other), request_id)
         assert not any(stored(store, h) for h in page_digests(other))
 
 
-def test_a_written_state_releases_the_pages_of_its_steps_it_does_not_reference():
+def test_moving_to_a_state_releases_the_pages_of_its_steps_it_does_not_reference():
     store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY)
     first, evicted, last = page_digests(HISTORY[:12])
-    with request(store, HISTORY) as (request_id, _, _):
+    with request(store, HISTORY) as (request_id, lease, _):
         for h in (first, evicted, last):
             put_pages(store, [h], request_id)
-        write(store, state_of([first, last]), request_id)
+        lease.move_to(state_of([first, last]), [first, last])
         assert not stored(store, evicted)
         assert stored(store, first) and stored(store, last)
 
 
-def test_the_pages_a_request_put_after_the_step_of_a_state_it_writes_stay():
+def test_the_pages_a_request_put_after_the_step_of_the_state_it_reaches_stay():
     store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY)
     first, second = page_digests(HISTORY[:8])
-    with request(store, HISTORY) as (request_id, _, _):
+    with request(store, HISTORY) as (request_id, lease, _):
         put_pages(store, [first], request_id)
         put_pages(store, [second], request_id)
-        write(store, state_of([first]), request_id)
+        write(store, state_of([first]), lease)
         assert stored(store, second)
     assert stored(store, first)
     assert not stored(store, second)
@@ -241,13 +244,13 @@ def test_the_pages_a_request_put_after_the_step_of_a_state_it_writes_stay():
 def test_a_running_request_keeps_its_newest_snapshot_after_the_lru_drops_it():
     store = LocalStore(PAGE_SIZE, capacity_bytes=PAGE_BYTES)
     first, second = page_digests(HISTORY[:8])
-    with request(store, HISTORY) as (request_id, _, _):
+    with request(store, HISTORY) as (request_id, lease, _):
         put_pages(store, [first], request_id)
-        write(store, state_of([first]), request_id)
+        write(store, state_of([first]), lease)
         run_request(store, [7] * 5, [7] * 5)
         assert stored(store, first)
         put_pages(store, [second], request_id)
-        write(store, state_of([first, second]), request_id)
+        write(store, state_of([first, second]), lease)
     assert stored(store, first) and stored(store, second)
 
 
@@ -255,12 +258,12 @@ def test_a_page_put_again_by_a_later_request_stays_for_it():
     store = LocalStore(PAGE_SIZE, capacity_bytes=2 * PAGE_BYTES)
     first = HISTORY[:8]
     run_request(store, first, first)
-    with request(store, first) as (request_id, _, covered):
-        assert covered == 0
+    with request(store, first) as (request_id, lease, token_count):
+        assert token_count == 0
         put_pages(store, page_digests(first), request_id)
         run_request(store, [7] * 5, [7] * 5)
         assert all(stored(store, h) for h in page_digests(first))
-        write(store, current_state(first), request_id)
+        write(store, current_state(first), lease)
     assert all(stored(store, h) for h in page_digests(first))
 
 
@@ -355,7 +358,7 @@ def test_a_restart_deletes_pages_no_state_references(tmp_path: Path):
         path,
         """
         store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=store_path)
-        with request(store, HISTORY) as (request_id, _, _):
+        with request(store, HISTORY) as (request_id, lease, _):
             put_pages(store, page_digests(HISTORY), request_id)
         """,
     )

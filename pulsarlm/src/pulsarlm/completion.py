@@ -37,19 +37,21 @@ async def complete(
     request_id = next(_request_ids)
     digests = engine.page_digests(prompt)
 
-    def handle_state(state: State) -> None:
-        if prefix_cache:
-            store.write(state, engine.page_keys(state), request_id=request_id)
-        if on_state is not None:
-            on_state(state)
-
     with store.lease(prompt, digests, request_id=request_id, cache=prefix_cache) as (
-        state,
-        covered,
+        lease,
+        token_count,
     ):
+
+        def handle_state(state: State) -> None:
+            lease.move_to(state, engine.page_keys(state))
+            if prefix_cache:
+                store.write(lease)
+            if on_state is not None:
+                on_state(state)
+
         stream = engine.submit(
-            state,
-            prompt[covered:],
+            lease.state,
+            prompt[token_count:],
             sampling=sampling,
             max_tokens=max_tokens,
             eviction=eviction,
