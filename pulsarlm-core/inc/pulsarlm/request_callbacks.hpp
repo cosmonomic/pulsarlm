@@ -48,7 +48,7 @@ struct state {
 // The state a request reached when an eviction cycle ended. It covers the request's first token_count tokens: the
 // initial state's tail, then the request's tokens, then the tokens it sampled.
 struct cycle_end {
-    state reached;
+    pulsarlm::state state;
     std::size_t token_count;
 };
 

@@ -114,12 +114,12 @@ bool k_eq_v(const gemma4_config& c, std::int64_t layer) {
 }
 
 struct weights {
-    c10::Dict<std::string, at::Tensor> named;
+    c10::Dict<std::string, at::Tensor> named_tensors;
 
     weights(const gemma4_config& c, at::ScalarType dtype) {
         at::manual_seed(11);
         auto add = [&](const std::string& name, at::Tensor t) {
-            named.insert("model.language_model." + name, t.to(cuda(dtype)));
+            named_tensors.insert("model.language_model." + name, t.to(cuda(dtype)));
         };
         auto projection = [](std::int64_t out, std::int64_t in) { return at::randn({out, in}) / std::sqrt(in); };
         auto norm = [](std::int64_t size) { return 1.0 + 0.1 * at::randn({size}); };
@@ -174,7 +174,7 @@ struct weights {
     }
 
     at::Tensor operator()(const std::string& name) const {
-        return named.at("model.language_model." + name).to(at::kFloat);
+        return named_tensors.at("model.language_model." + name).to(at::kFloat);
     }
 
     at::Tensor layer(std::int64_t layer, const std::string& name) const {
@@ -350,7 +350,7 @@ double max_relative_error(const at::Tensor& got, const at::Tensor& expected) {
 
 void check_against_dense(const gemma4_config& c, at::ScalarType dtype, double tolerance) {
     weights w(c, dtype);
-    pulsarlm::Gemma4Model model(c, w.named);
+    pulsarlm::Gemma4Model model(c, w.named_tensors);
     std::vector<pulsarlm::kv_layer> layers = model.kv_layers();
     REQUIRE(static_cast<std::int64_t>(layers.size()) == n_layers(c) - c.num_kv_shared_layers);
     std::vector<pulsarlm::kv> lines;
@@ -379,11 +379,11 @@ void check_against_dense(const gemma4_config& c, at::ScalarType dtype, double to
         INFO("tokens [" << ch.first << ", " << ch.last << ")" << (ch.prefill ? " prefill" : " decode"));
         pulsarlm::StepBatch batch;
         (ch.prefill
-             ? batch.prefill
-             : batch.decode) = step(tokens, static_cast<std::int64_t>(layers.size()), ch.first, ch.last, ch.prefill);
+             ? batch.prefill_group
+             : batch.decode_group) = step(tokens, static_cast<std::int64_t>(layers.size()), ch.first, ch.last, ch.prefill);
         pulsarlm::StepLogits logits = model.forward(batch, lines);
         auto expected = dense.logits.narrow(0, ch.first, ch.last - ch.first);
-        CHECK(max_relative_error(*(ch.prefill ? logits.prefill : logits.decode), expected) < tolerance);
+        CHECK(max_relative_error(*(ch.prefill ? logits.prefill_logits : logits.decode_logits), expected) < tolerance);
     }
 
     auto view = at::tensor(std::vector<std::int64_t>(view_lines.begin(), view_lines.end())).to(at::kCUDA);
@@ -406,14 +406,14 @@ TEST_CASE("Gemma 4 kv_layers name the layers keeping KV, with their windows and 
         SKIP("no CUDA device");
     }
     gemma4_config shared = shared_kv_config();
-    std::vector<pulsarlm::kv_layer> layers = pulsarlm::Gemma4Model(shared, weights(shared, at::kFloat).named)
+    std::vector<pulsarlm::kv_layer> layers = pulsarlm::Gemma4Model(shared, weights(shared, at::kFloat).named_tensors)
                                                  .kv_layers();
     REQUIRE(layers.size() == 3);
     CHECK((layers[0].sliding_window == std::optional<std::size_t>(6) && layers[0].head_dim == 64));
     CHECK((!layers[2].sliding_window && layers[2].head_dim == 128 && !layers[2].values_only));
 
     gemma4_config unified = k_eq_v_config();
-    layers = pulsarlm::Gemma4Model(unified, weights(unified, at::kFloat).named).kv_layers();
+    layers = pulsarlm::Gemma4Model(unified, weights(unified, at::kFloat).named_tensors).kv_layers();
     REQUIRE(layers.size() == 6);
     CHECK((layers[5].values_only && layers[5].n_kv_heads == 1 && !layers[0].values_only));
 }

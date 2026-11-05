@@ -35,13 +35,13 @@ make_model(const any_model_config& any_config, const std::unordered_map<std::str
     }
     const model_config& config = std::get<model_config>(any_config);
     if (config.architecture == "qwen2") {
-        return std::make_unique<Qwen2Model>(config.dense, weight_dict);
+        return std::make_unique<Qwen2Model>(config.dense_model, weight_dict);
     }
     if (config.architecture == "qwen3") {
-        return std::make_unique<Qwen3Model>(config.dense, weight_dict);
+        return std::make_unique<Qwen3Model>(config.dense_model, weight_dict);
     }
     if (config.architecture == "llama") {
-        return std::make_unique<LlamaModel>(config.dense, weight_dict);
+        return std::make_unique<LlamaModel>(config.dense_model, weight_dict);
     }
     throw std::invalid_argument(std::format("unknown architecture {:?}", config.architecture));
 }
@@ -68,12 +68,12 @@ python_engine::python_engine(
     const engine_config& config,
     std::unique_ptr<page_store>&& store
 )
-: wake(std::make_shared<wake_fd>()),
-  served(std::make_unique<engine>(std::move(model), config, std::move(store))) {}
+: wake_signal(std::make_shared<wake_fd>()),
+  core_engine(std::make_unique<engine>(std::move(model), config, std::move(store))) {}
 
 python_engine::~python_engine() {
     py::gil_scoped_release nogil;
-    served.reset();
+    core_engine.reset();
 }
 
 request_handle python_engine::submit(
@@ -88,33 +88,33 @@ request_handle python_engine::submit(
     request r{initial_state, std::move(tokens), sampling, max_tokens, eviction, request_id};
     {
         py::gil_scoped_release nogil;
-        served->submit(std::move(r), std::make_unique<buffered_callbacks>(buffer, wake));
+        core_engine->submit(std::move(r), std::make_unique<buffered_callbacks>(buffer, wake_signal));
     }
     return request_handle(std::move(buffer));
 }
 
 std::vector<digest> python_engine::page_digests(const std::vector<std::int64_t>& tokens) const {
-    return served->page_digests(tokens);
+    return core_engine->page_digests(tokens);
 }
 
 std::vector<digest> python_engine::page_keys(const state& s) const {
-    return served->page_keys(s);
+    return core_engine->page_keys(s);
 }
 
 engine_stat python_engine::stat() const {
-    return served->stat();
+    return core_engine->stat();
 }
 
 int python_engine::fileno() const noexcept {
-    return wake->fileno();
+    return wake_signal->fileno();
 }
 
 void python_engine::clear_wake() noexcept {
-    wake->clear();
+    wake_signal->clear();
 }
 
 std::optional<std::string> python_engine::exception() const {
-    std::exception_ptr thrown = served->exception();
+    std::exception_ptr thrown = core_engine->exception();
     if (!thrown) {
         return std::nullopt;
     }

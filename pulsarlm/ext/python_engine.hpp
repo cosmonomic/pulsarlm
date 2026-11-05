@@ -27,7 +27,7 @@ namespace pulsarlm {
 // architecture is "qwen2", "qwen3" or "llama".
 struct model_config {
     std::string architecture;
-    dense_config dense;
+    dense_config dense_model;
 };
 
 using any_model_config = std::
@@ -56,8 +56,8 @@ class request_handle {
 // The engine as Python uses it. The loop thread takes the GIL to call the store, so every call that waits for the
 // loop thread releases the GIL first.
 class python_engine {
-    std::shared_ptr<wake_fd> wake;
-    std::unique_ptr<engine> served;
+    std::shared_ptr<wake_fd> wake_signal;
+    std::unique_ptr<engine> core_engine;
 
   public:
     python_engine(std::unique_ptr<Model> model, const engine_config& config, std::unique_ptr<page_store>&& store);

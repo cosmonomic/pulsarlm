@@ -75,10 +75,10 @@ def random_weights() -> dict[str, torch.Tensor]:
 class CountingStore(LocalStore):
     def __init__(self) -> None:
         super().__init__(PAGE_SIZE, capacity_bytes=64 * LINE_BYTES)
-        self.fetched: list[bytes] = []
+        self.fetched_hashes: list[bytes] = []
 
     def fetch(self, hashes: list[bytes]):
-        self.fetched += hashes
+        self.fetched_hashes += hashes
         return super().fetch(hashes)
 
 
@@ -191,7 +191,7 @@ def test_another_engine_fetches_the_state_pages_from_the_store():
             assert len(state.layers[0].pages) == 2
             keys = second.page_keys(state)
         assert len(await collect(second, store, follow_up)) == 8
-        assert store.fetched == keys
+        assert store.fetched_hashes == keys
 
     asyncio.run(main())
 

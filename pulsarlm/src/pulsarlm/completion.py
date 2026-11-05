@@ -59,7 +59,7 @@ async def complete(
             while True:
                 tokens, cycle_ends, end = await stream.take()
                 for cycle_end in cycle_ends:
-                    handle_state(cycle_end.reached)
+                    handle_state(cycle_end.state)
                 for token in tokens:
                     yield token
                 if isinstance(end, State):

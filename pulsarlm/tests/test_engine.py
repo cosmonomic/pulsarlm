@@ -80,10 +80,10 @@ class MemoryStore:
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
         self.loop = loop
         self.pages: dict[bytes, tuple[torch.Tensor, torch.Tensor]] = {}
-        self.fetched: list[bytes] = []
+        self.fetched_hashes: list[bytes] = []
 
     def fetch(self, hashes: list[bytes]) -> Future:
-        self.fetched += hashes
+        self.fetched_hashes += hashes
         return asyncio.run_coroutine_threadsafe(self.lookup(hashes), self.loop)
 
     async def lookup(self, hashes: list[bytes]) -> list:
@@ -188,7 +188,7 @@ def test_another_engine_continues_a_state_from_the_store():
             second, second.submit(reached, follow_up, max_tokens=8)
         )
 
-        assert store.fetched == second.page_keys(reached)
+        assert store.fetched_hashes == second.page_keys(reached)
         assert continued == expected
         assert isinstance(end, State)
 

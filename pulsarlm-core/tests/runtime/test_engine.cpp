@@ -44,11 +44,11 @@ constexpr auto end_timeout = std::chrono::seconds(30);
 
 // Drops puts. A fetch never completes; it counts down fetch_started.
 struct stalling_store final : pulsarlm::page_store {
-    std::shared_ptr<std::latch> fetch_started = std::make_shared<std::latch>(1);
+    std::shared_ptr<std::latch> fetch_start_latch = std::make_shared<std::latch>(1);
 
     task<std::vector<std::optional<page>>> fetch(std::span<const digest>) override {
         auto [never, resolver] = pulsarlm::external_task<>::make();
-        fetch_started->count_down();
+        fetch_start_latch->count_down();
         co_await std::move(never);
         co_return {};
     }
@@ -65,11 +65,11 @@ class successor_model final : public pulsarlm::Model {
 
     pulsarlm::StepLogits forward(const pulsarlm::StepBatch& batch, std::span<const pulsarlm::kv>) override {
         pulsarlm::StepLogits logits;
-        if (batch.prefill) {
-            logits.prefill = predict(*batch.prefill);
+        if (batch.prefill_group) {
+            logits.prefill_logits = predict(*batch.prefill_group);
         }
-        if (batch.decode) {
-            logits.decode = predict(*batch.decode);
+        if (batch.decode_group) {
+            logits.decode_logits = predict(*batch.decode_group);
         }
         return logits;
     }
@@ -97,31 +97,31 @@ class failing_model final : public pulsarlm::Model {
 // Filled on the loop thread, read on the test thread.
 struct request_results {
     std::mutex mutex;
-    std::condition_variable ended;
+    std::condition_variable end_condition;
     token_list tokens;
     std::optional<std::expected<pulsarlm::state, request_error>> end;
 };
 
 class recording_callbacks final : public pulsarlm::request_callbacks {
-    std::shared_ptr<request_results> recorded;
+    std::shared_ptr<request_results> recorded_results;
 
   public:
-    explicit recording_callbacks(std::shared_ptr<request_results> recorded)
-    : recorded(std::move(recorded)) {}
+    explicit recording_callbacks(std::shared_ptr<request_results> recorded_results)
+    : recorded_results(std::move(recorded_results)) {}
 
     void on_token(std::int64_t token) noexcept override {
-        std::lock_guard lock(recorded->mutex);
-        recorded->tokens.push_back(token);
+        std::lock_guard lock(recorded_results->mutex);
+        recorded_results->tokens.push_back(token);
     }
 
     void on_cycle_end(pulsarlm::cycle_end&&) noexcept override {}
 
     void on_end(std::expected<pulsarlm::state, request_error>&& result) noexcept override {
         {
-            std::lock_guard lock(recorded->mutex);
-            recorded->end.emplace(std::move(result));
+            std::lock_guard lock(recorded_results->mutex);
+            recorded_results->end.emplace(std::move(result));
         }
-        recorded->ended.notify_all();
+        recorded_results->end_condition.notify_all();
     }
 
     bool cancelled() const noexcept override {
@@ -129,13 +129,13 @@ class recording_callbacks final : public pulsarlm::request_callbacks {
     }
 };
 
-std::unique_ptr<recording_callbacks> record_into(const std::shared_ptr<request_results>& recorded) {
-    return std::make_unique<recording_callbacks>(recorded);
+std::unique_ptr<recording_callbacks> record_into(const std::shared_ptr<request_results>& recorded_results) {
+    return std::make_unique<recording_callbacks>(recorded_results);
 }
 
-void wait_for_end(request_results& recorded) {
-    std::unique_lock lock(recorded.mutex);
-    REQUIRE(recorded.ended.wait_for(lock, end_timeout, [&] { return recorded.end.has_value(); }));
+void wait_for_end(request_results& recorded_results) {
+    std::unique_lock lock(recorded_results.mutex);
+    REQUIRE(recorded_results.end_condition.wait_for(lock, end_timeout, [&] { return recorded_results.end.has_value(); }));
 }
 
 pulsarlm::engine_config config(std::size_t n_lines) {
@@ -153,8 +153,8 @@ pulsarlm::engine_config config(std::size_t n_lines) {
     };
 }
 
-bool ended_with(const request_results& recorded, request_error error) {
-    return recorded.end && !recorded.end->has_value() && recorded.end->error() == error;
+bool ended_with(const request_results& recorded_results, request_error error) {
+    return recorded_results.end && !recorded_results.end->has_value() && recorded_results.end->error() == error;
 }
 
 // A state of one_layer's model whose one page is hash, with mass sum 0 and weight_sum.
@@ -189,105 +189,105 @@ TEST_CASE("an engine whose bfloat16 attention the kernels cannot run is rejected
 
 TEST_CASE("a submitted request passes its tokens and its end state to its callbacks") {
     pulsarlm::engine e(std::make_unique<successor_model>(), config(16), std::make_unique<stalling_store>());
-    auto recorded = std::make_shared<request_results>();
-    e.submit(request{.tokens = {1, 2, 3}, .max_tokens = 4}, record_into(recorded));
-    wait_for_end(*recorded);
+    auto recorded_results = std::make_shared<request_results>();
+    e.submit(request{.tokens = {1, 2, 3}, .max_tokens = 4}, record_into(recorded_results));
+    wait_for_end(*recorded_results);
 
-    REQUIRE(recorded->tokens == token_list{4, 5, 6, 7});
-    REQUIRE(recorded->end->has_value());
+    REQUIRE(recorded_results->tokens == token_list{4, 5, 6, 7});
+    REQUIRE(recorded_results->end->has_value());
     std::vector<digest> hashes = pulsarlm::make_page_digests(root(), token_list{1, 2, 3, 4}, page_size);
-    REQUIRE(((*recorded->end)->head == hashes.back()));
+    REQUIRE(((*recorded_results->end)->head == hashes.back()));
     REQUIRE(
-        ((*recorded->end)->layers ==
+        ((*recorded_results->end)->layers ==
          std::vector{pulsarlm::layer_sequence{
              .pages = {{.hash = hashes[0], .mass_sum = {0.0f}}},
              .density_moments = {pulsarlm::moments{}},
          }})
     );
-    REQUIRE((*recorded->end)->tail == token_list{5, 6});
+    REQUIRE((*recorded_results->end)->tail == token_list{5, 6});
     REQUIRE(e.exception() == nullptr);
 }
 
 TEST_CASE("submit rejects an invalid request without calling its callbacks") {
     pulsarlm::engine e(std::make_unique<successor_model>(), config(16), std::make_unique<stalling_store>());
-    auto recorded = std::make_shared<request_results>();
+    auto recorded_results = std::make_shared<request_results>();
 
-    REQUIRE_THROWS_AS(e.submit(request{}, record_into(recorded)), std::invalid_argument);
+    REQUIRE_THROWS_AS(e.submit(request{}, record_into(recorded_results)), std::invalid_argument);
     REQUIRE_THROWS_AS(
-        e.submit(request{.initial_state = {.tail = {1, 2, 3, 4}}}, record_into(recorded)),
+        e.submit(request{.initial_state = {.tail = {1, 2, 3, 4}}}, record_into(recorded_results)),
         std::invalid_argument
     );
-    REQUIRE_THROWS_AS(e.submit(request{.tokens = {-1}}, record_into(recorded)), std::invalid_argument);
+    REQUIRE_THROWS_AS(e.submit(request{.tokens = {-1}}, record_into(recorded_results)), std::invalid_argument);
     REQUIRE_THROWS_AS(
-        e.submit(request{.tokens = {static_cast<std::int64_t>(vocab)}}, record_into(recorded)),
-        std::invalid_argument
-    );
-    REQUIRE_THROWS_AS(
-        e.submit(request{.initial_state = {.tail = {200}}, .tokens = {1}}, record_into(recorded)),
+        e.submit(request{.tokens = {static_cast<std::int64_t>(vocab)}}, record_into(recorded_results)),
         std::invalid_argument
     );
     REQUIRE_THROWS_AS(
-        e.submit(request{.initial_state = {.head = digest{.hi = 1, .lo = 2}}, .tokens = {1}}, record_into(recorded)),
+        e.submit(request{.initial_state = {.tail = {200}}, .tokens = {1}}, record_into(recorded_results)),
+        std::invalid_argument
+    );
+    REQUIRE_THROWS_AS(
+        e.submit(request{.initial_state = {.head = digest{.hi = 1, .lo = 2}}, .tokens = {1}}, record_into(recorded_results)),
         std::invalid_argument
     );
     REQUIRE_THROWS_AS(
         e.submit(
             request{.initial_state = one_page_state(digest{.hi = 1, .lo = 2}, -1.0f), .tokens = {1}},
-            record_into(recorded)
+            record_into(recorded_results)
         ),
         std::invalid_argument
     );
     REQUIRE_THROWS_AS(
-        e.submit(request{.tokens = {1}, .eviction = {.n_working = 0}}, record_into(recorded)),
+        e.submit(request{.tokens = {1}, .eviction = {.n_working = 0}}, record_into(recorded_results)),
         std::invalid_argument
     );
     REQUIRE_THROWS_AS(
-        e.submit(request{.tokens = {1}, .eviction = {.cycle_tokens = 0}}, record_into(recorded)),
+        e.submit(request{.tokens = {1}, .eviction = {.cycle_tokens = 0}}, record_into(recorded_results)),
         std::invalid_argument
     );
     REQUIRE_THROWS_AS(
-        e.submit(request{.tokens = {1}, .eviction = {.attention_mass_decay = 0.0}}, record_into(recorded)),
+        e.submit(request{.tokens = {1}, .eviction = {.attention_mass_decay = 0.0}}, record_into(recorded_results)),
         std::invalid_argument
     );
     REQUIRE_THROWS_AS(
-        e.submit(request{.tokens = {1}, .eviction = {.attention_mass_decay = 1.5}}, record_into(recorded)),
+        e.submit(request{.tokens = {1}, .eviction = {.attention_mass_decay = 1.5}}, record_into(recorded_results)),
         std::invalid_argument
     );
     REQUIRE_THROWS_AS(
-        e.submit(request{.tokens = {1}, .eviction = {.eviction_threshold = -0.5}}, record_into(recorded)),
+        e.submit(request{.tokens = {1}, .eviction = {.eviction_threshold = -0.5}}, record_into(recorded_results)),
         std::invalid_argument
     );
     REQUIRE_THROWS_AS(
-        e.submit(request{.tokens = {1}, .eviction = {.eviction_threshold = 1.5}}, record_into(recorded)),
+        e.submit(request{.tokens = {1}, .eviction = {.eviction_threshold = 1.5}}, record_into(recorded_results)),
         std::invalid_argument
     );
-    REQUIRE(recorded->tokens.empty());
-    REQUIRE(!recorded->end);
+    REQUIRE(recorded_results->tokens.empty());
+    REQUIRE(!recorded_results->end);
 }
 
 TEST_CASE("destroying the engine ends the requests it serves with loop_exited") {
     auto store = std::make_unique<stalling_store>();
-    std::shared_ptr<std::latch> fetch_started = store->fetch_started;
+    std::shared_ptr<std::latch> fetch_start_latch = store->fetch_start_latch;
     std::optional<pulsarlm::engine> e;
     e.emplace(std::make_unique<successor_model>(), config(16), std::move(store));
-    auto recorded = std::make_shared<request_results>();
+    auto recorded_results = std::make_shared<request_results>();
     e->submit(
         request{.initial_state = one_page_state(digest{.hi = 1, .lo = 2}, 0.0f), .tokens = {1}, .max_tokens = 1},
-        record_into(recorded)
+        record_into(recorded_results)
     );
-    fetch_started->wait();
+    fetch_start_latch->wait();
     e.reset();
 
-    REQUIRE(ended_with(*recorded, request_error::loop_exited));
+    REQUIRE(ended_with(*recorded_results, request_error::loop_exited));
 }
 
 TEST_CASE("a panic ends the requests with loop_exited and leaves its exception") {
     pulsarlm::engine e(std::make_unique<failing_model>(), config(16), std::make_unique<stalling_store>());
-    auto recorded = std::make_shared<request_results>();
-    e.submit(request{.tokens = {1, 2, 3}, .max_tokens = 1}, record_into(recorded));
-    wait_for_end(*recorded);
+    auto recorded_results = std::make_shared<request_results>();
+    e.submit(request{.tokens = {1, 2, 3}, .max_tokens = 1}, record_into(recorded_results));
+    wait_for_end(*recorded_results);
 
-    REQUIRE(ended_with(*recorded, request_error::loop_exited));
+    REQUIRE(ended_with(*recorded_results, request_error::loop_exited));
     std::exception_ptr thrown = e.exception();
     REQUIRE(thrown != nullptr);
     REQUIRE_THROWS_AS(std::rethrow_exception(thrown), std::runtime_error);

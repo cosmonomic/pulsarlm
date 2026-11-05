@@ -70,8 +70,8 @@ class LocalStore:
         self._pages: dict[bytes, StoredPage] = {}
         self._states: OrderedDict[StateKey, StoredState] = OrderedDict()
         self._tails: dict[bytes, set[tuple[int, ...]]] = {}
-        self._unreferenced: set[bytes] = set()
-        self._running: dict[int, RunningRequest] = {}
+        self._unreferenced_pages: set[bytes] = set()
+        self._requests: dict[int, RunningRequest] = {}
         self._clock = count()
         self._file = None if path is None else StoreFile(path)
         if self._file is not None:
@@ -82,7 +82,7 @@ class LocalStore:
         for h, nbytes in sizes.items():
             self._pages[h] = StoredPage(None, nbytes)
             self._page_bytes += nbytes
-        self._unreferenced.update(sizes)
+        self._unreferenced_pages.update(sizes)
         incomplete = []
         last_used = -1
         for key, state, page_keys, used in saved:
@@ -148,16 +148,16 @@ class LocalStore:
                     nbytes = page.nbytes
                     self._pages[h] = StoredPage(page, nbytes)
                     self._page_bytes += nbytes
-                    self._unreferenced.add(h)
+                    self._unreferenced_pages.add(h)
                     new.append((h, page, nbytes))
             owned: dict[int, list[bytes]] = {}
             for request_id, index in owners:
-                if request_id in self._running:
+                if request_id in self._requests:
                     owned.setdefault(request_id, []).append(hashes[index])
             for request_id, keys in owned.items():
                 for h in keys:
                     self._reference(h)
-                self._running[request_id].puts.append(keys)
+                self._requests[request_id].puts.append(keys)
             if self._file is not None and new:
                 self._file.put(new)
             self._fit(room=sum(page.nbytes for page in pages))
@@ -184,12 +184,12 @@ class LocalStore:
             )
             for h in found.page_keys:
                 self._reference(h)
-            self._running[request_id] = RunningRequest(found.page_keys)
+            self._requests[request_id] = RunningRequest(found.page_keys)
         try:
             yield found.state, covered
         finally:
             with self._lock:
-                running = self._running.pop(request_id)
+                running = self._requests.pop(request_id)
                 self._dereference(running.snapshot_keys)
                 for keys in running.puts:
                     self._dereference(keys)
@@ -212,8 +212,8 @@ class LocalStore:
             self._states[key] = StoredState(state, page_keys)
             if self._file is not None:
                 self._file.write(key, state, page_keys, next(self._clock))
-            if request_id is not None and request_id in self._running:
-                running = self._running[request_id]
+            if request_id is not None and request_id in self._requests:
+                running = self._requests[request_id]
                 for h in page_keys:
                     self._reference(h)
                 self._dereference(running.snapshot_keys)
@@ -260,7 +260,7 @@ class LocalStore:
     def _reference(self, h: bytes) -> None:
         stored = self._pages[h]
         if stored.references == 0:
-            self._unreferenced.discard(h)
+            self._unreferenced_pages.discard(h)
         stored.references += 1
 
     def _dereference(self, keys: list[bytes]) -> None:
@@ -268,7 +268,7 @@ class LocalStore:
             page = self._pages[h]
             page.references -= 1
             if page.references == 0:
-                self._unreferenced.add(h)
+                self._unreferenced_pages.add(h)
 
     def _release_covered(self, running: RunningRequest, covered: set[bytes]) -> None:
         """Releases the puts up to the last one holding a page of the written state:
@@ -301,8 +301,8 @@ class LocalStore:
             self._file.delete(deleted_states, deleted_pages)
 
     def _delete_unused_pages(self) -> list[bytes]:
-        unused = list(self._unreferenced)
+        unused = list(self._unreferenced_pages)
         for h in unused:
             self._page_bytes -= self._pages.pop(h).nbytes
-        self._unreferenced.clear()
+        self._unreferenced_pages.clear()
         return unused

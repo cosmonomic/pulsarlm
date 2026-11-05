@@ -45,11 +45,11 @@ at::Tensor int32_cuda(const std::vector<std::int32_t>& values) {
 }
 
 struct weights {
-    c10::Dict<std::string, at::Tensor> named;
+    c10::Dict<std::string, at::Tensor> named_tensors;
 
     explicit weights(at::ScalarType dtype) {
         at::manual_seed(11);
-        auto add = [&](const std::string& name, at::Tensor t) { named.insert(name, t.to(cuda(dtype))); };
+        auto add = [&](const std::string& name, at::Tensor t) { named_tensors.insert(name, t.to(cuda(dtype))); };
         auto projection = [](std::int64_t out, std::int64_t in) { return at::randn({out, in}) / std::sqrt(in); };
         auto norm = [](std::int64_t size) { return 1.0 + 0.1 * at::randn({size}); };
         add("model.embed_tokens.weight", at::randn({vocab, hidden}));
@@ -70,7 +70,7 @@ struct weights {
     }
 
     at::Tensor operator()(const std::string& name) const {
-        return named.at(name).to(at::kFloat);
+        return named_tensors.at(name).to(at::kFloat);
     }
 
     at::Tensor layer(std::int64_t layer, const std::string& name) const {
@@ -228,7 +228,7 @@ void check_against_dense(at::ScalarType dtype, double tolerance) {
             .rope = {.theta = rope_theta, .llama3_scaling = scaling},
             .rms_norm_eps = rms_eps,
         },
-        w.named
+        w.named_tensors
     );
     std::vector<pulsarlm::kv> kv;
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
@@ -253,12 +253,12 @@ void check_against_dense(at::ScalarType dtype, double tolerance) {
          {chunk{0, 21, true}, chunk{21, 37, true}, chunk{37, 38, false}, chunk{38, 39, false}, chunk{39, 40, false}}) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
         pulsarlm::StepBatch batch;
-        (c.prefill ? batch.prefill : batch.decode) = step(tokens, c.first, c.last, c.prefill);
+        (c.prefill ? batch.prefill_group : batch.decode_group) = step(tokens, c.first, c.last, c.prefill);
         pulsarlm::StepLogits logits = model.forward(batch, kv);
-        const pulsarlm::GroupBatch& g = c.prefill ? *batch.prefill : *batch.decode;
+        const pulsarlm::GroupBatch& g = c.prefill ? *batch.prefill_group : *batch.decode_group;
 
         auto expected_logits = dense.logits.narrow(0, c.first, c.last - c.first);
-        CHECK(max_relative_error(*(c.prefill ? logits.prefill : logits.decode), expected_logits) < tolerance);
+        CHECK(max_relative_error(*(c.prefill ? logits.prefill_logits : logits.decode_logits), expected_logits) < tolerance);
         for (std::int64_t layer = 0; layer < n_layers; layer++) {
             dense_mass expected = dense_page_mass(dense, layer, c.first, c.last);
             CHECK(max_relative_error(g.page_mass_sum[layer], expected.mass_sum) < tolerance);

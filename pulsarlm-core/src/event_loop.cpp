@@ -49,7 +49,7 @@ void event::set() noexcept {
     while (waiter != nullptr) {
         awaiter* following = waiter->next;
         waiter->linked = false;
-        loop->schedule(waiter->scheduled);
+        loop->schedule(waiter->queue_node);
         waiter = following;
     }
 }
@@ -67,7 +67,7 @@ event::awaiter::~awaiter() {
 }
 
 void event::awaiter::await_suspend(std::coroutine_handle<> awaiting) noexcept {
-    scheduled.handle = awaiting;
+    queue_node.handle = awaiting;
     linked = true;
     next = std::exchange(target.waiters, this);
 }
@@ -116,7 +116,7 @@ void event_loop::push_ready(ready_node& node) noexcept {
 void event_loop::schedule(ready_node& node) noexcept {
     std::lock_guard lock(mutex);
     push_ready(node);
-    wake.notify_one();
+    wake_condition.notify_one();
 }
 
 void event_loop::spawn(task<void> root_task) {
@@ -124,8 +124,8 @@ void event_loop::spawn(task<void> root_task) {
     std::coroutine_handle<> handle = root_task.handle;
     std::lock_guard lock(mutex);
     auto [it, inserted] = root_tasks.try_emplace(handle, spawned_task{std::move(root_task), {.handle = handle}});
-    push_ready(it->second.scheduled);
-    wake.notify_one();
+    push_ready(it->second.queue_node);
+    wake_condition.notify_one();
 }
 
 std::exception_ptr event_loop::run() {
@@ -135,7 +135,7 @@ std::exception_ptr event_loop::run() {
         ready_node* resuming;
         {
             std::unique_lock lock(mutex);
-            wake.wait(lock, [this] { return stopping || ready_front != nullptr; });
+            wake_condition.wait(lock, [this] { return stopping || ready_front != nullptr; });
             if (stopping) {
                 break;
             }
@@ -159,7 +159,7 @@ std::exception_ptr event_loop::run() {
 void event_loop::stop() noexcept {
     std::lock_guard lock(mutex);
     stopping = true;
-    wake.notify_one();
+    wake_condition.notify_one();
 }
 
 task<void> synchronize(cudaStream_t stream) {

@@ -81,7 +81,7 @@ class ReplyDecoder:
         self._calling = False
         self._thinking = False
         self._label = ""
-        self._label_seen: str | None = None
+        self._seen_label: str | None = None
         self._content_started = False
         self._resume_think_block(prompt)
 
@@ -97,7 +97,7 @@ class ReplyDecoder:
             list(prompt[opening + 1 :]), skip_special_tokens=False
         )
         partial = self._label.startswith(after) and after != self._label
-        self._label_seen = after if partial else None
+        self._seen_label = after if partial else None
 
     def step(self, token: int) -> tuple[Part, str]:
         if token in self._stop_ids:
@@ -116,11 +116,11 @@ class ReplyDecoder:
         if token in self._labels:
             self._thinking = True
             self._label = self._labels[token]
-            self._label_seen = ""
+            self._seen_label = ""
             return "reasoning", ""
         if token in self._closing_ids:
             self._thinking = False
-            self._label_seen = None
+            self._seen_label = None
             return "reasoning", ""
         if self._thinking:
             return "reasoning", self._without_label(text)
@@ -130,11 +130,11 @@ class ReplyDecoder:
         return "content", text
 
     def _without_label(self, text: str) -> str:
-        if self._label_seen is None:
+        if self._seen_label is None:
             return text
-        self._label_seen += text
-        if self._label.startswith(self._label_seen):
+        self._seen_label += text
+        if self._label.startswith(self._seen_label):
             return ""
-        text = self._label_seen.removeprefix(self._label)
-        self._label_seen = None
+        text = self._seen_label.removeprefix(self._label)
+        self._seen_label = None
         return text

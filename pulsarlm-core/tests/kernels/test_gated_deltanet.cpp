@@ -79,7 +79,7 @@ const std::vector<int32_t> kBoundary{4, 1, 6, 7, 9};
 
 struct conv_expected {
     at::Tensor out;
-    at::Tensor running;
+    at::Tensor running_state;
     at::Tensor boundary;
 };
 
@@ -112,7 +112,7 @@ conv_expected reference_conv(
 
 struct delta_expected {
     at::Tensor out;
-    at::Tensor running;
+    at::Tensor running_state;
     std::optional<at::Tensor> boundary;
 };
 
@@ -203,7 +203,7 @@ TEST_CASE("causal_conv continues each sequence's inputs and keeps its last ones"
             dilation
         );
         CHECK(at::allclose(out.narrow(0, first, n), expected.out, tolerance, tolerance));
-        CHECK(at::equal(pool.select(0, kRunning[s]), expected.running));
+        CHECK(at::equal(pool.select(0, kRunning[s]), expected.running_state));
         CHECK(
             at::equal(
                 pool.select(0, kBoundary[s]),
@@ -265,7 +265,7 @@ TEST_CASE("gated_delta_rule continues each sequence's state and keeps it at its 
             batch.page_ends[s]
         );
         CHECK(at::allclose(out.narrow(0, first, n), expected.out, tolerance, tolerance));
-        CHECK(at::allclose(pool.select(0, kRunning[s]), expected.running, 1e-4, 1e-4));
+        CHECK(at::allclose(pool.select(0, kRunning[s]), expected.running_state, 1e-4, 1e-4));
         CHECK(
             at::allclose(
                 pool.select(0, kBoundary[s]),

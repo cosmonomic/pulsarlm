@@ -87,7 +87,7 @@ def wait_until_ready(
 
 
 @contextmanager
-def serving(command: list[str], base_url: str, log: Path) -> Iterator[None]:
+def run_server(command: list[str], base_url: str, log: Path) -> Iterator[None]:
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("w") as output:
         process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT)
@@ -100,7 +100,7 @@ def serving(command: list[str], base_url: str, log: Path) -> Iterator[None]:
 
 
 @contextmanager
-def pulsarlm_server(
+def run_pulsarlm_server(
     model: str,
     setting: Setting,
     data_dir: Path,
@@ -132,7 +132,7 @@ def pulsarlm_server(
         command += ["--n_working", str(n_working)]
     root = f"http://127.0.0.1:{port}"
     base_url = f"{root}/api/openai/v1"
-    with serving(command, base_url, data_dir / "serve.log"):
+    with run_server(command, base_url, data_dir / "serve.log"):
         yield Server(
             base_url=base_url,
             metrics_url=f"{root}/metrics",
@@ -141,7 +141,7 @@ def pulsarlm_server(
 
 
 @contextmanager
-def vllm_server(
+def run_vllm_server(
     model: str,
     setting: Setting,
     data_dir: Path,
@@ -169,7 +169,7 @@ def vllm_server(
         command += ["--no-enable-prefix-caching"]
     root = f"http://127.0.0.1:{port}"
     base_url = f"{root}/v1"
-    with serving(command, base_url, data_dir / "serve.log"):
+    with run_server(command, base_url, data_dir / "serve.log"):
         yield Server(
             base_url=base_url,
             metrics_url=f"{root}/metrics",
@@ -350,7 +350,7 @@ def finished_runs(
 
 
 @contextmanager
-def server_for(
+def run_server_for(
     name: str,
     model: str,
     out: Path,
@@ -365,7 +365,7 @@ def server_for(
 ) -> Iterator[Server]:
     setting = SETTINGS[name]
     if setting.engine == "vllm":
-        with vllm_server(
+        with run_vllm_server(
             model,
             setting,
             out / name,
@@ -377,7 +377,7 @@ def server_for(
         ) as server:
             yield server
     else:
-        with pulsarlm_server(
+        with run_pulsarlm_server(
             model,
             setting,
             out / name,
@@ -446,7 +446,7 @@ def run(
         if not todo:
             continue
         engine = SETTINGS[name].engine
-        with server_for(
+        with run_server_for(
             name,
             model,
             out,
@@ -524,8 +524,8 @@ def run(
 @dataclass(frozen=True)
 class TurnMetrics:
     context_tokens: int
-    prefill: float
-    decode: float
+    prefill_rate: float
+    decode_rate: float
     kv_gib: float
 
 
@@ -558,8 +558,8 @@ def summary(row: dict[str, Any]) -> str:
         errors = {r["error"] for r in row["requests"] if r["error"] is not None}
         return ", ".join(sorted(errors))
     return (
-        f"context {metrics.context_tokens}, prefill {metrics.prefill:.0f} tok/s, "
-        f"decode {metrics.decode:.0f} tok/s, KV {metrics.kv_gib:.2f} GiB"
+        f"context {metrics.context_tokens}, prefill {metrics.prefill_rate:.0f} tok/s, "
+        f"decode {metrics.decode_rate:.0f} tok/s, KV {metrics.kv_gib:.2f} GiB"
     )
 
 
@@ -589,8 +589,8 @@ SERIES = {
 }
 
 PANELS = {
-    "prefill": "Prefill (tok/s)",
-    "decode": "Decode (tok/s)",
+    "prefill_rate": "Prefill (tok/s)",
+    "decode_rate": "Decode (tok/s)",
     "kv_gib": "KV cache in use (GiB)",
 }
 
@@ -645,7 +645,7 @@ def plot(
         for m in run.turns:
             print(
                 f"{name:<30}{concurrency:>10}{m.context_tokens:>9}"
-                f"{m.prefill:>10.0f}{m.decode:>9.0f}{m.kv_gib:>8.2f}"
+                f"{m.prefill_rate:>10.0f}{m.decode_rate:>9.0f}{m.kv_gib:>8.2f}"
             )
         if run.oom_at is not None:
             print(f"{name:<30}{concurrency:>10}  oom at {run.oom_at} tokens")

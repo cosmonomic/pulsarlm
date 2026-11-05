@@ -25,7 +25,7 @@ class RequestStream:
     def __init__(self, engine: Engine, request: Request) -> None:
         self._engine = engine
         self._request = request
-        self._woken = asyncio.Event()
+        self._wake_event = asyncio.Event()
 
     async def take(
         self,
@@ -33,19 +33,19 @@ class RequestStream:
         """Waits for results, then returns them as Request.take does. Raises
         EngineStopped when the engine's loop exited."""
         while True:
-            self._woken.clear()
+            self._wake_event.clear()
             tokens, cycle_ends, end = self._request.take()
             if end == RequestError.LOOP_EXITED:
                 raise EngineStopped(self._engine.exception())
             if tokens or cycle_ends or end is not None:
                 return tokens, cycle_ends, end
-            await self._woken.wait()
+            await self._wake_event.wait()
 
     def cancel(self) -> None:
         self._request.cancel()
 
     def wake(self) -> None:
-        self._woken.set()
+        self._wake_event.set()
 
 
 class AsyncEngine:

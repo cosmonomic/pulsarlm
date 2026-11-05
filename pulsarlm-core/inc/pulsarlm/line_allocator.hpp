@@ -20,8 +20,8 @@ namespace pulsarlm {
 // lines. So a region's cached lines are freed together, and no new line joins a region caching older pages.
 class line_allocator {
     struct region {
-        std::uint32_t held = 0;
-        std::uint32_t cached = 0;
+        std::uint32_t held_count = 0;
+        std::uint32_t cached_count = 0;
         // The release that last cached one of its lines, by release order.
         std::uint64_t newest_cache = 0;
     };
@@ -68,8 +68,8 @@ class line_allocator {
     // the allocator while one is open.
     class transaction {
         line_allocator& lines;
-        std::unordered_map<std::uint32_t, std::pair<region, std::vector<std::uint64_t>>> saved;
-        std::vector<std::uint32_t> reclaimed;
+        std::unordered_map<std::uint32_t, std::pair<region, std::vector<std::uint64_t>>> saved_regions;
+        std::vector<std::uint32_t> reclaimed_regions;
         bool committed = false;
 
         void save(std::uint32_t r);

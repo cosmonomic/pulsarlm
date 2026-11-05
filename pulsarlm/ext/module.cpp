@@ -47,7 +47,7 @@ std::size_t vocab_size(const any_model_config& model) {
     if (const auto* qwen = std::get_if<qwen4_exp_config>(&model)) {
         return static_cast<std::size_t>(qwen->vocab_size);
     }
-    return static_cast<std::size_t>(std::get<model_config>(model).dense.vocab_size);
+    return static_cast<std::size_t>(std::get<model_config>(model).dense_model.vocab_size);
 }
 
 gemma4_layer_type layer_type(const std::string& name) {
@@ -215,7 +215,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
         .def_readwrite("tail", &state::tail);
 
     py::class_<cycle_end>(m, "CycleEnd")
-        .def_readonly("reached", &cycle_end::reached)
+        .def_readonly("state", &cycle_end::state)
         .def_readonly("token_count", &cycle_end::token_count);
 
     py::class_<engine_stat>(m, "EngineStat").def_readonly("kv_cache_bytes", &engine_stat::kv_cache_bytes);
@@ -304,7 +304,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
                         double rms_norm_eps) {
                 return model_config{
                     .architecture = std::move(architecture),
-                    .dense = dense_config{
+                    .dense_model = dense_config{
                         .vocab_size = vocab_size,
                         .n_layers = n_layers,
                         .n_heads = n_heads,
@@ -325,7 +325,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "rope"_a,
             "rms_norm_eps"_a
         )
-        .def_property_readonly("rope", [](const model_config& c) { return c.dense.rope; });
+        .def_property_readonly("rope", [](const model_config& c) { return c.dense_model.rope; });
 
     py::class_<llama3_rope_scaling>(m, "Llama3RopeScaling")
         .def(

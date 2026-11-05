@@ -502,7 +502,7 @@ kv_cache::get(std::span<const std::span<const digest>> hashes, cudaStream_t stre
         for (std::size_t i = 0; i < layer_hashes.size(); i++) {
             if (auto it = cached.digest_to_line_id.find(layer_hashes[i]); it != cached.digest_to_line_id.end()) {
                 layer_lines[i] = it->second;
-            } else if (auto it = cached.fetching.find(layer_hashes[i]); it != cached.fetching.end()) {
+            } else if (auto it = cached.fetches.find(layer_hashes[i]); it != cached.fetches.end()) {
                 layer_lines[i] = it->second.line_id;
                 joined[layer].push_back(i);
             } else {
@@ -536,7 +536,7 @@ kv_cache::get(std::span<const std::span<const digest>> hashes, cudaStream_t stre
             std::size_t i = to_fetch[layer][j];
             const digest& hash = hashes[layer][i];
             line_ids[layer][i] = (*taken)[layer][j];
-            layers[layer].fetching.try_emplace(hash, line_ids[layer][i]);
+            layers[layer].fetches.try_emplace(hash, line_ids[layer][i]);
             fetch_hashes.push_back(hash);
             fetch_keys.push_back(store_key(hash, layer));
             fetch_lines.push_back(layer_line{.layer = layer, .line_id = line_ids[layer][i]});
@@ -560,16 +560,16 @@ kv_cache::get(std::span<const std::span<const digest>> hashes, cudaStream_t stre
             if (pages[j]) {
                 assign_hash(layer, line_id, fetch_hashes[j]);
             }
-            layers[layer].fetching.extract(fetch_hashes[j]).mapped().done.set();
+            layers[layer].fetches.extract(fetch_hashes[j]).mapped().done_event.set();
         }
     }
 
     // An entry for the same hash in another line is a later fetch, after the one this call joined ended.
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
         for (std::size_t i : joined[layer]) {
-            auto it = layers[layer].fetching.find(hashes[layer][i]);
-            if (it != layers[layer].fetching.end() && it->second.line_id == line_ids[layer][i]) {
-                co_await it->second.done;
+            auto it = layers[layer].fetches.find(hashes[layer][i]);
+            if (it != layers[layer].fetches.end() && it->second.line_id == line_ids[layer][i]) {
+                co_await it->second.done_event;
             }
         }
     }

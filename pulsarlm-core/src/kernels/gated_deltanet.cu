@@ -24,7 +24,7 @@ struct ragged_tokens {
     const int32_t* cu_seqlens_q;
     int num_seqs;
 
-    __device__ int first(int s) const {
+    __device__ int first_token(int s) const {
         return cu_seqlens_q != nullptr ? cu_seqlens_q[s] : s;
     }
 
@@ -55,7 +55,7 @@ struct line_rows {
     const int32_t* ids;
     int64_t row_stride;
 
-    __device__ int64_t running(int s) const {
+    __device__ int64_t running_line(int s) const {
         return ids[s * row_stride];
     }
 
@@ -106,9 +106,9 @@ __global__ void causal_conv_kernel(
     const int token = static_cast<int>(index / channels);
     const int channel = static_cast<int>(index % channels);
     const int s = tokens.sequence_of(token);
-    const int first = tokens.first(s);
+    const int first = tokens.first_token(s);
     const int history = (kernel - 1) * dilation;
-    const scalar_t* old = conv_pool + rows.running(s) * line_stride + static_cast<int64_t>(channel) * history;
+    const scalar_t* old = conv_pool + rows.running_line(s) * line_stride + static_cast<int64_t>(channel) * history;
     float sum = 0.0f;
     for (int j = 0; j < kernel; j++) {
         const int input = token - first - history + j * dilation;
@@ -137,9 +137,9 @@ __global__ void conv_state_kernel(
     }
     const int s = static_cast<int>(index / channels);
     const int channel = static_cast<int>(index % channels);
-    const int first = tokens.first(s);
+    const int first = tokens.first_token(s);
     const int64_t channel_offset = static_cast<int64_t>(channel) * history;
-    scalar_t* running = conv_pool + rows.running(s) * line_stride + channel_offset;
+    scalar_t* running = conv_pool + rows.running_line(s) * line_stride + channel_offset;
     scalar_t old[kMaxConvHistory];
     for (int i = 0; i < history; i++) {
         old[i] = running[i];
@@ -195,8 +195,8 @@ struct delta_rule_block {
         state_offset = static_cast<int64_t>(head) * key_head_dim * p.value_dim + first_column;
     }
 
-    __device__ float* running(const delta_rule_params& p) const {
-        return p.state_pool + p.rows.running(s) * p.line_stride + state_offset;
+    __device__ float* running_state(const delta_rule_params& p) const {
+        return p.state_pool + p.rows.running_line(s) * p.line_stride + state_offset;
     }
 
     __device__ float* boundary(const delta_rule_params& p) const {
@@ -244,7 +244,7 @@ __global__ void __launch_bounds__(kStepThreads) delta_rule_step_kernel(
     const int row_lane = threadIdx.x % kStepLanes;
     const int column = block.first_column + block_column;
     const scalar_t* row = x + static_cast<int64_t>(block.s) * block.channels;
-    float* running = block.running(p) + block_column;
+    float* running = block.running_state(p) + block_column;
     auto row_of = [&](int quad, int e) { return 32 * quad + 4 * row_lane + e; };
 
     float q[kQuads][4];
@@ -374,7 +374,7 @@ __global__ void __launch_bounds__(kChunkThreads) delta_rule_chunk_kernel(
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
     const delta_rule_block block(p, KEY_DIM);
-    const int first = p.tokens.first(block.s);
+    const int first = p.tokens.first_token(block.s);
     const int n = p.tokens.count(block.s);
     const int page_end = p.page_end_tokens[block.s];
     auto line_index = [&](int i) {
@@ -431,7 +431,7 @@ __global__ void __launch_bounds__(kChunkThreads) delta_rule_chunk_kernel(
         }
     };
 
-    const float* running = block.running(p);
+    const float* running = block.running_state(p);
     for_each_index<KEY_DIM * kColumns / 4, kChunkThreads>([&](int i) {
         vector_at(state, 4 * i) = *reinterpret_cast<const float4*>(running + line_index(i));
     });
@@ -633,7 +633,7 @@ __global__ void __launch_bounds__(kChunkThreads) delta_rule_chunk_kernel(
         }
         chunk_first = chunk_end;
     }
-    store_state(block.running(p));
+    store_state(block.running_state(p));
 }
 
 // One CTA per row. blockDim.x is a power of two.

@@ -62,11 +62,11 @@ bool full(std::size_t layer) {
 }
 
 struct weights {
-    c10::Dict<std::string, at::Tensor> named;
+    c10::Dict<std::string, at::Tensor> named_tensors;
 
     explicit weights(at::ScalarType dtype) {
         at::manual_seed(13);
-        auto add = [&](const std::string& name, at::Tensor t) { named.insert(name, t.to(cuda(dtype))); };
+        auto add = [&](const std::string& name, at::Tensor t) { named_tensors.insert(name, t.to(cuda(dtype))); };
         auto projection = [](std::int64_t out, std::int64_t in) { return at::randn({out, in}) / std::sqrt(in); };
         auto norm = [](std::int64_t size) { return 0.1 * at::randn({size}); };
         const std::string p = "model.language_model.";
@@ -108,7 +108,7 @@ struct weights {
     }
 
     at::Tensor operator()(const std::string& name) const {
-        return named.at(name).to(at::kFloat);
+        return named_tensors.at(name).to(at::kFloat);
     }
 
     at::Tensor layer(std::size_t layer, const std::string& name) const {
@@ -343,7 +343,7 @@ void check_against_dense(at::ScalarType dtype, double tolerance, std::int64_t to
             .rms_norm_eps = rms_eps,
             .num_experts_per_tok = top_k,
         },
-        w.named
+        w.named_tensors
     );
     std::vector<pulsarlm::kv_layer> specs = model.kv_layers();
     REQUIRE(specs.size() == 7);
@@ -376,10 +376,10 @@ void check_against_dense(at::ScalarType dtype, double tolerance, std::int64_t to
          {chunk{0, 21, true}, chunk{21, 37, true}, chunk{37, 47, true}, chunk{47, 48, false}, chunk{48, 49, false}}) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
         pulsarlm::StepBatch batch;
-        (c.prefill ? batch.prefill : batch.decode) = step(tokens, c.first, c.last, c.prefill, specs);
+        (c.prefill ? batch.prefill_group : batch.decode_group) = step(tokens, c.first, c.last, c.prefill, specs);
         pulsarlm::StepLogits logits = model.forward(batch, kv);
         auto expected_logits = dense.logits.narrow(0, c.first, c.last - c.first);
-        CHECK(max_relative_error(*(c.prefill ? logits.prefill : logits.decode), expected_logits) < tolerance);
+        CHECK(max_relative_error(*(c.prefill ? logits.prefill_logits : logits.decode_logits), expected_logits) < tolerance);
     }
 
     auto permutation = at::tensor(rope_permutation()).to(at::kCUDA);

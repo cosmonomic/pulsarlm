@@ -105,12 +105,12 @@ std::optional<std::size_t> line_allocator::largest_free_order(std::uint32_t r) c
 
 void line_allocator::index(std::uint32_t r) {
     const region& indexed = regions[r];
-    if (indexed.held == 0 && indexed.cached == 0) {
+    if (indexed.held_count == 0 && indexed.cached_count == 0) {
         assert(std::ranges::all_of(units_of(r), [](std::uint64_t word) { return word == 0; }));
         free_regions.insert(r);
-    } else if (indexed.held == 0) {
+    } else if (indexed.held_count == 0) {
         reclaimable_regions.emplace(indexed.newest_cache, r);
-    } else if (indexed.cached == 0) {
+    } else if (indexed.cached_count == 0) {
         if (std::optional<std::size_t> order = largest_free_order(r)) {
             open_regions.emplace(*order, r);
         }
@@ -119,11 +119,11 @@ void line_allocator::index(std::uint32_t r) {
 
 void line_allocator::unindex(std::uint32_t r) noexcept {
     const region& indexed = regions[r];
-    if (indexed.held == 0 && indexed.cached == 0) {
+    if (indexed.held_count == 0 && indexed.cached_count == 0) {
         free_regions.erase(r);
-    } else if (indexed.held == 0) {
+    } else if (indexed.held_count == 0) {
         reclaimable_regions.erase({indexed.newest_cache, r});
-    } else if (indexed.cached == 0) {
+    } else if (indexed.cached_count == 0) {
         if (std::optional<std::size_t> order = largest_free_order(r)) {
             open_regions.erase({*order, r});
         }
@@ -140,10 +140,10 @@ void line_allocator::release(std::size_t block_class, std::uint32_t line_id, boo
     auto [r, unit] = region_unit(block_class, line_id);
     unindex(r);
     region& released = regions[r];
-    assert(released.held > 0);
-    released.held--;
+    assert(released.held_count > 0);
+    released.held_count--;
     if (keeps_page) {
-        released.cached++;
+        released.cached_count++;
         released.newest_cache = ++cache_count;
     } else {
         set_units(r, unit, std::size_t{1} << block_orders[block_class], false);
@@ -158,7 +158,7 @@ line_allocator::transaction::~transaction() {
     if (committed) {
         return;
     }
-    for (auto& [r, before] : saved) {
+    for (auto& [r, before] : saved_regions) {
         lines.unindex(r);
         lines.regions[r] = before.first;
         std::ranges::copy(before.second, lines.units_of(r).begin());
@@ -168,7 +168,7 @@ line_allocator::transaction::~transaction() {
 
 void line_allocator::transaction::save(std::uint32_t r) {
     std::span<const std::uint64_t> units = lines.units_of(r);
-    saved.try_emplace(r, lines.regions[r], std::vector<std::uint64_t>(units.begin(), units.end()));
+    saved_regions.try_emplace(r, lines.regions[r], std::vector<std::uint64_t>(units.begin(), units.end()));
 }
 
 std::optional<std::uint32_t> line_allocator::transaction::take(std::size_t block_class) {
@@ -182,10 +182,10 @@ std::optional<std::uint32_t> line_allocator::transaction::take(std::size_t block
         r = lines.reclaimable_regions.begin()->second;
         save(r);
         lines.unindex(r);
-        lines.regions[r].cached = 0;
+        lines.regions[r].cached_count = 0;
         std::ranges::fill(lines.units_of(r), 0);
         lines.index(r);
-        reclaimed.push_back(r);
+        reclaimed_regions.push_back(r);
     } else {
         return std::nullopt;
     }
@@ -194,7 +194,7 @@ std::optional<std::uint32_t> line_allocator::transaction::take(std::size_t block
     std::optional<std::size_t> first = lines.free_block(r, order);
     assert(first);
     lines.set_units(r, *first, std::size_t{1} << order, true);
-    lines.regions[r].held++;
+    lines.regions[r].held_count++;
     lines.index(r);
     return static_cast<std::uint32_t>(
         (r * lines.region_bytes() + *first * lines.unit_bytes) / lines.block_bytes(block_class)
@@ -206,15 +206,15 @@ void line_allocator::transaction::hold(std::size_t block_class, std::uint32_t li
     save(r);
     lines.unindex(r);
     region& held = lines.regions[r];
-    assert(held.cached > 0);
-    held.cached--;
-    held.held++;
+    assert(held.cached_count > 0);
+    held.cached_count--;
+    held.held_count++;
     lines.index(r);
 }
 
 std::vector<std::uint32_t> line_allocator::transaction::commit() noexcept {
     committed = true;
-    return std::move(reclaimed);
+    return std::move(reclaimed_regions);
 }
 
 std::size_t min_pool_bytes(std::span<const std::size_t> block_bytes) {

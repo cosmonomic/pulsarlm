@@ -75,9 +75,9 @@ template <typename value_type = std::monostate> class [[nodiscard]] external_tas
     using shared_state = std::shared_ptr<state>;
     class awaiter;
 
-    shared_state shared;
+    shared_state task_state;
 
-    explicit external_task(shared_state shared) noexcept;
+    explicit external_task(shared_state task_state) noexcept;
 
     void abandon() noexcept;
 
@@ -97,9 +97,9 @@ template <typename value_type = std::monostate> class [[nodiscard]] external_tas
 
 // Safe to call from any thread, once. Does nothing once its external_task was destroyed, so the value is dropped.
 template <typename value_type> class external_task<value_type>::resolver {
-    shared_state shared;
+    shared_state task_state;
 
-    explicit resolver(shared_state shared) noexcept;
+    explicit resolver(shared_state task_state) noexcept;
 
     friend class external_task;
 
@@ -115,12 +115,12 @@ class event_loop {
     };
 
     struct spawned_task {
-        task<void> owned;
-        ready_node scheduled;
+        task<void> root_task;
+        ready_node queue_node;
     };
 
     std::mutex mutex;
-    std::condition_variable wake;
+    std::condition_variable wake_condition;
     ready_node* ready_front = nullptr;
     ready_node* ready_back = nullptr;
     bool stopping = false;
@@ -291,7 +291,7 @@ template <typename t> typename task<t>::awaiter task<t>::operator co_await() && 
 
 class event::awaiter {
     event& target;
-    event_loop::ready_node scheduled;
+    event_loop::ready_node queue_node;
     awaiter* next = nullptr;
     bool linked = false;
 
@@ -322,7 +322,7 @@ template <typename value_type> struct external_task<value_type>::state {
     std::mutex mutex;
     std::optional<value_type> value;
     // Its handle is null until awaited.
-    event_loop::ready_node waiting;
+    event_loop::ready_node waiter;
     event_loop* loop = nullptr;
     bool alive = true;
 
@@ -335,34 +335,34 @@ template <typename value_type> struct external_task<value_type>::state {
         }
         assert(!value);
         value.emplace(std::move(resolved));
-        if (waiting.handle) {
-            loop->schedule(waiting);
+        if (waiter.handle) {
+            loop->schedule(waiter);
         }
     }
 };
 
 template <typename value_type> class external_task<value_type>::awaiter {
-    external_task owned;
+    pulsarlm::external_task<value_type> external_task;
 
   public:
-    explicit awaiter(external_task&& owned) noexcept
-    : owned(std::move(owned)) {}
+    explicit awaiter(pulsarlm::external_task<value_type>&& task) noexcept
+    : external_task(std::move(task)) {}
 
     awaiter(const awaiter&) = delete;
     awaiter& operator=(const awaiter&) = delete;
 
     bool await_ready() const noexcept {
-        assert(owned.shared);
+        assert(external_task.task_state);
         return false;
     }
 
     bool await_suspend(std::coroutine_handle<> awaiting) {
-        state& awaited = *owned.shared;
+        state& awaited = *external_task.task_state;
         std::lock_guard lock(awaited.mutex);
         if (awaited.value) {
             return false;
         }
-        awaited.waiting.handle = awaiting;
+        awaited.waiter.handle = awaiting;
         awaited.loop = event_loop::current();
         return true;
     }
@@ -370,36 +370,36 @@ template <typename value_type> class external_task<value_type>::awaiter {
     // The value was written under the state's lock, then the handle scheduled under the loop's lock, so it is visible
     // here without locking.
     value_type await_resume() {
-        return std::move(*owned.shared->value);
+        return std::move(*external_task.task_state->value);
     }
 };
 
 template <typename value_type>
-external_task<value_type>::external_task(shared_state shared) noexcept
-: shared(std::move(shared)) {}
+external_task<value_type>::external_task(shared_state task_state) noexcept
+: task_state(std::move(task_state)) {}
 
 template <typename value_type> void external_task<value_type>::abandon() noexcept {
-    if (shared) {
-        std::lock_guard lock(shared->mutex);
-        shared->alive = false;
+    if (task_state) {
+        std::lock_guard lock(task_state->mutex);
+        task_state->alive = false;
     }
 }
 
 template <typename value_type>
 std::pair<external_task<value_type>, typename external_task<value_type>::resolver> external_task<value_type>::make() {
-    shared_state shared = std::make_shared<state>();
-    return {external_task(shared), resolver(shared)};
+    shared_state task_state = std::make_shared<state>();
+    return {external_task(task_state), resolver(task_state)};
 }
 
 template <typename value_type>
 external_task<value_type>::external_task(external_task&& other) noexcept
-: shared(std::move(other.shared)) {}
+: task_state(std::move(other.task_state)) {}
 
 template <typename value_type>
 external_task<value_type>& external_task<value_type>::operator=(external_task&& other) noexcept {
     if (this != &other) {
         abandon();
-        shared = std::move(other.shared);
+        task_state = std::move(other.task_state);
     }
     return *this;
 }
@@ -414,11 +414,11 @@ typename external_task<value_type>::awaiter external_task<value_type>::operator 
 }
 
 template <typename value_type>
-external_task<value_type>::resolver::resolver(shared_state shared) noexcept
-: shared(std::move(shared)) {}
+external_task<value_type>::resolver::resolver(shared_state task_state) noexcept
+: task_state(std::move(task_state)) {}
 
 template <typename value_type> void external_task<value_type>::resolver::resolve(value_type&& value) const {
-    shared->set_value(value_type(std::move(value)));
+    task_state->set_value(value_type(std::move(value)));
 }
 
 }  // namespace pulsarlm

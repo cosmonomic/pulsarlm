@@ -50,31 +50,31 @@ struct request_results {
 };
 
 class recording_callbacks final : public pulsarlm::request_callbacks {
-    std::shared_ptr<request_results> recorded;
+    std::shared_ptr<request_results> recorded_results;
 
   public:
-    explicit recording_callbacks(std::shared_ptr<request_results> recorded)
-    : recorded(std::move(recorded)) {}
+    explicit recording_callbacks(std::shared_ptr<request_results> recorded_results)
+    : recorded_results(std::move(recorded_results)) {}
 
     void on_token(std::int64_t token) noexcept override {
-        recorded->tokens.push_back(token);
+        recorded_results->tokens.push_back(token);
     }
 
     void on_cycle_end(pulsarlm::cycle_end&& ended) noexcept override {
-        recorded->cycle_ends.push_back(std::move(ended));
+        recorded_results->cycle_ends.push_back(std::move(ended));
     }
 
     void on_end(std::expected<pulsarlm::state, request_error>&& result) noexcept override {
-        recorded->end.emplace(std::move(result));
+        recorded_results->end.emplace(std::move(result));
     }
 
     bool cancelled() const noexcept override {
-        return recorded->cancelled;
+        return recorded_results->cancelled;
     }
 };
 
-result_writer make_writer(const std::shared_ptr<request_results>& recorded) {
-    return result_writer(std::make_unique<recording_callbacks>(recorded));
+result_writer make_writer(const std::shared_ptr<request_results>& recorded_results) {
+    return result_writer(std::make_unique<recording_callbacks>(recorded_results));
 }
 
 constexpr std::size_t page_size = 4;
@@ -136,7 +136,7 @@ class sum_model final : public pulsarlm::Model {
     // Each decode step's page_positions, on the host.
     std::vector<at::Tensor> decode_page_positions;
     std::function<void()> on_forward;
-    std::function<bool(std::size_t, std::int64_t)> important = [](std::size_t, std::int64_t) { return false; };
+    std::function<bool(std::size_t, std::int64_t)> is_important = [](std::size_t, std::int64_t) { return false; };
 
     std::vector<pulsarlm::kv_layer> kv_layers() const override {
         return layers;
@@ -148,18 +148,18 @@ class sum_model final : public pulsarlm::Model {
             on_forward();
         }
         pulsarlm::StepLogits logits;
-        if (batch.prefill) {
-            at::Tensor starts = batch.prefill->cu_seqlens_q.cpu().to(at::kLong);
+        if (batch.prefill_group) {
+            at::Tensor starts = batch.prefill_group->cu_seqlens_q.cpu().to(at::kLong);
             prefill_chunks.push_back(token_list(starts.size(0) - 1));
             for (std::size_t s = 0; s < prefill_chunks.back().size(); s++) {
                 prefill_chunks.back()[s] = starts[s + 1].item<std::int64_t>() - starts[s].item<std::int64_t>();
             }
-            logits.prefill = predict(*batch.prefill, lines);
+            logits.prefill_logits = predict(*batch.prefill_group, lines);
         }
-        if (batch.decode) {
-            decode_sizes.push_back(batch.decode->tokens.size(0));
-            decode_page_positions.push_back(batch.decode->page_positions.cpu());
-            logits.decode = predict(*batch.decode, lines);
+        if (batch.decode_group) {
+            decode_sizes.push_back(batch.decode_group->tokens.size(0));
+            decode_page_positions.push_back(batch.decode_group->page_positions.cpu());
+            logits.decode_logits = predict(*batch.decode_group, lines);
         }
         return logits;
     }
@@ -294,7 +294,7 @@ class sum_model final : public pulsarlm::Model {
                         std::size_t row = first_page[layer][s] + j / page_size;
                         auto token = static_cast<std::int64_t>(layer_key[layer_table[s][j / page_size]][j % page_size]);
                         weight_sum[row] = sequence_weight;
-                        if (important(layer, token)) {
+                        if (is_important(layer, token)) {
                             mass_sum[row][0] = sequence_weight;
                         }
                     }
@@ -420,7 +420,7 @@ struct fixture {
     }
 
     // The K and V of layer's page hash in the store.
-    pulsarlm::kv stored(const digest& hash, std::size_t layer) const {
+    pulsarlm::kv stored_kv(const digest& hash, std::size_t layer) const {
         return pulsarlm::page_tensors(
             store->pages.at(pulsarlm::store_key(hash, layer)),
             page_shapes(model.layers)[layer]
@@ -541,13 +541,13 @@ bool page_holds(const pulsarlm::kv& p, const token_list& tokens, std::size_t fir
 
 struct submission {
     request r;
-    std::shared_ptr<request_results> recorded;
+    std::shared_ptr<request_results> recorded_results;
     result_writer writer;
 };
 
 submission make_submission(request r) {
-    auto recorded = std::make_shared<request_results>();
-    return submission{.r = std::move(r), .recorded = recorded, .writer = make_writer(recorded)};
+    auto recorded_results = std::make_shared<request_results>();
+    return submission{.r = std::move(r), .recorded_results = recorded_results, .writer = make_writer(recorded_results)};
 }
 
 task<void> serve(pulsarlm::scheduler& sched, request r, result_writer writer, std::size_t& remaining) {
@@ -567,7 +567,7 @@ std::vector<request_results> serve_submissions(pulsarlm::scheduler& sched, std::
     REQUIRE(loop.run() == nullptr);
     std::vector<request_results> results;
     for (submission& s : submissions) {
-        results.push_back(*s.recorded);
+        results.push_back(*s.recorded_results);
     }
     return results;
 }
@@ -626,8 +626,8 @@ TEST_CASE("a request from an empty state prefills, decodes and ends with its sta
     for (std::size_t i = 0; i < hashes_of(end).size(); i++) {
         std::size_t first_index = i * page_size;
         token_list page_tokens(forwarded.begin() + first_index, forwarded.begin() + first_index + page_size);
-        REQUIRE(page_holds(f.stored(hashes_of(end)[i], 0), page_tokens, first_index));
-        REQUIRE(page_holds(f.stored(hashes_of(end)[i], 1), page_tokens, first_index));
+        REQUIRE(page_holds(f.stored_kv(hashes_of(end)[i], 0), page_tokens, first_index));
+        REQUIRE(page_holds(f.stored_kv(hashes_of(end)[i], 1), page_tokens, first_index));
     }
 }
 
@@ -740,7 +740,7 @@ TEST_CASE("max_tokens 0 forwards the tokens and ends with their state") {
 TEST_CASE("a request cancelled before it runs ends with cancelled") {
     fixture f(16);
     submission s = make_submission(request{.tokens = {1, 2, 3}, .max_tokens = 10});
-    s.recorded->cancelled = true;
+    s.recorded_results->cancelled = true;
     std::vector<submission> submissions;
     submissions.push_back(std::move(s));
     std::vector<request_results> results = serve_submissions(f.sched, std::move(submissions));
@@ -754,9 +754,9 @@ TEST_CASE("a request cancelled while decoding ends with cancelled after its step
     fixture f(16);
     token_list prompt{1, 2, 3};
     submission s = make_submission(request{.tokens = prompt, .max_tokens = 10});
-    f.model.on_forward = [&f, recorded = s.recorded] {
+    f.model.on_forward = [&f, recorded_results = s.recorded_results] {
         if (f.model.forward_count == 3) {
-            recorded->cancelled = true;
+            recorded_results->cancelled = true;
         }
     };
     std::vector<submission> submissions;
@@ -834,17 +834,17 @@ TEST_CASE("a cycle ends every cycle_tokens tokens with the state it reached") {
     REQUIRE(cycle_ends.size() == 2);
     token_list first_pages(prompt.begin(), prompt.begin() + 4);
     REQUIRE(cycle_ends[0].token_count == 4);
-    REQUIRE((hashes_of(cycle_ends[0].reached) == pulsarlm::make_page_digests(root(), first_pages, page_size)));
-    REQUIRE(cycle_ends[0].reached.tail.empty());
+    REQUIRE((hashes_of(cycle_ends[0].state) == pulsarlm::make_page_digests(root(), first_pages, page_size)));
+    REQUIRE(cycle_ends[0].state.tail.empty());
     token_list forwarded = concat(prompt, token_list(generated.begin(), generated.begin() + 2));
     REQUIRE(cycle_ends[1].token_count == 8);
-    REQUIRE((hashes_of(cycle_ends[1].reached) == pulsarlm::make_page_digests(root(), forwarded, page_size)));
-    REQUIRE(cycle_ends[1].reached.tail.empty());
+    REQUIRE((hashes_of(cycle_ends[1].state) == pulsarlm::make_page_digests(root(), forwarded, page_size)));
+    REQUIRE(cycle_ends[1].state.tail.empty());
 }
 
 TEST_CASE("a cycle's end evicts the pages scoring below the threshold outside the sink and working pages") {
     fixture f(16);
-    f.model.important = [](std::size_t, std::int64_t token) { return token == 7; };
+    f.model.is_important = [](std::size_t, std::int64_t token) { return token == 7; };
     std::vector<request_results> results = serve_all(
         f.sched,
         {request{
@@ -863,8 +863,8 @@ TEST_CASE("a cycle's end evicts the pages scoring below the threshold outside th
     REQUIRE(results[0].tokens == token_list{first, continuation(concat(kept, {first}), 1)[0]});
     REQUIRE(results[0].cycle_ends.size() == 8);
     const pulsarlm::cycle_end& prefill_end = results[0].cycle_ends[7];
-    REQUIRE((hashes_of(prefill_end.reached) == std::vector{chain[0], chain[1], chain[4], chain[7]}));
-    REQUIRE(prefill_end.reached.tail.empty());
+    REQUIRE((hashes_of(prefill_end.state) == std::vector{chain[0], chain[1], chain[4], chain[7]}));
+    REQUIRE(prefill_end.state.tail.empty());
     REQUIRE(prefill_end.token_count == 32);
     pulsarlm::state end = ended_state(results[0]);
     REQUIRE((hashes_of(end) == std::vector{chain[0], chain[1], chain[4], chain[7]}));
@@ -873,7 +873,7 @@ TEST_CASE("a cycle's end evicts the pages scoring below the threshold outside th
 
 TEST_CASE("a layer evicts nothing by score during its warm-up") {
     fixture f(16);
-    f.model.important = [](std::size_t, std::int64_t token) { return token == 7; };
+    f.model.is_important = [](std::size_t, std::int64_t token) { return token == 7; };
     std::vector<request_results> results = serve_all(
         f.sched,
         {request{
@@ -886,13 +886,13 @@ TEST_CASE("a layer evicts nothing by score during its warm-up") {
 
     // The prompt's 6 sampled pages are fewer than the warm-up's 4 density samples then 4 score samples.
     REQUIRE(
-        (hashes_of(results[0].cycle_ends.back().reached) == pulsarlm::make_page_digests(root(), eight_pages, page_size))
+        (hashes_of(results[0].cycle_ends.back().state) == pulsarlm::make_page_digests(root(), eight_pages, page_size))
     );
 }
 
 TEST_CASE("a page's mass sums carry over from the cycles before") {
     fixture f(16);
-    f.model.important = [&f](std::size_t, std::int64_t token) { return token == 7 && f.model.forward_count == 1; };
+    f.model.is_important = [&f](std::size_t, std::int64_t token) { return token == 7 && f.model.forward_count == 1; };
     token_list prompt(eight_pages.begin(), eight_pages.begin() + 16);
     std::vector<request_results> results = serve_all(
         f.sched,
@@ -912,7 +912,7 @@ TEST_CASE("a page's mass sums carry over from the cycles before") {
 
     REQUIRE(f.model.prefill_chunks == std::vector<token_list>{{8}, {8}});
     REQUIRE(results[0].cycle_ends.size() == 2);
-    const pulsarlm::state& reached = results[0].cycle_ends[1].reached;
+    const pulsarlm::state& reached = results[0].cycle_ends[1].state;
     REQUIRE((hashes_of(reached) == pulsarlm::make_page_digests(root(), prompt, page_size)));
     std::vector<float> densities = densities_of(reached);
     REQUIRE(densities.size() == 4);
@@ -923,7 +923,7 @@ TEST_CASE("a page's mass sums carry over from the cycles before") {
 
 TEST_CASE("a request resumes with the mass sums and moments of its initial state") {
     fixture f(16);
-    f.model.important = [](std::size_t, std::int64_t token) { return token == 7; };
+    f.model.is_important = [](std::size_t, std::int64_t token) { return token == 7; };
     token_list prompt(eight_pages.begin(), eight_pages.begin() + 16);
     pulsarlm::eviction_policy
         policy{.n_sink = 4, .n_working = 4, .cycle_tokens = 4, .eviction_threshold = 0.5, .eviction_warmup = 0};
@@ -936,7 +936,7 @@ TEST_CASE("a request resumes with the mass sums and moments of its initial state
                 {.n_sink = 4, .n_working = 16, .cycle_tokens = 16, .eviction_threshold = 0.5, .eviction_warmup = 0}
         },
         [&](const request_results& first) {
-            f.model.important = [](std::size_t, std::int64_t) { return false; };
+            f.model.is_important = [](std::size_t, std::int64_t) { return false; };
             pulsarlm::state resumed = ended_state(first);
             for (pulsarlm::layer_sequence& sequence : resumed.layers) {
                 sequence.density_moments = {pulsarlm::moments{.count = 2, .mean = 0.5, .m2 = 0.25}};
@@ -960,7 +960,7 @@ TEST_CASE("a request resumes with the mass sums and moments of its initial state
         concat(prompt, {results[0].tokens.back(), 200, 201, 202}),
         page_size
     );
-    const pulsarlm::state& reached = results[1].cycle_ends[0].reached;
+    const pulsarlm::state& reached = results[1].cycle_ends[0].state;
     REQUIRE((hashes_of(reached) == std::vector{resumed_chain[0], resumed_chain[1], resumed_chain[4]}));
 }
 
@@ -980,7 +980,7 @@ TEST_CASE("a cycle's end evicts the oldest pages down to max_pages") {
     token_list kept(prompt.begin() + 8, prompt.end());
     std::int64_t first = continuation(prompt, 1)[0];
     REQUIRE(results[0].tokens == token_list{first, continuation(concat(kept, {first}), 1)[0]});
-    REQUIRE((hashes_of(results[0].cycle_ends[0].reached) == std::vector{chain[2], chain[3]}));
+    REQUIRE((hashes_of(results[0].cycle_ends[0].state) == std::vector{chain[2], chain[3]}));
 }
 
 TEST_CASE("a prompt longer than the cache fits when each cycle evicts down to max_pages") {
@@ -1058,7 +1058,7 @@ TEST_CASE("a sliding layer holds only the pages its window reaches") {
     REQUIRE((hashes_of(end) == pulsarlm::make_page_digests(root(), forwarded, page_size)));
     for (std::size_t i = 0; i < hashes_of(end).size(); i++) {
         token_list page_tokens(forwarded.begin() + i * page_size, forwarded.begin() + (i + 1) * page_size);
-        REQUIRE(keys_hold(f.stored(hashes_of(end)[i], 1), page_tokens));
+        REQUIRE(keys_hold(f.stored_kv(hashes_of(end)[i], 1), page_tokens));
     }
 }
 
@@ -1201,7 +1201,7 @@ TEST_CASE("a sliding layer keeps the pages its window reaches whatever the full-
     token_list kept(prompt.begin() + 12, prompt.end());
     std::int64_t first = continuation(prompt, 1)[0];
     REQUIRE(results[0].tokens == token_list{first, continuation(concat(kept, {first}), 1)[0]});
-    const pulsarlm::state& reached = results[0].cycle_ends[0].reached;
+    const pulsarlm::state& reached = results[0].cycle_ends[0].state;
     REQUIRE((hashes_of(reached, 0) == std::vector{chain[3]}));
     REQUIRE((hashes_of(reached, 1) == std::vector{chain[2], chain[3]}));
     f.sched.validate_state(reached);
@@ -1209,7 +1209,7 @@ TEST_CASE("a sliding layer keeps the pages its window reaches whatever the full-
 
 TEST_CASE("each full-attention layer evicts by its own attention mass") {
     fixture f(16);
-    f.model.important = each_layers_own;
+    f.model.is_important = each_layers_own;
     std::vector<request_results> results = serve_all(
         f.sched,
         {request{
@@ -1225,7 +1225,7 @@ TEST_CASE("each full-attention layer evicts by its own attention mass") {
     std::int64_t first = continuation(pages_of(eight_pages, {0, 1, 4, 6, 7}), 1)[0];
     token_list kept = pages_of(eight_pages, {0, 1, 4, 7});
     REQUIRE(results[0].tokens == concat({first}, continuation(concat(kept, {first}), 2)));
-    const pulsarlm::state& reached = results[0].cycle_ends[7].reached;
+    const pulsarlm::state& reached = results[0].cycle_ends[7].state;
     REQUIRE((hashes_of(reached, 0) == std::vector{chain[0], chain[1], chain[4], chain[7]}));
     REQUIRE((densities_of(reached, 0) == std::vector{0.0f, 1.0f, 1.0f, 0.0f}));
     REQUIRE((hashes_of(reached, 1) == std::vector{chain[0], chain[2], chain[5], chain[7]}));
@@ -1241,7 +1241,7 @@ TEST_CASE("each full-attention layer evicts by its own attention mass") {
 // despite their different views.
 TEST_CASE("a page takes the same position in every layer, its rank among the pages any layer holds") {
     fixture f(16);
-    f.model.important = each_layers_own;
+    f.model.is_important = each_layers_own;
     std::vector<request_results> results = serve_all(
         f.sched,
         {request{
@@ -1271,7 +1271,7 @@ TEST_CASE("a page takes the same position in every layer, its rank among the pag
 
 TEST_CASE("a request resumed from a state with different views per layer keeps their pages' positions") {
     fixture f(16);
-    f.model.important = each_layers_own;
+    f.model.is_important = each_layers_own;
     pulsarlm::eviction_policy
         policy{.n_sink = 4, .n_working = 4, .cycle_tokens = 4, .eviction_threshold = 0.5, .eviction_warmup = 0};
     std::vector<request_results> results = serve_in_turn(
@@ -1313,7 +1313,7 @@ std::int64_t sum_of_first(const token_list& tokens, std::size_t count) {
 }
 
 std::int64_t stored_state(const fixture& f, const digest& hash) {
-    return static_cast<std::int64_t>(f.stored(hash, 0).k.item<float>());
+    return static_cast<std::int64_t>(f.stored_kv(hash, 0).k.item<float>());
 }
 
 TEST_CASE("a recurrent layer carries its state across steps and keeps the state at the newest page") {
@@ -1374,7 +1374,7 @@ TEST_CASE("a recurrent layer's state covers the pages eviction drops") {
 
     REQUIRE(results[0].tokens == continuation(prompt, 2));
     std::vector<digest> chain = pulsarlm::make_page_digests(root(), prompt, page_size);
-    const pulsarlm::state& reached = results[0].cycle_ends[0].reached;
+    const pulsarlm::state& reached = results[0].cycle_ends[0].state;
     REQUIRE((hashes_of(reached, 1) == std::vector{chain[2], chain[3]}));
     REQUIRE((hashes_of(reached, 0) == std::vector{chain[3]}));
     REQUIRE(stored_state(f, chain[3]) == sum_of_first(prompt, 16));
@@ -1392,7 +1392,7 @@ TEST_CASE("each state a recurrent request reaches has the state at its head in t
     REQUIRE(results[0].tokens == continuation(prompt, 7));
     std::vector<pulsarlm::state> states;
     for (const pulsarlm::cycle_end& ended : results[0].cycle_ends) {
-        states.push_back(ended.reached);
+        states.push_back(ended.state);
     }
     states.push_back(ended_state(results[0]));
     REQUIRE(states.size() == 6);

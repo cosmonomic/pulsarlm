@@ -88,14 +88,14 @@ struct GroupBatch {
 
 // A step's two groups; either may be absent.
 struct StepBatch {
-    std::optional<GroupBatch> prefill;
-    std::optional<GroupBatch> decode;
+    std::optional<GroupBatch> prefill_group;
+    std::optional<GroupBatch> decode_group;
 };
 
 // Each present group's logits [rows, vocab] in the model's dtype.
 struct StepLogits {
-    std::optional<at::Tensor> prefill;
-    std::optional<at::Tensor> decode;
+    std::optional<at::Tensor> prefill_logits;
+    std::optional<at::Tensor> decode_logits;
 };
 
 class Model {

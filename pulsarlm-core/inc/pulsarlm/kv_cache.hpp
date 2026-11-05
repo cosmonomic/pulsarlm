@@ -101,7 +101,7 @@ class kv_cache {
     // done is set when the fetch completes. The page arrived when its line's hash then equals its digest.
     struct fetch {
         std::uint32_t line_id;
-        event done;
+        event done_event;
     };
 
     struct cache_layer {
@@ -110,7 +110,7 @@ class kv_cache {
         kv device_kv;
         std::unordered_map<digest, std::uint32_t, digest_hash> digest_to_line_id;
         // Pages a get is fetching into a line, not yet in digest_to_line_id.
-        std::unordered_map<digest, fetch, digest_hash> fetching;
+        std::unordered_map<digest, fetch, digest_hash> fetches;
     };
 
     struct layer_line {

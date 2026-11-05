@@ -352,7 +352,7 @@ def eviction_view(
     end = line["states"][-1]
     views = [in_view(layer, end["tokens"]) for layer in end["layers"]]
 
-    def kept(spans: list[Span]) -> float | None:
+    def kept_fraction(spans: list[Span]) -> float | None:
         if not spans:
             return None
         held = sum(any(wholly_in(view, span) for span in spans) for view in views)
@@ -362,7 +362,7 @@ def eviction_view(
     return {
         "in_view": sum(b - a for view in views for a, b in view)
         / (len(views) * end["tokens"]),
-        "needles_kept": [kept(spans) for spans in prompt.needle_spans],
+        "needles_kept": [kept_fraction(spans) for spans in prompt.needle_spans],
         "needle_evictions": [
             evictions(states, spans, line["cap_tokens"])
             for spans in prompt.needle_spans
@@ -561,7 +561,7 @@ async def run_item(
 
 
 @contextmanager
-def server(
+def run_server(
     model: str, data_dir: Path, port: int, server_args: list[str]
 ) -> Iterator[str]:
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -667,7 +667,7 @@ def run(
         eviction_log = out / name / "eviction.jsonl"
         server_args += ["--store_gib", str(store_gib)]
         server_args += ["--eviction_log", str(eviction_log)]
-        with server(model, out / name, port, server_args) as base_url:
+        with run_server(model, out / name, port, server_args) as base_url:
             asyncio.run(
                 run_setting(
                     base_url,
@@ -704,7 +704,7 @@ async def run_setting(
     slots = asyncio.Semaphore(concurrency)
     finished = 0
 
-    async def one(client: AsyncOpenAI, item: Item) -> None:
+    async def run_one(client: AsyncOpenAI, item: Item) -> None:
         nonlocal finished
         async with slots:
             row = await run_item(
@@ -730,7 +730,7 @@ async def run_setting(
         )
 
     async with AsyncOpenAI(base_url=base_url, api_key="none", timeout=3600) as client:
-        await asyncio.gather(*(one(client, item) for item in todo))
+        await asyncio.gather(*(run_one(client, item) for item in todo))
 
 
 def mean(values: list[float]) -> str:

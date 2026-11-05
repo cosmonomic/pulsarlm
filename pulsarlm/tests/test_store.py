@@ -32,7 +32,7 @@ def page_digests(tokens: list[int]) -> list[bytes]:
     return digests
 
 
-def reached(history: list[int], evicted: set[int] = set()) -> State:
+def current_state(history: list[int], evicted: set[int] = set()) -> State:
     """A state of two layers: one keeping every page not evicted, one the newest."""
     full = len(history) // PAGE_SIZE * PAGE_SIZE
     pages = [
@@ -105,7 +105,7 @@ def run_request(store: LocalStore, prompt: list[int], *states: list[int]) -> Non
     with request(store, prompt) as (request_id, _, _):
         for history in states:
             put_pages(store, page_digests(history), request_id)
-            write(store, reached(history), request_id)
+            write(store, current_state(history), request_id)
 
 
 def stored(store: LocalStore, h: bytes) -> bool:
@@ -162,7 +162,7 @@ def test_a_state_with_evicted_pages_is_found_by_its_last_page():
     history = HISTORY[:13]
     with request(store, history) as (request_id, _, _):
         put_pages(store, page_digests(history), request_id)
-        write(store, reached(history, evicted={1}), request_id)
+        write(store, current_state(history, evicted={1}), request_id)
     with lookup(store, HISTORY) as (state, covered):
         assert covered == 13
         assert len(hashes_of(state)) == 2
@@ -260,7 +260,7 @@ def test_a_page_put_again_by_a_later_request_stays_for_it():
         put_pages(store, page_digests(first), request_id)
         run_request(store, [7] * 5, [7] * 5)
         assert all(stored(store, h) for h in page_digests(first))
-        write(store, reached(first), request_id)
+        write(store, current_state(first), request_id)
     assert all(stored(store, h) for h in page_digests(first))
 
 
@@ -331,8 +331,8 @@ def test_states_and_pages_survive_a_restart(tmp_path: Path):
     assert store.byte_count() == 2 * PAGE_BYTES
     with lookup(store, HISTORY) as (state, covered):
         assert covered == 9
-        assert state.head == reached(HISTORY[:9]).head
-        assert state.layers == reached(HISTORY[:9]).layers
+        assert state.head == current_state(HISTORY[:9]).head
+        assert state.layers == current_state(HISTORY[:9]).layers
         assert state.tail == [HISTORY[8]]
         fetched = store.fetch(hashes_of(state)[1:]).result()[0]
         assert fetched is not None

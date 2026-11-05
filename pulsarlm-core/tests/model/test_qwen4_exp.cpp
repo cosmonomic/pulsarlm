@@ -88,12 +88,12 @@ std::vector<std::int64_t> head_offsets() {
 }
 
 struct weights {
-    c10::Dict<std::string, at::Tensor> named;
+    c10::Dict<std::string, at::Tensor> named_tensors;
     at::Tensor ngram_embedding;
 
     explicit weights(at::ScalarType dtype) {
         at::manual_seed(13);
-        auto add = [&](const std::string& name, at::Tensor t) { named.insert(name, t.to(cuda(dtype))); };
+        auto add = [&](const std::string& name, at::Tensor t) { named_tensors.insert(name, t.to(cuda(dtype))); };
         auto projection = [](std::int64_t out, std::int64_t in) { return at::randn({out, in}) / std::sqrt(in); };
         auto norm = [](std::int64_t size) { return 0.1 * at::randn({size}); };
         auto hyper_connection = [&](const std::string& p, bool injects) {
@@ -152,13 +152,13 @@ struct weights {
                 add(l + "ple.norm_conv.weight", norm(hc * hidden));
                 add(l + "ple.conv1d.weight", at::randn({hc * hidden, 1, ple_conv_kernel}) / 2.0);
                 const std::string e = l + "ple.ple_embedding.";
-                named.insert(e + "layer_multipliers", at::tensor(layer_multipliers).to(at::kCUDA));
-                named.insert(e + "ngram_heads_vocab_sizes", at::tensor(head_vocab_sizes).to(at::kCUDA));
-                named.insert(e + "ngram_heads_offsets", at::tensor(head_offsets()).to(at::kCUDA));
+                named_tensors.insert(e + "layer_multipliers", at::tensor(layer_multipliers).to(at::kCUDA));
+                named_tensors.insert(e + "ngram_heads_vocab_sizes", at::tensor(head_vocab_sizes).to(at::kCUDA));
+                named_tensors.insert(e + "ngram_heads_offsets", at::tensor(head_offsets()).to(at::kCUDA));
                 ngram_embedding = at::randn({ngram_rows, ngram_dim}).to(cuda(dtype));
                 std::vector<at::Tensor> shards = ngram_embedding.chunk(ngram_shards);
                 for (std::size_t shard = 0; shard < shards.size(); shard++) {
-                    named.insert(
+                    named_tensors.insert(
                         std::format("{}ngram_embedding.shard_{}.weight", e, shard),
                         shards[shard].contiguous()
                     );
@@ -168,7 +168,7 @@ struct weights {
     }
 
     at::Tensor operator()(const std::string& name) const {
-        return named.at(name).to(at::kFloat);
+        return named_tensors.at(name).to(at::kFloat);
     }
 
     at::Tensor layer(std::size_t layer, const std::string& name) const {
@@ -224,7 +224,7 @@ mixed_input mix(const weights& w, const std::string& p, const at::Tensor& x) {
     at::Tensor mix_weights = at::silu(at::linear(normed, w(p + "input_mix_weight_down.weight")) / hc);
     mix_weights = at::sigmoid(at::linear(mix_weights, w(p + "input_mix_weight_up.weight"))).view({-1, hc, hidden});
     mixed_input out{.input = (mix_weights * normed.view({-1, hc, hidden})).mean(1)};
-    if (w.named.contains(p + "block_inject_weight.weight")) {
+    if (w.named_tensors.contains(p + "block_inject_weight.weight")) {
         out.injection_weights = 2 * at::sigmoid(at::linear(normed, w(p + "block_inject_weight.weight")) / hc);
     }
     return out;
@@ -538,7 +538,7 @@ double max_relative_error(const at::Tensor& got, const at::Tensor& expected) {
 
 void check_against_dense(at::ScalarType dtype, double tolerance, std::int64_t experts_per_token, std::int64_t budget) {
     weights w(dtype);
-    pulsarlm::Qwen4ExpModel model(model_config(experts_per_token, budget), w.named);
+    pulsarlm::Qwen4ExpModel model(model_config(experts_per_token, budget), w.named_tensors);
     std::vector<pulsarlm::kv_layer> specs = model.kv_layers();
     REQUIRE(specs.size() == 9);
     std::vector<pulsarlm::kv> kv;
@@ -579,10 +579,10 @@ void check_against_dense(at::ScalarType dtype, double tolerance, std::int64_t ex
          {chunk{0, 21, true}, chunk{21, 37, true}, chunk{37, 47, true}, chunk{47, 48, false}, chunk{48, 49, false}}) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
         pulsarlm::StepBatch batch;
-        (c.prefill ? batch.prefill : batch.decode) = step(tokens, c.first, c.last, c.prefill, specs);
+        (c.prefill ? batch.prefill_group : batch.decode_group) = step(tokens, c.first, c.last, c.prefill, specs);
         pulsarlm::StepLogits logits = model.forward(batch, kv);
         auto expected_logits = dense.logits.narrow(0, c.first, c.last - c.first);
-        CHECK(max_relative_error(*(c.prefill ? logits.prefill : logits.decode), expected_logits) < tolerance);
+        CHECK(max_relative_error(*(c.prefill ? logits.prefill_logits : logits.decode_logits), expected_logits) < tolerance);
     }
 
     std::size_t kv_index = 0;
@@ -630,7 +630,7 @@ TEST_CASE("Qwen4-Exp kv_layers add a PLE layer's convolution and token lines", "
         SKIP("no CUDA device");
     }
     weights w(at::kFloat);
-    pulsarlm::Qwen4ExpModel model(model_config(2, 8), w.named);
+    pulsarlm::Qwen4ExpModel model(model_config(2, 8), w.named_tensors);
     std::vector<pulsarlm::kv_layer> specs = model.kv_layers();
     REQUIRE(specs.size() == 9);
     CHECK(specs[4].state->sizes == std::vector<std::int64_t>{hc * hidden, ple_history});

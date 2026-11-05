@@ -135,11 +135,11 @@ at::Tensor logit_inputs(const at::Tensor& x, const GroupBatch& g) {
 
 StepLogits paged_forward(const StepBatch& batch, const std::function<at::Tensor(const GroupBatch&)>& group_forward) {
     StepLogits logits;
-    if (batch.prefill) {
-        logits.prefill = group_forward(*batch.prefill);
+    if (batch.prefill_group) {
+        logits.prefill_logits = group_forward(*batch.prefill_group);
     }
-    if (batch.decode) {
-        logits.decode = group_forward(*batch.decode);
+    if (batch.decode_group) {
+        logits.decode_logits = group_forward(*batch.decode_group);
     }
     return logits;
 }

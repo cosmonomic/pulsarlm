@@ -53,15 +53,15 @@ class scheduler {
     digest root;
     std::vector<std::int64_t> stop_ids;
     std::size_t prefill_tokens_per_step;
-    std::vector<sequence*> running;
+    std::vector<sequence*> running_sequences;
     // Set when a sequence joins the running set.
-    std::optional<event> idle;
+    std::optional<event> join_event;
 
-    static event& next(std::optional<event>& waited);
+    static event& emplace_event(std::optional<event>& waited);
     static void wake(std::optional<event>& waited) noexcept;
     // The full pages of KV layer layer's view wholly before the window of a query at view index query.
     std::size_t passed_pages(std::size_t layer, std::size_t query) const noexcept;
-    state reached(const sequence& seq) const;
+    state state_of(const sequence& seq) const;
     // Per KV layer with pages, lines for its pages, then line_count empty lines; per recurrent layer, a copy of the
     // state at head, or zeros without head, and an empty line. Holds nothing on failure.
     task<std::expected<void, page_error>> take_lines(sequence& seq, std::size_t line_count);

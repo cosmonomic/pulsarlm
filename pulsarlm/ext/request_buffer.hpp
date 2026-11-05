@@ -23,7 +23,7 @@ struct taken_results {
 // A request's results, appended by its callbacks and taken by Python.
 class request_buffer {
     std::mutex mutex;
-    taken_results appended;
+    taken_results results;
     std::atomic<bool> cancel_flag = false;
 
   public:
@@ -38,7 +38,7 @@ class request_buffer {
 // Appends to a buffer and notifies a wake_fd after each append.
 class buffered_callbacks final : public request_callbacks {
     std::shared_ptr<request_buffer> buffer;
-    std::shared_ptr<wake_fd> wake;
+    std::shared_ptr<wake_fd> wake_signal;
 
   public:
     buffered_callbacks(std::shared_ptr<request_buffer> buffer, std::shared_ptr<wake_fd> wake) noexcept;
