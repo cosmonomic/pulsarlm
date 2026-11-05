@@ -164,14 +164,24 @@ class LocalStore:
 
     @contextmanager
     def lease(
-        self, prompt: list[int], page_digests: list[bytes], *, request_id: int
+        self,
+        prompt: list[int],
+        page_digests: list[bytes],
+        *,
+        request_id: int,
+        cache: bool,
     ) -> Iterator[tuple[State, int]]:
         """The newest stored state reaching a proper prefix of prompt, and how many
-        of prompt's tokens it covers; an empty state and 0 when there is none.
-        page_digests are prompt's full page hashes. request_id, distinct among open
-        leases, names the request to put and write while the lease is open."""
+        of prompt's tokens it covers; an empty state and 0 when there is none or
+        cache is false. page_digests are prompt's full page hashes. request_id,
+        distinct among open leases, names the request to put and write while the
+        lease is open."""
         with self._lock:
-            found, covered = self._find(prompt, page_digests)
+            found, covered = (
+                self._find(prompt, page_digests)
+                if cache
+                else (StoredState(State(), []), 0)
+            )
             for h in found.page_keys:
                 self._reference(h)
             self._running[request_id] = RunningRequest(found.page_keys)

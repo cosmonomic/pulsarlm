@@ -23,6 +23,7 @@ class ServedModel:
     chat_template: ChatTemplate
     stop_ids: list[int]
     eviction: EvictionPolicy
+    prefix_cache: bool
 
 
 def load_served_model(settings: Settings, path: Path) -> ServedModel:
@@ -64,4 +65,5 @@ def load_served_model(settings: Settings, path: Path) -> ServedModel:
             eviction_threshold=settings.eviction_threshold,
             eviction_warmup=settings.eviction_warmup,
         ),
+        prefix_cache=settings.prefix_cache,
     )

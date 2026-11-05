@@ -110,12 +110,16 @@ async def collect(
         sampling=SamplingParams(),
         max_tokens=8,
         eviction=EvictionPolicy(cycle_tokens=16),
+        prefix_cache=True,
     )
     return [token async for token in tokens]
 
 
 def covered_by_lookup(engine: AsyncEngine, store: LocalStore, prompt: list[int]) -> int:
-    with store.lease(prompt, engine.page_digests(prompt), request_id=0) as (_, covered):
+    with store.lease(prompt, engine.page_digests(prompt), request_id=0, cache=True) as (
+        _,
+        covered,
+    ):
         return covered
 
 
@@ -151,6 +155,25 @@ def test_every_cycle_end_state_is_findable():
     asyncio.run(main())
 
 
+def test_without_prefix_cache_a_request_writes_no_state():
+    async def main():
+        store = CountingStore()
+        engine = make_engine(store)
+        tokens = complete(
+            engine,
+            store,
+            PROMPT,
+            sampling=SamplingParams(),
+            max_tokens=8,
+            eviction=EvictionPolicy(cycle_tokens=16),
+            prefix_cache=False,
+        )
+        assert len([token async for token in tokens]) == 8
+        assert len(store) == 0
+
+    asyncio.run(main())
+
+
 def test_another_engine_fetches_the_state_pages_from_the_store():
     async def main():
         store = CountingStore()
@@ -159,7 +182,9 @@ def test_another_engine_fetches_the_state_pages_from_the_store():
         follow_up = PROMPT + reply + [11]
 
         second = make_engine(store)
-        with store.lease(follow_up, second.page_digests(follow_up), request_id=0) as (
+        with store.lease(
+            follow_up, second.page_digests(follow_up), request_id=0, cache=True
+        ) as (
             state,
             _,
         ):
@@ -182,6 +207,7 @@ def test_closing_early_cancels_and_the_engine_serves_the_next_request():
             sampling=SamplingParams(),
             max_tokens=None,
             eviction=EvictionPolicy(),
+            prefix_cache=True,
         )
         await anext(tokens)
         await tokens.aclose()

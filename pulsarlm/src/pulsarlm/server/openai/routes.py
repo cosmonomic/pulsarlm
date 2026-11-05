@@ -48,6 +48,7 @@ class ServerState:
     model_id: str
     stop_ids: list[int]
     eviction: EvictionPolicy
+    prefix_cache: bool
     eviction_log: EvictionLog | None
 
     def eviction_for(self, system_tokens: int) -> EvictionPolicy:
@@ -121,6 +122,7 @@ async def create_chat_completion(body: ChatCompletionRequest, state: State):
         ),
         max_tokens=body.max_tokens,
         eviction=state.eviction_for(system_tokens),
+        prefix_cache=state.prefix_cache,
         on_state=None if state.eviction_log is None else states.append,
     )
     if state.eviction_log is not None:

@@ -25,6 +25,7 @@ def load_server_state(
         model_id=settings.model,
         stop_ids=served.stop_ids,
         eviction=served.eviction,
+        prefix_cache=served.prefix_cache,
         eviction_log=None
         if eviction_log is None
         else EvictionLog(eviction_log, served.eviction),

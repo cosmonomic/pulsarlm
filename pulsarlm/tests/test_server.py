@@ -130,6 +130,7 @@ def load(
         model_id=MODEL_ID,
         stop_ids=stop_ids,
         eviction=EvictionPolicy(cycle_tokens=PAGE_SIZE),
+        prefix_cache=True,
         eviction_log=None,
     )
 
@@ -225,7 +226,9 @@ def test_a_follow_up_continues_from_a_stored_state(client):
 
     state = client.app.state.server_state
     prompt = encode(state, follow_up)
-    with state.store.lease(prompt, state.engine.page_digests(prompt), request_id=0) as (
+    with state.store.lease(
+        prompt, state.engine.page_digests(prompt), request_id=0, cache=True
+    ) as (
         _,
         covered,
     ):
@@ -247,7 +250,7 @@ def test_a_reply_ending_at_any_stop_token_leaves_its_end_state_findable():
         state = app.state.server_state
         prompt = encode(state, follow_up)
         with state.store.lease(
-            prompt, state.engine.page_digests(prompt), request_id=0
+            prompt, state.engine.page_digests(prompt), request_id=0, cache=True
         ) as (
             _,
             covered,

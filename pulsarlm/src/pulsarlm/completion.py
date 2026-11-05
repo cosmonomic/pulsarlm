@@ -24,21 +24,29 @@ async def complete(
     sampling: SamplingParams,
     max_tokens: int | None,
     eviction: EvictionPolicy,
+    prefix_cache: bool,
     on_state: Callable[[State], None] | None = None,
 ) -> AsyncGenerator[int]:
-    """Yields the sampled tokens and writes every state the request reaches to
-    store, passing each to on_state too. Raises CompletionError when the engine
-    ends the request with an error, and EngineStopped when its loop exited.
-    Closing the iterator early cancels the request."""
+    """Yields the sampled tokens and passes every state the request reaches to
+    on_state. With prefix_cache, the request resumes from the newest stored state
+    reaching a prefix of prompt and writes every state it reaches to store;
+    without it, it forwards the whole prompt and writes none. Raises
+    CompletionError when the engine ends the request with an error, and
+    EngineStopped when its loop exited. Closing the iterator early cancels the
+    request."""
     request_id = next(_request_ids)
     digests = engine.page_digests(prompt)
 
-    def write_state(state: State) -> None:
-        store.write(state, engine.page_keys(state), request_id=request_id)
+    def handle_state(state: State) -> None:
+        if prefix_cache:
+            store.write(state, engine.page_keys(state), request_id=request_id)
         if on_state is not None:
             on_state(state)
 
-    with store.lease(prompt, digests, request_id=request_id) as (state, covered):
+    with store.lease(prompt, digests, request_id=request_id, cache=prefix_cache) as (
+        state,
+        covered,
+    ):
         stream = engine.submit(
             state,
             prompt[covered:],
@@ -51,11 +59,11 @@ async def complete(
             while True:
                 tokens, cycle_ends, end = await stream.take()
                 for cycle_end in cycle_ends:
-                    write_state(cycle_end.reached)
+                    handle_state(cycle_end.reached)
                 for token in tokens:
                     yield token
                 if isinstance(end, State):
-                    write_state(end)
+                    handle_state(end)
                     return
                 if end is not None:
                     raise CompletionError(end)

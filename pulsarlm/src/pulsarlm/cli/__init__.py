@@ -139,6 +139,17 @@ def _known_model(model: str) -> str:
     return model
 
 
+PrefixCache = Annotated[
+    bool,
+    typer.Option(
+        "--prefix_cache/--no_prefix_cache",
+        help="Resume a request from the newest stored state that reaches a prefix "
+        "of its prompt; without it, every request forwards its whole prompt.",
+        rich_help_panel="Memory",
+    ),
+]
+
+
 @app.callback()
 def main() -> None:
     pass
@@ -156,6 +167,7 @@ def serve(
     prefill_tokens_per_step: PrefillTokensPerStep = 256,
     store_gib: StoreGib = 4.0,
     persist: Persist = False,
+    prefix_cache: PrefixCache = True,
     cycle_tokens: CycleTokens = 512,
     n_working: NWorking = 8192,
     eviction_threshold: EvictionThreshold = 0.0,
@@ -185,6 +197,7 @@ def serve(
                 prefill_tokens_per_step=prefill_tokens_per_step,
                 store_gib=store_gib,
                 persist=persist,
+                prefix_cache=prefix_cache,
                 cycle_tokens=cycle_tokens,
                 n_working=n_working,
                 eviction_threshold=eviction_threshold,
@@ -255,6 +268,7 @@ def chat(
     prefill_tokens_per_step: PrefillTokensPerStep = 256,
     store_gib: StoreGib = 4.0,
     persist: Persist = False,
+    prefix_cache: PrefixCache = True,
     cycle_tokens: CycleTokens = 512,
     n_working: NWorking = 8192,
     eviction_threshold: EvictionThreshold = 0.0,
@@ -275,6 +289,7 @@ def chat(
                 prefill_tokens_per_step=prefill_tokens_per_step,
                 store_gib=store_gib,
                 persist=persist,
+                prefix_cache=prefix_cache,
                 cycle_tokens=cycle_tokens,
                 n_working=n_working,
                 eviction_threshold=eviction_threshold,

@@ -71,6 +71,7 @@ def new_chat(
                         ),
                         max_tokens=None,
                         eviction=served.eviction,
+                        prefix_cache=served.prefix_cache,
                     ):
                         part, text = decoder.step(token)
                         if not text:

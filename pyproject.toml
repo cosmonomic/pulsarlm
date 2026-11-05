@@ -3,7 +3,14 @@ members = ["pulsarlm"]
 
 [dependency-groups]
 dev = ["pulsarlm", "pytest", "ruff", "ty"]
-benchmark = ["pulsarlm", "httpx", "matplotlib", "openai", "wonderwords"]
+benchmark = [
+    "pulsarlm",
+    "httpx",
+    "matplotlib",
+    "openai",
+    "wonderwords",
+    "harbor>=0.25.0",
+]
 
 [tool.uv.sources]
 pulsarlm = { workspace = true }

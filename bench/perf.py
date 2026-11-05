@@ -35,14 +35,20 @@ METRICS_INTERVAL_S = 0.05
 class Setting:
     engine: Literal["pulsarlm", "vllm"]
     max_context_window: int | None = None
+    prefix_cache: bool = True
 
 
 SETTINGS = {
     "full_kv": Setting("pulsarlm"),
+    "full_kv_no_prefix_cache": Setting("pulsarlm", prefix_cache=False),
     "cap_4k": Setting("pulsarlm", max_context_window=4096),
     "cap_8k": Setting("pulsarlm", max_context_window=8192),
     "cap_16k": Setting("pulsarlm", max_context_window=16384),
+    "cap_16k_no_prefix_cache": Setting(
+        "pulsarlm", max_context_window=16384, prefix_cache=False
+    ),
     "vllm": Setting("vllm"),
+    "vllm_no_prefix_cache": Setting("vllm", prefix_cache=False),
 }
 
 
@@ -111,6 +117,8 @@ def pulsarlm_server(
     command += ["--port", str(port), "--no_persist"]
     command += ["--kv_cache_gib", str(kv_cache_gib), "--store_gib", str(store_gib)]
     command += ["--prefill_tokens_per_step", str(prefill_tokens_per_step)]
+    if not setting.prefix_cache:
+        command += ["--no_prefix_cache"]
     if setting.max_context_window is None:
         # The view would otherwise be capped at the model's trained context.
         command += [
@@ -135,6 +143,7 @@ def pulsarlm_server(
 @contextmanager
 def vllm_server(
     model: str,
+    setting: Setting,
     data_dir: Path,
     port: int,
     *,
@@ -156,6 +165,8 @@ def vllm_server(
     # Without the vision encoder, as pulsarlm serves text only; it also drops the
     # floor vLLM puts on max_num_batched_tokens to fit one video.
     command += ["--language-model-only"]
+    if not setting.prefix_cache:
+        command += ["--no-enable-prefix-caching"]
     root = f"http://127.0.0.1:{port}"
     base_url = f"{root}/v1"
     with serving(command, base_url, data_dir / "serve.log"):
@@ -356,6 +367,7 @@ def server_for(
     if setting.engine == "vllm":
         with vllm_server(
             model,
+            setting,
             out / name,
             port,
             vllm=vllm,
@@ -556,14 +568,24 @@ class Series:
     label: str
     color: str
     linestyle: str = "-"
+    filled: bool = True
 
 
 SERIES = {
     "full_kv": Series("Full KV", "#52514e", "--"),
+    "full_kv_no_prefix_cache": Series(
+        "Full KV, no prefix cache", "#52514e", "--", filled=False
+    ),
     "cap_4k": Series("Capped @ 4k", "#86b6ef"),
     "cap_8k": Series("Capped @ 8k", "#2a78d6"),
     "cap_16k": Series("Capped @ 16k", "#104281"),
+    "cap_16k_no_prefix_cache": Series(
+        "Capped @ 16k, no prefix cache", "#104281", filled=False
+    ),
     "vllm": Series("vLLM", "#d95926", ":"),
+    "vllm_no_prefix_cache": Series(
+        "vLLM, no prefix cache", "#d95926", ":", filled=False
+    ),
 }
 
 PANELS = {
@@ -616,19 +638,19 @@ def plot(
     runs = load_runs(results)
 
     print(
-        f"{'setting':<10}{'sessions':>10}{'context':>9}{'prefill':>10}"
+        f"{'setting':<30}{'sessions':>10}{'context':>9}{'prefill':>10}"
         f"{'decode':>9}{'KV GiB':>8}"
     )
     for (name, concurrency), run in sorted(runs.items()):
         for m in run.turns:
             print(
-                f"{name:<10}{concurrency:>10}{m.context_tokens:>9}"
+                f"{name:<30}{concurrency:>10}{m.context_tokens:>9}"
                 f"{m.prefill:>10.0f}{m.decode:>9.0f}{m.kv_gib:>8.2f}"
             )
         if run.oom_at is not None:
-            print(f"{name:<10}{concurrency:>10}  oom at {run.oom_at} tokens")
+            print(f"{name:<30}{concurrency:>10}  oom at {run.oom_at} tokens")
         if run.error is not None:
-            print(f"{name:<10}{concurrency:>10}  error: {run.error}")
+            print(f"{name:<30}{concurrency:>10}  error: {run.error}")
 
     surface, ink, muted, grid = "#ffffff", "#0b0b0b", "#52514e", "#e4e3df"
     concurrencies = sorted({c for _, c in runs})
@@ -657,6 +679,7 @@ def plot(
                     linewidth=2,
                     marker="o",
                     markersize=4,
+                    markerfacecolor=series.color if series.filled else surface,
                     label=series.label,
                 )
                 if run.oom_at is not None:
@@ -687,7 +710,7 @@ def plot(
         frameon=False,
         labelcolor=ink,
         loc="lower center",
-        ncol=len(labels),
+        ncol=min(len(labels), 3),
     )
     figure.text(0.99, 0.01, "× out of KV cache", color=muted, fontsize=8, ha="right")
     figure.tight_layout(rect=(0, 0.06, 1, 1))

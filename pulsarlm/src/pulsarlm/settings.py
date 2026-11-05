@@ -12,6 +12,7 @@ class Settings:
     prefill_tokens_per_step: int
     store_gib: float
     persist: bool
+    prefix_cache: bool
     cycle_tokens: int
     n_working: int
     eviction_threshold: float
