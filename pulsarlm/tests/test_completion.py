@@ -116,7 +116,7 @@ async def collect(
 
 
 def covered_by_lookup(engine: AsyncEngine, store: LocalStore, prompt: list[int]) -> int:
-    with store.lease(prompt, engine.page_digests(prompt), request_id=0, cache=True) as (
+    with store.lease(prompt, engine.page_digests(prompt), request_id=0) as (
         _,
         token_count,
     ):
@@ -155,7 +155,7 @@ def test_every_cycle_end_state_is_findable():
     asyncio.run(main())
 
 
-def test_without_prefix_cache_a_request_writes_no_state():
+def test_without_prefix_cache_a_request_leaves_no_state_or_page_in_the_store():
     async def main():
         store = CountingStore()
         engine = make_engine(store)
@@ -170,6 +170,7 @@ def test_without_prefix_cache_a_request_writes_no_state():
         )
         assert len([token async for token in tokens]) == 8
         assert len(store) == 0
+        assert store.page_count() == 0
 
     asyncio.run(main())
 
@@ -182,9 +183,10 @@ def test_another_engine_fetches_the_state_pages_from_the_store():
         follow_up = PROMPT + reply + [11]
 
         second = make_engine(store)
-        with store.lease(
-            follow_up, second.page_digests(follow_up), request_id=0, cache=True
-        ) as (lease, _):
+        with store.lease(follow_up, second.page_digests(follow_up), request_id=0) as (
+            lease,
+            _,
+        ):
             assert len(lease.state.layers[0].pages) == 2
             keys = second.page_keys(lease.state)
         assert len(await collect(second, store, follow_up)) == 8

@@ -76,7 +76,7 @@ def request(store: LocalStore, prompt: list[int]) -> Iterator[tuple[int, Lease, 
     its state covers."""
     request_id = next(REQUEST_IDS)
     digests = page_digests(prompt)
-    with store.lease(prompt, digests, request_id=request_id, cache=True) as (
+    with store.lease(prompt, digests, request_id=request_id) as (
         lease,
         token_count,
     ):
@@ -132,18 +132,6 @@ def test_lookup_takes_the_longest_state_the_prompt_continues():
         assert covered == 10
         assert hashes_of(state) == page_digests(HISTORY[:8])
         assert state.tail == HISTORY[8:10]
-
-
-def test_a_lease_without_cache_gives_an_empty_state_and_keeps_writing():
-    store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY)
-    run_request(store, HISTORY, HISTORY[:10])
-    with store.lease(
-        HISTORY, page_digests(HISTORY), request_id=next(REQUEST_IDS), cache=False
-    ) as (lease, token_count):
-        assert lease.state.layers == [] and lease.state.tail == []
-        assert token_count == 0
-    with lookup(store, HISTORY) as (_, covered):
-        assert covered == 10
 
 
 def test_lookup_skips_a_state_whose_tail_diverges_from_the_prompt():

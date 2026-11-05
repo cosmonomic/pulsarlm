@@ -177,19 +177,14 @@ class LocalStore:
         page_digests: list[bytes],
         *,
         request_id: int,
-        cache: bool,
     ) -> Iterator[tuple[Lease, int]]:
         """A lease on the newest stored state reaching a proper prefix of prompt,
         and how many of prompt's tokens it covers; on an empty state and 0 when
-        there is none or cache is false. page_digests are prompt's full page
+        there is none. page_digests are prompt's full page
         hashes. request_id, distinct among open leases, names the request whose
         puts the lease references."""
         with self._lock:
-            found, covered = (
-                self._find(prompt, page_digests)
-                if cache
-                else (StoredState(State(), []), 0)
-            )
+            found, covered = self._find(prompt, page_digests)
             for h in found.page_keys:
                 self._reference(h)
             lease = Lease(self, found.state, found.page_keys)

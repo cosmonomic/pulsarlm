@@ -226,9 +226,10 @@ def test_a_follow_up_continues_from_a_stored_state(client):
 
     state = client.app.state.server_state
     prompt = encode(state, follow_up)
-    with state.store.lease(
-        prompt, state.engine.page_digests(prompt), request_id=0, cache=True
-    ) as (_, token_count):
+    with state.store.lease(prompt, state.engine.page_digests(prompt), request_id=0) as (
+        _,
+        token_count,
+    ):
         assert token_count >= 2 * PAGE_SIZE
     assert post(client, messages=follow_up, max_tokens=4).status_code == 200
 
@@ -247,7 +248,7 @@ def test_a_reply_ending_at_any_stop_token_leaves_its_end_state_findable():
         state = app.state.server_state
         prompt = encode(state, follow_up)
         with state.store.lease(
-            prompt, state.engine.page_digests(prompt), request_id=0, cache=True
+            prompt, state.engine.page_digests(prompt), request_id=0
         ) as (_, token_count):
             assert token_count == first["usage"]["prompt_tokens"]
 
