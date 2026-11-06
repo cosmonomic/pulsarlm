@@ -10,6 +10,7 @@ benchmark = [
     "openai",
     "wonderwords",
     "harbor>=0.25.0",
+    "scipy>=1.18.1",
 ]
 
 [tool.uv.sources]
