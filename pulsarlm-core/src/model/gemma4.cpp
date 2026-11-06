@@ -22,7 +22,7 @@ const std::string prefix = "model.language_model.";
 
 at::Tensor need(const c10::Dict<std::string, at::Tensor>& weights, const std::string& name) {
     if (!weights.contains(prefix + name)) {
-        throw std::invalid_argument(std::format("Gemma4Model: missing weight {:?}", prefix + name));
+        throw std::invalid_argument(std::format("gemma4_model: missing weight {:?}", prefix + name));
     }
     return weights.at(prefix + name);
 }
@@ -38,17 +38,17 @@ at::Tensor scaled(const at::Tensor& x, double scale) {
 
 }  // namespace
 
-Gemma4Model::Gemma4Model(gemma4_config config, const c10::Dict<std::string, at::Tensor>& weights)
+gemma4_model::gemma4_model(gemma4_config config, const c10::Dict<std::string, at::Tensor>& weights)
 : config(std::move(config)),
   n_layers(static_cast<std::int64_t>(this->config.layer_types.size())),
   embed_tokens(need(weights, "embed_tokens.weight")),
   norm(need(weights, "norm.weight")) {
     const gemma4_config& c = this->config;
     if (c.layer_types.empty() || c.layer_types.back() != gemma4_layer_type::full_attention) {
-        throw std::invalid_argument("Gemma4Model: the last layer must be a full-attention layer");
+        throw std::invalid_argument("gemma4_model: the last layer must be a full-attention layer");
     }
     if (c.num_kv_shared_layers < 0 || c.num_kv_shared_layers >= n_layers) {
-        throw std::invalid_argument("Gemma4Model: num_kv_shared_layers must leave a layer keeping KV");
+        throw std::invalid_argument("gemma4_model: num_kv_shared_layers must leave a layer keeping KV");
     }
     std::int64_t first_shared = n_layers - c.num_kv_shared_layers;
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
@@ -74,7 +74,7 @@ Gemma4Model::Gemma4Model(gemma4_config config, const c10::Dict<std::string, at::
         }
         if (source < 0) {
             throw std::invalid_argument(
-                std::format("Gemma4Model: KV-shared layer {} has no earlier layer of its type", layer)
+                std::format("gemma4_model: KV-shared layer {} has no earlier layer of its type", layer)
             );
         }
         kv_layer_of.push_back(kv_layer_of[source]);
@@ -88,7 +88,7 @@ Gemma4Model::Gemma4Model(gemma4_config config, const c10::Dict<std::string, at::
     }
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
         const std::string p = "layers." + std::to_string(layer) + ".";
-        LayerWeights w{
+        layer_weights w{
             .input_layernorm = need(weights, p + "input_layernorm.weight"),
             .post_attention_layernorm = need(weights, p + "post_attention_layernorm.weight"),
             .pre_feedforward_layernorm = need(weights, p + "pre_feedforward_layernorm.weight"),
@@ -130,16 +130,16 @@ Gemma4Model::Gemma4Model(gemma4_config config, const c10::Dict<std::string, at::
     hidden_ones = at::ones({c.hidden_size}, embed_tokens.options());
 }
 
-bool Gemma4Model::sliding(std::int64_t layer) const {
+bool gemma4_model::sliding(std::int64_t layer) const {
     return config.layer_types[layer] == gemma4_layer_type::sliding_attention;
 }
 
-std::vector<kv_layer> Gemma4Model::kv_layers() const {
+std::vector<kv_layer> gemma4_model::kv_layers() const {
     return kv_specs;
 }
 
 // [ntok, n_layers, hidden_size_per_layer_input].
-at::Tensor Gemma4Model::per_layer_inputs(const at::Tensor& tokens, const at::Tensor& embedded) const {
+at::Tensor gemma4_model::per_layer_inputs(const at::Tensor& tokens, const at::Tensor& embedded) const {
     const std::int64_t ntok = tokens.size(0);
     const std::int64_t width = config.hidden_size_per_layer_input;
     at::Tensor by_token = scaled(embed_tokens_per_layer.index_select(0, tokens), std::sqrt(static_cast<double>(width)))
@@ -151,9 +151,13 @@ at::Tensor Gemma4Model::per_layer_inputs(const at::Tensor& tokens, const at::Ten
     return (projected + by_token) * std::pow(2.0, -0.5);
 }
 
-at::Tensor
-Gemma4Model::attention(const at::Tensor& h, std::int64_t layer, const GroupBatch& g, std::span<const kv> lines) const {
-    const LayerWeights& w = layers[layer];
+at::Tensor gemma4_model::attention(
+    const at::Tensor& h,
+    std::int64_t layer,
+    const group_batch& g,
+    std::span<const kv> lines
+) const {
+    const layer_weights& w = layers[layer];
     const std::int64_t ntok = h.size(0);
     const std::size_t kv_index = kv_layer_of[layer];
     const kv_layer& spec = kv_specs[kv_index];
@@ -194,8 +198,8 @@ Gemma4Model::attention(const at::Tensor& h, std::int64_t layer, const GroupBatch
     return at::linear(o.reshape({ntok, config.n_heads * head_dim}), w.o_proj);
 }
 
-at::Tensor Gemma4Model::experts(const at::Tensor& x, std::int64_t layer) const {
-    const LayerWeights& w = layers[layer];
+at::Tensor gemma4_model::experts(const at::Tensor& x, std::int64_t layer) const {
+    const layer_weights& w = layers[layer];
     const double eps = config.rms_norm_eps;
 
     at::Tensor routed = rmsnorm_cuda(x, hidden_ones, eps) * w.router_scale *
@@ -215,14 +219,14 @@ at::Tensor Gemma4Model::experts(const at::Tensor& x, std::int64_t layer) const {
     );
 }
 
-at::Tensor Gemma4Model::block(
+at::Tensor gemma4_model::block(
     at::Tensor x,
     std::int64_t layer,
     const at::Tensor& per_layer_input,
-    const GroupBatch& g,
+    const group_batch& g,
     std::span<const kv> lines
 ) const {
-    const LayerWeights& w = layers[layer];
+    const layer_weights& w = layers[layer];
     const double eps = config.rms_norm_eps;
     at::Tensor attended = attention(rmsnorm_cuda(x, w.input_layernorm, eps), layer, g, lines);
     x = x + rmsnorm_cuda(attended, w.post_attention_layernorm, eps);
@@ -242,7 +246,7 @@ at::Tensor Gemma4Model::block(
     return x * w.layer_scalar;
 }
 
-at::Tensor Gemma4Model::head(const at::Tensor& x) const {
+at::Tensor gemma4_model::head(const at::Tensor& x) const {
     at::Tensor logits = at::matmul(rmsnorm_cuda(x, norm, config.rms_norm_eps), embed_tokens.t());
     if (config.final_logit_softcapping) {
         logits = at::tanh(logits / *config.final_logit_softcapping) * *config.final_logit_softcapping;
@@ -250,7 +254,7 @@ at::Tensor Gemma4Model::head(const at::Tensor& x) const {
     return logits;
 }
 
-at::Tensor Gemma4Model::group_forward(const GroupBatch& g, std::span<const kv> lines) const {
+at::Tensor gemma4_model::group_forward(const group_batch& g, std::span<const kv> lines) const {
     at::Tensor x = scaled(embed_tokens.index_select(0, g.tokens), std::sqrt(static_cast<double>(config.hidden_size)));
     at::Tensor per_layer;
     if (config.hidden_size_per_layer_input > 0) {
@@ -262,8 +266,8 @@ at::Tensor Gemma4Model::group_forward(const GroupBatch& g, std::span<const kv> l
     return head(logit_inputs(x, g));
 }
 
-StepLogits Gemma4Model::forward(const StepBatch& batch, std::span<const kv> lines) {
-    return paged_forward(batch, [&](const GroupBatch& g) { return group_forward(g, lines); });
+step_logits gemma4_model::forward(const step_batch& batch, std::span<const kv> lines) {
+    return paged_forward(batch, [&](const group_batch& g) { return group_forward(g, lines); });
 }
 
 }  // namespace pulsarlm

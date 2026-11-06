@@ -241,7 +241,7 @@ at::Tensor index_scores_cuda(
     double scale
 );
 
-// Fused int4 dequant-GEMM: y = x @ dequant(W)^T for a Linear with group-wise
+// Fused int4 dequant-GEMM: y = x @ dequant(W)^T for a linear with group-wise
 // symmetric int4 weights. Computes y[m,n] = sum_k x[m,k] * w_deq[n,k] with
 // w_deq[n,k] = int4(weight_packed[n,k]) * weight_scale[n, k/group_size].
 //   x             [M, K]    fp16/bf16, contiguous

@@ -21,7 +21,7 @@ namespace attn {
 
 constexpr size_t kSharedMemoryWithoutOptIn = 48 * 1024;
 
-template <typename scalar_t> struct PagedAttnParams {
+template <typename scalar_t> struct paged_attn_params {
     const scalar_t* q;  // [total_q, n_q_heads, head_dim], rotated
     const scalar_t* k_pool;  // [num_pages, page_size, n_kv_heads, head_dim], unrotated
     const scalar_t* v_pool;  // [num_pages, page_size, n_kv_heads, head_dim]
@@ -55,26 +55,26 @@ template <typename scalar_t> struct PagedAttnParams {
 };
 
 template <typename scalar_t>
-__device__ __forceinline__ int first_key(const PagedAttnParams<scalar_t>& p, int query_index) {
+__device__ __forceinline__ int first_key(const paged_attn_params<scalar_t>& p, int query_index) {
     return p.sliding_window > 0 ? max(0, query_index - p.sliding_window + 1) : 0;
 }
 
 // Key element d as stored, times its k_norm_weight entry when there is one.
 template <typename scalar_t>
-__device__ __forceinline__ float stored_key(const PagedAttnParams<scalar_t>& p, scalar_t value, int d) {
+__device__ __forceinline__ float stored_key(const paged_attn_params<scalar_t>& p, scalar_t value, int d) {
     const float key = static_cast<float>(value);
     return p.k_norm_weight ? __fmul_rn(key, p.k_norm_weight[d]) : key;
 }
 
 template <typename scalar_t>
 __device__ __forceinline__ void
-stored_key_pair(const PagedAttnParams<scalar_t>& p, const scalar_t* key, int pair, int half, float& lo, float& hi) {
+stored_key_pair(const paged_attn_params<scalar_t>& p, const scalar_t* key, int pair, int half, float& lo, float& hi) {
     lo = stored_key(p, key[pair], pair);
     hi = stored_key(p, key[pair + half], pair + half);
 }
 
 // The RoPE positions of one sequence's keys by their view index.
-struct KeyPositions {
+struct key_positions {
     const int32_t* page_positions;
     int page_size;
 
@@ -84,8 +84,9 @@ struct KeyPositions {
 };
 
 template <typename scalar_t>
-__device__ __forceinline__ KeyPositions key_positions(const PagedAttnParams<scalar_t>& p, int s, int page_size) {
-    return KeyPositions{p.page_positions + static_cast<int64_t>(s) * p.max_pages, page_size};
+__device__ __forceinline__ key_positions
+sequence_key_positions(const paged_attn_params<scalar_t>& p, int s, int page_size) {
+    return key_positions{p.page_positions + static_cast<int64_t>(s) * p.max_pages, page_size};
 }
 
 // cos/sin of the RoPE angle position * turns_per_position, rounded to fp32.
@@ -112,7 +113,7 @@ rope_sincos_turns(int position, uint64_t turns_per_position, float& cos_out, flo
     sin_out = __uint_as_float(__float_as_uint(swapped ? cosine : sine) ^ sin_sign);
 }
 
-template <typename scalar_t> struct RotatedPair {
+template <typename scalar_t> struct rotated_pair {
     scalar_t lo;
     scalar_t hi;
 };
@@ -121,8 +122,8 @@ template <typename scalar_t> struct RotatedPair {
 // the pool dtype. The rounding modes are explicit so that every kernel holding the
 // same key computes the same bits.
 template <typename scalar_t>
-__device__ __forceinline__ RotatedPair<scalar_t> rope_rotate(float lo, float hi, float cos_a, float sin_a) {
-    return RotatedPair<scalar_t>{
+__device__ __forceinline__ rotated_pair<scalar_t> rope_rotate(float lo, float hi, float cos_a, float sin_a) {
+    return rotated_pair<scalar_t>{
         static_cast<scalar_t>(__fsub_rn(__fmul_rn(lo, cos_a), __fmul_rn(hi, sin_a))),
         static_cast<scalar_t>(__fadd_rn(__fmul_rn(hi, cos_a), __fmul_rn(lo, sin_a))),
     };
@@ -130,7 +131,7 @@ __device__ __forceinline__ RotatedPair<scalar_t> rope_rotate(float lo, float hi,
 
 // The row of sequence s's view page b in mass_sum and weight_sum, so two views sharing a line accumulate apart.
 template <typename scalar_t>
-__device__ __forceinline__ int64_t mass_row(const PagedAttnParams<scalar_t>& p, int s, int view_page) {
+__device__ __forceinline__ int64_t mass_row(const paged_attn_params<scalar_t>& p, int s, int view_page) {
     const int row = p.cu_view_pages[s] + view_page;
     CUDA_KERNEL_ASSERT(row < p.cu_view_pages[s + 1] && row < p.total_view_pages);
     return row;

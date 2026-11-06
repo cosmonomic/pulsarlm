@@ -37,8 +37,8 @@ at::Tensor to_device(const at::Tensor& host, at::Device device) {
     return host.defined() ? host.to(host.options().device(device), /*non_blocking=*/true) : host;
 }
 
-GroupBatch to_device(const GroupBatch& host, at::Device device) {
-    return GroupBatch{
+group_batch to_device(const group_batch& host, at::Device device) {
+    return group_batch{
         .tokens = to_device(host.tokens, device),
         .pos = to_device(host.pos, device),
         .page_end_tokens = to_device(host.page_end_tokens, device),
@@ -53,7 +53,7 @@ GroupBatch to_device(const GroupBatch& host, at::Device device) {
 // zeroed parts of one tensor, which it returns: per such layer in turn, its mass_sum, then its weight_sum.
 // host_cu_view_pages is on the host.
 at::Tensor zero_page_mass(
-    GroupBatch& on_device,
+    group_batch& on_device,
     const at::Tensor& host_cu_view_pages,
     const std::vector<std::size_t>& mass_heads
 ) {
@@ -202,7 +202,7 @@ class scheduler::batch {
     std::vector<entry> entries;
     std::size_t decode_count = 0;
     // Pinned host tensors.
-    StepBatch inputs;
+    step_batch inputs;
     // Pinned host int64, one token per entry that samples, in entry order.
     at::Tensor sampled_tokens;
     // Pinned host fp32, defined for a group that measures mass: the page mass of each KV layer that measures it in
@@ -212,14 +212,18 @@ class scheduler::batch {
 
     batch(std::span<sequence* const> running, std::size_t page_size, std::size_t prefill_tokens_per_step);
 
-    static GroupBatch make_group(std::span<const entry> group, std::size_t page_size, bool prefill);
+    static group_batch make_group(std::span<const entry> group, std::size_t page_size, bool prefill);
     static bool measures_mass(std::span<const entry> group) noexcept;
-    // The group's tables of lines, or of positions with positions, as GroupBatch lays them out.
+    // The group's tables of lines, or of positions with positions, as group_batch lays them out.
     static at::Tensor page_tables(std::span<const entry> group, std::size_t n_kv_layers, bool positions);
     // Queues on stream the inputs' copies, the forward, the copies of the page mass to the host, the sampling and the
     // copy of the sampled tokens to the host. mass_heads is the scheduler's.
-    void
-    enqueue(Model& model, std::span<const kv> lines, const std::vector<std::size_t>& mass_heads, cudaStream_t stream);
+    void enqueue(
+        model& served_model,
+        std::span<const kv> lines,
+        const std::vector<std::size_t>& mass_heads,
+        cudaStream_t stream
+    );
     // Per KV layer, the mass_sum the step gave each of entry index's view pages, mass_heads[layer] values per page, and
     // their weight_sum; empty for a layer that measures none. The entry's group measures mass.
     struct layer_step_mass {
@@ -506,7 +510,7 @@ scheduler::batch::batch(
     }
 }
 
-GroupBatch scheduler::batch::make_group(std::span<const entry> group, std::size_t page_size, bool prefill) {
+group_batch scheduler::batch::make_group(std::span<const entry> group, std::size_t page_size, bool prefill) {
     std::size_t token_count = 0;
     for (const entry& e : group) {
         token_count += e.token_count;
@@ -515,7 +519,7 @@ GroupBatch scheduler::batch::make_group(std::span<const entry> group, std::size_
     auto n_tokens = static_cast<std::int64_t>(token_count);
     auto n_seqs = static_cast<std::int64_t>(group.size());
     auto n_kv_layers = static_cast<std::int64_t>(n_layers);
-    GroupBatch g{
+    group_batch g{
         .tokens = pinned({n_tokens}, at::kLong),
         .pos = pinned({n_tokens}, at::kLong),
     };
@@ -589,14 +593,14 @@ at::Tensor scheduler::batch::page_tables(std::span<const entry> group, std::size
 }
 
 void scheduler::batch::enqueue(
-    Model& model,
+    model& served_model,
     std::span<const kv> lines,
     const std::vector<std::size_t>& mass_heads,
     cudaStream_t stream
 ) {
     at::Device device = lines.front().k.device();
     c10::cuda::CUDAStreamGuard guard(c10::cuda::getStreamFromExternal(stream, device.index()));
-    StepBatch on_device;
+    step_batch on_device;
     std::span<entry> all(entries);
     at::Tensor decode_on_device, prefill_on_device;
     if (inputs.decode_group) {
@@ -617,7 +621,7 @@ void scheduler::batch::enqueue(
             prefill_on_device = zero_page_mass(*on_device.prefill_group, inputs.prefill_group->cu_view_pages, mass_heads);
         }
     }
-    StepLogits logits = model.forward(on_device, lines);
+    step_logits logits = served_model.forward(on_device, lines);
     if (decode_on_device.defined()) {
         decode_mass = pinned(decode_on_device.sizes(), at::kFloat);
         decode_mass.copy_(decode_on_device, /*non_blocking=*/true);
@@ -651,7 +655,7 @@ void scheduler::batch::enqueue(
 std::vector<scheduler::batch::layer_step_mass>
 scheduler::batch::step_mass(std::size_t index, const std::vector<std::size_t>& mass_heads) const {
     const bool decodes = index < decode_count;
-    const GroupBatch& group = decodes ? *inputs.decode_group : *inputs.prefill_group;
+    const group_batch& group = decodes ? *inputs.decode_group : *inputs.prefill_group;
     const float* mass = (decodes ? decode_mass : prefill_mass).const_data_ptr<float>();
     std::size_t s = decodes ? index : index - decode_count;
     auto row_size = static_cast<std::size_t>(group.cu_view_pages.size(1));
@@ -677,14 +681,14 @@ scheduler::batch::step_mass(std::size_t index, const std::vector<std::size_t>& m
 }
 
 scheduler::scheduler(
-    Model& model,
+    model& served_model,
     kv_cache cache,
     cudaStream_t stream,
     digest root,
     std::vector<std::int64_t>&& stop_ids,
     std::size_t prefill_tokens_per_step
 )
-: model(model),
+: served_model(served_model),
   cache(std::move(cache)),
   stream(stream),
   page_size(0),
@@ -692,7 +696,7 @@ scheduler::scheduler(
   stop_ids(std::move(stop_ids)),
   prefill_tokens_per_step(prefill_tokens_per_step) {
     assert(prefill_tokens_per_step > 0);
-    std::vector<kv_layer> layers = model.kv_layers();
+    std::vector<kv_layer> layers = served_model.kv_layers();
     assert(layers.size() == this->cache.layer_count());
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
         lines.push_back(this->cache.tensors(layer));
@@ -875,7 +879,7 @@ task<scheduler::batch> scheduler::build_batch() {
 }
 
 task<void> scheduler::launch(batch& b) {
-    b.enqueue(model, lines, mass_heads, stream);
+    b.enqueue(served_model, lines, mass_heads, stream);
     co_await synchronize(stream);
 }
 

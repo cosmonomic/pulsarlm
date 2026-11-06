@@ -43,7 +43,7 @@ template <typename scalar_t, int PAGE_SIZE, int HEAD_DIM, int KEY_PAGES> constex
 // Query tiles are 16 query tokens of one sequence, numbered in sequence order. Sets the
 // sequence and first local query of tile; false past the last tile.
 template <typename scalar_t>
-__device__ __forceinline__ bool query_tile(const PagedAttnParams<scalar_t>& p, int tile, int& s, int& qbase) {
+__device__ __forceinline__ bool query_tile(const paged_attn_params<scalar_t>& p, int tile, int& s, int& qbase) {
     for (s = 0; s < p.num_seqs; ++s) {
         const int tiles = (p.cu_seqlens_q[s + 1] - p.cu_seqlens_q[s] + 15) / 16;
         if (tile < tiles) {
@@ -57,7 +57,7 @@ __device__ __forceinline__ bool query_tile(const PagedAttnParams<scalar_t>& p, i
 
 template <typename scalar_t, int PAGE_SIZE, int HEAD_DIM, bool BF16, int NWARPS, int KEY_PAGES, int CTAS_PER_SM>
 __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kernel(
-    const PagedAttnParams<scalar_t> p,
+    const paged_attn_params<scalar_t> p,
     const scalar_t* __restrict__ rotated_k  // [num_seqs * max_pages, page_size, n_kv_heads, head_dim]
 ) {
     constexpr int KEY_TILE = PAGE_SIZE * KEY_PAGES;

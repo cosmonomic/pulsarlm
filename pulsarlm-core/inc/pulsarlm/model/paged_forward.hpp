@@ -31,7 +31,7 @@ at::Tensor paged_attention(
     const kv& lines,
     std::size_t kv_layer,
     std::size_t reader,
-    const GroupBatch& g,
+    const group_batch& g,
     double scale,
     const rope_parameters& rope,
     std::optional<int64_t> sliding_window = std::nullopt,
@@ -52,9 +52,9 @@ at::Tensor routed_experts(
 );
 
 // The rows of x whose logits g asks for.
-at::Tensor logit_inputs(const at::Tensor& x, const GroupBatch& g);
+at::Tensor logit_inputs(const at::Tensor& x, const group_batch& g);
 
 // The logits group_forward returns for each present group of batch.
-StepLogits paged_forward(const StepBatch& batch, const std::function<at::Tensor(const GroupBatch&)>& group_forward);
+step_logits paged_forward(const step_batch& batch, const std::function<at::Tensor(const group_batch&)>& group_forward);
 
 }  // namespace pulsarlm

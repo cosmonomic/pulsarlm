@@ -15,7 +15,7 @@
 namespace pulsarlm {
 namespace attn {
 
-struct AttnTuning {
+struct attn_tuning {
     int sm_arch;  // major * 10 + minor; kAnyArch matches any device
     int prefill_warps;  // warps per CTA of attn_prefill_tc_kernel
     int prefill_key_pages;  // pages one prefill key tile spans
@@ -33,7 +33,7 @@ constexpr int kAnyArch = -1;
 // A row that states no occupancy floor must keep prefill_warps at 4: at 4 warps
 // the time is flat across every prefill_ctas_per_sm, while 8 warps only reaches
 // the same time when a floor of 4 forces its register use down.
-constexpr AttnTuning kAttnTuningTable[] = {
+constexpr attn_tuning kAttnTuningTable[] = {
     // sm_arch, prefill_warps, prefill_key_pages, prefill_ctas_per_sm, decode_warps
     {120, 4, 2, 1, 8},
     {kAnyArch, 4, 2, 1, 8},

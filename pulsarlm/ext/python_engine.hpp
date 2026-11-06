@@ -34,7 +34,7 @@ using any_model_config = std::
     variant<model_config, gemma4_config, qwen3_5_config, qwen3_5_moe_config, qwen4_exp_config>;
 
 // weights carry Hugging Face's names and are on the engine's device.
-std::unique_ptr<Model>
+std::unique_ptr<model>
 make_model(const any_model_config& config, const std::unordered_map<std::string, at::Tensor>& weights);
 
 // Python's handle on a request. Dropping it cancels the request.
@@ -60,7 +60,11 @@ class python_engine {
     std::unique_ptr<engine> core_engine;
 
   public:
-    python_engine(std::unique_ptr<Model> model, const engine_config& config, std::unique_ptr<page_store>&& store);
+    python_engine(
+        std::unique_ptr<model> served_model,
+        const engine_config& config,
+        std::unique_ptr<page_store>&& store
+    );
     python_engine(const python_engine&) = delete;
     python_engine& operator=(const python_engine&) = delete;
     ~python_engine();

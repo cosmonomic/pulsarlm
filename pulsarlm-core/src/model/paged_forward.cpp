@@ -28,7 +28,7 @@ at::Tensor paged_attention(
     const kv& lines,
     std::size_t kv_layer,
     std::size_t reader,
-    const GroupBatch& g,
+    const group_batch& g,
     double scale,
     const rope_parameters& rope,
     std::optional<int64_t> sliding_window,
@@ -129,12 +129,12 @@ at::Tensor routed_experts(
     return at::zeros_like(h).index_add_(0, assigned_tokens, weighted);
 }
 
-at::Tensor logit_inputs(const at::Tensor& x, const GroupBatch& g) {
+at::Tensor logit_inputs(const at::Tensor& x, const group_batch& g) {
     return g.logit_rows.defined() ? x.index_select(0, g.logit_rows) : x;
 }
 
-StepLogits paged_forward(const StepBatch& batch, const std::function<at::Tensor(const GroupBatch&)>& group_forward) {
-    StepLogits logits;
+step_logits paged_forward(const step_batch& batch, const std::function<at::Tensor(const group_batch&)>& group_forward) {
+    step_logits logits;
     if (batch.prefill_group) {
         logits.prefill_logits = group_forward(*batch.prefill_group);
     }

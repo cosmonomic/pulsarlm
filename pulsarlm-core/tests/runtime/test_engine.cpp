@@ -60,14 +60,14 @@ struct stalling_store final : pulsarlm::page_store {
 };
 
 // Predicts each token's successor, mod vocab.
-class successor_model final : public pulsarlm::Model {
+class successor_model final : public pulsarlm::model {
   public:
     std::vector<pulsarlm::kv_layer> kv_layers() const override {
         return one_layer;
     }
 
-    pulsarlm::StepLogits forward(const pulsarlm::StepBatch& batch, std::span<const pulsarlm::kv>) override {
-        pulsarlm::StepLogits logits;
+    pulsarlm::step_logits forward(const pulsarlm::step_batch& batch, std::span<const pulsarlm::kv>) override {
+        pulsarlm::step_logits logits;
         if (batch.prefill_group) {
             logits.prefill_logits = predict(*batch.prefill_group);
         }
@@ -78,7 +78,7 @@ class successor_model final : public pulsarlm::Model {
     }
 
   private:
-    static at::Tensor predict(const pulsarlm::GroupBatch& g) {
+    static at::Tensor predict(const pulsarlm::group_batch& g) {
         return pulsarlm::logit_inputs(
             at::one_hot((g.tokens + 1) % static_cast<std::int64_t>(vocab), vocab).to(at::kFloat),
             g
@@ -86,13 +86,13 @@ class successor_model final : public pulsarlm::Model {
     }
 };
 
-class failing_model final : public pulsarlm::Model {
+class failing_model final : public pulsarlm::model {
   public:
     std::vector<pulsarlm::kv_layer> kv_layers() const override {
         return one_layer;
     }
 
-    pulsarlm::StepLogits forward(const pulsarlm::StepBatch&, std::span<const pulsarlm::kv>) override {
+    pulsarlm::step_logits forward(const pulsarlm::step_batch&, std::span<const pulsarlm::kv>) override {
         throw std::runtime_error("forward failed");
     }
 };

@@ -45,8 +45,8 @@ struct gemma4_config {
     std::int64_t top_k_experts = 0;
 };
 
-class Gemma4Model : public Model {
-    struct LayerWeights {
+class gemma4_model : public model {
+    struct layer_weights {
         at::Tensor input_layernorm;
         at::Tensor post_attention_layernorm;
         at::Tensor pre_feedforward_layernorm;
@@ -90,7 +90,7 @@ class Gemma4Model : public Model {
     at::Tensor embed_tokens_per_layer;
     at::Tensor per_layer_model_projection;
     at::Tensor per_layer_projection_norm;
-    std::vector<LayerWeights> layers;
+    std::vector<layer_weights> layers;
     // For the weightless RMSNorms: on V, one per head dim, and in the router.
     at::Tensor sliding_ones;
     at::Tensor full_ones;
@@ -102,21 +102,22 @@ class Gemma4Model : public Model {
         at::Tensor x,
         std::int64_t layer,
         const at::Tensor& per_layer_input,
-        const GroupBatch& g,
+        const group_batch& g,
         std::span<const kv> lines
     ) const;
-    at::Tensor attention(const at::Tensor& h, std::int64_t layer, const GroupBatch& g, std::span<const kv> lines) const;
+    at::Tensor
+    attention(const at::Tensor& h, std::int64_t layer, const group_batch& g, std::span<const kv> lines) const;
     // The experts' output for the hidden states x a layer's MLP block starts from.
     at::Tensor experts(const at::Tensor& x, std::int64_t layer) const;
     at::Tensor head(const at::Tensor& x) const;
-    at::Tensor group_forward(const GroupBatch& g, std::span<const kv> lines) const;
+    at::Tensor group_forward(const group_batch& g, std::span<const kv> lines) const;
 
   public:
     // weights are on the lines' device and dtype.
-    Gemma4Model(gemma4_config config, const c10::Dict<std::string, at::Tensor>& weights);
+    gemma4_model(gemma4_config config, const c10::Dict<std::string, at::Tensor>& weights);
 
     std::vector<kv_layer> kv_layers() const override;
-    StepLogits forward(const StepBatch& batch, std::span<const kv> lines) override;
+    step_logits forward(const step_batch& batch, std::span<const kv> lines) override;
 };
 
 }  // namespace pulsarlm

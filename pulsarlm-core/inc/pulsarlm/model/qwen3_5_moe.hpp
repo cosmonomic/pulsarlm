@@ -44,9 +44,9 @@ struct qwen3_5_moe_config {
 // A Gated DeltaNet layer keeps two recurrent KV layers: its delta rule state S, fp32 [value heads, key head dim, value
 // head dim], then its convolution's last linear_conv_kernel - 1 inputs, [conv channels, linear_conv_kernel - 1] in the
 // weights' dtype.
-class Qwen3_5MoeModel : public Model {
-    // Query and key heads are stored with their dims permuted as Qwen3_5Model stores them.
-    struct AttentionWeights {
+class qwen3_5_moe_model : public model {
+    // Query and key heads are stored with their dims permuted as qwen3_5_model stores them.
+    struct attention_weights {
         at::Tensor q_proj;  // [n_heads * 2 * head_dim, hidden], each head's query then gate
         at::Tensor k_proj;
         at::Tensor v_proj;
@@ -55,7 +55,7 @@ class Qwen3_5MoeModel : public Model {
         at::Tensor k_norm;
     };
 
-    struct DeltaNetWeights {
+    struct deltanet_weights {
         at::Tensor in_proj_qkv;
         at::Tensor in_proj_z;
         at::Tensor in_proj_b;
@@ -67,7 +67,7 @@ class Qwen3_5MoeModel : public Model {
         at::Tensor out_proj;
     };
 
-    struct MoeWeights {
+    struct moe_weights {
         at::Tensor router;  // [num_experts, hidden]
         at::Tensor experts_gate_up_proj;  // [num_experts, 2 * moe_intermediate_size, hidden]
         at::Tensor experts_down_proj;  // [num_experts, hidden, moe_intermediate_size]
@@ -77,12 +77,12 @@ class Qwen3_5MoeModel : public Model {
         at::Tensor shared_expert_gate;  // [1, hidden]
     };
 
-    struct LayerWeights {
+    struct layer_weights {
         at::Tensor input_layernorm;  // fp32 1 + weight
         at::Tensor post_attention_layernorm;
-        MoeWeights moe;
-        std::optional<AttentionWeights> attention;
-        std::optional<DeltaNetWeights> deltanet;
+        moe_weights moe;
+        std::optional<attention_weights> attention;
+        std::optional<deltanet_weights> deltanet;
     };
 
     qwen3_5_moe_config config;
@@ -94,20 +94,21 @@ class Qwen3_5MoeModel : public Model {
     at::Tensor embed_tokens;
     at::Tensor lm_head;
     at::Tensor norm;  // fp32 1 + weight
-    std::vector<LayerWeights> layers;
+    std::vector<layer_weights> layers;
 
     bool full_attention(std::int64_t layer) const;
-    at::Tensor attention(const at::Tensor& h, std::int64_t layer, const GroupBatch& g, std::span<const kv> lines) const;
-    at::Tensor deltanet(const at::Tensor& h, std::int64_t layer, const GroupBatch& g, std::span<const kv> lines) const;
+    at::Tensor
+    attention(const at::Tensor& h, std::int64_t layer, const group_batch& g, std::span<const kv> lines) const;
+    at::Tensor deltanet(const at::Tensor& h, std::int64_t layer, const group_batch& g, std::span<const kv> lines) const;
     at::Tensor moe(const at::Tensor& h, std::int64_t layer) const;
-    at::Tensor group_forward(const GroupBatch& g, std::span<const kv> lines) const;
+    at::Tensor group_forward(const group_batch& g, std::span<const kv> lines) const;
 
   public:
     // weights are on the lines' device, in the attention lines' dtype.
-    Qwen3_5MoeModel(qwen3_5_moe_config config, const c10::Dict<std::string, at::Tensor>& weights);
+    qwen3_5_moe_model(qwen3_5_moe_config config, const c10::Dict<std::string, at::Tensor>& weights);
 
     std::vector<kv_layer> kv_layers() const override;
-    StepLogits forward(const StepBatch& batch, std::span<const kv> lines) override;
+    step_logits forward(const step_batch& batch, std::span<const kv> lines) override;
 };
 
 }  // namespace pulsarlm

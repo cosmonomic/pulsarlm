@@ -23,7 +23,7 @@ namespace {
 // attends, each running an online softmax over its pages' keys and adding weight times
 // each page's max score into the page's mass_sum; the softmaxes combine with the flash
 // rescale.
-template <typename scalar_t, int PAGE_SIZE> __global__ void attn_scalar_kernel(const PagedAttnParams<scalar_t> p) {
+template <typename scalar_t, int PAGE_SIZE> __global__ void attn_scalar_kernel(const paged_attn_params<scalar_t> p) {
     const int tid = threadIdx.x;
     const int blk = blockIdx.x;
     const int qtok = blk / p.n_q_heads;
@@ -52,7 +52,7 @@ template <typename scalar_t, int PAGE_SIZE> __global__ void attn_scalar_kernel(c
     const int first = first_key(p, query_pos);
     const int first_page = first / PAGE_SIZE;
     const int last_page = query_pos / PAGE_SIZE;
-    const KeyPositions layout = key_positions(p, s, PAGE_SIZE);
+    const key_positions layout = sequence_key_positions(p, s, PAGE_SIZE);
     const int32_t* seq_table = p.page_tables + static_cast<int64_t>(s) * p.max_pages;
     const float weight = p.mass_sum ? p.query_weights[qtok] : 0.0f;
 
@@ -154,7 +154,7 @@ void check_pools(const char* op, const at::Tensor& k_pool, const at::Tensor& v_p
     );
 }
 
-PagedAttnBatch paged_attn_batch(
+paged_attn_batch make_paged_attn_batch(
     const char* op,
     const at::Tensor& q,
     const at::Tensor& k_pool,
@@ -189,7 +189,7 @@ PagedAttnBatch paged_attn_batch(
     TORCH_CHECK(q.dim() == 3, op, ": q must be 3-D [total_q, n_q_heads, head_dim]");
     check_pools(op, k_pool, v_pool);
 
-    PagedAttnBatch b;
+    paged_attn_batch b;
     b.total_q = q.size(0);
     b.n_q_heads = q.size(1);
     b.head_dim = q.size(2);
@@ -291,7 +291,7 @@ PagedAttnBatch paged_attn_batch(
     return b;
 }
 
-void launch_attn_scalar(const PagedAttnBatch& batch, cudaStream_t stream) {
+void launch_attn_scalar(const paged_attn_batch& batch, cudaStream_t stream) {
     if (batch.total_q == 0 || batch.num_seqs == 0) {
         return;
     }

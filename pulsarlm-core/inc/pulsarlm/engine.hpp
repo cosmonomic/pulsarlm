@@ -49,7 +49,7 @@ std::vector<page_shape> page_shapes(const engine_config& config, std::span<const
 // serving end with loop_exited and the engine is shut down: calling submit after a request ended with loop_exited is
 // undefined.
 class engine {
-    std::unique_ptr<Model> model;
+    std::unique_ptr<model> served_model;
     at::Device device;
     cudaStream_t stream;
     std::size_t page_size;
@@ -66,7 +66,7 @@ class engine {
     void run_loop(std::latch& started);
 
   public:
-    engine(std::unique_ptr<Model> model, const engine_config& config, std::unique_ptr<page_store>&& store);
+    engine(std::unique_ptr<model> served_model, const engine_config& config, std::unique_ptr<page_store>&& store);
     engine(const engine&) = delete;
     engine& operator=(const engine&) = delete;
     ~engine();

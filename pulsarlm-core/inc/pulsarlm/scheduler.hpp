@@ -39,7 +39,7 @@ class scheduler {
     class sequence;
     class batch;
 
-    Model& model;
+    model& served_model;
     // One layer per KV layer, in the model's KV layer order.
     kv_cache cache;
     std::vector<kv> lines;
@@ -83,7 +83,7 @@ class scheduler {
     // pages start from. A step forwards every decoding sequence and at most prefill_tokens_per_step tokens of the
     // others.
     scheduler(
-        Model& model,
+        model& served_model,
         kv_cache cache,
         cudaStream_t stream,
         digest root,

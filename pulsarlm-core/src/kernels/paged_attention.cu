@@ -43,9 +43,9 @@
 namespace pulsarlm {
 namespace {
 
-using attn::KeyPositions;
+using attn::key_positions;
 using attn::kThreads;
-using attn::PagedAttnParams;
+using attn::paged_attn_params;
 
 // One block per token; the n_kv_heads*head_dim elements are strided across the
 // block's threads. The pools may be one tensor.
@@ -109,7 +109,7 @@ constexpr int decode_tiles_per_page(int page_size, int head_dim) {
 
 // Every tile size is a multiple of 16 bytes, which keeps each tile 16-byte aligned for
 // ldmatrix. sQ and the ring's tiles are staged through attn::swizzled_offset.
-template <typename scalar_t, int HEAD_DIM, int NWARPS> struct DecodeTiles {
+template <typename scalar_t, int HEAD_DIM, int NWARPS> struct decode_tiles {
     static constexpr int KEY_TILE = decode_key_tile(HEAD_DIM);
     static constexpr int QKT_PARTS = attn::qkt_parts<KEY_TILE, NWARPS>();
     static constexpr int TILE_ELEMS = KEY_TILE * HEAD_DIM;
@@ -127,8 +127,8 @@ template <typename scalar_t, int HEAD_DIM, int NWARPS> struct DecodeTiles {
             sizeof(float) * (QKT_PARTS * 16 * KEY_TILE + 3 * 16);
     }
 
-    __device__ static DecodeTiles carve(unsigned char* base) {
-        DecodeTiles tiles;
+    __device__ static decode_tiles carve(unsigned char* base) {
+        decode_tiles tiles;
         tiles.sQ = reinterpret_cast<scalar_t*>(base);
         tiles.ring = tiles.sQ + 16 * HEAD_DIM;
         tiles.sP = tiles.ring + 2 * 2 * TILE_ELEMS;
@@ -157,7 +157,7 @@ int64_t window_tile_span(int64_t sliding_window, int64_t tile_keys) {
 // the softmax state.
 template <typename scalar_t, int HEAD_DIM, int NWARPS>
 __device__ __forceinline__ void
-begin_group(const PagedAttnParams<scalar_t>& p, int s, int g, scalar_t* sQ, float* Mrow, float* Lrow) {
+begin_group(const paged_attn_params<scalar_t>& p, int s, int g, scalar_t* sQ, float* Mrow, float* Lrow) {
     const int tid = threadIdx.x;
     for (int i = tid; i < 16 * HEAD_DIM; i += NWARPS * 32) {
         const int row = i / HEAD_DIM, col = i % HEAD_DIM;
@@ -192,21 +192,21 @@ begin_group(const PagedAttnParams<scalar_t>& p, int s, int g, scalar_t* sQ, floa
 // the staged values.
 template <typename scalar_t, int PAGE_SIZE, int HEAD_DIM, bool BF16, int NWARPS>
 __device__ __forceinline__ void tc_attend_tiles(
-    const PagedAttnParams<scalar_t>& p,
+    const paged_attn_params<scalar_t>& p,
     int s,
     int g,
     int ctx_len,
     int first,
-    const KeyPositions& layout,
+    const key_positions& layout,
     float* __restrict__ group_mass,
     float* __restrict__ page_weight,
     int t_start,
     int t_end,
-    const DecodeTiles<scalar_t, HEAD_DIM, NWARPS>& tiles,
+    const decode_tiles<scalar_t, HEAD_DIM, NWARPS>& tiles,
     float* out
 ) {
-    using Tiles = DecodeTiles<scalar_t, HEAD_DIM, NWARPS>;
-    constexpr int KEY_TILE = Tiles::KEY_TILE;
+    using tiles_type = decode_tiles<scalar_t, HEAD_DIM, NWARPS>;
+    constexpr int KEY_TILE = tiles_type::KEY_TILE;
     constexpr int THREADS = NWARPS * 32;
     constexpr int HALF = HEAD_DIM / 2;
     static_assert(sizeof(scalar_t) == 2, "the tile staging moves 8 elements at a time");
@@ -342,7 +342,7 @@ __device__ __forceinline__ void tc_attend_tiles(
             const int c = j * ROW_LANES + row_lane;
             float raw_score = 0.0f;
 #pragma unroll
-            for (int part = 0; part < Tiles::QKT_PARTS; ++part) {
+            for (int part = 0; part < tiles_type::QKT_PARTS; ++part) {
                 raw_score += sS[(part * 16 + row) * KEY_TILE + c];
             }
             scores[j] = attended(tile_base + c) ? p.scale * raw_score : -CUDART_INF_F;
@@ -417,18 +417,18 @@ __device__ __forceinline__ void tc_attend_tiles(
 // Sequence s's mass_sum entries for kv head g's query rows, and its weight_sum entries for kv head 0; null for both
 // when the op measures no mass.
 template <typename scalar_t>
-__device__ __forceinline__ float* group_mass_entries(const PagedAttnParams<scalar_t>& p, int s, int g) {
+__device__ __forceinline__ float* group_mass_entries(const paged_attn_params<scalar_t>& p, int s, int g) {
     return p.mass_sum ? p.mass_sum + attn::mass_row(p, s, 0) * p.n_q_heads + g * p.group : nullptr;
 }
 
 template <typename scalar_t>
-__device__ __forceinline__ float* page_weight_entries(const PagedAttnParams<scalar_t>& p, int s, int g) {
+__device__ __forceinline__ float* page_weight_entries(const paged_attn_params<scalar_t>& p, int s, int g) {
     return p.mass_sum && g == 0 ? p.weight_sum + attn::mass_row(p, s, 0) : nullptr;
 }
 
 // Single-CTA tensor-core decode: one CTA per (seq s, kv head g) attends the whole view.
 template <typename scalar_t, int PAGE_SIZE, int HEAD_DIM, bool BF16, int NWARPS>
-__global__ void __launch_bounds__(NWARPS * 32) attn_decode_tc_kernel(const PagedAttnParams<scalar_t> p) {
+__global__ void __launch_bounds__(NWARPS * 32) attn_decode_tc_kernel(const paged_attn_params<scalar_t> p) {
     const int tid = threadIdx.x;
     const int s = blockIdx.x / p.n_kv_heads;
     const int g = blockIdx.x % p.n_kv_heads;
@@ -436,7 +436,7 @@ __global__ void __launch_bounds__(NWARPS * 32) attn_decode_tc_kernel(const Paged
     const int first = attn::first_key(p, ctx_len - 1);
 
     extern __shared__ __align__(16) unsigned char shared_memory[];
-    const auto tiles = DecodeTiles<scalar_t, HEAD_DIM, NWARPS>::carve(shared_memory);
+    const auto tiles = decode_tiles<scalar_t, HEAD_DIM, NWARPS>::carve(shared_memory);
     const float* Lrow = tiles.Lrow;
     float out[attn::pv_slabs_per_warp<HEAD_DIM, NWARPS>() * attn::kPvSlabAccums] = {};
 
@@ -448,7 +448,7 @@ __global__ void __launch_bounds__(NWARPS * 32) attn_decode_tc_kernel(const Paged
         g,
         ctx_len,
         first,
-        attn::key_positions(p, s, PAGE_SIZE),
+        attn::sequence_key_positions(p, s, PAGE_SIZE),
         group_mass_entries(p, s, g),
         page_weight_entries(p, s, g),
         0,
@@ -469,7 +469,7 @@ __global__ void __launch_bounds__(NWARPS * 32) attn_decode_tc_kernel(const Paged
 
 template <typename scalar_t, int PAGE_SIZE, int HEAD_DIM, bool BF16, int NWARPS>
 __global__ void __launch_bounds__(NWARPS * 32) paged_decode_split_kernel(
-    const PagedAttnParams<scalar_t> p,
+    const paged_attn_params<scalar_t> p,
     float* __restrict__ o_partial,
     float* __restrict__ m_partial,
     float* __restrict__ l_partial,
@@ -485,7 +485,7 @@ __global__ void __launch_bounds__(NWARPS * 32) paged_decode_split_kernel(
     const int first = attn::first_key(p, ctx_len - 1);
 
     extern __shared__ __align__(16) unsigned char shared_memory[];
-    const auto tiles = DecodeTiles<scalar_t, HEAD_DIM, NWARPS>::carve(shared_memory);
+    const auto tiles = decode_tiles<scalar_t, HEAD_DIM, NWARPS>::carve(shared_memory);
     const float* Mrow = tiles.Mrow;
     const float* Lrow = tiles.Lrow;
     float out[attn::pv_slabs_per_warp<HEAD_DIM, NWARPS>() * attn::kPvSlabAccums] = {};
@@ -494,7 +494,7 @@ __global__ void __launch_bounds__(NWARPS * 32) paged_decode_split_kernel(
     __syncthreads();
     // Slices start on page boundaries, so every page's max is one CTA's.
     constexpr int TILES_PER_PAGE = decode_tiles_per_page(PAGE_SIZE, HEAD_DIM);
-    const int first_tile = first / DecodeTiles<scalar_t, HEAD_DIM, NWARPS>::KEY_TILE / TILES_PER_PAGE * TILES_PER_PAGE;
+    const int first_tile = first / decode_tiles<scalar_t, HEAD_DIM, NWARPS>::KEY_TILE / TILES_PER_PAGE * TILES_PER_PAGE;
     const int t_start = first_tile + split * tiles_per_split;
     tc_attend_tiles<scalar_t, PAGE_SIZE, HEAD_DIM, BF16, NWARPS>(
         p,
@@ -502,7 +502,7 @@ __global__ void __launch_bounds__(NWARPS * 32) paged_decode_split_kernel(
         g,
         ctx_len,
         first,
-        attn::key_positions(p, s, PAGE_SIZE),
+        attn::sequence_key_positions(p, s, PAGE_SIZE),
         group_mass_entries(p, s, g),
         page_weight_entries(p, s, g),
         t_start,
@@ -530,7 +530,7 @@ __global__ void __launch_bounds__(NWARPS * 32) paged_decode_split_kernel(
 // weight per split.
 template <typename scalar_t>
 __global__ void paged_decode_combine_kernel(
-    const PagedAttnParams<scalar_t> p,
+    const paged_attn_params<scalar_t> p,
     float* __restrict__ lse_out,
     const float* __restrict__ o_partial,
     const float* __restrict__ m_partial,
@@ -599,14 +599,14 @@ int auto_splits(int64_t base_ctas, int64_t max_tiles, int64_t resident_ctas) {
     return static_cast<int>(best_splits);
 }
 
-template <typename scalar_t, bool BF16> int64_t resident_split_ctas(const attn::PagedAttnBatch& b) {
+template <typename scalar_t, bool BF16> int64_t resident_split_ctas(const attn::paged_attn_batch& b) {
     int64_t resident = 0;
     attn::dispatch_page_head("attn_decode", b.page_size, b.head_dim, [&](auto bs_tag, auto hd_tag) {
         constexpr int BS = decltype(bs_tag)::value;
         constexpr int HD = decltype(hd_tag)::value;
         attn::dispatch_attn_tuning([&](auto row_tag) {
             constexpr int NWARPS = attn::kAttnTuningTable[decltype(row_tag)::value].decode_warps;
-            constexpr size_t smem = DecodeTiles<scalar_t, HD, NWARPS>::bytes();
+            constexpr size_t smem = decode_tiles<scalar_t, HD, NWARPS>::bytes();
             static const int64_t kernel_resident = [] {
                 const auto kernel = paged_decode_split_kernel<scalar_t, BS, HD, BF16, NWARPS>;
                 attn::allow_shared_memory(kernel, smem);
@@ -621,8 +621,8 @@ template <typename scalar_t, bool BF16> int64_t resident_split_ctas(const attn::
 }
 
 template <typename scalar_t, bool BF16>
-void launch_tc_decode(const attn::PagedAttnBatch& b, int64_t forced_splits, cudaStream_t stream) {
-    const PagedAttnParams<scalar_t> p = b.params<scalar_t>();
+void launch_tc_decode(const attn::paged_attn_batch& b, int64_t forced_splits, cudaStream_t stream) {
+    const paged_attn_params<scalar_t> p = b.params<scalar_t>();
     const int64_t group = b.n_q_heads / b.n_kv_heads;
     const int64_t base_ctas = b.num_seqs * b.n_kv_heads;
     auto fopts = b.q.options().dtype(at::kFloat);
@@ -646,7 +646,7 @@ void launch_tc_decode(const attn::PagedAttnBatch& b, int64_t forced_splits, cuda
             constexpr int HD = decltype(hd_tag)::value;
             attn::dispatch_attn_tuning([&](auto row_tag) {
                 constexpr int NWARPS = attn::kAttnTuningTable[decltype(row_tag)::value].decode_warps;
-                constexpr size_t smem = DecodeTiles<scalar_t, HD, NWARPS>::bytes();
+                constexpr size_t smem = decode_tiles<scalar_t, HD, NWARPS>::bytes();
                 const auto kernel = attn_decode_tc_kernel<scalar_t, BS, HD, BF16, NWARPS>;
                 attn::allow_shared_memory(kernel, smem);
                 kernel<<<static_cast<int>(base_ctas), NWARPS * 32, smem, stream>>>(p);
@@ -667,7 +667,7 @@ void launch_tc_decode(const attn::PagedAttnBatch& b, int64_t forced_splits, cuda
         constexpr int HD = decltype(hd_tag)::value;
         attn::dispatch_attn_tuning([&](auto row_tag) {
             constexpr int NWARPS = attn::kAttnTuningTable[decltype(row_tag)::value].decode_warps;
-            constexpr size_t smem = DecodeTiles<scalar_t, HD, NWARPS>::bytes();
+            constexpr size_t smem = decode_tiles<scalar_t, HD, NWARPS>::bytes();
             const auto kernel = paged_decode_split_kernel<scalar_t, BS, HD, BF16, NWARPS>;
             attn::allow_shared_memory(kernel, smem);
             kernel<<<static_cast<int>(base_ctas * nsplits), NWARPS * 32, smem, stream>>>(
@@ -699,7 +699,7 @@ bool attn::decode_fits(int64_t page_size, int64_t head_dim) {
     attn::dispatch_page_head("attn_decode", page_size, head_dim, [&](auto, auto hd_tag) {
         attn::dispatch_attn_tuning([&](auto row_tag) {
             constexpr int NWARPS = attn::kAttnTuningTable[decltype(row_tag)::value].decode_warps;
-            fits = attn::fits_shared_memory(DecodeTiles<at::Half, decltype(hd_tag)::value, NWARPS>::bytes());
+            fits = attn::fits_shared_memory(decode_tiles<at::Half, decltype(hd_tag)::value, NWARPS>::bytes());
         });
     });
     return fits;
@@ -707,7 +707,7 @@ bool attn::decode_fits(int64_t page_size, int64_t head_dim) {
 
 namespace {
 
-at::Tensor paged_decode(const attn::PagedAttnBatch& b, int64_t num_splits) {
+at::Tensor paged_decode(const attn::paged_attn_batch& b, int64_t num_splits) {
     TORCH_CHECK(num_splits >= 0, "attn_decode: num_splits must be >= 0");
     if (b.num_seqs == 0) {
         return b.o;
@@ -833,7 +833,7 @@ at::Tensor attn_decode_cuda(
     const std::optional<at::Tensor>& query_weights,
     int64_t num_splits
 ) {
-    const auto batch = attn::paged_attn_batch(
+    const auto batch = attn::make_paged_attn_batch(
         "attn_decode",
         q,
         k_pool,

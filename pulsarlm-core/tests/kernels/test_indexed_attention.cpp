@@ -26,14 +26,14 @@ at::Tensor int32_cuda(const std::vector<int32_t>& v) {
     return at::tensor(v, at::dtype(at::kInt)).to(at::kCUDA);
 }
 
-struct View {
+struct sequence_view {
     std::vector<int32_t> lines;
     int64_t ctx;
     int64_t seq_q;
 };
 
-struct Batch {
-    std::vector<View> views;
+struct view_batch {
+    std::vector<sequence_view> views;
     at::Tensor page_tables;
     at::Tensor cu_seqlens_q;
     at::Tensor seqlens_k;
@@ -45,8 +45,10 @@ struct Batch {
     int64_t total_q = 0;
 };
 
-Batch make_batch(int64_t page_size) {
-    Batch b{.views = {View{{0, 3, 5, 1}, 3 * page_size + 5, 24}, View{{2, 4}, page_size + 3, 1}}};
+view_batch make_batch(int64_t page_size) {
+    view_batch b{
+        .views = {sequence_view{{0, 3, 5, 1}, 3 * page_size + 5, 24}, sequence_view{{2, 4}, page_size + 3, 1}}
+    };
     std::vector<int32_t> tables(b.views.size() * kMaxPages, 0), seqlens, cu_q{0}, cu_view;
     for (size_t s = 0; s < b.views.size(); ++s) {
         std::copy(b.views[s].lines.begin(), b.views[s].lines.end(), tables.begin() + s * kMaxPages);
@@ -63,7 +65,7 @@ Batch make_batch(int64_t page_size) {
                            .expand_as(b.page_tables)
                            .contiguous();
     b.cu_view_pages = int32_cuda(cu_view);
-    for (const View& view : b.views) {
+    for (const sequence_view& view : b.views) {
         for (int64_t r = 0; r < view.seq_q; ++r) {
             b.weights.push_back(kAlpha * std::pow(1.0 - kAlpha, static_cast<double>(view.seq_q - 1 - r)));
         }
@@ -74,10 +76,10 @@ Batch make_batch(int64_t page_size) {
 }
 
 // Each query's blocks at random, its own block always among them.
-at::Tensor random_selection(const Batch& b, int64_t page_size, int64_t words) {
+at::Tensor random_selection(const view_batch& b, int64_t page_size, int64_t words) {
     at::Tensor bits = at::zeros({b.total_q, words * 32}, at::kBool);
     int64_t row = 0;
-    for (const View& view : b.views) {
+    for (const sequence_view& view : b.views) {
         for (int64_t r = 0; r < view.seq_q; ++r, ++row) {
             const int64_t p = view.ctx - view.seq_q + r;
             const int64_t blocks = p / kBlockSize + 1;
@@ -89,7 +91,7 @@ at::Tensor random_selection(const Batch& b, int64_t page_size, int64_t words) {
     return (bits.view({b.total_q, words, 32}).to(at::kLong) * weights).sum(-1).to(at::kInt).to(at::kCUDA);
 }
 
-at::Tensor full_selection(const Batch& b, int64_t words) {
+at::Tensor full_selection(const view_batch& b, int64_t words) {
     return at::full({b.total_q, words}, -1, at::device(at::kCUDA).dtype(at::kInt));
 }
 
@@ -103,7 +105,7 @@ bool selected(const at::Tensor& host_bits, int64_t row, int64_t key) {
 // the queries attending one of the page's keys of their weight times their max scaled score over its keys they attend;
 // weight_sum is [view pages], the sum of those weights.
 void reference(
-    const Batch& b,
+    const view_batch& b,
     const at::Tensor& q,
     const at::Tensor& k_pool,
     const at::Tensor& v_pool,
@@ -120,7 +122,7 @@ void reference(
     at::Tensor host_weight = at::zeros(weight_sum.sizes(), at::kDouble);
     int64_t row = 0;
     for (size_t s = 0; s < b.views.size(); ++s) {
-        const View& view = b.views[s];
+        const sequence_view& view = b.views[s];
         auto lines = at::tensor(std::vector<int64_t>(view.lines.begin(), view.lines.end())).to(at::kCUDA);
         auto k = k_pool.index_select(0, lines).view({-1, n_kv, head_dim}).slice(0, 0, view.ctx).to(at::kFloat);
         auto pos = at::arange(view.ctx, at::device(at::kCUDA).dtype(at::kLong)).view({-1, 1});
@@ -177,7 +179,7 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
     const pulsarlm::rope_parameters rope{.theta = 1e4, .partial_rotary_factor = 0.25};
     const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
     at::manual_seed(7);
-    Batch b = make_batch(page_size);
+    view_batch b = make_batch(page_size);
     auto opts = at::device(at::kCUDA).dtype(dtype);
     auto k_pool = at::randn({num_lines, page_size, n_kv, head_dim}, opts);
     auto v_pool = at::randn({num_lines, page_size, n_kv, head_dim}, opts);

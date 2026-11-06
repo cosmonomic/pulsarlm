@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-// Qwen3_5Model's paged forward against a dense ATen Qwen3.5 written from Hugging Face's code, with the delta rule run
+// qwen3_5_model's paged forward against a dense ATen Qwen3.5 written from Hugging Face's code, with the delta rule run
 // token by token: chunked prefill then decode, checking the logits, the states the recurrent lines hold at the end and
 // at the newest page end, and the K the attention lines hold.
 
@@ -250,7 +250,7 @@ std::vector<std::int64_t> rope_permutation() {
 }
 
 // A step of the single sequence forwarding the tokens at positions [first, last).
-pulsarlm::GroupBatch step(
+pulsarlm::group_batch step(
     const at::Tensor& tokens,
     std::int64_t first,
     std::int64_t last,
@@ -269,7 +269,7 @@ pulsarlm::GroupBatch step(
     std::int64_t page_end = last / page_size * page_size;
     auto n_kv_layers = static_cast<std::int64_t>(specs.size());
     auto key_count = int32_cuda({static_cast<std::int32_t>(last)}).expand({n_kv_layers, 1}).contiguous();
-    pulsarlm::GroupBatch g{
+    pulsarlm::group_batch g{
         .tokens = tokens.narrow(0, first, last - first),
         .pos = at::arange(first, last, cuda(at::kLong)),
         .page_tables = int32_cuda(rows).view({n_kv_layers, 1, -1}),
@@ -334,7 +334,7 @@ void check_against_dense(at::ScalarType dtype, double tolerance, std::optional<p
     weights w(dtype);
     const c10::Dict<std::string, at::Tensor> model_weights = block ? fp8_model_weights(w, *block, dtype)
                                                                    : w.named_tensors;
-    pulsarlm::Qwen3_5Model model(
+    pulsarlm::qwen3_5_model model(
         pulsarlm::qwen3_5_config{
             .vocab_size = vocab,
             .hidden_size = hidden,
@@ -384,9 +384,9 @@ void check_against_dense(at::ScalarType dtype, double tolerance, std::optional<p
     for (chunk c :
          {chunk{0, 21, true}, chunk{21, 37, true}, chunk{37, 47, true}, chunk{47, 48, false}, chunk{48, 49, false}}) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
-        pulsarlm::StepBatch batch;
+        pulsarlm::step_batch batch;
         (c.prefill ? batch.prefill_group : batch.decode_group) = step(tokens, c.first, c.last, c.prefill, specs);
-        pulsarlm::StepLogits logits = model.forward(batch, kv);
+        pulsarlm::step_logits logits = model.forward(batch, kv);
         auto expected_logits = dense.logits.narrow(0, c.first, c.last - c.first);
         CHECK(
             max_relative_error(*(c.prefill ? logits.prefill_logits : logits.decode_logits), expected_logits) < tolerance

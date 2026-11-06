@@ -59,9 +59,9 @@ struct qwen4_exp_config {
 // recurrent KV layers. A PLE layer then keeps two more: its convolution's
 // last (kernel - 1) * ngram_size inputs, [hc_count * hidden, (kernel - 1) * ngram_size] in the weights' dtype, and the
 // last ngram_size - 1 tokens, int64, each XOR eos_token_id so that a zeroed line holds EOS.
-class Qwen4ExpModel : public Model {
-    // Query and key heads are stored with their dims permuted as Qwen3_5Model stores them.
-    struct AttentionWeights {
+class qwen4_exp_model : public model {
+    // Query and key heads are stored with their dims permuted as qwen3_5_model stores them.
+    struct attention_weights {
         at::Tensor q_proj;  // [n_heads * 2 * head_dim, hidden], each head's query then gate
         at::Tensor k_proj;
         at::Tensor v_proj;
@@ -73,7 +73,7 @@ class Qwen4ExpModel : public Model {
         at::Tensor index_k_norm;
     };
 
-    struct DeltaNetWeights {
+    struct deltanet_weights {
         at::Tensor in_proj_qkv;
         at::Tensor in_proj_z;
         at::Tensor in_proj_b;
@@ -85,7 +85,7 @@ class Qwen4ExpModel : public Model {
         at::Tensor out_proj;
     };
 
-    struct MoeWeights {
+    struct moe_weights {
         at::Tensor router;  // [num_experts, hidden]
         at::Tensor experts_gate_up_proj;  // [num_experts, 2 * moe_intermediate_size, hidden]
         at::Tensor experts_down_proj;  // [num_experts, hidden, moe_intermediate_size]
@@ -95,18 +95,18 @@ class Qwen4ExpModel : public Model {
         at::Tensor shared_expert_gate;  // [1, hidden]
     };
 
-    struct MixerWeights {
+    struct mixer_weights {
         at::Tensor hc_norm;  // fp32 1 + weight, [hc_count * hidden], one RMSNorm per stream
         at::Tensor input_mix_weight_down;
         at::Tensor input_mix_weight_up;
     };
 
-    struct HyperConnectionWeights {
-        MixerWeights mixer;
+    struct hyper_connection_weights {
+        mixer_weights mixer;
         at::Tensor block_inject_weight;
     };
 
-    struct PleWeights {
+    struct ple_weights {
         at::Tensor key_proj;
         at::Tensor value_proj;
         at::Tensor norm_key;  // fp32 1 + weight, one RMSNorm per stream
@@ -119,16 +119,16 @@ class Qwen4ExpModel : public Model {
         at::Tensor ngram_embedding;  // [rows, embedding dim / n-gram heads]
     };
 
-    struct LayerWeights {
-        HyperConnectionWeights attn_hyper_connection;
-        HyperConnectionWeights mlp_hyper_connection;
-        MoeWeights moe;
-        std::optional<AttentionWeights> attention;
-        std::optional<DeltaNetWeights> deltanet;
-        std::optional<PleWeights> ple;
+    struct layer_weights {
+        hyper_connection_weights attn_hyper_connection;
+        hyper_connection_weights mlp_hyper_connection;
+        moe_weights moe;
+        std::optional<attention_weights> attention;
+        std::optional<deltanet_weights> deltanet;
+        std::optional<ple_weights> ple;
     };
 
-    struct MixedInput {
+    struct mixed_input {
         at::Tensor input;  // [ntok, hidden]
         at::Tensor injection_weights;  // [ntok, hc_count]
     };
@@ -143,8 +143,8 @@ class Qwen4ExpModel : public Model {
     std::vector<kv_layer> kv_specs;
     at::Tensor embed_tokens;
     at::Tensor lm_head;
-    MixerWeights hyper_connection_mixer;
-    std::vector<LayerWeights> layers;
+    mixer_weights hyper_connection_mixer;
+    std::vector<layer_weights> layers;
 
     bool indexed_attention(std::int64_t layer) const;
     // x [..., indexer_head_dim] with its first rotary_dim dims rotated as Hugging Face rotates them, at positions
@@ -152,7 +152,7 @@ class Qwen4ExpModel : public Model {
     at::Tensor index_rope(const at::Tensor& x, const at::Tensor& positions) const;
     // int32 [ntok, words]: each query's selected blocks, as attn_indexed_cuda reads them.
     at::Tensor selected_blocks(
-        const AttentionWeights& w,
+        const attention_weights& w,
         const at::Tensor& queries,
         const kv& lines,
         const at::Tensor& page_tables,
@@ -162,23 +162,24 @@ class Qwen4ExpModel : public Model {
     ) const;
     at::Tensor stream_norm(const at::Tensor& x, const at::Tensor& weight) const;
     // The mix of the normed streams [ntok, hc_count * hidden] a sublayer or the head reads.
-    at::Tensor mixed_streams(const at::Tensor& normed, const MixerWeights& w) const;
-    MixedInput mix(const at::Tensor& x, const HyperConnectionWeights& w) const;
+    at::Tensor mixed_streams(const at::Tensor& normed, const mixer_weights& w) const;
+    mixed_input mix(const at::Tensor& x, const hyper_connection_weights& w) const;
     at::Tensor final_mix(const at::Tensor& x) const;
-    at::Tensor attention(const at::Tensor& h, std::int64_t layer, const GroupBatch& g, std::span<const kv> lines) const;
-    at::Tensor deltanet(const at::Tensor& h, std::int64_t layer, const GroupBatch& g, std::span<const kv> lines) const;
+    at::Tensor
+    attention(const at::Tensor& h, std::int64_t layer, const group_batch& g, std::span<const kv> lines) const;
+    at::Tensor deltanet(const at::Tensor& h, std::int64_t layer, const group_batch& g, std::span<const kv> lines) const;
     at::Tensor moe(const at::Tensor& h, std::int64_t layer) const;
     // Each token's n-gram ids into the layer's table, [ntok, n-gram heads], updating its token lines.
-    at::Tensor ngram_ids(const PleWeights& w, std::size_t token_layer, const GroupBatch& g, const kv& lines) const;
-    at::Tensor ple(const at::Tensor& x, std::int64_t layer, const GroupBatch& g, std::span<const kv> lines) const;
-    at::Tensor group_forward(const GroupBatch& g, std::span<const kv> lines) const;
+    at::Tensor ngram_ids(const ple_weights& w, std::size_t token_layer, const group_batch& g, const kv& lines) const;
+    at::Tensor ple(const at::Tensor& x, std::int64_t layer, const group_batch& g, std::span<const kv> lines) const;
+    at::Tensor group_forward(const group_batch& g, std::span<const kv> lines) const;
 
   public:
     // weights are on the lines' device, in the attention lines' dtype; the PLE buffers are int64.
-    Qwen4ExpModel(qwen4_exp_config config, const c10::Dict<std::string, at::Tensor>& weights);
+    qwen4_exp_model(qwen4_exp_config config, const c10::Dict<std::string, at::Tensor>& weights);
 
     std::vector<kv_layer> kv_layers() const override;
-    StepLogits forward(const StepBatch& batch, std::span<const kv> lines) override;
+    step_logits forward(const step_batch& batch, std::span<const kv> lines) override;
 };
 
 }  // namespace pulsarlm

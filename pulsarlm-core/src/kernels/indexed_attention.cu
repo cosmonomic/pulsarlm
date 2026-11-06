@@ -25,7 +25,7 @@ namespace {
 
 // The selection of one batch: bit b of query q's row, word b / 32, bit b % 32, selects view keys
 // [b * block_size, (b + 1) * block_size).
-struct Selection {
+struct block_selection {
     const uint32_t* bits;
     int words;
     int block_size;
@@ -41,7 +41,7 @@ struct Selection {
 };
 
 // The sequence of query token qtok, by binary search over cu_seqlens_q.
-template <typename scalar_t> __device__ int sequence_of(const attn::PagedAttnParams<scalar_t>& p, int qtok) {
+template <typename scalar_t> __device__ int sequence_of(const attn::paged_attn_params<scalar_t>& p, int qtok) {
     int lo = 0, hi = p.num_seqs;
     while (hi - lo > 1) {
         const int mid = (lo + hi) >> 1;
@@ -56,7 +56,7 @@ template <typename scalar_t> __device__ int sequence_of(const attn::PagedAttnPar
 
 // One CTA per (query token, query head), as attn_scalar_kernel, its threads striding over pages up to the query's.
 template <typename scalar_t, int PAGE_SIZE>
-__global__ void attn_indexed_scalar_kernel(const attn::PagedAttnParams<scalar_t> p, const Selection selection) {
+__global__ void attn_indexed_scalar_kernel(const attn::paged_attn_params<scalar_t> p, const block_selection selection) {
     const int tid = threadIdx.x;
     const int blk = blockIdx.x;
     const int qtok = blk / p.n_q_heads;
@@ -70,7 +70,7 @@ __global__ void attn_indexed_scalar_kernel(const attn::PagedAttnParams<scalar_t>
     const int seq_q = p.cu_seqlens_q[s + 1] - q0;
     const int ctx_len = p.seqlens_k[s];
     const int query_pos = ctx_len - seq_q + (qtok - q0);
-    const attn::KeyPositions layout = attn::key_positions(p, s, PAGE_SIZE);
+    const attn::key_positions layout = attn::sequence_key_positions(p, s, PAGE_SIZE);
     const int32_t* seq_table = p.page_tables + static_cast<int64_t>(s) * p.max_pages;
 
     // Dynamic shared: [ qsh(head_dim) | out_acc(head_dim) | red(kThreads) ]
@@ -159,8 +159,8 @@ __global__ void attn_indexed_scalar_kernel(const attn::PagedAttnParams<scalar_t>
 // One thread per (query row, selection word): marks the view pages of the row's sequence its selected blocks lie in.
 template <typename scalar_t>
 __global__ void mark_selected_pages_kernel(
-    const attn::PagedAttnParams<scalar_t> p,
-    const Selection selection,
+    const attn::paged_attn_params<scalar_t> p,
+    const block_selection selection,
     int total_q,
     int page_size,
     int32_t* __restrict__ selected_pages
@@ -184,7 +184,7 @@ __global__ void mark_selected_pages_kernel(
 // rotate_view_keys_kernel.
 template <typename scalar_t>
 __global__ void rotate_indexed_keys_kernel(
-    const attn::PagedAttnParams<scalar_t> p,
+    const attn::paged_attn_params<scalar_t> p,
     int page_size,
     const int32_t* __restrict__ selected_pages,
     scalar_t* __restrict__ rotated_k
@@ -198,7 +198,7 @@ __global__ void rotate_indexed_keys_kernel(
     const int half = p.head_dim / 2;
     const int pairs_per_key = p.n_kv_heads * half;
     const int64_t page_elems = static_cast<int64_t>(page_size) * p.n_kv_heads * p.head_dim;
-    const attn::KeyPositions layout = attn::key_positions(p, s, page_size);
+    const attn::key_positions layout = attn::sequence_key_positions(p, s, page_size);
     const int line = p.page_tables[static_cast<int64_t>(s) * p.max_pages + view_page];
     const scalar_t* src = p.k_pool + line * p.page_stride;
     scalar_t* dst = rotated_k + blockIdx.x * page_elems;
@@ -221,8 +221,8 @@ __global__ void rotate_indexed_keys_kernel(
 // the token's next selected blocks in view order. The tile, sweep and staging arithmetic is attn_prefill_tc_kernel's.
 template <typename scalar_t, int PAGE_SIZE, int HEAD_DIM, bool BF16, int NWARPS, int KEY_PAGES, int CTAS_PER_SM>
 __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kernel(
-    const attn::PagedAttnParams<scalar_t> p,
-    const Selection selection,
+    const attn::paged_attn_params<scalar_t> p,
+    const block_selection selection,
     const scalar_t* __restrict__ rotated_k  // [num_seqs * max_pages, page_size, n_kv_heads, head_dim]
 ) {
     constexpr int KEY_TILE = PAGE_SIZE * KEY_PAGES;
@@ -483,7 +483,7 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
 }
 
 template <typename scalar_t, bool BF16>
-void launch_indexed_tc(const attn::PagedAttnBatch& b, const Selection& selection, cudaStream_t stream) {
+void launch_indexed_tc(const attn::paged_attn_batch& b, const block_selection& selection, cudaStream_t stream) {
     const int64_t grid = b.total_q * b.n_kv_heads;
     const auto params = b.params<scalar_t>();
     const int64_t view_pages = b.num_seqs * b.max_pages;
@@ -510,7 +510,7 @@ void launch_indexed_tc(const attn::PagedAttnBatch& b, const Selection& selection
         constexpr int BS = decltype(bs_tag)::value;
         constexpr int HD = decltype(hd_tag)::value;
         attn::dispatch_attn_tuning([&](auto row_tag) {
-            constexpr attn::AttnTuning kTuning = attn::kAttnTuningTable[decltype(row_tag)::value];
+            constexpr attn::attn_tuning kTuning = attn::kAttnTuningTable[decltype(row_tag)::value];
             constexpr int NWARPS = kTuning.prefill_warps;
             constexpr int KEY_PAGES = attn::prefill_key_pages<scalar_t, BS, HD, kTuning.prefill_key_pages>();
             constexpr size_t smem = attn::prefill_tile_bytes<scalar_t, BS, HD, KEY_PAGES>();
@@ -527,7 +527,7 @@ void launch_indexed_tc(const attn::PagedAttnBatch& b, const Selection& selection
     });
 }
 
-void launch_indexed_scalar(const attn::PagedAttnBatch& b, const Selection& selection, cudaStream_t stream) {
+void launch_indexed_scalar(const attn::paged_attn_batch& b, const block_selection& selection, cudaStream_t stream) {
     const int64_t blocks = b.total_q * b.n_q_heads;
     const size_t smem = static_cast<size_t>(2 * b.head_dim + attn::kThreads) * sizeof(float);
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, b.q.scalar_type(), "attn_indexed_scalar", [&] {
@@ -559,7 +559,7 @@ at::Tensor attn_indexed_cuda(
     const std::optional<at::Tensor>& cu_view_pages,
     const std::optional<at::Tensor>& query_weights
 ) {
-    const auto b = attn::paged_attn_batch(
+    const auto b = attn::make_paged_attn_batch(
         "attn_indexed",
         q,
         k_pool,
@@ -591,7 +591,7 @@ at::Tensor attn_indexed_cuda(
     if (b.total_q == 0 || b.num_seqs == 0) {
         return b.o;
     }
-    const Selection selection{
+    const block_selection selection{
         .bits = reinterpret_cast<const uint32_t*>(selected.const_data_ptr<int32_t>()),
         .words = static_cast<int>(selected.size(1)),
         .block_size = static_cast<int>(block_size),

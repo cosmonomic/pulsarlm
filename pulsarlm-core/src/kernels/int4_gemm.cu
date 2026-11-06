@@ -17,7 +17,7 @@
 
 // Fused int4 dequant-GEMM: y = x @ dequant(W)^T, i.e.
 //   y[m,n] = sum_k x[m,k] * w_deq[n,k]
-// for a Linear with int4 group-wise symmetric weights.
+// for a linear with int4 group-wise symmetric weights.
 //
 //   x             [M, K]      fp16/bf16, row-major, contiguous (A operand).
 //   weight_packed [N, K/8]    int32; 8 signed int4 per int32 along K, LSB-first

@@ -47,7 +47,7 @@ struct kv {
 // its own view of each sequence: a new token is written into its view page's line, at its view index. A token's RoPE
 // position is the same in every KV layer. A prefill group carries cu_seqlens_q; a decode group, whose sequences forward
 // one token each, leaves it undefined.
-struct GroupBatch {
+struct group_batch {
     at::Tensor tokens;
     // int64 [ntok]: each token's RoPE position.
     at::Tensor pos;
@@ -87,25 +87,25 @@ struct GroupBatch {
 };
 
 // A step's two groups; either may be absent.
-struct StepBatch {
-    std::optional<GroupBatch> prefill_group;
-    std::optional<GroupBatch> decode_group;
+struct step_batch {
+    std::optional<group_batch> prefill_group;
+    std::optional<group_batch> decode_group;
 };
 
 // Each present group's logits [rows, vocab] in the model's dtype.
-struct StepLogits {
+struct step_logits {
     std::optional<at::Tensor> prefill_logits;
     std::optional<at::Tensor> decode_logits;
 };
 
-class Model {
+class model {
   public:
-    virtual ~Model() = default;
+    virtual ~model() = default;
 
     // The layers that keep KV, in the order forward takes their lines. A layer reading another layer's KV is not one.
     virtual std::vector<kv_layer> kv_layers() const = 0;
     // lines holds one kv per entry of kv_layers().
-    virtual StepLogits forward(const StepBatch& batch, std::span<const kv> lines) = 0;
+    virtual step_logits forward(const step_batch& batch, std::span<const kv> lines) = 0;
 };
 
 }  // namespace pulsarlm

@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-// LlamaModel's paged forward, with Llama 3 RoPE scaling and an untied lm_head, against a dense ATen Llama: chunked prefill then decode over pages scattered across the
+// llama_model's paged forward, with Llama 3 RoPE scaling and an untied lm_head, against a dense ATen Llama: chunked prefill then decode over pages scattered across the
 // lines, checking the logits, the unrotated K the lines hold, and the per-page attention mass.
 
 namespace {
@@ -185,9 +185,9 @@ at::Tensor every_layer(const at::Tensor& t) {
 }
 
 // A step of the single sequence forwarding the tokens at positions [first, last).
-pulsarlm::GroupBatch step(const at::Tensor& tokens, std::int64_t first, std::int64_t last, bool prefill) {
+pulsarlm::group_batch step(const at::Tensor& tokens, std::int64_t first, std::int64_t last, bool prefill) {
     auto key_count = every_layer(int32_cuda({static_cast<std::int32_t>(last)}));
-    pulsarlm::GroupBatch g{
+    pulsarlm::group_batch g{
         .tokens = tokens.narrow(0, first, last - first),
         .pos = at::arange(first, last, cuda(at::kLong)),
         .page_tables = every_layer(int32_cuda(view_lines).view({1, -1})),
@@ -218,7 +218,7 @@ double max_relative_error(const at::Tensor& got, const at::Tensor& expected) {
 
 void check_against_dense(at::ScalarType dtype, double tolerance) {
     weights w(dtype);
-    pulsarlm::LlamaModel model(
+    pulsarlm::llama_model model(
         pulsarlm::dense_config{
             .vocab_size = vocab,
             .n_layers = n_layers,
@@ -252,10 +252,10 @@ void check_against_dense(at::ScalarType dtype, double tolerance) {
     for (chunk c :
          {chunk{0, 21, true}, chunk{21, 37, true}, chunk{37, 38, false}, chunk{38, 39, false}, chunk{39, 40, false}}) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
-        pulsarlm::StepBatch batch;
+        pulsarlm::step_batch batch;
         (c.prefill ? batch.prefill_group : batch.decode_group) = step(tokens, c.first, c.last, c.prefill);
-        pulsarlm::StepLogits logits = model.forward(batch, kv);
-        const pulsarlm::GroupBatch& g = c.prefill ? *batch.prefill_group : *batch.decode_group;
+        pulsarlm::step_logits logits = model.forward(batch, kv);
+        const pulsarlm::group_batch& g = c.prefill ? *batch.prefill_group : *batch.decode_group;
 
         auto expected_logits = dense.logits.narrow(0, c.first, c.last - c.first);
         CHECK(max_relative_error(*(c.prefill ? logits.prefill_logits : logits.decode_logits), expected_logits) < tolerance);

@@ -16,8 +16,8 @@
 
 namespace pulsarlm {
 
-class LlamaModel : public Model {
-    struct LayerWeights {
+class llama_model : public model {
+    struct layer_weights {
         at::Tensor input_layernorm;
         at::Tensor post_attention_layernorm;
         at::Tensor q_proj;
@@ -33,17 +33,18 @@ class LlamaModel : public Model {
     at::Tensor embed_tokens;
     at::Tensor lm_head;
     at::Tensor norm;
-    std::vector<LayerWeights> layers;
+    std::vector<layer_weights> layers;
 
-    at::Tensor attention(const at::Tensor& h, std::int64_t layer, const GroupBatch& g, std::span<const kv> lines) const;
-    at::Tensor group_forward(const GroupBatch& g, std::span<const kv> lines) const;
+    at::Tensor
+    attention(const at::Tensor& h, std::int64_t layer, const group_batch& g, std::span<const kv> lines) const;
+    at::Tensor group_forward(const group_batch& g, std::span<const kv> lines) const;
 
   public:
     // weights are on the lines' device and dtype.
-    LlamaModel(dense_config config, const c10::Dict<std::string, at::Tensor>& weights);
+    llama_model(dense_config config, const c10::Dict<std::string, at::Tensor>& weights);
 
     std::vector<kv_layer> kv_layers() const override;
-    StepLogits forward(const StepBatch& batch, std::span<const kv> lines) override;
+    step_logits forward(const step_batch& batch, std::span<const kv> lines) override;
 };
 
 }  // namespace pulsarlm

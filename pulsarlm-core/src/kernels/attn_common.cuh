@@ -22,7 +22,7 @@ namespace attn {
 // One validated call of a paged attention op. cu_seqlens_q is undefined for decode,
 // where sequence s has the one query row s. mass_sum, weight_sum, cu_view_pages and
 // query_weights are all defined or all undefined.
-struct PagedAttnBatch {
+struct paged_attn_batch {
     at::Tensor q;
     at::Tensor k_pool;
     at::Tensor v_pool;
@@ -47,9 +47,9 @@ struct PagedAttnBatch {
     int64_t page_size;
     int64_t max_pages;
 
-    template <typename scalar_t> PagedAttnParams<scalar_t> params() const {
+    template <typename scalar_t> paged_attn_params<scalar_t> params() const {
         auto data = [](const at::Tensor& t) { return t.defined() ? t.data_ptr() : nullptr; };
-        return PagedAttnParams<scalar_t>{
+        return paged_attn_params<scalar_t>{
             static_cast<const scalar_t*>(data(this->q)),
             static_cast<const scalar_t*>(data(this->k_pool)),
             static_cast<const scalar_t*>(data(this->v_pool)),
@@ -90,7 +90,7 @@ void check_pools(const char* op, const at::Tensor& k_pool, const at::Tensor& v_p
 
 // Checks the argument contract the attention ops share (pulsarlm/ops.hpp) and allocates o. op names the caller in
 // every error.
-PagedAttnBatch paged_attn_batch(
+paged_attn_batch make_paged_attn_batch(
     const char* op,
     const at::Tensor& q,
     const at::Tensor& k_pool,
@@ -111,7 +111,7 @@ PagedAttnBatch paged_attn_batch(
 
 // The scalar kernel over the whole batch: the fallback for shapes the tensor-core
 // kernels are not compiled for, and the reference both are checked against.
-void launch_attn_scalar(const PagedAttnBatch& batch, cudaStream_t stream);
+void launch_attn_scalar(const paged_attn_batch& batch, cudaStream_t stream);
 
 // Upper bound on head_dim; sizes the scalar kernels' per-thread output
 // accumulator, which lives in local memory.

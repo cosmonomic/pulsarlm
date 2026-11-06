@@ -24,7 +24,7 @@ const std::string prefix = "model.language_model.";
 
 at::Tensor need(const c10::Dict<std::string, at::Tensor>& weights, const std::string& name) {
     if (!weights.contains(name)) {
-        throw std::invalid_argument(std::format("Qwen3_5Model: missing weight {:?}", name));
+        throw std::invalid_argument(std::format("qwen3_5_model: missing weight {:?}", name));
     }
     return weights.at(name);
 }
@@ -39,14 +39,14 @@ bool quantized(const c10::Dict<std::string, at::Tensor>& weights, const std::str
 
 const fp8_block& block_of(const std::optional<fp8_block>& block, const std::string& name) {
     if (!block) {
-        throw std::invalid_argument(std::format("Qwen3_5Model: {:?} has fp8 scales but no fp8_weight_block", name));
+        throw std::invalid_argument(std::format("qwen3_5_model: {:?} has fp8 scales but no fp8_weight_block", name));
     }
     return *block;
 }
 
 // name is a linear's prefix, such as layers.0.mlp.gate_proj. An fp8 linear may be on the host; it is copied to device
 // only for its repack.
-Linear need_linear(
+linear need_linear(
     const c10::Dict<std::string, at::Tensor>& weights,
     const std::string& name,
     const std::optional<fp8_block>& block,
@@ -54,16 +54,16 @@ Linear need_linear(
 ) {
     at::Tensor weight = need_text(weights, name + ".weight");
     if (!quantized(weights, name)) {
-        return Linear::dense(std::move(weight));
+        return linear::dense(std::move(weight));
     }
     const fp8_block& b = block_of(block, name);
-    return Linear::fp8(weight.to(device), need_text(weights, name + ".weight_scale_inv").to(device), b.n, b.k);
+    return linear::fp8(weight.to(device), need_text(weights, name + ".weight_scale_inv").to(device), b.n, b.k);
 }
 
 // permute reorders a linear's output rows. An fp8 linear's scales expand to one per row first, since the permutation
 // moves rows across the scale blocks.
 template <class row_permutation>
-Linear need_permuted_linear(
+linear need_permuted_linear(
     const c10::Dict<std::string, at::Tensor>& weights,
     const std::string& name,
     const std::optional<fp8_block>& block,
@@ -72,14 +72,14 @@ Linear need_permuted_linear(
 ) {
     const at::Tensor weight = need_text(weights, name + ".weight").to(device);
     if (!quantized(weights, name)) {
-        return Linear::dense(permute(weight));
+        return linear::dense(permute(weight));
     }
     const fp8_block& b = block_of(block, name);
     const at::Tensor row_scale = need_text(weights, name + ".weight_scale_inv")
                                      .to(device)
                                      .repeat_interleave(b.n, 0)
                                      .narrow(0, 0, weight.size(0));
-    return Linear::fp8(permute(weight.view(at::kByte)).view(at::kFloat8_e4m3fn), permute(row_scale), 1, b.k);
+    return linear::fp8(permute(weight.view(at::kByte)).view(at::kFloat8_e4m3fn), permute(row_scale), 1, b.k);
 }
 
 // Hugging Face's Qwen3.5 RMSNorm scales by 1 + weight, in fp32.
@@ -89,7 +89,7 @@ at::Tensor zero_centered(const at::Tensor& weight) {
 
 }  // namespace
 
-Qwen3_5Model::Qwen3_5Model(qwen3_5_config config, const c10::Dict<std::string, at::Tensor>& weights)
+qwen3_5_model::qwen3_5_model(qwen3_5_config config, const c10::Dict<std::string, at::Tensor>& weights)
 : config(std::move(config)),
   n_layers(static_cast<std::int64_t>(this->config.layer_types.size())),
   embed_tokens(need_text(weights, "embed_tokens.weight")),
@@ -97,10 +97,10 @@ Qwen3_5Model::Qwen3_5Model(qwen3_5_config config, const c10::Dict<std::string, a
     const qwen3_5_config& c = this->config;
     const auto rotary_dim = static_cast<std::int64_t>(std::llround(c.partial_rotary_factor * c.head_dim));
     if (rotary_dim % 2 != 0 || rotary_dim > c.head_dim || c.head_dim % 2 != 0) {
-        throw std::invalid_argument("Qwen3_5Model: the rotated dims must be an even part of an even head dim");
+        throw std::invalid_argument("qwen3_5_model: the rotated dims must be an even part of an even head dim");
     }
     if (c.linear_n_value_heads % c.linear_n_key_heads != 0) {
-        throw std::invalid_argument("Qwen3_5Model: the value heads must be a multiple of the key heads");
+        throw std::invalid_argument("qwen3_5_model: the value heads must be a multiple of the key heads");
     }
     rope = rope_parameters{
         .theta = std::pow(c.rope_theta, static_cast<double>(c.head_dim) / static_cast<double>(rotary_dim)),
@@ -114,7 +114,7 @@ Qwen3_5Model::Qwen3_5Model(qwen3_5_config config, const c10::Dict<std::string, a
 
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
         const std::string p = "layers." + std::to_string(layer) + ".";
-        LayerWeights w{
+        layer_weights w{
             .input_layernorm = zero_centered(need_text(weights, p + "input_layernorm.weight")),
             .post_attention_layernorm = zero_centered(need_text(weights, p + "post_attention_layernorm.weight")),
             .gate_proj = need_linear(weights, p + "mlp.gate_proj", c.fp8_weight_block, device),
@@ -123,7 +123,7 @@ Qwen3_5Model::Qwen3_5Model(qwen3_5_config config, const c10::Dict<std::string, a
         };
         kv_layer_of.push_back(kv_specs.size());
         if (full_attention(layer)) {
-            w.attention = AttentionWeights{
+            w.attention = attention_weights{
                 .q_proj = need_permuted_linear(
                     weights,
                     p + "self_attn.q_proj",
@@ -151,7 +151,7 @@ Qwen3_5Model::Qwen3_5Model(qwen3_5_config config, const c10::Dict<std::string, a
                 }
             );
         } else {
-            w.deltanet = DeltaNetWeights{
+            w.deltanet = deltanet_weights{
                 .in_proj_qkv = need_linear(weights, p + "linear_attn.in_proj_qkv", c.fp8_weight_block, device),
                 .in_proj_z = need_linear(weights, p + "linear_attn.in_proj_z", c.fp8_weight_block, device),
                 .in_proj_b = need_linear(weights, p + "linear_attn.in_proj_b", c.fp8_weight_block, device),
@@ -187,17 +187,21 @@ Qwen3_5Model::Qwen3_5Model(qwen3_5_config config, const c10::Dict<std::string, a
     }
 }
 
-bool Qwen3_5Model::full_attention(std::int64_t layer) const {
+bool qwen3_5_model::full_attention(std::int64_t layer) const {
     return config.layer_types[layer] == qwen3_5_layer_type::full_attention;
 }
 
-std::vector<kv_layer> Qwen3_5Model::kv_layers() const {
+std::vector<kv_layer> qwen3_5_model::kv_layers() const {
     return kv_specs;
 }
 
-at::Tensor
-Qwen3_5Model::attention(const at::Tensor& h, std::int64_t layer, const GroupBatch& g, std::span<const kv> lines) const {
-    const AttentionWeights& w = *layers[layer].attention;
+at::Tensor qwen3_5_model::attention(
+    const at::Tensor& h,
+    std::int64_t layer,
+    const group_batch& g,
+    std::span<const kv> lines
+) const {
+    const attention_weights& w = *layers[layer].attention;
     const qwen3_5_config& c = config;
     const std::int64_t ntok = h.size(0);
     const std::size_t kv_index = kv_layer_of[layer];
@@ -222,9 +226,13 @@ Qwen3_5Model::attention(const at::Tensor& h, std::int64_t layer, const GroupBatc
     return w.o_proj.apply(o.reshape({ntok, c.n_heads * c.head_dim}) * at::sigmoid(gate));
 }
 
-at::Tensor
-Qwen3_5Model::deltanet(const at::Tensor& h, std::int64_t layer, const GroupBatch& g, std::span<const kv> lines) const {
-    const DeltaNetWeights& w = *layers[layer].deltanet;
+at::Tensor qwen3_5_model::deltanet(
+    const at::Tensor& h,
+    std::int64_t layer,
+    const group_batch& g,
+    std::span<const kv> lines
+) const {
+    const deltanet_weights& w = *layers[layer].deltanet;
     const qwen3_5_config& c = config;
     const std::int64_t ntok = h.size(0);
     const std::size_t state_layer = kv_layer_of[layer];
@@ -260,11 +268,11 @@ Qwen3_5Model::deltanet(const at::Tensor& h, std::int64_t layer, const GroupBatch
     return w.out_proj.apply(gated.view({ntok, c.linear_n_value_heads * c.linear_value_head_dim}));
 }
 
-at::Tensor Qwen3_5Model::group_forward(const GroupBatch& g, std::span<const kv> lines) const {
+at::Tensor qwen3_5_model::group_forward(const group_batch& g, std::span<const kv> lines) const {
     const double eps = config.rms_norm_eps;
     at::Tensor x = embed_tokens.index_select(0, g.tokens);
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
-        const LayerWeights& w = layers[layer];
+        const layer_weights& w = layers[layer];
         at::Tensor h = rmsnorm_cuda(x, w.input_layernorm, eps);
         x = x + (full_attention(layer) ? attention(h, layer, g, lines) : deltanet(h, layer, g, lines));
         at::Tensor h2 = rmsnorm_cuda(x, w.post_attention_layernorm, eps);
@@ -273,8 +281,8 @@ at::Tensor Qwen3_5Model::group_forward(const GroupBatch& g, std::span<const kv> 
     return at::matmul(rmsnorm_cuda(logit_inputs(x, g), norm, eps), lm_head.t());
 }
 
-StepLogits Qwen3_5Model::forward(const StepBatch& batch, std::span<const kv> lines) {
-    return paged_forward(batch, [&](const GroupBatch& g) { return group_forward(g, lines); });
+step_logits qwen3_5_model::forward(const step_batch& batch, std::span<const kv> lines) {
+    return paged_forward(batch, [&](const group_batch& g) { return group_forward(g, lines); });
 }
 
 }  // namespace pulsarlm

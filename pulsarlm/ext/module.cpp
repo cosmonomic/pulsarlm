@@ -35,20 +35,20 @@ py::tuple take_to_python(request_handle& handle) {
     return py::make_tuple(std::move(taken.tokens), py::cast(std::move(taken.cycle_ends)), std::move(end));
 }
 
-std::size_t vocab_size(const any_model_config& model) {
-    if (const auto* gemma = std::get_if<gemma4_config>(&model)) {
+std::size_t vocab_size(const any_model_config& architecture_config) {
+    if (const auto* gemma = std::get_if<gemma4_config>(&architecture_config)) {
         return static_cast<std::size_t>(gemma->vocab_size);
     }
-    if (const auto* qwen = std::get_if<qwen3_5_config>(&model)) {
+    if (const auto* qwen = std::get_if<qwen3_5_config>(&architecture_config)) {
         return static_cast<std::size_t>(qwen->vocab_size);
     }
-    if (const auto* qwen = std::get_if<qwen3_5_moe_config>(&model)) {
+    if (const auto* qwen = std::get_if<qwen3_5_moe_config>(&architecture_config)) {
         return static_cast<std::size_t>(qwen->vocab_size);
     }
-    if (const auto* qwen = std::get_if<qwen4_exp_config>(&model)) {
+    if (const auto* qwen = std::get_if<qwen4_exp_config>(&architecture_config)) {
         return static_cast<std::size_t>(qwen->vocab_size);
     }
-    return static_cast<std::size_t>(std::get<model_config>(model).dense_model.vocab_size);
+    return static_cast<std::size_t>(std::get<model_config>(architecture_config).dense_model.vocab_size);
 }
 
 gemma4_layer_type layer_type(const std::string& name) {
@@ -93,7 +93,7 @@ gate_activation activation(const std::string& name) {
 
 std::unique_ptr<python_engine> make_engine(
     py::object store,
-    const any_model_config& model,
+    const any_model_config& architecture_config,
     const std::unordered_map<std::string, at::Tensor>& weights,
     const std::string& model_name,
     std::size_t page_size,
@@ -114,13 +114,13 @@ std::unique_ptr<python_engine> make_engine(
         static_cast<std::size_t>(kv_cache_gib * (1ull << 30)),
         device,
         std::move(stop_ids),
-        vocab_size(model),
+        vocab_size(architecture_config),
         prefill_tokens_per_step,
     };
-    std::unique_ptr<Model> served_model;
+    std::unique_ptr<model> served_model;
     {
         py::gil_scoped_release nogil;
-        served_model = make_model(model, weights);
+        served_model = make_model(architecture_config, weights);
     }
     std::size_t largest_page_bytes = 0;
     for (const page_shape& shape : page_shapes(config, served_model->kv_layers())) {

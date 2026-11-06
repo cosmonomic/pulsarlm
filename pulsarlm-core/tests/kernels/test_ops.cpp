@@ -266,7 +266,7 @@ TEST_CASE("decode gives each page its query attends the query's weight", "[ops][
 namespace {
 
 // One sequence of the shared-line case: its view over the pool and its pages' positions.
-struct View {
+struct sequence_view {
     std::vector<int32_t> lines;
     int64_t ctx;
     int64_t seq_q;  // prefill queries, the last seq_q view indices
@@ -283,7 +283,7 @@ struct View {
 // rows and adds each row's scores, at query weight alpha * (1 - alpha)^(rows after it),
 // to the view's mass rows from first_row on.
 void reference_view(
-    const View& view,
+    const sequence_view& view,
     const at::Tensor& q,
     const at::Tensor& k_pool,
     const at::Tensor& v_pool,
@@ -332,9 +332,9 @@ TEST_CASE("views sharing a line rotate and accumulate apart", "[ops][cuda]") {
         SKIP("no CUDA device");
     }
     const int64_t n_q = 4, n_kv = 2, num_lines = 3;
-    const std::vector<View> views = {
-        View{{0, 2}, kPageSize + 5, 5, {0, kPageSize, 2 * kPageSize}},
-        View{{1, 2, 0}, 2 * kPageSize + 7, 20, {0, 3 * kPageSize, 5 * kPageSize}},
+    const std::vector<sequence_view> views = {
+        sequence_view{{0, 2}, kPageSize + 5, 5, {0, kPageSize, 2 * kPageSize}},
+        sequence_view{{1, 2, 0}, 2 * kPageSize + 7, 20, {0, 3 * kPageSize, 5 * kPageSize}},
     };
     const double alpha = 0.5;
     const int64_t max_pages = 3, total_view_pages = 2 * max_pages;
@@ -355,7 +355,7 @@ TEST_CASE("views sharing a line rotate and accumulate apart", "[ops][cuda]") {
     auto cu_seqlens_q = int32_cuda(cu_q);
     auto cu_view_pages = int32_cuda(cu_view);
     std::vector<float> pre_weights;
-    for (const View& view : views) {
+    for (const sequence_view& view : views) {
         for (int64_t r = 0; r < view.seq_q; ++r) {
             pre_weights.push_back(
                 static_cast<float>(alpha * std::pow(1.0 - alpha, static_cast<double>(view.seq_q - 1 - r)))
@@ -492,7 +492,7 @@ TEST_CASE("ATen rope_rotate matches the rope kernel", "[ops][cuda]") {
 
 namespace {
 
-struct WindowedView {
+struct windowed_view {
     std::vector<int32_t> lines;
     int64_t ctx;
     int64_t seq_q;
@@ -505,7 +505,7 @@ int64_t first_attended(int64_t query, std::optional<int64_t> window) {
 // The view's keys as the kernels stage them: scaled by k_norm_weight in fp32, rotated to their view index, rounded to
 // the pool dtype.
 at::Tensor reference_keys(
-    const WindowedView& view,
+    const windowed_view& view,
     const at::Tensor& k_pool,
     const pulsarlm::rope_parameters& rope,
     const std::optional<at::Tensor>& k_norm_weight
@@ -525,7 +525,7 @@ at::Tensor reference_keys(
 }
 
 void reference_windowed(
-    const WindowedView& view,
+    const windowed_view& view,
     const at::Tensor& keys,
     const at::Tensor& v_pool,
     const at::Tensor& q,
@@ -583,9 +583,9 @@ TEST_CASE(
                         const pulsarlm::rope_parameters rope{.theta = 1e4, .partial_rotary_factor = factor};
                         const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
                         const int64_t num_lines = 6, max_pages = 4;
-                        std::vector<WindowedView> views = {
-                            WindowedView{{0, 3, 5, 1}, 3 * page_size + 5, 24},
-                            WindowedView{{2, 4}, page_size + 3, 4},
+                        std::vector<windowed_view> views = {
+                            windowed_view{{0, 3, 5, 1}, 3 * page_size + 5, 24},
+                            windowed_view{{2, 4}, page_size + 3, 4},
                         };
                         std::vector<int32_t> tables(views.size() * max_pages, 0), seqlens, cu_q{0}, cu_view;
                         for (size_t s = 0; s < views.size(); ++s) {
@@ -607,7 +607,7 @@ TEST_CASE(
                         auto cu_view_pages = int32_cuda(cu_view);
                         const int64_t total_view_pages = static_cast<int64_t>(views.size()) * max_pages;
                         std::vector<float> pre_weights;
-                        for (const WindowedView& view : views) {
+                        for (const windowed_view& view : views) {
                             for (int64_t r = 0; r < view.seq_q; ++r) {
                                 pre_weights.push_back(
                                     static_cast<float>(

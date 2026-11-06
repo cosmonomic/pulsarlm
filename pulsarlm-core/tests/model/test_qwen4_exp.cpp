@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-// Qwen4ExpModel's paged forward against a dense ATen Qwen4-Exp written from Hugging Face's code, with the delta rule
+// qwen4_exp_model's paged forward against a dense ATen Qwen4-Exp written from Hugging Face's code, with the delta rule
 // run token by token, the experts one by one, QSA's blocks selected query by query and the n-gram ids hashed on the
 // host: chunked prefill then decode, checking the logits and the lines of every recurrent KV layer at the end and at the
 // newest page end.
@@ -497,7 +497,7 @@ pulsarlm::qwen4_exp_config model_config(std::int64_t experts_per_token, std::int
 }
 
 // A step of the single sequence forwarding the tokens at positions [first, last).
-pulsarlm::GroupBatch step(
+pulsarlm::group_batch step(
     const at::Tensor& tokens,
     std::int64_t first,
     std::int64_t last,
@@ -516,7 +516,7 @@ pulsarlm::GroupBatch step(
     std::int64_t page_end = last / page_size * page_size;
     auto n_kv_layers = static_cast<std::int64_t>(specs.size());
     auto key_count = int32_cuda({static_cast<std::int32_t>(last)}).expand({n_kv_layers, 1}).contiguous();
-    pulsarlm::GroupBatch g{
+    pulsarlm::group_batch g{
         .tokens = tokens.narrow(0, first, last - first),
         .pos = at::arange(first, last, cuda(at::kLong)),
         .page_tables = int32_cuda(rows).view({n_kv_layers, 1, -1}),
@@ -538,7 +538,7 @@ double max_relative_error(const at::Tensor& got, const at::Tensor& expected) {
 
 void check_against_dense(at::ScalarType dtype, double tolerance, std::int64_t experts_per_token, std::int64_t budget) {
     weights w(dtype);
-    pulsarlm::Qwen4ExpModel model(model_config(experts_per_token, budget), w.named_tensors);
+    pulsarlm::qwen4_exp_model model(model_config(experts_per_token, budget), w.named_tensors);
     std::vector<pulsarlm::kv_layer> specs = model.kv_layers();
     REQUIRE(specs.size() == 9);
     std::vector<pulsarlm::kv> kv;
@@ -578,9 +578,9 @@ void check_against_dense(at::ScalarType dtype, double tolerance, std::int64_t ex
     for (chunk c :
          {chunk{0, 21, true}, chunk{21, 37, true}, chunk{37, 47, true}, chunk{47, 48, false}, chunk{48, 49, false}}) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
-        pulsarlm::StepBatch batch;
+        pulsarlm::step_batch batch;
         (c.prefill ? batch.prefill_group : batch.decode_group) = step(tokens, c.first, c.last, c.prefill, specs);
-        pulsarlm::StepLogits logits = model.forward(batch, kv);
+        pulsarlm::step_logits logits = model.forward(batch, kv);
         auto expected_logits = dense.logits.narrow(0, c.first, c.last - c.first);
         CHECK(max_relative_error(*(c.prefill ? logits.prefill_logits : logits.decode_logits), expected_logits) < tolerance);
     }
@@ -630,7 +630,7 @@ TEST_CASE("Qwen4-Exp kv_layers add a PLE layer's convolution and token lines", "
         SKIP("no CUDA device");
     }
     weights w(at::kFloat);
-    pulsarlm::Qwen4ExpModel model(model_config(2, 8), w.named_tensors);
+    pulsarlm::qwen4_exp_model model(model_config(2, 8), w.named_tensors);
     std::vector<pulsarlm::kv_layer> specs = model.kv_layers();
     REQUIRE(specs.size() == 9);
     CHECK(specs[4].state->sizes == std::vector<std::int64_t>{hc * hidden, ple_history});

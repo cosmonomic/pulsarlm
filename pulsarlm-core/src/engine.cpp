@@ -123,17 +123,17 @@ std::vector<page_shape> page_shapes(const engine_config& config, std::span<const
     return shapes;
 }
 
-engine::engine(std::unique_ptr<Model> model, const engine_config& config, std::unique_ptr<page_store>&& store)
-: model(std::move(model)),
+engine::engine(std::unique_ptr<model> served_model, const engine_config& config, std::unique_ptr<page_store>&& store)
+: served_model(std::move(served_model)),
   device(config.device),
   stream(c10::cuda::getStreamFromPool(false, config.device.index()).stream()),
   page_size(config.page_size),
   vocab_size(config.vocab_size),
-  root(make_root_digest(config.model_name, page_shapes(config, this->model->kv_layers()))),
+  root(make_root_digest(config.model_name, page_shapes(config, this->served_model->kv_layers()))),
   store(std::move(store)),
   sched(
-      *this->model,
-      make_cache(config, this->model->kv_layers(), *this->store),
+      *this->served_model,
+      make_cache(config, this->served_model->kv_layers(), *this->store),
       stream,
       root,
       std::vector<std::int64_t>(config.stop_ids),

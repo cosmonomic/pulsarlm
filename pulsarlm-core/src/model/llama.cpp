@@ -17,14 +17,14 @@ namespace {
 
 at::Tensor need(const c10::Dict<std::string, at::Tensor>& weights, const std::string& name) {
     if (!weights.contains(name)) {
-        throw std::invalid_argument(std::format("LlamaModel: missing weight {:?}", name));
+        throw std::invalid_argument(std::format("llama_model: missing weight {:?}", name));
     }
     return weights.at(name);
 }
 
 }  // namespace
 
-LlamaModel::LlamaModel(dense_config config, const c10::Dict<std::string, at::Tensor>& weights)
+llama_model::llama_model(dense_config config, const c10::Dict<std::string, at::Tensor>& weights)
 : config(std::move(config)),
   embed_tokens(need(weights, "model.embed_tokens.weight")),
   norm(need(weights, "model.norm.weight")) {
@@ -32,7 +32,7 @@ LlamaModel::LlamaModel(dense_config config, const c10::Dict<std::string, at::Ten
     for (std::int64_t layer = 0; layer < this->config.n_layers; layer++) {
         const std::string p = "model.layers." + std::to_string(layer) + ".";
         layers.push_back(
-            LayerWeights{
+            layer_weights{
                 .input_layernorm = need(weights, p + "input_layernorm.weight"),
                 .post_attention_layernorm = need(weights, p + "post_attention_layernorm.weight"),
                 .q_proj = need(weights, p + "self_attn.q_proj.weight"),
@@ -47,7 +47,7 @@ LlamaModel::LlamaModel(dense_config config, const c10::Dict<std::string, at::Ten
     }
 }
 
-std::vector<kv_layer> LlamaModel::kv_layers() const {
+std::vector<kv_layer> llama_model::kv_layers() const {
     return std::vector<kv_layer>(
         config.n_layers,
         kv_layer{
@@ -59,8 +59,8 @@ std::vector<kv_layer> LlamaModel::kv_layers() const {
 }
 
 at::Tensor
-LlamaModel::attention(const at::Tensor& h, std::int64_t layer, const GroupBatch& g, std::span<const kv> lines) const {
-    const LayerWeights& w = layers[layer];
+llama_model::attention(const at::Tensor& h, std::int64_t layer, const group_batch& g, std::span<const kv> lines) const {
+    const layer_weights& w = layers[layer];
     const dense_config& c = config;
     const std::int64_t ntok = h.size(0);
 
@@ -81,11 +81,11 @@ LlamaModel::attention(const at::Tensor& h, std::int64_t layer, const GroupBatch&
     return at::linear(o.reshape({ntok, c.n_heads * c.head_dim}), w.o_proj);
 }
 
-at::Tensor LlamaModel::group_forward(const GroupBatch& g, std::span<const kv> lines) const {
+at::Tensor llama_model::group_forward(const group_batch& g, std::span<const kv> lines) const {
     const double eps = config.rms_norm_eps;
     at::Tensor x = embed_tokens.index_select(0, g.tokens);
     for (std::int64_t layer = 0; layer < config.n_layers; layer++) {
-        const LayerWeights& w = layers[layer];
+        const layer_weights& w = layers[layer];
         x = x + attention(rmsnorm_cuda(x, w.input_layernorm, eps), layer, g, lines);
         at::Tensor h = rmsnorm_cuda(x, w.post_attention_layernorm, eps);
         x = x + at::linear(at::silu(at::linear(h, w.gate_proj)) * at::linear(h, w.up_proj), w.down_proj);
@@ -93,8 +93,8 @@ at::Tensor LlamaModel::group_forward(const GroupBatch& g, std::span<const kv> li
     return at::matmul(rmsnorm_cuda(logit_inputs(x, g), norm, eps), lm_head.t());
 }
 
-StepLogits LlamaModel::forward(const StepBatch& batch, std::span<const kv> lines) {
-    return paged_forward(batch, [&](const GroupBatch& g) { return group_forward(g, lines); });
+step_logits llama_model::forward(const step_batch& batch, std::span<const kv> lines) {
+    return paged_forward(batch, [&](const group_batch& g) { return group_forward(g, lines); });
 }
 
 }  // namespace pulsarlm

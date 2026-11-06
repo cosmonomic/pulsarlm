@@ -151,7 +151,7 @@ struct memory_store final : pulsarlm::page_store {
 // layer, every query token attends every view page holding a key, with mass 1 in its one query head when the page
 // holds a key important accepts for that layer, else 0. While the first full-attention layer has evicted nothing, every key a sliding layer reads must equal that layer's key at the same
 // distance from the query.
-class sum_model final : public pulsarlm::Model {
+class sum_model final : public pulsarlm::model {
   public:
     std::vector<pulsarlm::kv_layer> layers = two_full_layers;
     std::size_t forward_count = 0;
@@ -166,12 +166,12 @@ class sum_model final : public pulsarlm::Model {
         return layers;
     }
 
-    pulsarlm::StepLogits forward(const pulsarlm::StepBatch& batch, std::span<const pulsarlm::kv> lines) override {
+    pulsarlm::step_logits forward(const pulsarlm::step_batch& batch, std::span<const pulsarlm::kv> lines) override {
         forward_count++;
         if (on_forward) {
             on_forward();
         }
-        pulsarlm::StepLogits logits;
+        pulsarlm::step_logits logits;
         if (batch.prefill_group) {
             at::Tensor starts = batch.prefill_group->cu_seqlens_q.cpu().to(at::kLong);
             prefill_chunks.push_back(token_list(starts.size(0) - 1));
@@ -189,7 +189,7 @@ class sum_model final : public pulsarlm::Model {
     }
 
   private:
-    at::Tensor predict(const pulsarlm::GroupBatch& g, std::span<const pulsarlm::kv> lines) const {
+    at::Tensor predict(const pulsarlm::group_batch& g, std::span<const pulsarlm::kv> lines) const {
         std::int64_t n_tokens = g.tokens.size(0);
         at::Tensor positions = g.pos.cpu();
         at::Tensor all_tables = g.page_tables.cpu();
@@ -333,7 +333,7 @@ class sum_model final : public pulsarlm::Model {
     // Each row's sum of every token forwarded through it. Starts from each sequence's first line, updates it, and
     // writes the sum after the sequence's page_end_tokens into its second line.
     static std::vector<double>
-    run_state(const pulsarlm::GroupBatch& g, const pulsarlm::kv& lines, const at::Tensor& rows) {
+    run_state(const pulsarlm::group_batch& g, const pulsarlm::kv& lines, const at::Tensor& rows) {
         REQUIRE(g.page_end_tokens.defined());
         at::Tensor tokens = g.tokens.cpu();
         at::Tensor page_end_tokens = g.page_end_tokens.cpu();

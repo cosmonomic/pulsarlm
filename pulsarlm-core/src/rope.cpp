@@ -57,11 +57,11 @@ long double rope_frequency(const rope_parameters& rope, int64_t head_dim, int64_
 template <typename Element, Element (*per_frequency)(long double)>
 const at::Tensor&
 rope_frequency_table(const rope_parameters& rope, int64_t head_dim, at::Device device, at::ScalarType dtype) {
-    using Key = std::tuple<rope_parameters, int64_t, int8_t>;
+    using cache_key = std::tuple<rope_parameters, int64_t, int8_t>;
     static std::mutex guard;
-    static auto* cache = new std::map<Key, at::Tensor>();
+    static auto* cache = new std::map<cache_key, at::Tensor>();
 
-    const Key key{rope, head_dim, device.index()};
+    const cache_key key{rope, head_dim, device.index()};
     const std::lock_guard<std::mutex> lock(guard);
     if (const auto found = cache->find(key); found != cache->end()) {
         return found->second;

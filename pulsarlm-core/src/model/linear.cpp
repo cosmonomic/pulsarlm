@@ -9,16 +9,16 @@
 
 namespace pulsarlm {
 
-Linear::Linear(std::variant<at::Tensor, fp8_weight> weight)
+linear::linear(std::variant<at::Tensor, fp8_weight> weight)
 : weight(std::move(weight)) {}
 
-Linear Linear::dense(at::Tensor weight) {
-    return Linear(std::move(weight));
+linear linear::dense(at::Tensor weight) {
+    return linear(std::move(weight));
 }
 
-Linear Linear::fp8(const at::Tensor& weight, const at::Tensor& scale, std::int64_t block_n, std::int64_t group_size) {
+linear linear::fp8(const at::Tensor& weight, const at::Tensor& scale, std::int64_t block_n, std::int64_t group_size) {
     auto [weight_marlin, scale_marlin] = repack_fp8_marlin_cuda(weight, scale, block_n, group_size);
-    return Linear(
+    return linear(
         fp8_weight{
             .weight_marlin = std::move(weight_marlin),
             .scale_marlin = std::move(scale_marlin),
@@ -29,7 +29,7 @@ Linear Linear::fp8(const at::Tensor& weight, const at::Tensor& scale, std::int64
     );
 }
 
-at::Tensor Linear::apply(const at::Tensor& x) const {
+at::Tensor linear::apply(const at::Tensor& x) const {
     if (const auto* dense = std::get_if<at::Tensor>(&weight)) {
         return at::linear(x, *dense);
     }

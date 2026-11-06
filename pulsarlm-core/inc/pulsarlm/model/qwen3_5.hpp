@@ -45,38 +45,38 @@ struct qwen3_5_config {
 // A Gated DeltaNet layer keeps two recurrent KV layers: its delta rule state S, fp32 [value heads, key head dim, value
 // head dim], then its convolution's last linear_conv_kernel - 1 inputs, [conv channels, linear_conv_kernel - 1] in the
 // weights' dtype.
-class Qwen3_5Model : public Model {
+class qwen3_5_model : public model {
     // Query and key heads are stored with their dims permuted so that the paged attention ops' partial RoPE, which
     // rotates pairs (j, j + head_dim / 2), rotates Hugging Face's pairs (j, j + rotary_dim / 2).
-    struct AttentionWeights {
-        Linear q_proj;  // [n_heads * 2 * head_dim, hidden], each head's query then gate
-        Linear k_proj;
-        Linear v_proj;
-        Linear o_proj;
+    struct attention_weights {
+        linear q_proj;  // [n_heads * 2 * head_dim, hidden], each head's query then gate
+        linear k_proj;
+        linear v_proj;
+        linear o_proj;
         at::Tensor q_norm;  // fp32 1 + weight
         at::Tensor k_norm;
     };
 
-    struct DeltaNetWeights {
-        Linear in_proj_qkv;
-        Linear in_proj_z;
-        Linear in_proj_b;
-        Linear in_proj_a;
+    struct deltanet_weights {
+        linear in_proj_qkv;
+        linear in_proj_z;
+        linear in_proj_b;
+        linear in_proj_a;
         at::Tensor conv;  // [conv channels, 1, linear_conv_kernel]
         at::Tensor dt_bias;  // fp32
         at::Tensor neg_a;  // fp32 -exp(A_log)
         at::Tensor norm;
-        Linear out_proj;
+        linear out_proj;
     };
 
-    struct LayerWeights {
+    struct layer_weights {
         at::Tensor input_layernorm;  // fp32 1 + weight
         at::Tensor post_attention_layernorm;
-        Linear gate_proj;
-        Linear up_proj;
-        Linear down_proj;
-        std::optional<AttentionWeights> attention;
-        std::optional<DeltaNetWeights> deltanet;
+        linear gate_proj;
+        linear up_proj;
+        linear down_proj;
+        std::optional<attention_weights> attention;
+        std::optional<deltanet_weights> deltanet;
     };
 
     qwen3_5_config config;
@@ -88,20 +88,21 @@ class Qwen3_5Model : public Model {
     at::Tensor embed_tokens;
     at::Tensor lm_head;
     at::Tensor norm;  // fp32 1 + weight
-    std::vector<LayerWeights> layers;
+    std::vector<layer_weights> layers;
 
     bool full_attention(std::int64_t layer) const;
-    at::Tensor attention(const at::Tensor& h, std::int64_t layer, const GroupBatch& g, std::span<const kv> lines) const;
-    at::Tensor deltanet(const at::Tensor& h, std::int64_t layer, const GroupBatch& g, std::span<const kv> lines) const;
-    at::Tensor group_forward(const GroupBatch& g, std::span<const kv> lines) const;
+    at::Tensor
+    attention(const at::Tensor& h, std::int64_t layer, const group_batch& g, std::span<const kv> lines) const;
+    at::Tensor deltanet(const at::Tensor& h, std::int64_t layer, const group_batch& g, std::span<const kv> lines) const;
+    at::Tensor group_forward(const group_batch& g, std::span<const kv> lines) const;
 
   public:
     // weights are on the lines' device, in the attention lines' dtype, except that fp8 linears and their scales may
     // be on the host.
-    Qwen3_5Model(qwen3_5_config config, const c10::Dict<std::string, at::Tensor>& weights);
+    qwen3_5_model(qwen3_5_config config, const c10::Dict<std::string, at::Tensor>& weights);
 
     std::vector<kv_layer> kv_layers() const override;
-    StepLogits forward(const StepBatch& batch, std::span<const kv> lines) override;
+    step_logits forward(const step_batch& batch, std::span<const kv> lines) override;
 };
 
 }  // namespace pulsarlm

@@ -24,7 +24,7 @@ const std::string prefix = "model.language_model.";
 
 at::Tensor need(const c10::Dict<std::string, at::Tensor>& weights, const std::string& name) {
     if (!weights.contains(name)) {
-        throw std::invalid_argument(std::format("Qwen3_5MoeModel: missing weight {:?}", name));
+        throw std::invalid_argument(std::format("qwen3_5_moe_model: missing weight {:?}", name));
     }
     return weights.at(name);
 }
@@ -40,7 +40,7 @@ at::Tensor zero_centered(const at::Tensor& weight) {
 
 }  // namespace
 
-Qwen3_5MoeModel::Qwen3_5MoeModel(qwen3_5_moe_config config, const c10::Dict<std::string, at::Tensor>& weights)
+qwen3_5_moe_model::qwen3_5_moe_model(qwen3_5_moe_config config, const c10::Dict<std::string, at::Tensor>& weights)
 : config(std::move(config)),
   n_layers(static_cast<std::int64_t>(this->config.layer_types.size())),
   embed_tokens(need_text(weights, "embed_tokens.weight")),
@@ -48,10 +48,10 @@ Qwen3_5MoeModel::Qwen3_5MoeModel(qwen3_5_moe_config config, const c10::Dict<std:
     const qwen3_5_moe_config& c = this->config;
     const auto rotary_dim = static_cast<std::int64_t>(std::llround(c.partial_rotary_factor * c.head_dim));
     if (rotary_dim % 2 != 0 || rotary_dim > c.head_dim || c.head_dim % 2 != 0) {
-        throw std::invalid_argument("Qwen3_5MoeModel: the rotated dims must be an even part of an even head dim");
+        throw std::invalid_argument("qwen3_5_moe_model: the rotated dims must be an even part of an even head dim");
     }
     if (c.linear_n_value_heads % c.linear_n_key_heads != 0) {
-        throw std::invalid_argument("Qwen3_5MoeModel: the value heads must be a multiple of the key heads");
+        throw std::invalid_argument("qwen3_5_moe_model: the value heads must be a multiple of the key heads");
     }
     rope = rope_parameters{
         .theta = std::pow(c.rope_theta, static_cast<double>(c.head_dim) / static_cast<double>(rotary_dim)),
@@ -64,10 +64,10 @@ Qwen3_5MoeModel::Qwen3_5MoeModel(qwen3_5_moe_config config, const c10::Dict<std:
 
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
         const std::string p = "layers." + std::to_string(layer) + ".";
-        LayerWeights w{
+        layer_weights w{
             .input_layernorm = zero_centered(need_text(weights, p + "input_layernorm.weight")),
             .post_attention_layernorm = zero_centered(need_text(weights, p + "post_attention_layernorm.weight")),
-            .moe = MoeWeights{
+            .moe = moe_weights{
                 .router = need_text(weights, p + "mlp.gate.weight"),
                 .experts_gate_up_proj = need_text(weights, p + "mlp.experts.gate_up_proj"),
                 .experts_down_proj = need_text(weights, p + "mlp.experts.down_proj"),
@@ -78,11 +78,11 @@ Qwen3_5MoeModel::Qwen3_5MoeModel(qwen3_5_moe_config config, const c10::Dict<std:
             },
         };
         if (c.num_experts_per_tok < 1 || w.moe.router.size(0) < c.num_experts_per_tok) {
-            throw std::invalid_argument("Qwen3_5MoeModel: num_experts_per_tok must be between 1 and the experts");
+            throw std::invalid_argument("qwen3_5_moe_model: num_experts_per_tok must be between 1 and the experts");
         }
         kv_layer_of.push_back(kv_specs.size());
         if (full_attention(layer)) {
-            w.attention = AttentionWeights{
+            w.attention = attention_weights{
                 .q_proj = permute_queries(need_text(weights, p + "self_attn.q_proj.weight"), c.n_heads, permutation),
                 .k_proj = permute_heads(need_text(weights, p + "self_attn.k_proj.weight"), c.n_kv_heads, permutation),
                 .v_proj = need_text(weights, p + "self_attn.v_proj.weight"),
@@ -98,7 +98,7 @@ Qwen3_5MoeModel::Qwen3_5MoeModel(qwen3_5_moe_config config, const c10::Dict<std:
                 }
             );
         } else {
-            w.deltanet = DeltaNetWeights{
+            w.deltanet = deltanet_weights{
                 .in_proj_qkv = need_text(weights, p + "linear_attn.in_proj_qkv.weight"),
                 .in_proj_z = need_text(weights, p + "linear_attn.in_proj_z.weight"),
                 .in_proj_b = need_text(weights, p + "linear_attn.in_proj_b.weight"),
@@ -134,21 +134,21 @@ Qwen3_5MoeModel::Qwen3_5MoeModel(qwen3_5_moe_config config, const c10::Dict<std:
     }
 }
 
-bool Qwen3_5MoeModel::full_attention(std::int64_t layer) const {
+bool qwen3_5_moe_model::full_attention(std::int64_t layer) const {
     return config.layer_types[layer] == qwen3_5_layer_type::full_attention;
 }
 
-std::vector<kv_layer> Qwen3_5MoeModel::kv_layers() const {
+std::vector<kv_layer> qwen3_5_moe_model::kv_layers() const {
     return kv_specs;
 }
 
-at::Tensor Qwen3_5MoeModel::attention(
+at::Tensor qwen3_5_moe_model::attention(
     const at::Tensor& h,
     std::int64_t layer,
-    const GroupBatch& g,
+    const group_batch& g,
     std::span<const kv> lines
 ) const {
-    const AttentionWeights& w = *layers[layer].attention;
+    const attention_weights& w = *layers[layer].attention;
     const qwen3_5_moe_config& c = config;
     const std::int64_t ntok = h.size(0);
     const std::size_t kv_index = kv_layer_of[layer];
@@ -177,13 +177,13 @@ at::Tensor Qwen3_5MoeModel::attention(
     return at::linear(o.reshape({ntok, c.n_heads * c.head_dim}) * at::sigmoid(gate), w.o_proj);
 }
 
-at::Tensor Qwen3_5MoeModel::deltanet(
+at::Tensor qwen3_5_moe_model::deltanet(
     const at::Tensor& h,
     std::int64_t layer,
-    const GroupBatch& g,
+    const group_batch& g,
     std::span<const kv> lines
 ) const {
-    const DeltaNetWeights& w = *layers[layer].deltanet;
+    const deltanet_weights& w = *layers[layer].deltanet;
     const qwen3_5_moe_config& c = config;
     const std::int64_t ntok = h.size(0);
     const std::size_t state_layer = kv_layer_of[layer];
@@ -219,8 +219,8 @@ at::Tensor Qwen3_5MoeModel::deltanet(
     return at::linear(gated.view({ntok, c.linear_n_value_heads * c.linear_value_head_dim}), w.out_proj);
 }
 
-at::Tensor Qwen3_5MoeModel::moe(const at::Tensor& h, std::int64_t layer) const {
-    const MoeWeights& m = layers[layer].moe;
+at::Tensor qwen3_5_moe_model::moe(const at::Tensor& h, std::int64_t layer) const {
+    const moe_weights& m = layers[layer].moe;
     at::Tensor shared = at::linear(
         at::silu(at::linear(h, m.shared_gate_proj)) * at::linear(h, m.shared_up_proj),
         m.shared_down_proj
@@ -239,11 +239,11 @@ at::Tensor Qwen3_5MoeModel::moe(const at::Tensor& h, std::int64_t layer) const {
     return routed + at::sigmoid(at::linear(h, m.shared_expert_gate)) * shared;
 }
 
-at::Tensor Qwen3_5MoeModel::group_forward(const GroupBatch& g, std::span<const kv> lines) const {
+at::Tensor qwen3_5_moe_model::group_forward(const group_batch& g, std::span<const kv> lines) const {
     const double eps = config.rms_norm_eps;
     at::Tensor x = embed_tokens.index_select(0, g.tokens);
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
-        const LayerWeights& w = layers[layer];
+        const layer_weights& w = layers[layer];
         at::Tensor h = rmsnorm_cuda(x, w.input_layernorm, eps);
         x = x + (full_attention(layer) ? attention(h, layer, g, lines) : deltanet(h, layer, g, lines));
         x = x + moe(rmsnorm_cuda(x, w.post_attention_layernorm, eps), layer);
@@ -251,8 +251,8 @@ at::Tensor Qwen3_5MoeModel::group_forward(const GroupBatch& g, std::span<const k
     return at::matmul(rmsnorm_cuda(logit_inputs(x, g), norm, eps), lm_head.t());
 }
 
-StepLogits Qwen3_5MoeModel::forward(const StepBatch& batch, std::span<const kv> lines) {
-    return paged_forward(batch, [&](const GroupBatch& g) { return group_forward(g, lines); });
+step_logits qwen3_5_moe_model::forward(const step_batch& batch, std::span<const kv> lines) {
+    return paged_forward(batch, [&](const group_batch& g) { return group_forward(g, lines); });
 }
 
 }  // namespace pulsarlm

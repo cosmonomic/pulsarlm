@@ -25,7 +25,7 @@ const std::string prefix = "model.language_model.";
 
 at::Tensor need(const c10::Dict<std::string, at::Tensor>& weights, const std::string& name) {
     if (!weights.contains(prefix + name)) {
-        throw std::invalid_argument(std::format("Qwen4ExpModel: missing weight {:?}", prefix + name));
+        throw std::invalid_argument(std::format("qwen4_exp_model: missing weight {:?}", prefix + name));
     }
     return weights.at(prefix + name);
 }
@@ -42,36 +42,36 @@ at::Tensor ngram_table(const c10::Dict<std::string, at::Tensor>& weights, const 
         shards.push_back(weights.at(std::format("{}{}shard_{}.weight", prefix, p, shards.size())));
     }
     if (shards.empty()) {
-        throw std::invalid_argument(std::format("Qwen4ExpModel: missing weight {:?}", prefix + p + "shard_0.weight"));
+        throw std::invalid_argument(std::format("qwen4_exp_model: missing weight {:?}", prefix + p + "shard_0.weight"));
     }
     return at::cat(shards);
 }
 
 }  // namespace
 
-Qwen4ExpModel::Qwen4ExpModel(qwen4_exp_config config, const c10::Dict<std::string, at::Tensor>& weights)
+qwen4_exp_model::qwen4_exp_model(qwen4_exp_config config, const c10::Dict<std::string, at::Tensor>& weights)
 : config(std::move(config)),
   n_layers(static_cast<std::int64_t>(this->config.layer_types.size())),
   embed_tokens(need(weights, "embed_tokens.weight")) {
     const qwen4_exp_config& c = this->config;
     const auto rotary_dim = static_cast<std::int64_t>(std::llround(c.partial_rotary_factor * c.head_dim));
     if (rotary_dim % 2 != 0 || rotary_dim > c.head_dim || c.head_dim % 2 != 0) {
-        throw std::invalid_argument("Qwen4ExpModel: the rotated dims must be an even part of an even head dim");
+        throw std::invalid_argument("qwen4_exp_model: the rotated dims must be an even part of an even head dim");
     }
     if (c.linear_n_value_heads % c.linear_n_key_heads != 0) {
-        throw std::invalid_argument("Qwen4ExpModel: the value heads must be a multiple of the key heads");
+        throw std::invalid_argument("qwen4_exp_model: the value heads must be a multiple of the key heads");
     }
     if (c.hc_count < 2 || c.ngram_size < 2) {
-        throw std::invalid_argument("Qwen4ExpModel: hc_count and ngram_size must be at least 2");
+        throw std::invalid_argument("qwen4_exp_model: hc_count and ngram_size must be at least 2");
     }
     if (c.indexer_budget % c.indexer_compress_ratio != 0 || rotary_dim > c.indexer_head_dim) {
         throw std::invalid_argument(
-            "Qwen4ExpModel: the indexer budget must be whole blocks and the rotated dims fit an index head"
+            "qwen4_exp_model: the indexer budget must be whole blocks and the rotated dims fit an index head"
         );
     }
     for (std::int64_t layer : c.ple_layers) {
         if (layer < 0 || layer >= n_layers || c.layer_types[layer] != qwen4_exp_layer_type::linear_attention) {
-            throw std::invalid_argument("Qwen4ExpModel: a PLE layer must be a linear attention layer");
+            throw std::invalid_argument("qwen4_exp_model: a PLE layer must be a linear attention layer");
         }
     }
     rope = rope_parameters{
@@ -86,14 +86,14 @@ Qwen4ExpModel::Qwen4ExpModel(qwen4_exp_config config, const c10::Dict<std::strin
     const std::int64_t conv_channels = 2 * c.linear_n_key_heads * c.linear_key_head_dim +
         c.linear_n_value_heads * c.linear_value_head_dim;
     auto mixer = [&](const std::string& p) {
-        return MixerWeights{
+        return mixer_weights{
             .hc_norm = zero_centered(need(weights, p + "hc_norm.weight")),
             .input_mix_weight_down = need(weights, p + "input_mix_weight_down.weight"),
             .input_mix_weight_up = need(weights, p + "input_mix_weight_up.weight"),
         };
     };
     auto hyper_connection = [&](const std::string& p) {
-        return HyperConnectionWeights{
+        return hyper_connection_weights{
             .mixer = mixer(p),
             .block_inject_weight = need(weights, p + "block_inject_weight.weight"),
         };
@@ -109,10 +109,10 @@ Qwen4ExpModel::Qwen4ExpModel(qwen4_exp_config config, const c10::Dict<std::strin
 
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
         const std::string p = "layers." + std::to_string(layer) + ".";
-        LayerWeights w{
+        layer_weights w{
             .attn_hyper_connection = hyper_connection(p + "attn_hyper_connection."),
             .mlp_hyper_connection = hyper_connection(p + "mlp_hyper_connection."),
-            .moe = MoeWeights{
+            .moe = moe_weights{
                 .router = need(weights, p + "mlp.gate.weight"),
                 .experts_gate_up_proj = need(weights, p + "mlp.experts.gate_up_proj"),
                 .experts_down_proj = need(weights, p + "mlp.experts.down_proj"),
@@ -123,11 +123,11 @@ Qwen4ExpModel::Qwen4ExpModel(qwen4_exp_config config, const c10::Dict<std::strin
             },
         };
         if (w.moe.router.size(0) < c.num_experts_per_tok || c.num_experts_per_tok < 1) {
-            throw std::invalid_argument("Qwen4ExpModel: num_experts_per_tok must be between 1 and the experts");
+            throw std::invalid_argument("qwen4_exp_model: num_experts_per_tok must be between 1 and the experts");
         }
         kv_layer_of.push_back(kv_specs.size());
         if (indexed_attention(layer)) {
-            w.attention = AttentionWeights{
+            w.attention = attention_weights{
                 .q_proj = permute_queries(need(weights, p + "self_attn.q_proj.weight"), c.n_heads, permutation),
                 .k_proj = permute_heads(need(weights, p + "self_attn.k_proj.weight"), c.n_kv_heads, permutation),
                 .v_proj = need(weights, p + "self_attn.v_proj.weight"),
@@ -147,7 +147,7 @@ Qwen4ExpModel::Qwen4ExpModel(qwen4_exp_config config, const c10::Dict<std::strin
                 }
             );
         } else {
-            w.deltanet = DeltaNetWeights{
+            w.deltanet = deltanet_weights{
                 .in_proj_qkv = need(weights, p + "linear_attn.in_proj_qkv.weight"),
                 .in_proj_z = need(weights, p + "linear_attn.in_proj_z.weight"),
                 .in_proj_b = need(weights, p + "linear_attn.in_proj_b.weight"),
@@ -165,7 +165,7 @@ Qwen4ExpModel::Qwen4ExpModel(qwen4_exp_config config, const c10::Dict<std::strin
         }
         if (std::ranges::contains(c.ple_layers, layer)) {
             const std::string e = p + "ple.ple_embedding.";
-            w.ple = PleWeights{
+            w.ple = ple_weights{
                 .key_proj = need(weights, p + "ple.key_proj.weight"),
                 .value_proj = need(weights, p + "ple.value_proj.weight"),
                 .norm_key = zero_centered(need(weights, p + "ple.norm_key.weight")),
@@ -179,7 +179,7 @@ Qwen4ExpModel::Qwen4ExpModel(qwen4_exp_config config, const c10::Dict<std::strin
             };
             if (w.ple->layer_multipliers.size(0) != c.ngram_size ||
                 w.ple->head_vocab_sizes.size(0) % (c.ngram_size - 1) != 0) {
-                throw std::invalid_argument("Qwen4ExpModel: the n-gram buffers must match ngram_size");
+                throw std::invalid_argument("qwen4_exp_model: the n-gram buffers must match ngram_size");
             }
             const std::int64_t history = (w.ple->conv.size(2) - 1) * c.ngram_size;
             kv_specs.push_back(recurrent({c.hc_count * c.hidden_size, history}, embed_tokens.scalar_type()));
@@ -189,15 +189,15 @@ Qwen4ExpModel::Qwen4ExpModel(qwen4_exp_config config, const c10::Dict<std::strin
     }
 }
 
-std::vector<kv_layer> Qwen4ExpModel::kv_layers() const {
+std::vector<kv_layer> qwen4_exp_model::kv_layers() const {
     return kv_specs;
 }
 
-bool Qwen4ExpModel::indexed_attention(std::int64_t layer) const {
+bool qwen4_exp_model::indexed_attention(std::int64_t layer) const {
     return config.layer_types[layer] == qwen4_exp_layer_type::indexed_attention;
 }
 
-at::Tensor Qwen4ExpModel::index_rope(const at::Tensor& x, const at::Tensor& positions) const {
+at::Tensor qwen4_exp_model::index_rope(const at::Tensor& x, const at::Tensor& positions) const {
     const std::int64_t rotary_dim = 2 * index_inv_freq.size(0);
     at::Tensor freqs = positions.to(at::kFloat).unsqueeze(-1) * index_inv_freq;
     at::Tensor angles = at::cat({freqs, freqs}, -1);
@@ -215,8 +215,8 @@ at::Tensor Qwen4ExpModel::index_rope(const at::Tensor& x, const at::Tensor& posi
 
 // Hugging Face takes a query's top blocks with torch.topk, whose order among equal scores is unspecified; here the lower
 // block wins.
-at::Tensor Qwen4ExpModel::selected_blocks(
-    const AttentionWeights& w,
+at::Tensor qwen4_exp_model::selected_blocks(
+    const attention_weights& w,
     const at::Tensor& queries,
     const kv& lines,
     const at::Tensor& page_tables,
@@ -229,7 +229,7 @@ at::Tensor Qwen4ExpModel::selected_blocks(
     const std::int64_t ntok = queries.size(0);
     const std::int64_t num_seqs = page_tables.size(0);
     const std::int64_t page_size = lines.index_keys.size(1);
-    TORCH_CHECK(page_size % ratio == 0, "Qwen4ExpModel: a page must hold whole index blocks");
+    TORCH_CHECK(page_size % ratio == 0, "qwen4_exp_model: a page must hold whole index blocks");
     const std::int64_t max_blocks = page_tables.size(1) * page_size / ratio;
     const std::int64_t words = max_blocks / 32 + 1;
     const auto longs = queries.options().dtype(at::kLong);
@@ -275,13 +275,13 @@ at::Tensor Qwen4ExpModel::selected_blocks(
     return at::cat(selected);
 }
 
-at::Tensor Qwen4ExpModel::stream_norm(const at::Tensor& x, const at::Tensor& weight) const {
+at::Tensor qwen4_exp_model::stream_norm(const at::Tensor& x, const at::Tensor& weight) const {
     at::Tensor streams = x.to(at::kFloat).view({x.size(0), -1, config.hidden_size});
     at::Tensor normed = streams * at::rsqrt(streams.pow(2).mean(-1, true) + config.rms_norm_eps);
     return (normed.flatten(1) * weight).to(x.scalar_type());
 }
 
-at::Tensor Qwen4ExpModel::mixed_streams(const at::Tensor& normed, const MixerWeights& w) const {
+at::Tensor qwen4_exp_model::mixed_streams(const at::Tensor& normed, const mixer_weights& w) const {
     const auto hc = static_cast<double>(config.hc_count);
     at::Tensor mix_weights = at::silu(at::linear(normed, w.input_mix_weight_down) / hc);
     mix_weights = at::sigmoid(at::linear(mix_weights, w.input_mix_weight_up));
@@ -289,26 +289,26 @@ at::Tensor Qwen4ExpModel::mixed_streams(const at::Tensor& normed, const MixerWei
     return (mix_weights.view(streams.sizes()) * streams).mean(-2);
 }
 
-Qwen4ExpModel::MixedInput Qwen4ExpModel::mix(const at::Tensor& x, const HyperConnectionWeights& w) const {
+qwen4_exp_model::mixed_input qwen4_exp_model::mix(const at::Tensor& x, const hyper_connection_weights& w) const {
     at::Tensor normed = stream_norm(x, w.mixer.hc_norm);
-    return MixedInput{
+    return mixed_input{
         .input = mixed_streams(normed, w.mixer),
         .injection_weights = 2 *
             at::sigmoid(at::linear(normed, w.block_inject_weight) / static_cast<double>(config.hc_count)),
     };
 }
 
-at::Tensor Qwen4ExpModel::final_mix(const at::Tensor& x) const {
+at::Tensor qwen4_exp_model::final_mix(const at::Tensor& x) const {
     return mixed_streams(stream_norm(x, hyper_connection_mixer.hc_norm), hyper_connection_mixer);
 }
 
-at::Tensor Qwen4ExpModel::attention(
+at::Tensor qwen4_exp_model::attention(
     const at::Tensor& h,
     std::int64_t layer,
-    const GroupBatch& g,
+    const group_batch& g,
     std::span<const kv> lines
 ) const {
-    const AttentionWeights& w = *layers[layer].attention;
+    const attention_weights& w = *layers[layer].attention;
     const qwen4_exp_config& c = config;
     const std::int64_t ntok = h.size(0);
     const std::size_t kv_index = kv_layer_of[layer];
@@ -382,9 +382,13 @@ at::Tensor Qwen4ExpModel::attention(
     return at::linear(o.reshape({ntok, c.n_heads * c.head_dim}) * at::sigmoid(gate), w.o_proj);
 }
 
-at::Tensor
-Qwen4ExpModel::deltanet(const at::Tensor& h, std::int64_t layer, const GroupBatch& g, std::span<const kv> lines) const {
-    const DeltaNetWeights& w = *layers[layer].deltanet;
+at::Tensor qwen4_exp_model::deltanet(
+    const at::Tensor& h,
+    std::int64_t layer,
+    const group_batch& g,
+    std::span<const kv> lines
+) const {
+    const deltanet_weights& w = *layers[layer].deltanet;
     const qwen4_exp_config& c = config;
     const std::int64_t ntok = h.size(0);
     const std::size_t state_layer = kv_layer_of[layer];
@@ -420,8 +424,8 @@ Qwen4ExpModel::deltanet(const at::Tensor& h, std::int64_t layer, const GroupBatc
     return at::linear(gated.view({ntok, c.linear_n_value_heads * c.linear_value_head_dim}), w.out_proj);
 }
 
-at::Tensor Qwen4ExpModel::moe(const at::Tensor& h, std::int64_t layer) const {
-    const MoeWeights& m = layers[layer].moe;
+at::Tensor qwen4_exp_model::moe(const at::Tensor& h, std::int64_t layer) const {
+    const moe_weights& m = layers[layer].moe;
     at::Tensor probabilities = at::softmax(at::linear(h, m.router), -1, at::kFloat);
     auto [top_weights, top_experts] = at::topk(probabilities, config.num_experts_per_tok, -1);
     top_weights = top_weights / top_weights.sum(-1, true);
@@ -443,7 +447,7 @@ at::Tensor Qwen4ExpModel::moe(const at::Tensor& h, std::int64_t layer) const {
 // Hugging Face shifts each sequence right by k with EOS in the places before the sequence's start and before a token
 // following an EOS, so a token's k-th previous token is EOS when any of its previous k is EOS.
 at::Tensor
-Qwen4ExpModel::ngram_ids(const PleWeights& w, std::size_t token_layer, const GroupBatch& g, const kv& lines) const {
+qwen4_exp_model::ngram_ids(const ple_weights& w, std::size_t token_layer, const group_batch& g, const kv& lines) const {
     const std::int64_t ntok = g.tokens.size(0);
     const std::int64_t context = config.ngram_size - 1;
     const std::int64_t eos = config.eos_token_id;
@@ -501,8 +505,8 @@ Qwen4ExpModel::ngram_ids(const PleWeights& w, std::size_t token_layer, const Gro
 }
 
 at::Tensor
-Qwen4ExpModel::ple(const at::Tensor& x, std::int64_t layer, const GroupBatch& g, std::span<const kv> lines) const {
-    const PleWeights& w = *layers[layer].ple;
+qwen4_exp_model::ple(const at::Tensor& x, std::int64_t layer, const group_batch& g, std::span<const kv> lines) const {
+    const ple_weights& w = *layers[layer].ple;
     const qwen4_exp_config& c = config;
     const std::int64_t ntok = x.size(0);
     const std::size_t conv_layer = kv_layer_of[layer] + 2;
@@ -531,17 +535,17 @@ Qwen4ExpModel::ple(const at::Tensor& x, std::int64_t layer, const GroupBatch& g,
     return gated + convolved;
 }
 
-at::Tensor Qwen4ExpModel::group_forward(const GroupBatch& g, std::span<const kv> lines) const {
-    auto inject = [](const at::Tensor& x, const at::Tensor& out, const MixedInput& mixed) {
+at::Tensor qwen4_exp_model::group_forward(const group_batch& g, std::span<const kv> lines) const {
+    auto inject = [](const at::Tensor& x, const at::Tensor& out, const mixed_input& mixed) {
         return x + (out.unsqueeze(1) * mixed.injection_weights.unsqueeze(-1)).flatten(1);
     };
     at::Tensor x = embed_tokens.index_select(0, g.tokens).repeat({1, config.hc_count});
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
-        const LayerWeights& w = layers[layer];
+        const layer_weights& w = layers[layer];
         if (w.ple) {
             x = x + ple(x, layer, g, lines);
         }
-        MixedInput mixed = mix(x, w.attn_hyper_connection);
+        mixed_input mixed = mix(x, w.attn_hyper_connection);
         x = inject(
             x,
             indexed_attention(layer) ? attention(mixed.input, layer, g, lines) : deltanet(mixed.input, layer, g, lines),
@@ -553,8 +557,8 @@ at::Tensor Qwen4ExpModel::group_forward(const GroupBatch& g, std::span<const kv>
     return at::matmul(final_mix(logit_inputs(x, g)), lm_head.t());
 }
 
-StepLogits Qwen4ExpModel::forward(const StepBatch& batch, std::span<const kv> lines) {
-    return paged_forward(batch, [&](const GroupBatch& g) { return group_forward(g, lines); });
+step_logits qwen4_exp_model::forward(const step_batch& batch, std::span<const kv> lines) {
+    return paged_forward(batch, [&](const group_batch& g) { return group_forward(g, lines); });
 }
 
 }  // namespace pulsarlm

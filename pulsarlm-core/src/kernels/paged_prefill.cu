@@ -28,7 +28,7 @@ namespace {
 // so rotating there would repeat each rotation that many times.
 template <typename scalar_t>
 __global__ void
-rotate_view_keys_kernel(const attn::PagedAttnParams<scalar_t> p, int page_size, scalar_t* __restrict__ rotated_k) {
+rotate_view_keys_kernel(const attn::paged_attn_params<scalar_t> p, int page_size, scalar_t* __restrict__ rotated_k) {
     const int s = blockIdx.x / p.max_pages;
     const int view_page = blockIdx.x % p.max_pages;
     const int ctx_len = p.seqlens_k[s];
@@ -40,7 +40,7 @@ rotate_view_keys_kernel(const attn::PagedAttnParams<scalar_t> p, int page_size, 
     const int half = p.head_dim / 2;
     const int pairs_per_key = p.n_kv_heads * half;
     const int64_t page_elems = static_cast<int64_t>(page_size) * p.n_kv_heads * p.head_dim;
-    const attn::KeyPositions layout = attn::key_positions(p, s, page_size);
+    const attn::key_positions layout = attn::sequence_key_positions(p, s, page_size);
     const int line = p.page_tables[static_cast<int64_t>(s) * p.max_pages + view_page];
     const scalar_t* src = p.k_pool + line * p.page_stride;
     scalar_t* dst = rotated_k + blockIdx.x * page_elems;
@@ -59,7 +59,7 @@ rotate_view_keys_kernel(const attn::PagedAttnParams<scalar_t> p, int page_size, 
     }
 }
 
-template <typename scalar_t, bool BF16> void launch_tc_prefill(const attn::PagedAttnBatch& b, cudaStream_t stream) {
+template <typename scalar_t, bool BF16> void launch_tc_prefill(const attn::paged_attn_batch& b, cudaStream_t stream) {
     if (b.total_q == 0) {
         return;
     }
@@ -80,7 +80,7 @@ template <typename scalar_t, bool BF16> void launch_tc_prefill(const attn::Paged
         constexpr int BS = decltype(bs_tag)::value;
         constexpr int HD = decltype(hd_tag)::value;
         attn::dispatch_attn_tuning([&](auto row_tag) {
-            constexpr attn::AttnTuning kTuning = attn::kAttnTuningTable[decltype(row_tag)::value];
+            constexpr attn::attn_tuning kTuning = attn::kAttnTuningTable[decltype(row_tag)::value];
             constexpr int NWARPS = kTuning.prefill_warps;
             constexpr int KEY_PAGES = attn::prefill_key_pages<scalar_t, BS, HD, kTuning.prefill_key_pages>();
             constexpr size_t smem = attn::prefill_tile_bytes<scalar_t, BS, HD, KEY_PAGES>();
@@ -92,7 +92,7 @@ template <typename scalar_t, bool BF16> void launch_tc_prefill(const attn::Paged
     });
 }
 
-at::Tensor paged_prefill(const attn::PagedAttnBatch& b) {
+at::Tensor paged_prefill(const attn::paged_attn_batch& b) {
     if (b.total_q == 0 || b.num_seqs == 0) {
         return b.o;
     }
@@ -152,7 +152,7 @@ at::Tensor attn_prefill_cuda(
     const std::optional<at::Tensor>& cu_view_pages,
     const std::optional<at::Tensor>& query_weights
 ) {
-    const auto batch = attn::paged_attn_batch(
+    const auto batch = attn::make_paged_attn_batch(
         "attn_prefill",
         q,
         k_pool,
