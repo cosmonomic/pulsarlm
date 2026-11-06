@@ -1,5 +1,6 @@
 #pragma once
 
+#include "pulsarlm/communicator.hpp"
 #include "pulsarlm/model/interface.hpp"
 #include "pulsarlm/model/linear.hpp"
 #include "pulsarlm/rope.hpp"
@@ -80,11 +81,17 @@ class qwen3_5_model : public model {
     };
 
     qwen3_5_config config;
+    communicator comm;
+    // This GPU's heads.
+    std::int64_t n_heads;
+    std::int64_t n_kv_heads;
+    std::int64_t linear_n_key_heads;
+    std::int64_t linear_n_value_heads;
     std::int64_t n_layers;
     rope_parameters rope;
     // The first KV layer of each layer.
     std::vector<std::size_t> kv_layer_of;
-    std::vector<kv_layer> kv_specs;
+    std::vector<kv_layer_shard> kv_shards;
     at::Tensor embed_tokens;
     at::Tensor lm_head;
     at::Tensor norm;  // fp32 1 + weight
@@ -94,14 +101,18 @@ class qwen3_5_model : public model {
     at::Tensor
     attention(const at::Tensor& h, std::int64_t layer, const group_batch& g, std::span<const kv> lines) const;
     at::Tensor deltanet(const at::Tensor& h, std::int64_t layer, const group_batch& g, std::span<const kv> lines) const;
+    at::Tensor embed(const at::Tensor& tokens) const;
     at::Tensor group_forward(const group_batch& g, std::span<const kv> lines) const;
 
   public:
     // weights are on the lines' device, in the attention lines' dtype, except that fp8 linears and their scales may
-    // be on the host.
-    qwen3_5_model(qwen3_5_config config, const c10::Dict<std::string, at::Tensor>& weights);
+    // be on the host. With comm of more than one rank, weights hold this rank's slices, cut as vLLM v0.31.0 cuts
+    // Qwen3.5: embed_tokens and lm_head hold rows [rank * rows, (rank + 1) * rows) of the vocabulary padded to a
+    // multiple of 64, rows its padded size / comm.size(), the padding rows zero.
+    qwen3_5_model(qwen3_5_config config, const c10::Dict<std::string, at::Tensor>& weights, communicator comm = {});
 
     std::vector<kv_layer> kv_layers() const override;
+    std::vector<kv_layer_shard> kv_layer_shards() const override;
     step_logits forward(const step_batch& batch, std::span<const kv> lines) override;
 };
 
