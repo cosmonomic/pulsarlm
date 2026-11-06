@@ -7,6 +7,7 @@ class Settings:
     model: str
     data_dir: Path | None
     device: str
+    tensor_parallel_size: int
     dtype: str
     kv_cache_gib: float
     prefill_tokens_per_step: int

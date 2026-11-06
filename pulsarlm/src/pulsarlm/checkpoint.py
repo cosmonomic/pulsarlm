@@ -1,9 +1,10 @@
 import hashlib
+import importlib
 import json
 import os
 import shutil
 import zipfile
-from collections.abc import Generator
+from collections.abc import Generator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple, Self
@@ -175,27 +176,41 @@ def load_weights(
     device: torch.device,
     dtype: torch.dtype | None = None,
     unused_prefixes: tuple[str, ...] = (),
+    shard: tuple[int, int] = (0, 1),
 ) -> dict[str, Tensor]:
-    out: dict[str, Tensor] = {}
-
+    """With shard (rank, size) of more than one GPU, GPU rank's part of the
+    weights (pulsarlm.sharding), read without the rest. Each tensor reaches the
+    device before the next is read."""
     assert archive.filename is not None
     cache_dir = get_shard_cache_dir(Path(archive.filename))
+    paths = [
+        cache_shard(shard_path, cache_dir)
+        for shard_path in zipfile.Path(archive, at="weights/").glob("*.safetensors")
+    ]
+    rank, size = shard
+    if size > 1:
+        sharding = importlib.import_module("pulsarlm.sharding")
+        host = sharding.rank_weights(
+            paths, load_config(zipfile.Path(archive)), rank, size, unused_prefixes
+        )
+    else:
+        host = whole_weights(paths, unused_prefixes)
+    return {
+        name: tensor
+        if quantized(name, tensor)
+        else tensor.to(device=device, dtype=dtype, non_blocking=True)
+        for name, tensor in host
+    }
 
-    for shard_path in zipfile.Path(archive, at="weights/").glob("*.safetensors"):
-        cached_shard_path = cache_shard(shard_path, cache_dir)
 
-        with safetensors.safe_open(cached_shard_path, framework="pt") as f:
+def whole_weights(
+    paths: list[Path], unused_prefixes: tuple[str, ...]
+) -> Iterator[tuple[str, Tensor]]:
+    for path in paths:
+        with safetensors.safe_open(path, framework="pt") as f:
             for name in f.keys():
-                if name.startswith(unused_prefixes):
-                    continue
-                tensor = f.get_tensor(name)
-                out[name] = (
-                    tensor
-                    if quantized(name, tensor)
-                    else tensor.to(device=device, dtype=dtype, non_blocking=True)
-                )
-
-    return out
+                if not name.startswith(unused_prefixes):
+                    yield name, f.get_tensor(name)
 
 
 def text_model_weights(
@@ -218,6 +233,7 @@ def load(
     *,
     device: torch.device,
     dtype: torch.dtype | None = None,
+    shard: tuple[int, int] = (0, 1),
 ) -> PulsarLMModel:
     with zipfile.ZipFile(path, mode="r") as archive:
         archive_path = zipfile.Path(archive)
@@ -232,6 +248,7 @@ def load(
                 device=device,
                 dtype=dtype,
                 unused_prefixes=UNUSED_PREFIXES.get(config.architecture, ()),
+                shard=shard,
             ),
         )
 

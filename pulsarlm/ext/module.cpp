@@ -91,6 +91,50 @@ gate_activation activation(const std::string& name) {
     throw std::invalid_argument("unknown gate activation " + name);
 }
 
+// shards[s] runs on devices[s]; kv_cache_gib sizes each device's KV cache.
+std::unique_ptr<python_engine> make_sharded_engine(
+    py::object store,
+    std::vector<std::unique_ptr<model>>&& shards,
+    std::vector<at::Device> devices,
+    std::size_t model_vocab_size,
+    const std::string& model_name,
+    std::size_t page_size,
+    at::ScalarType kv_dtype,
+    double kv_cache_gib,
+    double store_gib,
+    std::vector<std::int64_t> stop_ids,
+    std::size_t prefill_tokens_per_step
+) {
+    if (!(kv_cache_gib > 0.0) || !(store_gib >= 0.0)) {
+        throw std::invalid_argument("kv_cache_gib must be positive and store_gib not negative");
+    }
+    engine_config config{
+        model_name,
+        page_size,
+        kv_dtype,
+        static_cast<std::size_t>(kv_cache_gib * (1ull << 30)),
+        std::move(devices),
+        std::move(stop_ids),
+        model_vocab_size,
+        prefill_tokens_per_step,
+    };
+    std::size_t largest_page_bytes = 0;
+    std::vector<kv_layer> full_layers;
+    for (const kv_layer_shard& layer : shards.front()->kv_layer_shards()) {
+        full_layers.push_back(layer.full);
+    }
+    for (const page_shape& shape : page_shapes(config, full_layers)) {
+        largest_page_bytes = std::max(largest_page_bytes, line_bytes(shape));
+    }
+    auto adapter = std::make_unique<python_store>(
+        std::move(store),
+        static_cast<std::size_t>(store_gib * (1ull << 30)),
+        largest_page_bytes
+    );
+    py::gil_scoped_release nogil;
+    return std::make_unique<python_engine>(std::move(shards), config, std::move(adapter));
+}
+
 std::unique_ptr<python_engine> make_engine(
     py::object store,
     const any_model_config& architecture_config,
@@ -104,39 +148,91 @@ std::unique_ptr<python_engine> make_engine(
     std::vector<std::int64_t> stop_ids,
     std::size_t prefill_tokens_per_step
 ) {
-    if (!(kv_cache_gib > 0.0) || !(store_gib >= 0.0)) {
-        throw std::invalid_argument("kv_cache_gib must be positive and store_gib not negative");
+    std::vector<std::unique_ptr<model>> shards;
+    {
+        py::gil_scoped_release nogil;
+        shards.push_back(make_model(architecture_config, weights));
     }
-    engine_config config{
+    return make_sharded_engine(
+        std::move(store),
+        std::move(shards),
+        {device},
+        vocab_size(architecture_config),
         model_name,
         page_size,
         kv_dtype,
-        static_cast<std::size_t>(kv_cache_gib * (1ull << 30)),
-        {device},
+        kv_cache_gib,
+        store_gib,
         std::move(stop_ids),
-        vocab_size(architecture_config),
-        prefill_tokens_per_step,
-    };
-    std::unique_ptr<model> served_model;
-    {
-        py::gil_scoped_release nogil;
-        served_model = make_model(architecture_config, weights);
-    }
-    std::size_t largest_page_bytes = 0;
-    std::vector<kv_layer> full_layers;
-    for (const kv_layer_shard& layer : served_model->kv_layer_shards()) {
-        full_layers.push_back(layer.full);
-    }
-    for (const page_shape& shape : page_shapes(config, full_layers)) {
-        largest_page_bytes = std::max(largest_page_bytes, line_bytes(shape));
-    }
-    auto adapter = std::make_unique<python_store>(
-        std::move(store),
-        static_cast<std::size_t>(store_gib * (1ull << 30)),
-        largest_page_bytes
+        prefill_tokens_per_step
     );
+}
+
+// Takes each model out of its handle, which an engine then holds; the devices are the models'.
+std::unique_ptr<python_engine> make_engine_from_models(
+    py::object store,
+    const std::vector<model_handle*>& models,
+    const std::string& model_name,
+    std::size_t page_size,
+    at::ScalarType kv_dtype,
+    double kv_cache_gib,
+    double store_gib,
+    std::vector<std::int64_t> stop_ids,
+    std::size_t prefill_tokens_per_step
+) {
+    if (models.empty()) {
+        throw std::invalid_argument("an engine takes at least one model");
+    }
+    std::vector<std::unique_ptr<model>> shards;
+    std::vector<at::Device> devices;
+    for (model_handle* handle : models) {
+        if (!handle->served_model) {
+            throw std::invalid_argument("a model another engine took");
+        }
+        devices.push_back(handle->device);
+    }
+    std::size_t model_vocab_size = models.front()->vocab_size;
+    for (model_handle* handle : models) {
+        shards.push_back(std::move(handle->served_model));
+    }
+    return make_sharded_engine(
+        std::move(store),
+        std::move(shards),
+        std::move(devices),
+        model_vocab_size,
+        model_name,
+        page_size,
+        kv_dtype,
+        kv_cache_gib,
+        store_gib,
+        std::move(stop_ids),
+        prefill_tokens_per_step
+    );
+}
+
+// The device of the weights on a CUDA device; a fp8 checkpoint's quantized weights stay on the host.
+at::Device cuda_device_of(const std::unordered_map<std::string, at::Tensor>& weights) {
+    for (const auto& [name, tensor] : weights) {
+        if (tensor.is_cuda()) {
+            return tensor.device();
+        }
+    }
+    throw std::invalid_argument("make_model: no weight is on a CUDA device");
+}
+
+std::unique_ptr<model_handle> make_model_handle(
+    const any_model_config& architecture_config,
+    const std::unordered_map<std::string, at::Tensor>& weights,
+    const communicator& comm
+) {
+    at::Device device = cuda_device_of(weights);
+    std::size_t model_vocab_size = vocab_size(architecture_config);
     py::gil_scoped_release nogil;
-    return std::make_unique<python_engine>(std::move(served_model), config, std::move(adapter));
+    return std::make_unique<model_handle>(model_handle{
+        .served_model = make_model(architecture_config, weights, comm),
+        .device = device,
+        .vocab_size = model_vocab_size,
+    });
 }
 
 }  // namespace
@@ -696,6 +792,23 @@ PYBIND11_MODULE(pulsarlm_core, m) {
         )
         .def_readonly("eos_token_id", &qwen4_exp_config::eos_token_id);
 
+    py::class_<communicator>(m, "Communicator")
+        .def(py::init<>())
+        .def_static(
+            "make",
+            [](const std::vector<at::Device>& devices) { return communicator::make(devices); },
+            "devices"_a
+        )
+        .def_static("make_on_one_device", &communicator::make_on_one_device, "device"_a, "size"_a)
+        .def_property_readonly("rank", &communicator::rank)
+        .def_property_readonly("size", &communicator::size);
+
+    py::class_<model_handle>(m, "Model").def_property_readonly("device", [](const model_handle& handle) {
+        return handle.device;
+    });
+
+    m.def("make_model", &make_model_handle, "config"_a, "weights"_a, "communicator"_a);
+
     py::class_<request_handle>(m, "Request").def("take", &take_to_python).def("cancel", &request_handle::cancel);
 
     py::class_<python_engine>(m, "Engine")
@@ -711,6 +824,19 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "kv_cache_gib"_a = 4.0,
             "store_gib"_a,
             "device"_a,
+            "stop_ids"_a,
+            "prefill_tokens_per_step"_a
+        )
+        .def(
+            py::init(&make_engine_from_models),
+            "store"_a,
+            py::kw_only(),
+            "models"_a,
+            "model_name"_a,
+            "page_size"_a,
+            "kv_dtype"_a,
+            "kv_cache_gib"_a = 4.0,
+            "store_gib"_a,
             "stop_ids"_a,
             "prefill_tokens_per_step"_a
         )

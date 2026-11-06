@@ -47,11 +47,21 @@ ArchiveDataDir = Annotated[
     ),
 ]
 Device = Annotated[str, typer.Option(help="Torch device.")]
+TensorParallelSize = Annotated[
+    int,
+    typer.Option(
+        "--tensor_parallel_size",
+        min=1,
+        help="GPUs the model is split across, cuda:0 on; above 1, --device is unused.",
+    ),
+]
 WeightDType = Annotated[DType, typer.Option(help="Weight and KV cache dtype.")]
 KvCacheGib = Annotated[
     float,
     typer.Option(
-        "--kv_cache_gib", help="KV cache size in GiB.", rich_help_panel="Memory"
+        "--kv_cache_gib",
+        help="KV cache size in GiB, per GPU.",
+        rich_help_panel="Memory",
     ),
 ]
 PrefillTokensPerStep = Annotated[
@@ -162,6 +172,7 @@ def serve(
     port: Annotated[int, typer.Option(help="Port to listen on.")] = 8000,
     data_dir: SearchedDataDir = None,
     device: Device = "cuda",
+    tensor_parallel_size: TensorParallelSize = 1,
     dtype: WeightDType = DType.bfloat16,
     kv_cache_gib: KvCacheGib = 4.0,
     prefill_tokens_per_step: PrefillTokensPerStep = 256,
@@ -192,6 +203,7 @@ def serve(
                 model=model,
                 data_dir=data_dir,
                 device=device,
+                tensor_parallel_size=tensor_parallel_size,
                 dtype=dtype,
                 kv_cache_gib=kv_cache_gib,
                 prefill_tokens_per_step=prefill_tokens_per_step,
@@ -263,6 +275,7 @@ def chat(
     ] = False,
     data_dir: SearchedDataDir = None,
     device: Device = "cuda",
+    tensor_parallel_size: TensorParallelSize = 1,
     dtype: WeightDType = DType.bfloat16,
     kv_cache_gib: KvCacheGib = 4.0,
     prefill_tokens_per_step: PrefillTokensPerStep = 256,
@@ -284,6 +297,7 @@ def chat(
                 model=model,
                 data_dir=data_dir,
                 device=device,
+                tensor_parallel_size=tensor_parallel_size,
                 dtype=dtype,
                 kv_cache_gib=kv_cache_gib,
                 prefill_tokens_per_step=prefill_tokens_per_step,

@@ -1,6 +1,6 @@
 import enum
 from concurrent.futures import Future
-from typing import Literal, Protocol
+from typing import Literal, Protocol, overload
 
 import torch
 from torch import Tensor
@@ -310,6 +310,42 @@ class Qwen4ExpConfig:
         indexer_compress_ratio: int,
     ) -> None: ...
 
+class Communicator:
+    """One GPU's member of a group of GPUs that split a model; default-constructed,
+    a group of one GPU."""
+
+    def __init__(self) -> None: ...
+    @staticmethod
+    def make(devices: list[torch.device]) -> list[Communicator]:
+        """Rank i on devices[i], over NCCL; the devices are distinct."""
+    @staticmethod
+    def make_on_one_device(device: torch.device, size: int) -> list[Communicator]:
+        """size ranks on one device, without NCCL, for tests."""
+    @property
+    def rank(self) -> int: ...
+    @property
+    def size(self) -> int: ...
+
+class Model:
+    """One GPU's model, until an engine takes it."""
+
+    @property
+    def device(self) -> torch.device: ...
+
+def make_model(
+    config: ModelConfig
+    | Gemma4Config
+    | Qwen3_5Config
+    | Qwen3_5MoeConfig
+    | Qwen4ExpConfig,
+    weights: dict[str, Tensor],
+    communicator: Communicator,
+) -> Model:
+    """communicator's rank's model on the device of its weights, which are that
+    rank's part of the checkpoint's (pulsarlm.sharding) when the communicator has
+    more than one rank. Raises ValueError for an architecture that does not split
+    across GPUs."""
+
 class Request:
     def take(
         self,
@@ -319,6 +355,7 @@ class Request:
     def cancel(self) -> None: ...
 
 class Engine:
+    @overload
     def __init__(
         self,
         store: PageStore,
@@ -338,6 +375,22 @@ class Engine:
         stop_ids: list[int],
         prefill_tokens_per_step: int,
     ) -> None: ...
+    @overload
+    def __init__(
+        self,
+        store: PageStore,
+        *,
+        models: list[Model],
+        model_name: str,
+        page_size: int,
+        kv_dtype: torch.dtype,
+        kv_cache_gib: float = 4.0,
+        store_gib: float,
+        stop_ids: list[int],
+        prefill_tokens_per_step: int,
+    ) -> None:
+        """Takes the models, one per GPU of one communicator in rank order, each run
+        on its device with a KV cache of kv_cache_gib."""
     def submit(
         self,
         initial_state: State,

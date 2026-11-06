@@ -3,6 +3,7 @@
 from pulsarlm.core import pulsarlm_core
 
 ActivePage = pulsarlm_core.ActivePage
+Communicator = pulsarlm_core.Communicator
 CycleEnd = pulsarlm_core.CycleEnd
 Engine = pulsarlm_core.Engine
 EngineStat = pulsarlm_core.EngineStat
@@ -11,6 +12,7 @@ Gemma4Config = pulsarlm_core.Gemma4Config
 LayerSequence = pulsarlm_core.LayerSequence
 Llama3RopeScaling = pulsarlm_core.Llama3RopeScaling
 ModelConfig = pulsarlm_core.ModelConfig
+Model = pulsarlm_core.Model
 Moments = pulsarlm_core.Moments
 Qwen3_5Config = pulsarlm_core.Qwen3_5Config
 Qwen3_5MoeConfig = pulsarlm_core.Qwen3_5MoeConfig
@@ -20,5 +22,6 @@ RopeParameters = pulsarlm_core.RopeParameters
 RequestError = pulsarlm_core.RequestError
 SamplingParams = pulsarlm_core.SamplingParams
 State = pulsarlm_core.State
+make_model = pulsarlm_core.make_model
 page_score = pulsarlm_core.page_score
 score_threshold = pulsarlm_core.score_threshold
