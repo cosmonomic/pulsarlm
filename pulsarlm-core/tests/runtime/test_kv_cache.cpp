@@ -20,6 +20,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -32,6 +33,7 @@ using pulsarlm::event_loop;
 using pulsarlm::external_task;
 using pulsarlm::page;
 using pulsarlm::page_error;
+using pulsarlm::sharded_page;
 using pulsarlm::task;
 
 using line_ids = std::vector<std::uint32_t>;
@@ -58,12 +60,15 @@ struct memory_store final : pulsarlm::page_store {
     std::shared_ptr<store_state> state = std::make_shared<store_state>();
     std::shared_ptr<pulsarlm::host_page_pool> host_pages;
 
-    task<std::vector<bool>>
-    fetch(std::span<const digest> hashes, std::vector<page>&& lines, cudaStream_t stream) override {
+    task<std::vector<bool>> fetch(
+        std::span<const digest> hashes,
+        std::vector<sharded_page>&& lines,
+        std::span<const cudaStream_t> streams
+    ) override {
         std::shared_ptr<store_state> shared = state;
         std::shared_ptr<pulsarlm::host_page_pool> pool = host_pages;
         std::vector<digest> requested(hashes.begin(), hashes.end());
-        std::vector<page> targets = std::move(lines);
+        std::vector<sharded_page> targets = std::move(lines);
         shared->fetches.push_back(requested);
         if (shared->gated) {
             auto [gate, opener] = external_task<>::make();
@@ -71,7 +76,7 @@ struct memory_store final : pulsarlm::page_store {
             co_await std::move(gate);
         }
         std::vector<bool> found(requested.size());
-        std::vector<page> found_targets;
+        std::vector<sharded_page> found_targets;
         std::vector<page> found_pages;
         for (std::size_t i = 0; i < requested.size(); i++) {
             if (auto it = shared->pages.find(requested[i]); it != shared->pages.end()) {
@@ -80,24 +85,23 @@ struct memory_store final : pulsarlm::page_store {
                 found_pages.push_back(it->second);
             }
         }
-        co_await pulsarlm::copy_from_host(*pool, found_targets, found_pages, stream);
+        co_await pulsarlm::copy_from_host(*pool, found_targets, found_pages, streams);
         co_return found;
     }
 
-    task<std::expected<void, page_error>> put(
-        std::vector<digest>&& keys,
-        std::vector<page>&& pages,
+    task<std::expected<void, page_error>>
+    put(std::vector<digest>&& keys,
+        std::vector<sharded_page>&& pages,
         std::vector<pulsarlm::page_owner>&& owners,
-        cudaStream_t stream
-    ) override {
+        std::span<const cudaStream_t> streams) override {
         std::shared_ptr<store_state> shared = state;
         std::vector<digest> put_keys = std::move(keys);
-        std::vector<page> sources = std::move(pages);
+        std::vector<sharded_page> sources = std::move(pages);
         shared->puts++;
         for (const pulsarlm::page_owner& owner : owners) {
             shared->owners.emplace_back(owner.request, put_keys[owner.page]);
         }
-        std::optional<std::vector<page>> copies = co_await pulsarlm::copy_to_host(*host_pages, sources, stream);
+        std::optional<std::vector<page>> copies = co_await pulsarlm::copy_to_host(*host_pages, sources, streams);
         if (!copies) {
             co_return std::unexpected(page_error::oom);
         }
@@ -108,8 +112,8 @@ struct memory_store final : pulsarlm::page_store {
     }
 };
 
-cudaStream_t compute_stream() {
-    return c10::cuda::getCurrentCUDAStream().stream();
+std::vector<cudaStream_t> compute_streams() {
+    return {c10::cuda::getCurrentCUDAStream().stream()};
 }
 
 std::size_t lines_bytes(const std::vector<pulsarlm::page_shape>& shapes) {
@@ -207,7 +211,7 @@ void release(pulsarlm::kv_cache& kv, const line_ids& held) {
 
 task<lines_result> get_one_layer(pulsarlm::kv_cache& kv, std::vector<digest> hashes) {
     std::vector<std::span<const digest>> layer_hashes{hashes};
-    layer_lines_result got = co_await kv.get(layer_hashes, compute_stream());
+    layer_lines_result got = co_await kv.get(layer_hashes, compute_streams());
     co_return only_layer(std::move(got));
 }
 
@@ -220,7 +224,7 @@ task<std::expected<void, page_error>> sync_each(
 ) {
     std::vector<std::vector<digest>> layer_hashes(kv.layer_count(), hashes);
     std::vector<std::vector<std::uint64_t>> layer_owners(kv.layer_count(), owners);
-    std::expected<void, page_error> result = co_await kv.sync(layer_hashes, layer_owners, lines, compute_stream());
+    std::expected<void, page_error> result = co_await kv.sync(layer_hashes, layer_owners, lines, compute_streams());
     co_return result;
 }
 
@@ -505,11 +509,11 @@ TEST_CASE("clone copies a held page into unmapped held lines") {
     cache_fixture fixture(3);
     line_ids tail = allocate(fixture.kv, 1).value();
     fill_line(fixture.kv, tail.front(), 4.0f);
-    line_ids copies = fixture.kv.clone(0, tail.front(), 2, compute_stream()).value();
+    line_ids copies = fixture.kv.clone(0, tail.front(), 2, compute_streams()).value();
     REQUIRE(copies.size() == 2);
     REQUIRE(line_filled_with(fixture.kv, copies[0], 4.0f));
     REQUIRE(line_filled_with(fixture.kv, copies[1], 4.0f));
-    REQUIRE(fixture.kv.clone(0, tail.front(), 1, compute_stream()) == oom);
+    REQUIRE(fixture.kv.clone(0, tail.front(), 1, compute_streams()) == oom);
     release(fixture.kv, tail);
     release(fixture.kv, copies);
     require_all_free(fixture.kv, 3);
@@ -766,7 +770,7 @@ TEST_CASE("get fetches the pages of every layer in one fetch") {
     std::vector<digest> second_layer{hash_of(2)};
     std::vector<std::span<const digest>> hashes{first_layer, second_layer};
 
-    layer_lines_result got = run_to_completion(fixture.kv.get(hashes, compute_stream()));
+    layer_lines_result got = run_to_completion(fixture.kv.get(hashes, compute_streams()));
     REQUIRE(got.has_value());
     REQUIRE((fixture.store->fetches == std::vector<std::vector<digest>>{{key_of(1, 0), key_of(2, 0), key_of(2, 1)}}));
     REQUIRE(line_filled_with(fixture.kv, (*got)[0][0], 1.0f, 0));
@@ -782,7 +786,7 @@ TEST_CASE("a page missing in one layer fails the get with miss holding nothing i
     std::vector<digest> page_hashes{hash_of(1)};
     std::vector<std::span<const digest>> hashes{page_hashes, page_hashes};
 
-    layer_lines_result got = run_to_completion(fixture.kv.get(hashes, compute_stream()));
+    layer_lines_result got = run_to_completion(fixture.kv.get(hashes, compute_streams()));
     REQUIRE((got == layer_lines_result(std::unexpected(page_error::miss))));
     REQUIRE(fixture.kv.free_count() == 2);
 }
@@ -817,7 +821,7 @@ TEST_CASE("a layer's line reclaims the region whose cached page is oldest, which
         std::vector<digest> wanted{hash_of(n)};
         std::vector<std::span<const digest>> hashes{none, none};
         hashes[layer] = wanted;
-        layer_lines_result got = run_to_completion(fixture.kv.get(hashes, compute_stream()));
+        layer_lines_result got = run_to_completion(fixture.kv.get(hashes, compute_streams()));
         REQUIRE(got.has_value());
         REQUIRE(line_filled_with(fixture.kv, (*got)[layer].front(), static_cast<float>(n), layer));
         fixture.kv.release(layer, (*got)[layer]);
@@ -847,24 +851,24 @@ TEST_CASE("a large line reclaims a region of cached small pages and drops them a
     backing.state->pages.emplace(key_of(5, 1), host_page(5.0f, wide));
     std::vector<digest> none;
     layer_lines_result got = run_to_completion(
-        kv.get(std::vector<std::span<const digest>>{narrow_hashes, none}, compute_stream())
+        kv.get(std::vector<std::span<const digest>>{narrow_hashes, none}, compute_streams())
     );
     REQUIRE(got.has_value());
     kv.release(0, (*got)[0]);
 
     std::vector<digest> wide_hashes{hash_of(5)};
-    got = run_to_completion(kv.get(std::vector<std::span<const digest>>{none, wide_hashes}, compute_stream()));
+    got = run_to_completion(kv.get(std::vector<std::span<const digest>>{none, wide_hashes}, compute_streams()));
     REQUIRE(got.has_value());
     kv.release(1, (*got)[1]);
     REQUIRE(backing.state->fetches.size() == 2);
 
     std::vector<digest> newer{hash_of(3), hash_of(4)};
-    got = run_to_completion(kv.get(std::vector<std::span<const digest>>{newer, none}, compute_stream()));
+    got = run_to_completion(kv.get(std::vector<std::span<const digest>>{newer, none}, compute_streams()));
     REQUIRE(got.has_value());
     kv.release(0, (*got)[0]);
     REQUIRE(backing.state->fetches.size() == 2);
     std::vector<digest> older{hash_of(1)};
-    got = run_to_completion(kv.get(std::vector<std::span<const digest>>{older, none}, compute_stream()));
+    got = run_to_completion(kv.get(std::vector<std::span<const digest>>{older, none}, compute_streams()));
     REQUIRE(got.has_value());
     kv.release(0, (*got)[0]);
     REQUIRE(backing.state->fetches.size() == 3);
@@ -887,9 +891,11 @@ TEST_CASE("lines of several sizes pack into regions of the largest size") {
     REQUIRE(line_filled_with(aligned, held[0].front(), 1.0f, 0));
     REQUIRE(line_filled_with(aligned, held[1].front(), 2.0f, 1));
     REQUIRE(aligned.free_count() == 0);
-    line_ids narrow = aligned.clone(0, held[0].front(), 1, compute_stream()).value();
+    line_ids narrow = aligned.clone(0, held[0].front(), 1, compute_streams()).value();
     REQUIRE(line_filled_with(aligned, narrow.front(), 1.0f, 0));
-    REQUIRE((aligned.clone(0, held[0].front(), 1, compute_stream()) == lines_result(std::unexpected(page_error::oom))));
+    REQUIRE(
+        (aligned.clone(0, held[0].front(), 1, compute_streams()) == lines_result(std::unexpected(page_error::oom)))
+    );
     aligned.release(0, narrow);
     aligned.release(0, held[0]);
     aligned.release(1, held[1]);
@@ -964,7 +970,7 @@ TEST_CASE("a recurrent layer's line is one tensor of its state sizes and dtype, 
     std::vector<digest> none;
     std::vector<digest> wanted{hash_of(1)};
     layer_lines_result got = run_to_completion(
-        fixture.kv.get(std::vector<std::span<const digest>>{none, wanted}, compute_stream())
+        fixture.kv.get(std::vector<std::span<const digest>>{none, wanted}, compute_streams())
     );
     REQUIRE(got.has_value());
     REQUIRE(lines.k.select(0, (*got)[1].front()).equal(at::arange(15, at::kDouble).view({3, 5}).cuda()));
@@ -998,7 +1004,7 @@ TEST_CASE("the host pool carries pages of layers with different shapes") {
         fixture.kv.release(layer, evicting[layer]);
     }
     std::vector<std::span<const digest>> layer_hashes{hashes, hashes};
-    layer_lines_result got = run_to_completion(fixture.kv.get(layer_hashes, compute_stream()));
+    layer_lines_result got = run_to_completion(fixture.kv.get(layer_hashes, compute_streams()));
     REQUIRE(got.has_value());
     REQUIRE(fixture.kv.tensors(0).v.select(0, (*got)[0][1]).eq(2.0f).all().item<bool>());
     REQUIRE(line_filled_with(fixture.kv, (*got)[1][0], 3.0f, 1));
@@ -1006,4 +1012,220 @@ TEST_CASE("the host pool carries pages of layers with different shapes") {
     for (std::size_t layer = 0; layer < 2; layer++) {
         fixture.kv.release(layer, (*got)[layer]);
     }
+}
+
+namespace {
+
+using row_ranges = std::vector<std::pair<std::size_t, std::size_t>>;
+
+const pulsarlm::page_shape indexed_shape{
+    .n_layers = 1,
+    .page_size = 4,
+    .n_kv_heads = 2,
+    .head_dim = 2,
+    .dtype = at::kFloat,
+    .index_head_dim = 2,
+};
+const pulsarlm::page_shape state_shape{
+    .n_layers = 1,
+    .page_size = 4,
+    .n_kv_heads = 0,
+    .head_dim = 0,
+    .dtype = at::kFloat,
+    .values_only = true,
+    .state_sizes = {4, 3},
+};
+
+std::size_t first_dim(const pulsarlm::page_shape& page_shape) {
+    return page_shape.state_sizes.empty() ? page_shape.n_kv_heads
+                                          : static_cast<std::size_t>(page_shape.state_sizes.front());
+}
+
+pulsarlm::page_shape with_rows(pulsarlm::page_shape page_shape, const row_ranges& rows) {
+    std::size_t count = 0;
+    for (auto [first, last] : rows) {
+        count += last - first;
+    }
+    if (page_shape.state_sizes.empty()) {
+        page_shape.n_kv_heads = count;
+    } else {
+        page_shape.state_sizes.front() = static_cast<std::int64_t>(count);
+    }
+    return page_shape;
+}
+
+// A full page of distinct floats from base, in pageable memory.
+page full_page(const pulsarlm::page_shape& page_shape, float base) {
+    auto floats = static_cast<std::int64_t>(pulsarlm::line_bytes(page_shape) / sizeof(float));
+    return page{.bytes = (at::arange(floats, at::kFloat) + base).view(at::kByte)};
+}
+
+// The bytes of full's rows, then its index keys: one shard's line of it.
+page shard_page(const page& full, const pulsarlm::page_shape& page_shape, const row_ranges& rows) {
+    std::size_t index_bytes = page_shape.page_size * page_shape.index_head_dim * sizeof(float);
+    std::size_t row_bytes = (pulsarlm::line_bytes(page_shape) - index_bytes) / first_dim(page_shape);
+    std::vector<at::Tensor> parts;
+    for (auto [first, last] : rows) {
+        parts.push_back(full.bytes.narrow(
+            0,
+            static_cast<std::int64_t>(first * row_bytes),
+            static_cast<std::int64_t>((last - first) * row_bytes)
+        ));
+    }
+    if (index_bytes > 0) {
+        parts.push_back(full.bytes.narrow(
+            0,
+            static_cast<std::int64_t>(first_dim(page_shape) * row_bytes),
+            static_cast<std::int64_t>(index_bytes)
+        ));
+    }
+    return page{.bytes = at::cat(parts).contiguous()};
+}
+
+void write_line(
+    const pulsarlm::kv& lines,
+    std::uint32_t line_id,
+    const page& p,
+    const pulsarlm::page_shape& page_shape
+) {
+    pulsarlm::kv source = pulsarlm::page_tensors(p, page_shape);
+    lines.k.select(0, line_id).copy_(source.k.select(0, 0));
+    if (!page_shape.values_only) {
+        lines.v.select(0, line_id).copy_(source.v.select(0, 0));
+    }
+    if (page_shape.index_head_dim > 0) {
+        lines.index_keys.select(0, line_id).copy_(source.index_keys.select(0, 0));
+    }
+}
+
+bool line_equals(
+    const pulsarlm::kv& lines,
+    std::uint32_t line_id,
+    const page& p,
+    const pulsarlm::page_shape& page_shape
+) {
+    pulsarlm::kv expected = pulsarlm::page_tensors(p, page_shape);
+    bool equal = at::equal(lines.k.select(0, line_id).cpu(), expected.k.select(0, 0)) &&
+        at::equal(lines.v.select(0, line_id).cpu(), expected.v.select(0, 0));
+    if (page_shape.index_head_dim > 0) {
+        equal = equal && at::equal(lines.index_keys.select(0, line_id).cpu(), expected.index_keys.select(0, 0));
+    }
+    return equal;
+}
+
+struct sharded_fixture {
+    std::vector<pulsarlm::page_shape> full_shapes;
+    // Per shard, per layer.
+    std::vector<std::vector<row_ranges>> rows;
+    memory_store backing;
+
+    std::vector<pulsarlm::kv_cache_shard> cache_shards() const {
+        std::vector<pulsarlm::kv_cache_shard> shards;
+        for (const std::vector<row_ranges>& shard_rows : rows) {
+            pulsarlm::kv_cache_shard shard{.device = at::Device(at::kCUDA, 0), .rows = shard_rows};
+            for (std::size_t layer = 0; layer < full_shapes.size(); layer++) {
+                shard.shapes.push_back(with_rows(full_shapes[layer], shard_rows[layer]));
+            }
+            shards.push_back(std::move(shard));
+        }
+        return shards;
+    }
+
+    pulsarlm::kv_cache make_cache() {
+        return pulsarlm::kv_cache(full_shapes, cache_shards(), 4 * lines_bytes(full_shapes), backing);
+    }
+
+    std::vector<cudaStream_t> streams() const {
+        return std::vector<cudaStream_t>(rows.size(), c10::cuda::getCurrentCUDAStream().stream());
+    }
+};
+
+task<std::expected<void, page_error>>
+sync_sharded(pulsarlm::kv_cache& kv, std::vector<line_ids> lines, std::vector<cudaStream_t> streams) {
+    std::vector<std::vector<digest>> hashes(kv.layer_count(), {hash_of(1)});
+    std::vector<std::vector<std::uint64_t>> owners(kv.layer_count(), {0});
+    co_return co_await kv.sync(hashes, owners, lines, streams);
+}
+
+task<layer_lines_result> get_sharded(pulsarlm::kv_cache& kv, std::vector<cudaStream_t> streams) {
+    std::vector<digest> wanted{hash_of(1)};
+    std::vector<std::span<const digest>> hashes(kv.layer_count(), wanted);
+    co_return co_await kv.get(hashes, streams);
+}
+
+// Writes each shard's rows of a full page per layer, puts the lines, and fetches them into a second cache.
+void check_round_trip(sharded_fixture& fixture) {
+    fixture.backing = with_host_pages(memory_store{}, host_bytes, fixture.full_shapes);
+    std::vector<pulsarlm::kv_cache_shard> shards = fixture.cache_shards();
+    std::vector<page> full_pages;
+    for (std::size_t layer = 0; layer < fixture.full_shapes.size(); layer++) {
+        full_pages.push_back(full_page(fixture.full_shapes[layer], 100.0f * static_cast<float>(layer + 1)));
+    }
+
+    pulsarlm::kv_cache writer = fixture.make_cache();
+    layer_lines_result lines = allocate_each(writer, 1);
+    REQUIRE(lines);
+    for (std::size_t shard = 0; shard < shards.size(); shard++) {
+        for (std::size_t layer = 0; layer < fixture.full_shapes.size(); layer++) {
+            write_line(
+                writer.tensors(layer, shard),
+                (*lines)[layer].front(),
+                shard_page(full_pages[layer], fixture.full_shapes[layer], shards[shard].rows[layer]),
+                shards[shard].shapes[layer]
+            );
+        }
+    }
+    REQUIRE(run_to_completion(sync_sharded(writer, *lines, fixture.streams())));
+    for (std::size_t layer = 0; layer < fixture.full_shapes.size(); layer++) {
+        REQUIRE(at::equal(fixture.backing.state->pages.at(key_of(1, layer)).bytes, full_pages[layer].bytes));
+    }
+
+    pulsarlm::kv_cache reader = fixture.make_cache();
+    layer_lines_result got = run_to_completion(get_sharded(reader, fixture.streams()));
+    REQUIRE(got);
+    for (std::size_t shard = 0; shard < shards.size(); shard++) {
+        for (std::size_t layer = 0; layer < fixture.full_shapes.size(); layer++) {
+            REQUIRE(line_equals(
+                reader.tensors(layer, shard),
+                (*got)[layer].front(),
+                shard_page(full_pages[layer], fixture.full_shapes[layer], shards[shard].rows[layer]),
+                shards[shard].shapes[layer]
+            ));
+        }
+    }
+}
+
+}  // namespace
+
+TEST_CASE("a sharded cache puts each byte of a page once and fetches every shard's rows of it", "[runtime][cuda]") {
+    sharded_fixture fixture{
+        .full_shapes = {indexed_shape, state_shape},
+        .rows = {{{{0, 1}}, {{0, 1}, {2, 3}}}, {{{1, 2}}, {{1, 2}, {3, 4}}}},
+    };
+    check_round_trip(fixture);
+}
+
+TEST_CASE("shards holding the same KV head put it once and both fetch it", "[runtime][cuda]") {
+    pulsarlm::page_shape one_head = indexed_shape;
+    one_head.n_kv_heads = 1;
+    sharded_fixture fixture{
+        .full_shapes = {one_head, state_shape},
+        .rows = {{{{0, 1}}, {{0, 2}}}, {{{0, 1}}, {{2, 4}}}},
+    };
+    check_round_trip(fixture);
+}
+
+TEST_CASE("a sharded cache rejects rows that overlap in part or leave rows out", "[runtime][cuda]") {
+    sharded_fixture partial{
+        .full_shapes = {state_shape},
+        .rows = {{{{0, 2}}}, {{{1, 3}}}},
+        .backing = with_host_pages(memory_store{}, host_bytes, {state_shape}),
+    };
+    REQUIRE_THROWS_AS(partial.make_cache(), std::invalid_argument);
+    sharded_fixture uncovered{
+        .full_shapes = {state_shape},
+        .rows = {{{{0, 2}}}, {{{0, 2}}}},
+        .backing = with_host_pages(memory_store{}, host_bytes, {state_shape}),
+    };
+    REQUIRE_THROWS_AS(uncovered.make_cache(), std::invalid_argument);
 }

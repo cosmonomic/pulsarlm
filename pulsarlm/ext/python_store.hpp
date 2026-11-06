@@ -40,14 +40,16 @@ class python_store final : public page_store {
     python_store& operator=(const python_store&) = delete;
     ~python_store() override;
 
-    task<std::vector<bool>>
-    fetch(std::span<const digest> hashes, std::vector<page>&& lines, cudaStream_t stream) override;
-    task<std::expected<void, page_error>> put(
-        std::vector<digest>&& hashes,
-        std::vector<page>&& pages,
-        std::vector<page_owner>&& owners,
-        cudaStream_t stream
+    task<std::vector<bool>> fetch(
+        std::span<const digest> hashes,
+        std::vector<sharded_page>&& lines,
+        std::span<const cudaStream_t> streams
     ) override;
+    task<std::expected<void, page_error>>
+    put(std::vector<digest>&& hashes,
+        std::vector<sharded_page>&& pages,
+        std::vector<page_owner>&& owners,
+        std::span<const cudaStream_t> streams) override;
 };
 
 }  // namespace pulsarlm

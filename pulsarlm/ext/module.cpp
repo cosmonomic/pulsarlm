@@ -112,7 +112,7 @@ std::unique_ptr<python_engine> make_engine(
         page_size,
         kv_dtype,
         static_cast<std::size_t>(kv_cache_gib * (1ull << 30)),
-        device,
+        {device},
         std::move(stop_ids),
         vocab_size(architecture_config),
         prefill_tokens_per_step,
@@ -123,7 +123,11 @@ std::unique_ptr<python_engine> make_engine(
         served_model = make_model(architecture_config, weights);
     }
     std::size_t largest_page_bytes = 0;
-    for (const page_shape& shape : page_shapes(config, served_model->kv_layers())) {
+    std::vector<kv_layer> full_layers;
+    for (const kv_layer_shard& layer : served_model->kv_layer_shards()) {
+        full_layers.push_back(layer.full);
+    }
+    for (const page_shape& shape : page_shapes(config, full_layers)) {
         largest_page_bytes = std::max(largest_page_bytes, line_bytes(shape));
     }
     auto adapter = std::make_unique<python_store>(

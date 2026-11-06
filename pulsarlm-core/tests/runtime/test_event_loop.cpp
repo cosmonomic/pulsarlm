@@ -125,6 +125,22 @@ task<void> record_current(event_loop** seen) {
     co_return;
 }
 
+task<std::thread::id> worker_thread_id() {
+    co_return std::this_thread::get_id();
+}
+
+task<void> record_worker_thread(std::thread::id* seen) {
+    *seen = std::this_thread::get_id();
+    co_return;
+}
+
+task<void> await_on_worker(event_loop* worker, std::thread::id* valued_on, std::thread::id* void_on) {
+    *valued_on = co_await pulsarlm::run_on(*worker, worker_thread_id());
+    co_await pulsarlm::run_on(*worker, record_worker_thread(void_on));
+    worker->stop();
+    stop_current();
+}
+
 task<void> synchronize_twice(cudaStream_t stream, bool* synchronized) {
     co_await pulsarlm::synchronize(stream);
     co_await pulsarlm::synchronize(stream);
@@ -263,4 +279,22 @@ TEST_CASE("synchronize completes after the work queued on a CUDA stream") {
     }
     CHECK(synchronized);
     CHECK(cudaStreamDestroy(stream) == cudaSuccess);
+}
+
+TEST_CASE("run_on runs a task on another loop's thread and resumes the awaiter with its result") {
+    event_loop worker;
+    std::thread::id worker_id;
+    std::thread worker_thread([&] {
+        worker_id = std::this_thread::get_id();
+        CHECK(worker.run() == nullptr);
+    });
+    event_loop loop;
+    std::thread::id valued_on;
+    std::thread::id void_on;
+    loop.spawn(await_on_worker(&worker, &valued_on, &void_on));
+    CHECK(loop.run() == nullptr);
+    worker_thread.join();
+    CHECK(valued_on == worker_id);
+    CHECK(void_on == worker_id);
+    CHECK(valued_on != std::this_thread::get_id());
 }

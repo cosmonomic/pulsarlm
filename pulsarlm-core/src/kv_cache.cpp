@@ -24,6 +24,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
@@ -183,6 +184,47 @@ c10::cuda::CUDAStreamGuard guard_stream(const at::Tensor& lines, cudaStream_t st
     return c10::cuda::CUDAStreamGuard(c10::cuda::getStreamFromExternal(stream, lines.device().index()));
 }
 
+// The extent of a line's first dimension: KV heads, or a state's first size.
+std::size_t row_count(const page_shape& shape) {
+    return shape.state_sizes.empty() ? shape.n_kv_heads : static_cast<std::size_t>(shape.state_sizes.front());
+}
+
+// The bytes of one entry of a line's first dimension.
+std::size_t row_bytes(const page_shape& shape) {
+    if (!shape.state_sizes.empty()) {
+        std::size_t elements = 1;
+        for (std::size_t dim = 1; dim < shape.state_sizes.size(); dim++) {
+            elements *= static_cast<std::size_t>(shape.state_sizes[dim]);
+        }
+        return elements * c10::elementSize(shape.dtype);
+    }
+    return tensor_count(shape) * shape.page_size * shape.head_dim * c10::elementSize(shape.dtype);
+}
+
+// An indexed attention line's index keys, after its rows.
+std::size_t index_key_bytes(const page_shape& shape) {
+    return shape.page_size * shape.index_head_dim * c10::elementSize(shape.dtype);
+}
+
+void require(bool holds, const std::string& message) {
+    if (!holds) {
+        throw std::invalid_argument(message);
+    }
+}
+
+std::span<const page_shape> first_shard_shapes(std::span<const kv_cache_shard> shards) {
+    require(!shards.empty(), "a KV cache has at least one shard");
+    return shards.front().shapes;
+}
+
+kv_cache_shard whole_shard(std::span<const page_shape> shapes, at::Device device) {
+    kv_cache_shard shard{.device = device, .shapes = std::vector<page_shape>(shapes.begin(), shapes.end())};
+    for (const page_shape& shape : shapes) {
+        shard.rows.push_back({{0, row_count(shape)}});
+    }
+    return shard;
+}
+
 void check_page(const page_shape& shape, const page& source) {
     TORCH_CHECK(
         source.bytes.scalar_type() == at::kByte && source.bytes.dim() == 1 && source.bytes.is_contiguous() &&
@@ -245,39 +287,123 @@ digest store_key(const digest& page, std::size_t layer) {
     return make_digest(seed);
 }
 
-kv_cache::kv_cache(std::span<const page_shape> shapes, std::size_t pool_bytes, at::Device device, page_store& store)
-: pool(make_pool(shapes, pool_bytes, device)),
-  allocator(distinct_block_bytes(shapes), pool_bytes),
+kv_cache::kv_cache(
+    std::span<const page_shape> full_shapes,
+    std::span<const kv_cache_shard> shards,
+    std::size_t pool_bytes_per_device,
+    page_store& store
+)
+: allocator(distinct_block_bytes(first_shard_shapes(shards)), pool_bytes_per_device),
   store(&store) {
-    if (std::size_t needed = min_pool_bytes(layer_block_bytes(shapes)); pool_bytes < needed) {
+    std::span<const page_shape> first_shapes = first_shard_shapes(shards);
+    for (const kv_cache_shard& shard : shards) {
+        require(
+            shard.shapes.size() == full_shapes.size() && shard.rows.size() == full_shapes.size(),
+            "a KV cache shard holds a page shape and rows for every KV layer"
+        );
+        for (std::size_t layer = 0; layer < full_shapes.size(); layer++) {
+            require(
+                line_bytes(shard.shapes[layer]) == line_bytes(first_shapes[layer]),
+                std::format("every KV cache shard's line of KV layer {} takes the same bytes", layer)
+            );
+        }
+    }
+    if (std::size_t needed = min_pool_bytes(layer_block_bytes(first_shapes)); pool_bytes_per_device < needed) {
         throw std::invalid_argument(
             std::format(
                 "a KV cache of {} bytes holds no line of every KV layer; a line of each takes {} bytes",
-                pool_bytes,
+                pool_bytes_per_device,
                 needed
             )
         );
     }
-    std::vector<std::size_t> blocks = distinct_block_bytes(shapes);
+    for (const kv_cache_shard& shard : shards) {
+        pools.push_back(make_pool(shard.shapes, pool_bytes_per_device, shard.device));
+    }
+    std::vector<std::size_t> blocks = distinct_block_bytes(first_shapes);
     for (std::size_t c = 0; c < blocks.size(); c++) {
         classes.push_back(
             block_class{.block_bytes = blocks[c], .lines = std::vector<cache_line>(allocator.line_count(c))}
         );
     }
-    layers.reserve(shapes.size());
-    for (const page_shape& shape : shapes) {
+    layers.reserve(full_shapes.size());
+    for (std::size_t layer = 0; layer < full_shapes.size(); layer++) {
+        const page_shape& full = full_shapes[layer];
         auto class_index = static_cast<std::size_t>(
-            std::ranges::lower_bound(blocks, block_bytes(shape)) - blocks.begin()
+            std::ranges::lower_bound(blocks, block_bytes(first_shapes[layer])) - blocks.begin()
         );
-        layers.push_back(
-            cache_layer{
-                .shape = shape,
-                .block_class = class_index,
-                .device_kv = pool_views(pool, shape, classes[class_index].lines.size()),
+        cache_layer cached{.full_shape = full, .block_class = class_index};
+        std::vector<std::pair<std::size_t, std::size_t>> covered;
+        std::size_t covered_bytes = 0;
+        for (std::size_t s = 0; s < shards.size(); s++) {
+            const page_shape& shape = shards[s].shapes[layer];
+            require(
+                shape.dtype == full.dtype && shape.state_sizes.empty() == full.state_sizes.empty() &&
+                    shape.index_head_dim == full.index_head_dim && row_bytes(shape) == row_bytes(full),
+                std::format("KV cache shard {}'s line of KV layer {} is rows of the full line", s, layer)
+            );
+            std::vector<line_piece> pieces;
+            std::size_t row = 0;
+            for (auto [first, last] : shards[s].rows[layer]) {
+                require(
+                    first < last && last <= row_count(full),
+                    std::format("KV cache shard {}'s rows of KV layer {} lie within the full line", s, layer)
+                );
+                pieces.push_back(
+                    line_piece{
+                        .line_offset = row * row_bytes(full),
+                        .host_offset = first * row_bytes(full),
+                        .bytes = (last - first) * row_bytes(full),
+                    }
+                );
+                row += last - first;
             }
+            require(
+                row == row_count(shape),
+                std::format("KV cache shard {}'s rows of KV layer {} fill its line", s, layer)
+            );
+            if (index_key_bytes(full) > 0) {
+                pieces.push_back(
+                    line_piece{
+                        .line_offset = row_count(shape) * row_bytes(full),
+                        .host_offset = row_count(full) * row_bytes(full),
+                        .bytes = index_key_bytes(full),
+                    }
+                );
+            }
+            for (line_piece& piece : pieces) {
+                std::pair<std::size_t, std::size_t> range{piece.host_offset, piece.host_offset + piece.bytes};
+                auto overlapping = std::ranges::find_if(covered, [&](const auto& other) {
+                    return other.first < range.second && range.first < other.second;
+                });
+                require(
+                    overlapping == covered.end() || *overlapping == range,
+                    std::format("KV cache shards hold KV layer {}'s rows whole or not at all", layer)
+                );
+                piece.put_source = overlapping == covered.end();
+                if (piece.put_source) {
+                    covered.push_back(range);
+                    covered_bytes += piece.bytes;
+                }
+            }
+            cached.shards.push_back(
+                shard_layer{
+                    .shape = shape,
+                    .pieces = std::move(pieces),
+                    .device_kv = pool_views(pools[s], shape, classes[class_index].lines.size()),
+                }
+            );
+        }
+        require(
+            covered_bytes == line_bytes(full),
+            std::format("the KV cache shards cover KV layer {}'s full line", layer)
         );
+        layers.push_back(std::move(cached));
     }
 }
+
+kv_cache::kv_cache(std::span<const page_shape> shapes, std::size_t pool_bytes, at::Device device, page_store& store)
+: kv_cache(shapes, std::vector<kv_cache_shard>{whole_shard(shapes, device)}, pool_bytes, store) {}
 
 void kv_cache::assign_hash(std::size_t layer, std::uint32_t line_id, const digest& hash) {
     line(layer, line_id).hash = hash;
@@ -367,15 +493,58 @@ std::size_t kv_cache::line_offset(std::size_t layer, std::uint32_t line_id) cons
     return line_id * classes[layers[layer].block_class].block_bytes;
 }
 
-page kv_cache::device_page(const layer_line& line_of_layer) const {
+at::Tensor kv_cache::shard_line(std::size_t layer, std::size_t shard, std::uint32_t line_id) const {
+    return pools[shard].narrow(
+        0,
+        static_cast<std::int64_t>(line_offset(layer, line_id)),
+        static_cast<std::int64_t>(line_bytes(layers[layer].shards[shard].shape))
+    );
+}
+
+sharded_page kv_cache::fetch_target(const layer_line& line_of_layer) const {
     auto [layer, line_id] = line_of_layer;
-    return page{
-        .bytes = pool.narrow(
-            0,
-            static_cast<std::int64_t>(line_offset(layer, line_id)),
-            static_cast<std::int64_t>(line_bytes(layers[layer].shape))
-        )
-    };
+    sharded_page target;
+    for (std::size_t shard = 0; shard < pools.size(); shard++) {
+        at::Tensor line_bytes_of_shard = shard_line(layer, shard, line_id);
+        for (const line_piece& piece : layers[layer].shards[shard].pieces) {
+            target.shards.push_back(
+                page_shard{
+                    .bytes = line_bytes_of_shard.narrow(
+                        0,
+                        static_cast<std::int64_t>(piece.line_offset),
+                        static_cast<std::int64_t>(piece.bytes)
+                    ),
+                    .host_offset = piece.host_offset,
+                    .cache_shard = shard,
+                }
+            );
+        }
+    }
+    return target;
+}
+
+sharded_page kv_cache::put_source(const layer_line& line_of_layer) const {
+    auto [layer, line_id] = line_of_layer;
+    sharded_page source;
+    for (std::size_t shard = 0; shard < pools.size(); shard++) {
+        at::Tensor line_bytes_of_shard = shard_line(layer, shard, line_id);
+        for (const line_piece& piece : layers[layer].shards[shard].pieces) {
+            if (piece.put_source) {
+                source.shards.push_back(
+                    page_shard{
+                        .bytes = line_bytes_of_shard.narrow(
+                            0,
+                            static_cast<std::int64_t>(piece.line_offset),
+                            static_cast<std::int64_t>(piece.bytes)
+                        ),
+                        .host_offset = piece.host_offset,
+                        .cache_shard = shard,
+                    }
+                );
+            }
+        }
+    }
+    return source;
 }
 
 void kv_cache::release_all(std::span<const std::vector<std::uint32_t>> line_ids) noexcept {
@@ -386,7 +555,7 @@ void kv_cache::release_all(std::span<const std::vector<std::uint32_t>> line_ids)
 
 // Every layer's resident pages are held before any line is taken, so taking one never drops a page this call needs.
 task<std::expected<std::vector<std::vector<std::uint32_t>>, page_error>>
-kv_cache::get(std::span<const std::span<const digest>> hashes, cudaStream_t stream) {
+kv_cache::get(std::span<const std::span<const digest>> hashes, std::span<const cudaStream_t> streams) {
     assert(hashes.size() == layers.size());
     std::vector<std::vector<std::uint32_t>> line_ids(layers.size());
     std::vector<std::vector<std::size_t>> joined(layers.size());
@@ -443,12 +612,12 @@ kv_cache::get(std::span<const std::span<const digest>> hashes, cudaStream_t stre
     }
 
     if (!fetch_keys.empty()) {
-        std::vector<page> targets;
+        std::vector<sharded_page> targets;
         targets.reserve(fetch_lines.size());
         for (const layer_line& target : fetch_lines) {
-            targets.push_back(device_page(target));
+            targets.push_back(fetch_target(target));
         }
-        std::vector<bool> found = co_await store->fetch(fetch_keys, std::move(targets), stream);
+        std::vector<bool> found = co_await store->fetch(fetch_keys, std::move(targets), streams);
         assert(found.size() == fetch_keys.size());
         for (std::size_t j = 0; j < found.size(); j++) {
             auto [layer, line_id] = fetch_lines[j];
@@ -493,7 +662,7 @@ kv_cache::allocate(std::span<const std::size_t> counts) {
 }
 
 std::expected<std::vector<std::uint32_t>, page_error>
-kv_cache::clone(std::size_t layer, std::uint32_t line_id, std::size_t count, cudaStream_t stream) {
+kv_cache::clone(std::size_t layer, std::uint32_t line_id, std::size_t count, std::span<const cudaStream_t> streams) {
     assert(line(layer, line_id).ref > 0);
     std::vector<std::size_t> counts(layers.size(), 0);
     counts[layer] = count;
@@ -504,13 +673,11 @@ kv_cache::clone(std::size_t layer, std::uint32_t line_id, std::size_t count, cud
     }
     commit(taking, *taken);
     std::vector<std::uint32_t> copies = std::move((*taken)[layer]);
-    auto bytes = static_cast<std::int64_t>(line_bytes(layers[layer].shape));
-    auto line_at = [&](std::uint32_t id) {
-        return pool.narrow(0, static_cast<std::int64_t>(line_offset(layer, id)), bytes);
-    };
-    auto guard = guard_stream(pool, stream);
-    for (std::uint32_t copy : copies) {
-        line_at(copy).copy_(line_at(line_id), /*non_blocking=*/true);
+    for (std::size_t shard = 0; shard < pools.size(); shard++) {
+        auto guard = guard_stream(pools[shard], streams[shard]);
+        for (std::uint32_t copy : copies) {
+            shard_line(layer, shard, copy).copy_(shard_line(layer, shard, line_id), /*non_blocking=*/true);
+        }
     }
     return copies;
 }
@@ -519,7 +686,7 @@ task<std::expected<void, page_error>> kv_cache::sync(
     const std::vector<std::vector<digest>>& hashes,
     const std::vector<std::vector<std::uint64_t>>& owners,
     const std::vector<std::vector<std::uint32_t>>& line_ids,
-    cudaStream_t stream
+    std::span<const cudaStream_t> streams
 ) {
     assert(hashes.size() == layers.size() && owners.size() == layers.size() && line_ids.size() == layers.size());
     std::vector<layer_line> sources;
@@ -545,15 +712,15 @@ task<std::expected<void, page_error>> kv_cache::sync(
         co_return {};
     }
 
-    std::vector<page> pages;
+    std::vector<sharded_page> pages;
     pages.reserve(sources.size());
     for (const layer_line& source : sources) {
-        pages.push_back(device_page(source));
+        pages.push_back(put_source(source));
     }
     for (const auto& [target, hash] : named) {
         assign_hash(target.layer, target.line_id, hash);
     }
-    co_return co_await store->put(std::move(keys), std::move(pages), std::move(page_owners), stream);
+    co_return co_await store->put(std::move(keys), std::move(pages), std::move(page_owners), streams);
 }
 
 void kv_cache::release(std::size_t layer, std::span<const std::uint32_t> line_ids) noexcept {
@@ -599,8 +766,16 @@ std::size_t kv_cache::layer_count() const noexcept {
     return layers.size();
 }
 
+std::size_t kv_cache::shard_count() const noexcept {
+    return pools.size();
+}
+
+const kv& kv_cache::tensors(std::size_t layer, std::size_t shard) const noexcept {
+    return layers[layer].shards[shard].device_kv;
+}
+
 const kv& kv_cache::tensors(std::size_t layer) const noexcept {
-    return layers[layer].device_kv;
+    return tensors(layer, 0);
 }
 
 }  // namespace pulsarlm

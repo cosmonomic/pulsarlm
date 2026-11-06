@@ -97,13 +97,16 @@ python_store::~python_store() {
     }
 }
 
-task<std::vector<bool>>
-python_store::fetch(std::span<const digest> hashes, std::vector<page>&& lines, cudaStream_t stream) {
+task<std::vector<bool>> python_store::fetch(
+    std::span<const digest> hashes,
+    std::vector<sharded_page>&& lines,
+    std::span<const cudaStream_t> streams
+) {
     auto [fetched, resolver] = external_task<fetched_pages>::make();
     start_fetch(hashes, std::move(resolver));
     fetched_pages pages = co_await std::move(fetched);
     std::vector<bool> found(pages.size());
-    std::vector<page> targets;
+    std::vector<sharded_page> targets;
     std::vector<page> arrived;
     for (std::size_t i = 0; i < pages.size(); i++) {
         if (pages[i]) {
@@ -112,7 +115,7 @@ python_store::fetch(std::span<const digest> hashes, std::vector<page>&& lines, c
             arrived.push_back(std::move(*pages[i]));
         }
     }
-    co_await copy_from_host(host_pages, targets, arrived, stream);
+    co_await copy_from_host(host_pages, targets, arrived, streams);
     co_return found;
 }
 
@@ -142,16 +145,16 @@ std::vector<std::size_t> python_store::keep(std::span<const digest> hashes, std:
 
 task<std::expected<void, page_error>> python_store::put(
     std::vector<digest>&& hashes,
-    std::vector<page>&& pages,
+    std::vector<sharded_page>&& pages,
     std::vector<page_owner>&& owners,
-    cudaStream_t stream
+    std::span<const cudaStream_t> streams
 ) {
     std::vector<std::size_t> kept = keep(hashes, owners);
     std::erase_if(kept, [&](std::size_t i) { return i >= hashes.size(); });
     if (kept.empty()) {
         co_return {};
     }
-    std::vector<page> sources;
+    std::vector<sharded_page> sources;
     std::vector<digest> kept_hashes;
     std::unordered_map<std::size_t, std::size_t> kept_index;
     for (std::size_t i : kept) {
@@ -160,7 +163,7 @@ task<std::expected<void, page_error>> python_store::put(
             kept_hashes.push_back(hashes[i]);
         }
     }
-    std::optional<std::vector<page>> copies = co_await copy_to_host(host_pages, sources, stream);
+    std::optional<std::vector<page>> copies = co_await copy_to_host(host_pages, sources, streams);
     if (!copies) {
         co_return std::unexpected(page_error::oom);
     }

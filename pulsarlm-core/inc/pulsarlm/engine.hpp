@@ -22,15 +22,16 @@
 
 namespace pulsarlm {
 
-// model_name names the model and its weights version; with the KV layers' page shapes it makes the root digest. The KV
-// layers' lines share one pool of kv_cache_pool_bytes, which must hold a line of every KV layer. A step forwards every
-// decoding sequence and at most prefill_tokens_per_step tokens of the others.
+// model_name names the model and its weights version; with the page shapes of the whole model's KV layers it makes
+// the root digest. Shard s of the model runs on devices[s], its part of the KV layers' lines sharing one pool of
+// kv_cache_pool_bytes there, which must hold a line of every KV layer. A step forwards every decoding sequence and at
+// most prefill_tokens_per_step tokens of the others.
 struct engine_config {
     std::string model_name;
     std::size_t page_size;
     at::ScalarType kv_dtype;
     std::size_t kv_cache_pool_bytes;
-    at::Device device;
+    std::vector<at::Device> devices;
     std::vector<std::int64_t> stop_ids;
     std::size_t vocab_size;
     std::size_t prefill_tokens_per_step;
@@ -45,13 +46,14 @@ struct engine_stat {
 // The page shape of each KV layer, one layer each.
 std::vector<page_shape> page_shapes(const engine_config& config, std::span<const kv_layer> layers);
 
-// Serves requests on a loop thread it owns. Once the loop exits, after a panic or on destruction, the requests it was
-// serving end with loop_exited and the engine is shut down: calling submit after a request ended with loop_exited is
-// undefined.
+// Serves requests on a loop thread it owns, with one more loop thread per shard past the first. Once the loops exit,
+// after a panic in any of them or on destruction, the requests it was serving end with loop_exited and the engine is
+// shut down: calling submit after a request ended with loop_exited is undefined.
 class engine {
-    std::unique_ptr<model> served_model;
-    at::Device device;
-    cudaStream_t stream;
+    std::vector<std::unique_ptr<model>> shards;
+    std::vector<at::Device> devices;
+    std::vector<cudaStream_t> streams;
+    std::vector<std::unique_ptr<event_loop>> worker_loops;
     std::size_t page_size;
     std::size_t vocab_size;
     digest root;
@@ -61,11 +63,20 @@ class engine {
     // Set while the loop runs.
     event_loop* loop = nullptr;
     std::exception_ptr loop_exception;
+    std::vector<std::thread> worker_threads;
     std::thread loop_thread;
 
     void run_loop(std::latch& started);
+    void run_worker_loop(std::size_t shard);
 
   public:
+    // shards[s] holds shard s of the model, run on config.devices[s].
+    engine(
+        std::vector<std::unique_ptr<model>>&& shards,
+        const engine_config& config,
+        std::unique_ptr<page_store>&& store
+    );
+    // One shard on config.devices[0].
     engine(std::unique_ptr<model> served_model, const engine_config& config, std::unique_ptr<page_store>&& store);
     engine(const engine&) = delete;
     engine& operator=(const engine&) = delete;

@@ -170,4 +170,13 @@ task<void> synchronize(cudaStream_t stream) {
     check_cuda(co_await std::move(done));
 }
 
+external_task<> run_on(event_loop& target, task<void> root_task) {
+    auto [result, resolver] = external_task<>::make();
+    target.spawn([](task<void> awaited, external_task<>::resolver resolving) -> task<void> {
+        co_await std::move(awaited);
+        resolving.resolve();
+    }(std::move(root_task), std::move(resolver)));
+    return std::move(result);
+}
+
 }  // namespace pulsarlm

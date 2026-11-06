@@ -12,6 +12,7 @@
 #include <span>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "pulsarlm/digest.hpp"
@@ -39,10 +40,22 @@ struct page_shape {
 // The device bytes of one line: its K and V in every layer, or its one tensor for values_only, and its index keys.
 std::size_t line_bytes(const page_shape& shape);
 
-// One line of a layer as uint8 [line_bytes(shape)], laid out as the line: a host copy, or in fetch and put a device
-// view of the line.
+// One line of a layer of the whole model as uint8 [line_bytes(shape)], laid out as the line, in host memory.
 struct page {
     at::Tensor bytes;
+};
+
+// The part of a page one GPU's line holds: a device view of those bytes of the line of kv_cache_shard cache_shard, and
+// their offset in the page.
+struct page_shard {
+    at::Tensor bytes;
+    std::size_t host_offset;
+    std::size_t cache_shard;
+};
+
+// One page across the GPUs holding it; on one GPU holding whole lines, a single shard covering the line.
+struct sharded_page {
+    std::vector<page_shard> shards;
 };
 
 // The K and V of a page of shape, [n_layers, page_size, n_kv_heads, head_dim] views of its bytes, or its one tensor as
@@ -73,26 +86,35 @@ class page_store {
   public:
     virtual ~page_store() = default;
 
-    // Copies the page of hashes[i] into lines[i] on stream, and completes once the copies are done with true for each
-    // page it had.
+    // A shard's copies run on streams[shard.cache_shard].
+
+    // Copies the page of hashes[i] into every shard of lines[i], and completes once the copies are done with true for
+    // each page it had.
     virtual task<std::vector<bool>>
-    fetch(std::span<const digest> hashes, std::vector<page>&& lines, cudaStream_t stream) = 0;
-    // Takes the pages of hashes, matched by index, and copies the ones it keeps on stream, completing once the copies
-    // are done. A page has an owner for every request that produced it. Fails with oom when it has no host memory for
-    // a page it keeps.
-    virtual task<std::expected<void, page_error>> put(
-        std::vector<digest>&& hashes,
-        std::vector<page>&& pages,
+    fetch(std::span<const digest> hashes, std::vector<sharded_page>&& lines, std::span<const cudaStream_t> streams) = 0;
+    // Takes the pages of hashes, matched by index, and copies the ones it keeps, completing once the copies are done.
+    // The shards of a page cover it once. A page has an owner for every request that produced it. Fails with oom when
+    // it has no host memory for a page it keeps.
+    virtual task<std::expected<void, page_error>>
+    put(std::vector<digest>&& hashes,
+        std::vector<sharded_page>&& pages,
         std::vector<page_owner>&& owners,
-        cudaStream_t stream
-    ) = 0;
+        std::span<const cudaStream_t> streams) = 0;
 };
 
+// One GPU's pool: the page shape of its line of each KV layer, and per KV layer the ranges along the full line's first
+// dimension (KV heads, or a state's first size) its line holds, in order; index keys are always whole.
+struct kv_cache_shard {
+    at::Device device;
+    std::vector<page_shape> shapes;
+    std::vector<std::vector<std::pair<std::size_t, std::size_t>>> rows;
+};
 
-// The lines of every KV layer, in one device pool of bytes. A line holds one page of one layer, in a block of the pool
-// a line_allocator gives it; the layers whose lines take blocks of one size share their line ids. A line is free when
-// it is neither held nor caching a page; taking a line may drop the cached pages of a region, all of them, oldest
-// first, as line_allocator describes. A layer's page is stored under store_key(page, layer).
+// The lines of every KV layer, in one device pool of bytes per shard. A line holds one page of one layer, in a block of
+// every shard's pool a line_allocator gives it, each shard holding its part of the page; the layers whose lines take
+// blocks of one size share their line ids. A line is free when it is neither held nor caching a page; taking a line may
+// drop the cached pages of a region, all of them, oldest first, as line_allocator describes. A layer's page is stored
+// under store_key(page, layer).
 class kv_cache {
   private:
     struct cache_line {
@@ -113,10 +135,25 @@ class kv_cache {
         event done_event;
     };
 
-    struct cache_layer {
+    // Bytes [line_offset, line_offset + bytes) of a shard's line hold bytes [host_offset, host_offset + bytes) of the
+    // page. A put copies only the pieces that cover the page once.
+    struct line_piece {
+        std::size_t line_offset;
+        std::size_t host_offset;
+        std::size_t bytes;
+        bool put_source;
+    };
+
+    struct shard_layer {
         page_shape shape;
-        std::size_t block_class;
+        std::vector<line_piece> pieces;
         kv device_kv;
+    };
+
+    struct cache_layer {
+        page_shape full_shape;
+        std::size_t block_class;
+        std::vector<shard_layer> shards;
         std::unordered_map<digest, std::uint32_t, digest_hash> digest_to_line_id;
         // Pages a get is fetching into a line, not yet in digest_to_line_id.
         std::unordered_map<digest, fetch, digest_hash> fetches;
@@ -127,7 +164,7 @@ class kv_cache {
         std::uint32_t line_id;
     };
 
-    at::Tensor pool;
+    std::vector<at::Tensor> pools;
     std::vector<block_class> classes;
     std::vector<cache_layer> layers;
     line_allocator allocator;
@@ -150,29 +187,42 @@ class kv_cache {
     void count_unused(std::size_t layer) noexcept;
     void assign_hash(std::size_t layer, std::uint32_t line_id, const digest& hash);
     std::size_t line_offset(std::size_t layer, std::uint32_t line_id) const noexcept;
-    page device_page(const layer_line& line_of_layer) const;
+    at::Tensor shard_line(std::size_t layer, std::size_t shard, std::uint32_t line_id) const;
+    // Every piece of every shard's line, for a fetch; the pieces that cover the page once, for a put.
+    sharded_page fetch_target(const layer_line& line_of_layer) const;
+    sharded_page put_source(const layer_line& line_of_layer) const;
     void release_all(std::span<const std::vector<std::uint32_t>> line_ids) noexcept;
 
   public:
-    // shapes holds one page shape per KV layer, each with n_layers 1 and one dtype for all. The pool takes pool_bytes;
-    // throws std::invalid_argument when that holds no line of every layer. store outlives the cache.
+    // full_shapes holds one page shape per KV layer of the whole model, each with n_layers 1 and one dtype for all;
+    // each shard holds its part of every layer, every shard's line of a layer taking the same bytes. Each shard's pool
+    // takes pool_bytes_per_device; throws std::invalid_argument when that holds no line of every layer, or when a
+    // shard's rows do not lay out its lines or do not cover the full lines between them. store outlives the cache.
+    kv_cache(
+        std::span<const page_shape> full_shapes,
+        std::span<const kv_cache_shard> shards,
+        std::size_t pool_bytes_per_device,
+        page_store& store
+    );
+    // One shard on device holding whole lines of shapes.
     kv_cache(std::span<const page_shape> shapes, std::size_t pool_bytes, at::Device device, page_store& store);
 
-    // Copies run on stream. Callers release lines only after the GPU work using them completes. get, allocate and
-    // clone never wait for lines; without enough of them the call fails with oom, holding nothing in any layer and
-    // dropping no page, which is also true of every other failure. Line ids come per layer, indexed by layer.
+    // A shard's copies run on streams[shard], one stream per shard. Callers release lines only after the GPU work
+    // using them completes. get, allocate and clone never wait for lines; without enough of them the call fails with
+    // oom, holding nothing in any layer and dropping no page, which is also true of every other failure. Line ids come
+    // per layer, indexed by layer.
 
     // Each layer's hashes are distinct. Gives every page of hashes[layer] a line of that layer in their order, fetching
     // the pages that are not resident from the store in one fetch, and holds the lines until release. A page another
     // get is fetching shares that line and fetch. Fails with miss when the store does not have a page.
     task<std::expected<std::vector<std::vector<std::uint32_t>>, page_error>>
-    get(std::span<const std::span<const digest>> hashes, cudaStream_t stream);
+    get(std::span<const std::span<const digest>> hashes, std::span<const cudaStream_t> streams);
     // Gives counts[layer] empty lines of each layer, held until release. get does not find their pages until they are
     // synced, and releasing a line before it is synced drops its page.
     std::expected<std::vector<std::vector<std::uint32_t>>, page_error> allocate(std::span<const std::size_t> counts);
     // Gives count unmapped lines of layer holding a copy of the page at its held line_id, held until release.
     std::expected<std::vector<std::uint32_t>, page_error>
-    clone(std::size_t layer, std::uint32_t line_id, std::size_t count, cudaStream_t stream);
+    clone(std::size_t layer, std::uint32_t line_id, std::size_t count, std::span<const cudaStream_t> streams);
     // Names the page at line_ids[layer][i], held and unmapped, by hashes[layer][i] and hands each distinct page of a
     // layer, owned by every owners[layer][i] of its hash, to the store in one put, also when another line caches its
     // hash: the store may have dropped that page. A hash already cached at another line leaves its line unmapped.
@@ -181,17 +231,20 @@ class kv_cache {
         const std::vector<std::vector<digest>>& hashes,
         const std::vector<std::vector<std::uint64_t>>& owners,
         const std::vector<std::vector<std::uint32_t>>& line_ids,
-        cudaStream_t stream
+        std::span<const cudaStream_t> streams
     );
     void release(std::size_t layer, std::span<const std::uint32_t> line_ids) noexcept;
 
     // The largest count for which allocate gives count lines of every layer now.
     std::size_t free_count();
-    // The bytes of the pool that lines in use take: lines get, allocate or clone gave and release has not taken back,
-    // not lines only caching a page. Safe to call from any thread.
+    // The bytes of each shard's pool that lines in use take: lines get, allocate or clone gave and release has not
+    // taken back, not lines only caching a page. Safe to call from any thread.
     std::size_t used_bytes() const noexcept;
     std::size_t layer_count() const noexcept;
-    // [n_lines, page_size, n_kv_heads, head_dim] views of the pool, indexed by line id, lines a block apart.
+    std::size_t shard_count() const noexcept;
+    // [n_lines, page_size, n_kv_heads, head_dim] views of shard's pool, indexed by line id, lines a block apart.
+    const kv& tensors(std::size_t layer, std::size_t shard) const noexcept;
+    // tensors(layer, 0).
     const kv& tensors(std::size_t layer) const noexcept;
 };
 

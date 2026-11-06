@@ -160,6 +160,11 @@ class event_loop {
 // cudaLaunchHostFunc also runs after a CUDA error; an error panics.
 task<void> synchronize(cudaStream_t stream);
 
+// Runs root_task as a root task of target and completes with its result once it does. Safe to call from any thread. A
+// panic in root_task panics target, and the returned task then never completes.
+template <typename value_type> external_task<value_type> run_on(event_loop& target, task<value_type> root_task);
+external_task<> run_on(event_loop& target, task<void> root_task);
+
 template <typename t> class task<t>::value_result {
     std::optional<t> value;
 
@@ -419,6 +424,15 @@ external_task<value_type>::resolver::resolver(shared_state task_state) noexcept
 
 template <typename value_type> void external_task<value_type>::resolver::resolve(value_type&& value) const {
     task_state->set_value(value_type(std::move(value)));
+}
+
+// The coroutine lambda captures nothing: its frame owns the task and the resolver as parameters.
+template <typename value_type> external_task<value_type> run_on(event_loop& target, task<value_type> root_task) {
+    auto [result, resolver] = external_task<value_type>::make();
+    target.spawn([](task<value_type> awaited, typename external_task<value_type>::resolver resolving) -> task<void> {
+        resolving.resolve(co_await std::move(awaited));
+    }(std::move(root_task), std::move(resolver)));
+    return std::move(result);
 }
 
 }  // namespace pulsarlm

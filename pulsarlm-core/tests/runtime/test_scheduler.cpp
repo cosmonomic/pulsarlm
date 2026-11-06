@@ -40,6 +40,7 @@ using pulsarlm::page;
 using pulsarlm::request;
 using pulsarlm::request_error;
 using pulsarlm::result_writer;
+using pulsarlm::sharded_page;
 using pulsarlm::task;
 
 using token_list = std::vector<std::int64_t>;
@@ -100,14 +101,17 @@ struct memory_store final : pulsarlm::page_store {
     std::shared_ptr<store_contents> contents = std::make_shared<store_contents>();
     std::shared_ptr<pulsarlm::host_page_pool> host_pages;
 
-    task<std::vector<bool>>
-    fetch(std::span<const digest> hashes, std::vector<page>&& lines, cudaStream_t stream) override {
+    task<std::vector<bool>> fetch(
+        std::span<const digest> hashes,
+        std::vector<sharded_page>&& lines,
+        std::span<const cudaStream_t> streams
+    ) override {
         std::shared_ptr<store_contents> shared = contents;
         std::vector<digest> requested(hashes.begin(), hashes.end());
-        std::vector<page> targets = std::move(lines);
+        std::vector<sharded_page> targets = std::move(lines);
         shared->fetches.push_back(requested);
         std::vector<bool> found(requested.size());
-        std::vector<page> found_targets;
+        std::vector<sharded_page> found_targets;
         std::vector<page> found_pages;
         for (std::size_t i = 0; i < requested.size(); i++) {
             if (auto it = shared->pages.find(requested[i]); it != shared->pages.end()) {
@@ -116,24 +120,23 @@ struct memory_store final : pulsarlm::page_store {
                 found_pages.push_back(it->second);
             }
         }
-        co_await pulsarlm::copy_from_host(*host_pages, found_targets, found_pages, stream);
+        co_await pulsarlm::copy_from_host(*host_pages, found_targets, found_pages, streams);
         co_return found;
     }
 
-    task<std::expected<void, pulsarlm::page_error>> put(
-        std::vector<digest>&& keys,
-        std::vector<page>&& pages,
+    task<std::expected<void, pulsarlm::page_error>>
+    put(std::vector<digest>&& keys,
+        std::vector<sharded_page>&& pages,
         std::vector<pulsarlm::page_owner>&& owners,
-        cudaStream_t stream
-    ) override {
+        std::span<const cudaStream_t> streams) override {
         std::shared_ptr<store_contents> shared = contents;
         std::vector<digest> put_keys = std::move(keys);
-        std::vector<page> sources = std::move(pages);
+        std::vector<sharded_page> sources = std::move(pages);
         shared->puts++;
         for (const pulsarlm::page_owner& owner : owners) {
             shared->owners.emplace_back(owner.request, put_keys[owner.page]);
         }
-        std::optional<std::vector<page>> copies = co_await pulsarlm::copy_to_host(*host_pages, sources, stream);
+        std::optional<std::vector<page>> copies = co_await pulsarlm::copy_to_host(*host_pages, sources, streams);
         if (!copies) {
             co_return std::unexpected(pulsarlm::page_error::oom);
         }
@@ -361,8 +364,8 @@ class sum_model final : public pulsarlm::model {
     }
 };
 
-cudaStream_t compute_stream() {
-    return c10::cuda::getCurrentCUDAStream().stream();
+std::vector<cudaStream_t> compute_streams() {
+    return {c10::cuda::getCurrentCUDAStream().stream()};
 }
 
 std::vector<pulsarlm::page_shape> page_shapes(const std::vector<pulsarlm::kv_layer>& layers) {
@@ -426,9 +429,10 @@ struct fixture {
       store(backing.contents),
       model(with_layers(std::move(layers))),
       sched(
-          model,
+          {&model},
           make_cache(model.layers, n_lines, pool_bytes, backing),
-          compute_stream(),
+          compute_streams(),
+          {},
           root(),
           std::move(stop_ids),
           prefill_tokens_per_step

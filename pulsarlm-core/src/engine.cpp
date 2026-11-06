@@ -83,10 +83,78 @@ void validate(const request& r, std::size_t page_size, std::size_t vocab_size) {
     }
 }
 
-kv_cache make_cache(const engine_config& config, std::span<const kv_layer> layers, page_store& store) {
-    check_attention(config, layers);
-    std::vector<page_shape> shapes = page_shapes(config, layers);
-    return kv_cache(shapes, config.kv_cache_pool_bytes, config.device, store);
+std::vector<kv_layer> full_layers(const model& shard) {
+    std::vector<kv_layer> layers;
+    for (const kv_layer_shard& layer : shard.kv_layer_shards()) {
+        layers.push_back(layer.full);
+    }
+    return layers;
+}
+
+std::vector<at::Device> checked_devices(const engine_config& config, std::size_t shard_count) {
+    if (shard_count == 0 || config.devices.size() != shard_count) {
+        throw std::invalid_argument(
+            std::format(
+                "the engine runs {} model shards on {} devices; it takes one per shard",
+                shard_count,
+                config.devices.size()
+            )
+        );
+    }
+    return config.devices;
+}
+
+std::vector<cudaStream_t> make_streams(std::span<const at::Device> devices) {
+    std::vector<cudaStream_t> streams;
+    for (const at::Device& device : devices) {
+        streams.push_back(c10::cuda::getStreamFromPool(false, device.index()).stream());
+    }
+    return streams;
+}
+
+std::vector<std::unique_ptr<event_loop>> make_worker_loops(std::size_t shard_count) {
+    std::vector<std::unique_ptr<event_loop>> loops;
+    for (std::size_t shard = 1; shard < shard_count; shard++) {
+        loops.push_back(std::make_unique<event_loop>());
+    }
+    return loops;
+}
+
+std::vector<model*> model_pointers(std::span<const std::unique_ptr<model>> shards) {
+    std::vector<model*> pointers;
+    for (const std::unique_ptr<model>& shard : shards) {
+        pointers.push_back(shard.get());
+    }
+    return pointers;
+}
+
+std::vector<event_loop*> loop_pointers(std::span<const std::unique_ptr<event_loop>> loops) {
+    std::vector<event_loop*> pointers;
+    for (const std::unique_ptr<event_loop>& loop : loops) {
+        pointers.push_back(loop.get());
+    }
+    return pointers;
+}
+
+kv_cache make_cache(const engine_config& config, std::span<const std::unique_ptr<model>> shards, page_store& store) {
+    std::vector<page_shape> full_shapes = page_shapes(config, full_layers(*shards.front()));
+    std::vector<kv_cache_shard> cache_shards;
+    for (std::size_t shard = 0; shard < shards.size(); shard++) {
+        std::vector<kv_layer> layers = shards[shard]->kv_layers();
+        check_attention(config, layers);
+        kv_cache_shard cache_shard{.device = config.devices[shard], .shapes = page_shapes(config, layers)};
+        for (const kv_layer_shard& layer : shards[shard]->kv_layer_shards()) {
+            cache_shard.rows.push_back(layer.rows);
+        }
+        cache_shards.push_back(std::move(cache_shard));
+    }
+    return kv_cache(full_shapes, cache_shards, config.kv_cache_pool_bytes, store);
+}
+
+std::vector<std::unique_ptr<model>> one_shard(std::unique_ptr<model> served_model) {
+    std::vector<std::unique_ptr<model>> shards;
+    shards.push_back(std::move(served_model));
+    return shards;
 }
 
 }  // namespace
@@ -123,26 +191,38 @@ std::vector<page_shape> page_shapes(const engine_config& config, std::span<const
     return shapes;
 }
 
-engine::engine(std::unique_ptr<model> served_model, const engine_config& config, std::unique_ptr<page_store>&& store)
-: served_model(std::move(served_model)),
-  device(config.device),
-  stream(c10::cuda::getStreamFromPool(false, config.device.index()).stream()),
+engine::engine(
+    std::vector<std::unique_ptr<model>>&& shards,
+    const engine_config& config,
+    std::unique_ptr<page_store>&& store
+)
+: shards(std::move(shards)),
+  devices(checked_devices(config, this->shards.size())),
+  streams(make_streams(devices)),
+  worker_loops(make_worker_loops(devices.size())),
   page_size(config.page_size),
   vocab_size(config.vocab_size),
-  root(make_root_digest(config.model_name, page_shapes(config, this->served_model->kv_layers()))),
+  root(make_root_digest(config.model_name, page_shapes(config, full_layers(*this->shards.front())))),
   store(std::move(store)),
   sched(
-      *this->served_model,
-      make_cache(config, this->served_model->kv_layers(), *this->store),
-      stream,
+      model_pointers(this->shards),
+      make_cache(config, this->shards, *this->store),
+      std::vector<cudaStream_t>(streams),
+      loop_pointers(worker_loops),
       root,
       std::vector<std::int64_t>(config.stop_ids),
       config.prefill_tokens_per_step
   ) {
+    for (std::size_t shard = 1; shard < devices.size(); shard++) {
+        worker_threads.emplace_back([this, shard] { run_worker_loop(shard); });
+    }
     std::latch started(1);
     loop_thread = std::thread([this, &started] { run_loop(started); });
     started.wait();
 }
+
+engine::engine(std::unique_ptr<model> served_model, const engine_config& config, std::unique_ptr<page_store>&& store)
+: engine(one_shard(std::move(served_model)), config, std::move(store)) {}
 
 engine::~engine() {
     {
@@ -154,10 +234,11 @@ engine::~engine() {
     loop_thread.join();
 }
 
-// The loop's frames hold host buffers the stream may still use, so they are destroyed after it finishes. Their
-// writers end their callbacks with loop_exited after loop_exception is set.
+// The worker loops' tasks hold references into the loop's frames, so the workers stop before those frames are
+// destroyed; the frames hold host buffers the streams may still use, so they are destroyed after the streams finish.
+// Their writers end their callbacks with loop_exited after loop_exception is set.
 void engine::run_loop(std::latch& started) {
-    c10::cuda::CUDAGuard device_guard(device);
+    c10::cuda::CUDAGuard device_guard(devices.front());
     {
         event_loop running;
         running.spawn(sched.run());
@@ -167,11 +248,36 @@ void engine::run_loop(std::latch& started) {
         }
         started.count_down();
         std::exception_ptr thrown = running.run();
-        cudaStreamSynchronize(stream);
+        for (const std::unique_ptr<event_loop>& worker : worker_loops) {
+            worker->stop();
+        }
+        for (std::thread& worker : worker_threads) {
+            worker.join();
+        }
+        for (cudaStream_t stream : streams) {
+            cudaStreamSynchronize(stream);
+        }
         {
             std::lock_guard lock(mutex);
-            loop_exception = std::move(thrown);
+            if (!loop_exception) {
+                loop_exception = std::move(thrown);
+            }
             loop = nullptr;
+        }
+    }
+}
+
+// A panic on a worker loop stops the engine's loop with the worker's exception.
+void engine::run_worker_loop(std::size_t shard) {
+    c10::cuda::CUDAGuard device_guard(devices[shard]);
+    std::exception_ptr thrown = worker_loops[shard - 1]->run();
+    if (thrown) {
+        std::lock_guard lock(mutex);
+        if (!loop_exception) {
+            loop_exception = std::move(thrown);
+        }
+        if (loop != nullptr) {
+            loop->stop();
         }
     }
 }

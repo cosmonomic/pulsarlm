@@ -39,16 +39,23 @@ class scheduler {
     class sequence;
     class batch;
 
-    model& served_model;
-    // One layer per KV layer, in the model's KV layer order.
+    // One model per shard of the cache, each holding its part of every layer.
+    std::vector<model*> shards;
+    // One layer per KV layer, in the models' KV layer order.
     kv_cache cache;
-    std::vector<kv> lines;
+    // Per shard, one kv per KV layer.
+    std::vector<std::vector<kv>> lines;
     std::vector<std::optional<std::size_t>> sliding_windows;
     std::vector<bool> recurrent;
     // Per KV layer, the query heads it measures mass and evicts pages in: those of every attention layer reading a
     // full-attention layer, 0 for other layers.
     std::vector<std::size_t> mass_heads;
-    cudaStream_t stream;
+    // Per shard, per KV layer, the shard's part of mass_heads; the shards' parts in shard order make up the layer's.
+    std::vector<std::vector<std::size_t>> shard_mass_heads;
+    // One stream per shard.
+    std::vector<cudaStream_t> streams;
+    // The loops of shards 1 on: shard s's forward runs on worker_loops[s - 1]; shard 0's on the scheduler's loop.
+    std::vector<event_loop*> worker_loops;
     std::size_t page_size;
     digest root;
     std::vector<std::int64_t> stop_ids;
@@ -71,6 +78,8 @@ class scheduler {
     bool release_passed_pages(sequence& seq);
     task<batch> build_batch();
     task<void> launch(batch& b);
+    task<void> forward_on_shard(batch& b, std::size_t shard);
+    task<void> synchronize_shards();
     task<void> write_back(batch& b);
     // Adds to the moments of each layer that measures mass the full pages outside the sinks that cycle_tokens tokens
     // now follow, given that seq's newest completed full pages just completed.
@@ -79,13 +88,15 @@ class scheduler {
     bool end_cycle(sequence& seq);
 
   public:
-    // cache holds one layer per entry of model.kv_layers(). root is the digest the page chains of a state with no
-    // pages start from. A step forwards every decoding sequence and at most prefill_tokens_per_step tokens of the
-    // others.
+    // shards[s] runs on cache shard s with streams[s], shards 1 on on worker_loops[s - 1]; the cache holds one layer
+    // per entry of each model's kv_layers(), and the shards agree on which layers are recurrent or sliding. root is the
+    // digest the page chains of a state with no pages start from. A step forwards every decoding sequence and at most
+    // prefill_tokens_per_step tokens of the others.
     scheduler(
-        model& served_model,
+        std::vector<model*>&& shards,
         kv_cache cache,
-        cudaStream_t stream,
+        std::vector<cudaStream_t>&& streams,
+        std::vector<event_loop*>&& worker_loops,
         digest root,
         std::vector<std::int64_t>&& stop_ids,
         std::size_t prefill_tokens_per_step

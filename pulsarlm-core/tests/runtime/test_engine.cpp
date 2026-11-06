@@ -33,6 +33,7 @@ using pulsarlm::digest;
 using pulsarlm::page;
 using pulsarlm::request;
 using pulsarlm::request_error;
+using pulsarlm::sharded_page;
 using pulsarlm::task;
 
 using token_list = std::vector<std::int64_t>;
@@ -46,7 +47,8 @@ constexpr auto end_timeout = std::chrono::seconds(30);
 struct stalling_store final : pulsarlm::page_store {
     std::shared_ptr<std::latch> fetch_start_latch = std::make_shared<std::latch>(1);
 
-    task<std::vector<bool>> fetch(std::span<const digest>, std::vector<page>&&, cudaStream_t) override {
+    task<std::vector<bool>>
+    fetch(std::span<const digest>, std::vector<sharded_page>&&, std::span<const cudaStream_t>) override {
         auto [never, resolver] = pulsarlm::external_task<>::make();
         fetch_start_latch->count_down();
         co_await std::move(never);
@@ -54,7 +56,10 @@ struct stalling_store final : pulsarlm::page_store {
     }
 
     task<std::expected<void, pulsarlm::page_error>>
-    put(std::vector<digest>&&, std::vector<page>&&, std::vector<pulsarlm::page_owner>&&, cudaStream_t) override {
+    put(std::vector<digest>&&,
+        std::vector<sharded_page>&&,
+        std::vector<pulsarlm::page_owner>&&,
+        std::span<const cudaStream_t>) override {
         co_return {};
     }
 };
@@ -148,7 +153,7 @@ pulsarlm::engine_config config(std::size_t n_lines) {
         .page_size = page_size,
         .kv_dtype = at::kFloat,
         .kv_cache_pool_bytes = n_lines * line_bytes,
-        .device = at::Device(at::kCUDA, 0),
+        .devices = {at::Device(at::kCUDA, 0)},
         .stop_ids = {},
         .vocab_size = vocab,
         .prefill_tokens_per_step = 64,
