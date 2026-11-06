@@ -525,15 +525,17 @@ def run(
 class TurnMetrics:
     context_tokens: int
     prefill_rate: float
+    ttft_s: float
     decode_rate: float
     kv_gib: float
 
 
 def turn_metrics(row: dict[str, Any]) -> TurnMetrics | None:
     """Prefill: the prompt tokens past the previous turn's prompt over the time
-    to the last session's first token. Decode: each session's tokens after its
-    first over the time from its first token to its last, summed over the
-    sessions. KV: the most the engine's running requests held while the turn
+    to the last session's first token. TTFT: the mean over the sessions of the
+    time to their first token. Decode: each session's tokens
+    after its first over the time from its first token to its last, summed over
+    the sessions. KV: the most the engine's running requests held while the turn
     ran. None when a request failed."""
     requests = row["requests"]
     if row["context_tokens"] is None:
@@ -541,14 +543,66 @@ def turn_metrics(row: dict[str, Any]) -> TurnMetrics | None:
     new_tokens = sum(r["prompt_tokens"] for r in requests) - row[
         "previous_context_tokens"
     ] * len(requests)
-    prefill = new_tokens / max(r["first_token_s"] for r in requests)
+    first_tokens = [r["first_token_s"] for r in requests]
+    prefill = new_tokens / max(first_tokens)
     decode = sum(
         (r["completion_tokens"] - 1) / (r["last_token_s"] - r["first_token_s"])
         for r in requests
         if r["last_token_s"] > r["first_token_s"]
     )
     return TurnMetrics(
-        row["context_tokens"], prefill, decode, row["peak_kv_cache_bytes"] / 2**30
+        row["context_tokens"],
+        prefill,
+        statistics.mean(first_tokens),
+        decode,
+        row["peak_kv_cache_bytes"] / 2**30,
+    )
+
+
+@dataclass(frozen=True)
+class OomTurn:
+    """A turn failing with oom: the context it tried to reach, the throughput and
+    mean time to first token of its sessions whose request finished, None when
+    none did, and the most KV the engine held while it ran."""
+
+    context_tokens: int
+    finished_sessions: int
+    prefill_rate: float | None
+    ttft_s: float | None
+    decode_rate: float | None
+    kv_gib: float
+
+
+def oom_turn(row: dict[str, Any]) -> OomTurn:
+    """turn_metrics over the turn's finished requests."""
+    finished = [
+        r
+        for r in row["requests"]
+        if r["error"] is None and r.get("first_token_s") is not None
+    ]
+    previous = row["previous_context_tokens"]
+    prefill = (
+        sum(r["prompt_tokens"] - previous for r in finished)
+        / max(r["first_token_s"] for r in finished)
+        if finished
+        else None
+    )
+    decoding = [r for r in finished if r["last_token_s"] > r["first_token_s"]]
+    decode = (
+        sum(
+            (r["completion_tokens"] - 1) / (r["last_token_s"] - r["first_token_s"])
+            for r in decoding
+        )
+        if decoding
+        else None
+    )
+    return OomTurn(
+        previous + row["turn_tokens"],
+        len(finished),
+        prefill,
+        statistics.mean(r["first_token_s"] for r in finished) if finished else None,
+        decode,
+        row["peak_kv_cache_bytes"] / 2**30,
     )
 
 
@@ -567,14 +621,13 @@ def summary(row: dict[str, Any]) -> str:
 class Series:
     label: str
     color: str
-    linestyle: str = "-"
     filled: bool = True
 
 
 SERIES = {
-    "full_kv": Series("Full KV", "#52514e", "--"),
+    "full_kv": Series("Full KV", "#52514e"),
     "full_kv_no_prefix_cache": Series(
-        "Full KV, no prefix cache", "#52514e", "--", filled=False
+        "Full KV, no prefix cache", "#52514e", filled=False
     ),
     "cap_4k": Series("Capped @ 4k", "#86b6ef"),
     "cap_8k": Series("Capped @ 8k", "#2a78d6"),
@@ -582,14 +635,12 @@ SERIES = {
     "cap_16k_no_prefix_cache": Series(
         "Capped @ 16k, no prefix cache", "#104281", filled=False
     ),
-    "vllm": Series("vLLM", "#d95926", ":"),
-    "vllm_no_prefix_cache": Series(
-        "vLLM, no prefix cache", "#d95926", ":", filled=False
-    ),
+    "vllm": Series("vLLM", "#d95926"),
+    "vllm_no_prefix_cache": Series("vLLM, no prefix cache", "#d95926", filled=False),
 }
 
 PANELS = {
-    "prefill_rate": "Prefill (tok/s)",
+    "ttft_s": "Time to first token (s)",
     "decode_rate": "Decode (tok/s)",
     "kv_gib": "KV cache in use (GiB)",
 }
@@ -598,9 +649,7 @@ PANELS = {
 @dataclass(frozen=True)
 class Run:
     turns: list[TurnMetrics]
-    # The context a turn failing with oom tried to reach, with its user
-    # message.
-    oom_at: int | None
+    oom: OomTurn | None
     error: str | None
 
 
@@ -616,13 +665,9 @@ def load_runs(results: Path) -> dict[tuple[str, int], Run]:
         turns = [m for row in run_rows if (m := turn_metrics(row)) is not None]
         last = run_rows[-1]
         errors = {r["error"] for r in last["requests"] if r["error"] is not None}
-        oom_at = (
-            last["previous_context_tokens"] + last["turn_tokens"]
-            if "oom" in errors
-            else None
-        )
+        oom = oom_turn(last) if "oom" in errors else None
         other = sorted(errors - {"oom"})
-        runs[key] = Run(turns, oom_at, ", ".join(other) or None)
+        runs[key] = Run(turns, oom, ", ".join(other) or None)
     return runs
 
 
@@ -630,30 +675,51 @@ def load_runs(results: Path) -> dict[tuple[str, int], Run]:
 def plot(
     results: Path = Path("bench/results/perf/results.jsonl"),
     out: Path = Path("bench/perf.svg"),
+    concurrency: Annotated[list[int] | None, typer.Option()] = None,
 ) -> None:
     """Prints each run's turns and how it ended, and plots each metric against
-    the context, one row of panels per concurrency, marking with a cross the
-    context at which a run failed with oom."""
+    the context, one row of panels per concurrency (every one in results unless
+    given), marking with a cross a turn failing with oom at the context it tried
+    to reach: its peak KV, and the metrics of the sessions whose request
+    finished. The time to first token is the sessions' mean on a log scale."""
     pyplot = importlib.import_module("matplotlib.pyplot")
-    runs = load_runs(results)
+    runs = {
+        key: run
+        for key, run in load_runs(results).items()
+        if concurrency is None or key[1] in concurrency
+    }
 
     print(
-        f"{'setting':<30}{'sessions':>10}{'context':>9}{'prefill':>10}"
-        f"{'decode':>9}{'KV GiB':>8}"
+        f"{'setting':<30}{'sessions':>10}{'context':>9}{'TTFT s':>9}"
+        f"{'prefill':>10}{'decode':>9}{'KV GiB':>8}"
     )
-    for (name, concurrency), run in sorted(runs.items()):
+    for (name, sessions), run in sorted(runs.items()):
         for m in run.turns:
             print(
-                f"{name:<30}{concurrency:>10}{m.context_tokens:>9}"
+                f"{name:<30}{sessions:>10}{m.context_tokens:>9}{m.ttft_s:>9.1f}"
                 f"{m.prefill_rate:>10.0f}{m.decode_rate:>9.0f}{m.kv_gib:>8.2f}"
             )
-        if run.oom_at is not None:
-            print(f"{name:<30}{concurrency:>10}  oom at {run.oom_at} tokens")
+        if run.oom is not None:
+            oom = run.oom
+            rates = (
+                f"prefill {oom.prefill_rate:.0f} tok/s, "
+                if oom.prefill_rate is not None
+                else ""
+            ) + (
+                f"decode {oom.decode_rate:.0f} tok/s, "
+                if oom.decode_rate is not None
+                else ""
+            )
+            print(
+                f"{name:<30}{sessions:>10}  oom at {oom.context_tokens} tokens: "
+                f"{rates}KV {oom.kv_gib:.2f} GiB, "
+                f"{oom.finished_sessions} of {sessions} sessions finished"
+            )
         if run.error is not None:
-            print(f"{name:<30}{concurrency:>10}  error: {run.error}")
+            print(f"{name:<30}{sessions:>10}  error: {run.error}")
 
     surface, ink, muted, grid = "#ffffff", "#0b0b0b", "#52514e", "#e4e3df"
-    concurrencies = sorted({c for _, c in runs})
+    concurrencies = sorted({sessions for _, sessions in runs})
     figure, axes_grid = pyplot.subplots(
         len(concurrencies),
         len(PANELS),
@@ -662,40 +728,41 @@ def plot(
         squeeze=False,
     )
     figure.patch.set_facecolor(surface)
-    for axes_row, concurrency in zip(axes_grid, concurrencies):
+    for axes_row, sessions in zip(axes_grid, concurrencies):
         for axes, (panel, title) in zip(axes_row, PANELS.items()):
             axes.set_facecolor(surface)
             for name, series in SERIES.items():
-                run = runs.get((name, concurrency))
-                if run is None or not run.turns:
+                run = runs.get((name, sessions))
+                if run is None:
                     continue
-                xs = [m.context_tokens / 1024 for m in run.turns]
-                ys = [getattr(m, panel) for m in run.turns]
                 axes.plot(
-                    xs,
-                    ys,
+                    [m.context_tokens / 1024 for m in run.turns],
+                    [getattr(m, panel) for m in run.turns],
                     color=series.color,
-                    linestyle=series.linestyle,
-                    linewidth=2,
+                    linewidth=1.1,
                     marker="o",
-                    markersize=4,
+                    markersize=2.6,
+                    markeredgewidth=0.8,
                     markerfacecolor=series.color if series.filled else surface,
                     label=series.label,
                 )
-                if run.oom_at is not None:
+                if run.oom is not None and (y := getattr(run.oom, panel)) is not None:
                     axes.plot(
-                        run.oom_at / 1024,
-                        ys[-1],
+                        run.oom.context_tokens / 1024,
+                        y,
                         color=series.color,
                         marker="x",
-                        markersize=9,
-                        markeredgewidth=2,
+                        markersize=6,
+                        markeredgewidth=1.4,
                         linestyle="none",
                     )
-            sessions = "session" if concurrency == 1 else "sessions"
-            axes.set_title(f"{title}, {concurrency} {sessions}", color=ink, fontsize=10)
+            noun = "session" if sessions == 1 else "sessions"
+            axes.set_title(f"{title}, {sessions} {noun}", color=ink, fontsize=10)
             axes.set_xlim(left=0)
-            axes.set_ylim(bottom=0)
+            if panel == "ttft_s":
+                axes.set_yscale("log")
+            else:
+                axes.set_ylim(bottom=0)
             axes.set_xlabel("Context (k tokens)", color=muted)
             axes.tick_params(colors=muted)
             axes.grid(axis="y", color=grid, linewidth=1)
@@ -712,8 +779,9 @@ def plot(
         loc="lower center",
         ncol=min(len(labels), 3),
     )
-    figure.text(0.99, 0.01, "× out of KV cache", color=muted, fontsize=8, ha="right")
-    figure.tight_layout(rect=(0, 0.06, 1, 1))
+    figure.text(0.99, 0.01, "× cache oom", color=muted, fontsize=8, ha="right")
+    legend_inches = 0.8
+    figure.tight_layout(rect=(0, legend_inches / figure.get_figheight(), 1, 1))
     out.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(out, facecolor=surface)
     print(f"wrote {out}")

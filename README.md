@@ -33,7 +33,11 @@ To work around this, PulsarLM stores snapshots of the context
 at regular intervals in an external store,
 and resumes a conversation from its latest snapshot.
 
+To try it, `pip install pulsarlm` or see [Quickstart](#quickstart).
+
 ## Performance
+
+### Small model throughput
 
 On an RTX 5090, in bf16 with the default settings:
 
@@ -47,6 +51,37 @@ On an RTX 5090, in bf16 with the default settings:
 Prefill is measured on a 5k-token prompt.
 Decode is one request generating 512 tokens,
 and 16 concurrent requests generating 256 tokens each.
+
+### Growing conversations
+
+![Time to first token, decode throughput and KV cache in use against context, for 1 and 4 chat sessions](bench/perf.svg)
+
+Multi-turn chat sessions with Gemma 4 12B are evaluated on a single NVIDIA RTX 5090.
+For each turn, a 4,096-token user message and a model reply of at most 256 tokens are appended,
+and sessions grow to approximately 128k tokens of context.
+Both engines are allotted a 4 GiB KV cache
+and prefill at most 256 prompt tokens per step.
+In the "Capped @ 16k" configuration, eviction limits the attention view to 16,384 tokens;
+in the "no prefix cache" configurations, the entire conversation is recomputed at every turn.
+The vLLM baseline is version 0.31.0.
+Crosses denote turns that failed because the KV cache was exhausted (cache oom).
+
+The last turn each run completed:
+
+| Setting | Sessions | Context tokens | TTFT | Decode | KV cache | Run time | Ended |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| Full KV | 1 | 126,965 | 7.4 s | 50 tok/s | 1.44 GiB | 4 min | finished |
+| Full KV, no prefix cache | 1 | 126,965 | 103 s | 50 tok/s | 1.44 GiB | 22 min | finished |
+| Capped @ 16k | 1 | 126,965 | 2.0 s | 53 tok/s | 0.59 GiB | 3 min | finished |
+| Capped @ 16k, no prefix cache | 1 | 126,965 | 41 s | 53 tok/s | 0.59 GiB | 12 min | finished |
+| vLLM | 1 | 126,965 | 3.3 s | 43 tok/s | 2.40 GiB | 4 min | finished |
+| vLLM, no prefix cache | 1 | 126,965 | 53 s | 43 tok/s | 2.40 GiB | 13 min | finished |
+| Full KV | 4 | 70,051 | 12 s | 97 tok/s | 3.91 GiB | 5 min | cache oom at 74,147 tokens |
+| Full KV, no prefix cache | 4 | 126,965 | 265 s | 71 tok/s | 2.58 GiB | 84 min | finished |
+| Capped @ 16k | 4 | 126,965 | 5.8 s | 130 tok/s | 2.37 GiB | 7 min | finished |
+| Capped @ 16k, no prefix cache | 4 | 126,965 | 110 s | 84 tok/s | 1.41 GiB | 47 min | finished |
+| vLLM | 4 | 126,965 | 142 s | 171 tok/s | 2.40 GiB | 48 min | finished |
+| vLLM, no prefix cache | 4 | 126,965 | 142 s | 171 tok/s | 2.40 GiB | 48 min | finished |
 
 ## Accuracy under eviction
 
