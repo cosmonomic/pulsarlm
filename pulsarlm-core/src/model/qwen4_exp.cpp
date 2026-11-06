@@ -47,13 +47,44 @@ at::Tensor ngram_table(const c10::Dict<std::string, at::Tensor>& weights, const 
     return at::cat(shards);
 }
 
+std::int64_t split(std::int64_t count, std::int64_t parts, const char* what) {
+    if (count % parts != 0) {
+        throw std::invalid_argument(
+            std::format("qwen4_exp_model: {} {} do not split across {} GPUs", count, what, parts)
+        );
+    }
+    return count / parts;
+}
+
 }  // namespace
 
-qwen4_exp_model::qwen4_exp_model(qwen4_exp_config config, const c10::Dict<std::string, at::Tensor>& weights)
+qwen4_exp_model::qwen4_exp_model(
+    qwen4_exp_config config,
+    const c10::Dict<std::string, at::Tensor>& weights,
+    communicator comm
+)
 : config(std::move(config)),
+  comm(std::move(comm)),
   n_layers(static_cast<std::int64_t>(this->config.layer_types.size())),
   embed_tokens(need(weights, "embed_tokens.weight")) {
     const qwen4_exp_config& c = this->config;
+    const auto gpus = static_cast<std::int64_t>(this->comm.size());
+    const auto rank = static_cast<std::int64_t>(this->comm.rank());
+    if (c.n_kv_heads % gpus != 0 && gpus % c.n_kv_heads != 0) {
+        throw std::invalid_argument(
+            std::format("qwen4_exp_model: {} KV heads do not split across or repeat over {} GPUs", c.n_kv_heads, gpus)
+        );
+    }
+    heads = shard_heads{
+        .n_heads = split(c.n_heads, gpus, "query heads"),
+        .n_kv_heads = std::max<std::int64_t>(1, c.n_kv_heads / gpus),
+        .linear_n_key_heads = split(c.linear_n_key_heads, gpus, "Gated DeltaNet key heads"),
+        .linear_n_value_heads = split(c.linear_n_value_heads, gpus, "Gated DeltaNet value heads"),
+    };
+    first_vocab_row = rank * embed_tokens.size(0);
+    if (embed_tokens.size(0) * gpus < c.vocab_size) {
+        throw std::invalid_argument("qwen4_exp_model: the GPUs' embedding rows do not cover the vocabulary");
+    }
     const auto rotary_dim = static_cast<std::int64_t>(std::llround(c.partial_rotary_factor * c.head_dim));
     if (rotary_dim % 2 != 0 || rotary_dim > c.head_dim || c.head_dim % 2 != 0) {
         throw std::invalid_argument("qwen4_exp_model: the rotated dims must be an even part of an even head dim");
@@ -83,8 +114,14 @@ qwen4_exp_model::qwen4_exp_model(qwen4_exp_config config, const c10::Dict<std::s
             .to(embed_tokens.device());
     lm_head = weights.contains("lm_head.weight") ? weights.at("lm_head.weight") : embed_tokens;
     at::Tensor permutation = rope_permutation(c.head_dim, rotary_dim, embed_tokens.device());
-    const std::int64_t conv_channels = 2 * c.linear_n_key_heads * c.linear_key_head_dim +
-        c.linear_n_value_heads * c.linear_value_head_dim;
+    const std::int64_t key_channels = heads.linear_n_key_heads * c.linear_key_head_dim;
+    const std::int64_t value_channels = heads.linear_n_value_heads * c.linear_value_head_dim;
+    const std::int64_t full_key_channels = c.linear_n_key_heads * c.linear_key_head_dim;
+    const std::int64_t full_value_channels = c.linear_n_value_heads * c.linear_value_head_dim;
+    const std::int64_t first_kv_head = gpus <= c.n_kv_heads ? rank * heads.n_kv_heads : rank / (gpus / c.n_kv_heads);
+    auto rows = [](std::int64_t first, std::int64_t count) {
+        return std::pair{static_cast<std::size_t>(first), static_cast<std::size_t>(first + count)};
+    };
     auto mixer = [&](const std::string& p) {
         return mixer_weights{
             .hc_norm = zero_centered(need(weights, p + "hc_norm.weight")),
@@ -105,6 +142,15 @@ qwen4_exp_model::qwen4_exp_model(qwen4_exp_config config, const c10::Dict<std::s
             .head_dim = 0,
             .state = recurrent_state{.sizes = std::move(sizes), .dtype = dtype}
         };
+    };
+    auto add_kv_layer = [&](kv_layer layer, kv_layer full, std::vector<std::pair<std::size_t, std::size_t>> held) {
+        kv_specs.push_back(std::move(layer));
+        kv_shards.push_back(kv_layer_shard{.full = std::move(full), .rows = std::move(held)});
+    };
+    auto whole = [&](std::vector<std::int64_t> sizes, at::ScalarType dtype) {
+        kv_layer layer = recurrent(std::move(sizes), dtype);
+        std::int64_t first_size = layer.state->sizes.front();
+        add_kv_layer(layer, layer, {rows(0, first_size)});
     };
 
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
@@ -128,8 +174,8 @@ qwen4_exp_model::qwen4_exp_model(qwen4_exp_config config, const c10::Dict<std::s
         kv_layer_of.push_back(kv_specs.size());
         if (indexed_attention(layer)) {
             w.attention = attention_weights{
-                .q_proj = permute_queries(need(weights, p + "self_attn.q_proj.weight"), c.n_heads, permutation),
-                .k_proj = permute_heads(need(weights, p + "self_attn.k_proj.weight"), c.n_kv_heads, permutation),
+                .q_proj = permute_queries(need(weights, p + "self_attn.q_proj.weight"), heads.n_heads, permutation),
+                .k_proj = permute_heads(need(weights, p + "self_attn.k_proj.weight"), heads.n_kv_heads, permutation),
                 .v_proj = need(weights, p + "self_attn.v_proj.weight"),
                 .o_proj = need(weights, p + "self_attn.o_proj.weight"),
                 .q_norm = zero_centered(need(weights, p + "self_attn.q_norm.weight")).index_select(0, permutation),
@@ -138,13 +184,18 @@ qwen4_exp_model::qwen4_exp_model(qwen4_exp_config config, const c10::Dict<std::s
                 .index_q_norm = zero_centered(need(weights, p + "self_attn.indexer.q_layernorm.weight")),
                 .index_k_norm = zero_centered(need(weights, p + "self_attn.indexer.k_layernorm.weight")),
             };
-            kv_specs.push_back(
-                kv_layer{
-                    .n_kv_heads = static_cast<std::size_t>(c.n_kv_heads),
+            auto attention_layer = [&](std::int64_t n_kv_heads, std::int64_t n_q_heads) {
+                return kv_layer{
+                    .n_kv_heads = static_cast<std::size_t>(n_kv_heads),
                     .head_dim = static_cast<std::size_t>(c.head_dim),
-                    .n_q_heads = static_cast<std::size_t>(c.n_heads),
+                    .n_q_heads = static_cast<std::size_t>(n_q_heads),
                     .index_head_dim = static_cast<std::size_t>(c.indexer_head_dim),
-                }
+                };
+            };
+            add_kv_layer(
+                attention_layer(heads.n_kv_heads, heads.n_heads),
+                attention_layer(c.n_kv_heads, c.n_heads),
+                {rows(first_kv_head, heads.n_kv_heads)}
             );
         } else {
             w.deltanet = deltanet_weights{
@@ -158,13 +209,25 @@ qwen4_exp_model::qwen4_exp_model(qwen4_exp_config config, const c10::Dict<std::s
                 .norm = need(weights, p + "linear_attn.norm.weight"),
                 .out_proj = need(weights, p + "linear_attn.out_proj.weight"),
             };
-            kv_specs.push_back(
-                recurrent({c.linear_n_value_heads, c.linear_key_head_dim, c.linear_value_head_dim}, at::kFloat)
+            add_kv_layer(
+                recurrent({heads.linear_n_value_heads, c.linear_key_head_dim, c.linear_value_head_dim}, at::kFloat),
+                recurrent({c.linear_n_value_heads, c.linear_key_head_dim, c.linear_value_head_dim}, at::kFloat),
+                {rows(rank * heads.linear_n_value_heads, heads.linear_n_value_heads)}
             );
-            kv_specs.push_back(recurrent({conv_channels, c.linear_conv_kernel - 1}, embed_tokens.scalar_type()));
+            add_kv_layer(
+                recurrent({2 * key_channels + value_channels, c.linear_conv_kernel - 1}, embed_tokens.scalar_type()),
+                recurrent(
+                    {2 * full_key_channels + full_value_channels, c.linear_conv_kernel - 1},
+                    embed_tokens.scalar_type()
+                ),
+                {rows(rank * key_channels, key_channels),
+                 rows(full_key_channels + rank * key_channels, key_channels),
+                 rows(2 * full_key_channels + rank * value_channels, value_channels)}
+            );
         }
         if (std::ranges::contains(c.ple_layers, layer)) {
             const std::string e = p + "ple.ple_embedding.";
+            at::Tensor table = ngram_table(weights, e + "ngram_embedding.");
             w.ple = ple_weights{
                 .key_proj = need(weights, p + "ple.key_proj.weight"),
                 .value_proj = need(weights, p + "ple.value_proj.weight"),
@@ -175,15 +238,19 @@ qwen4_exp_model::qwen4_exp_model(qwen4_exp_config config, const c10::Dict<std::s
                 .layer_multipliers = need(weights, e + "layer_multipliers").to(at::kLong),
                 .head_vocab_sizes = need(weights, e + "ngram_heads_vocab_sizes").to(at::kLong),
                 .head_offsets = need(weights, e + "ngram_heads_offsets").to(at::kLong),
-                .ngram_embedding = ngram_table(weights, e + "ngram_embedding."),
+                .ngram_embedding = table,
+                .first_row = rank * table.size(0),
             };
+            if ((w.ple->head_offsets + w.ple->head_vocab_sizes).max().item<std::int64_t>() > table.size(0) * gpus) {
+                throw std::invalid_argument("qwen4_exp_model: the GPUs' n-gram table rows do not cover its heads");
+            }
             if (w.ple->layer_multipliers.size(0) != c.ngram_size ||
                 w.ple->head_vocab_sizes.size(0) % (c.ngram_size - 1) != 0) {
                 throw std::invalid_argument("qwen4_exp_model: the n-gram buffers must match ngram_size");
             }
             const std::int64_t history = (w.ple->conv.size(2) - 1) * c.ngram_size;
-            kv_specs.push_back(recurrent({c.hc_count * c.hidden_size, history}, embed_tokens.scalar_type()));
-            kv_specs.push_back(recurrent({c.ngram_size - 1}, at::kLong));
+            whole({c.hc_count * c.hidden_size, history}, embed_tokens.scalar_type());
+            whole({c.ngram_size - 1}, at::kLong);
         }
         layers.push_back(std::move(w));
     }
@@ -191,6 +258,31 @@ qwen4_exp_model::qwen4_exp_model(qwen4_exp_config config, const c10::Dict<std::s
 
 std::vector<kv_layer> qwen4_exp_model::kv_layers() const {
     return kv_specs;
+}
+
+std::vector<kv_layer_shard> qwen4_exp_model::kv_layer_shards() const {
+    return kv_shards;
+}
+
+at::Tensor qwen4_exp_model::lookup(const at::Tensor& table, std::int64_t first_row, const at::Tensor& ids) const {
+    at::Tensor rows = ids - first_row;
+    at::Tensor held = rows.ge(0).logical_and(rows.lt(table.size(0))).unsqueeze(-1);
+    std::vector<std::int64_t> sizes = ids.sizes().vec();
+    sizes.push_back(table.size(1));
+    at::Tensor found = table.index_select(0, rows.clamp(0, table.size(0) - 1).flatten()).view(sizes);
+    at::Tensor summed = at::where(held, found, at::zeros({}, found.options()));
+    comm.all_reduce(summed);
+    return summed;
+}
+
+at::Tensor qwen4_exp_model::logits(const at::Tensor& x) const {
+    at::Tensor part = at::matmul(x, lm_head.t()).contiguous();
+    const auto gpus = static_cast<std::int64_t>(comm.size());
+    return comm.all_gather(part)
+        .view({gpus, part.size(0), part.size(1)})
+        .permute({1, 0, 2})
+        .reshape({part.size(0), gpus * part.size(1)})
+        .narrow(1, 0, config.vocab_size);
 }
 
 bool qwen4_exp_model::indexed_attention(std::int64_t layer) const {
@@ -313,16 +405,16 @@ at::Tensor qwen4_exp_model::attention(
     const std::int64_t ntok = h.size(0);
     const std::size_t kv_index = kv_layer_of[layer];
 
-    at::Tensor query_gate = at::linear(h, w.q_proj).view({ntok, c.n_heads, 2 * c.head_dim});
+    at::Tensor query_gate = at::linear(h, w.q_proj).view({ntok, heads.n_heads, 2 * c.head_dim});
     at::Tensor q = rmsnorm_cuda(query_gate.narrow(-1, 0, c.head_dim), w.q_norm, c.rms_norm_eps);
-    at::Tensor gate = query_gate.narrow(-1, c.head_dim, c.head_dim).reshape({ntok, c.n_heads * c.head_dim});
-    q = rope_q(q.view({ntok, c.n_heads * c.head_dim}), g.pos, c.n_heads, c.head_dim, rope);
+    at::Tensor gate = query_gate.narrow(-1, c.head_dim, c.head_dim).reshape({ntok, heads.n_heads * c.head_dim});
+    q = rope_q(q.view({ntok, heads.n_heads * c.head_dim}), g.pos, heads.n_heads, c.head_dim, rope);
     at::Tensor k = rmsnorm_cuda(
-        at::linear(h, w.k_proj).view({ntok, c.n_kv_heads, c.head_dim}),
+        at::linear(h, w.k_proj).view({ntok, heads.n_kv_heads, c.head_dim}),
         w.k_norm,
         c.rms_norm_eps
     );
-    at::Tensor v = at::linear(h, w.v_proj).view({ntok, c.n_kv_heads, c.head_dim}).contiguous();
+    at::Tensor v = at::linear(h, w.v_proj).view({ntok, heads.n_kv_heads, c.head_dim}).contiguous();
 
     const kv& line = lines[kv_index];
     const auto layer_row = static_cast<std::int64_t>(kv_index);
@@ -379,7 +471,9 @@ at::Tensor qwen4_exp_model::attention(
         cu_view_pages,
         query_weights
     );
-    return at::linear(o.reshape({ntok, c.n_heads * c.head_dim}) * at::sigmoid(gate), w.o_proj);
+    at::Tensor out = at::linear(o.reshape({ntok, heads.n_heads * c.head_dim}) * at::sigmoid(gate), w.o_proj);
+    comm.all_reduce(out);
+    return out;
 }
 
 at::Tensor qwen4_exp_model::deltanet(
@@ -417,11 +511,13 @@ at::Tensor qwen4_exp_model::deltanet(
         g.page_tables.select(0, static_cast<std::int64_t>(state_layer)),
         cu_seqlens_q,
         g.page_end_tokens,
-        c.linear_n_key_heads
+        heads.linear_n_key_heads
     );
     at::Tensor z = at::linear(h, w.in_proj_z).view(core.sizes());
     at::Tensor gated = gated_rmsnorm_cuda(core, z, w.norm, c.rms_norm_eps, c.linear_output_gate);
-    return at::linear(gated.view({ntok, c.linear_n_value_heads * c.linear_value_head_dim}), w.out_proj);
+    at::Tensor out = at::linear(gated.view({ntok, heads.linear_n_value_heads * c.linear_value_head_dim}), w.out_proj);
+    comm.all_reduce(out);
+    return out;
 }
 
 at::Tensor qwen4_exp_model::moe(const at::Tensor& h, std::int64_t layer) const {
@@ -441,7 +537,9 @@ at::Tensor qwen4_exp_model::moe(const at::Tensor& h, std::int64_t layer) const {
         at::silu(at::linear(h, m.shared_gate_proj)) * at::linear(h, m.shared_up_proj),
         m.shared_down_proj
     );
-    return routed + at::sigmoid(at::linear(h, m.shared_expert_gate)) * shared;
+    at::Tensor out = routed + at::sigmoid(at::linear(h, m.shared_expert_gate)) * shared;
+    comm.all_reduce(out);
+    return out;
 }
 
 // Hugging Face shifts each sequence right by k with EOS in the places before the sequence's start and before a token
@@ -517,7 +615,7 @@ qwen4_exp_model::ple(const at::Tensor& x, std::int64_t layer, const group_batch&
     }
 
     at::Tensor ids = ngram_ids(w, token_layer, g, lines[token_layer]);
-    at::Tensor embeddings = w.ngram_embedding.index_select(0, ids.flatten()).view({ntok, -1});
+    at::Tensor embeddings = lookup(w.ngram_embedding, w.first_row, ids).view({ntok, -1});
     at::Tensor keys = stream_norm(at::linear(embeddings, w.key_proj), w.norm_key).view({ntok, c.hc_count, -1});
     at::Tensor queries = stream_norm(x, w.norm_query).view({ntok, c.hc_count, -1});
     at::Tensor gate = (keys * queries).sum(-1, true) / std::sqrt(static_cast<double>(c.hidden_size));
@@ -539,7 +637,7 @@ at::Tensor qwen4_exp_model::group_forward(const group_batch& g, std::span<const 
     auto inject = [](const at::Tensor& x, const at::Tensor& out, const mixed_input& mixed) {
         return x + (out.unsqueeze(1) * mixed.injection_weights.unsqueeze(-1)).flatten(1);
     };
-    at::Tensor x = embed_tokens.index_select(0, g.tokens).repeat({1, config.hc_count});
+    at::Tensor x = lookup(embed_tokens, first_vocab_row, g.tokens).repeat({1, config.hc_count});
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
         const layer_weights& w = layers[layer];
         if (w.ple) {
@@ -554,7 +652,7 @@ at::Tensor qwen4_exp_model::group_forward(const group_batch& g, std::span<const 
         mixed = mix(x, w.mlp_hyper_connection);
         x = inject(x, moe(mixed.input, layer), mixed);
     }
-    return at::matmul(final_mix(logit_inputs(x, g)), lm_head.t());
+    return logits(final_mix(logit_inputs(x, g)));
 }
 
 step_logits qwen4_exp_model::forward(const step_batch& batch, std::span<const kv> lines) {

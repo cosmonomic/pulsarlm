@@ -1,5 +1,6 @@
 #pragma once
 
+#include "pulsarlm/communicator.hpp"
 #include "pulsarlm/model/interface.hpp"
 #include "pulsarlm/ops.hpp"
 #include "pulsarlm/rope.hpp"
@@ -22,6 +23,14 @@
 // heads against the RMSNorm of each block's mean raw index key roped at the block's first key, and the incomplete
 // block holding it. Weights carry Hugging Face's names under model.language_model., the untied head lm_head.weight, and
 // each PLE layer's n-gram table its shards ple.ple_embedding.ngram_embedding.shard_<i>.weight.
+//
+// Across the N GPUs of a communicator, GPU g holds the g-th of N equal parts, as vLLM v0.31.0 splits them: of the query
+// heads; of the KV heads, or KV head g / (N / KV heads) when N exceeds them; of the Gated DeltaNet key heads and value
+// heads, in_proj_qkv's and conv1d's q, k and v channels each split apart; of every expert's and the shared expert's
+// intermediate size, the gate and up halves of gate_up_proj each split apart; of the embedding's and lm_head's rows,
+// the vocabulary padded to a multiple of 64; and of each PLE layer's n-gram table rows, its shards concatenated. Every
+// other weight is whole on every GPU. The outputs of o_proj, out_proj, the sparse block and the embedding lookups are
+// summed across the GPUs, and the logits gathered.
 
 namespace pulsarlm {
 
@@ -117,6 +126,7 @@ class qwen4_exp_model : public model {
         at::Tensor head_vocab_sizes;  // int64 [n-gram heads]
         at::Tensor head_offsets;
         at::Tensor ngram_embedding;  // [rows, embedding dim / n-gram heads]
+        std::int64_t first_row;  // of the whole table, the row ngram_embedding starts at
     };
 
     struct layer_weights {
@@ -128,12 +138,22 @@ class qwen4_exp_model : public model {
         std::optional<ple_weights> ple;
     };
 
+    // This GPU's head counts.
+    struct shard_heads {
+        std::int64_t n_heads;
+        std::int64_t n_kv_heads;
+        std::int64_t linear_n_key_heads;
+        std::int64_t linear_n_value_heads;
+    };
+
     struct mixed_input {
         at::Tensor input;  // [ntok, hidden]
         at::Tensor injection_weights;  // [ntok, hc_count]
     };
 
     qwen4_exp_config config;
+    communicator comm;
+    shard_heads heads;
     std::int64_t n_layers;
     rope_parameters rope;
     // fp32 [rotary_dim / 2]: Hugging Face's RoPE frequencies, which the indexer rotates its queries and blocks by.
@@ -141,12 +161,20 @@ class qwen4_exp_model : public model {
     // The first KV layer of each layer.
     std::vector<std::size_t> kv_layer_of;
     std::vector<kv_layer> kv_specs;
+    std::vector<kv_layer_shard> kv_shards;
     at::Tensor embed_tokens;
+    // Of the padded vocabulary, the row embed_tokens and lm_head start at.
+    std::int64_t first_vocab_row;
     at::Tensor lm_head;
     mixer_weights hyper_connection_mixer;
     std::vector<layer_weights> layers;
 
     bool indexed_attention(std::int64_t layer) const;
+    // The rows of a table split across the GPUs at ids, [ids..., table columns], summed across the GPUs; this GPU's
+    // part of the table starts at first_row.
+    at::Tensor lookup(const at::Tensor& table, std::int64_t first_row, const at::Tensor& ids) const;
+    // The logits [rows, vocab_size] of the final mix x [rows, hidden], from every GPU's part of lm_head.
+    at::Tensor logits(const at::Tensor& x) const;
     // x [..., indexer_head_dim] with its first rotary_dim dims rotated as Hugging Face rotates them, at positions
     // [...] (x's leading dims, or all but its last two).
     at::Tensor index_rope(const at::Tensor& x, const at::Tensor& positions) const;
@@ -175,10 +203,12 @@ class qwen4_exp_model : public model {
     at::Tensor group_forward(const group_batch& g, std::span<const kv> lines) const;
 
   public:
-    // weights are on the lines' device, in the attention lines' dtype; the PLE buffers are int64.
-    qwen4_exp_model(qwen4_exp_config config, const c10::Dict<std::string, at::Tensor>& weights);
+    // weights are this GPU's parts, on the lines' device, in the attention lines' dtype; the PLE buffers are int64.
+    // Throws std::invalid_argument when a split part is not a whole number of heads.
+    qwen4_exp_model(qwen4_exp_config config, const c10::Dict<std::string, at::Tensor>& weights, communicator comm = {});
 
     std::vector<kv_layer> kv_layers() const override;
+    std::vector<kv_layer_shard> kv_layer_shards() const override;
     step_logits forward(const step_batch& batch, std::span<const kv> lines) override;
 };
 

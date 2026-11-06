@@ -1,20 +1,30 @@
 #include "pulsarlm/model/qwen4_exp.hpp"
 
+#include "pulsarlm/communicator.hpp"
+
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAFunctions.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <format>
+#include <memory>
+#include <stdexcept>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 // qwen4_exp_model's paged forward against a dense ATen Qwen4-Exp written from Hugging Face's code, with the delta rule
 // run token by token, the experts one by one, QSA's blocks selected query by query and the n-gram ids hashed on the
 // host: chunked prefill then decode, checking the logits and the lines of every recurrent KV layer at the end and at the
-// newest page end.
+// newest page end. The same forward split across GPUs, ranks of a communicator on one device, against it and against
+// the lines of the forward on one GPU.
 
 namespace {
 
@@ -536,53 +546,173 @@ double max_relative_error(const at::Tensor& got, const at::Tensor& expected) {
     return ((got.to(at::kFloat) - expected).abs().max() / expected.abs().max()).item<double>();
 }
 
-void check_against_dense(at::ScalarType dtype, double tolerance, std::int64_t experts_per_token, std::int64_t budget) {
-    weights w(dtype);
-    pulsarlm::qwen4_exp_model model(model_config(experts_per_token, budget), w.named_tensors);
-    std::vector<pulsarlm::kv_layer> specs = model.kv_layers();
-    REQUIRE(specs.size() == 9);
-    std::vector<pulsarlm::kv> kv;
+struct chunk {
+    std::int64_t first;
+    std::int64_t last;
+    bool prefill;
+};
+
+const std::vector<chunk> chunks{
+    chunk{0, 21, true},
+    chunk{21, 37, true},
+    chunk{37, 47, true},
+    chunk{47, 48, false},
+    chunk{48, 49, false},
+};
+
+std::vector<pulsarlm::kv> make_lines(const std::vector<pulsarlm::kv_layer>& specs, at::ScalarType dtype) {
+    std::vector<pulsarlm::kv> lines;
     for (const pulsarlm::kv_layer& spec : specs) {
         if (spec.state) {
             std::vector<std::int64_t> sizes{n_lines};
             sizes.insert(sizes.end(), spec.state->sizes.begin(), spec.state->sizes.end());
-            at::Tensor lines = at::zeros(sizes, cuda(spec.state->dtype));
-            kv.push_back(pulsarlm::kv{.k = lines, .v = lines});
+            at::Tensor layer_lines = at::zeros(sizes, cuda(spec.state->dtype));
+            lines.push_back(pulsarlm::kv{.k = layer_lines, .v = layer_lines});
         } else {
-            kv.push_back(
+            auto kv_heads = static_cast<std::int64_t>(spec.n_kv_heads);
+            lines.push_back(
                 pulsarlm::kv{
-                    .k = at::zeros({n_lines, page_size, n_kv_heads, head_dim}, cuda(dtype)),
-                    .v = at::zeros({n_lines, page_size, n_kv_heads, head_dim}, cuda(dtype)),
+                    .k = at::zeros({n_lines, page_size, kv_heads, head_dim}, cuda(dtype)),
+                    .v = at::zeros({n_lines, page_size, kv_heads, head_dim}, cuda(dtype)),
                     .index_keys = at::zeros({n_lines, page_size, indexer_dim}, cuda(dtype)),
                 }
             );
         }
     }
+    return lines;
+}
 
+// n_tokens random tokens with EOS at eos_positions, on the device and on the host.
+std::pair<at::Tensor, std::vector<std::int64_t>> make_tokens() {
     auto tokens = at::randint(vocab, {n_tokens}, cuda(at::kLong));
     for (std::int64_t position : eos_positions) {
         tokens[position] = eos;
     }
     at::Tensor host_tokens = tokens.cpu();
-    std::vector<std::int64_t> token_ids(
-        host_tokens.data_ptr<std::int64_t>(),
-        host_tokens.data_ptr<std::int64_t>() + n_tokens
+    return {
+        tokens,
+        std::vector<std::int64_t>(host_tokens.data_ptr<std::int64_t>(), host_tokens.data_ptr<std::int64_t>() + n_tokens)
+    };
+}
+
+pulsarlm::step_batch chunk_batch(const at::Tensor& tokens, chunk c, const std::vector<pulsarlm::kv_layer>& specs) {
+    pulsarlm::step_batch batch;
+    (c.prefill ? batch.prefill_group : batch.decode_group) = step(tokens, c.first, c.last, c.prefill, specs);
+    return batch;
+}
+
+const at::Tensor& chunk_logits(const pulsarlm::step_logits& logits, chunk c) {
+    return *(c.prefill ? logits.prefill_logits : logits.decode_logits);
+}
+
+// The equal part of [count] along dim that GPU rank of gpus holds, starting at first within t.
+at::Tensor part(
+    const at::Tensor& t,
+    std::int64_t dim,
+    std::int64_t first,
+    std::int64_t count,
+    std::size_t rank,
+    std::size_t gpus
+) {
+    const std::int64_t share = count / static_cast<std::int64_t>(gpus);
+    return t.narrow(dim, first + static_cast<std::int64_t>(rank) * share, share);
+}
+
+// The vocabulary padded to a multiple of 64, as vLLM pads it before splitting it.
+constexpr std::int64_t padded_vocab = (vocab + 63) / 64 * 64;
+
+// Of a whole-model weight, the part GPU rank of gpus holds, as vLLM v0.31.0 splits Qwen4-Exp.
+at::Tensor rank_part(const std::string& name, const at::Tensor& t, std::size_t rank, std::size_t gpus) {
+    constexpr std::int64_t key_dim = key_heads * key_head_dim;
+    constexpr std::int64_t value_dim = value_heads * value_head_dim;
+    auto ends = [&](const char* suffix) { return name.ends_with(suffix); };
+    if (ends("embed_tokens.weight") || ends("lm_head.weight")) {
+        at::Tensor padded = at::cat({t, at::zeros({padded_vocab - vocab, t.size(1)}, t.options())});
+        return part(padded, 0, 0, padded_vocab, rank, gpus);
+    }
+    if (ends("self_attn.q_proj.weight")) {
+        return part(t, 0, 0, t.size(0), rank, gpus);
+    }
+    if (ends("self_attn.k_proj.weight") || ends("self_attn.v_proj.weight")) {
+        if (static_cast<std::int64_t>(gpus) <= n_kv_heads) {
+            return part(t, 0, 0, t.size(0), rank, gpus);
+        }
+        const auto head = static_cast<std::int64_t>(rank) / (static_cast<std::int64_t>(gpus) / n_kv_heads);
+        return t.narrow(0, head * head_dim, head_dim);
+    }
+    if (ends("self_attn.o_proj.weight") || ends("linear_attn.out_proj.weight") ||
+        ends("mlp.shared_expert.down_proj.weight")) {
+        return part(t, 1, 0, t.size(1), rank, gpus);
+    }
+    if (ends("linear_attn.in_proj_qkv.weight") || ends("linear_attn.conv1d.weight")) {
+        return at::cat({
+            part(t, 0, 0, key_dim, rank, gpus),
+            part(t, 0, key_dim, key_dim, rank, gpus),
+            part(t, 0, 2 * key_dim, value_dim, rank, gpus),
+        });
+    }
+    if (ends("linear_attn.in_proj_z.weight") || ends("linear_attn.in_proj_b.weight") ||
+        ends("linear_attn.in_proj_a.weight") || ends("linear_attn.dt_bias") || ends("linear_attn.A_log") ||
+        ends("mlp.shared_expert.gate_proj.weight") || ends("mlp.shared_expert.up_proj.weight")) {
+        return part(t, 0, 0, t.size(0), rank, gpus);
+    }
+    if (ends("mlp.experts.gate_up_proj")) {
+        const std::int64_t intermediate = t.size(1) / 2;
+        return at::cat(
+            {part(t, 1, 0, intermediate, rank, gpus), part(t, 1, intermediate, intermediate, rank, gpus)},
+            1
+        );
+    }
+    if (ends("mlp.experts.down_proj")) {
+        return part(t, 2, 0, t.size(2), rank, gpus);
+    }
+    return t;
+}
+
+// GPU rank's weights: each weight's part, and its rows of the n-gram table as two shards.
+c10::Dict<std::string, at::Tensor> rank_weights(const weights& w, std::size_t rank, std::size_t gpus) {
+    c10::Dict<std::string, at::Tensor> parts;
+    for (const auto& entry : w.named_tensors) {
+        if (entry.key().find("ngram_embedding.shard_") == std::string::npos) {
+            parts.insert(entry.key(), rank_part(entry.key(), entry.value(), rank, gpus).contiguous());
+        }
+    }
+    const std::string table = std::format(
+        "model.language_model.layers.{}.ple.ple_embedding.ngram_embedding.",
+        ple_layer
     );
+    std::vector<at::Tensor> shards = part(w.ngram_embedding, 0, 0, ngram_rows, rank, gpus).chunk(ngram_shards);
+    for (std::size_t shard = 0; shard < shards.size(); shard++) {
+        parts.insert(std::format("{}shard_{}.weight", table, shard), shards[shard].contiguous());
+    }
+    return parts;
+}
+
+// The rows a shard holds of each line of full, [n_lines, rows...] along dim.
+at::Tensor
+held_rows(const at::Tensor& full, std::int64_t dim, const std::vector<std::pair<std::size_t, std::size_t>>& rows) {
+    std::vector<at::Tensor> parts;
+    for (auto [first, last] : rows) {
+        parts.push_back(full.narrow(dim, static_cast<std::int64_t>(first), static_cast<std::int64_t>(last - first)));
+    }
+    return at::cat(parts, dim);
+}
+
+void check_against_dense(at::ScalarType dtype, double tolerance, std::int64_t experts_per_token, std::int64_t budget) {
+    weights w(dtype);
+    pulsarlm::qwen4_exp_model model(model_config(experts_per_token, budget), w.named_tensors);
+    std::vector<pulsarlm::kv_layer> specs = model.kv_layers();
+    REQUIRE(specs.size() == 9);
+    std::vector<pulsarlm::kv> kv = make_lines(specs, dtype);
+
+    auto [tokens, token_ids] = make_tokens();
     dense_output dense = dense_forward(w, token_ids, experts_per_token, budget);
 
-    struct chunk {
-        std::int64_t first;
-        std::int64_t last;
-        bool prefill;
-    };
-    for (chunk c :
-         {chunk{0, 21, true}, chunk{21, 37, true}, chunk{37, 47, true}, chunk{47, 48, false}, chunk{48, 49, false}}) {
+    for (chunk c : chunks) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
-        pulsarlm::step_batch batch;
-        (c.prefill ? batch.prefill_group : batch.decode_group) = step(tokens, c.first, c.last, c.prefill, specs);
-        pulsarlm::step_logits logits = model.forward(batch, kv);
+        pulsarlm::step_logits logits = model.forward(chunk_batch(tokens, c, specs), kv);
         auto expected_logits = dense.logits.narrow(0, c.first, c.last - c.first);
-        CHECK(max_relative_error(*(c.prefill ? logits.prefill_logits : logits.decode_logits), expected_logits) < tolerance);
+        CHECK(max_relative_error(chunk_logits(logits, c), expected_logits) < tolerance);
     }
 
     std::size_t kv_index = 0;
@@ -623,6 +753,101 @@ void check_against_dense(at::ScalarType dtype, double tolerance, std::int64_t ex
     }
 }
 
+// Each rank's forward on its own thread and stream, as the ranks of a communicator run.
+std::vector<pulsarlm::step_logits> sharded_forward(
+    const std::vector<std::unique_ptr<pulsarlm::qwen4_exp_model>>& shards,
+    const std::vector<std::vector<pulsarlm::kv>>& lines,
+    const std::vector<c10::cuda::CUDAStream>& streams,
+    const pulsarlm::step_batch& batch
+) {
+    c10::cuda::device_synchronize();
+    std::vector<pulsarlm::step_logits> logits(shards.size());
+    std::vector<std::thread> threads;
+    for (std::size_t rank = 0; rank < shards.size(); rank++) {
+        threads.emplace_back([&, rank] {
+            c10::cuda::CUDAStreamGuard guard(streams[rank]);
+            logits[rank] = shards[rank]->forward(batch, lines[rank]);
+            streams[rank].synchronize();
+        });
+    }
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+    return logits;
+}
+
+void check_sharded(
+    at::ScalarType dtype,
+    double tolerance,
+    std::int64_t experts_per_token,
+    std::int64_t budget,
+    std::size_t gpus
+) {
+    weights w(dtype);
+    pulsarlm::qwen4_exp_config config = model_config(experts_per_token, budget);
+    pulsarlm::qwen4_exp_model single(config, w.named_tensors);
+    std::vector<pulsarlm::kv_layer> specs = single.kv_layers();
+    std::vector<pulsarlm::kv> single_lines = make_lines(specs, dtype);
+
+    std::vector<pulsarlm::communicator> ranks = pulsarlm::communicator::make_on_one_device(
+        at::Device(at::kCUDA, 0),
+        gpus
+    );
+    std::vector<std::unique_ptr<pulsarlm::qwen4_exp_model>> shards;
+    std::vector<std::vector<pulsarlm::kv>> lines;
+    std::vector<c10::cuda::CUDAStream> streams;
+    for (std::size_t rank = 0; rank < gpus; rank++) {
+        shards.push_back(std::make_unique<pulsarlm::qwen4_exp_model>(config, rank_weights(w, rank, gpus), ranks[rank]));
+        std::vector<pulsarlm::kv_layer> rank_specs = shards.back()->kv_layers();
+        REQUIRE(rank_specs.size() == specs.size());
+        lines.push_back(make_lines(rank_specs, dtype));
+        streams.push_back(c10::cuda::getStreamFromPool(false, 0));
+    }
+
+    auto [tokens, token_ids] = make_tokens();
+    dense_output dense = dense_forward(w, token_ids, experts_per_token, budget);
+
+    for (chunk c : chunks) {
+        INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
+        pulsarlm::step_batch batch = chunk_batch(tokens, c, specs);
+        single.forward(batch, single_lines);
+        std::vector<pulsarlm::step_logits> logits = sharded_forward(shards, lines, streams, batch);
+        const at::Tensor& rank_0 = chunk_logits(logits.front(), c);
+        CHECK(max_relative_error(rank_0, dense.logits.narrow(0, c.first, c.last - c.first)) < tolerance);
+        for (std::size_t rank = 1; rank < gpus; rank++) {
+            CHECK(at::equal(chunk_logits(logits[rank], c), rank_0));
+        }
+    }
+
+    for (std::size_t rank = 0; rank < gpus; rank++) {
+        std::vector<pulsarlm::kv_layer_shard> held = shards[rank]->kv_layer_shards();
+        REQUIRE(held.size() == specs.size());
+        for (std::size_t layer = 0; layer < specs.size(); layer++) {
+            INFO("rank " << rank << ", KV layer " << layer);
+            const pulsarlm::kv_layer& full = held[layer].full;
+            const pulsarlm::kv& got = lines[rank][layer];
+            const pulsarlm::kv& whole = single_lines[layer];
+            CHECK(full.n_kv_heads == specs[layer].n_kv_heads);
+            CHECK(full.n_q_heads == specs[layer].n_q_heads);
+            CHECK(full.index_head_dim == specs[layer].index_head_dim);
+            CHECK(full.state.has_value() == specs[layer].state.has_value());
+            if (full.state) {
+                CHECK(full.state->sizes == specs[layer].state->sizes);
+                at::Tensor expected = held_rows(whole.k, 1, held[layer].rows);
+                if (full.state->dtype == at::kLong) {
+                    CHECK(at::equal(got.k, expected));
+                } else {
+                    CHECK(max_relative_error(got.k, expected.to(at::kFloat)) < tolerance);
+                }
+            } else {
+                CHECK(max_relative_error(got.k, held_rows(whole.k, 2, held[layer].rows).to(at::kFloat)) < tolerance);
+                CHECK(max_relative_error(got.v, held_rows(whole.v, 2, held[layer].rows).to(at::kFloat)) < tolerance);
+                CHECK(max_relative_error(got.index_keys, whole.index_keys.to(at::kFloat)) < tolerance);
+            }
+        }
+    }
+}
+
 }  // namespace
 
 TEST_CASE("Qwen4-Exp kv_layers add a PLE layer's convolution and token lines", "[model][cuda]") {
@@ -655,4 +880,31 @@ TEST_CASE("Qwen4-Exp matches a dense forward in bf16", "[model][cuda]") {
         SKIP("no CUDA device");
     }
     check_against_dense(at::kBFloat16, 5e-2, n_experts, n_tokens * compress_ratio);
+}
+
+TEST_CASE("Qwen4-Exp split across 2 GPUs matches a dense forward in fp32", "[model][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    check_sharded(at::kFloat, 1e-4, 2, 8, 2);
+}
+
+TEST_CASE("Qwen4-Exp split across 2 GPUs matches a dense forward in bf16", "[model][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    check_sharded(at::kBFloat16, 5e-2, n_experts, n_tokens * compress_ratio, 2);
+}
+
+// The test model's 2 Gated DeltaNet key heads do not split across 4 GPUs.
+TEST_CASE("Qwen4-Exp rejects a split that is not whole heads", "[model][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    weights w(at::kFloat);
+    std::vector<pulsarlm::communicator> ranks = pulsarlm::communicator::make_on_one_device(at::Device(at::kCUDA, 0), 4);
+    REQUIRE_THROWS_AS(
+        pulsarlm::qwen4_exp_model(model_config(2, 8), w.named_tensors, ranks.front()),
+        std::invalid_argument
+    );
 }
