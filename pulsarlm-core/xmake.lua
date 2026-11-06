@@ -12,6 +12,16 @@ option("tests", {default = true, description = "Build the Catch2 test binaries."
 option("cuda_arch", {default = "native", description = "Comma-separated GPU architectures the CUDA kernels are compiled for, such as sm_89,sm_120,compute_120."})
 option("digest", {default = "sha256", values = {"sha256", "blake3"}, description = "Hash function behind page digests."})
 
+option("nccl_prefix")
+    set_default("")
+    set_description("The nvidia-nccl wheel's directory, holding include/nccl.h and lib/libnccl.so.2.")
+    after_check(function (option)
+        if option:value() == "" then
+            option:set_value(os.iorunv("python", {"-c", "import nvidia.nccl; print(nvidia.nccl.__path__[0])"}):trim())
+        end
+    end)
+option_end()
+
 if is_config("digest", "blake3") then
     add_requires("blake3 1.8.7")
 else
@@ -25,9 +35,14 @@ add_requires("cmake::Torch", {system = true, configs = {
 target("pulsarlm_core")
     set_kind("static")
     set_languages("c++23")
-    add_options("cuda_arch")
+    add_options("cuda_arch", "nccl_prefix")
     on_load(function (target)
         target:add("cugencodes", table.unpack(get_config("cuda_arch"):split(",")))
+        local nccl = get_config("nccl_prefix")
+        target:add("sysincludedirs", path.join(nccl, "include"), {public = true})
+        target:add("linkdirs", path.join(nccl, "lib"), {public = true})
+        target:add("rpathdirs", path.join(nccl, "lib"), {public = true})
+        target:add("links", ":libnccl.so.2", {public = true})
     end)
     set_values("cuda.rdc", false)
     add_cxflags("-fPIC")

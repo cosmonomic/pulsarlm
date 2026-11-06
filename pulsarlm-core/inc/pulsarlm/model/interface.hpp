@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace pulsarlm {
@@ -98,12 +99,29 @@ struct step_logits {
     std::optional<at::Tensor> decode_logits;
 };
 
+// A KV layer of the whole model and the ranges [first, last) along its line's first dimension, KV heads or a state's
+// first size, that one GPU's line holds, in order. An indexed attention layer's index keys are always whole.
+struct kv_layer_shard {
+    kv_layer full;
+    std::vector<std::pair<std::size_t, std::size_t>> rows;
+};
+
 class model {
   public:
     virtual ~model() = default;
 
-    // The layers that keep KV, in the order forward takes their lines. A layer reading another layer's KV is not one.
+    // This GPU's layers that keep KV, in the order forward takes their lines. A layer reading another layer's KV is
+    // not one.
     virtual std::vector<kv_layer> kv_layers() const = 0;
+    // Per entry of kv_layers(), the layer of the whole model and the part of its line this GPU holds.
+    virtual std::vector<kv_layer_shard> kv_layer_shards() const {
+        std::vector<kv_layer_shard> shards;
+        for (const kv_layer& layer : kv_layers()) {
+            std::size_t rows = layer.state ? static_cast<std::size_t>(layer.state->sizes.front()) : layer.n_kv_heads;
+            shards.push_back(kv_layer_shard{.full = layer, .rows = {{0, rows}}});
+        }
+        return shards;
+    }
     // lines holds one kv per entry of kv_layers().
     virtual step_logits forward(const step_batch& batch, std::span<const kv> lines) = 0;
 };

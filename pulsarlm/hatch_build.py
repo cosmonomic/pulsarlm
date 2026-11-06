@@ -4,6 +4,7 @@ import subprocess
 import sysconfig
 from pathlib import Path
 
+import nvidia.nccl
 import torch.utils
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 from hatchling.metadata.plugin.interface import MetadataHookInterface
@@ -38,6 +39,7 @@ class CustomBuildHook(BuildHookInterface):
                 "--tests=n",
                 f"--cuda_arch={os.environ.get('PULSARLM_CUDA_ARCH', 'native')}",
                 f"--torch_cmake_prefix={torch.utils.cmake_prefix_path}",
+                f"--nccl_prefix={nvidia.nccl.__path__[0]}",
                 f"--python_include={sysconfig.get_paths()['include']}",
             ],
             check=True,
