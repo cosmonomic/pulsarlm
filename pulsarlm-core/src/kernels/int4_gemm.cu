@@ -1,4 +1,4 @@
-#include "w4a16_common.cuh"
+#include "dequant_gemm_common.cuh"
 
 #include "pulsarlm/ops.hpp"
 
@@ -15,7 +15,7 @@
 #include <algorithm>
 #include <cstdint>
 
-// Fused w4a16 dequant-GEMM: y = x @ dequant(W)^T, i.e.
+// Fused int4 dequant-GEMM: y = x @ dequant(W)^T, i.e.
 //   y[m,n] = sum_k x[m,k] * w_deq[n,k]
 // for a Linear with int4 group-wise symmetric weights.
 //
@@ -151,7 +151,7 @@ __device__ __forceinline__ void bfrag(
 // ksplits partials into y. An empty split (kz*cps >= nchunks) runs no MMAs and
 // writes its zero-initialized accumulator, contributing 0 to the reduction.
 template <int BM, typename scalar_t, bool BF16, bool SPLIT>
-__global__ void __launch_bounds__(NTHREADS) gemm_w4a16_kernel(
+__global__ void __launch_bounds__(NTHREADS) gemm_int4_kernel(
     const scalar_t* __restrict__ x,
     const int32_t* __restrict__ weight_packed,
     const float* __restrict__ weight_scale,
@@ -202,7 +202,7 @@ __global__ void __launch_bounds__(NTHREADS) gemm_w4a16_kernel(
         if (s < local_nchunks) {
             const int k0 = (chunk_begin + s) * BK;
             cpasync_pack_chunk(sPack[s], weight_packed, n0, k0, N, K, pack_stride, tid);
-            w4a16::load_x_chunk<BM, BK, NTHREADS>(sX[s], x, m0, k0, M, K, tid);
+            dequant_gemm::load_x_chunk<BM, BK, NTHREADS>(sX[s], x, m0, k0, M, K, tid);
         }
         __pipeline_commit();
     }
@@ -221,7 +221,7 @@ __global__ void __launch_bounds__(NTHREADS) gemm_w4a16_kernel(
             const int fbuf = fetch % STAGES;
             const int k_f = (chunk_begin + fetch) * BK;
             cpasync_pack_chunk(sPack[fbuf], weight_packed, n0, k_f, N, K, pack_stride, tid);
-            w4a16::load_x_chunk<BM, BK, NTHREADS>(sX[fbuf], x, m0, k_f, M, K, tid);
+            dequant_gemm::load_x_chunk<BM, BK, NTHREADS>(sX[fbuf], x, m0, k_f, M, K, tid);
         }
         __pipeline_commit();
 
@@ -260,7 +260,18 @@ __global__ void __launch_bounds__(NTHREADS) gemm_w4a16_kernel(
     }
 
     const int64_t poff = static_cast<int64_t>(kz) * M * N;
-    w4a16::store_acc_tile<scalar_t, SPLIT, LSUB, MROW, NWARPS>(y, y_partial, poff, acc, m0, n0, M, N, warp, lane);
+    dequant_gemm::store_acc_tile<scalar_t, SPLIT, LSUB, MROW, NWARPS>(
+        y,
+        y_partial,
+        poff,
+        acc,
+        m0,
+        n0,
+        M,
+        N,
+        warp,
+        lane
+    );
 }
 
 template <int BM, typename scalar_t, bool BF16, bool SPLIT>
@@ -278,7 +289,7 @@ void launch(
     int group_size,
     int cps
 ) {
-    gemm_w4a16_kernel<BM, scalar_t, BF16, SPLIT>
+    gemm_int4_kernel<BM, scalar_t, BF16, SPLIT>
         <<<grid, NTHREADS, 0, stream>>>(x, wp, ws, y, yp, M, N, K, group_size, cps);
 }
 
@@ -303,7 +314,7 @@ void dispatch(
 ) {
     if (split) {
         launch<BM, scalar_t, BF16, true>(grid, stream, x, wp, ws, y, yp, M, N, K, group_size, cps);
-        w4a16::launch_combine(y, yp, M, N, ksplits, stream);
+        dequant_gemm::launch_combine(y, yp, M, N, ksplits, stream);
     } else {
         launch<BM, scalar_t, BF16, false>(grid, stream, x, wp, ws, y, nullptr, M, N, K, group_size, cps);
     }
@@ -314,7 +325,7 @@ void dispatch(
 // direct (non-split) kernel when it comes out 1. forced_splits >= 1 => always
 // route through the split+combine path with exactly that many splits (allowed to
 // exceed nchunks; the extra splits are empty and contribute 0).
-at::Tensor gemm_w4a16_run(
+at::Tensor gemm_int4_run(
     const at::Tensor& x,
     const at::Tensor& weight_packed,
     const at::Tensor& weight_scale,
@@ -323,28 +334,28 @@ at::Tensor gemm_w4a16_run(
 ) {
     TORCH_CHECK(
         x.is_cuda() && weight_packed.is_cuda() && weight_scale.is_cuda(),
-        "gemm_w4a16: all inputs must be CUDA tensors"
+        "gemm_int4: all inputs must be CUDA tensors"
     );
-    TORCH_CHECK(x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16, "gemm_w4a16: x must be fp16 or bf16");
-    TORCH_CHECK(weight_packed.scalar_type() == at::kInt, "gemm_w4a16: weight_packed must be int32");
-    TORCH_CHECK(x.dim() == 2, "gemm_w4a16: x must be 2-D [M, K]");
-    TORCH_CHECK(weight_packed.dim() == 2, "gemm_w4a16: weight_packed must be 2-D [N, K/8]");
-    TORCH_CHECK(weight_scale.dim() == 2, "gemm_w4a16: weight_scale must be 2-D [N, K/group_size]");
-    TORCH_CHECK(x.is_contiguous(), "gemm_w4a16: x must be contiguous");
+    TORCH_CHECK(x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16, "gemm_int4: x must be fp16 or bf16");
+    TORCH_CHECK(weight_packed.scalar_type() == at::kInt, "gemm_int4: weight_packed must be int32");
+    TORCH_CHECK(x.dim() == 2, "gemm_int4: x must be 2-D [M, K]");
+    TORCH_CHECK(weight_packed.dim() == 2, "gemm_int4: weight_packed must be 2-D [N, K/8]");
+    TORCH_CHECK(weight_scale.dim() == 2, "gemm_int4: weight_scale must be 2-D [N, K/group_size]");
+    TORCH_CHECK(x.is_contiguous(), "gemm_int4: x must be contiguous");
 
     const int64_t M = x.size(0);
     const int64_t K = x.size(1);
     const int64_t N = weight_packed.size(0);
 
-    TORCH_CHECK(group_size > 0 && group_size % 16 == 0, "gemm_w4a16: group_size must be a positive multiple of 16");
+    TORCH_CHECK(group_size > 0 && group_size % 16 == 0, "gemm_int4: group_size must be a positive multiple of 16");
     TORCH_CHECK(
         K % 8 == 0 && weight_packed.size(1) == K / 8,
-        "gemm_w4a16: weight_packed must be [N, K/8] with K a multiple of 8"
+        "gemm_int4: weight_packed must be [N, K/8] with K a multiple of 8"
     );
-    TORCH_CHECK(K % group_size == 0, "gemm_w4a16: K must be a multiple of group_size");
+    TORCH_CHECK(K % group_size == 0, "gemm_int4: K must be a multiple of group_size");
     TORCH_CHECK(
         weight_scale.size(0) == N && weight_scale.size(1) == K / group_size,
-        "gemm_w4a16: weight_scale must be [N, K/group_size]"
+        "gemm_int4: weight_scale must be [N, K/group_size]"
     );
 
     auto xc = x.contiguous();
@@ -371,7 +382,7 @@ at::Tensor gemm_w4a16_run(
         ksplits = forced_splits;
         split = true;
     } else {
-        ksplits = w4a16::split_k_count(static_cast<int64_t>(gx) * gy, nchunks);
+        ksplits = dequant_gemm::split_k_count(static_cast<int64_t>(gx) * gy, nchunks);
         split = ksplits > 1;
     }
     // chunks_per_split partitions the nchunks K-chunks into contiguous runs.
@@ -468,24 +479,24 @@ at::Tensor gemm_w4a16_run(
 
 }  // namespace
 
-at::Tensor gemm_w4a16_cuda(
+at::Tensor gemm_int4_cuda(
     const at::Tensor& x,
     const at::Tensor& weight_packed,
     const at::Tensor& weight_scale,
     int64_t group_size
 ) {
-    return gemm_w4a16_run(x, weight_packed, weight_scale, group_size, 0);
+    return gemm_int4_run(x, weight_packed, weight_scale, group_size, 0);
 }
 
-at::Tensor gemm_w4a16_split_cuda(
+at::Tensor gemm_int4_split_cuda(
     const at::Tensor& x,
     const at::Tensor& weight_packed,
     const at::Tensor& weight_scale,
     int64_t group_size,
     int64_t num_splits
 ) {
-    TORCH_CHECK(num_splits >= 1, "gemm_w4a16_split: num_splits must be >= 1");
-    return gemm_w4a16_run(x, weight_packed, weight_scale, group_size, static_cast<int>(num_splits));
+    TORCH_CHECK(num_splits >= 1, "gemm_int4_split: num_splits must be >= 1");
+    return gemm_int4_run(x, weight_packed, weight_scale, group_size, static_cast<int>(num_splits));
 }
 
 }  // namespace pulsarlm

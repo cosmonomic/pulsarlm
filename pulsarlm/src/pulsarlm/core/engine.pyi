@@ -233,6 +233,7 @@ class Gemma4Config:
 
 class Qwen3_5Config:
     layer_types: list[str]
+    fp8_weight_block: tuple[int, int] | None
     def __init__(
         self,
         *,
@@ -250,6 +251,7 @@ class Qwen3_5Config:
         linear_value_head_dim: int,
         linear_conv_kernel: int,
         rms_norm_eps: float,
+        fp8_weight_block: tuple[int, int] | None = None,
     ) -> None: ...
 
 class Qwen3_5MoeConfig:

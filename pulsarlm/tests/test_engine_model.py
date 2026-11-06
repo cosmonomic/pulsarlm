@@ -1,3 +1,5 @@
+import dataclasses
+
 import pytest
 
 from pulsarlm.checkpoint import PulsarLMModelConfig, PulsarLMModelLoadingError
@@ -90,6 +92,40 @@ def test_a_qwen3_5_moe_checkpoint_maps_its_experts_per_token():
 
     assert isinstance(model, Qwen3_5MoeConfig)
     assert model.num_experts_per_tok == 8
+
+
+FP8 = {
+    "quant_method": "fp8",
+    "fmt": "e4m3",
+    "activation_scheme": "dynamic",
+    "weight_block_size": [128, 128],
+}
+
+
+def test_a_qwen3_5_fp8_checkpoint_maps_its_weight_block():
+    model = engine_model(dataclasses.replace(qwen3_5(), quantization=FP8))
+
+    assert isinstance(model, Qwen3_5Config)
+    assert model.fp8_weight_block == (128, 128)
+
+
+def test_an_unquantized_qwen3_5_checkpoint_has_no_weight_block():
+    model = engine_model(qwen3_5())
+
+    assert isinstance(model, Qwen3_5Config)
+    assert model.fp8_weight_block is None
+
+
+def test_a_qwen3_5_checkpoint_of_another_quantization_is_rejected():
+    awq = {"quant_method": "awq", "bits": 4, "group_size": 128}
+    with pytest.raises(PulsarLMModelLoadingError, match="unsupported quantization awq"):
+        engine_model(dataclasses.replace(qwen3_5(), quantization=awq))
+
+
+def test_a_quantized_qwen3_5_moe_checkpoint_is_rejected():
+    moe = qwen3_5(num_experts=256, num_experts_per_tok=8, moe_intermediate_size=512)
+    with pytest.raises(PulsarLMModelLoadingError, match="quantized qwen3_5_moe"):
+        engine_model(dataclasses.replace(moe, quantization=FP8))
 
 
 def test_a_qwen3_5_checkpoint_without_an_output_gate_is_rejected():

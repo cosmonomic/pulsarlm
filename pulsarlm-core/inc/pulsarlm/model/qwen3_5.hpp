@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pulsarlm/model/interface.hpp"
+#include "pulsarlm/model/linear.hpp"
 #include "pulsarlm/rope.hpp"
 
 #include <ATen/core/Dict.h>
@@ -37,6 +38,8 @@ struct qwen3_5_config {
     std::int64_t linear_value_head_dim;
     std::int64_t linear_conv_kernel;
     double rms_norm_eps;
+    // Set for an fp8 checkpoint, whose quantized linears carry a weight_scale_inv beside their weight.
+    std::optional<fp8_block> fp8_weight_block;
 };
 
 // A Gated DeltaNet layer keeps two recurrent KV layers: its delta rule state S, fp32 [value heads, key head dim, value
@@ -46,32 +49,32 @@ class Qwen3_5Model : public Model {
     // Query and key heads are stored with their dims permuted so that the paged attention ops' partial RoPE, which
     // rotates pairs (j, j + head_dim / 2), rotates Hugging Face's pairs (j, j + rotary_dim / 2).
     struct AttentionWeights {
-        at::Tensor q_proj;  // [n_heads * 2 * head_dim, hidden], each head's query then gate
-        at::Tensor k_proj;
-        at::Tensor v_proj;
-        at::Tensor o_proj;
+        Linear q_proj;  // [n_heads * 2 * head_dim, hidden], each head's query then gate
+        Linear k_proj;
+        Linear v_proj;
+        Linear o_proj;
         at::Tensor q_norm;  // fp32 1 + weight
         at::Tensor k_norm;
     };
 
     struct DeltaNetWeights {
-        at::Tensor in_proj_qkv;
-        at::Tensor in_proj_z;
-        at::Tensor in_proj_b;
-        at::Tensor in_proj_a;
+        Linear in_proj_qkv;
+        Linear in_proj_z;
+        Linear in_proj_b;
+        Linear in_proj_a;
         at::Tensor conv;  // [conv channels, 1, linear_conv_kernel]
         at::Tensor dt_bias;  // fp32
         at::Tensor neg_a;  // fp32 -exp(A_log)
         at::Tensor norm;
-        at::Tensor out_proj;
+        Linear out_proj;
     };
 
     struct LayerWeights {
         at::Tensor input_layernorm;  // fp32 1 + weight
         at::Tensor post_attention_layernorm;
-        at::Tensor gate_proj;
-        at::Tensor up_proj;
-        at::Tensor down_proj;
+        Linear gate_proj;
+        Linear up_proj;
+        Linear down_proj;
         std::optional<AttentionWeights> attention;
         std::optional<DeltaNetWeights> deltanet;
     };
@@ -93,7 +96,8 @@ class Qwen3_5Model : public Model {
     at::Tensor group_forward(const GroupBatch& g, std::span<const kv> lines) const;
 
   public:
-    // weights are on the lines' device, in the attention lines' dtype.
+    // weights are on the lines' device, in the attention lines' dtype, except that fp8 linears and their scales may
+    // be on the host.
     Qwen3_5Model(qwen3_5_config config, const c10::Dict<std::string, at::Tensor>& weights);
 
     std::vector<kv_layer> kv_layers() const override;

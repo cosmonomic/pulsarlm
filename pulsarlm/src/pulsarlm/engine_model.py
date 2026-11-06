@@ -2,8 +2,6 @@
 
 from pulsarlm.checkpoint import (
     GEMMA4,
-    QWEN3_5,
-    QWEN3_5_TEXT,
     QWEN4_EXP,
     PulsarLMModelConfig,
     PulsarLMModelLoadingError,
@@ -20,6 +18,7 @@ from pulsarlm.core.engine import (
 
 SLIDING = "sliding_attention"
 QWEN3_5_MOE = ("qwen3_5_moe", "qwen3_5_moe_text")
+QWEN3_5_DENSE = ("qwen3_5", "qwen3_5_text")
 FULL = "full_attention"
 INDEXED = "indexed_attention"
 
@@ -132,8 +131,26 @@ def qwen3_5_fields(text: dict) -> dict:
     )
 
 
-def qwen3_5_config(text: dict) -> Qwen3_5Config:
-    return Qwen3_5Config(**qwen3_5_fields(text))
+def fp8_weight_block(quantization: dict) -> tuple[int, int]:
+    """The [rows, columns] each scale of a block-quantized fp8 checkpoint
+    covers."""
+    method = quantization.get("quant_method")
+    fmt = quantization.get("fmt", "e4m3")
+    block = quantization.get("weight_block_size")
+    if method != "fp8" or fmt != "e4m3" or block is None or len(block) != 2:
+        raise PulsarLMModelLoadingError(
+            f"unsupported quantization {method} {fmt} with blocks {block}"
+        )
+    return block[0], block[1]
+
+
+def qwen3_5_config(text: dict, quantization: dict | None) -> Qwen3_5Config:
+    return Qwen3_5Config(
+        **qwen3_5_fields(text),
+        fp8_weight_block=None
+        if quantization is None
+        else fp8_weight_block(quantization),
+    )
 
 
 def qwen3_5_moe_config(text: dict) -> Qwen3_5MoeConfig:
@@ -236,12 +253,16 @@ def dense_config(architecture: str, text: dict) -> ModelConfig:
 def engine_model(
     cfg: PulsarLMModelConfig,
 ) -> ModelConfig | Gemma4Config | Qwen3_5Config | Qwen3_5MoeConfig | Qwen4ExpConfig:
+    if cfg.quantization is not None and cfg.architecture not in QWEN3_5_DENSE:
+        raise PulsarLMModelLoadingError(
+            f"quantized {cfg.architecture} checkpoints are not supported"
+        )
     if cfg.architecture in GEMMA4:
         return gemma4_config(cfg.architecture, cfg.text)
     if cfg.architecture in QWEN3_5_MOE:
         return qwen3_5_moe_config(cfg.text)
-    if cfg.architecture in QWEN3_5 + QWEN3_5_TEXT:
-        return qwen3_5_config(cfg.text)
+    if cfg.architecture in QWEN3_5_DENSE:
+        return qwen3_5_config(cfg.text, cfg.quantization)
     if cfg.architecture in QWEN4_EXP:
         return qwen4_exp_config(cfg.text)
     return dense_config(cfg.architecture, cfg.text)

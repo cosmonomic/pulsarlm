@@ -470,7 +470,8 @@ PYBIND11_MODULE(pulsarlm_core, m) {
                         std::int64_t linear_key_head_dim,
                         std::int64_t linear_value_head_dim,
                         std::int64_t linear_conv_kernel,
-                        double rms_norm_eps) {
+                        double rms_norm_eps,
+                        std::optional<std::pair<std::int64_t, std::int64_t>> fp8_weight_block) {
                 std::vector<qwen3_5_layer_type> types;
                 for (const std::string& name : layer_types) {
                     types.push_back(qwen3_5_layer(name));
@@ -490,6 +491,11 @@ PYBIND11_MODULE(pulsarlm_core, m) {
                     .linear_value_head_dim = linear_value_head_dim,
                     .linear_conv_kernel = linear_conv_kernel,
                     .rms_norm_eps = rms_norm_eps,
+                    .fp8_weight_block = fp8_weight_block.transform(
+                        [](const std::pair<std::int64_t, std::int64_t>& block) {
+                            return fp8_block{.n = block.first, .k = block.second};
+                        }
+                    ),
                 };
             }),
             py::kw_only(),
@@ -506,7 +512,14 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "linear_key_head_dim"_a,
             "linear_value_head_dim"_a,
             "linear_conv_kernel"_a,
-            "rms_norm_eps"_a
+            "rms_norm_eps"_a,
+            "fp8_weight_block"_a = py::none()
+        )
+        .def_property_readonly(
+            "fp8_weight_block",
+            [](const qwen3_5_config& c) {
+                return c.fp8_weight_block.transform([](const fp8_block& block) { return std::pair{block.n, block.k}; });
+            }
         )
         .def_property_readonly("layer_types", [](const qwen3_5_config& c) {
             std::vector<std::string> names;

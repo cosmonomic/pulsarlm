@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -284,12 +285,55 @@ pulsarlm::GroupBatch step(
     return g;
 }
 
+struct fp8_linear {
+    at::Tensor weight;
+    at::Tensor scale;
+};
+
+// One scale per block, its largest magnitude mapped to e4m3's largest finite value 448.
+fp8_linear quantized(const at::Tensor& weight, pulsarlm::fp8_block block) {
+    const std::int64_t n = weight.size(0), k = weight.size(1);
+    const std::int64_t rows = (n + block.n - 1) / block.n;
+    at::Tensor padded = at::zeros({rows * block.n, k}, cuda(at::kFloat));
+    padded.narrow(0, 0, n).copy_(weight);
+    const at::Tensor scale = padded.view({rows, block.n, k / block.k, block.k}).abs().amax({1, 3}).clamp_min(1e-12) /
+        448.0;
+    const at::Tensor expanded = scale.repeat_interleave(block.n, 0).narrow(0, 0, n).repeat_interleave(block.k, 1);
+    return {.weight = (weight.to(at::kFloat) / expanded).to(at::kFloat8_e4m3fn), .scale = scale};
+}
+
+// in_proj_a and in_proj_b stay dense, as in Qwen's fp8 checkpoints.
+bool quantized_name(const std::string& name) {
+    return name.ends_with("proj.weight") && !name.ends_with("in_proj_a.weight") && !name.ends_with("in_proj_b.weight");
+}
+
+// The model's weights: w's, with the linears quantized to fp8 and w's own replaced by their dequantized values, which
+// the dense forward then reads.
+c10::Dict<std::string, at::Tensor> fp8_model_weights(weights& w, pulsarlm::fp8_block block, at::ScalarType dtype) {
+    c10::Dict<std::string, at::Tensor> model = w.named_tensors.copy();
+    for (const auto& entry : w.named_tensors.copy()) {
+        if (!quantized_name(entry.key())) {
+            continue;
+        }
+        const fp8_linear q = quantized(entry.value(), block);
+        const at::Tensor expanded = q.scale.repeat_interleave(block.n, 0)
+                                        .narrow(0, 0, q.weight.size(0))
+                                        .repeat_interleave(block.k, 1);
+        w.named_tensors.insert_or_assign(entry.key(), (q.weight.to(at::kFloat) * expanded).to(dtype));
+        model.insert_or_assign(entry.key(), q.weight);
+        model.insert(entry.key() + "_scale_inv", q.scale);
+    }
+    return model;
+}
+
 double max_relative_error(const at::Tensor& got, const at::Tensor& expected) {
     return ((got.to(at::kFloat) - expected).abs().max() / expected.abs().max()).item<double>();
 }
 
-void check_against_dense(at::ScalarType dtype, double tolerance) {
+void check_against_dense(at::ScalarType dtype, double tolerance, std::optional<pulsarlm::fp8_block> block = {}) {
     weights w(dtype);
+    const c10::Dict<std::string, at::Tensor> model_weights = block ? fp8_model_weights(w, *block, dtype)
+                                                                   : w.named_tensors;
     pulsarlm::Qwen3_5Model model(
         pulsarlm::qwen3_5_config{
             .vocab_size = vocab,
@@ -306,8 +350,9 @@ void check_against_dense(at::ScalarType dtype, double tolerance) {
             .linear_value_head_dim = value_head_dim,
             .linear_conv_kernel = conv_kernel,
             .rms_norm_eps = rms_eps,
+            .fp8_weight_block = block,
         },
-        w.named_tensors
+        model_weights
     );
     std::vector<pulsarlm::kv_layer> specs = model.kv_layers();
     REQUIRE(specs.size() == 7);
@@ -343,7 +388,9 @@ void check_against_dense(at::ScalarType dtype, double tolerance) {
         (c.prefill ? batch.prefill_group : batch.decode_group) = step(tokens, c.first, c.last, c.prefill, specs);
         pulsarlm::StepLogits logits = model.forward(batch, kv);
         auto expected_logits = dense.logits.narrow(0, c.first, c.last - c.first);
-        CHECK(max_relative_error(*(c.prefill ? logits.prefill_logits : logits.decode_logits), expected_logits) < tolerance);
+        CHECK(
+            max_relative_error(*(c.prefill ? logits.prefill_logits : logits.decode_logits), expected_logits) < tolerance
+        );
     }
 
     auto permutation = at::tensor(rope_permutation()).to(at::kCUDA);
@@ -383,4 +430,11 @@ TEST_CASE("Qwen3.5 matches a dense forward in bf16", "[model][cuda]") {
         SKIP("no CUDA device");
     }
     check_against_dense(at::kBFloat16, 5e-2);
+}
+
+TEST_CASE("Qwen3.5 with fp8 linears matches a dense forward of their dequantized weights", "[model][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    check_against_dense(at::kBFloat16, 5e-2, pulsarlm::fp8_block{.n = 32, .k = 32});
 }

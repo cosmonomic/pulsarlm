@@ -30,6 +30,8 @@ QWEN4_EXP = ("qwen4_exp",)
 # Multimodal checkpoints whose text model's config is their text_config.
 MULTIMODAL = GEMMA4 + QWEN3_5 + QWEN4_EXP
 ARCHITECTURES = DENSE + MULTIMODAL + QWEN3_5_TEXT
+# Weights the text model doesn't read yet: Qwen3.5's vision tower and multi-token prediction layer.
+UNUSED_PREFIXES = dict.fromkeys(QWEN3_5 + QWEN3_5_TEXT, ("model.visual.", "mtp."))
 
 
 @dataclass
@@ -37,6 +39,7 @@ class PulsarLMModelConfig:
     architecture: str
     text: dict
     eos_ids: list[int]
+    quantization: dict | None
 
     @classmethod
     def from_dict(cls, raw: dict) -> Self:
@@ -48,6 +51,7 @@ class PulsarLMModelConfig:
             architecture=architecture,
             text=raw["text_config"] if architecture in MULTIMODAL else raw,
             eos_ids=eos if isinstance(eos, list) else [eos],
+            quantization=raw.get("quantization_config"),
         )
 
     @property
@@ -158,11 +162,19 @@ def cache_shard(shard_path: zipfile.Path, cache_dir: Path) -> Path:
     return cached_path
 
 
+def quantized(name: str, tensor: Tensor) -> bool:
+    """An fp8 checkpoint's quantized weight or its scales. They keep their
+    stored dtype and stay on the host: the model repacks each onto the device,
+    so a device copy here would double them there."""
+    return tensor.dtype == torch.float8_e4m3fn or name.endswith(".weight_scale_inv")
+
+
 def load_weights(
     archive: zipfile.ZipFile,
     *,
     device: torch.device,
     dtype: torch.dtype | None = None,
+    unused_prefixes: tuple[str, ...] = (),
 ) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
 
@@ -172,11 +184,16 @@ def load_weights(
     for shard_path in zipfile.Path(archive, at="weights/").glob("*.safetensors"):
         cached_shard_path = cache_shard(shard_path, cache_dir)
 
-        with safetensors.safe_open(
-            cached_shard_path, framework="pt", device=str(device)
-        ) as f:
+        with safetensors.safe_open(cached_shard_path, framework="pt") as f:
             for name in f.keys():
-                out[name] = f.get_tensor(name).to(dtype=dtype, non_blocking=True)
+                if name.startswith(unused_prefixes):
+                    continue
+                tensor = f.get_tensor(name)
+                out[name] = (
+                    tensor
+                    if quantized(name, tensor)
+                    else tensor.to(device=device, dtype=dtype, non_blocking=True)
+                )
 
     return out
 
@@ -209,7 +226,13 @@ def load(
         tokenizer = load_tokenizer(archive_path)
         chat_template = load_chat_template(archive_path)
         weights = text_model_weights(
-            config.architecture, load_weights(archive, device=device, dtype=dtype)
+            config.architecture,
+            load_weights(
+                archive,
+                device=device,
+                dtype=dtype,
+                unused_prefixes=UNUSED_PREFIXES.get(config.architecture, ()),
+            ),
         )
 
     return PulsarLMModel(
