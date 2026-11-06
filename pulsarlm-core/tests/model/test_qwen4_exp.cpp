@@ -9,6 +9,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -38,12 +39,9 @@ constexpr std::int64_t head_dim = 64;
 constexpr double rope_theta = 1e6;
 constexpr double partial_rotary_factor = 0.25;
 constexpr std::int64_t rotary_dim = 16;
-constexpr std::int64_t key_heads = 2;
-constexpr std::int64_t value_heads = 4;
 constexpr std::int64_t key_head_dim = 32;
 constexpr std::int64_t value_head_dim = 32;
 constexpr std::int64_t conv_kernel = 4;
-constexpr std::int64_t channels = 2 * key_heads * key_head_dim + value_heads * value_head_dim;
 constexpr std::int64_t n_experts = 8;
 constexpr std::int64_t moe_intermediate = 32;
 constexpr std::int64_t shared_intermediate = 48;
@@ -56,7 +54,6 @@ constexpr std::int64_t ple_history = (ple_conv_kernel - 1) * ngram_size;
 constexpr std::int64_t eos = 7;
 const std::vector<std::int64_t> head_vocab_sizes{101, 103, 107, 109};
 const std::vector<std::int64_t> layer_multipliers{1000003, 999983, 12345679};
-constexpr std::int64_t ngram_rows = 430;
 constexpr std::int64_t ngram_dim = 16;
 constexpr std::int64_t ngram_shards = 2;
 constexpr std::int64_t indexer_heads = 4;
@@ -76,6 +73,30 @@ constexpr std::int32_t boundary_line = 4;
 constexpr std::int64_t n_lines = 6;
 constexpr std::int64_t n_tokens = 49;
 const std::vector<std::int64_t> eos_positions{5, 20, 21, 40};
+
+// The sizes a split across GPUs divides.
+struct split_dims {
+    std::int64_t key_heads;
+    std::int64_t value_heads;
+    std::int64_t ngram_rows;
+
+    constexpr std::int64_t key_channels() const {
+        return key_heads * key_head_dim;
+    }
+
+    constexpr std::int64_t value_channels() const {
+        return value_heads * value_head_dim;
+    }
+
+    constexpr std::int64_t channels() const {
+        return 2 * key_channels() + value_channels();
+    }
+};
+
+// Splits 2 ways.
+constexpr split_dims base_dims{.key_heads = 2, .value_heads = 4, .ngram_rows = 430};
+// Splits 4 ways, which puts each of the n_kv_heads KV heads on 2 GPUs.
+constexpr split_dims four_way_dims{.key_heads = 4, .value_heads = 8, .ngram_rows = 432};
 
 at::TensorOptions cuda(at::ScalarType dtype) {
     return at::device(at::kCUDA).dtype(dtype);
@@ -98,10 +119,12 @@ std::vector<std::int64_t> head_offsets() {
 }
 
 struct weights {
+    split_dims dims;
     c10::Dict<std::string, at::Tensor> named_tensors;
     at::Tensor ngram_embedding;
 
-    explicit weights(at::ScalarType dtype) {
+    weights(at::ScalarType dtype, split_dims dims)
+    : dims(dims) {
         at::manual_seed(13);
         auto add = [&](const std::string& name, at::Tensor t) { named_tensors.insert(name, t.to(cuda(dtype))); };
         auto projection = [](std::int64_t out, std::int64_t in) { return at::randn({out, in}) / std::sqrt(in); };
@@ -143,15 +166,15 @@ struct weights {
                 add(l + "self_attn.q_norm.weight", norm(head_dim));
                 add(l + "self_attn.k_norm.weight", norm(head_dim));
             } else {
-                add(l + "linear_attn.in_proj_qkv.weight", projection(channels, hidden));
-                add(l + "linear_attn.in_proj_z.weight", projection(value_heads * value_head_dim, hidden));
-                add(l + "linear_attn.in_proj_b.weight", projection(value_heads, hidden));
-                add(l + "linear_attn.in_proj_a.weight", projection(value_heads, hidden));
-                add(l + "linear_attn.conv1d.weight", at::randn({channels, 1, conv_kernel}) / 2.0);
-                add(l + "linear_attn.dt_bias", at::randn({value_heads}));
-                add(l + "linear_attn.A_log", at::log(at::rand({value_heads}) * 15.0 + 0.5));
+                add(l + "linear_attn.in_proj_qkv.weight", projection(dims.channels(), hidden));
+                add(l + "linear_attn.in_proj_z.weight", projection(dims.value_channels(), hidden));
+                add(l + "linear_attn.in_proj_b.weight", projection(dims.value_heads, hidden));
+                add(l + "linear_attn.in_proj_a.weight", projection(dims.value_heads, hidden));
+                add(l + "linear_attn.conv1d.weight", at::randn({dims.channels(), 1, conv_kernel}) / 2.0);
+                add(l + "linear_attn.dt_bias", at::randn({dims.value_heads}));
+                add(l + "linear_attn.A_log", at::log(at::rand({dims.value_heads}) * 15.0 + 0.5));
                 add(l + "linear_attn.norm.weight", 1.0 + 0.1 * at::randn({value_head_dim}));
-                add(l + "linear_attn.out_proj.weight", projection(hidden, value_heads * value_head_dim));
+                add(l + "linear_attn.out_proj.weight", projection(hidden, dims.value_channels()));
             }
             if (static_cast<std::int64_t>(layer) == ple_layer) {
                 const std::int64_t embedding_dim = ngram_dim * static_cast<std::int64_t>(head_vocab_sizes.size());
@@ -165,7 +188,7 @@ struct weights {
                 named_tensors.insert(e + "layer_multipliers", at::tensor(layer_multipliers).to(at::kCUDA));
                 named_tensors.insert(e + "ngram_heads_vocab_sizes", at::tensor(head_vocab_sizes).to(at::kCUDA));
                 named_tensors.insert(e + "ngram_heads_offsets", at::tensor(head_offsets()).to(at::kCUDA));
-                ngram_embedding = at::randn({ngram_rows, ngram_dim}).to(cuda(dtype));
+                ngram_embedding = at::randn({dims.ngram_rows, ngram_dim}).to(cuda(dtype));
                 std::vector<at::Tensor> shards = ngram_embedding.chunk(ngram_shards);
                 for (std::size_t shard = 0; shard < shards.size(); shard++) {
                     named_tensors.insert(
@@ -246,6 +269,9 @@ at::Tensor inject(const at::Tensor& x, const at::Tensor& out, const mixed_input&
 
 at::Tensor deltanet(const weights& w, std::size_t layer, const at::Tensor& h, dense_output& out) {
     const std::int64_t n = h.size(0);
+    const std::int64_t key_heads = w.dims.key_heads;
+    const std::int64_t value_heads = w.dims.value_heads;
+    const std::int64_t channels = w.dims.channels();
     auto mixed = at::linear(h, w.layer(layer, "linear_attn.in_proj_qkv.weight"));
     out.conv_inputs[layer] = mixed;
     auto padded = at::cat({at::zeros({channels, conv_kernel - 1}, cuda(at::kFloat)), mixed.t()}, 1);
@@ -477,7 +503,7 @@ dense_forward(const weights& w, const std::vector<std::int64_t>& tokens, std::in
     return out;
 }
 
-pulsarlm::qwen4_exp_config model_config(std::int64_t experts_per_token, std::int64_t budget) {
+pulsarlm::qwen4_exp_config model_config(const split_dims& dims, std::int64_t experts_per_token, std::int64_t budget) {
     return {
         .vocab_size = vocab,
         .hidden_size = hidden,
@@ -487,8 +513,8 @@ pulsarlm::qwen4_exp_config model_config(std::int64_t experts_per_token, std::int
         .head_dim = head_dim,
         .rope_theta = rope_theta,
         .partial_rotary_factor = partial_rotary_factor,
-        .linear_n_key_heads = key_heads,
-        .linear_n_value_heads = value_heads,
+        .linear_n_key_heads = dims.key_heads,
+        .linear_n_value_heads = dims.value_heads,
         .linear_key_head_dim = key_head_dim,
         .linear_value_head_dim = value_head_dim,
         .linear_conv_kernel = conv_kernel,
@@ -622,9 +648,10 @@ at::Tensor part(
 constexpr std::int64_t padded_vocab = (vocab + 63) / 64 * 64;
 
 // Of a whole-model weight, the part GPU rank of gpus holds, as vLLM v0.31.0 splits Qwen4-Exp.
-at::Tensor rank_part(const std::string& name, const at::Tensor& t, std::size_t rank, std::size_t gpus) {
-    constexpr std::int64_t key_dim = key_heads * key_head_dim;
-    constexpr std::int64_t value_dim = value_heads * value_head_dim;
+at::Tensor
+rank_part(const split_dims& dims, const std::string& name, const at::Tensor& t, std::size_t rank, std::size_t gpus) {
+    const std::int64_t key_dim = dims.key_channels();
+    const std::int64_t value_dim = dims.value_channels();
     auto ends = [&](const char* suffix) { return name.ends_with(suffix); };
     if (ends("embed_tokens.weight") || ends("lm_head.weight")) {
         at::Tensor padded = at::cat({t, at::zeros({padded_vocab - vocab, t.size(1)}, t.options())});
@@ -674,14 +701,14 @@ c10::Dict<std::string, at::Tensor> rank_weights(const weights& w, std::size_t ra
     c10::Dict<std::string, at::Tensor> parts;
     for (const auto& entry : w.named_tensors) {
         if (entry.key().find("ngram_embedding.shard_") == std::string::npos) {
-            parts.insert(entry.key(), rank_part(entry.key(), entry.value(), rank, gpus).contiguous());
+            parts.insert(entry.key(), rank_part(w.dims, entry.key(), entry.value(), rank, gpus).contiguous());
         }
     }
     const std::string table = std::format(
         "model.language_model.layers.{}.ple.ple_embedding.ngram_embedding.",
         ple_layer
     );
-    std::vector<at::Tensor> shards = part(w.ngram_embedding, 0, 0, ngram_rows, rank, gpus).chunk(ngram_shards);
+    std::vector<at::Tensor> shards = part(w.ngram_embedding, 0, 0, w.dims.ngram_rows, rank, gpus).chunk(ngram_shards);
     for (std::size_t shard = 0; shard < shards.size(); shard++) {
         parts.insert(std::format("{}shard_{}.weight", table, shard), shards[shard].contiguous());
     }
@@ -699,8 +726,8 @@ held_rows(const at::Tensor& full, std::int64_t dim, const std::vector<std::pair<
 }
 
 void check_against_dense(at::ScalarType dtype, double tolerance, std::int64_t experts_per_token, std::int64_t budget) {
-    weights w(dtype);
-    pulsarlm::qwen4_exp_model model(model_config(experts_per_token, budget), w.named_tensors);
+    weights w(dtype, base_dims);
+    pulsarlm::qwen4_exp_model model(model_config(w.dims, experts_per_token, budget), w.named_tensors);
     std::vector<pulsarlm::kv_layer> specs = model.kv_layers();
     REQUIRE(specs.size() == 9);
     std::vector<pulsarlm::kv> kv = make_lines(specs, dtype);
@@ -777,14 +804,15 @@ std::vector<pulsarlm::step_logits> sharded_forward(
 }
 
 void check_sharded(
+    const split_dims& dims,
     at::ScalarType dtype,
     double tolerance,
     std::int64_t experts_per_token,
     std::int64_t budget,
     std::size_t gpus
 ) {
-    weights w(dtype);
-    pulsarlm::qwen4_exp_config config = model_config(experts_per_token, budget);
+    weights w(dtype, dims);
+    pulsarlm::qwen4_exp_config config = model_config(w.dims, experts_per_token, budget);
     pulsarlm::qwen4_exp_model single(config, w.named_tensors);
     std::vector<pulsarlm::kv_layer> specs = single.kv_layers();
     std::vector<pulsarlm::kv> single_lines = make_lines(specs, dtype);
@@ -840,6 +868,13 @@ void check_sharded(
                     CHECK(max_relative_error(got.k, expected.to(at::kFloat)) < tolerance);
                 }
             } else {
+                const auto kv_heads = static_cast<std::size_t>(n_kv_heads);
+                const std::size_t rank_kv_heads = std::max<std::size_t>(1, kv_heads / gpus);
+                const std::size_t first_kv_head = gpus <= kv_heads ? rank * rank_kv_heads : rank / (gpus / kv_heads);
+                CHECK(
+                    held[layer].rows ==
+                    std::vector<std::pair<std::size_t, std::size_t>>{{first_kv_head, first_kv_head + rank_kv_heads}}
+                );
                 CHECK(max_relative_error(got.k, held_rows(whole.k, 2, held[layer].rows).to(at::kFloat)) < tolerance);
                 CHECK(max_relative_error(got.v, held_rows(whole.v, 2, held[layer].rows).to(at::kFloat)) < tolerance);
                 CHECK(max_relative_error(got.index_keys, whole.index_keys.to(at::kFloat)) < tolerance);
@@ -854,8 +889,8 @@ TEST_CASE("Qwen4-Exp kv_layers add a PLE layer's convolution and token lines", "
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
-    weights w(at::kFloat);
-    pulsarlm::qwen4_exp_model model(model_config(2, 8), w.named_tensors);
+    weights w(at::kFloat, base_dims);
+    pulsarlm::qwen4_exp_model model(model_config(w.dims, 2, 8), w.named_tensors);
     std::vector<pulsarlm::kv_layer> specs = model.kv_layers();
     REQUIRE(specs.size() == 9);
     CHECK(specs[4].state->sizes == std::vector<std::int64_t>{hc * hidden, ple_history});
@@ -886,14 +921,14 @@ TEST_CASE("Qwen4-Exp split across 2 GPUs matches a dense forward in fp32", "[mod
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
-    check_sharded(at::kFloat, 1e-4, 2, 8, 2);
+    check_sharded(base_dims, at::kFloat, 1e-4, 2, 8, 2);
 }
 
 TEST_CASE("Qwen4-Exp split across 2 GPUs matches a dense forward in bf16", "[model][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
-    check_sharded(at::kBFloat16, 5e-2, n_experts, n_tokens * compress_ratio, 2);
+    check_sharded(base_dims, at::kBFloat16, 5e-2, n_experts, n_tokens * compress_ratio, 2);
 }
 
 // The test model's 2 Gated DeltaNet key heads do not split across 4 GPUs.
@@ -901,10 +936,18 @@ TEST_CASE("Qwen4-Exp rejects a split that is not whole heads", "[model][cuda]") 
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
-    weights w(at::kFloat);
+    weights w(at::kFloat, base_dims);
     std::vector<pulsarlm::communicator> ranks = pulsarlm::communicator::make_on_one_device(at::Device(at::kCUDA, 0), 4);
     REQUIRE_THROWS_AS(
-        pulsarlm::qwen4_exp_model(model_config(2, 8), w.named_tensors, ranks.front()),
+        pulsarlm::qwen4_exp_model(model_config(w.dims, 2, 8), w.named_tensors, ranks.front()),
         std::invalid_argument
     );
+}
+
+// 4 GPUs and 2 KV heads, so GPUs 0 and 1 hold KV head 0 and GPUs 2 and 3 KV head 1.
+TEST_CASE("Qwen4-Exp split across 4 GPUs, each KV head on 2, matches a dense forward in fp32", "[model][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    check_sharded(four_way_dims, at::kFloat, 1e-4, 2, 8, 4);
 }
