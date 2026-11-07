@@ -41,7 +41,6 @@ uv=$UV_INSTALL_DIR/uv
 
 if [[ ! -x $venv/bin/pulsarlm ]]; then
     "$uv" venv --python 3.13 "$venv"
-    "$uv" pip install --python "$venv" "torch==2.14.1" --index-url https://download.pytorch.org/whl/cu132
     "$uv" pip install --python "$venv" "pulsarlm==$pulsarlm_version" httpx==0.28.1 openai==3.31.0 wonderwords==3.0.1
 fi
 "$uv" pip freeze --python "$venv"
