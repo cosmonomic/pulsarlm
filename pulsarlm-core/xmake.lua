@@ -12,36 +12,37 @@ option("tests", {default = true, description = "Build the Catch2 test binaries."
 option("cuda_arch", {default = "native", description = "Comma-separated GPU architectures the CUDA kernels are compiled for, such as sm_89,sm_120,compute_120."})
 option("digest", {default = "sha256", values = {"sha256", "blake3"}, description = "Hash function behind page digests."})
 
-option("nccl_prefix")
-    set_default("")
-    set_description("The nvidia-nccl wheel's directory, holding include/nccl.h and lib/libnccl.so.2.")
-    after_check(function (option)
-        if option:value() == "" then
-            option:set_value(os.iorunv("python", {"-c", "import nvidia.nccl; print(nvidia.nccl.__path__[0])"}):trim())
-        end
-    end)
-option_end()
+option("nccl", {default = "", description = "NCCL's directory, holding include/nccl.h and lib/libnccl.so.2. Empty uses the compiler's default search paths."})
 
 if is_config("digest", "blake3") then
     add_requires("blake3 1.8.7")
 else
     add_requires("openssl3", {system = true})
 end
+local torch_envs = {CMAKE_PREFIX_PATH = get_config("torch_cmake_prefix")}
+local cuda = get_config("cuda")
+if cuda then
+    -- Torch's FindCUDA reads CUDA_PATH and its enable_language(CUDA) reads CUDACXX; without them both search /usr/local/cuda.
+    torch_envs.CUDA_PATH = cuda
+    torch_envs.CUDACXX = path.join(cuda, "bin", "nvcc")
+end
 add_requires("cmake::Torch", {system = true, configs = {
-    envs = {CMAKE_PREFIX_PATH = get_config("torch_cmake_prefix")},
+    envs = torch_envs,
     presets = {CMAKE_LINK_DEPENDS_USE_LINKER = false},
 }})
 
 target("pulsarlm_core")
     set_kind("static")
     set_languages("c++23")
-    add_options("cuda_arch", "nccl_prefix")
+    add_options("cuda_arch", "nccl")
     on_load(function (target)
         target:add("cugencodes", table.unpack(get_config("cuda_arch"):split(",")))
-        local nccl = get_config("nccl_prefix")
-        target:add("sysincludedirs", path.join(nccl, "include"), {public = true})
-        target:add("linkdirs", path.join(nccl, "lib"), {public = true})
-        target:add("rpathdirs", path.join(nccl, "lib"), {public = true})
+        local nccl = get_config("nccl")
+        if nccl ~= "" then
+            target:add("sysincludedirs", path.join(nccl, "include"), {public = true})
+            target:add("linkdirs", path.join(nccl, "lib"), {public = true})
+            target:add("rpathdirs", path.join(nccl, "lib"), {public = true})
+        end
         target:add("links", ":libnccl.so.2", {public = true})
     end)
     set_values("cuda.rdc", false)

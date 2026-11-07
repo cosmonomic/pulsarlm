@@ -114,7 +114,7 @@ pulsarlm serve gemma-4-e2b-it
 
 If installing from sdist or building from source:
 
-- nvcc >= 13.4
+- nvcc >= 13.2
 - gcc >= 15
 - xmake
 - OpenSSL 3 headers

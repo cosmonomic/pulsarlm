@@ -39,7 +39,7 @@ class CustomBuildHook(BuildHookInterface):
                 "--tests=n",
                 f"--cuda_arch={os.environ.get('PULSARLM_CUDA_ARCH', 'native')}",
                 f"--torch_cmake_prefix={torch.utils.cmake_prefix_path}",
-                f"--nccl_prefix={nvidia.nccl.__path__[0]}",
+                f"--nccl={nvidia.nccl.__path__[0]}",
                 f"--python_include={sysconfig.get_paths()['include']}",
             ],
             check=True,
