@@ -124,7 +124,7 @@ class LocalStore:
             future.set_result(pages)
             return future
 
-        def keep(read: Future[list[Page | None]]) -> None:
+        def resolve(read: Future[list[Page | None]]) -> None:
             try:
                 loaded = read.result()
             except Exception as error:
@@ -138,7 +138,7 @@ class LocalStore:
                         stored.page = page
             future.set_result(pages)
 
-        self._file.read([hashes[i] for i in in_file]).add_done_callback(keep)
+        self._file.read([hashes[i] for i in in_file]).add_done_callback(resolve)
         return future
 
     def claim(self, hashes: list[bytes], owners: Sequence[tuple[int, int]]) -> list[int]:
