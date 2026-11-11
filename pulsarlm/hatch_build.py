@@ -6,6 +6,7 @@ from pathlib import Path
 
 import nvidia.nccl
 import torch.utils
+from torch.utils.cpp_extension import CUDA_HOME
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 from hatchling.metadata.plugin.interface import MetadataHookInterface
 
@@ -27,6 +28,10 @@ class CustomMetadataHook(MetadataHookInterface):
 class CustomBuildHook(BuildHookInterface):
     def initialize(self, version, build_data):
         root = self.root
+        if CUDA_HOME is None:
+            raise RuntimeError(
+                "no CUDA toolkit: set CUDA_HOME or CUDA_PATH, or put nvcc on PATH"
+            )
         subprocess.run(
             [
                 "xmake",
@@ -37,6 +42,7 @@ class CustomBuildHook(BuildHookInterface):
                 "-m",
                 "release",
                 "--tests=n",
+                f"--cuda={CUDA_HOME}",
                 f"--cuda_arch={os.environ.get('PULSARLM_CUDA_ARCH', 'native')}",
                 f"--torch_cmake_prefix={torch.utils.cmake_prefix_path}",
                 f"--nccl={nvidia.nccl.__path__[0]}",
