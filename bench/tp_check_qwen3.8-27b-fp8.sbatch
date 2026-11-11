@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=tp-check-qwen3.8-27b-fp8
+#SBATCH --nodelist=watgpu308
+#SBATCH --gres=gpu:schoolgpu:2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --time=0-06:00:00
