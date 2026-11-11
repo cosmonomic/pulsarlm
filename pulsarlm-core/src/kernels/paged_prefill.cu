@@ -1,7 +1,7 @@
-#include "attn_common.cuh"
+#include "pulsarlm/kernels/attn_common.cuh"
 
-#include "attn_tuning.hpp"
-#include "paged_prefill.cuh"
+#include "pulsarlm/kernels/attn_tuning.hpp"
+#include "pulsarlm/kernels/paged_prefill.cuh"
 #include "pulsarlm/kernels/ops.hpp"
 
 #include <ATen/ATen.h>

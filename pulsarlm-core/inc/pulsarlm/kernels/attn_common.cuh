@@ -1,6 +1,6 @@
 #pragma once
 
-#include "attn_params.cuh"
+#include "pulsarlm/kernels/attn_params.cuh"
 #include "pulsarlm/kernels/rope.hpp"
 
 #include <ATen/core/Tensor.h>

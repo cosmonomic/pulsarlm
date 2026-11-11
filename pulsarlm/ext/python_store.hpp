@@ -11,6 +11,7 @@
 #include "host_page_pool.hpp"
 #include "pulsarlm/digest.hpp"
 #include "pulsarlm/engine.hpp"
+#include "pulsarlm/task.hpp"
 
 namespace pulsarlm {
 

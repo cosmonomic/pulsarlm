@@ -1,7 +1,7 @@
 #pragma once
 
-#include "attn_params.cuh"
-#include "attn_tiles.cuh"
+#include "pulsarlm/kernels/attn_params.cuh"
+#include "pulsarlm/kernels/attn_tiles.cuh"
 
 #include <cuda_runtime.h>
 #include <math_constants.h>

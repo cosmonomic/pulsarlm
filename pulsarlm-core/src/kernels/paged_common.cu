@@ -1,7 +1,7 @@
-#include "attn_common.cuh"
+#include "pulsarlm/kernels/attn_common.cuh"
 
 #include "pulsarlm/kernels/ops.hpp"
-#include "rope_tables.hpp"
+#include "pulsarlm/kernels/rope_tables.hpp"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>

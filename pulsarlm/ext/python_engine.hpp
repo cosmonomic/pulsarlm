@@ -11,6 +11,7 @@
 #include <variant>
 #include <vector>
 
+#include "pulsarlm/config.hpp"
 #include "pulsarlm/engine.hpp"
 #include "request_buffer.hpp"
 #include "wake_fd.hpp"

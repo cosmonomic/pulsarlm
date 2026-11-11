@@ -19,6 +19,7 @@
 #include "pulsarlm/engine/event_loop.hpp"
 #include "pulsarlm/engine/line_allocator.hpp"
 #include "pulsarlm/engine/model/interface.hpp"
+#include "pulsarlm/engine/page_store.hpp"
 
 namespace pulsarlm {
 
@@ -40,24 +41,6 @@ struct page_shape {
 // The device bytes of one line: its K and V in every layer, or its one tensor for values_only, and its index keys.
 std::size_t line_bytes(const page_shape& shape);
 
-// One line of a layer of the whole model as uint8 [line_bytes(shape)], laid out as the line, in host memory.
-struct page {
-    at::Tensor bytes;
-};
-
-// The part of a page one GPU's line holds: a device view of those bytes of the line of kv_cache_shard cache_shard, and
-// their offset in the page.
-struct page_shard {
-    at::Tensor bytes;
-    std::size_t host_offset;
-    std::size_t cache_shard;
-};
-
-// One page across the GPUs holding it; on one GPU holding whole lines, a single shard covering the line.
-struct sharded_page {
-    std::vector<page_shard> shards;
-};
-
 // The K and V of a page of shape, [n_layers, page_size, n_kv_heads, head_dim] views of its bytes, or its one tensor as
 // both for values_only, and its index keys [n_layers, page_size, index_head_dim].
 kv page_tensors(const page& p, const page_shape& shape);
@@ -73,34 +56,6 @@ digest make_root_digest(std::string_view model, std::span<const page_shape> shap
 // The key of KV layer layer's page in the store: the digest of the page's digest bytes followed by layer as 8
 // little-endian bytes.
 digest store_key(const digest& page, std::size_t layer);
-
-// A request whose step produced pages[page] of a put.
-struct page_owner {
-    std::uint64_t request;
-    std::size_t page;
-};
-
-enum class page_error { miss, oom };
-
-class page_store {
-  public:
-    virtual ~page_store() = default;
-
-    // A shard's copies run on streams[shard.cache_shard].
-
-    // Copies the page of hashes[i] into every shard of lines[i], and completes once the copies are done with true for
-    // each page it had.
-    virtual task<std::vector<bool>>
-    fetch(std::span<const digest> hashes, std::vector<sharded_page>&& lines, std::span<const cudaStream_t> streams) = 0;
-    // Takes the pages of hashes, matched by index, and copies the ones it keeps, completing once the copies are done.
-    // The shards of a page cover it once. A page has an owner for every request that produced it. Fails with oom when
-    // it has no host memory for a page it keeps.
-    virtual task<std::expected<void, page_error>>
-    put(std::vector<digest>&& hashes,
-        std::vector<sharded_page>&& pages,
-        std::vector<page_owner>&& owners,
-        std::span<const cudaStream_t> streams) = 0;
-};
 
 // One GPU's pool: the page shape of its line of each KV layer, and per KV layer the ranges along the full line's first
 // dimension (KV heads, or a state's first size) its line holds, in order; index keys are always whole.

@@ -1,8 +1,8 @@
-#include "dequant_gemm_common.cuh"
+#include "pulsarlm/kernels/dequant_gemm_common.cuh"
 
 #include "pulsarlm/kernels/ops.hpp"
 
-#include "mma.cuh"
+#include "pulsarlm/kernels/mma.cuh"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>

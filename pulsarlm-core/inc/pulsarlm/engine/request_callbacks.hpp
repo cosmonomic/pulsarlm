@@ -8,42 +8,9 @@
 #include <vector>
 
 #include "pulsarlm/digest.hpp"
-#include "pulsarlm/engine/eviction.hpp"
+#include "pulsarlm/engine/state.hpp"
 
 namespace pulsarlm {
-
-// A page of a sequence: its hash, its index among the history's full pages, and the sums its eviction densities come
-// from (add_step_mass): mass_sum in each query head its layer measures mass in, and weight_sum. A state the scheduler
-// reaches holds a mass_sum per head; an initial state may hold none, which reads as 0, with weight_sum 0.
-struct active_page {
-    digest hash;
-    std::size_t index;
-    std::vector<float> mass_sum;
-    float weight_sum = 0.0f;
-
-    bool operator==(const active_page&) const = default;
-};
-
-// One KV layer's active pages, in view order, and the moments of the pages it sampled (add_sampled_page): of their
-// densities, one per query head the layer measures mass in, or none for a layer that
-// measures none or an initial state without them, and of their scores.
-struct layer_sequence {
-    std::vector<active_page> pages;
-    std::vector<moments> density_moments;
-    moments score_moments;
-
-    bool operator==(const layer_sequence&) const = default;
-};
-
-// head is the hash of the newest full page of the history, which new pages chain from and every non-empty sequence
-// ends with; absent before the first full page. layers holds one sequence per KV layer, and may be empty when head is
-// absent. tail holds the tokens after head. A sequence's hashes are distinct: they come from one digest chain. A state
-// that breaks this is undefined behaviour.
-struct state {
-    std::optional<digest> head;
-    std::vector<layer_sequence> layers;
-    std::vector<std::int64_t> tail;
-};
 
 // The state a request reached when an eviction cycle ended. It covers the request's first token_count tokens: the
 // initial state's tail, then the request's tokens, then the tokens it sampled.

@@ -6,26 +6,10 @@
 #include <span>
 #include <vector>
 
-namespace pulsarlm {
+#include "pulsarlm/engine/eviction_policy.hpp"
+#include "pulsarlm/engine/state.hpp"
 
-// A request's eviction policy, its counts in tokens. A cycle ends once cycle_tokens tokens were forwarded since it
-// began. Its end evicts, in each KV layer, the full pages outside those holding the first n_sink tokens and the last
-// n_working tokens of the full pages whose page_score is below score_threshold at eviction_threshold, then the oldest
-// ones until the view holds at most max_context_window tokens through the next cycle. eviction_threshold is in [0, 1],
-// and 0 evicts nothing by score. A layer samples each full page outside the sinks once cycle_tokens tokens followed its
-// last one (add_sampled_page). eviction_warmup counts cycles: a layer evicts by score once it sampled the pages of that
-// many cycles' tokens twice over, as its density moments need that many samples before it samples scores, and its score
-// moments as many before it evicts. attention_mass_decay is the density EMA's rate per token. The defaults evict
-// nothing.
-struct eviction_policy {
-    std::size_t n_sink = 1024;
-    std::size_t n_working = 8192;
-    std::size_t cycle_tokens = 512;
-    std::optional<std::size_t> max_context_window;
-    double eviction_threshold = 0.0;
-    std::size_t eviction_warmup = 1;
-    double attention_mass_decay = 1.0 / 256;
-};
+namespace pulsarlm {
 
 // An eviction_policy with its sink, working set, warm-up and context window in pages: n_sink and n_working round up,
 // eviction_warmup is its cycles times the pages a cycle's tokens fill, rounded up, and max_pages rounds down. A cycle's end keeps the full pages and the pages a partial tail page and the next cycle's
@@ -43,15 +27,6 @@ struct page_eviction_policy {
 };
 
 page_eviction_policy to_pages(const eviction_policy& policy, std::size_t page_size) noexcept;
-
-// The running count, mean and sum of squared deviations from the mean (Welford) of the samples added.
-struct moments {
-    std::uint64_t count = 0;
-    double mean = 0.0;
-    double m2 = 0.0;
-
-    bool operator==(const moments&) const = default;
-};
 
 void add_sample(moments& m, double x) noexcept;
 
