@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=perf-qwen3.8-27b-fp8
+#SBATCH --constraint=H200
+#SBATCH --gres=gpu:2
+#SBATCH --requeue
+#SBATCH --open-mode=append
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --time=7-00:00:00
 #SBATCH -o %x-%j.out
 set -euo pipefail
 
-pulsarlm_version=0.1.0a6.post1
-pulsarlm_tag=v0.1.0-alpha6-post1
+pulsarlm_version=0.1.0a7
+pulsarlm_tag=v0.1.0-alpha-7
 uv_version=0.13.7
 model=qwen3.8-27b-fp8
 checkpoint_revision=017b9c7af6b5689d5dd426a76e0bc077eb5ca20a
@@ -49,11 +53,26 @@ perf=$work/perf-$pulsarlm_tag.py
 if [[ ! -f $perf ]]; then
     curl -fsSL "https://raw.githubusercontent.com/cosmonomic/pulsarlm/$pulsarlm_tag/bench/perf.py" -o "$perf"
 fi
+check=$work/tp_check-$pulsarlm_tag.py
+if [[ ! -f $check ]]; then
+    curl -fsSL "https://raw.githubusercontent.com/cosmonomic/pulsarlm/$pulsarlm_tag/bench/tp_check.py" -o "$check"
+fi
 
 if [[ ! -f $PULSARLM_DATA_DIR/$model.pulsarlm ]]; then
     "$venv/bin/pulsarlm" download "$model" --revision "$checkpoint_revision"
 fi
 rm -rf "$HF_HOME"
+
+if [[ ! -f $work/tp_check/tp_check.json ]]; then
+    rm -rf "$work/tp_check"
+    "$venv/bin/python" -I "$check" \
+        --model "$model" \
+        --out "$work/tp_check" \
+        --sizes 1 \
+        --sizes 2 \
+        --max-tokens 64 \
+        --kv-cache-gib "$kv_cache_gib"
+fi
 
 for setting in "${settings[@]}"; do
     for tensor_parallel_size in "${tensor_parallel_sizes[@]}"; do

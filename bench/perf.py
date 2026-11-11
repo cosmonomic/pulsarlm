@@ -339,11 +339,18 @@ def run_key(row: dict[str, Any]) -> RunKey:
 
 def finished_runs(results: Path, *, max_context: int, max_tokens: int) -> set[RunKey]:
     """The runs whose sessions ended. Removes the rows of the others from
-    results, as their sessions cannot be resumed."""
+    results, as their sessions cannot be resumed, and a last line cut short by a
+    job killed while writing it."""
     if not results.exists():
         return set()
     with results.open() as f:
-        rows = [json.loads(line) for line in f]
+        lines = f.read().splitlines()
+    rows = [json.loads(line) for line in lines[:-1]]
+    if lines:
+        try:
+            rows.append(json.loads(lines[-1]))
+        except json.JSONDecodeError:
+            pass
     last: dict[RunKey, dict[str, Any]] = {}
     for row in rows:
         last[run_key(row)] = row
@@ -353,7 +360,7 @@ def finished_runs(results: Path, *, max_context: int, max_tokens: int) -> set[Ru
         if ended(row, max_context=max_context, max_tokens=max_tokens)
     }
     kept = [row for row in rows if run_key(row) in finished]
-    if len(kept) < len(rows):
+    if len(kept) < len(lines):
         with results.open("w") as f:
             f.writelines(json.dumps(row) + "\n" for row in kept)
     return finished
@@ -433,16 +440,17 @@ def run(
     port: int = 18091,
     tensor_parallel_size: int = 1,
 ) -> None:
-    """Appends runs more runs of setting, each on a fresh server: grows concurrency chat
-    sessions side by side, each turn adding a user message of turn_tokens random
-    words and a reply of at most max_tokens, until a session would pass
-    max_context or a request fails, and appends a row per turn to
+    """Runs setting until runs of its runs have finished, each on a fresh server: grows
+    concurrency chat sessions side by side, each turn adding a user message of
+    turn_tokens random words and a reply of at most max_tokens, until a session
+    would pass max_context or a request fails, and appends a row per turn to
     out/results.jsonl, which accumulates every setting's, concurrency's and
-    tensor-parallel size's runs. The new runs take the lowest indices without a
-    finished run, run r drawing its messages from seed and r, the same in every
-    setting. A request that does not fit the KV cache fails with oom. A run whose
-    sessions did not end there is dropped and run again under its index. Both engines forward at most prefill_tokens_per_step prompt
-    tokens per step, and full KV and vLLM may run past the model's trained
+    tensor-parallel size's runs. Runs 0 to runs - 1 that have not finished run, so a
+    job restarted after preemption only finishes the rest; run r draws its messages
+    from seed and r, the same in every setting. A request that does not fit the KV
+    cache fails with oom. A run whose sessions did not end there is dropped and run
+    again under its index. Both engines forward at most prefill_tokens_per_step
+    prompt tokens per step, and full KV and vLLM may run past the model's trained
     context up to max_context. Both engines split the model across
     tensor_parallel_size GPUs, kv_cache_gib sizing each GPU's KV cache."""
     if setting not in SETTINGS:
@@ -460,7 +468,7 @@ def run(
         for key in done
         if key[:3] == (setting, concurrency, tensor_parallel_size)
     }
-    new_runs = [i for i in range(len(finished) + runs) if i not in finished][:runs]
+    new_runs = [i for i in range(runs) if i not in finished]
     for run_index in new_runs:
 
         def message(session: int, turn: int) -> str:
