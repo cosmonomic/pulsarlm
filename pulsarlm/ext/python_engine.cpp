@@ -105,6 +105,10 @@ std::vector<digest> python_engine::page_keys(const state& s) const {
     return core_engine->page_keys(s);
 }
 
+eviction_report python_engine::eviction_report_of(const state& s, const eviction_policy& policy) const {
+    return core_engine->eviction_report_of(s, policy);
+}
+
 engine_stat python_engine::stat() const {
     return core_engine->stat();
 }

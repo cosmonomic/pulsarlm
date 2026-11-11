@@ -1,4 +1,5 @@
 #include "pulsarlm/engine/engine.hpp"
+#include "pulsarlm/engine/eviction.hpp"
 
 #include "pulsarlm/kernels/ops.hpp"
 
@@ -314,6 +315,10 @@ std::vector<digest> engine::page_keys(const state& s) const {
         }
     }
     return keys;
+}
+
+eviction_report engine::eviction_report_of(const state& s, const eviction_policy& policy) const {
+    return make_eviction_report(s, policy, page_size);
 }
 
 }  // namespace pulsarlm

@@ -8,6 +8,7 @@ from pulsarlm.core.engine import (
     Engine,
     EngineStat,
     EvictionPolicy,
+    EvictionReport,
     Request,
     RequestError,
     SamplingParams,
@@ -89,6 +90,11 @@ class AsyncEngine:
 
     def page_keys(self, state: State) -> list[bytes]:
         return self._engine.page_keys(state)
+
+    def eviction_report_of(
+        self, state: State, eviction: EvictionPolicy
+    ) -> EvictionReport:
+        return self._engine.eviction_report_of(state, eviction)
 
     def stat(self) -> EngineStat:
         return self._engine.stat()

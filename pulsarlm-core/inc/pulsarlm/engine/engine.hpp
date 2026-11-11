@@ -16,6 +16,8 @@
 
 #include "pulsarlm/engine/event_loop.hpp"
 #include "pulsarlm/engine/engine_config.hpp"
+#include "pulsarlm/engine/eviction_policy.hpp"
+#include "pulsarlm/engine/eviction_report.hpp"
 #include "pulsarlm/engine/kv_cache.hpp"
 #include "pulsarlm/engine/model/interface.hpp"
 #include "pulsarlm/engine/request_callbacks.hpp"
@@ -78,6 +80,8 @@ class engine {
     std::vector<digest> page_digests(std::span<const std::int64_t> tokens) const;
     // The store keys of the pages of s's sequences, which a request resuming from s reads. Safe to call from any thread.
     std::vector<digest> page_keys(const state& s) const;
+    // The scores a cycle's end under policy would evict s's pages by. Safe to call from any thread.
+    eviction_report eviction_report_of(const state& s, const eviction_policy& policy) const;
     // Safe to call from any thread.
     engine_stat stat() const;
 };

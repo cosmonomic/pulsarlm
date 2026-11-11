@@ -1,7 +1,6 @@
 """The engine binding on a small random Qwen3, with an in-memory page store."""
 
 import asyncio
-import math
 from concurrent.futures import Future
 
 import pytest
@@ -10,14 +9,12 @@ import torch
 from pulsarlm.core.engine import (
     ActivePage,
     Engine,
+    EvictionPolicy,
     LayerSequence,
     ModelConfig,
-    Moments,
     RequestError,
     RopeParameters,
     State,
-    page_score,
-    score_threshold,
 )
 
 N_LAYERS = 2
@@ -306,15 +303,21 @@ def test_a_digest_is_16_bytes():
         State(head=b"short")
 
 
-def test_a_page_scores_its_highest_standardized_density():
-    density_moments = [Moments(2, 1.0, 4.0), Moments(2, 0.0, 0.25)]
-    assert page_score([6.0, 1.0], 2.0, density_moments, 2) == 1.0
-    assert page_score([1.0, 1.0], 0.0, density_moments, 2) == -math.inf
-    assert page_score([1.0], 1.0, [Moments()], 2) is None
+def test_the_eviction_report_scores_every_page_of_a_layer_measuring_mass():
+    async def main():
+        engine = make_engine(MemoryStore(asyncio.get_running_loop()))
+        eviction = EvictionPolicy(
+            cycle_tokens=PAGE_SIZE, max_context_window=8 * PAGE_SIZE
+        )
+        _, _, end = await run(
+            engine, engine.submit(State(), PROMPT, max_tokens=8, eviction=eviction)
+        )
 
+        report = engine.eviction_report_of(end, eviction)
+        assert report.cap_tokens == 6 * PAGE_SIZE
+        assert [scores.layer for scores in report.layers] == list(range(N_LAYERS))
+        for scores in report.layers:
+            assert len(scores.page_scores) == len(end.layers[scores.layer].pages)
+        assert engine.eviction_report_of(end, EvictionPolicy()).cap_tokens is None
 
-def test_the_score_threshold_is_the_normal_quantile_of_the_scores():
-    assert score_threshold(Moments(2, 1.0, 4.0), 0.5, 2) == 1.0
-    assert score_threshold(Moments(2, 1.0, 4.0), 0.0, 2) == -math.inf
-    assert score_threshold(Moments(1, 1.0, 0.0), 0.5, 2) == -math.inf
-    assert score_threshold(Moments(2, 1.0, 4.0), 0.5, 3) == -math.inf
+    asyncio.run(main())

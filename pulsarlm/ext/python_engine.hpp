@@ -84,6 +84,7 @@ class python_engine {
     );
     std::vector<digest> page_digests(const std::vector<std::int64_t>& tokens) const;
     std::vector<digest> page_keys(const state& s) const;
+    eviction_report eviction_report_of(const state& s, const eviction_policy& policy) const;
     engine_stat stat() const;
     int fileno() const noexcept;
     void clear_wake() noexcept;

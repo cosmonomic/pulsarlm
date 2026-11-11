@@ -392,18 +392,14 @@ PYBIND11_MODULE(pulsarlm_core, m) {
         .def_readwrite("eviction_warmup", &eviction_policy::eviction_warmup)
         .def_readwrite("attention_mass_decay", &eviction_policy::attention_mass_decay);
 
-    m.def(
-        "page_score",
-        [](const std::vector<float>& mass_sum,
-           float weight_sum,
-           const std::vector<moments>& density_moments,
-           std::size_t min_samples) { return page_score(mass_sum, weight_sum, density_moments, min_samples); },
-        "mass_sum"_a,
-        "weight_sum"_a,
-        "density_moments"_a,
-        "min_samples"_a
-    );
-    m.def("score_threshold", &score_threshold, "score_moments"_a, "threshold"_a, "min_samples"_a);
+    py::class_<layer_scores>(m, "LayerScores")
+        .def_readonly("layer", &layer_scores::layer)
+        .def_readonly("threshold", &layer_scores::threshold)
+        .def_readonly("page_scores", &layer_scores::page_scores);
+
+    py::class_<eviction_report>(m, "EvictionReport")
+        .def_readonly("cap_tokens", &eviction_report::cap_tokens)
+        .def_readonly("layers", &eviction_report::layers);
 
     py::class_<model_config>(m, "ModelConfig")
         .def(
@@ -863,6 +859,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             [](const python_engine& e, const state& s) { return to_bytes_list(e.page_keys(s)); },
             "state"_a
         )
+        .def("eviction_report_of", &python_engine::eviction_report_of, "state"_a, "eviction"_a)
         .def("stat", &python_engine::stat)
         .def("fileno", &python_engine::fileno)
         .def("clear_wake", &python_engine::clear_wake)

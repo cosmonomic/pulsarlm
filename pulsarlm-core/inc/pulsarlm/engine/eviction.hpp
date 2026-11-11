@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "pulsarlm/engine/eviction_policy.hpp"
+#include "pulsarlm/engine/eviction_report.hpp"
 #include "pulsarlm/engine/state.hpp"
 
 namespace pulsarlm {
@@ -27,6 +28,10 @@ struct page_eviction_policy {
 };
 
 page_eviction_policy to_pages(const eviction_policy& policy, std::size_t page_size) noexcept;
+
+// The most full pages a view keeps at a cycle's end: max_pages less the pages a partial tail page and the next cycle's
+// tokens fill, nullopt without max_pages.
+std::optional<std::size_t> full_page_cap(const page_eviction_policy& policy, std::size_t page_size) noexcept;
 
 void add_sample(moments& m, double x) noexcept;
 
@@ -83,5 +88,8 @@ std::vector<std::size_t> pages_to_evict(
     std::size_t page_size,
     const page_eviction_policy& policy
 );
+
+// The scores of s's KV layers whose pages hold a mass_sum, under policy.
+eviction_report make_eviction_report(const state& s, const eviction_policy& policy, std::size_t page_size);
 
 }  // namespace pulsarlm

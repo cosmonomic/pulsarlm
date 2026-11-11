@@ -139,24 +139,29 @@ class EvictionPolicy:
         attention_mass_decay: float = 1.0 / 256,
     ) -> None: ...
 
-def page_score(
-    mass_sum: list[float],
-    weight_sum: float,
-    density_moments: list[Moments],
-    min_samples: int,
-) -> float | None:
-    """The max over the query heads of the page's density standardized by the
-    head's density_moments, leaving out heads with fewer than max(2, min_samples)
-    samples or no spread; -inf when no query token attended the page, None when no
-    head is left."""
+class LayerScores:
+    @property
+    def layer(self) -> int: ...
+    @property
+    def threshold(self) -> float:
+        """The score at quantile eviction_threshold of a normal distribution with
+        the layer's score moments; -inf before the warm-up's samples or at
+        threshold 0, +inf at threshold 1. A cycle's end evicts the unprotected
+        pages scoring below it."""
+    @property
+    def page_scores(self) -> list[float | None]:
+        """page_scores[i] scores the layer's pages[i]: its highest density
+        standardized by each head's density moments; -inf when no query token
+        attended it, None when no head has the warm-up's samples and a spread."""
 
-def score_threshold(
-    score_moments: Moments, threshold: float, min_samples: int
-) -> float:
-    """The score at quantile threshold of a normal distribution with score_moments'
-    mean and sample variance; -inf at threshold 0 or below max(2, min_samples)
-    samples, +inf at threshold 1. A cycle's end evicts the unprotected pages scoring
-    below it."""
+class EvictionReport:
+    @property
+    def cap_tokens(self) -> int | None:
+        """The most full-page tokens a view keeps at a cycle's end; None without
+        max_context_window."""
+    @property
+    def layers(self) -> list[LayerScores]:
+        """The layers whose pages hold attention mass."""
 
 class ModelConfig:
     rope: RopeParameters
@@ -409,6 +414,10 @@ class Engine:
     def page_keys(self, state: State) -> list[bytes]:
         """The store keys of the pages of state's sequences, which a request
         resuming from state reads."""
+    def eviction_report_of(
+        self, state: State, eviction: EvictionPolicy
+    ) -> EvictionReport:
+        """The scores a cycle's end under eviction would evict state's pages by."""
     def stat(self) -> EngineStat: ...
     def fileno(self) -> int:
         """An eventfd that becomes readable when a request has results to take."""

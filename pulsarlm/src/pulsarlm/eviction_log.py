@@ -8,7 +8,8 @@ from contextlib import aclosing
 from pathlib import Path
 from typing import Any
 
-from pulsarlm.core.engine import EvictionPolicy, State, page_score, score_threshold
+from pulsarlm.async_engine import AsyncEngine
+from pulsarlm.core.engine import EvictionPolicy, State
 from pulsarlm.paging import PAGE_SIZE
 
 
@@ -21,12 +22,15 @@ class EvictionLog:
     prompt's length and prompt_sha256, cap_tokens, and each state it reached, in
     order, with the tokens the state covers and, per layer eviction measures, the
     layer's score_threshold and the [start, end, score] of each full page in view,
-    score being page_score (None without one). The tokens after the last page are in
+    score being the engine's page score (None without one). The tokens after the last page are in
     view too. cap_tokens is the most full-page tokens a view keeps at a cycle's end,
     None without max_context_window."""
 
-    def __init__(self, path: Path, eviction: EvictionPolicy) -> None:
+    def __init__(
+        self, path: Path, engine: AsyncEngine, eviction: EvictionPolicy
+    ) -> None:
         self._path = path
+        self._engine = engine
         self._eviction = eviction
 
     async def record(
@@ -45,28 +49,13 @@ class EvictionLog:
             "id": completion_id,
             "prompt_tokens": len(prompt),
             "prompt_sha256": prompt_sha256(prompt),
-            "cap_tokens": self._cap_tokens(),
+            "cap_tokens": self._engine.eviction_report_of(
+                State(), self._eviction
+            ).cap_tokens,
             "states": [self._view(state) for state in states],
         }
         with self._path.open("a") as f:
             f.write(json.dumps(line) + "\n")
-
-    # _cap_tokens and _warmup_pages compute what to_pages and pages_to_evict compute in
-    # pulsarlm-core.
-    def _cap_tokens(self) -> int | None:
-        window = self._eviction.max_context_window
-        if window is None:
-            return None
-        max_pages = window // PAGE_SIZE
-        next_cycle_pages = _ceil_div(
-            self._eviction.cycle_tokens + PAGE_SIZE - 1, PAGE_SIZE
-        )
-        return max(max_pages - next_cycle_pages, 0) * PAGE_SIZE
-
-    def _warmup_pages(self) -> int:
-        return self._eviction.eviction_warmup * _ceil_div(
-            self._eviction.cycle_tokens, PAGE_SIZE
-        )
 
     def _view(self, state: State) -> dict[str, Any]:
         full_pages = max(
@@ -77,35 +66,20 @@ class EvictionLog:
             ),
             default=0,
         )
+        report = self._engine.eviction_report_of(state, self._eviction)
         return {
             "tokens": full_pages * PAGE_SIZE + len(state.tail),
             "layers": [
                 {
-                    "layer": layer,
-                    "threshold": score_threshold(
-                        sequence.score_moments,
-                        self._eviction.eviction_threshold,
-                        self._warmup_pages(),
-                    ),
+                    "layer": scores.layer,
+                    "threshold": scores.threshold,
                     "pages": [
-                        [
-                            page.index * PAGE_SIZE,
-                            (page.index + 1) * PAGE_SIZE,
-                            page_score(
-                                page.mass_sum,
-                                page.weight_sum,
-                                sequence.density_moments,
-                                self._warmup_pages(),
-                            ),
-                        ]
-                        for page in sequence.pages
+                        [page.index * PAGE_SIZE, (page.index + 1) * PAGE_SIZE, score]
+                        for page, score in zip(
+                            state.layers[scores.layer].pages, scores.page_scores
+                        )
                     ],
                 }
-                for layer, sequence in enumerate(state.layers)
-                if sequence.pages and sequence.pages[0].mass_sum
+                for scores in report.layers
             ],
         }
-
-
-def _ceil_div(n: int, d: int) -> int:
-    return (n + d - 1) // d

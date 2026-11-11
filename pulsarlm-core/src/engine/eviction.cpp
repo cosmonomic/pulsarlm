@@ -8,6 +8,7 @@
 #include <numbers>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace pulsarlm {
@@ -89,6 +90,14 @@ page_eviction_policy to_pages(const eviction_policy& policy, std::size_t page_si
         .eviction_warmup = policy.eviction_warmup * ceil_div(policy.cycle_tokens, page_size),
         .attention_mass_decay = policy.attention_mass_decay,
     };
+}
+
+std::optional<std::size_t> full_page_cap(const page_eviction_policy& policy, std::size_t page_size) noexcept {
+    if (!policy.max_pages) {
+        return std::nullopt;
+    }
+    std::size_t next_cycle_pages = ceil_div(policy.cycle_tokens + page_size - 1, page_size);
+    return *policy.max_pages > next_cycle_pages ? *policy.max_pages - next_cycle_pages : 0;
 }
 
 bool page_eviction_policy::can_evict() const noexcept {
@@ -213,11 +222,8 @@ std::vector<std::size_t> pages_to_evict(
         }
     }
 
-    if (policy.max_pages) {
-        std::size_t next_cycle_pages = ceil_div(policy.cycle_tokens + page_size - 1, page_size);
-        std::size_t full_page_cap = *policy.max_pages > next_cycle_pages ? *policy.max_pages - next_cycle_pages : 0;
-        for (std::size_t page = policy.n_sink; page < first_protected && page_count - evicted_count > full_page_cap;
-             page++) {
+    if (std::optional<std::size_t> cap = full_page_cap(policy, page_size)) {
+        for (std::size_t page = policy.n_sink; page < first_protected && page_count - evicted_count > *cap; page++) {
             if (!evicted[page]) {
                 evicted[page] = true;
                 evicted_count++;
@@ -232,6 +238,30 @@ std::vector<std::size_t> pages_to_evict(
         }
     }
     return pages;
+}
+
+eviction_report make_eviction_report(const state& s, const eviction_policy& policy, std::size_t page_size) {
+    page_eviction_policy pages = to_pages(policy, page_size);
+    std::optional<std::size_t> cap = full_page_cap(pages, page_size);
+    eviction_report report{.cap_tokens = cap ? std::optional(*cap * page_size) : std::nullopt, .layers = {}};
+    for (std::size_t layer = 0; layer < s.layers.size(); layer++) {
+        const layer_sequence& sequence = s.layers[layer];
+        if (sequence.pages.empty() || sequence.pages.front().mass_sum.empty()) {
+            continue;
+        }
+        layer_scores scores{
+            .layer = layer,
+            .threshold = score_threshold(sequence.score_moments, pages.eviction_threshold, pages.eviction_warmup),
+            .page_scores = {},
+        };
+        for (const active_page& page : sequence.pages) {
+            scores.page_scores.push_back(
+                page_score(page.mass_sum, page.weight_sum, sequence.density_moments, pages.eviction_warmup)
+            );
+        }
+        report.layers.push_back(std::move(scores));
+    }
+    return report;
 }
 
 }  // namespace pulsarlm
