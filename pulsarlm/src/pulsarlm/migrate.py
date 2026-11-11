@@ -40,7 +40,7 @@ from pulsarlm.checkpoint import (
     PulsarLMModelLoadingError,
 )
 
-SOURCE_FILES = [
+UNSHARDED_FILES = [
     "config.json",
     "generation_config.json",
     "tokenizer.json",
@@ -48,8 +48,6 @@ SOURCE_FILES = [
     "chat_template.jinja",
     "model.safetensors",
     "model.safetensors.index.json",
-    "model-*.safetensors",
-    "model.safetensors-*.safetensors",
 ]
 
 
