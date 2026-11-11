@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=tp-check-qwen3.8-27b-fp8
-#SBATCH --nodelist=watgpu308
-#SBATCH --gres=gpu:schoolgpu:2
+#SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --time=0-06:00:00
 #SBATCH -o %x-%j.out
 set -euo pipefail
 
-pulsarlm_version=0.1.0a8
-pulsarlm_tag=v0.1.0-alpha-8
+pulsarlm_version=0.1.0a9
+pulsarlm_tag=v0.1.0-alpha-9
 uv_version=0.13.7
 model=qwen3.8-27b-fp8
 checkpoint_revision=017b9c7af6b5689d5dd426a76e0bc077eb5ca20a
