@@ -19,6 +19,18 @@ struct cycle_end {
     std::size_t token_count;
 };
 
+// A request's final state, which leaves out the last sampled token, and its token counts. total_tokens: the initial
+// state's history, its full pages and tail, then the request's tokens, then the tokens it sampled. cached_tokens: the
+// tokens of the initial state's full pages, which the request did not forward; its tail is forwarded again.
+// device_cached_tokens: those of them on pages that every KV layer reading the page had resident in the KV cache when
+// the request started, not fetched from the store.
+struct request_result {
+    pulsarlm::state state;
+    std::size_t total_tokens;
+    std::size_t cached_tokens;
+    std::size_t device_cached_tokens;
+};
+
 enum class request_error { miss, oom, cancelled, loop_exited };
 
 // One request's sampled tokens and cycle ends, then its end: its final state or an error. Calls come one at a time and
@@ -30,7 +42,7 @@ class request_callbacks {
     virtual void on_token(std::int64_t token) noexcept = 0;
     virtual void on_cycle_end(cycle_end&& ended) noexcept = 0;
     // Called once, last.
-    virtual void on_end(std::expected<state, request_error>&& result) noexcept = 0;
+    virtual void on_end(std::expected<request_result, request_error>&& result) noexcept = 0;
     // Checked after each step; true ends the request with cancelled.
     virtual bool cancelled() const noexcept = 0;
 };
@@ -50,7 +62,7 @@ class result_writer {
     void append(std::int64_t token) noexcept;
     void append(cycle_end&& ended) noexcept;
     // Called once; the callbacks are destroyed once it returns.
-    void end(std::expected<state, request_error>&& result) noexcept;
+    void end(std::expected<request_result, request_error>&& result) noexcept;
     bool cancelled() const noexcept;
 };
 

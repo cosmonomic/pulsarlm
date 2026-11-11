@@ -27,7 +27,7 @@ void result_writer::append(cycle_end&& ended) noexcept {
     callbacks->on_cycle_end(std::move(ended));
 }
 
-void result_writer::end(std::expected<state, request_error>&& result) noexcept {
+void result_writer::end(std::expected<request_result, request_error>&& result) noexcept {
     assert(callbacks);
     std::unique_ptr<request_callbacks> ended = std::move(callbacks);
     ended->on_end(std::move(result));

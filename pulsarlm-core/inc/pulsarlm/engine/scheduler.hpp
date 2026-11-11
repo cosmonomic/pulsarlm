@@ -69,6 +69,8 @@ class scheduler {
     // The full pages of KV layer layer's view wholly before the window of a query at view index query.
     std::size_t passed_pages(std::size_t layer, std::size_t query) const noexcept;
     state state_of(const sequence& seq) const;
+    // The tokens of seq's full history pages that every KV layer reading the page holds resident.
+    std::size_t device_cached_tokens(const sequence& seq) const;
     // Per KV layer with pages, lines for its pages, then line_count empty lines; per recurrent layer, a copy of the
     // state at head, or zeros without head, and an empty line. Holds nothing on failure.
     task<std::expected<void, page_error>> take_lines(sequence& seq, std::size_t line_count);
@@ -102,7 +104,7 @@ class scheduler {
         std::size_t prefill_tokens_per_step
     );
 
-    // Serves r, then ends writer with its final state, which leaves out the last sampled token, or an error. Appends
+    // Serves r, then ends writer with its result or an error. Appends
     // the state to writer at the end of each eviction cycle. Ends with oom, never waiting, when the free lines do not
     // cover the state's pages and one cycle's tokens at the start, or the next cycle's tokens while running; the
     // caller resubmits.

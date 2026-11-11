@@ -48,6 +48,9 @@ struct request_results {
     token_list tokens;
     std::vector<pulsarlm::cycle_end> cycle_ends;
     std::optional<std::expected<pulsarlm::state, request_error>> end;
+    std::size_t total_tokens = 0;
+    std::size_t cached_tokens = 0;
+    std::size_t device_cached_tokens = 0;
     bool cancelled = false;
 };
 
@@ -66,8 +69,13 @@ class recording_callbacks final : public pulsarlm::request_callbacks {
         recorded_results->cycle_ends.push_back(std::move(ended));
     }
 
-    void on_end(std::expected<pulsarlm::state, request_error>&& result) noexcept override {
-        recorded_results->end.emplace(std::move(result));
+    void on_end(std::expected<pulsarlm::request_result, request_error>&& result) noexcept override {
+        if (result) {
+            recorded_results->total_tokens = result->total_tokens;
+            recorded_results->cached_tokens = result->cached_tokens;
+            recorded_results->device_cached_tokens = result->device_cached_tokens;
+        }
+        recorded_results->end.emplace(std::move(result).transform([](pulsarlm::request_result&& ended) { return std::move(ended.state); }));
     }
 
     bool cancelled() const noexcept override {
@@ -753,6 +761,47 @@ TEST_CASE("a request continues from pages another cache fetches from the store")
     REQUIRE(second.tokens == continuation(concat(concat(prompt, first.tokens), user), 4));
     std::vector<digest> keys = concat(keys_of(hashes_of(first_end), 0), keys_of(hashes_of(first_end), 1));
     REQUIRE((first_engine.store->fetches == std::vector<std::vector<digest>>{keys}));
+}
+
+TEST_CASE("a request's result counts its tokens and the initial state's full pages it did not forward") {
+    fixture f(16);
+    token_list prompt{1, 2, 3, 4, 5, 6};
+    token_list user{7, 8};
+    std::vector<request_results> results = serve_in_turn(
+        f.sched,
+        request{.tokens = prompt, .max_tokens = 5},
+        [&](const request_results& first) {
+            return request{
+                .initial_state = ended_state(first),
+                .tokens = concat({first.tokens.back()}, user),
+                .max_tokens = 4
+            };
+        }
+    );
+
+    REQUIRE(results[0].total_tokens == 11);
+    REQUIRE(results[0].cached_tokens == 0);
+    REQUIRE(results[0].device_cached_tokens == 0);
+    REQUIRE(results[1].total_tokens == 8 + 2 + 3 + 4);
+    REQUIRE(results[1].cached_tokens == 8);
+    REQUIRE(results[1].device_cached_tokens == 8);
+}
+
+TEST_CASE("pages fetched from the store count as cached but not device cached") {
+    fixture first_engine(16);
+    token_list prompt{1, 2, 3, 4, 5, 6};
+    request_results first = serve_all(first_engine.sched, {request{.tokens = prompt, .max_tokens = 5}})[0];
+
+    memory_store shared_store;
+    shared_store.contents = first_engine.store;
+    fixture second_engine(16, 64, {}, shared_store);
+    request_results second = serve_all(
+        second_engine.sched,
+        {request{.initial_state = ended_state(first), .tokens = {first.tokens.back()}, .max_tokens = 1}}
+    )[0];
+
+    REQUIRE(second.cached_tokens == 8);
+    REQUIRE(second.device_cached_tokens == 0);
 }
 
 TEST_CASE("a state page missing from the store ends the request with miss") {

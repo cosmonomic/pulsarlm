@@ -739,6 +739,10 @@ void kv_cache::release(std::size_t layer, std::span<const std::uint32_t> line_id
     }
 }
 
+bool kv_cache::contains(std::size_t layer, const digest& hash) const {
+    return layers[layer].digest_to_line_id.contains(hash);
+}
+
 std::size_t kv_cache::free_count() {
     std::size_t block_total = 0;
     for (const cache_layer& layer : layers) {

@@ -47,8 +47,8 @@ class recording_callbacks final : public pulsarlm::request_callbacks {
         recorded_results->cycle_ends.push_back(std::move(ended));
     }
 
-    void on_end(std::expected<pulsarlm::state, request_error>&& result) noexcept override {
-        recorded_results->end.emplace(std::move(result));
+    void on_end(std::expected<pulsarlm::request_result, request_error>&& result) noexcept override {
+        recorded_results->end.emplace(std::move(result).transform([](pulsarlm::request_result&& ended) { return std::move(ended.state); }));
         recorded_results->end_count++;
     }
 
@@ -86,7 +86,14 @@ TEST_CASE("the writer ends its callbacks once, then destroys them") {
     {
         result_writer writer = make_writer(recorded_results);
         pulsarlm::digest page_hash{.hi = 1, .lo = 2};
-        writer.end(pulsarlm::state{.head = page_hash, .tail = {5}});
+        writer.end(
+            pulsarlm::request_result{
+                .state = pulsarlm::state{.head = page_hash, .tail = {5}},
+                .total_tokens = 5,
+                .cached_tokens = 4,
+                .device_cached_tokens = 4,
+            }
+        );
 
         REQUIRE(recorded_results->callbacks_destroyed);
         REQUIRE(recorded_results->end->has_value());

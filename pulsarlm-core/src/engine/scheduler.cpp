@@ -146,6 +146,11 @@ class scheduler::sequence {
     // The request's tokens forwarded so far, which the state covers: the initial state's tail, then the request's
     // tokens, then sampled tokens.
     std::size_t covered_count = 0;
+    // The tokens of the initial state's history, full pages and tail, then the request's tokens.
+    std::size_t prompt_count = 0;
+    // The tokens of the initial state's full pages, and of those every layer reading them had resident at the start.
+    std::size_t cached_count = 0;
+    std::size_t device_cached_count = 0;
 
     sequence(
         request&& r,
@@ -336,6 +341,8 @@ scheduler::sequence::sequence(
             history_pages = sequence.pages.back().index + 1;
         }
     }
+    cached_count = history_pages * page_size;
+    prompt_count = cached_count + pending_tokens.size();
     update_held();
 }
 
@@ -846,6 +853,8 @@ task<void> scheduler::submit(request r, result_writer writer) {
         writer.end(std::unexpected(request_error::cancelled));
         co_return;
     }
+    // take_lines holds the resident pages before it first suspends, so they are the ones counted here.
+    seq.device_cached_count = device_cached_tokens(seq);
     std::expected<void, page_error> taken = co_await take_lines(seq, seq.cycle_lines(page_size));
     if (!taken) {
         writer.end(std::unexpected(taken.error() == page_error::miss ? request_error::miss : request_error::oom));
@@ -861,7 +870,14 @@ task<void> scheduler::submit(request r, result_writer writer) {
 
     switch (*seq.end_reason) {
     case exit_reason::finished:
-        writer.end(state_of(seq));
+        writer.end(
+            request_result{
+                .state = state_of(seq),
+                .total_tokens = seq.prompt_count + seq.generated_count,
+                .cached_tokens = seq.cached_count,
+                .device_cached_tokens = seq.device_cached_count,
+            }
+        );
         co_return;
     case exit_reason::cancelled:
         writer.end(std::unexpected(request_error::cancelled));
@@ -870,6 +886,25 @@ task<void> scheduler::submit(request r, result_writer writer) {
         writer.end(std::unexpected(request_error::oom));
         co_return;
     }
+}
+
+std::size_t scheduler::device_cached_tokens(const sequence& seq) const {
+    std::vector<bool> fetched(seq.history_pages, false);
+    for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
+        const layer_view& view = seq.layers[layer];
+        if (recurrent[layer]) {
+            if (seq.head && !cache.contains(layer, *seq.head)) {
+                fetched[seq.history_pages - 1] = true;
+            }
+            continue;
+        }
+        for (std::size_t i = 0; i < view.pages.size(); i++) {
+            if (!cache.contains(layer, view.pages[i])) {
+                fetched[view.indices[i]] = true;
+            }
+        }
+    }
+    return (seq.history_pages - static_cast<std::size_t>(std::ranges::count(fetched, true))) * page_size;
 }
 
 task<std::expected<void, page_error>> scheduler::take_lines(sequence& seq, std::size_t line_count) {

@@ -189,6 +189,9 @@ class kv_cache {
         std::span<const cudaStream_t> streams
     );
     void release(std::size_t layer, std::span<const std::uint32_t> line_ids) noexcept;
+    // Whether layer caches the page hash in a line, which get then holds without fetching; a page being fetched is not
+    // cached yet.
+    bool contains(std::size_t layer, const digest& hash) const;
 
     // The largest count for which allocate gives count lines of every layer now.
     std::size_t free_count();

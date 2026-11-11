@@ -45,7 +45,7 @@ class buffered_callbacks final : public request_callbacks {
 
     void on_token(std::int64_t token) noexcept override;
     void on_cycle_end(cycle_end&& ended) noexcept override;
-    void on_end(std::expected<state, request_error>&& result) noexcept override;
+    void on_end(std::expected<request_result, request_error>&& result) noexcept override;
     bool cancelled() const noexcept override;
 };
 

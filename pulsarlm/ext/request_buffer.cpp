@@ -46,8 +46,8 @@ void buffered_callbacks::on_cycle_end(cycle_end&& ended) noexcept {
     wake_signal->notify();
 }
 
-void buffered_callbacks::on_end(std::expected<state, request_error>&& result) noexcept {
-    buffer->end(std::move(result));
+void buffered_callbacks::on_end(std::expected<request_result, request_error>&& result) noexcept {
+    buffer->end(std::move(result).transform([](request_result&& ended) { return std::move(ended.state); }));
     wake_signal->notify();
 }
 
