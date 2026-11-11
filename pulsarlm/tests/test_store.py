@@ -197,21 +197,21 @@ def test_the_pages_a_request_puts_stay_until_its_lease_closes():
     assert not any(stored(store, h) for h in page_digests(HISTORY))
 
 
-def test_keep_gives_the_pages_an_open_lease_owns_that_the_store_lacks():
+def test_claim_gives_the_pages_an_open_lease_owns_that_the_store_lacks():
     store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY)
     first, second, third = page_digests(HISTORY[:12])
     run_request(store, HISTORY[:4], HISTORY[:4])
     with request(store, HISTORY) as (request_id, _, _):
         owners = [(request_id, 0), (request_id, 1), (next(REQUEST_IDS), 2)]
-        assert store.keep([first, second, third], owners) == [1]
+        assert store.claim([first, second, third], owners) == [1]
 
 
-def test_keep_holds_a_page_the_store_has_for_its_lease_until_the_lease_closes():
+def test_claim_holds_a_page_the_store_has_for_its_lease_until_the_lease_closes():
     store = LocalStore(PAGE_SIZE, capacity_bytes=PAGE_BYTES)
     first = page_digests(HISTORY[:4])[0]
     run_request(store, HISTORY[:4], HISTORY[:4])
     with request(store, [7] * 5) as (request_id, _, _):
-        assert store.keep([first], [(request_id, 0)]) == []
+        assert store.claim([first], [(request_id, 0)]) == []
         run_request(store, [8] * 5, [8] * 5)
         assert stored(store, first)
     assert not stored(store, first)

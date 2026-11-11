@@ -12,16 +12,17 @@ class PageStore(Protocol):
     """Called on the engine's loop thread with the GIL held. A page is one KV
     layer's line as a host uint8 tensor of its bytes, laid out as only the engine
     reads it; an owner pairs a request id with the index of a page its step
-    produced. keep gives the indices of a step's pages the store takes, and put
-    then hands it their host copies with those pages' owners. fetch and put return
+    produced. claim takes the pages of a step the store has for the leases owning
+    them and gives the indices of those it needs, and put then hands it their host
+    copies with those pages' owners. fetch and put return
     without waiting for the store. A fetch whose call raises, or whose future
     fails, is cancelled, is dropped unfinished or yields a malformed result, misses
-    every page it asked for. An exception raised by keep, which then keeps
+    every page it asked for. An exception raised by claim, which then claims
     nothing, or by put goes to sys.unraisablehook.
     """
 
     def fetch(self, hashes: list[bytes]) -> Future[list[Page | None]]: ...
-    def keep(self, hashes: list[bytes], owners: list[tuple[int, int]]) -> list[int]: ...
+    def claim(self, hashes: list[bytes], owners: list[tuple[int, int]]) -> list[int]: ...
     def put(
         self, hashes: list[bytes], pages: list[Page], owners: list[tuple[int, int]]
     ) -> None: ...

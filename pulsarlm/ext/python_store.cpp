@@ -137,12 +137,12 @@ void python_store::start_fetch(std::span<const digest> hashes, external_task<fet
     }
 }
 
-std::vector<std::size_t> python_store::keep(std::span<const digest> hashes, std::span<const page_owner> owners) {
+std::vector<std::size_t> python_store::claim(std::span<const digest> hashes, std::span<const page_owner> owners) {
     py::gil_scoped_acquire gil;
     try {
-        return hooks.attr("keep")(to_bytes_list(hashes), owners_to_python(owners)).cast<std::vector<std::size_t>>();
+        return hooks.attr("claim")(to_bytes_list(hashes), owners_to_python(owners)).cast<std::vector<std::size_t>>();
     } catch (py::error_already_set& e) {
-        e.discard_as_unraisable("pulsarlm page store keep");
+        e.discard_as_unraisable("pulsarlm page store claim");
     } catch (const py::cast_error&) {
     }
     return {};
@@ -154,36 +154,36 @@ task<std::expected<void, page_error>> python_store::put(
     std::vector<page_owner>&& owners,
     std::span<const cudaStream_t> streams
 ) {
-    std::vector<std::size_t> kept = keep(hashes, owners);
-    std::erase_if(kept, [&](std::size_t i) { return i >= hashes.size(); });
-    if (kept.empty()) {
+    std::vector<std::size_t> missing = claim(hashes, owners);
+    std::erase_if(missing, [&](std::size_t i) { return i >= hashes.size(); });
+    if (missing.empty()) {
         co_return {};
     }
     std::vector<sharded_page> sources;
-    std::vector<digest> kept_hashes;
-    std::unordered_map<std::size_t, std::size_t> kept_index;
-    for (std::size_t i : kept) {
-        if (kept_index.try_emplace(i, sources.size()).second) {
+    std::vector<digest> copied_hashes;
+    std::unordered_map<std::size_t, std::size_t> copied_index;
+    for (std::size_t i : missing) {
+        if (copied_index.try_emplace(i, sources.size()).second) {
             sources.push_back(std::move(pages[i]));
-            kept_hashes.push_back(hashes[i]);
+            copied_hashes.push_back(hashes[i]);
         }
     }
     std::optional<std::vector<page>> copies = co_await copy_to_host(*host_pages, sources, streams);
     if (!copies) {
         co_return std::unexpected(page_error::oom);
     }
-    std::vector<page_owner> kept_owners;
+    std::vector<page_owner> copied_owners;
     for (const page_owner& owner : owners) {
-        if (auto it = kept_index.find(owner.page); it != kept_index.end()) {
-            kept_owners.push_back(page_owner{.request = owner.request, .page = it->second});
+        if (auto it = copied_index.find(owner.page); it != copied_index.end()) {
+            copied_owners.push_back(page_owner{.request = owner.request, .page = it->second});
         }
     }
     py::gil_scoped_acquire gil;
     try {
         hooks.attr("put")(
-            to_bytes_list(kept_hashes),
+            to_bytes_list(copied_hashes),
             pages_to_python(std::move(*copies)),
-            owners_to_python(kept_owners)
+            owners_to_python(copied_owners)
         );
     } catch (py::error_already_set& e) {
         e.discard_as_unraisable("pulsarlm page store put");

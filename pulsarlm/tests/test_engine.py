@@ -86,7 +86,7 @@ class MemoryStore:
     async def lookup(self, hashes: list[bytes]) -> list:
         return [self.pages.get(h) for h in hashes]
 
-    def keep(self, hashes: list[bytes], owners: list) -> list[int]:
+    def claim(self, hashes: list[bytes], owners: list) -> list[int]:
         return [i for i, h in enumerate(hashes) if h not in self.pages]
 
     def put(self, hashes: list[bytes], pages: list, owners: list) -> None:
