@@ -240,6 +240,8 @@ engine::loaded_model engine::load_model(
     std::vector<communicator> communicators = make_communicators(devices);
     loaded_model loaded{.shards = {}, .vocab_size = pulsarlm::vocab_size(model_config)};
     for (std::size_t rank = 0; rank < devices.size(); rank++) {
+        // Loading launches kernels, such as the fp8 Marlin repack, on the current device's stream.
+        c10::cuda::CUDAGuard device_guard(devices[rank]);
         loaded.shards.push_back(make_model(model_config, load_model_shard(rank, devices.size()), communicators[rank]));
     }
     return loaded;
