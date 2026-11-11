@@ -2,6 +2,7 @@
 
 #include <ATen/core/Tensor.h>
 
+#include "pulsarlm/kernels/gate_activation.hpp"
 #include "pulsarlm/kernels/rope.hpp"
 
 #include <cstdint>
@@ -52,8 +53,6 @@ at::Tensor gated_delta_rule_cuda(
     const at::Tensor& page_end_tokens,
     int64_t key_heads
 );
-
-enum class gate_activation { silu, sigmoid };
 
 // weight * RMSNorm(x) * activation(z) over the last axis, the normalized x and its product with weight each rounded to
 // x's dtype. z and weight are in x's dtype.

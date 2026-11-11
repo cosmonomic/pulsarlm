@@ -13,7 +13,7 @@ from tokenizers import Tokenizer, models, pre_tokenizers
 
 from pulsarlm.async_engine import AsyncEngine
 from pulsarlm.chat import ChatTemplate, encode_prompt
-from pulsarlm.core.engine import Engine, EvictionPolicy
+from pulsarlm.core.engine import Engine, EvictionPolicy, ModelConfig, RopeParameters
 from pulsarlm.eviction_log import EvictionLog, prompt_sha256
 from pulsarlm.server import create_app
 from pulsarlm.server.openai import ServerState
@@ -37,18 +37,16 @@ BASE_URL = "http://testserver/api/openai/v1"
 SPECIAL_TOKENS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>"]
 ROLES = ["system", "user", "assistant"]
 
-CONFIG = {
-    "model_type": "qwen3",
-    "eos_token_id": 0,
-    "vocab_size": VOCAB_SIZE,
-    "hidden_size": HIDDEN,
-    "num_hidden_layers": N_LAYERS,
-    "num_attention_heads": N_HEADS,
-    "num_key_value_heads": N_KV_HEADS,
-    "head_dim": HEAD_DIM,
-    "rope_theta": 1e6,
-    "rms_norm_eps": 1e-6,
-}
+MODEL = ModelConfig(
+    architecture="qwen3",
+    n_layers=N_LAYERS,
+    n_heads=N_HEADS,
+    n_kv_heads=N_KV_HEADS,
+    head_dim=HEAD_DIM,
+    vocab_size=VOCAB_SIZE,
+    rope=RopeParameters(theta=1e6),
+    rms_norm_eps=1e-6,
+)
 
 
 def random_weights(embedding_scale: float) -> dict[str, torch.Tensor]:
@@ -113,7 +111,7 @@ def load(
     store = LocalStore(PAGE_SIZE, capacity_bytes=64 * LINE_BYTES)
     engine = Engine(
         store,
-        CONFIG,
+        MODEL,
         lambda rank, size: random_weights(embedding_scale),
         model_name=MODEL_ID,
         page_size=PAGE_SIZE,

@@ -18,10 +18,10 @@
 #include <vector>
 
 #include "pulsarlm/engine/event_loop.hpp"
-#include "pulsarlm/engine/config_value.hpp"
 #include "pulsarlm/engine/engine_config.hpp"
 #include "pulsarlm/engine/eviction_policy.hpp"
 #include "pulsarlm/engine/eviction_report.hpp"
+#include "pulsarlm/engine/model/config.hpp"
 #include "pulsarlm/engine/kv_cache.hpp"
 #include "pulsarlm/engine/model/interface.hpp"
 #include "pulsarlm/engine/request_callbacks.hpp"
@@ -66,7 +66,7 @@ class engine {
     struct loaded_model;
 
     static loaded_model load_model(
-        const config_dict& model_config,
+        const any_model_config& model_config,
         const model_shard_loader& load_model_shard,
         std::span<const at::Device> devices
     );
@@ -76,12 +76,12 @@ class engine {
     void run_worker_loop(std::size_t shard);
 
   public:
-    // The model of a checkpoint's config.json, split over config.devices: shard r runs on config.devices[r] with the
-    // weights load_model_shard(r, config.devices.size()) gives, loaded one shard after another. Shards on distinct
-    // devices reduce over NCCL; several on one device, for tests, without it. Throws std::invalid_argument for a model
-    // the engine does not run.
+    // The model of model_config, split over config.devices: shard r runs on config.devices[r] with the weights
+    // load_model_shard(r, config.devices.size()) gives, loaded one shard after another. Shards on distinct devices reduce
+    // over NCCL; several on one device, for tests, without it. Throws std::invalid_argument for a model the engine does
+    // not split over config.devices.
     engine(
-        const config_dict& model_config,
+        const any_model_config& model_config,
         const model_shard_loader& load_model_shard,
         const engine_config& config,
         std::unique_ptr<page_store>&& store

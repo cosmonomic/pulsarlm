@@ -15,6 +15,7 @@ from torch import Tensor
 from pulsarlm import checkpoint, sharding
 from pulsarlm.checkpoint import PulsarLMModelConfig, PulsarLMModelLoadingError
 from pulsarlm.core.engine import Engine, State
+from pulsarlm.engine_model import engine_model
 
 PREFIX = "model.language_model."
 QWEN3_5_TEXT = {
@@ -394,7 +395,7 @@ def test_an_engine_split_over_two_ranks_generates_what_one_gpu_does(
         )
         one_gpu = Engine(
             MemoryStore(loop),
-            cfg.raw,
+            engine_model(cfg),
             lambda rank, size: {name: t.to(device) for name, t in weights.items()},
             devices=[device],
             **settings,
@@ -408,7 +409,7 @@ def test_an_engine_split_over_two_ranks_generates_what_one_gpu_does(
 
         split = Engine(
             MemoryStore(loop),
-            cfg.raw,
+            engine_model(cfg),
             load_model_shard,
             devices=[device, device],
             **settings,

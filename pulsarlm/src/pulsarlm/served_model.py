@@ -10,6 +10,7 @@ from tokenizers import Tokenizer
 from pulsarlm import checkpoint
 from pulsarlm.chat import ChatTemplate, stop_ids
 from pulsarlm.core.engine import Engine, EvictionPolicy
+from pulsarlm.engine_model import engine_model
 from pulsarlm.paging import PAGE_SIZE
 from pulsarlm.settings import Settings
 from pulsarlm.store import LocalStore
@@ -59,7 +60,7 @@ def load_served_model(settings: Settings, path: Path) -> ServedModel:
     try:
         engine = Engine(
             store,
-            cfg.raw,
+            engine_model(cfg),
             load_model_shard,
             devices=devices,
             model_name=model_name,

@@ -35,48 +35,51 @@ py::tuple take_to_python(request_handle& handle) {
     return py::make_tuple(std::move(taken.tokens), py::cast(std::move(taken.cycle_ends)), std::move(end));
 }
 
-// A JSON value from a Python object: None, a bool, an int, a float, a str, or a list or a dict with str keys of them.
-config_value to_config_value(const py::handle& object) {
-    if (object.is_none()) {
-        return {nullptr};
+gemma4_layer_type layer_type(const std::string& name) {
+    if (name == "sliding_attention") {
+        return gemma4_layer_type::sliding_attention;
     }
-    if (py::isinstance<py::bool_>(object)) {
-        return {object.cast<bool>()};
+    if (name == "full_attention") {
+        return gemma4_layer_type::full_attention;
     }
-    if (py::isinstance<py::int_>(object)) {
-        return {object.cast<std::int64_t>()};
+    throw std::invalid_argument("unknown Gemma 4 layer type " + name);
+}
+
+qwen3_5_layer_type qwen3_5_layer(const std::string& name) {
+    if (name == "linear_attention") {
+        return qwen3_5_layer_type::linear_attention;
     }
-    if (py::isinstance<py::float_>(object)) {
-        return {object.cast<double>()};
+    if (name == "full_attention") {
+        return qwen3_5_layer_type::full_attention;
     }
-    if (py::isinstance<py::str>(object)) {
-        return {object.cast<std::string>()};
+    throw std::invalid_argument("unknown Qwen3.5 layer type " + name);
+}
+
+qwen4_exp_layer_type qwen4_exp_layer(const std::string& name) {
+    if (name == "linear_attention") {
+        return qwen4_exp_layer_type::linear_attention;
     }
-    if (py::isinstance<py::list>(object) || py::isinstance<py::tuple>(object)) {
-        config_list list;
-        for (const py::handle& item : object) {
-            list.push_back(to_config_value(item));
-        }
-        return {std::move(list)};
+    if (name == "indexed_attention") {
+        return qwen4_exp_layer_type::indexed_attention;
     }
-    if (py::isinstance<py::dict>(object)) {
-        config_dict dict;
-        for (const auto& [key, item] : object.cast<py::dict>()) {
-            if (!py::isinstance<py::str>(key)) {
-                throw py::type_error("a config's keys are strings, got " + py::repr(key).cast<std::string>());
-            }
-            dict.emplace(key.cast<std::string>(), to_config_value(item));
-        }
-        return {std::move(dict)};
+    throw std::invalid_argument("unknown Qwen4-Exp layer type " + name);
+}
+
+gate_activation activation(const std::string& name) {
+    if (name == "silu") {
+        return gate_activation::silu;
     }
-    throw py::type_error("a config holds None, bool, int, float, str, list and dict, got " + py::repr(object).cast<std::string>());
+    if (name == "sigmoid") {
+        return gate_activation::sigmoid;
+    }
+    throw std::invalid_argument("unknown gate activation " + name);
 }
 
 // Shard r of the model runs on devices[r] with the weights load_model_shard(r, len(devices)) returns; kv_cache_gib
 // sizes each device's KV cache.
 std::unique_ptr<python_engine> make_engine(
     py::object store,
-    const py::dict& config,
+    const any_model_config& model_config,
     py::object load_model_shard,
     std::vector<at::Device> devices,
     const std::string& model_name,
@@ -90,7 +93,6 @@ std::unique_ptr<python_engine> make_engine(
     if (!(kv_cache_gib > 0.0) || !(store_gib >= 0.0)) {
         throw std::invalid_argument("kv_cache_gib must be positive and store_gib not negative");
     }
-    config_dict model_config = std::get<config_dict>(to_config_value(config).value);
     engine_config engine_settings{
         .model_name = model_name,
         .page_size = page_size,
@@ -274,6 +276,393 @@ PYBIND11_MODULE(pulsarlm_core, m) {
     py::class_<eviction_report>(m, "EvictionReport")
         .def_readonly("cap_tokens", &eviction_report::cap_tokens)
         .def_readonly("layers", &eviction_report::layers);
+
+    py::class_<model_config>(m, "ModelConfig")
+        .def(
+            py::init([](std::string architecture,
+                        std::int64_t vocab_size,
+                        std::int64_t n_layers,
+                        std::int64_t n_heads,
+                        std::int64_t n_kv_heads,
+                        std::int64_t head_dim,
+                        const rope_parameters& rope,
+                        double rms_norm_eps) {
+                return model_config{
+                    .architecture = std::move(architecture),
+                    .dense_model = dense_config{
+                        .vocab_size = vocab_size,
+                        .n_layers = n_layers,
+                        .n_heads = n_heads,
+                        .n_kv_heads = n_kv_heads,
+                        .head_dim = head_dim,
+                        .rope = rope,
+                        .rms_norm_eps = rms_norm_eps,
+                    },
+                };
+            }),
+            py::kw_only(),
+            "architecture"_a,
+            "vocab_size"_a,
+            "n_layers"_a,
+            "n_heads"_a,
+            "n_kv_heads"_a,
+            "head_dim"_a,
+            "rope"_a,
+            "rms_norm_eps"_a
+        )
+        .def_property_readonly("rope", [](const model_config& c) { return c.dense_model.rope; });
+
+    py::class_<llama3_rope_scaling>(m, "Llama3RopeScaling")
+        .def(
+            py::init([](double factor,
+                        double low_freq_factor,
+                        double high_freq_factor,
+                        double original_max_position_embeddings) {
+                return llama3_rope_scaling{factor, low_freq_factor, high_freq_factor, original_max_position_embeddings};
+            }),
+            py::kw_only(),
+            "factor"_a,
+            "low_freq_factor"_a,
+            "high_freq_factor"_a,
+            "original_max_position_embeddings"_a
+        )
+        .def_readonly("factor", &llama3_rope_scaling::factor)
+        .def_readonly("low_freq_factor", &llama3_rope_scaling::low_freq_factor)
+        .def_readonly("high_freq_factor", &llama3_rope_scaling::high_freq_factor)
+        .def_readonly("original_max_position_embeddings", &llama3_rope_scaling::original_max_position_embeddings);
+
+    py::class_<rope_parameters>(m, "RopeParameters")
+        .def(
+            py::init([](double theta, double partial_rotary_factor, std::optional<llama3_rope_scaling> llama3_scaling) {
+                return rope_parameters{theta, partial_rotary_factor, llama3_scaling};
+            }),
+            py::kw_only(),
+            "theta"_a,
+            "partial_rotary_factor"_a = 1.0,
+            "llama3_scaling"_a = py::none()
+        )
+        .def_readonly("theta", &rope_parameters::theta)
+        .def_readonly("partial_rotary_factor", &rope_parameters::partial_rotary_factor)
+        .def_readonly("llama3_scaling", &rope_parameters::llama3_scaling);
+
+    py::class_<gemma4_config>(m, "Gemma4Config")
+        .def(
+            py::init([](std::int64_t vocab_size,
+                        std::int64_t hidden_size,
+                        std::int64_t n_heads,
+                        std::int64_t n_kv_heads,
+                        std::int64_t head_dim,
+                        std::int64_t global_n_kv_heads,
+                        std::int64_t global_head_dim,
+                        bool attention_k_eq_v,
+                        const std::vector<std::string>& layer_types,
+                        std::int64_t sliding_window,
+                        const rope_parameters& sliding_rope,
+                        const rope_parameters& full_rope,
+                        double rms_norm_eps,
+                        std::optional<double> final_logit_softcapping,
+                        std::int64_t num_kv_shared_layers,
+                        std::int64_t hidden_size_per_layer_input,
+                        bool enable_moe_block,
+                        std::int64_t top_k_experts) {
+                std::vector<gemma4_layer_type> types;
+                for (const std::string& name : layer_types) {
+                    types.push_back(layer_type(name));
+                }
+                return gemma4_config{
+                    vocab_size,
+                    hidden_size,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    global_n_kv_heads,
+                    global_head_dim,
+                    attention_k_eq_v,
+                    std::move(types),
+                    sliding_window,
+                    sliding_rope,
+                    full_rope,
+                    rms_norm_eps,
+                    final_logit_softcapping,
+                    num_kv_shared_layers,
+                    hidden_size_per_layer_input,
+                    enable_moe_block,
+                    top_k_experts,
+                };
+            }),
+            py::kw_only(),
+            "vocab_size"_a,
+            "hidden_size"_a,
+            "n_heads"_a,
+            "n_kv_heads"_a,
+            "head_dim"_a,
+            "global_n_kv_heads"_a,
+            "global_head_dim"_a,
+            "attention_k_eq_v"_a,
+            "layer_types"_a,
+            "sliding_window"_a,
+            "sliding_rope"_a,
+            "full_rope"_a,
+            "rms_norm_eps"_a,
+            "final_logit_softcapping"_a,
+            "num_kv_shared_layers"_a,
+            "hidden_size_per_layer_input"_a,
+            "enable_moe_block"_a,
+            "top_k_experts"_a
+        )
+        .def_property_readonly(
+            "layer_types",
+            [](const gemma4_config& c) {
+                std::vector<std::string> names;
+                for (gemma4_layer_type type : c.layer_types) {
+                    names.push_back(
+                        type == gemma4_layer_type::sliding_attention ? "sliding_attention" : "full_attention"
+                    );
+                }
+                return names;
+            }
+        )
+        .def_readonly("global_n_kv_heads", &gemma4_config::global_n_kv_heads)
+        .def_readonly("hidden_size_per_layer_input", &gemma4_config::hidden_size_per_layer_input)
+        .def_readonly("sliding_rope", &gemma4_config::sliding_rope)
+        .def_readonly("full_rope", &gemma4_config::full_rope);
+
+    py::class_<qwen3_5_config>(m, "Qwen3_5Config")
+        .def(
+            py::init([](std::int64_t vocab_size,
+                        std::int64_t hidden_size,
+                        const std::vector<std::string>& layer_types,
+                        std::int64_t n_heads,
+                        std::int64_t n_kv_heads,
+                        std::int64_t head_dim,
+                        double rope_theta,
+                        double partial_rotary_factor,
+                        std::int64_t linear_n_key_heads,
+                        std::int64_t linear_n_value_heads,
+                        std::int64_t linear_key_head_dim,
+                        std::int64_t linear_value_head_dim,
+                        std::int64_t linear_conv_kernel,
+                        double rms_norm_eps,
+                        std::optional<std::pair<std::int64_t, std::int64_t>> fp8_weight_block) {
+                std::vector<qwen3_5_layer_type> types;
+                for (const std::string& name : layer_types) {
+                    types.push_back(qwen3_5_layer(name));
+                }
+                return qwen3_5_config{
+                    .vocab_size = vocab_size,
+                    .hidden_size = hidden_size,
+                    .layer_types = std::move(types),
+                    .n_heads = n_heads,
+                    .n_kv_heads = n_kv_heads,
+                    .head_dim = head_dim,
+                    .rope_theta = rope_theta,
+                    .partial_rotary_factor = partial_rotary_factor,
+                    .linear_n_key_heads = linear_n_key_heads,
+                    .linear_n_value_heads = linear_n_value_heads,
+                    .linear_key_head_dim = linear_key_head_dim,
+                    .linear_value_head_dim = linear_value_head_dim,
+                    .linear_conv_kernel = linear_conv_kernel,
+                    .rms_norm_eps = rms_norm_eps,
+                    .fp8_weight_block = fp8_weight_block.transform(
+                        [](const std::pair<std::int64_t, std::int64_t>& block) {
+                            return fp8_block{.n = block.first, .k = block.second};
+                        }
+                    ),
+                };
+            }),
+            py::kw_only(),
+            "vocab_size"_a,
+            "hidden_size"_a,
+            "layer_types"_a,
+            "n_heads"_a,
+            "n_kv_heads"_a,
+            "head_dim"_a,
+            "rope_theta"_a,
+            "partial_rotary_factor"_a,
+            "linear_n_key_heads"_a,
+            "linear_n_value_heads"_a,
+            "linear_key_head_dim"_a,
+            "linear_value_head_dim"_a,
+            "linear_conv_kernel"_a,
+            "rms_norm_eps"_a,
+            "fp8_weight_block"_a = py::none()
+        )
+        .def_property_readonly(
+            "fp8_weight_block",
+            [](const qwen3_5_config& c) {
+                return c.fp8_weight_block.transform([](const fp8_block& block) { return std::pair{block.n, block.k}; });
+            }
+        )
+        .def_property_readonly("layer_types", [](const qwen3_5_config& c) {
+            std::vector<std::string> names;
+            for (qwen3_5_layer_type type : c.layer_types) {
+                names.push_back(type == qwen3_5_layer_type::linear_attention ? "linear_attention" : "full_attention");
+            }
+            return names;
+        });
+
+    py::class_<qwen3_5_moe_config>(m, "Qwen3_5MoeConfig")
+        .def(
+            py::init([](std::int64_t vocab_size,
+                        std::int64_t hidden_size,
+                        const std::vector<std::string>& layer_types,
+                        std::int64_t n_heads,
+                        std::int64_t n_kv_heads,
+                        std::int64_t head_dim,
+                        double rope_theta,
+                        double partial_rotary_factor,
+                        std::int64_t linear_n_key_heads,
+                        std::int64_t linear_n_value_heads,
+                        std::int64_t linear_key_head_dim,
+                        std::int64_t linear_value_head_dim,
+                        std::int64_t linear_conv_kernel,
+                        double rms_norm_eps,
+                        std::int64_t num_experts_per_tok) {
+                std::vector<qwen3_5_layer_type> types;
+                for (const std::string& name : layer_types) {
+                    types.push_back(qwen3_5_layer(name));
+                }
+                return qwen3_5_moe_config{
+                    .vocab_size = vocab_size,
+                    .hidden_size = hidden_size,
+                    .layer_types = std::move(types),
+                    .n_heads = n_heads,
+                    .n_kv_heads = n_kv_heads,
+                    .head_dim = head_dim,
+                    .rope_theta = rope_theta,
+                    .partial_rotary_factor = partial_rotary_factor,
+                    .linear_n_key_heads = linear_n_key_heads,
+                    .linear_n_value_heads = linear_n_value_heads,
+                    .linear_key_head_dim = linear_key_head_dim,
+                    .linear_value_head_dim = linear_value_head_dim,
+                    .linear_conv_kernel = linear_conv_kernel,
+                    .rms_norm_eps = rms_norm_eps,
+                    .num_experts_per_tok = num_experts_per_tok,
+                };
+            }),
+            py::kw_only(),
+            "vocab_size"_a,
+            "hidden_size"_a,
+            "layer_types"_a,
+            "n_heads"_a,
+            "n_kv_heads"_a,
+            "head_dim"_a,
+            "rope_theta"_a,
+            "partial_rotary_factor"_a,
+            "linear_n_key_heads"_a,
+            "linear_n_value_heads"_a,
+            "linear_key_head_dim"_a,
+            "linear_value_head_dim"_a,
+            "linear_conv_kernel"_a,
+            "rms_norm_eps"_a,
+            "num_experts_per_tok"_a
+        )
+        .def_readonly("num_experts_per_tok", &qwen3_5_moe_config::num_experts_per_tok)
+        .def_property_readonly("layer_types", [](const qwen3_5_moe_config& c) {
+            std::vector<std::string> names;
+            for (qwen3_5_layer_type type : c.layer_types) {
+                names.push_back(type == qwen3_5_layer_type::linear_attention ? "linear_attention" : "full_attention");
+            }
+            return names;
+        });
+
+    py::class_<qwen4_exp_config>(m, "Qwen4ExpConfig")
+        .def(
+            py::init([](std::int64_t vocab_size,
+                        std::int64_t hidden_size,
+                        const std::vector<std::string>& layer_types,
+                        std::int64_t n_heads,
+                        std::int64_t n_kv_heads,
+                        std::int64_t head_dim,
+                        double rope_theta,
+                        double partial_rotary_factor,
+                        std::int64_t linear_n_key_heads,
+                        std::int64_t linear_n_value_heads,
+                        std::int64_t linear_key_head_dim,
+                        std::int64_t linear_value_head_dim,
+                        std::int64_t linear_conv_kernel,
+                        const std::string& linear_output_gate,
+                        double rms_norm_eps,
+                        std::int64_t num_experts_per_tok,
+                        std::int64_t hc_count,
+                        std::vector<std::int64_t> ple_layers,
+                        std::int64_t ngram_size,
+                        std::int64_t eos_token_id,
+                        std::int64_t indexer_n_heads,
+                        std::int64_t indexer_head_dim,
+                        std::int64_t indexer_budget,
+                        std::int64_t indexer_compress_ratio) {
+                std::vector<qwen4_exp_layer_type> types;
+                for (const std::string& name : layer_types) {
+                    types.push_back(qwen4_exp_layer(name));
+                }
+                return qwen4_exp_config{
+                    .vocab_size = vocab_size,
+                    .hidden_size = hidden_size,
+                    .layer_types = std::move(types),
+                    .n_heads = n_heads,
+                    .n_kv_heads = n_kv_heads,
+                    .head_dim = head_dim,
+                    .rope_theta = rope_theta,
+                    .partial_rotary_factor = partial_rotary_factor,
+                    .linear_n_key_heads = linear_n_key_heads,
+                    .linear_n_value_heads = linear_n_value_heads,
+                    .linear_key_head_dim = linear_key_head_dim,
+                    .linear_value_head_dim = linear_value_head_dim,
+                    .linear_conv_kernel = linear_conv_kernel,
+                    .linear_output_gate = activation(linear_output_gate),
+                    .rms_norm_eps = rms_norm_eps,
+                    .num_experts_per_tok = num_experts_per_tok,
+                    .hc_count = hc_count,
+                    .ple_layers = std::move(ple_layers),
+                    .ngram_size = ngram_size,
+                    .eos_token_id = eos_token_id,
+                    .indexer_n_heads = indexer_n_heads,
+                    .indexer_head_dim = indexer_head_dim,
+                    .indexer_budget = indexer_budget,
+                    .indexer_compress_ratio = indexer_compress_ratio,
+                };
+            }),
+            py::kw_only(),
+            "vocab_size"_a,
+            "hidden_size"_a,
+            "layer_types"_a,
+            "n_heads"_a,
+            "n_kv_heads"_a,
+            "head_dim"_a,
+            "rope_theta"_a,
+            "partial_rotary_factor"_a,
+            "linear_n_key_heads"_a,
+            "linear_n_value_heads"_a,
+            "linear_key_head_dim"_a,
+            "linear_value_head_dim"_a,
+            "linear_conv_kernel"_a,
+            "linear_output_gate"_a,
+            "rms_norm_eps"_a,
+            "num_experts_per_tok"_a,
+            "hc_count"_a,
+            "ple_layers"_a,
+            "ngram_size"_a,
+            "eos_token_id"_a,
+            "indexer_n_heads"_a,
+            "indexer_head_dim"_a,
+            "indexer_budget"_a,
+            "indexer_compress_ratio"_a
+        )
+        .def_readonly("ple_layers", &qwen4_exp_config::ple_layers)
+        .def_property_readonly(
+            "layer_types",
+            [](const qwen4_exp_config& c) {
+                std::vector<std::string> names;
+                for (qwen4_exp_layer_type type : c.layer_types) {
+                    names.push_back(
+                        type == qwen4_exp_layer_type::linear_attention ? "linear_attention" : "indexed_attention"
+                    );
+                }
+                return names;
+            }
+        )
+        .def_readonly("eos_token_id", &qwen4_exp_config::eos_token_id);
 
     py::class_<request_handle>(m, "Request").def("take", &take_to_python).def("cancel", &request_handle::cancel);
 

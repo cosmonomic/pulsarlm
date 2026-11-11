@@ -5,13 +5,9 @@
 #include <cstdint>
 #include <variant>
 
-namespace pulsarlm {
+#include "pulsarlm/engine/model/fp8_block.hpp"
 
-// The weights one fp8 scale covers: n output rows by k input columns.
-struct fp8_block {
-    std::int64_t n;
-    std::int64_t k;
-};
+namespace pulsarlm {
 
 // y = x @ W^T over x's last dim, for a weight stored dense or quantized.
 class linear {

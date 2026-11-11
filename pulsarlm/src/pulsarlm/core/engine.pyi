@@ -1,7 +1,7 @@
 import enum
 from concurrent.futures import Future
 from collections.abc import Callable
-from typing import Protocol
+from typing import Literal, Protocol
 
 import torch
 from torch import Tensor
@@ -164,6 +164,158 @@ class EvictionReport:
     def layers(self) -> list[LayerScores]:
         """The layers whose pages hold attention mass."""
 
+class ModelConfig:
+    rope: RopeParameters
+    def __init__(
+        self,
+        *,
+        architecture: str,
+        vocab_size: int,
+        n_layers: int,
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        rope: RopeParameters,
+        rms_norm_eps: float,
+    ) -> None: ...
+
+class Llama3RopeScaling:
+    factor: float
+    low_freq_factor: float
+    high_freq_factor: float
+    original_max_position_embeddings: float
+    def __init__(
+        self,
+        *,
+        factor: float,
+        low_freq_factor: float,
+        high_freq_factor: float,
+        original_max_position_embeddings: float,
+    ) -> None: ...
+
+class RopeParameters:
+    """The first floor(partial_rotary_factor * head_dim / 2) rotate_half pairs
+    rotate; the others pass through."""
+
+    theta: float
+    partial_rotary_factor: float
+    llama3_scaling: Llama3RopeScaling | None
+    def __init__(
+        self,
+        *,
+        theta: float,
+        partial_rotary_factor: float = 1.0,
+        llama3_scaling: Llama3RopeScaling | None = None,
+    ) -> None: ...
+
+class Gemma4Config:
+    layer_types: list[str]
+    global_n_kv_heads: int
+    hidden_size_per_layer_input: int
+    sliding_rope: RopeParameters
+    full_rope: RopeParameters
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        hidden_size: int,
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        global_n_kv_heads: int,
+        global_head_dim: int,
+        attention_k_eq_v: bool,
+        layer_types: list[str],
+        sliding_window: int,
+        sliding_rope: RopeParameters,
+        full_rope: RopeParameters,
+        rms_norm_eps: float,
+        final_logit_softcapping: float | None,
+        num_kv_shared_layers: int,
+        hidden_size_per_layer_input: int,
+        enable_moe_block: bool,
+        top_k_experts: int,
+    ) -> None: ...
+
+class Qwen3_5Config:
+    layer_types: list[str]
+    fp8_weight_block: tuple[int, int] | None
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        hidden_size: int,
+        layer_types: list[str],
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        rope_theta: float,
+        partial_rotary_factor: float,
+        linear_n_key_heads: int,
+        linear_n_value_heads: int,
+        linear_key_head_dim: int,
+        linear_value_head_dim: int,
+        linear_conv_kernel: int,
+        rms_norm_eps: float,
+        fp8_weight_block: tuple[int, int] | None = None,
+    ) -> None: ...
+
+class Qwen3_5MoeConfig:
+    layer_types: list[str]
+    num_experts_per_tok: int
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        hidden_size: int,
+        layer_types: list[str],
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        rope_theta: float,
+        partial_rotary_factor: float,
+        linear_n_key_heads: int,
+        linear_n_value_heads: int,
+        linear_key_head_dim: int,
+        linear_value_head_dim: int,
+        linear_conv_kernel: int,
+        rms_norm_eps: float,
+        num_experts_per_tok: int,
+    ) -> None: ...
+
+class Qwen4ExpConfig:
+    layer_types: list[str]
+    ple_layers: list[int]
+    eos_token_id: int
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        hidden_size: int,
+        layer_types: list[str],
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        rope_theta: float,
+        partial_rotary_factor: float,
+        linear_n_key_heads: int,
+        linear_n_value_heads: int,
+        linear_key_head_dim: int,
+        linear_value_head_dim: int,
+        linear_conv_kernel: int,
+        linear_output_gate: Literal["silu", "sigmoid"],
+        rms_norm_eps: float,
+        num_experts_per_tok: int,
+        hc_count: int,
+        ple_layers: list[int],
+        ngram_size: int,
+        eos_token_id: int,
+        indexer_n_heads: int,
+        indexer_head_dim: int,
+        indexer_budget: int,
+        indexer_compress_ratio: int,
+    ) -> None: ...
+
 class Request:
     def take(
         self,
@@ -172,13 +324,15 @@ class Request:
         set by the take that first finds the request ended, None otherwise."""
     def cancel(self) -> None: ...
 
-type JSON = None | bool | int | float | str | list[JSON] | dict[str, JSON]
-
 class Engine:
     def __init__(
         self,
         store: PageStore,
-        config: dict[str, JSON],
+        config: ModelConfig
+        | Gemma4Config
+        | Qwen3_5Config
+        | Qwen3_5MoeConfig
+        | Qwen4ExpConfig,
         load_model_shard: Callable[[int, int], dict[str, Tensor]],
         *,
         devices: list[torch.device],
@@ -190,10 +344,10 @@ class Engine:
         stop_ids: list[int],
         prefill_tokens_per_step: int,
     ) -> None:
-        """Runs the model a checkpoint's config.json describes, split over devices:
-        load_model_shard(rank, len(devices)) gives rank's weights on devices[rank],
-        each rank loaded before the next. Each device's KV cache takes
-        kv_cache_gib. Raises ValueError for a model the engine does not run."""
+        """Runs the model of config split over devices: load_model_shard(rank,
+        len(devices)) gives rank's weights on devices[rank], each rank loaded
+        before the next. Each device's KV cache takes kv_cache_gib. Raises
+        ValueError for a model the engine does not split over devices."""
     def submit(
         self,
         initial_state: State,

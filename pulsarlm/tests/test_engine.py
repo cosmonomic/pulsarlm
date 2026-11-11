@@ -11,7 +11,9 @@ from pulsarlm.core.engine import (
     Engine,
     EvictionPolicy,
     LayerSequence,
+    ModelConfig,
     RequestError,
+    RopeParameters,
     State,
 )
 
@@ -27,18 +29,16 @@ DEVICE = torch.device("cuda", 0)
 DTYPE = torch.bfloat16
 LINE_BYTES = 2 * N_LAYERS * PAGE_SIZE * N_KV_HEADS * HEAD_DIM * DTYPE.itemsize
 
-CONFIG = {
-    "model_type": "qwen3",
-    "eos_token_id": 0,
-    "vocab_size": VOCAB_SIZE,
-    "hidden_size": HIDDEN,
-    "num_hidden_layers": N_LAYERS,
-    "num_attention_heads": N_HEADS,
-    "num_key_value_heads": N_KV_HEADS,
-    "head_dim": HEAD_DIM,
-    "rope_theta": 1e6,
-    "rms_norm_eps": 1e-6,
-}
+MODEL = ModelConfig(
+    architecture="qwen3",
+    n_layers=N_LAYERS,
+    n_heads=N_HEADS,
+    n_kv_heads=N_KV_HEADS,
+    head_dim=HEAD_DIM,
+    vocab_size=VOCAB_SIZE,
+    rope=RopeParameters(theta=1e6),
+    rms_norm_eps=1e-6,
+)
 
 
 def random_weights() -> dict[str, torch.Tensor]:
@@ -101,7 +101,7 @@ class FailingStore(MemoryStore):
 def make_engine(store: MemoryStore, store_pages: int = 0) -> Engine:
     return Engine(
         store,
-        CONFIG,
+        MODEL,
         lambda rank, size: random_weights(),
         model_name="random-qwen3",
         page_size=PAGE_SIZE,
@@ -285,7 +285,7 @@ def test_a_cache_without_a_line_or_a_negative_store_is_rejected(
     with pytest.raises(ValueError, match=message):
         Engine(
             MemoryStore(asyncio.new_event_loop()),
-            CONFIG,
+            MODEL,
             lambda rank, size: random_weights(),
             model_name="random-qwen3",
             page_size=PAGE_SIZE,

@@ -2,6 +2,7 @@
 
 #include "pulsarlm/engine/communicator.hpp"
 #include "pulsarlm/engine/model/interface.hpp"
+#include "pulsarlm/engine/model/qwen4_exp_config.hpp"
 #include "pulsarlm/kernels/ops.hpp"
 #include "pulsarlm/kernels/rope.hpp"
 
@@ -33,36 +34,6 @@
 // summed across the GPUs, and the logits gathered.
 
 namespace pulsarlm {
-
-enum class qwen4_exp_layer_type { linear_attention, indexed_attention };
-
-// Hugging Face's text config. ple_layers are zero-indexed.
-struct qwen4_exp_config {
-    std::int64_t vocab_size;
-    std::int64_t hidden_size;
-    std::vector<qwen4_exp_layer_type> layer_types;
-    std::int64_t n_heads;
-    std::int64_t n_kv_heads;
-    std::int64_t head_dim;
-    double rope_theta;
-    double partial_rotary_factor;
-    std::int64_t linear_n_key_heads;
-    std::int64_t linear_n_value_heads;
-    std::int64_t linear_key_head_dim;
-    std::int64_t linear_value_head_dim;
-    std::int64_t linear_conv_kernel;
-    gate_activation linear_output_gate;
-    double rms_norm_eps;
-    std::int64_t num_experts_per_tok;
-    std::int64_t hc_count;
-    std::vector<std::int64_t> ple_layers;
-    std::int64_t ngram_size;
-    std::int64_t eos_token_id;
-    std::int64_t indexer_n_heads;
-    std::int64_t indexer_head_dim;
-    std::int64_t indexer_budget;
-    std::int64_t indexer_compress_ratio;
-};
 
 // An indexed attention layer's KV layer also keeps each token's raw index key. A Gated DeltaNet layer keeps Qwen3.5's two
 // recurrent KV layers. A PLE layer then keeps two more: its convolution's

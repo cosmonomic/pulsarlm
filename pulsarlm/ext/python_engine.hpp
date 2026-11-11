@@ -44,7 +44,7 @@ class python_engine {
   public:
     // Builds the engine with load_model_shard, then sizes store's pool to its pages.
     python_engine(
-        const config_dict& model_config,
+        const any_model_config& model_config,
         const model_shard_loader& load_model_shard,
         const engine_config& config,
         std::unique_ptr<python_store>&& store

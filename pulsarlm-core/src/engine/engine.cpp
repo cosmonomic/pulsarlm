@@ -21,6 +21,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace pulsarlm {
@@ -225,24 +226,27 @@ struct engine::loaded_model {
 };
 
 engine::loaded_model engine::load_model(
-    const config_dict& model_config,
+    const any_model_config& model_config,
     const model_shard_loader& load_model_shard,
     std::span<const at::Device> devices
 ) {
     if (devices.empty()) {
         throw std::invalid_argument("an engine takes at least one device");
     }
-    any_model_config parsed = parse_model_config(model_config);
+    if (devices.size() > 1 && !std::holds_alternative<qwen3_5_config>(model_config) &&
+        !std::holds_alternative<qwen4_exp_config>(model_config)) {
+        throw std::invalid_argument("only Qwen3.5 and Qwen4-Exp models split across GPUs");
+    }
     std::vector<communicator> communicators = make_communicators(devices);
-    loaded_model loaded{.shards = {}, .vocab_size = pulsarlm::vocab_size(parsed)};
+    loaded_model loaded{.shards = {}, .vocab_size = pulsarlm::vocab_size(model_config)};
     for (std::size_t rank = 0; rank < devices.size(); rank++) {
-        loaded.shards.push_back(make_model(parsed, load_model_shard(rank, devices.size()), communicators[rank]));
+        loaded.shards.push_back(make_model(model_config, load_model_shard(rank, devices.size()), communicators[rank]));
     }
     return loaded;
 }
 
 engine::engine(
-    const config_dict& model_config,
+    const any_model_config& model_config,
     const model_shard_loader& load_model_shard,
     const engine_config& config,
     std::unique_ptr<page_store>&& store

@@ -41,7 +41,6 @@ class PulsarLMModelConfig:
     text: dict
     eos_ids: list[int]
     quantization: dict | None
-    raw: dict
 
     @classmethod
     def from_dict(cls, raw: dict) -> Self:
@@ -54,7 +53,6 @@ class PulsarLMModelConfig:
             text=raw["text_config"] if architecture in MULTIMODAL else raw,
             eos_ids=eos if isinstance(eos, list) else [eos],
             quantization=raw.get("quantization_config"),
-            raw=raw,
         )
 
     @property

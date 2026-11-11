@@ -31,7 +31,7 @@ void request_handle::cancel() noexcept {
 }
 
 python_engine::python_engine(
-    const config_dict& model_config,
+    const any_model_config& model_config,
     const model_shard_loader& load_model_shard,
     const engine_config& config,
     std::unique_ptr<python_store>&& store

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "pulsarlm/kernels/rope.hpp"
+#include "pulsarlm/kernels/rope_parameters.hpp"
 
 #include <cstdint>
 
