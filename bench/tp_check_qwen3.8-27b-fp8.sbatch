@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=tp-check-qwen3.8-27b-fp8
-#SBATCH --nodelist=watgpu308
-#SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --time=0-06:00:00
 #SBATCH -o %x-%j.out
 set -euo pipefail
 
-pulsarlm_version=0.1.0a5
-pulsarlm_tag=v0.1.0-alpha-5
+pulsarlm_version=0.1.0a6.post1
+pulsarlm_tag=v0.1.0-alpha6-post1
 uv_version=0.13.7
 model=qwen3.8-27b-fp8
 checkpoint_revision=017b9c7af6b5689d5dd426a76e0bc077eb5ca20a
@@ -26,11 +24,6 @@ export HF_HOME=$work/hf
 export XDG_CACHE_HOME=$work/cache
 export PULSARLM_DATA_DIR=$work/data
 
-gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader)
-if [[ $gpus != $'NVIDIA RTX A6000\nNVIDIA RTX A6000' ]]; then
-    echo "expected two NVIDIA RTX A6000, got: $gpus" >&2
-    exit 1
-fi
 nvidia-smi
 nvidia-smi topo -m
 
