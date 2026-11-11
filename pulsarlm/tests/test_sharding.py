@@ -14,6 +14,7 @@ from torch import Tensor
 
 from pulsarlm import checkpoint, sharding
 from pulsarlm.checkpoint import PulsarLMModelConfig, PulsarLMModelLoadingError
+from pulsarlm.safetensors_file import SafetensorsFile
 from pulsarlm.core.engine import Engine, State
 from pulsarlm.engine_model import engine_model
 
@@ -128,7 +129,8 @@ def write_files(directory: Path, weights: dict[str, Tensor]) -> list[Path]:
 def rank_parts(
     paths: list[Path], cfg: PulsarLMModelConfig, size: int
 ) -> list[dict[str, Tensor]]:
-    return [dict(sharding.rank_weights(paths, cfg, rank, size)) for rank in range(size)]
+    files = [SafetensorsFile.of_file(path) for path in paths]
+    return [dict(sharding.rank_weights(files, cfg, rank, size)) for rank in range(size)]
 
 
 def bytes_of(tensor: Tensor) -> Tensor:
@@ -242,7 +244,11 @@ def test_an_fp8_part_of_partial_blocks_is_rejected(tmp_path: Path):
     cfg = model_config(quantization=FP8 | {"weight_block_size": [128, 128]})
     paths = write_files(tmp_path, fp8_weights(cfg))
     with pytest.raises(PulsarLMModelLoadingError, match="whole blocks"):
-        list(sharding.rank_weights(paths, cfg, 0, 2))
+        list(
+            sharding.rank_weights(
+                [SafetensorsFile.of_file(p) for p in paths], cfg, 0, 2
+            )
+        )
 
 
 def test_qwen4_exp_splits_experts_and_the_n_gram_table_across_its_shards(
@@ -292,7 +298,11 @@ def test_an_architecture_without_a_split_is_rejected(tmp_path: Path):
     )
     paths = write_files(tmp_path, {"model.norm.weight": torch.ones(4)})
     with pytest.raises(PulsarLMModelLoadingError, match="do not split"):
-        list(sharding.rank_weights(paths, cfg, 0, 2))
+        list(
+            sharding.rank_weights(
+                [SafetensorsFile.of_file(p) for p in paths], cfg, 0, 2
+            )
+        )
 
 
 def write_archive(path: Path, cfg_raw: dict, weights: dict[str, Tensor]) -> list[Path]:
@@ -307,23 +317,21 @@ def write_archive(path: Path, cfg_raw: dict, weights: dict[str, Tensor]) -> list
     return paths
 
 
-def test_load_weights_reads_one_rank_s_part_of_an_archive(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+@pytest.mark.parametrize("form", ["archive", "directory"])
+def test_load_weights_reads_one_rank_s_part_of_a_model(tmp_path: Path, form: str):
     cfg = model_config()
     weights = qwen3_5_weights(cfg)
-    path = tmp_path / "model.pulsarlm"
-    paths = write_archive(
-        path,
-        {"model_type": "qwen3_5", "eos_token_id": 0, "text_config": QWEN3_5_TEXT},
-        weights,
-    )
-    with zipfile.ZipFile(path) as archive:
-        loaded = checkpoint.load_weights(
-            archive, device=torch.device("cpu"), shard=(1, 2)
-        )
-        whole = checkpoint.load_weights(archive, device=torch.device("cpu"))
+    raw = {"model_type": "qwen3_5", "eos_token_id": 0, "text_config": QWEN3_5_TEXT}
+    if form == "archive":
+        path = tmp_path / "model.pulsarlm"
+        paths = write_archive(path, raw, weights)
+    else:
+        path = tmp_path / "model"
+        (path / "weights").mkdir(parents=True)
+        paths = write_files(path / "weights", weights)
+        (path / "config.json").write_text(json.dumps(raw))
+    loaded = checkpoint.load_weights(path, device=torch.device("cpu"), shard=(1, 2))
+    whole = checkpoint.load_weights(path, device=torch.device("cpu"))
     expected = rank_parts(paths, cfg, 2)[1]
     assert loaded.keys() == expected.keys()
     assert all(torch.equal(loaded[name], expected[name]) for name in expected)

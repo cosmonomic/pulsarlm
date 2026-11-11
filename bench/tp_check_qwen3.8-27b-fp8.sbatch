@@ -8,8 +8,8 @@
 #SBATCH -o %x-%j.out
 set -euo pipefail
 
-pulsarlm_version=0.1.0a7
-pulsarlm_tag=v0.1.0-alpha-7
+pulsarlm_version=0.1.0a8
+pulsarlm_tag=v0.1.0-alpha-8
 uv_version=0.13.7
 model=qwen3.8-27b-fp8
 checkpoint_revision=017b9c7af6b5689d5dd426a76e0bc077eb5ca20a
@@ -45,8 +45,8 @@ if [[ ! -f $check ]]; then
     curl -fsSL "https://raw.githubusercontent.com/cosmonomic/pulsarlm/$pulsarlm_tag/bench/tp_check.py" -o "$check"
 fi
 
-if [[ ! -f $PULSARLM_DATA_DIR/$model.pulsarlm ]]; then
-    "$venv/bin/pulsarlm" download "$model" --revision "$checkpoint_revision"
+if [[ ! -d $PULSARLM_DATA_DIR/$model ]]; then
+    "$venv/bin/pulsarlm" models download "$model" --revision "$checkpoint_revision"
 fi
 rm -rf "$HF_HOME"
 

@@ -30,7 +30,9 @@ class DType(StrEnum):
     bfloat16 = "bfloat16"
 
 
-ModelName = Annotated[str, typer.Argument(help="The name of a .pulsarlm model.")]
+ModelName = Annotated[
+    str, typer.Argument(help="The name of a model directory or .pulsarlm archive.")
+]
 SearchedDataDir = Annotated[
     Path | None,
     typer.Option(
@@ -39,11 +41,11 @@ SearchedDataDir = Annotated[
         "data directories.",
     ),
 ]
-ArchiveDataDir = Annotated[
+NewModelDataDir = Annotated[
     Path | None,
     typer.Option(
         "--data_dir",
-        help="Where the archive goes. Defaults to PULSARLM_DATA_DIR, then the XDG data home.",
+        help="Where the model goes. Defaults to PULSARLM_DATA_DIR, then the XDG data home.",
     ),
 ]
 Device = Annotated[str, typer.Option(help="Torch device.")]
@@ -144,7 +146,7 @@ def _positive(value: float) -> float:
 def _known_model(model: str) -> str:
     if model not in REPOSITORIES:
         raise typer.BadParameter(
-            f"{model} is not a known model; `pulsarlm models` lists them."
+            f"{model} is not a known model; `pulsarlm models list` lists them."
         )
     return model
 
@@ -325,20 +327,39 @@ def chat(
         raise typer.Exit(1) from error
 
 
-@app.command()
-def models() -> None:
-    """List the models pulsarlm can download and their Hugging Face repositories."""
-    width = max(map(len, REPOSITORIES))
-    for model in REPOSITORIES:
-        typer.echo(f"{model:<{width}}  {repository_url(model)}")
+models = typer.Typer(
+    help="Download, list, pack and verify models.", add_completion=False
+)
+app.add_typer(models, name="models")
 
 
-@app.command()
-def download(
+@models.callback(invoke_without_command=True)
+def models_main(ctx: typer.Context, data_dir: SearchedDataDir = None) -> None:
+    """Without a command, list the models."""
+    if ctx.invoked_subcommand is None:
+        list_models(data_dir)
+
+
+@models.command("list")
+def list_models(data_dir: SearchedDataDir = None) -> None:
+    """List the models pulsarlm can download, their Hugging Face repositories and
+    their local copies, then the local models it cannot download."""
+    checkpoint = importlib.import_module("pulsarlm.checkpoint")
+    local = checkpoint.local_models(data_dir)
+    names = list(REPOSITORIES) + sorted(set(local) - set(REPOSITORIES))
+    width = max(map(len, names))
+    for name in names:
+        repository = repository_url(name) if name in REPOSITORIES else "-"
+        copies = ", ".join(str(path) for path in local.get(name, []))
+        typer.echo(f"{name:<{width}}  {repository}  {copies}".rstrip())
+
+
+@models.command("download")
+def download_model(
     model: Annotated[
         str,
         typer.Argument(
-            help="A model from `pulsarlm models`, such as qwen3-8b.",
+            help="A model from `pulsarlm models list`, such as qwen3-8b.",
             callback=_known_model,
         ),
     ],
@@ -349,39 +370,39 @@ def download(
     revision: Annotated[
         str | None, typer.Option(help="A branch, tag or commit of the repository.")
     ] = None,
-    data_dir: ArchiveDataDir = None,
+    data_dir: NewModelDataDir = None,
 ) -> None:
-    """Download a Hugging Face model and pack it into a .pulsarlm archive."""
+    """Download a Hugging Face model into a model directory. An interrupted
+    download resumes when run again."""
     # Imported here: torch takes seconds to load, which --help does not need.
     downloading = importlib.import_module("pulsarlm.download")
-    archive = downloading.download(
+    directory = downloading.download(
         model, name=name, revision=revision, data_dir=data_dir
     )
-    typer.secho(f"wrote {archive}", fg=typer.colors.GREEN)
+    typer.secho(f"wrote {directory}", fg=typer.colors.GREEN)
 
 
-@app.command()
-def migrate(
-    source: Annotated[
-        Path,
-        typer.Argument(
-            help="A Hugging Face checkpoint directory.",
-            exists=True,
-            file_okay=False,
-        ),
-    ],
-    name: Annotated[
-        str | None,
-        typer.Option(
-            help="The model's name in pulsarlm. Defaults to the directory's name, lowercased."
-        ),
-    ] = None,
-    data_dir: ArchiveDataDir = None,
-) -> None:
-    """Pack a Hugging Face checkpoint directory into a .pulsarlm archive."""
-    # Imported here: torch takes seconds to load, which --help does not need.
+@models.command("pack")
+def pack_model(model: ModelName, data_dir: SearchedDataDir = None) -> None:
+    """Pack a model directory into a .pulsarlm archive beside it."""
     checkpoint = importlib.import_module("pulsarlm.checkpoint")
-    migrating = importlib.import_module("pulsarlm.migrate")
-    archive = checkpoint.new_model_path(name or source.name.lower(), data_dir)
-    migrating.migrate(source, archive)
+    packing = importlib.import_module("pulsarlm.packing")
+    directory = checkpoint.model_path(model, data_dir)
+    if not directory.is_dir():
+        raise typer.BadParameter(f"{directory} is not a model directory")
+    archive = directory.with_name(model + checkpoint.ARCHIVE_SUFFIX)
+    if archive.exists():
+        raise typer.BadParameter(f"{archive} exists")
+    packing.pack(directory, archive)
     typer.secho(f"wrote {archive}", fg=typer.colors.GREEN)
+
+
+@models.command("verify")
+def verify_model(model: ModelName, data_dir: SearchedDataDir = None) -> None:
+    """Check every member of a model directory or archive against its size and
+    CRC-32."""
+    checkpoint = importlib.import_module("pulsarlm.checkpoint")
+    packing = importlib.import_module("pulsarlm.packing")
+    path = checkpoint.model_path(model, data_dir)
+    packing.verify(path)
+    typer.secho(f"{path} matches its checksums", fg=typer.colors.GREEN)

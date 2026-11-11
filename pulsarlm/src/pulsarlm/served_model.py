@@ -1,6 +1,5 @@
 """A model loaded with its engine and store, as the server and the terminal chat run it."""
 
-import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,8 +37,7 @@ def load_served_model(settings: Settings, path: Path) -> ServedModel:
         if tensor_parallel_size == 1
         else [torch.device("cuda", rank) for rank in range(tensor_parallel_size)]
     )
-    with zipfile.ZipFile(path, mode="r") as archive:
-        root = zipfile.Path(archive)
+    with checkpoint.model_root(path) as root:
         cfg = checkpoint.load_config(root)
         tokenizer = checkpoint.load_tokenizer(root)
         chat_template = checkpoint.load_chat_template(root)

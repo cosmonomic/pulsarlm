@@ -9,7 +9,6 @@ import statistics
 import subprocess
 import sys
 import time
-import zipfile
 from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -319,8 +318,8 @@ async def measure_turn(
 
 
 def load_tokenizer(model: str) -> Tokenizer:
-    with zipfile.ZipFile(checkpoint.model_path(model)) as archive:
-        return checkpoint.load_tokenizer(zipfile.Path(archive))
+    with checkpoint.model_root(checkpoint.model_path(model)) as root:
+        return checkpoint.load_tokenizer(root)
 
 
 def ended(last: dict[str, Any], *, max_context: int, max_tokens: int) -> bool:

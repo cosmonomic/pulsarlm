@@ -4,15 +4,12 @@ size equal parts of each split dimension, and every other weight whole."""
 
 import re
 from collections.abc import Iterator
-from contextlib import ExitStack
 from dataclasses import dataclass
-from pathlib import Path
-
-import safetensors
 import torch
 from torch import Tensor
 
 from pulsarlm.checkpoint import PulsarLMModelConfig, PulsarLMModelLoadingError
+from pulsarlm.safetensors_file import SafetensorsFile
 
 _SPLIT_ARCHITECTURES = ("qwen3_5", "qwen3_5_text", "qwen4_exp")
 _NGRAM_SHARD = re.compile(r"(.*ngram_embedding\.)shard_(\d+)\.weight")
@@ -199,7 +196,7 @@ def _read_vocab_rows(tensor_slice, rows: int, cut: _VocabRows) -> Tensor:
 
 
 def _read_table_rows(
-    shards: list[tuple[safetensors.safe_open, str]], first: int, last: int
+    shards: list[tuple[SafetensorsFile, str]], first: int, last: int
 ) -> Tensor:
     """Rows [first, last) of the table the shards make up, in order."""
     parts = []
@@ -215,49 +212,47 @@ def _read_table_rows(
 
 
 def rank_weights(
-    paths: list[Path],
+    files: list[SafetensorsFile],
     config: PulsarLMModelConfig,
     rank: int,
     size: int,
     unused_prefixes: tuple[str, ...] = (),
 ) -> Iterator[tuple[str, Tensor]]:
-    """GPU rank's part of each weight in the safetensors files at paths, on the
-    host, one at a time. A PLE layer's n-gram table is one shard_0 of its rows
-    of the table its shards make up."""
+    """GPU rank's part of each weight in files, on the host, one at a time. A PLE
+    layer's n-gram table is one shard_0 of its rows of the table its shards make
+    up."""
     if config.architecture not in _SPLIT_ARCHITECTURES:
         raise PulsarLMModelLoadingError(
             f"{config.architecture} models do not split across GPUs"
         )
     split = _Split(config=config, rank=rank, size=size)
-    with ExitStack() as files:
-        index = {}
-        for path in paths:
-            f = files.enter_context(safetensors.safe_open(path, framework="pt"))
-            for name in f.keys():
-                if not name.startswith(unused_prefixes):
-                    index[name] = f
-        tables: dict[str, list[tuple[int, str]]] = {}
-        for name, f in index.items():
-            if match := _NGRAM_SHARD.fullmatch(name):
-                tables.setdefault(match[1], []).append((int(match[2]), name))
-                continue
-            tensor_slice = f.get_slice(name)
-            shape = tensor_slice.get_shape()
-            base = name.removesuffix(_SCALE_SUFFIX)
-            if base != name and base in index:
-                cut = split.scale_cut(
-                    split.cut(base, index[base].get_slice(base).get_shape())
-                )
-            else:
-                cut = split.cut(name, shape)
-            if cut is None:
-                yield name, f.get_tensor(name)
-            elif isinstance(cut, _Ranges):
-                yield name, _read_ranges(tensor_slice, cut)
-            else:
-                yield name, _read_vocab_rows(tensor_slice, shape[0], cut)
-        for prefix, shards in tables.items():
-            ordered = [(index[name], name) for _, name in sorted(shards)]
-            total = sum(f.get_slice(name).get_shape()[0] for f, name in ordered)
-            first, last = split.part(total, "n-gram table rows")
-            yield prefix + "shard_0.weight", _read_table_rows(ordered, first, last)
+    index = {}
+    for f in files:
+        for name in f.keys():
+            if not name.startswith(unused_prefixes):
+                index[name] = f
+    tables: dict[str, list[tuple[int, str]]] = {}
+    for name, f in index.items():
+        if match := _NGRAM_SHARD.fullmatch(name):
+            tables.setdefault(match[1], []).append((int(match[2]), name))
+            continue
+        tensor_slice = f.get_slice(name)
+        shape = tensor_slice.get_shape()
+        base = name.removesuffix(_SCALE_SUFFIX)
+        if base != name and base in index:
+            cut = split.scale_cut(
+                split.cut(base, index[base].get_slice(base).get_shape())
+            )
+        else:
+            cut = split.cut(name, shape)
+        if cut is None:
+            yield name, f.get_tensor(name)
+        elif isinstance(cut, _Ranges):
+            yield name, _read_ranges(tensor_slice, cut)
+        else:
+            yield name, _read_vocab_rows(tensor_slice, shape[0], cut)
+    for prefix, shards in tables.items():
+        ordered = [(index[name], name) for _, name in sorted(shards)]
+        total = sum(f.get_slice(name).get_shape()[0] for f, name in ordered)
+        first, last = split.part(total, "n-gram table rows")
+        yield prefix + "shard_0.weight", _read_table_rows(ordered, first, last)

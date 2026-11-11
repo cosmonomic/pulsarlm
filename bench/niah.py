@@ -15,7 +15,6 @@ import subprocess
 import sys
 import time
 import uuid
-import zipfile
 from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -589,9 +588,8 @@ def run_server(
 
 
 def load_chat(model: str) -> tuple[Tokenizer, ChatTemplate]:
-    with zipfile.ZipFile(checkpoint.model_path(model)) as archive:
-        path = zipfile.Path(archive)
-        return checkpoint.load_tokenizer(path), checkpoint.load_chat_template(path)
+    with checkpoint.model_root(checkpoint.model_path(model)) as root:
+        return checkpoint.load_tokenizer(root), checkpoint.load_chat_template(root)
 
 
 def done_keys(results: Path) -> set[tuple[str, str, int, int]]:

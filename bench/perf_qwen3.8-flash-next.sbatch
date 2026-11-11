@@ -10,8 +10,8 @@
 #SBATCH -o %x-%j.out
 set -euo pipefail
 
-pulsarlm_version=0.1.0a7
-pulsarlm_tag=v0.1.0-alpha-7
+pulsarlm_version=0.1.0a8
+pulsarlm_tag=v0.1.0-alpha-8
 uv_version=0.13.7
 model=qwen3.8-flash-next
 checkpoint_revision=812d96e10a0dd82b69d749e68693698cf6c36daa
@@ -54,8 +54,8 @@ if [[ ! -f $perf ]]; then
     curl -fsSL "https://raw.githubusercontent.com/cosmonomic/pulsarlm/$pulsarlm_tag/bench/perf.py" -o "$perf"
 fi
 
-if [[ ! -f $PULSARLM_DATA_DIR/$model.pulsarlm ]]; then
-    "$venv/bin/pulsarlm" download "$model" --revision "$checkpoint_revision"
+if [[ ! -d $PULSARLM_DATA_DIR/$model ]]; then
+    "$venv/bin/pulsarlm" models download "$model" --revision "$checkpoint_revision"
 fi
 rm -rf "$HF_HOME"
 

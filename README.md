@@ -96,7 +96,7 @@ pip install pulsarlm
 
 # list and download implemented models
 pulsarlm models
-pulsarlm download gemma-4-e2b-it
+pulsarlm models download gemma-4-e2b-it
 
 # start a chat
 pulsarlm chat gemma-4-e2b-it

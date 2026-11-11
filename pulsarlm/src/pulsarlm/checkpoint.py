@@ -2,24 +2,30 @@ import hashlib
 import importlib
 import json
 import os
-import shutil
 import zipfile
 from collections.abc import Generator, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple, Self
 
-import safetensors
 import torch
 from tokenizers import Tokenizer
 
 from pulsarlm.chat import ChatTemplate
+from pulsarlm.safetensors_file import SafetensorsFile
 from torch import Tensor
-from xdg_base_dirs import xdg_cache_home, xdg_data_dirs, xdg_data_home
+from xdg_base_dirs import xdg_data_dirs, xdg_data_home
 
 
 class PulsarLMModelLoadingError(RuntimeError):
     pass
+
+
+CHECKSUMS = "checksums.json"
+ARCHIVE_SUFFIX = ".pulsarlm"
+
+type ModelRoot = Path | zipfile.Path
 
 
 DENSE = ("qwen2", "qwen3", "llama")
@@ -89,78 +95,111 @@ def iter_data_paths(data_dir: Path | None = None) -> Generator[Path]:
 
 
 def model_path(model: str, data_dir: Path | None = None) -> Path:
-    filename = f"{model}.pulsarlm"
+    """The model's directory, or its archive, in the first data path holding
+    either; the directory when one holds both."""
     for data_path in iter_data_paths(data_dir):
-        if (path := (data_path / filename)).exists():
-            return path
+        for path in (data_path / model, data_path / f"{model}{ARCHIVE_SUFFIX}"):
+            if path.exists():
+                return path
 
     raise PulsarLMModelLoadingError(f"model {model} not found")
 
 
+def local_models(data_dir: Path | None = None) -> dict[str, list[Path]]:
+    """Each model's directories and archives in the data paths, in search
+    order."""
+    found: dict[str, list[Path]] = {}
+    seen: set[Path] = set()
+    for data_path in iter_data_paths(data_dir):
+        if data_path in seen or not data_path.is_dir():
+            continue
+        seen.add(data_path)
+        for path in sorted(data_path.iterdir()):
+            if path.name.startswith("."):
+                continue
+            if path.is_dir() and (path / CHECKSUMS).exists():
+                found.setdefault(path.name, []).append(path)
+            elif path.is_file() and path.suffix == ARCHIVE_SUFFIX:
+                found.setdefault(path.stem, []).append(path)
+    return found
+
+
 def new_model_path(model: str, data_dir: Path | None = None) -> Path:
-    return next(iter_data_paths(data_dir)) / f"{model}.pulsarlm"
+    return next(iter_data_paths(data_dir)) / model
 
 
 def store_path(data_dir: Path | None = None) -> Path:
     return next(iter_data_paths(data_dir)) / "store.sqlite"
 
 
-def weights_version(path: Path) -> str:
+def member_checksums(path: Path) -> list[tuple[str, int, int]]:
+    """Each member's name, CRC-32 and size, from a directory's checksums.json or
+    an archive's zip records, sorted."""
+    if path.is_dir():
+        checksums = json.loads((path / CHECKSUMS).read_text())
+        return sorted(
+            (name, entry["crc32"], entry["size"]) for name, entry in checksums.items()
+        )
     with zipfile.ZipFile(path, mode="r") as archive:
-        members = sorted(
+        return sorted(
             (info.filename, info.CRC, info.file_size) for info in archive.infolist()
         )
-    return hashlib.sha256(json.dumps(members).encode()).hexdigest()[:16]
 
 
-def load_config(path: zipfile.Path) -> PulsarLMModelConfig:
+def weights_version(path: Path) -> str:
+    """The same for a model directory and the archive packed from it."""
+    return hashlib.sha256(json.dumps(member_checksums(path)).encode()).hexdigest()[:16]
+
+
+@contextmanager
+def model_root(path: Path) -> Iterator[ModelRoot]:
+    """The root of a model directory or archive, which its members are read
+    under."""
+    if path.is_dir():
+        yield path
+        return
+    with zipfile.ZipFile(path, mode="r") as archive:
+        yield zipfile.Path(archive)
+
+
+def weight_files(path: Path) -> list[SafetensorsFile]:
+    """The weights/*.safetensors of a model directory or archive, read in
+    place."""
+    if path.is_dir():
+        return [
+            SafetensorsFile.of_file(file)
+            for file in sorted((path / "weights").glob("*.safetensors"))
+        ]
+    with zipfile.ZipFile(path, mode="r") as archive:
+        infos = sorted(archive.infolist(), key=lambda info: info.filename)
+    return [
+        SafetensorsFile.of_member(path, info)
+        for info in infos
+        if info.filename.startswith("weights/")
+        and info.filename.endswith(".safetensors")
+    ]
+
+
+def load_config(path: ModelRoot) -> PulsarLMModelConfig:
     with (path / "config.json").open("r") as f:
         raw = json.load(f)
     return PulsarLMModelConfig.from_dict(raw)
 
 
-def load_tokenizer(path: zipfile.Path) -> Tokenizer:
+def load_tokenizer(path: ModelRoot) -> Tokenizer:
     raw = (path / "tokenizer.json").read_text(encoding="utf-8")
     return Tokenizer.from_str(raw)
 
 
-def load_chat_template(path: zipfile.Path) -> ChatTemplate:
+def load_chat_template(path: ModelRoot) -> ChatTemplate:
     template = path / "chat_template.jinja"
     if not template.exists():
         raise PulsarLMModelLoadingError(
-            "the archive has no chat template; pack it again with pulsarlm download"
-            " or pulsarlm migrate"
+            "the model has no chat template; download it again with pulsarlm models"
+            " download"
         )
     tokenizer_config = json.loads((path / "tokenizer_config.json").read_text())
     return ChatTemplate(template.read_text(encoding="utf-8"), tokenizer_config)
-
-
-def get_shard_cache_dir(archive_path: Path) -> Path:
-    "get or create cache dir for shards, including a tmp dir for atomic extraction"
-    stat = archive_path.stat()
-    key = hashlib.sha256(
-        f"{archive_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}".encode()
-    ).hexdigest()[:16]
-    cache_dir = xdg_cache_home() / "pulsarlm" / "shards" / key
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir.resolve()
-
-
-def cache_shard(shard_path: zipfile.Path, cache_dir: Path) -> Path:
-    if (cached_path := cache_dir / shard_path.name).exists():
-        return cached_path
-
-    tmp_path = cached_path.with_suffix(cached_path.suffix + ".tmp")
-
-    with (
-        shard_path.open("rb") as fsrc,
-        tmp_path.open("wb") as fdst,
-    ):
-        shutil.copyfileobj(fsrc, fdst)
-
-    tmp_path.replace(cached_path)
-
-    return cached_path
 
 
 def quantized(name: str, tensor: Tensor) -> bool:
@@ -171,7 +210,7 @@ def quantized(name: str, tensor: Tensor) -> bool:
 
 
 def load_weights(
-    archive: zipfile.ZipFile,
+    path: Path,
     *,
     device: torch.device,
     dtype: torch.dtype | None = None,
@@ -181,20 +220,15 @@ def load_weights(
     """With shard (rank, size) of more than one GPU, GPU rank's part of the
     weights (pulsarlm.sharding), read without the rest. Each tensor reaches the
     device before the next is read."""
-    assert archive.filename is not None
-    cache_dir = get_shard_cache_dir(Path(archive.filename))
-    paths = [
-        cache_shard(shard_path, cache_dir)
-        for shard_path in zipfile.Path(archive, at="weights/").glob("*.safetensors")
-    ]
+    files = weight_files(path)
     rank, size = shard
     if size > 1:
         sharding = importlib.import_module("pulsarlm.sharding")
-        host = sharding.rank_weights(
-            paths, load_config(zipfile.Path(archive)), rank, size, unused_prefixes
-        )
+        with model_root(path) as root:
+            config = load_config(root)
+        host = sharding.rank_weights(files, config, rank, size, unused_prefixes)
     else:
-        host = whole_weights(paths, unused_prefixes)
+        host = whole_weights(files, unused_prefixes)
     return {
         name: tensor
         if quantized(name, tensor)
@@ -204,13 +238,12 @@ def load_weights(
 
 
 def whole_weights(
-    paths: list[Path], unused_prefixes: tuple[str, ...]
+    files: list[SafetensorsFile], unused_prefixes: tuple[str, ...]
 ) -> Iterator[tuple[str, Tensor]]:
-    for path in paths:
-        with safetensors.safe_open(path, framework="pt") as f:
-            for name in f.keys():
-                if not name.startswith(unused_prefixes):
-                    yield name, f.get_tensor(name)
+    for f in files:
+        for name in f.keys():
+            if not name.startswith(unused_prefixes):
+                yield name, f.get_tensor(name)
 
 
 def text_model_weights(
@@ -235,22 +268,21 @@ def load(
     dtype: torch.dtype | None = None,
     shard: tuple[int, int] = (0, 1),
 ) -> PulsarLMModel:
-    with zipfile.ZipFile(path, mode="r") as archive:
-        archive_path = zipfile.Path(archive)
-
-        config = load_config(archive_path)
-        tokenizer = load_tokenizer(archive_path)
-        chat_template = load_chat_template(archive_path)
-        weights = text_model_weights(
-            config.architecture,
-            load_weights(
-                archive,
-                device=device,
-                dtype=dtype,
-                unused_prefixes=UNUSED_PREFIXES.get(config.architecture, ()),
-                shard=shard,
-            ),
-        )
+    """The model directory or archive at path."""
+    with model_root(path) as root:
+        config = load_config(root)
+        tokenizer = load_tokenizer(root)
+        chat_template = load_chat_template(root)
+    weights = text_model_weights(
+        config.architecture,
+        load_weights(
+            path,
+            device=device,
+            dtype=dtype,
+            unused_prefixes=UNUSED_PREFIXES.get(config.architecture, ()),
+            shard=shard,
+        ),
+    )
 
     return PulsarLMModel(
         config=config,
