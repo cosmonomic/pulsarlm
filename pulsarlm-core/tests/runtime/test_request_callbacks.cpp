@@ -1,5 +1,5 @@
 #include "pulsarlm/digest.hpp"
-#include "pulsarlm/request_callbacks.hpp"
+#include "pulsarlm/engine/request_callbacks.hpp"
 
 #undef CHECK
 #include <catch2/catch_test_macros.hpp>

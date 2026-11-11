@@ -1,4 +1,4 @@
-#include "pulsarlm/model/llama.hpp"
+#include "pulsarlm/engine/model/llama.hpp"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAFunctions.h>

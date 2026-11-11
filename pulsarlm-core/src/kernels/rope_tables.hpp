@@ -1,6 +1,6 @@
 #pragma once
 
-#include "pulsarlm/rope.hpp"
+#include "pulsarlm/kernels/rope.hpp"
 
 #include <ATen/core/Tensor.h>
 

@@ -13,7 +13,7 @@
 #include <utility>
 
 #include "digest_bytes.hpp"
-#include "pulsarlm/host_copy.hpp"
+#include "pulsarlm/engine.hpp"
 
 namespace pulsarlm {
 

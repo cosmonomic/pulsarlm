@@ -1,4 +1,4 @@
-#include "pulsarlm/model/qwen3_5_moe.hpp"
+#include "pulsarlm/engine/model/qwen3_5_moe.hpp"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAFunctions.h>

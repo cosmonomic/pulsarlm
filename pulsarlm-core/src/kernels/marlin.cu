@@ -1,6 +1,6 @@
 #include "dequant_gemm_common.cuh"
 
-#include "pulsarlm/ops.hpp"
+#include "pulsarlm/kernels/ops.hpp"
 
 #include "mma.cuh"
 

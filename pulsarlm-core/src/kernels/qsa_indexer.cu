@@ -1,7 +1,7 @@
 #include "attn_common.cuh"
 
 #include "attn_tiles.cuh"
-#include "pulsarlm/ops.hpp"
+#include "pulsarlm/kernels/ops.hpp"
 
 #include <ATen/ATen.h>
 #include <ATen/Dispatch.h>

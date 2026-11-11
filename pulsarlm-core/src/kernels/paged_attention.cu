@@ -2,7 +2,7 @@
 
 #include "attn_tiles.cuh"
 #include "attn_tuning.hpp"
-#include "pulsarlm/ops.hpp"
+#include "pulsarlm/kernels/ops.hpp"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>

@@ -1,4 +1,4 @@
-#include "pulsarlm/line_allocator.hpp"
+#include "pulsarlm/engine/line_allocator.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 

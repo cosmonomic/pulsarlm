@@ -1,4 +1,4 @@
-#include "pulsarlm/model/gemma4.hpp"
+#include "pulsarlm/engine/model/gemma4.hpp"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAFunctions.h>

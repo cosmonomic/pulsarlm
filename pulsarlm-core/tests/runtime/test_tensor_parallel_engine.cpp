@@ -1,13 +1,13 @@
-#include "pulsarlm/communicator.hpp"
+#include "pulsarlm/engine/communicator.hpp"
 #include "pulsarlm/digest.hpp"
-#include "pulsarlm/engine.hpp"
-#include "pulsarlm/event_loop.hpp"
-#include "pulsarlm/host_copy.hpp"
-#include "pulsarlm/host_page_pool.hpp"
-#include "pulsarlm/kv_cache.hpp"
-#include "pulsarlm/model/qwen3_5.hpp"
-#include "pulsarlm/request_callbacks.hpp"
-#include "pulsarlm/scheduler.hpp"
+#include "pulsarlm/engine/engine.hpp"
+#include "pulsarlm/engine/event_loop.hpp"
+#include "pulsarlm/engine/host_copy.hpp"
+#include "pulsarlm/engine/host_page_pool.hpp"
+#include "pulsarlm/engine/kv_cache.hpp"
+#include "pulsarlm/engine/model/qwen3_5.hpp"
+#include "pulsarlm/engine/request_callbacks.hpp"
+#include "pulsarlm/engine/scheduler.hpp"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAFunctions.h>

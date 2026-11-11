@@ -1,4 +1,4 @@
-#include "pulsarlm/sampling.hpp"
+#include "pulsarlm/engine/sampling.hpp"
 
 #include <ATen/ATen.h>
 

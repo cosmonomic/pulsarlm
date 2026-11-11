@@ -1,7 +1,7 @@
 #pragma once
 
 #include "attn_params.cuh"
-#include "pulsarlm/rope.hpp"
+#include "pulsarlm/kernels/rope.hpp"
 
 #include <ATen/core/Tensor.h>
 #include <ATen/cuda/CUDAContext.h>

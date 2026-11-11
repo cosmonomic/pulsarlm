@@ -1,4 +1,4 @@
-#include "pulsarlm/event_loop.hpp"
+#include "pulsarlm/engine/event_loop.hpp"
 
 #include <cuda_runtime_api.h>
 

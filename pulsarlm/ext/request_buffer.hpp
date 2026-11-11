@@ -8,7 +8,7 @@
 #include <optional>
 #include <vector>
 
-#include "pulsarlm/request_callbacks.hpp"
+#include "pulsarlm/engine.hpp"
 #include "wake_fd.hpp"
 
 namespace pulsarlm {

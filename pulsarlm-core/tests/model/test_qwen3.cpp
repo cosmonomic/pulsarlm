@@ -1,4 +1,4 @@
-#include "pulsarlm/model/qwen3.hpp"
+#include "pulsarlm/engine/model/qwen3.hpp"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAFunctions.h>

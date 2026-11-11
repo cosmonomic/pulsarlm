@@ -1,8 +1,8 @@
-#include "pulsarlm/kv_cache.hpp"
+#include "pulsarlm/engine/kv_cache.hpp"
 #include "pulsarlm/digest.hpp"
-#include "pulsarlm/event_loop.hpp"
-#include "pulsarlm/host_copy.hpp"
-#include "pulsarlm/host_page_pool.hpp"
+#include "pulsarlm/engine/event_loop.hpp"
+#include "pulsarlm/engine/host_copy.hpp"
+#include "pulsarlm/engine/host_page_pool.hpp"
 
 #include <ATen/ATen.h>
 #include <ATen/core/CachingHostAllocator.h>

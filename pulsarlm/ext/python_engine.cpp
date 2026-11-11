@@ -7,9 +7,7 @@
 #include <stdexcept>
 #include <utility>
 
-#include "pulsarlm/model/llama.hpp"
-#include "pulsarlm/model/qwen2.hpp"
-#include "pulsarlm/model/qwen3.hpp"
+#include "pulsarlm/engine.hpp"
 
 namespace pulsarlm {
 

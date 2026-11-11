@@ -1,4 +1,4 @@
-#include "pulsarlm/host_page_pool.hpp"
+#include "pulsarlm/engine/host_page_pool.hpp"
 
 #include <ATen/ATen.h>
 #include <cuda_runtime_api.h>

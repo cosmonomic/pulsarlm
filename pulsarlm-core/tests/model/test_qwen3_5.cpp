@@ -1,5 +1,5 @@
-#include "pulsarlm/communicator.hpp"
-#include "pulsarlm/model/qwen3_5.hpp"
+#include "pulsarlm/engine/communicator.hpp"
+#include "pulsarlm/engine/model/qwen3_5.hpp"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAFunctions.h>

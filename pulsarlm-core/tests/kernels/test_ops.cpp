@@ -1,5 +1,5 @@
-#include "pulsarlm/ops.hpp"
-#include "pulsarlm/rope.hpp"
+#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/rope.hpp"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAFunctions.h>

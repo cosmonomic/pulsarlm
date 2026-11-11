@@ -1,6 +1,6 @@
-#include "pulsarlm/model/qwen4_exp.hpp"
+#include "pulsarlm/engine/model/qwen4_exp.hpp"
 
-#include "pulsarlm/communicator.hpp"
+#include "pulsarlm/engine/communicator.hpp"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAFunctions.h>

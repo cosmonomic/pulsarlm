@@ -1,4 +1,4 @@
-#include "pulsarlm/ops.hpp"
+#include "pulsarlm/kernels/ops.hpp"
 #include "rope_tables.hpp"
 
 #include <ATen/ATen.h>

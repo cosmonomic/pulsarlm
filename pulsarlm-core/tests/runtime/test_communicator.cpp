@@ -1,4 +1,4 @@
-#include "pulsarlm/communicator.hpp"
+#include "pulsarlm/engine/communicator.hpp"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAFunctions.h>
