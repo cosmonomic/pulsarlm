@@ -1,7 +1,5 @@
 #include "pulsarlm/digest.hpp"
 #include "pulsarlm/engine/event_loop.hpp"
-#include "pulsarlm/engine/host_copy.hpp"
-#include "pulsarlm/engine/host_page_pool.hpp"
 #include "pulsarlm/engine/kv_cache.hpp"
 #include "pulsarlm/engine/model/interface.hpp"
 #include "pulsarlm/engine/model/paged_forward.hpp"
@@ -9,6 +7,7 @@
 #include "pulsarlm/engine/scheduler.hpp"
 
 #include <ATen/ATen.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 
 #undef CHECK
@@ -96,10 +95,50 @@ struct store_contents {
     std::vector<std::pair<std::uint64_t, digest>> owners;
 };
 
-// Keeps every page it is put, copied into its host pool.
+std::size_t page_bytes_of(const sharded_page& p) {
+    std::size_t bytes = 0;
+    for (const pulsarlm::page_shard& shard : p.shards) {
+        bytes = std::max(bytes, shard.host_offset + static_cast<std::size_t>(shard.bytes.numel()));
+    }
+    return bytes;
+}
+
+// Pageable copies of sources, each shard into its bytes of the page on streams[shard.cache_shard].
+std::vector<page> copy_pages_to_host(std::span<const sharded_page> sources, std::span<const cudaStream_t> streams) {
+    std::vector<page> pages;
+    pages.reserve(sources.size());
+    for (const sharded_page& source : sources) {
+        at::Tensor bytes = at::empty({static_cast<std::int64_t>(page_bytes_of(source))}, at::kByte);
+        for (const pulsarlm::page_shard& shard : source.shards) {
+            c10::cuda::CUDAStreamGuard guard(
+                c10::cuda::getStreamFromExternal(streams[shard.cache_shard], shard.bytes.device().index())
+            );
+            bytes.narrow(0, static_cast<std::int64_t>(shard.host_offset), shard.bytes.numel()).copy_(shard.bytes);
+        }
+        pages.push_back(page{.bytes = std::move(bytes)});
+    }
+    return pages;
+}
+
+// Copies each shard's bytes of pages[i] into the shards of targets[i] on streams[shard.cache_shard].
+void copy_pages_from_host(
+    std::span<const sharded_page> targets,
+    std::span<const page> pages,
+    std::span<const cudaStream_t> streams
+) {
+    for (std::size_t i = 0; i < targets.size(); i++) {
+        for (const pulsarlm::page_shard& shard : targets[i].shards) {
+            c10::cuda::CUDAStreamGuard guard(
+                c10::cuda::getStreamFromExternal(streams[shard.cache_shard], shard.bytes.device().index())
+            );
+            shard.bytes.copy_(pages[i].bytes.narrow(0, static_cast<std::int64_t>(shard.host_offset), shard.bytes.numel()));
+        }
+    }
+}
+
+// Keeps every page it is put, copied to pageable host memory.
 struct memory_store final : pulsarlm::page_store {
     std::shared_ptr<store_contents> contents = std::make_shared<store_contents>();
-    std::shared_ptr<pulsarlm::host_page_pool> host_pages;
 
     task<std::vector<bool>> fetch(
         std::span<const digest> hashes,
@@ -120,7 +159,7 @@ struct memory_store final : pulsarlm::page_store {
                 found_pages.push_back(it->second);
             }
         }
-        co_await pulsarlm::copy_from_host(*host_pages, found_targets, found_pages, streams);
+        copy_pages_from_host(found_targets, found_pages, streams);
         co_return found;
     }
 
@@ -136,12 +175,9 @@ struct memory_store final : pulsarlm::page_store {
         for (const pulsarlm::page_owner& owner : owners) {
             shared->owners.emplace_back(owner.request, put_keys[owner.page]);
         }
-        std::optional<std::vector<page>> copies = co_await pulsarlm::copy_to_host(*host_pages, sources, streams);
-        if (!copies) {
-            co_return std::unexpected(pulsarlm::page_error::oom);
-        }
+        std::vector<page> copies = copy_pages_to_host(sources, streams);
         for (std::size_t i = 0; i < put_keys.size(); i++) {
-            shared->pages.insert_or_assign(put_keys[i], std::move((*copies)[i]));
+            shared->pages.insert_or_assign(put_keys[i], std::move(copies[i]));
         }
         co_return {};
     }
@@ -398,15 +434,10 @@ pulsarlm::kv_cache make_cache(
     memory_store& store
 ) {
     std::vector<pulsarlm::page_shape> shapes = page_shapes(layers);
-    std::size_t host_page_bytes = 0;
     std::size_t lines_bytes = 0;
-    std::size_t largest = 0;
     for (const pulsarlm::page_shape& shape : shapes) {
-        host_page_bytes += 64 * pulsarlm::line_bytes(shape);
         lines_bytes += n_lines * pulsarlm::line_bytes(shape);
-        largest = std::max(largest, pulsarlm::line_bytes(shape));
     }
-    store.host_pages = std::make_shared<pulsarlm::host_page_pool>(host_page_bytes, largest);
     return pulsarlm::kv_cache(shapes, pool_bytes.value_or(lines_bytes), at::Device(at::kCUDA, 0), store);
 }
 

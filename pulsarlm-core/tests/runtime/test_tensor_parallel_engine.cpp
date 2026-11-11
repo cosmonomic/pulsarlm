@@ -2,8 +2,6 @@
 #include "pulsarlm/digest.hpp"
 #include "pulsarlm/engine/engine.hpp"
 #include "pulsarlm/engine/event_loop.hpp"
-#include "pulsarlm/engine/host_copy.hpp"
-#include "pulsarlm/engine/host_page_pool.hpp"
 #include "pulsarlm/engine/kv_cache.hpp"
 #include "pulsarlm/engine/model/qwen3_5.hpp"
 #include "pulsarlm/engine/request_callbacks.hpp"
@@ -11,6 +9,7 @@
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAFunctions.h>
+#include <c10/cuda/CUDAGuard.h>
 
 #undef CHECK
 #include <catch2/catch_test_macros.hpp>
@@ -234,10 +233,50 @@ struct store_contents {
     std::size_t fetched_pages = 0;
 };
 
+std::size_t page_bytes_of(const sharded_page& p) {
+    std::size_t bytes = 0;
+    for (const pulsarlm::page_shard& shard : p.shards) {
+        bytes = std::max(bytes, shard.host_offset + static_cast<std::size_t>(shard.bytes.numel()));
+    }
+    return bytes;
+}
+
+// Pageable copies of sources, each shard into its bytes of the page on streams[shard.cache_shard].
+std::vector<page> copy_pages_to_host(std::span<const sharded_page> sources, std::span<const cudaStream_t> streams) {
+    std::vector<page> pages;
+    pages.reserve(sources.size());
+    for (const sharded_page& source : sources) {
+        at::Tensor bytes = at::empty({static_cast<std::int64_t>(page_bytes_of(source))}, at::kByte);
+        for (const pulsarlm::page_shard& shard : source.shards) {
+            c10::cuda::CUDAStreamGuard guard(
+                c10::cuda::getStreamFromExternal(streams[shard.cache_shard], shard.bytes.device().index())
+            );
+            bytes.narrow(0, static_cast<std::int64_t>(shard.host_offset), shard.bytes.numel()).copy_(shard.bytes);
+        }
+        pages.push_back(page{.bytes = std::move(bytes)});
+    }
+    return pages;
+}
+
+// Copies each shard's bytes of pages[i] into the shards of targets[i] on streams[shard.cache_shard].
+void copy_pages_from_host(
+    std::span<const sharded_page> targets,
+    std::span<const page> pages,
+    std::span<const cudaStream_t> streams
+) {
+    for (std::size_t i = 0; i < targets.size(); i++) {
+        for (const pulsarlm::page_shard& shard : targets[i].shards) {
+            c10::cuda::CUDAStreamGuard guard(
+                c10::cuda::getStreamFromExternal(streams[shard.cache_shard], shard.bytes.device().index())
+            );
+            shard.bytes.copy_(pages[i].bytes.narrow(0, static_cast<std::int64_t>(shard.host_offset), shard.bytes.numel()));
+        }
+    }
+}
+
 // Keeps every page it is put, copied to the host; engines built on one contents share its pages.
 struct memory_store final : pulsarlm::page_store {
     std::shared_ptr<store_contents> contents;
-    std::shared_ptr<pulsarlm::host_page_pool> host_pages;
 
     task<std::vector<bool>> fetch(
         std::span<const digest> hashes,
@@ -258,7 +297,7 @@ struct memory_store final : pulsarlm::page_store {
             }
         }
         shared->fetched_pages += found_pages.size();
-        co_await pulsarlm::copy_from_host(*host_pages, found_targets, found_pages, streams);
+        copy_pages_from_host(found_targets, found_pages, streams);
         co_return found;
     }
 
@@ -270,12 +309,9 @@ struct memory_store final : pulsarlm::page_store {
         std::shared_ptr<store_contents> shared = contents;
         std::vector<digest> put_keys = std::move(keys);
         std::vector<sharded_page> sources = std::move(pages);
-        std::optional<std::vector<page>> copies = co_await pulsarlm::copy_to_host(*host_pages, sources, streams);
-        if (!copies) {
-            co_return std::unexpected(pulsarlm::page_error::oom);
-        }
+        std::vector<page> copies = copy_pages_to_host(sources, streams);
         for (std::size_t i = 0; i < put_keys.size(); i++) {
-            shared->pages.insert_or_assign(put_keys[i], std::move((*copies)[i]));
+            shared->pages.insert_or_assign(put_keys[i], std::move(copies[i]));
         }
         co_return {};
     }
@@ -356,7 +392,6 @@ std::unique_ptr<pulsarlm::engine> make_engine(
     }
     auto store = std::make_unique<memory_store>();
     store->contents = contents;
-    store->host_pages = std::make_shared<pulsarlm::host_page_pool>(std::size_t{256} << 20, std::size_t{1} << 20);
     return std::make_unique<pulsarlm::engine>(std::move(shards), engine_config(shard_count), std::move(store));
 }
 

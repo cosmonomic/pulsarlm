@@ -101,7 +101,7 @@ class FailingStore(MemoryStore):
         raise ConnectionError("store unreachable")
 
 
-def make_engine(store: MemoryStore) -> Engine:
+def make_engine(store: MemoryStore, store_pages: int = 0) -> Engine:
     return Engine(
         store,
         MODEL,
@@ -110,7 +110,7 @@ def make_engine(store: MemoryStore) -> Engine:
         page_size=PAGE_SIZE,
         kv_dtype=DTYPE,
         kv_cache_gib=64 * LINE_BYTES / 2**30,
-        store_gib=0,
+        store_gib=store_pages * LINE_BYTES / 2**30,
         device=DEVICE,
         stop_ids=[],
         prefill_tokens_per_step=64,
@@ -172,10 +172,11 @@ def test_page_digests_are_the_page_hashes_of_the_end_state():
     asyncio.run(main())
 
 
-def test_another_engine_continues_a_state_from_the_store():
+@pytest.mark.parametrize("store_pages", [0, 1, 64])
+def test_another_engine_continues_a_state_from_the_store(store_pages: int):
     async def main():
         store = MemoryStore(asyncio.get_running_loop())
-        first = make_engine(store)
+        first = make_engine(store, store_pages)
         sampled, _, reached = await run(
             first, first.submit(State(), PROMPT, max_tokens=8)
         )
@@ -186,7 +187,7 @@ def test_another_engine_continues_a_state_from_the_store():
             first, first.submit(reached, follow_up, max_tokens=8)
         )
 
-        second = make_engine(store)
+        second = make_engine(store, store_pages)
         continued, _, end = await run(
             second, second.submit(reached, follow_up, max_tokens=8)
         )
@@ -194,6 +195,31 @@ def test_another_engine_continues_a_state_from_the_store():
         assert store.fetched_hashes == second.page_keys(reached)
         assert continued == expected
         assert isinstance(end, State)
+
+    asyncio.run(main())
+
+
+def test_pages_past_the_room_of_the_store_pool_are_pageable():
+    async def main():
+        store = MemoryStore(asyncio.get_running_loop())
+        engine = make_engine(store, store_pages=1)
+        await run(engine, engine.submit(State(), PROMPT, max_tokens=8))
+
+        pinned = [page.is_pinned() for page in store.pages.values()]
+        assert True in pinned
+        assert False in pinned
+
+    asyncio.run(main())
+
+
+def test_a_store_pool_with_room_gives_pinned_pages():
+    async def main():
+        store = MemoryStore(asyncio.get_running_loop())
+        engine = make_engine(store, store_pages=64)
+        await run(engine, engine.submit(State(), PROMPT, max_tokens=8))
+
+        assert store.pages
+        assert all(page.is_pinned() for page in store.pages.values())
 
     asyncio.run(main())
 

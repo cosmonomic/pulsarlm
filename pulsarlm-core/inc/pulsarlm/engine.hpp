@@ -4,8 +4,6 @@
 #include "pulsarlm/engine/engine.hpp"
 #include "pulsarlm/engine/event_loop.hpp"
 #include "pulsarlm/engine/eviction.hpp"
-#include "pulsarlm/engine/host_copy.hpp"
-#include "pulsarlm/engine/host_page_pool.hpp"
 #include "pulsarlm/engine/kv_cache.hpp"
 #include "pulsarlm/engine/model/dense_config.hpp"
 #include "pulsarlm/engine/model/gemma4.hpp"

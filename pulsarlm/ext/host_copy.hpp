@@ -6,9 +6,8 @@
 #include <span>
 #include <vector>
 
-#include "pulsarlm/engine/event_loop.hpp"
-#include "pulsarlm/engine/host_page_pool.hpp"
-#include "pulsarlm/engine/kv_cache.hpp"
+#include "host_page_pool.hpp"
+#include "pulsarlm/engine.hpp"
 
 namespace pulsarlm {
 

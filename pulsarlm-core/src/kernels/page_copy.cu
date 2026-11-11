@@ -1,4 +1,4 @@
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/page_copy.hpp"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
