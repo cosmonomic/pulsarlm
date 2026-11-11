@@ -21,7 +21,6 @@ struct engine_config {
     std::size_t kv_cache_pool_bytes;
     std::vector<at::Device> devices;
     std::vector<std::int64_t> stop_ids;
-    std::size_t vocab_size;
     std::size_t prefill_tokens_per_step;
 };
 

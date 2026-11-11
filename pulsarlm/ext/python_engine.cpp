@@ -13,43 +13,6 @@ namespace pulsarlm {
 
 namespace py = pybind11;
 
-std::unique_ptr<model> make_model(
-    const any_model_config& any_config,
-    const std::unordered_map<std::string, at::Tensor>& weights,
-    const communicator& comm
-) {
-    c10::Dict<std::string, at::Tensor> weight_dict;
-    for (const auto& [name, tensor] : weights) {
-        weight_dict.insert(name, tensor);
-    }
-    if (const auto* qwen = std::get_if<qwen3_5_config>(&any_config)) {
-        return std::make_unique<qwen3_5_model>(*qwen, weight_dict, comm);
-    }
-    if (const auto* qwen = std::get_if<qwen4_exp_config>(&any_config)) {
-        return std::make_unique<qwen4_exp_model>(*qwen, weight_dict, comm);
-    }
-    if (comm.size() > 1) {
-        throw std::invalid_argument("only Qwen3.5 and Qwen4-Exp models split across GPUs");
-    }
-    if (const auto* gemma = std::get_if<gemma4_config>(&any_config)) {
-        return std::make_unique<gemma4_model>(*gemma, weight_dict);
-    }
-    if (const auto* qwen = std::get_if<qwen3_5_moe_config>(&any_config)) {
-        return std::make_unique<qwen3_5_moe_model>(*qwen, weight_dict);
-    }
-    const model_config& config = std::get<model_config>(any_config);
-    if (config.architecture == "qwen2") {
-        return std::make_unique<qwen2_model>(config.dense_model, weight_dict);
-    }
-    if (config.architecture == "qwen3") {
-        return std::make_unique<qwen3_model>(config.dense_model, weight_dict);
-    }
-    if (config.architecture == "llama") {
-        return std::make_unique<llama_model>(config.dense_model, weight_dict);
-    }
-    throw std::invalid_argument(std::format("unknown architecture {:?}", config.architecture));
-}
-
 request_handle::request_handle(std::shared_ptr<request_buffer> buffer) noexcept
 : buffer(std::move(buffer)) {}
 
@@ -68,12 +31,16 @@ void request_handle::cancel() noexcept {
 }
 
 python_engine::python_engine(
-    std::vector<std::unique_ptr<model>>&& shards,
+    const config_dict& model_config,
+    const model_shard_loader& load_model_shard,
     const engine_config& config,
-    std::unique_ptr<page_store>&& store
+    std::unique_ptr<python_store>&& store
 )
-: wake_signal(std::make_shared<wake_fd>()),
-  core_engine(std::make_unique<engine>(std::move(shards), config, std::move(store))) {}
+: wake_signal(std::make_shared<wake_fd>()) {
+    python_store& host_store = *store;
+    core_engine = std::make_unique<engine>(model_config, load_model_shard, config, std::move(store));
+    host_store.size_host_pages(core_engine->largest_page_bytes());
+}
 
 python_engine::~python_engine() {
     py::gil_scoped_release nogil;

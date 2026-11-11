@@ -35,68 +35,50 @@ py::tuple take_to_python(request_handle& handle) {
     return py::make_tuple(std::move(taken.tokens), py::cast(std::move(taken.cycle_ends)), std::move(end));
 }
 
-std::size_t vocab_size(const any_model_config& architecture_config) {
-    if (const auto* gemma = std::get_if<gemma4_config>(&architecture_config)) {
-        return static_cast<std::size_t>(gemma->vocab_size);
+// A JSON value from a Python object: None, a bool, an int, a float, a str, or a list or a dict with str keys of them.
+config_value to_config_value(const py::handle& object) {
+    if (object.is_none()) {
+        return {nullptr};
     }
-    if (const auto* qwen = std::get_if<qwen3_5_config>(&architecture_config)) {
-        return static_cast<std::size_t>(qwen->vocab_size);
+    if (py::isinstance<py::bool_>(object)) {
+        return {object.cast<bool>()};
     }
-    if (const auto* qwen = std::get_if<qwen3_5_moe_config>(&architecture_config)) {
-        return static_cast<std::size_t>(qwen->vocab_size);
+    if (py::isinstance<py::int_>(object)) {
+        return {object.cast<std::int64_t>()};
     }
-    if (const auto* qwen = std::get_if<qwen4_exp_config>(&architecture_config)) {
-        return static_cast<std::size_t>(qwen->vocab_size);
+    if (py::isinstance<py::float_>(object)) {
+        return {object.cast<double>()};
     }
-    return static_cast<std::size_t>(std::get<model_config>(architecture_config).dense_model.vocab_size);
+    if (py::isinstance<py::str>(object)) {
+        return {object.cast<std::string>()};
+    }
+    if (py::isinstance<py::list>(object) || py::isinstance<py::tuple>(object)) {
+        config_list list;
+        for (const py::handle& item : object) {
+            list.push_back(to_config_value(item));
+        }
+        return {std::move(list)};
+    }
+    if (py::isinstance<py::dict>(object)) {
+        config_dict dict;
+        for (const auto& [key, item] : object.cast<py::dict>()) {
+            if (!py::isinstance<py::str>(key)) {
+                throw py::type_error("a config's keys are strings, got " + py::repr(key).cast<std::string>());
+            }
+            dict.emplace(key.cast<std::string>(), to_config_value(item));
+        }
+        return {std::move(dict)};
+    }
+    throw py::type_error("a config holds None, bool, int, float, str, list and dict, got " + py::repr(object).cast<std::string>());
 }
 
-gemma4_layer_type layer_type(const std::string& name) {
-    if (name == "sliding_attention") {
-        return gemma4_layer_type::sliding_attention;
-    }
-    if (name == "full_attention") {
-        return gemma4_layer_type::full_attention;
-    }
-    throw std::invalid_argument("unknown Gemma 4 layer type " + name);
-}
-
-qwen3_5_layer_type qwen3_5_layer(const std::string& name) {
-    if (name == "linear_attention") {
-        return qwen3_5_layer_type::linear_attention;
-    }
-    if (name == "full_attention") {
-        return qwen3_5_layer_type::full_attention;
-    }
-    throw std::invalid_argument("unknown Qwen3.5 layer type " + name);
-}
-
-qwen4_exp_layer_type qwen4_exp_layer(const std::string& name) {
-    if (name == "linear_attention") {
-        return qwen4_exp_layer_type::linear_attention;
-    }
-    if (name == "indexed_attention") {
-        return qwen4_exp_layer_type::indexed_attention;
-    }
-    throw std::invalid_argument("unknown Qwen4-Exp layer type " + name);
-}
-
-gate_activation activation(const std::string& name) {
-    if (name == "silu") {
-        return gate_activation::silu;
-    }
-    if (name == "sigmoid") {
-        return gate_activation::sigmoid;
-    }
-    throw std::invalid_argument("unknown gate activation " + name);
-}
-
-// shards[s] runs on devices[s]; kv_cache_gib sizes each device's KV cache.
-std::unique_ptr<python_engine> make_sharded_engine(
+// Shard r of the model runs on devices[r] with the weights load_model_shard(r, len(devices)) returns; kv_cache_gib
+// sizes each device's KV cache.
+std::unique_ptr<python_engine> make_engine(
     py::object store,
-    std::vector<std::unique_ptr<model>>&& shards,
+    const py::dict& config,
+    py::object load_model_shard,
     std::vector<at::Device> devices,
-    std::size_t model_vocab_size,
     const std::string& model_name,
     std::size_t page_size,
     at::ScalarType kv_dtype,
@@ -108,131 +90,23 @@ std::unique_ptr<python_engine> make_sharded_engine(
     if (!(kv_cache_gib > 0.0) || !(store_gib >= 0.0)) {
         throw std::invalid_argument("kv_cache_gib must be positive and store_gib not negative");
     }
-    engine_config config{
-        model_name,
-        page_size,
-        kv_dtype,
-        static_cast<std::size_t>(kv_cache_gib * (1ull << 30)),
-        std::move(devices),
-        std::move(stop_ids),
-        model_vocab_size,
-        prefill_tokens_per_step,
+    config_dict model_config = std::get<config_dict>(to_config_value(config).value);
+    engine_config engine_settings{
+        .model_name = model_name,
+        .page_size = page_size,
+        .kv_dtype = kv_dtype,
+        .kv_cache_pool_bytes = static_cast<std::size_t>(kv_cache_gib * (1ull << 30)),
+        .devices = std::move(devices),
+        .stop_ids = std::move(stop_ids),
+        .prefill_tokens_per_step = prefill_tokens_per_step,
     };
-    std::size_t largest_page_bytes = 0;
-    std::vector<kv_layer> full_layers;
-    for (const kv_layer_shard& layer : shards.front()->kv_layer_shards()) {
-        full_layers.push_back(layer.full);
-    }
-    for (const page_shape& shape : page_shapes(config, full_layers)) {
-        largest_page_bytes = std::max(largest_page_bytes, line_bytes(shape));
-    }
-    auto adapter = std::make_unique<python_store>(
-        std::move(store),
-        static_cast<std::size_t>(store_gib * (1ull << 30)),
-        largest_page_bytes
-    );
+    auto adapter = std::make_unique<python_store>(std::move(store), static_cast<std::size_t>(store_gib * (1ull << 30)));
+    model_shard_loader loader = [&load_model_shard](std::size_t rank, std::size_t size) {
+        py::gil_scoped_acquire gil;
+        return load_model_shard(rank, size).cast<std::unordered_map<std::string, at::Tensor>>();
+    };
     py::gil_scoped_release nogil;
-    return std::make_unique<python_engine>(std::move(shards), config, std::move(adapter));
-}
-
-std::unique_ptr<python_engine> make_engine(
-    py::object store,
-    const any_model_config& architecture_config,
-    const std::unordered_map<std::string, at::Tensor>& weights,
-    const std::string& model_name,
-    std::size_t page_size,
-    at::ScalarType kv_dtype,
-    double kv_cache_gib,
-    double store_gib,
-    at::Device device,
-    std::vector<std::int64_t> stop_ids,
-    std::size_t prefill_tokens_per_step
-) {
-    std::vector<std::unique_ptr<model>> shards;
-    {
-        py::gil_scoped_release nogil;
-        shards.push_back(make_model(architecture_config, weights));
-    }
-    return make_sharded_engine(
-        std::move(store),
-        std::move(shards),
-        {device},
-        vocab_size(architecture_config),
-        model_name,
-        page_size,
-        kv_dtype,
-        kv_cache_gib,
-        store_gib,
-        std::move(stop_ids),
-        prefill_tokens_per_step
-    );
-}
-
-// Takes each model out of its handle, which an engine then holds; the devices are the models'.
-std::unique_ptr<python_engine> make_engine_from_models(
-    py::object store,
-    const std::vector<model_handle*>& models,
-    const std::string& model_name,
-    std::size_t page_size,
-    at::ScalarType kv_dtype,
-    double kv_cache_gib,
-    double store_gib,
-    std::vector<std::int64_t> stop_ids,
-    std::size_t prefill_tokens_per_step
-) {
-    if (models.empty()) {
-        throw std::invalid_argument("an engine takes at least one model");
-    }
-    std::vector<std::unique_ptr<model>> shards;
-    std::vector<at::Device> devices;
-    for (model_handle* handle : models) {
-        if (!handle->served_model) {
-            throw std::invalid_argument("a model another engine took");
-        }
-        devices.push_back(handle->device);
-    }
-    std::size_t model_vocab_size = models.front()->vocab_size;
-    for (model_handle* handle : models) {
-        shards.push_back(std::move(handle->served_model));
-    }
-    return make_sharded_engine(
-        std::move(store),
-        std::move(shards),
-        std::move(devices),
-        model_vocab_size,
-        model_name,
-        page_size,
-        kv_dtype,
-        kv_cache_gib,
-        store_gib,
-        std::move(stop_ids),
-        prefill_tokens_per_step
-    );
-}
-
-// The device of the weights on a CUDA device; a fp8 checkpoint's quantized weights stay on the host.
-at::Device cuda_device_of(const std::unordered_map<std::string, at::Tensor>& weights) {
-    for (const auto& [name, tensor] : weights) {
-        if (tensor.is_cuda()) {
-            return tensor.device();
-        }
-    }
-    throw std::invalid_argument("make_model: no weight is on a CUDA device");
-}
-
-std::unique_ptr<model_handle> make_model_handle(
-    const any_model_config& architecture_config,
-    const std::unordered_map<std::string, at::Tensor>& weights,
-    const communicator& comm
-) {
-    at::Device device = cuda_device_of(weights);
-    std::size_t model_vocab_size = vocab_size(architecture_config);
-    py::gil_scoped_release nogil;
-    return std::make_unique<model_handle>(model_handle{
-        .served_model = make_model(architecture_config, weights, comm),
-        .device = device,
-        .vocab_size = model_vocab_size,
-    });
+    return std::make_unique<python_engine>(model_config, loader, engine_settings, std::move(adapter));
 }
 
 }  // namespace
@@ -401,433 +275,16 @@ PYBIND11_MODULE(pulsarlm_core, m) {
         .def_readonly("cap_tokens", &eviction_report::cap_tokens)
         .def_readonly("layers", &eviction_report::layers);
 
-    py::class_<model_config>(m, "ModelConfig")
-        .def(
-            py::init([](std::string architecture,
-                        std::int64_t vocab_size,
-                        std::int64_t n_layers,
-                        std::int64_t n_heads,
-                        std::int64_t n_kv_heads,
-                        std::int64_t head_dim,
-                        const rope_parameters& rope,
-                        double rms_norm_eps) {
-                return model_config{
-                    .architecture = std::move(architecture),
-                    .dense_model = dense_config{
-                        .vocab_size = vocab_size,
-                        .n_layers = n_layers,
-                        .n_heads = n_heads,
-                        .n_kv_heads = n_kv_heads,
-                        .head_dim = head_dim,
-                        .rope = rope,
-                        .rms_norm_eps = rms_norm_eps,
-                    },
-                };
-            }),
-            py::kw_only(),
-            "architecture"_a,
-            "vocab_size"_a,
-            "n_layers"_a,
-            "n_heads"_a,
-            "n_kv_heads"_a,
-            "head_dim"_a,
-            "rope"_a,
-            "rms_norm_eps"_a
-        )
-        .def_property_readonly("rope", [](const model_config& c) { return c.dense_model.rope; });
-
-    py::class_<llama3_rope_scaling>(m, "Llama3RopeScaling")
-        .def(
-            py::init([](double factor,
-                        double low_freq_factor,
-                        double high_freq_factor,
-                        double original_max_position_embeddings) {
-                return llama3_rope_scaling{factor, low_freq_factor, high_freq_factor, original_max_position_embeddings};
-            }),
-            py::kw_only(),
-            "factor"_a,
-            "low_freq_factor"_a,
-            "high_freq_factor"_a,
-            "original_max_position_embeddings"_a
-        )
-        .def_readonly("factor", &llama3_rope_scaling::factor)
-        .def_readonly("low_freq_factor", &llama3_rope_scaling::low_freq_factor)
-        .def_readonly("high_freq_factor", &llama3_rope_scaling::high_freq_factor)
-        .def_readonly("original_max_position_embeddings", &llama3_rope_scaling::original_max_position_embeddings);
-
-    py::class_<rope_parameters>(m, "RopeParameters")
-        .def(
-            py::init([](double theta, double partial_rotary_factor, std::optional<llama3_rope_scaling> llama3_scaling) {
-                return rope_parameters{theta, partial_rotary_factor, llama3_scaling};
-            }),
-            py::kw_only(),
-            "theta"_a,
-            "partial_rotary_factor"_a = 1.0,
-            "llama3_scaling"_a = py::none()
-        )
-        .def_readonly("theta", &rope_parameters::theta)
-        .def_readonly("partial_rotary_factor", &rope_parameters::partial_rotary_factor)
-        .def_readonly("llama3_scaling", &rope_parameters::llama3_scaling);
-
-    py::class_<gemma4_config>(m, "Gemma4Config")
-        .def(
-            py::init([](std::int64_t vocab_size,
-                        std::int64_t hidden_size,
-                        std::int64_t n_heads,
-                        std::int64_t n_kv_heads,
-                        std::int64_t head_dim,
-                        std::int64_t global_n_kv_heads,
-                        std::int64_t global_head_dim,
-                        bool attention_k_eq_v,
-                        const std::vector<std::string>& layer_types,
-                        std::int64_t sliding_window,
-                        const rope_parameters& sliding_rope,
-                        const rope_parameters& full_rope,
-                        double rms_norm_eps,
-                        std::optional<double> final_logit_softcapping,
-                        std::int64_t num_kv_shared_layers,
-                        std::int64_t hidden_size_per_layer_input,
-                        bool enable_moe_block,
-                        std::int64_t top_k_experts) {
-                std::vector<gemma4_layer_type> types;
-                for (const std::string& name : layer_types) {
-                    types.push_back(layer_type(name));
-                }
-                return gemma4_config{
-                    vocab_size,
-                    hidden_size,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    global_n_kv_heads,
-                    global_head_dim,
-                    attention_k_eq_v,
-                    std::move(types),
-                    sliding_window,
-                    sliding_rope,
-                    full_rope,
-                    rms_norm_eps,
-                    final_logit_softcapping,
-                    num_kv_shared_layers,
-                    hidden_size_per_layer_input,
-                    enable_moe_block,
-                    top_k_experts,
-                };
-            }),
-            py::kw_only(),
-            "vocab_size"_a,
-            "hidden_size"_a,
-            "n_heads"_a,
-            "n_kv_heads"_a,
-            "head_dim"_a,
-            "global_n_kv_heads"_a,
-            "global_head_dim"_a,
-            "attention_k_eq_v"_a,
-            "layer_types"_a,
-            "sliding_window"_a,
-            "sliding_rope"_a,
-            "full_rope"_a,
-            "rms_norm_eps"_a,
-            "final_logit_softcapping"_a,
-            "num_kv_shared_layers"_a,
-            "hidden_size_per_layer_input"_a,
-            "enable_moe_block"_a,
-            "top_k_experts"_a
-        )
-        .def_property_readonly(
-            "layer_types",
-            [](const gemma4_config& c) {
-                std::vector<std::string> names;
-                for (gemma4_layer_type type : c.layer_types) {
-                    names.push_back(
-                        type == gemma4_layer_type::sliding_attention ? "sliding_attention" : "full_attention"
-                    );
-                }
-                return names;
-            }
-        )
-        .def_readonly("global_n_kv_heads", &gemma4_config::global_n_kv_heads)
-        .def_readonly("hidden_size_per_layer_input", &gemma4_config::hidden_size_per_layer_input)
-        .def_readonly("sliding_rope", &gemma4_config::sliding_rope)
-        .def_readonly("full_rope", &gemma4_config::full_rope);
-
-    py::class_<qwen3_5_config>(m, "Qwen3_5Config")
-        .def(
-            py::init([](std::int64_t vocab_size,
-                        std::int64_t hidden_size,
-                        const std::vector<std::string>& layer_types,
-                        std::int64_t n_heads,
-                        std::int64_t n_kv_heads,
-                        std::int64_t head_dim,
-                        double rope_theta,
-                        double partial_rotary_factor,
-                        std::int64_t linear_n_key_heads,
-                        std::int64_t linear_n_value_heads,
-                        std::int64_t linear_key_head_dim,
-                        std::int64_t linear_value_head_dim,
-                        std::int64_t linear_conv_kernel,
-                        double rms_norm_eps,
-                        std::optional<std::pair<std::int64_t, std::int64_t>> fp8_weight_block) {
-                std::vector<qwen3_5_layer_type> types;
-                for (const std::string& name : layer_types) {
-                    types.push_back(qwen3_5_layer(name));
-                }
-                return qwen3_5_config{
-                    .vocab_size = vocab_size,
-                    .hidden_size = hidden_size,
-                    .layer_types = std::move(types),
-                    .n_heads = n_heads,
-                    .n_kv_heads = n_kv_heads,
-                    .head_dim = head_dim,
-                    .rope_theta = rope_theta,
-                    .partial_rotary_factor = partial_rotary_factor,
-                    .linear_n_key_heads = linear_n_key_heads,
-                    .linear_n_value_heads = linear_n_value_heads,
-                    .linear_key_head_dim = linear_key_head_dim,
-                    .linear_value_head_dim = linear_value_head_dim,
-                    .linear_conv_kernel = linear_conv_kernel,
-                    .rms_norm_eps = rms_norm_eps,
-                    .fp8_weight_block = fp8_weight_block.transform(
-                        [](const std::pair<std::int64_t, std::int64_t>& block) {
-                            return fp8_block{.n = block.first, .k = block.second};
-                        }
-                    ),
-                };
-            }),
-            py::kw_only(),
-            "vocab_size"_a,
-            "hidden_size"_a,
-            "layer_types"_a,
-            "n_heads"_a,
-            "n_kv_heads"_a,
-            "head_dim"_a,
-            "rope_theta"_a,
-            "partial_rotary_factor"_a,
-            "linear_n_key_heads"_a,
-            "linear_n_value_heads"_a,
-            "linear_key_head_dim"_a,
-            "linear_value_head_dim"_a,
-            "linear_conv_kernel"_a,
-            "rms_norm_eps"_a,
-            "fp8_weight_block"_a = py::none()
-        )
-        .def_property_readonly(
-            "fp8_weight_block",
-            [](const qwen3_5_config& c) {
-                return c.fp8_weight_block.transform([](const fp8_block& block) { return std::pair{block.n, block.k}; });
-            }
-        )
-        .def_property_readonly("layer_types", [](const qwen3_5_config& c) {
-            std::vector<std::string> names;
-            for (qwen3_5_layer_type type : c.layer_types) {
-                names.push_back(type == qwen3_5_layer_type::linear_attention ? "linear_attention" : "full_attention");
-            }
-            return names;
-        });
-
-    py::class_<qwen3_5_moe_config>(m, "Qwen3_5MoeConfig")
-        .def(
-            py::init([](std::int64_t vocab_size,
-                        std::int64_t hidden_size,
-                        const std::vector<std::string>& layer_types,
-                        std::int64_t n_heads,
-                        std::int64_t n_kv_heads,
-                        std::int64_t head_dim,
-                        double rope_theta,
-                        double partial_rotary_factor,
-                        std::int64_t linear_n_key_heads,
-                        std::int64_t linear_n_value_heads,
-                        std::int64_t linear_key_head_dim,
-                        std::int64_t linear_value_head_dim,
-                        std::int64_t linear_conv_kernel,
-                        double rms_norm_eps,
-                        std::int64_t num_experts_per_tok) {
-                std::vector<qwen3_5_layer_type> types;
-                for (const std::string& name : layer_types) {
-                    types.push_back(qwen3_5_layer(name));
-                }
-                return qwen3_5_moe_config{
-                    .vocab_size = vocab_size,
-                    .hidden_size = hidden_size,
-                    .layer_types = std::move(types),
-                    .n_heads = n_heads,
-                    .n_kv_heads = n_kv_heads,
-                    .head_dim = head_dim,
-                    .rope_theta = rope_theta,
-                    .partial_rotary_factor = partial_rotary_factor,
-                    .linear_n_key_heads = linear_n_key_heads,
-                    .linear_n_value_heads = linear_n_value_heads,
-                    .linear_key_head_dim = linear_key_head_dim,
-                    .linear_value_head_dim = linear_value_head_dim,
-                    .linear_conv_kernel = linear_conv_kernel,
-                    .rms_norm_eps = rms_norm_eps,
-                    .num_experts_per_tok = num_experts_per_tok,
-                };
-            }),
-            py::kw_only(),
-            "vocab_size"_a,
-            "hidden_size"_a,
-            "layer_types"_a,
-            "n_heads"_a,
-            "n_kv_heads"_a,
-            "head_dim"_a,
-            "rope_theta"_a,
-            "partial_rotary_factor"_a,
-            "linear_n_key_heads"_a,
-            "linear_n_value_heads"_a,
-            "linear_key_head_dim"_a,
-            "linear_value_head_dim"_a,
-            "linear_conv_kernel"_a,
-            "rms_norm_eps"_a,
-            "num_experts_per_tok"_a
-        )
-        .def_readonly("num_experts_per_tok", &qwen3_5_moe_config::num_experts_per_tok)
-        .def_property_readonly("layer_types", [](const qwen3_5_moe_config& c) {
-            std::vector<std::string> names;
-            for (qwen3_5_layer_type type : c.layer_types) {
-                names.push_back(type == qwen3_5_layer_type::linear_attention ? "linear_attention" : "full_attention");
-            }
-            return names;
-        });
-
-    py::class_<qwen4_exp_config>(m, "Qwen4ExpConfig")
-        .def(
-            py::init([](std::int64_t vocab_size,
-                        std::int64_t hidden_size,
-                        const std::vector<std::string>& layer_types,
-                        std::int64_t n_heads,
-                        std::int64_t n_kv_heads,
-                        std::int64_t head_dim,
-                        double rope_theta,
-                        double partial_rotary_factor,
-                        std::int64_t linear_n_key_heads,
-                        std::int64_t linear_n_value_heads,
-                        std::int64_t linear_key_head_dim,
-                        std::int64_t linear_value_head_dim,
-                        std::int64_t linear_conv_kernel,
-                        const std::string& linear_output_gate,
-                        double rms_norm_eps,
-                        std::int64_t num_experts_per_tok,
-                        std::int64_t hc_count,
-                        std::vector<std::int64_t> ple_layers,
-                        std::int64_t ngram_size,
-                        std::int64_t eos_token_id,
-                        std::int64_t indexer_n_heads,
-                        std::int64_t indexer_head_dim,
-                        std::int64_t indexer_budget,
-                        std::int64_t indexer_compress_ratio) {
-                std::vector<qwen4_exp_layer_type> types;
-                for (const std::string& name : layer_types) {
-                    types.push_back(qwen4_exp_layer(name));
-                }
-                return qwen4_exp_config{
-                    .vocab_size = vocab_size,
-                    .hidden_size = hidden_size,
-                    .layer_types = std::move(types),
-                    .n_heads = n_heads,
-                    .n_kv_heads = n_kv_heads,
-                    .head_dim = head_dim,
-                    .rope_theta = rope_theta,
-                    .partial_rotary_factor = partial_rotary_factor,
-                    .linear_n_key_heads = linear_n_key_heads,
-                    .linear_n_value_heads = linear_n_value_heads,
-                    .linear_key_head_dim = linear_key_head_dim,
-                    .linear_value_head_dim = linear_value_head_dim,
-                    .linear_conv_kernel = linear_conv_kernel,
-                    .linear_output_gate = activation(linear_output_gate),
-                    .rms_norm_eps = rms_norm_eps,
-                    .num_experts_per_tok = num_experts_per_tok,
-                    .hc_count = hc_count,
-                    .ple_layers = std::move(ple_layers),
-                    .ngram_size = ngram_size,
-                    .eos_token_id = eos_token_id,
-                    .indexer_n_heads = indexer_n_heads,
-                    .indexer_head_dim = indexer_head_dim,
-                    .indexer_budget = indexer_budget,
-                    .indexer_compress_ratio = indexer_compress_ratio,
-                };
-            }),
-            py::kw_only(),
-            "vocab_size"_a,
-            "hidden_size"_a,
-            "layer_types"_a,
-            "n_heads"_a,
-            "n_kv_heads"_a,
-            "head_dim"_a,
-            "rope_theta"_a,
-            "partial_rotary_factor"_a,
-            "linear_n_key_heads"_a,
-            "linear_n_value_heads"_a,
-            "linear_key_head_dim"_a,
-            "linear_value_head_dim"_a,
-            "linear_conv_kernel"_a,
-            "linear_output_gate"_a,
-            "rms_norm_eps"_a,
-            "num_experts_per_tok"_a,
-            "hc_count"_a,
-            "ple_layers"_a,
-            "ngram_size"_a,
-            "eos_token_id"_a,
-            "indexer_n_heads"_a,
-            "indexer_head_dim"_a,
-            "indexer_budget"_a,
-            "indexer_compress_ratio"_a
-        )
-        .def_readonly("ple_layers", &qwen4_exp_config::ple_layers)
-        .def_property_readonly(
-            "layer_types",
-            [](const qwen4_exp_config& c) {
-                std::vector<std::string> names;
-                for (qwen4_exp_layer_type type : c.layer_types) {
-                    names.push_back(
-                        type == qwen4_exp_layer_type::linear_attention ? "linear_attention" : "indexed_attention"
-                    );
-                }
-                return names;
-            }
-        )
-        .def_readonly("eos_token_id", &qwen4_exp_config::eos_token_id);
-
-    py::class_<communicator>(m, "Communicator")
-        .def(py::init<>())
-        .def_static(
-            "make",
-            [](const std::vector<at::Device>& devices) { return communicator::make(devices); },
-            "devices"_a
-        )
-        .def_static("make_on_one_device", &communicator::make_on_one_device, "device"_a, "size"_a)
-        .def_property_readonly("rank", &communicator::rank)
-        .def_property_readonly("size", &communicator::size);
-
-    py::class_<model_handle>(m, "Model").def_property_readonly("device", [](const model_handle& handle) {
-        return handle.device;
-    });
-
-    m.def("make_model", &make_model_handle, "config"_a, "weights"_a, "communicator"_a);
-
     py::class_<request_handle>(m, "Request").def("take", &take_to_python).def("cancel", &request_handle::cancel);
 
     py::class_<python_engine>(m, "Engine")
         .def(
             py::init(&make_engine),
             "store"_a,
-            "model"_a,
-            "weights"_a,
+            "config"_a,
+            "load_model_shard"_a,
             py::kw_only(),
-            "model_name"_a,
-            "page_size"_a,
-            "kv_dtype"_a,
-            "kv_cache_gib"_a = 4.0,
-            "store_gib"_a,
-            "device"_a,
-            "stop_ids"_a,
-            "prefill_tokens_per_step"_a
-        )
-        .def(
-            py::init(&make_engine_from_models),
-            "store"_a,
-            py::kw_only(),
-            "models"_a,
+            "devices"_a,
             "model_name"_a,
             "page_size"_a,
             "kv_dtype"_a,

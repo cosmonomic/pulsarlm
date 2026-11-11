@@ -360,7 +360,6 @@ pulsarlm::engine_config engine_config(std::size_t shard_count) {
         .kv_cache_pool_bytes = std::size_t{64} << 20,
         .devices = std::vector<at::Device>(shard_count, at::Device(at::kCUDA, 0)),
         .stop_ids = {},
-        .vocab_size = vocab,
         .prefill_tokens_per_step = 32,
     };
 }
@@ -392,7 +391,7 @@ std::unique_ptr<pulsarlm::engine> make_engine(
     }
     auto store = std::make_unique<memory_store>();
     store->contents = contents;
-    return std::make_unique<pulsarlm::engine>(std::move(shards), engine_config(shard_count), std::move(store));
+    return std::make_unique<pulsarlm::engine>(std::move(shards), vocab, engine_config(shard_count), std::move(store));
 }
 
 struct served {

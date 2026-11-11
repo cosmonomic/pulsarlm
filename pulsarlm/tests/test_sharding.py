@@ -14,8 +14,7 @@ from torch import Tensor
 
 from pulsarlm import checkpoint, sharding
 from pulsarlm.checkpoint import PulsarLMModelConfig, PulsarLMModelLoadingError
-from pulsarlm.core.engine import Communicator, Engine, State, make_model
-from pulsarlm.engine_model import engine_model
+from pulsarlm.core.engine import Engine, State
 
 PREFIX = "model.language_model."
 QWEN3_5_TEXT = {
@@ -384,40 +383,37 @@ def test_an_engine_split_over_two_ranks_generates_what_one_gpu_does(
 
     async def main():
         loop = asyncio.get_running_loop()
+        settings = dict(
+            model_name="split-qwen3.5",
+            page_size=16,
+            kv_dtype=torch.float32,
+            kv_cache_gib=1 / 64,
+            store_gib=0.0,
+            stop_ids=[],
+            prefill_tokens_per_step=32,
+        )
         one_gpu = Engine(
             MemoryStore(loop),
-            engine_model(cfg),
-            {name: t.to(device) for name, t in weights.items()},
-            model_name="split-qwen3.5",
-            page_size=16,
-            kv_dtype=torch.float32,
-            kv_cache_gib=1 / 64,
-            store_gib=0.0,
-            device=device,
-            stop_ids=[],
-            prefill_tokens_per_step=32,
+            cfg.raw,
+            lambda rank, size: {name: t.to(device) for name, t in weights.items()},
+            devices=[device],
+            **settings,
         )
-        communicators = Communicator.make_on_one_device(device, 2)
-        models = [
-            make_model(
-                engine_model(cfg),
-                {name: t.to(device) for name, t in part.items()},
-                communicators[rank],
-            )
-            for rank, part in enumerate(parts)
-        ]
-        assert all(model.device == device for model in models)
+        loaded: list[int] = []
+
+        def load_model_shard(rank: int, size: int) -> dict[str, Tensor]:
+            assert size == 2
+            loaded.append(rank)
+            return {name: t.to(device) for name, t in parts[rank].items()}
+
         split = Engine(
             MemoryStore(loop),
-            models=models,
-            model_name="split-qwen3.5",
-            page_size=16,
-            kv_dtype=torch.float32,
-            kv_cache_gib=1 / 64,
-            store_gib=0.0,
-            stop_ids=[],
-            prefill_tokens_per_step=32,
+            cfg.raw,
+            load_model_shard,
+            devices=[device, device],
+            **settings,
         )
+        assert loaded == [0, 1]
         expected, expected_end = await generate(one_gpu, prompt, 12)
         tokens, end = await generate(split, prompt, 12)
         assert len(expected) == 12

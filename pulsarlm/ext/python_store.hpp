@@ -27,17 +27,21 @@ namespace pulsarlm {
 // memory past its room.
 class python_store final : public page_store {
     pybind11::object hooks;
-    host_page_pool host_pages;
+    std::size_t host_page_bytes;
+    std::optional<host_page_pool> host_pages;
 
     void
     start_fetch(std::span<const digest> hashes, external_task<std::vector<std::optional<page>>>::resolver&& resolver);
     std::vector<std::size_t> keep(std::span<const digest> hashes, std::span<const page_owner> owners);
 
   public:
-    // host_page_bytes sizes the pool; largest_page_bytes is the largest page it takes.
-    python_store(pybind11::object&& hooks, std::size_t host_page_bytes, std::size_t largest_page_bytes);
+    // host_page_bytes sizes the pool, which size_host_pages makes before the engine fetches or puts a page.
+    python_store(pybind11::object&& hooks, std::size_t host_page_bytes);
     python_store(const python_store&) = delete;
     python_store& operator=(const python_store&) = delete;
+
+    // Makes the pool, whose largest block holds largest_page_bytes.
+    void size_host_pages(std::size_t largest_page_bytes);
     ~python_store() override;
 
     task<std::vector<bool>> fetch(

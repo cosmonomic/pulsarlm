@@ -155,7 +155,6 @@ pulsarlm::engine_config config(std::size_t n_lines) {
         .kv_cache_pool_bytes = n_lines * line_bytes,
         .devices = {at::Device(at::kCUDA, 0)},
         .stop_ids = {},
-        .vocab_size = vocab,
         .prefill_tokens_per_step = 64,
     };
 }
@@ -180,7 +179,7 @@ TEST_CASE("an engine whose KV cache holds no line is rejected") {
     pulsarlm::engine_config sized = config(16);
     sized.kv_cache_pool_bytes = pulsarlm::line_bytes(pulsarlm::page_shapes(sized, one_layer)[0]) - 1;
     REQUIRE_THROWS_AS(
-        pulsarlm::engine(std::make_unique<successor_model>(), sized, std::make_unique<stalling_store>()),
+        pulsarlm::engine(std::make_unique<successor_model>(), vocab, sized, std::make_unique<stalling_store>()),
         std::invalid_argument
     );
 }
@@ -189,13 +188,13 @@ TEST_CASE("an engine whose bfloat16 attention the kernels cannot run is rejected
     pulsarlm::engine_config bfloat16 = config(16);
     bfloat16.kv_dtype = at::kBFloat16;
     REQUIRE_THROWS_AS(
-        pulsarlm::engine(std::make_unique<successor_model>(), bfloat16, std::make_unique<stalling_store>()),
+        pulsarlm::engine(std::make_unique<successor_model>(), vocab, bfloat16, std::make_unique<stalling_store>()),
         std::invalid_argument
     );
 }
 
 TEST_CASE("a submitted request passes its tokens and its end state to its callbacks") {
-    pulsarlm::engine e(std::make_unique<successor_model>(), config(16), std::make_unique<stalling_store>());
+    pulsarlm::engine e(std::make_unique<successor_model>(), vocab, config(16), std::make_unique<stalling_store>());
     auto recorded_results = std::make_shared<request_results>();
     e.submit(request{.tokens = {1, 2, 3}, .max_tokens = 4}, record_into(recorded_results));
     wait_for_end(*recorded_results);
@@ -216,7 +215,7 @@ TEST_CASE("a submitted request passes its tokens and its end state to its callba
 }
 
 TEST_CASE("submit rejects an invalid request without calling its callbacks") {
-    pulsarlm::engine e(std::make_unique<successor_model>(), config(16), std::make_unique<stalling_store>());
+    pulsarlm::engine e(std::make_unique<successor_model>(), vocab, config(16), std::make_unique<stalling_store>());
     auto recorded_results = std::make_shared<request_results>();
 
     REQUIRE_THROWS_AS(e.submit(request{}, record_into(recorded_results)), std::invalid_argument);
@@ -276,7 +275,7 @@ TEST_CASE("destroying the engine ends the requests it serves with loop_exited") 
     auto store = std::make_unique<stalling_store>();
     std::shared_ptr<std::latch> fetch_start_latch = store->fetch_start_latch;
     std::optional<pulsarlm::engine> e;
-    e.emplace(std::make_unique<successor_model>(), config(16), std::move(store));
+    e.emplace(std::make_unique<successor_model>(), vocab, config(16), std::move(store));
     auto recorded_results = std::make_shared<request_results>();
     e->submit(
         request{.initial_state = one_page_state(digest{.hi = 1, .lo = 2}, 0.0f), .tokens = {1}, .max_tokens = 1},
@@ -289,7 +288,7 @@ TEST_CASE("destroying the engine ends the requests it serves with loop_exited") 
 }
 
 TEST_CASE("a panic ends the requests with loop_exited and leaves its exception") {
-    pulsarlm::engine e(std::make_unique<failing_model>(), config(16), std::make_unique<stalling_store>());
+    pulsarlm::engine e(std::make_unique<failing_model>(), vocab, config(16), std::make_unique<stalling_store>());
     auto recorded_results = std::make_shared<request_results>();
     e.submit(request{.tokens = {1, 2, 3}, .max_tokens = 1}, record_into(recorded_results));
     wait_for_end(*recorded_results);

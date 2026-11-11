@@ -87,9 +87,13 @@ py::list owners_to_python(std::span<const page_owner> owners) {
 
 }  // namespace
 
-python_store::python_store(py::object&& hooks, std::size_t host_page_bytes, std::size_t largest_page_bytes)
+python_store::python_store(py::object&& hooks, std::size_t host_page_bytes)
 : hooks(std::move(hooks)),
-  host_pages(host_page_bytes, largest_page_bytes) {}
+  host_page_bytes(host_page_bytes) {}
+
+void python_store::size_host_pages(std::size_t largest_page_bytes) {
+    host_pages.emplace(host_page_bytes, largest_page_bytes);
+}
 
 python_store::~python_store() {
     if (hooks) {
@@ -116,7 +120,7 @@ task<std::vector<bool>> python_store::fetch(
             arrived.push_back(std::move(*pages[i]));
         }
     }
-    co_await copy_from_host(host_pages, targets, arrived, streams);
+    co_await copy_from_host(*host_pages, targets, arrived, streams);
     co_return found;
 }
 
@@ -164,7 +168,7 @@ task<std::expected<void, page_error>> python_store::put(
             kept_hashes.push_back(hashes[i]);
         }
     }
-    std::optional<std::vector<page>> copies = co_await copy_to_host(host_pages, sources, streams);
+    std::optional<std::vector<page>> copies = co_await copy_to_host(*host_pages, sources, streams);
     if (!copies) {
         co_return std::unexpected(page_error::oom);
     }

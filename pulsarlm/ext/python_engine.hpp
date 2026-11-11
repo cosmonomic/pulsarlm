@@ -13,34 +13,11 @@
 
 #include "pulsarlm/config.hpp"
 #include "pulsarlm/engine.hpp"
+#include "python_store.hpp"
 #include "request_buffer.hpp"
 #include "wake_fd.hpp"
 
 namespace pulsarlm {
-
-// architecture is "qwen2", "qwen3" or "llama".
-struct model_config {
-    std::string architecture;
-    dense_config dense_model;
-};
-
-using any_model_config = std::
-    variant<model_config, gemma4_config, qwen3_5_config, qwen3_5_moe_config, qwen4_exp_config>;
-
-// weights carry Hugging Face's names and are on the engine's device; they are comm's rank's slices when comm has more
-// than one rank, which only Qwen3.5 and Qwen4-Exp split across.
-std::unique_ptr<model> make_model(
-    const any_model_config& config,
-    const std::unordered_map<std::string, at::Tensor>& weights,
-    const communicator& comm = {}
-);
-
-// One rank's model as Python holds it until an engine takes it.
-struct model_handle {
-    std::unique_ptr<model> served_model;
-    at::Device device;
-    std::size_t vocab_size;
-};
 
 // Python's handle on a request. Dropping it cancels the request.
 class request_handle {
@@ -65,10 +42,12 @@ class python_engine {
     std::unique_ptr<engine> core_engine;
 
   public:
+    // Builds the engine with load_model_shard, then sizes store's pool to its pages.
     python_engine(
-        std::vector<std::unique_ptr<model>>&& shards,
+        const config_dict& model_config,
+        const model_shard_loader& load_model_shard,
         const engine_config& config,
-        std::unique_ptr<page_store>&& store
+        std::unique_ptr<python_store>&& store
     );
     python_engine(const python_engine&) = delete;
     python_engine& operator=(const python_engine&) = delete;

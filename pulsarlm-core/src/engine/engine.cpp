@@ -1,11 +1,13 @@
 #include "pulsarlm/engine/engine.hpp"
 #include "pulsarlm/engine/eviction.hpp"
+#include "pulsarlm/engine/model/make_model.hpp"
 
 #include "pulsarlm/kernels/ops.hpp"
 
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -152,6 +154,31 @@ kv_cache make_cache(const engine_config& config, std::span<const std::unique_ptr
     return kv_cache(full_shapes, cache_shards, config.kv_cache_pool_bytes, store);
 }
 
+std::vector<communicator> make_communicators(std::span<const at::Device> devices) {
+    if (devices.size() == 1) {
+        return {communicator{}};
+    }
+    if (std::ranges::all_of(devices, [&](const at::Device& device) { return device == devices.front(); })) {
+        return communicator::make_on_one_device(devices.front(), devices.size());
+    }
+    for (std::size_t i = 0; i < devices.size(); i++) {
+        for (std::size_t j = i + 1; j < devices.size(); j++) {
+            if (devices[i] == devices[j]) {
+                throw std::invalid_argument("an engine's devices are distinct, or all one device");
+            }
+        }
+    }
+    return communicator::make(devices);
+}
+
+std::size_t largest_line(const engine_config& config, const model& shard) {
+    std::size_t largest = 0;
+    for (const page_shape& shape : page_shapes(config, full_layers(shard))) {
+        largest = std::max(largest, line_bytes(shape));
+    }
+    return largest;
+}
+
 std::vector<std::unique_ptr<model>> one_shard(std::unique_ptr<model> served_model) {
     std::vector<std::unique_ptr<model>> shards;
     shards.push_back(std::move(served_model));
@@ -192,8 +219,42 @@ std::vector<page_shape> page_shapes(const engine_config& config, std::span<const
     return shapes;
 }
 
+struct engine::loaded_model {
+    std::vector<std::unique_ptr<model>> shards;
+    std::size_t vocab_size;
+};
+
+engine::loaded_model engine::load_model(
+    const config_dict& model_config,
+    const model_shard_loader& load_model_shard,
+    std::span<const at::Device> devices
+) {
+    if (devices.empty()) {
+        throw std::invalid_argument("an engine takes at least one device");
+    }
+    any_model_config parsed = parse_model_config(model_config);
+    std::vector<communicator> communicators = make_communicators(devices);
+    loaded_model loaded{.shards = {}, .vocab_size = pulsarlm::vocab_size(parsed)};
+    for (std::size_t rank = 0; rank < devices.size(); rank++) {
+        loaded.shards.push_back(make_model(parsed, load_model_shard(rank, devices.size()), communicators[rank]));
+    }
+    return loaded;
+}
+
+engine::engine(
+    const config_dict& model_config,
+    const model_shard_loader& load_model_shard,
+    const engine_config& config,
+    std::unique_ptr<page_store>&& store
+)
+: engine(load_model(model_config, load_model_shard, config.devices), config, std::move(store)) {}
+
+engine::engine(loaded_model&& loaded, const engine_config& config, std::unique_ptr<page_store>&& store)
+: engine(std::move(loaded.shards), loaded.vocab_size, config, std::move(store)) {}
+
 engine::engine(
     std::vector<std::unique_ptr<model>>&& shards,
+    std::size_t vocab_size,
     const engine_config& config,
     std::unique_ptr<page_store>&& store
 )
@@ -202,7 +263,8 @@ engine::engine(
   streams(make_streams(devices)),
   worker_loops(make_worker_loops(devices.size())),
   page_size(config.page_size),
-  vocab_size(config.vocab_size),
+  vocab_size(vocab_size),
+  max_page_bytes(largest_line(config, *this->shards.front())),
   root(make_root_digest(config.model_name, page_shapes(config, full_layers(*this->shards.front())))),
   store(std::move(store)),
   sched(
@@ -222,8 +284,13 @@ engine::engine(
     started.wait();
 }
 
-engine::engine(std::unique_ptr<model> served_model, const engine_config& config, std::unique_ptr<page_store>&& store)
-: engine(one_shard(std::move(served_model)), config, std::move(store)) {}
+engine::engine(
+    std::unique_ptr<model> served_model,
+    std::size_t vocab_size,
+    const engine_config& config,
+    std::unique_ptr<page_store>&& store
+)
+: engine(one_shard(std::move(served_model)), vocab_size, config, std::move(store)) {}
 
 engine::~engine() {
     {
@@ -301,6 +368,10 @@ std::exception_ptr engine::exception() const {
 
 std::vector<digest> engine::page_digests(std::span<const std::int64_t> tokens) const {
     return make_page_digests(root, tokens, page_size);
+}
+
+std::size_t engine::largest_page_bytes() const noexcept {
+    return max_page_bytes;
 }
 
 engine_stat engine::stat() const {

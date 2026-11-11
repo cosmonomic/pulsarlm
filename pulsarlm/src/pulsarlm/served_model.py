@@ -9,14 +9,7 @@ from tokenizers import Tokenizer
 
 from pulsarlm import checkpoint
 from pulsarlm.chat import ChatTemplate, stop_ids
-from pulsarlm.core.engine import (
-    Communicator,
-    Engine,
-    EvictionPolicy,
-    Model,
-    make_model,
-)
-from pulsarlm.engine_model import engine_model
+from pulsarlm.core.engine import Engine, EvictionPolicy
 from pulsarlm.paging import PAGE_SIZE
 from pulsarlm.settings import Settings
 from pulsarlm.store import LocalStore
@@ -33,65 +26,42 @@ class ServedModel:
     prefix_cache: bool
 
 
-def split_models(path: Path, size: int, dtype: torch.dtype) -> list[Model]:
-    """The model split across cuda:0 to cuda:size - 1, one GPU's part loaded and
-    on its GPU before the next is read."""
-    devices = [torch.device("cuda", rank) for rank in range(size)]
-    communicators = Communicator.make(devices)
-    models = []
-    for rank, device in enumerate(devices):
-        part = checkpoint.load(path, device=device, dtype=dtype, shard=(rank, size))
-        models.append(
-            make_model(engine_model(part.config), part.weights, communicators[rank])
-        )
-        del part
-    return models
-
-
 def load_served_model(settings: Settings, path: Path) -> ServedModel:
     """eviction is the settings' policy, its n_sink left at the default. Above one
-    tensor-parallel GPU, the model is split across cuda:0 on."""
-    device = torch.device(settings.device)
+    tensor-parallel GPU, the model is split across cuda:0 on, one GPU's part loaded
+    and on its GPU before the next is read."""
     dtype = getattr(torch, settings.dtype)
-    size = settings.tensor_parallel_size
-    if size == 1:
-        model = checkpoint.load(path, device=device, dtype=dtype)
-    else:
-        with zipfile.ZipFile(path, mode="r") as archive:
-            root = zipfile.Path(archive)
-            model = checkpoint.PulsarLMModel(
-                config=checkpoint.load_config(root),
-                weights={},
-                tokenizer=checkpoint.load_tokenizer(root),
-                chat_template=checkpoint.load_chat_template(root),
-            )
-    cfg = model.config
+    tensor_parallel_size = settings.tensor_parallel_size
+    devices = (
+        [torch.device(settings.device)]
+        if tensor_parallel_size == 1
+        else [torch.device("cuda", rank) for rank in range(tensor_parallel_size)]
+    )
+    with zipfile.ZipFile(path, mode="r") as archive:
+        root = zipfile.Path(archive)
+        cfg = checkpoint.load_config(root)
+        tokenizer = checkpoint.load_tokenizer(root)
+        chat_template = checkpoint.load_chat_template(root)
+
+    def load_model_shard(rank: int, size: int) -> dict[str, torch.Tensor]:
+        return checkpoint.load(
+            path, device=devices[rank], dtype=dtype, shard=(rank, size)
+        ).weights
+
     max_context = cfg.max_position_embeddings or None
-    stops = stop_ids(model.tokenizer, cfg.eos_ids)
+    stops = stop_ids(tokenizer, cfg.eos_ids)
     store = LocalStore(
         PAGE_SIZE,
         int(settings.store_gib * 2**30),
         checkpoint.store_path(settings.data_dir) if settings.persist else None,
     )
     model_name = f"{settings.model}@{checkpoint.weights_version(path)}"
-    if size == 1:
+    try:
         engine = Engine(
             store,
-            engine_model(cfg),
-            model.weights,
-            model_name=model_name,
-            page_size=PAGE_SIZE,
-            kv_dtype=dtype,
-            kv_cache_gib=settings.kv_cache_gib,
-            store_gib=settings.store_gib,
-            device=device,
-            stop_ids=stops,
-            prefill_tokens_per_step=settings.prefill_tokens_per_step,
-        )
-    else:
-        engine = Engine(
-            store,
-            models=split_models(path, size, dtype),
+            cfg.raw,
+            load_model_shard,
+            devices=devices,
             model_name=model_name,
             page_size=PAGE_SIZE,
             kv_dtype=dtype,
@@ -100,11 +70,13 @@ def load_served_model(settings: Settings, path: Path) -> ServedModel:
             stop_ids=stops,
             prefill_tokens_per_step=settings.prefill_tokens_per_step,
         )
+    except ValueError as error:
+        raise checkpoint.PulsarLMModelLoadingError(str(error)) from error
     return ServedModel(
         engine=engine,
         store=store,
-        tokenizer=model.tokenizer,
-        chat_template=model.chat_template,
+        tokenizer=tokenizer,
+        chat_template=chat_template,
         stop_ids=stops,
         eviction=EvictionPolicy(
             n_working=settings.n_working,
