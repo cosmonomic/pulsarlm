@@ -19,19 +19,33 @@
 
 namespace pulsarlm {
 
+// Raises RequestFailed(error) in Python.
+[[noreturn]] void raise_request_failed(request_error error);
+
 // Python's handle on a request. Dropping it cancels the request.
 class request_handle {
     std::shared_ptr<request_buffer> buffer;
+    pybind11::object on_cycle_end;
+    pybind11::object on_end;
+    bool ended = false;
+    std::optional<request_error> failure;
 
   public:
-    explicit request_handle(std::shared_ptr<request_buffer> buffer) noexcept;
+    request_handle(
+        std::shared_ptr<request_buffer> buffer,
+        pybind11::object&& on_cycle_end,
+        pybind11::object&& on_end
+    ) noexcept;
     request_handle(const request_handle&) = delete;
     request_handle& operator=(const request_handle&) = delete;
     request_handle(request_handle&&) noexcept = default;
     request_handle& operator=(request_handle&&) = delete;
     ~request_handle();
 
-    taken_results take();
+    // The tokens sampled since the last take, None once the request ended and every token was taken. Passes each cycle
+    // end to on_cycle_end and the result to on_end first, when they are not None. Raises RequestFailed once every
+    // token before an error was taken.
+    pybind11::object take();
     void cancel() noexcept;
 };
 
@@ -59,7 +73,9 @@ class python_engine {
         const sampling_params& sampling,
         std::optional<std::size_t> max_tokens,
         const eviction_policy& eviction,
-        std::uint64_t request_id
+        std::uint64_t request_id,
+        pybind11::object on_cycle_end,
+        pybind11::object on_end
     );
     std::vector<digest> page_digests(const std::vector<std::int64_t>& tokens) const;
     std::vector<digest> page_keys(const state& s) const;

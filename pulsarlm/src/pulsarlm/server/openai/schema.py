@@ -58,10 +58,15 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Literal["auto", "none"] = "auto"
 
 
+class PromptTokensDetails(BaseModel):
+    cached_tokens: int
+
+
 class Usage(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    prompt_tokens_details: PromptTokensDetails
 
 
 class ChatCompletionChoice(BaseModel):

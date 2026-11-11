@@ -14,7 +14,7 @@ void request_buffer::append(cycle_end&& ended) {
     results.cycle_ends.push_back(std::move(ended));
 }
 
-void request_buffer::end(std::expected<state, request_error>&& result) {
+void request_buffer::end(std::expected<request_result, request_error>&& result) {
     std::lock_guard lock(mutex);
     results.end = std::move(result);
 }
@@ -47,7 +47,7 @@ void buffered_callbacks::on_cycle_end(cycle_end&& ended) noexcept {
 }
 
 void buffered_callbacks::on_end(std::expected<request_result, request_error>&& result) noexcept {
-    buffer->end(std::move(result).transform([](request_result&& ended) { return std::move(ended.state); }));
+    buffer->end(std::move(result));
     wake_signal->notify();
 }
 

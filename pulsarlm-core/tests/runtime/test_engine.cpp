@@ -127,7 +127,9 @@ class recording_callbacks final : public pulsarlm::request_callbacks {
     void on_end(std::expected<pulsarlm::request_result, request_error>&& result) noexcept override {
         {
             std::lock_guard lock(recorded_results->mutex);
-            recorded_results->end.emplace(std::move(result).transform([](pulsarlm::request_result&& ended) { return std::move(ended.state); }));
+            recorded_results->end.emplace(std::move(result).transform([](pulsarlm::request_result&& ended) {
+                return std::move(ended.state);
+            }));
         }
         recorded_results->end_condition.notify_all();
     }

@@ -17,7 +17,7 @@ namespace pulsarlm {
 struct taken_results {
     std::vector<std::int64_t> tokens;
     std::vector<cycle_end> cycle_ends;
-    std::optional<std::expected<state, request_error>> end;
+    std::optional<std::expected<request_result, request_error>> end;
 };
 
 // A request's results, appended by its callbacks and taken by Python.
@@ -29,7 +29,7 @@ class request_buffer {
   public:
     void append(std::int64_t token);
     void append(cycle_end&& ended);
-    void end(std::expected<state, request_error>&& result);
+    void end(std::expected<request_result, request_error>&& result);
     taken_results take();
     void cancel() noexcept;
     bool cancelled() const noexcept;

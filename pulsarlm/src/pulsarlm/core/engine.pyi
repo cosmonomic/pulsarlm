@@ -95,11 +95,33 @@ class CycleEnd:
     @property
     def token_count(self) -> int: ...
 
+class RequestResult:
+    """A request's final state, which leaves out the last sampled token, and its
+    token counts. total_tokens: the initial state's history, its full pages and
+    tail, then the request's tokens, then the tokens it sampled. cached_tokens: the
+    tokens of the initial state's full pages, which the request did not forward;
+    its tail is forwarded again. device_cached_tokens: those of them on pages every
+    KV layer reading the page had resident in the KV cache when the request
+    started, not fetched from the store."""
+
+    @property
+    def state(self) -> State: ...
+    @property
+    def total_tokens(self) -> int: ...
+    @property
+    def cached_tokens(self) -> int: ...
+    @property
+    def device_cached_tokens(self) -> int: ...
+
 class RequestError(enum.Enum):
     MISS = ...
     OOM = ...
     CANCELLED = ...
     LOOP_EXITED = ...
+
+class RequestFailed(Exception):
+    @property
+    def error(self) -> RequestError: ...
 
 class EngineStat:
     @property
@@ -318,11 +340,11 @@ class Qwen4ExpConfig:
     ) -> None: ...
 
 class Request:
-    def take(
-        self,
-    ) -> tuple[list[int], list[CycleEnd], State | RequestError | None]:
-        """The tokens and cycle ends appended since the last take, then the end:
-        set by the take that first finds the request ended, None otherwise."""
+    def take(self) -> list[int] | None:
+        """The tokens sampled since the last take; None once the request ended and
+        every token was taken. Passes each cycle end to on_cycle_end, then the
+        result to on_end, before it returns. Raises RequestFailed once every token
+        before an error was taken."""
     def cancel(self) -> None: ...
 
 class Engine:
@@ -358,9 +380,12 @@ class Engine:
         max_tokens: int | None = None,
         eviction: EvictionPolicy = ...,
         request_id: int = 0,
+        on_cycle_end: Callable[[CycleEnd], None] | None = None,
+        on_end: Callable[[RequestResult], None] | None = None,
     ) -> Request:
         """Raises ValueError for a request the engine cannot serve. The pages the
-        request's steps put reach the store owned by request_id."""
+        request's steps put reach the store owned by request_id. Request.take calls
+        on_cycle_end and on_end on its caller's thread."""
     def page_digests(self, tokens: list[int]) -> list[bytes]:
         """The hashes of the full pages of a token history from its start; the last
         is the head of a state reaching that history."""

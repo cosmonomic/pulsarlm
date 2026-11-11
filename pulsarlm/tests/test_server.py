@@ -182,6 +182,7 @@ def test_a_completion_stops_at_max_tokens(client):
         "prompt_tokens": 41,
         "completion_tokens": 4,
         "total_tokens": 45,
+        "prompt_tokens_details": {"cached_tokens": 0},
     }
     assert body["choices"][0]["finish_reason"] == "length"
 
@@ -213,6 +214,7 @@ def test_a_stream_with_include_usage_ends_with_a_usage_chunk(client):
         "prompt_tokens": 41,
         "completion_tokens": 4,
         "total_tokens": 45,
+        "prompt_tokens_details": {"cached_tokens": 0},
     }
 
 
@@ -227,11 +229,15 @@ def test_a_follow_up_continues_from_a_stored_state(client):
     state = client.app.state.server_state
     prompt = encode(state, follow_up)
     with state.store.lease(prompt, state.engine.page_digests(prompt), request_id=0) as (
-        _,
+        lease,
         token_count,
     ):
         assert token_count >= 2 * PAGE_SIZE
-    assert post(client, messages=follow_up, max_tokens=4).status_code == 200
+        full_page_tokens = token_count - len(lease.state.tail)
+    response = post(client, messages=follow_up, max_tokens=4)
+    assert response.status_code == 200
+    details = response.json()["usage"]["prompt_tokens_details"]
+    assert details == {"cached_tokens": full_page_tokens}
 
 
 def test_a_reply_ending_at_any_stop_token_leaves_its_end_state_findable():

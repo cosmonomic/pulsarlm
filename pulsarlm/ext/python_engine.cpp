@@ -1,6 +1,7 @@
 #include "python_engine.hpp"
 
 #include <ATen/core/Dict.h>
+#include <pybind11/stl.h>
 
 #include <exception>
 #include <format>
@@ -13,8 +14,14 @@ namespace pulsarlm {
 
 namespace py = pybind11;
 
-request_handle::request_handle(std::shared_ptr<request_buffer> buffer) noexcept
-: buffer(std::move(buffer)) {}
+request_handle::request_handle(
+    std::shared_ptr<request_buffer> buffer,
+    py::object&& on_cycle_end,
+    py::object&& on_end
+) noexcept
+: buffer(std::move(buffer)),
+  on_cycle_end(std::move(on_cycle_end)),
+  on_end(std::move(on_end)) {}
 
 request_handle::~request_handle() {
     if (buffer) {
@@ -22,8 +29,38 @@ request_handle::~request_handle() {
     }
 }
 
-taken_results request_handle::take() {
-    return buffer->take();
+py::object request_handle::take() {
+    if (failure) {
+        raise_request_failed(*failure);
+    }
+    if (ended) {
+        return py::none();
+    }
+    taken_results taken = buffer->take();
+    for (cycle_end& ended_cycle : taken.cycle_ends) {
+        if (!on_cycle_end.is_none()) {
+            on_cycle_end(std::move(ended_cycle));
+        }
+    }
+    if (taken.end) {
+        if (*taken.end) {
+            ended = true;
+            if (!on_end.is_none()) {
+                on_end(std::move(**taken.end));
+            }
+        } else {
+            failure = taken.end->error();
+        }
+    }
+    if (taken.tokens.empty()) {
+        if (failure) {
+            raise_request_failed(*failure);
+        }
+        if (ended) {
+            return py::none();
+        }
+    }
+    return py::cast(std::move(taken.tokens));
 }
 
 void request_handle::cancel() noexcept {
@@ -53,7 +90,9 @@ request_handle python_engine::submit(
     const sampling_params& sampling,
     std::optional<std::size_t> max_tokens,
     const eviction_policy& eviction,
-    std::uint64_t request_id
+    std::uint64_t request_id,
+    py::object on_cycle_end,
+    py::object on_end
 ) {
     auto buffer = std::make_shared<request_buffer>();
     request r{initial_state, std::move(tokens), sampling, max_tokens, eviction, request_id};
@@ -61,7 +100,7 @@ request_handle python_engine::submit(
         py::gil_scoped_release nogil;
         core_engine->submit(std::move(r), std::make_unique<buffered_callbacks>(buffer, wake_signal));
     }
-    return request_handle(std::move(buffer));
+    return request_handle(std::move(buffer), std::move(on_cycle_end), std::move(on_end));
 }
 
 std::vector<digest> python_engine::page_digests(const std::vector<std::int64_t>& tokens) const {

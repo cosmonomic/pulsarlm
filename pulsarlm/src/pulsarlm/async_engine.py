@@ -2,6 +2,7 @@
 
 import asyncio
 import weakref
+from collections.abc import AsyncIterator, Callable
 
 from pulsarlm.core.engine import (
     CycleEnd,
@@ -11,6 +12,8 @@ from pulsarlm.core.engine import (
     EvictionReport,
     Request,
     RequestError,
+    RequestFailed,
+    RequestResult,
     SamplingParams,
     State,
 )
@@ -21,26 +24,33 @@ class EngineStopped(Exception):
 
 
 class RequestStream:
-    """Cancels its request when dropped."""
+    """The tokens of a request as they are sampled. Raises RequestFailed when the
+    engine ends the request with an error, and EngineStopped when its loop exited.
+    Cancels its request when dropped."""
 
     def __init__(self, engine: Engine, request: Request) -> None:
         self._engine = engine
         self._request = request
         self._wake_event = asyncio.Event()
 
-    async def take(
-        self,
-    ) -> tuple[list[int], list[CycleEnd], State | RequestError | None]:
-        """Waits for results, then returns them as Request.take does. Raises
-        EngineStopped when the engine's loop exited."""
+    def __aiter__(self) -> AsyncIterator[int]:
+        return self._tokens()
+
+    async def _tokens(self) -> AsyncIterator[int]:
         while True:
             self._wake_event.clear()
-            tokens, cycle_ends, end = self._request.take()
-            if end == RequestError.LOOP_EXITED:
-                raise EngineStopped(self._engine.exception())
-            if tokens or cycle_ends or end is not None:
-                return tokens, cycle_ends, end
-            await self._wake_event.wait()
+            try:
+                tokens = self._request.take()
+            except RequestFailed as failure:
+                if failure.error == RequestError.LOOP_EXITED:
+                    raise EngineStopped(self._engine.exception()) from failure
+                raise
+            if tokens is None:
+                return
+            if not tokens:
+                await self._wake_event.wait()
+            for token in tokens:
+                yield token
 
     def cancel(self) -> None:
         self._request.cancel()
@@ -68,9 +78,12 @@ class AsyncEngine:
         max_tokens: int | None,
         eviction: EvictionPolicy,
         request_id: int,
+        on_cycle_end: Callable[[CycleEnd], None] | None = None,
+        on_end: Callable[[RequestResult], None] | None = None,
     ) -> RequestStream:
         """Raises EngineStopped when the engine's loop exited, ValueError for a
-        request the engine cannot serve."""
+        request the engine cannot serve. The stream calls on_cycle_end and on_end
+        on the event loop's thread."""
         if (message := self._engine.exception()) is not None:
             raise EngineStopped(message)
         request = self._engine.submit(
@@ -80,6 +93,8 @@ class AsyncEngine:
             max_tokens=max_tokens,
             eviction=eviction,
             request_id=request_id,
+            on_cycle_end=on_cycle_end,
+            on_end=on_end,
         )
         stream = RequestStream(self._engine, request)
         self._streams.add(stream)

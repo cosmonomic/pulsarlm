@@ -1,5 +1,6 @@
 #include <torch/csrc/utils/pybind.h>
 
+#include <pybind11/gil_safe_call_once.h>
 #include <pybind11/native_enum.h>
 #include <pybind11/operators.h>
 #include <pybind11/stl.h>
@@ -26,13 +27,16 @@ namespace pulsarlm {
 
 namespace {
 
-py::tuple take_to_python(request_handle& handle) {
-    taken_results taken = handle.take();
-    py::object end = py::none();
-    if (taken.end) {
-        end = *taken.end ? py::cast(std::move(**taken.end)) : py::cast(taken.end->error());
-    }
-    return py::make_tuple(std::move(taken.tokens), py::cast(std::move(taken.cycle_ends)), std::move(end));
+PYBIND11_CONSTINIT py::gil_safe_call_once_and_store<py::object> request_failed_type;
+
+// An exception class whose error property is its first argument.
+py::object make_request_failed_type() {
+    auto type = py::reinterpret_steal<py::object>(
+        PyErr_NewException("pulsarlm.pulsarlm_core.RequestFailed", PyExc_Exception, nullptr)
+    );
+    py::cpp_function first_argument([](const py::handle& self) { return self.attr("args")[py::int_(0)]; });
+    type.attr("error") = py::module_::import("builtins").attr("property")(first_argument);
+    return type;
 }
 
 gemma4_layer_type layer_type(const std::string& name) {
@@ -112,6 +116,11 @@ std::unique_ptr<python_engine> make_engine(
 }
 
 }  // namespace
+
+void raise_request_failed(request_error error) {
+    PyErr_SetObject(request_failed_type.get_stored().ptr(), py::cast(error).ptr());
+    throw py::error_already_set();
+}
 
 }  // namespace pulsarlm
 
@@ -207,6 +216,12 @@ PYBIND11_MODULE(pulsarlm_core, m) {
         .def_readonly("state", &cycle_end::state)
         .def_readonly("token_count", &cycle_end::token_count);
 
+    py::class_<request_result>(m, "RequestResult")
+        .def_readonly("state", &request_result::state)
+        .def_readonly("total_tokens", &request_result::total_tokens)
+        .def_readonly("cached_tokens", &request_result::cached_tokens)
+        .def_readonly("device_cached_tokens", &request_result::device_cached_tokens);
+
     py::class_<engine_stat>(m, "EngineStat").def_readonly("kv_cache_bytes", &engine_stat::kv_cache_bytes);
 
     py::native_enum<request_error>(m, "RequestError", "enum.Enum")
@@ -215,6 +230,8 @@ PYBIND11_MODULE(pulsarlm_core, m) {
         .value("CANCELLED", request_error::cancelled)
         .value("LOOP_EXITED", request_error::loop_exited)
         .finalize();
+
+    m.attr("RequestFailed") = request_failed_type.call_once_and_store_result(make_request_failed_type).get_stored();
 
     py::class_<sampling_params>(m, "SamplingParams")
         .def(
@@ -664,7 +681,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
         )
         .def_readonly("eos_token_id", &qwen4_exp_config::eos_token_id);
 
-    py::class_<request_handle>(m, "Request").def("take", &take_to_python).def("cancel", &request_handle::cancel);
+    py::class_<request_handle>(m, "Request").def("take", &request_handle::take).def("cancel", &request_handle::cancel);
 
     py::class_<python_engine>(m, "Engine")
         .def(
@@ -691,7 +708,9 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "sampling"_a = sampling_params{},
             "max_tokens"_a = py::none(),
             "eviction"_a = eviction_policy{},
-            "request_id"_a = 0
+            "request_id"_a = 0,
+            "on_cycle_end"_a = py::none(),
+            "on_end"_a = py::none()
         )
         .def(
             "page_digests",

@@ -8,11 +8,15 @@ import torch
 
 from pulsarlm.core.engine import (
     ActivePage,
+    CycleEnd,
     Engine,
     EvictionPolicy,
     LayerSequence,
     ModelConfig,
+    Request,
     RequestError,
+    RequestFailed,
+    RequestResult,
     RopeParameters,
     State,
 )
@@ -114,22 +118,50 @@ def make_engine(store: MemoryStore, store_pages: int = 0) -> Engine:
     )
 
 
-async def run(engine: Engine, request) -> tuple[list[int], list, object]:
+class Recording:
+    def __init__(self) -> None:
+        self.cycle_ends: list[CycleEnd] = []
+        self.result: RequestResult | None = None
+
+    def record_result(self, result: RequestResult) -> None:
+        self.result = result
+
+
+def submit(
+    engine: Engine, initial_state: State, tokens: list[int], **options
+) -> tuple[Request, Recording]:
+    recording = Recording()
+    request = engine.submit(
+        initial_state,
+        tokens,
+        on_cycle_end=recording.cycle_ends.append,
+        on_end=recording.record_result,
+        **options,
+    )
+    return request, recording
+
+
+async def run(
+    engine: Engine, request: Request, recording: Recording
+) -> tuple[list[int], list[CycleEnd], State | RequestError]:
     loop = asyncio.get_running_loop()
     woke = asyncio.Event()
     loop.add_reader(engine.fileno(), woke.set)
     tokens: list[int] = []
-    cycle_ends: list = []
     try:
         while True:
-            await woke.wait()
             woke.clear()
             engine.clear_wake()
-            taken_tokens, taken_cycle_ends, end = request.take()
-            tokens += taken_tokens
-            cycle_ends += taken_cycle_ends
-            if end is not None:
-                return tokens, cycle_ends, end
+            try:
+                taken = request.take()
+            except RequestFailed as failure:
+                return tokens, recording.cycle_ends, failure.error
+            if taken is None:
+                assert recording.result is not None
+                return tokens, recording.cycle_ends, recording.result.state
+            tokens += taken
+            if not taken:
+                await woke.wait()
     finally:
         loop.remove_reader(engine.fileno())
 
@@ -143,7 +175,9 @@ def test_generates_max_tokens_and_ends_with_a_state():
     async def main():
         store = MemoryStore(asyncio.get_running_loop())
         engine = make_engine(store)
-        tokens, _, end = await run(engine, engine.submit(State(), PROMPT, max_tokens=8))
+        tokens, _, end = await run(
+            engine, *submit(engine, State(), PROMPT, max_tokens=8)
+        )
 
         assert len(tokens) == 8
         assert all(0 <= t < VOCAB_SIZE for t in tokens)
@@ -158,7 +192,9 @@ def test_generates_max_tokens_and_ends_with_a_state():
 def test_page_digests_are_the_page_hashes_of_the_end_state():
     async def main():
         engine = make_engine(MemoryStore(asyncio.get_running_loop()))
-        tokens, _, end = await run(engine, engine.submit(State(), PROMPT, max_tokens=8))
+        tokens, _, end = await run(
+            engine, *submit(engine, State(), PROMPT, max_tokens=8)
+        )
 
         assert isinstance(end, State)
         digests = engine.page_digests(PROMPT + tokens[:-1])
@@ -175,18 +211,18 @@ def test_another_engine_continues_a_state_from_the_store(store_pages: int):
         store = MemoryStore(asyncio.get_running_loop())
         first = make_engine(store, store_pages)
         sampled, _, reached = await run(
-            first, first.submit(State(), PROMPT, max_tokens=8)
+            first, *submit(first, State(), PROMPT, max_tokens=8)
         )
         assert isinstance(reached, State)
 
         follow_up = [sampled[-1], 11, 12, 13]
         expected, _, _ = await run(
-            first, first.submit(reached, follow_up, max_tokens=8)
+            first, *submit(first, reached, follow_up, max_tokens=8)
         )
 
         second = make_engine(store, store_pages)
         continued, _, end = await run(
-            second, second.submit(reached, follow_up, max_tokens=8)
+            second, *submit(second, reached, follow_up, max_tokens=8)
         )
 
         assert store.fetched_hashes == second.page_keys(reached)
@@ -196,11 +232,39 @@ def test_another_engine_continues_a_state_from_the_store(store_pages: int):
     asyncio.run(main())
 
 
+def test_the_result_counts_the_tokens_resumed_on_resident_and_fetched_pages():
+    async def main():
+        store = MemoryStore(asyncio.get_running_loop())
+        first = make_engine(store, store_pages=64)
+        request, recording = submit(first, State(), PROMPT, max_tokens=8)
+        sampled, _, reached = await run(first, request, recording)
+        assert isinstance(reached, State)
+        assert recording.result is not None
+        assert recording.result.total_tokens == len(PROMPT) + len(sampled)
+        assert recording.result.cached_tokens == 0
+
+        follow_up = [sampled[-1], 11, 12]
+        resumed_tokens = len(reached.layers[0].pages) * PAGE_SIZE
+        request, resident = submit(first, reached, follow_up, max_tokens=2)
+        await run(first, request, resident)
+        second = make_engine(store, store_pages=64)
+        request, fetched = submit(second, reached, follow_up, max_tokens=2)
+        await run(second, request, fetched)
+
+        assert resident.result is not None and fetched.result is not None
+        assert resident.result.cached_tokens == resumed_tokens
+        assert resident.result.device_cached_tokens == resumed_tokens
+        assert fetched.result.cached_tokens == resumed_tokens
+        assert fetched.result.device_cached_tokens == 0
+
+    asyncio.run(main())
+
+
 def test_pages_past_the_room_of_the_store_pool_are_pageable():
     async def main():
         store = MemoryStore(asyncio.get_running_loop())
         engine = make_engine(store, store_pages=1)
-        await run(engine, engine.submit(State(), PROMPT, max_tokens=8))
+        await run(engine, *submit(engine, State(), PROMPT, max_tokens=8))
 
         pinned = [page.is_pinned() for page in store.pages.values()]
         assert True in pinned
@@ -213,7 +277,7 @@ def test_a_store_pool_with_room_gives_pinned_pages():
     async def main():
         store = MemoryStore(asyncio.get_running_loop())
         engine = make_engine(store, store_pages=64)
-        await run(engine, engine.submit(State(), PROMPT, max_tokens=8))
+        await run(engine, *submit(engine, State(), PROMPT, max_tokens=8))
 
         assert store.pages
         assert all(page.is_pinned() for page in store.pages.values())
@@ -228,7 +292,7 @@ def test_a_page_missing_from_the_store_ends_with_miss():
             head=bytes(16),
             layers=[LayerSequence([ActivePage(bytes(16), 0)])] * N_LAYERS,
         )
-        _, _, end = await run(engine, engine.submit(missing, [1], max_tokens=1))
+        _, _, end = await run(engine, *submit(engine, missing, [1], max_tokens=1))
 
         assert end == RequestError.MISS
 
@@ -242,7 +306,7 @@ def test_a_failing_fetch_misses():
             head=bytes(16),
             layers=[LayerSequence([ActivePage(bytes(16), 0)])] * N_LAYERS,
         )
-        _, _, end = await run(engine, engine.submit(missing, [1], max_tokens=1))
+        _, _, end = await run(engine, *submit(engine, missing, [1], max_tokens=1))
 
         assert end == RequestError.MISS
         assert engine.exception() is None
@@ -253,9 +317,9 @@ def test_a_failing_fetch_misses():
 def test_cancel_ends_the_request_with_cancelled():
     async def main():
         engine = make_engine(MemoryStore(asyncio.get_running_loop()))
-        request = engine.submit(State(), PROMPT)
+        request, recording = submit(engine, State(), PROMPT)
         request.cancel()
-        _, _, end = await run(engine, request)
+        _, _, end = await run(engine, request, recording)
 
         assert end == RequestError.CANCELLED
 
@@ -310,8 +374,9 @@ def test_the_eviction_report_scores_every_page_of_a_layer_measuring_mass():
             cycle_tokens=PAGE_SIZE, max_context_window=8 * PAGE_SIZE
         )
         _, _, end = await run(
-            engine, engine.submit(State(), PROMPT, max_tokens=8, eviction=eviction)
+            engine, *submit(engine, State(), PROMPT, max_tokens=8, eviction=eviction)
         )
+        assert isinstance(end, State)
 
         report = engine.eviction_report_of(end, eviction)
         assert report.cap_tokens == 6 * PAGE_SIZE

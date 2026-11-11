@@ -75,7 +75,9 @@ class recording_callbacks final : public pulsarlm::request_callbacks {
             recorded_results->cached_tokens = result->cached_tokens;
             recorded_results->device_cached_tokens = result->device_cached_tokens;
         }
-        recorded_results->end.emplace(std::move(result).transform([](pulsarlm::request_result&& ended) { return std::move(ended.state); }));
+        recorded_results->end.emplace(std::move(result).transform([](pulsarlm::request_result&& ended) {
+            return std::move(ended.state);
+        }));
     }
 
     bool cancelled() const noexcept override {

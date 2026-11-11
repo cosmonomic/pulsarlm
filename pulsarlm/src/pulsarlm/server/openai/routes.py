@@ -13,7 +13,7 @@ from tokenizers import Tokenizer
 
 from pulsarlm.async_engine import AsyncEngine, EngineStopped
 from pulsarlm.chat import ChatTemplate, ChatTemplateError, Message, encode_prompt
-from pulsarlm.completion import CompletionError, complete
+from pulsarlm.completion import CompletionError, CompletionUsage, complete
 from pulsarlm.core.engine import EvictionPolicy, RequestError, SamplingParams
 from pulsarlm.core.engine import State as EngineState
 from pulsarlm.eviction_log import EvictionLog
@@ -31,6 +31,7 @@ from pulsarlm.server.openai.schema import (
     MessageToolCall,
     ModelCard,
     ModelList,
+    PromptTokensDetails,
     Usage,
 )
 from pulsarlm.paging import sink_tokens
@@ -110,6 +111,7 @@ async def create_chat_completion(body: ChatCompletionRequest, state: State):
         raise HTTPException(400, f"chat template: {error}") from error
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     states: list[EngineState] = []
+    reply = _Reply(state, body.max_tokens, prompt, tool_calls=tools is not None)
     tokens = complete(
         state.engine,
         state.store,
@@ -124,13 +126,13 @@ async def create_chat_completion(body: ChatCompletionRequest, state: State):
         eviction=state.eviction_for(system_tokens),
         prefix_cache=state.prefix_cache,
         on_state=None if state.eviction_log is None else states.append,
+        on_completed=reply.record_usage,
     )
     if state.eviction_log is not None:
         tokens = state.eviction_log.record(completion_id, prompt, tokens, states)
-    reply = _Reply(state, body.max_tokens, prompt, tool_calls=tools is not None)
     if body.stream:
-        return _stream_completion(body, completion_id, reply, tokens, len(prompt))
-    return await _full_completion(body, completion_id, reply, tokens, len(prompt))
+        return _stream_completion(body, completion_id, reply, tokens)
+    return await _full_completion(body, completion_id, reply, tokens)
 
 
 def template_messages(messages: list[ChatMessage]) -> list[Message]:
@@ -181,6 +183,21 @@ class _Reply:
         )
         self.token_count = 0
         self.finish_reason: FinishReason | None = None
+        self.usage: CompletionUsage | None = None
+
+    def record_usage(self, usage: CompletionUsage) -> None:
+        self.usage = usage
+
+    def usage_body(self) -> Usage:
+        assert self.usage is not None
+        return Usage(
+            prompt_tokens=self.usage.prompt_tokens,
+            completion_tokens=self.usage.completion_tokens,
+            total_tokens=self.usage.prompt_tokens + self.usage.completion_tokens,
+            prompt_tokens_details=PromptTokensDetails(
+                cached_tokens=self.usage.cached_tokens
+            ),
+        )
 
     def step(self, token: int) -> tuple[Part, str]:
         self.token_count += 1
@@ -240,7 +257,6 @@ async def _full_completion(
     completion_id: str,
     reply: _Reply,
     tokens: AsyncGenerator[int],
-    prompt_tokens: int,
 ) -> ChatCompletionResponse:
     texts: dict[Part, list[str]] = {"reasoning": [], "content": []}
     try:
@@ -267,11 +283,7 @@ async def _full_completion(
                 finish_reason=reply.final_finish_reason(calls),
             )
         ],
-        usage=Usage(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=reply.token_count,
-            total_tokens=prompt_tokens + reply.token_count,
-        ),
+        usage=reply.usage_body(),
     )
 
 
@@ -280,7 +292,6 @@ def _stream_completion(
     completion_id: str,
     reply: _Reply,
     tokens: AsyncGenerator[int],
-    prompt_tokens: int,
 ) -> StreamingResponse:
     created = int(time.time())
 
@@ -328,11 +339,7 @@ def _stream_completion(
                     created=created,
                     model=body.model,
                     choices=[],
-                    usage=Usage(
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=reply.token_count,
-                        total_tokens=prompt_tokens + reply.token_count,
-                    ),
+                    usage=reply.usage_body(),
                 )
                 yield f"data: {usage.model_dump_json()}\n\n"
         yield "data: [DONE]\n\n"
