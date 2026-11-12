@@ -6,17 +6,17 @@
 #SBATCH --open-mode=append
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
-#SBATCH --time=7-00:00:00
+#SBATCH --time=2-00:00:00
 #SBATCH -o %x-%j.out
 set -euo pipefail
 
-pulsarlm_version=0.1.0a8
-pulsarlm_tag=v0.1.0-alpha-8
+pulsarlm_version=0.1.0a9
+pulsarlm_tag=v0.1.0-alpha-9
 uv_version=0.13.7
 model=qwen3.8-27b-fp8
 checkpoint_revision=017b9c7af6b5689d5dd426a76e0bc077eb5ca20a
 settings=(full_kv cap_16k)
-tensor_parallel_sizes=(1 2)
+tensor_parallel_sizes=(2)
 concurrencies=(1 4)
 runs=5
 kv_cache_gib=18
@@ -43,7 +43,7 @@ fi
 uv=$UV_INSTALL_DIR/uv
 
 if [[ ! -x $venv/bin/pulsarlm ]]; then
-    "$uv" venv --python 3.13 "$venv"
+    "$uv" venv --clear --python 3.13 "$venv"
     "$uv" pip install --python "$venv" "pulsarlm==$pulsarlm_version" httpx==0.28.1 openai==3.31.0 \
         wonderwords==3.0.1 scipy==1.18.1
 fi
@@ -51,11 +51,13 @@ fi
 
 perf=$work/perf-$pulsarlm_tag.py
 if [[ ! -f $perf ]]; then
-    curl -fsSL "https://raw.githubusercontent.com/cosmonomic/pulsarlm/$pulsarlm_tag/bench/perf.py" -o "$perf"
+    curl -fsSL "https://raw.githubusercontent.com/cosmonomic/pulsarlm/$pulsarlm_tag/bench/perf.py" -o "$perf.part"
+    mv "$perf.part" "$perf"
 fi
 check=$work/tp_check-$pulsarlm_tag.py
 if [[ ! -f $check ]]; then
-    curl -fsSL "https://raw.githubusercontent.com/cosmonomic/pulsarlm/$pulsarlm_tag/bench/tp_check.py" -o "$check"
+    curl -fsSL "https://raw.githubusercontent.com/cosmonomic/pulsarlm/$pulsarlm_tag/bench/tp_check.py" -o "$check.part"
+    mv "$check.part" "$check"
 fi
 
 if [[ ! -d $PULSARLM_DATA_DIR/$model ]]; then
