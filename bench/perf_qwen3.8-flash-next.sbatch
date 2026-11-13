@@ -11,11 +11,11 @@
 set -euo pipefail
 
 pulsarlm_version=0.1.0a9.post1
-pulsarlm_tag=v0.1.0-alpha9-post1
+bench_revision=d9212b07ceaacc8e4b9345666e92f3aab68f208c
 uv_version=0.13.7
 model=qwen3.8-flash-next
 checkpoint_revision=812d96e10a0dd82b69d749e68693698cf6c36daa
-settings=(full_kv cap_16k)
+settings=(full_kv cap_16k_mass_0.5)
 tensor_parallel_sizes=(4)
 concurrencies=(1 4)
 runs=5
@@ -49,14 +49,14 @@ if [[ ! -x $venv/bin/pulsarlm ]]; then
 fi
 "$uv" pip freeze --python "$venv"
 
-perf=$work/perf-$pulsarlm_tag.py
+perf=$work/perf-$bench_revision.py
 if [[ ! -f $perf ]]; then
-    curl -fsSL "https://raw.githubusercontent.com/cosmonomic/pulsarlm/$pulsarlm_tag/bench/perf.py" -o "$perf.part"
+    curl -fsSL "https://raw.githubusercontent.com/cosmonomic/pulsarlm/$bench_revision/bench/perf.py" -o "$perf.part"
     mv "$perf.part" "$perf"
 fi
-check=$work/tp_check-$pulsarlm_tag.py
+check=$work/tp_check-$bench_revision.py
 if [[ ! -f $check ]]; then
-    curl -fsSL "https://raw.githubusercontent.com/cosmonomic/pulsarlm/$pulsarlm_tag/bench/tp_check.py" -o "$check.part"
+    curl -fsSL "https://raw.githubusercontent.com/cosmonomic/pulsarlm/$bench_revision/bench/tp_check.py" -o "$check.part"
     mv "$check.part" "$check"
 fi
 
