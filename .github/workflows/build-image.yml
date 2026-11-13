@@ -1,0 +1,71 @@
+name: Build image
+
+# The wheel build image: manylinux_2_34 with CUDA 13.2, gcc-toolset-15 and xmake
+# (.github/build-image). Its tag is the git tree hash of .github/build-image, so
+# an image is built and pushed once per content of that directory and reused by
+# every later run.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+    outputs:
+      tag:
+        value: ${{ jobs.tag.outputs.tag }}
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag or commit whose .github/build-image to build."
+        required: true
+        type: string
+
+env:
+  IMAGE: ghcr.io/cosmonomic/pulsarlm-build
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - id: tag
+        run: echo "tag=$(git rev-parse HEAD:.github/build-image)" >> "$GITHUB_OUTPUT"
+
+  image:
+    needs: tag
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Log in to the GitHub container registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push the image unless it exists
+        run: |
+          image="$IMAGE:${{ needs.tag.outputs.tag }}-${{ matrix.arch }}"
+          if docker manifest inspect "$image" > /dev/null 2>&1; then
+            echo "$image exists"
+            exit 0
+          fi
+          docker build --build-arg base=quay.io/pypa/manylinux_2_34_${{ matrix.arch }} -t "$image" .github/build-image
+          docker push "$image"

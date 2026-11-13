@@ -26,6 +26,14 @@ on:
         type: string
 
 jobs:
+  image:
+    uses: ./.github/workflows/build-image.yml
+    with:
+      ref: ${{ inputs.ref || github.ref }}
+    permissions:
+      contents: read
+      packages: write
+
   sdist:
     runs-on: ubuntu-latest
     steps:
@@ -45,14 +53,19 @@ jobs:
           path: dist/
 
   wheel:
+    needs: image
     strategy:
       matrix:
-        include:
+        platform:
           - runner: ubuntu-latest
             arch: x86_64
           - runner: ubuntu-24.04-arm
             arch: aarch64
-    runs-on: ${{ matrix.runner }}
+        python: [cp313, cp314]
+    runs-on: ${{ matrix.platform.runner }}
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v7
         with:
@@ -62,14 +75,21 @@ jobs:
       - name: Free disk space
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
 
+      - name: Log in to the GitHub container registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
       - uses: pypa/cibuildwheel@v4.3.1
         with:
           package-dir: pulsarlm
           output-dir: dist
+        env:
+          CIBW_BUILD: ${{ matrix.python }}-manylinux_${{ matrix.platform.arch }}
+          CIBW_MANYLINUX_X86_64_IMAGE: ghcr.io/cosmonomic/pulsarlm-build:${{ needs.image.outputs.tag }}-x86_64
+          CIBW_MANYLINUX_AARCH64_IMAGE: ghcr.io/cosmonomic/pulsarlm-build:${{ needs.image.outputs.tag }}-aarch64
 
       - uses: actions/upload-artifact@v5
         with:
-          name: wheel-${{ matrix.arch }}
+          name: wheel-${{ matrix.platform.arch }}-${{ matrix.python }}
           path: dist/
 
   publish:
