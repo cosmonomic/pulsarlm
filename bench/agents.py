@@ -154,7 +154,9 @@ def run_vllm_server(
     # Without the vision encoder, as pulsarlm serves text only; it also drops the
     # floor vLLM puts on max_num_batched_tokens to fit one video.
     command += ["--language-model-only"]
-    if not setting.prefix_cache:
+    if setting.prefix_cache:
+        command += ["--mamba-cache-mode", "align"]
+    else:
         command += ["--no-enable-prefix-caching"]
     root = f"http://127.0.0.1:{port}"
     base_url = f"{root}/v1"
