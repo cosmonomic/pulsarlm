@@ -10,8 +10,8 @@
 #SBATCH -o %x-%j.out
 set -euo pipefail
 
-pulsarlm_version=0.1.0a9
-pulsarlm_tag=v0.1.0-alpha-9
+pulsarlm_version=0.1.0a9.post1
+pulsarlm_tag=v0.1.0-alpha9-post1
 uv_version=0.13.7
 model=qwen3.8-flash-next
 checkpoint_revision=812d96e10a0dd82b69d749e68693698cf6c36daa
