@@ -72,11 +72,16 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 0  # hatch-vcs needs the tag, not just the commit
 
-      - name: Free disk space
-        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
-
       - name: Log in to the GitHub container registry
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Free disk space and pull the build image
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL &
+          docker pull "ghcr.io/cosmonomic/pulsarlm-build:${{ needs.image.outputs.tag }}-${{ matrix.platform.arch }}"
+          wait
+          df -h /
 
       - uses: pypa/cibuildwheel@v4.3.1
         with:

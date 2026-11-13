@@ -60,6 +60,7 @@ cache-keys = [
 
 [tool.cibuildwheel]
 build = "cp313-manylinux_* cp314-manylinux_*"
+build-frontend = "build[uv]"
 build-verbosity = 1
 
 [tool.cibuildwheel.linux]
