@@ -58,14 +58,14 @@ def load_served_model(settings: Settings, path: Path) -> ServedModel:
         int(settings.store_gib * 2**30),
         checkpoint.store_path(settings.data_dir) if settings.persist else None,
     )
-    model_name = f"{settings.model}@{checkpoint.weights_version(path)}"
     try:
         engine = Engine(
             store,
             engine_model(cfg),
             load_model_shard,
             devices=devices,
-            model_name=model_name,
+            model_name=settings.model,
+            model_hash=checkpoint.model_hash(path),
             page_size=PAGE_SIZE,
             kv_dtype=dtype,
             kv_cache_gib=settings.kv_cache_gib,

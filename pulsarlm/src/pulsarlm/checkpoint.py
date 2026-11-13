@@ -169,7 +169,7 @@ def member_checksums(path: Path) -> list[tuple[str, int, int]]:
         )
 
 
-def weights_version(path: Path) -> str:
+def model_hash(path: Path) -> str:
     """The same for a model directory and the archive packed from it."""
     return hashlib.sha256(json.dumps(member_checksums(path)).encode()).hexdigest()[:16]
 

@@ -45,13 +45,13 @@ std::size_t line_bytes(const page_shape& shape);
 // both for values_only, and its index keys [n_layers, page_size, index_head_dim].
 kv page_tensors(const page& p, const page_shape& shape);
 
-// The digest that the page chains of an engine start from. model names the model and its weights version; with the
-// page shape of every KV layer (in KV layer order) and digest_function it covers everything that changes a
-// page's KV or how tokens split into pages. The seed is digest_function and model, each as an 8-byte little-endian
-// length then its bytes, then the shape count as 8 little-endian bytes, then per shape the dtype name as a length and
+// The digest that the page chains of an engine start from. model_name names the model and model_hash its files'
+// version; with the page shape of every KV layer (in KV layer order) and digest_function they cover everything that
+// changes a page's KV or how tokens split into pages. The seed is digest_function, model_name and model_hash, each as
+// an 8-byte little-endian length then its bytes, then the shape count as 8 little-endian bytes, then per shape the dtype name as a length and
 // its bytes, followed by n_layers, page_size, n_kv_heads, head_dim, values_only and index_head_dim, each as 8
 // little-endian bytes, then the count of state sizes and each size, as 8 little-endian bytes each.
-digest make_root_digest(std::string_view model, std::span<const page_shape> shapes);
+digest make_root_digest(std::string_view model_name, std::string_view model_hash, std::span<const page_shape> shapes);
 
 // The key of KV layer layer's page in the store: the digest of the page's digest bytes followed by layer as 8
 // little-endian bytes.

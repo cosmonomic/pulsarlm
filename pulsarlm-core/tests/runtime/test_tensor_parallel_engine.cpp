@@ -357,6 +357,7 @@ class recording_callbacks final : public pulsarlm::request_callbacks {
 pulsarlm::engine_config engine_config(std::size_t shard_count) {
     return pulsarlm::engine_config{
         .model_name = "qwen3_5-test",
+        .model_hash = "1",
         .page_size = page_size,
         .kv_dtype = at::kFloat,
         .kv_cache_pool_bytes = std::size_t{64} << 20,

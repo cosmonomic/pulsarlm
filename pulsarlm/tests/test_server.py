@@ -114,6 +114,7 @@ def load(
         MODEL,
         lambda rank, size: random_weights(embedding_scale),
         model_name=MODEL_ID,
+        model_hash="1",
         page_size=PAGE_SIZE,
         kv_dtype=DTYPE,
         kv_cache_gib=n_lines * LINE_BYTES / 2**30,

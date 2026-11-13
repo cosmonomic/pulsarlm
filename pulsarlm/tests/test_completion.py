@@ -89,6 +89,7 @@ def make_engine(store: LocalStore) -> AsyncEngine:
             MODEL,
             lambda rank, size: random_weights(),
             model_name="random-qwen3",
+            model_hash="1",
             page_size=PAGE_SIZE,
             kv_dtype=DTYPE,
             kv_cache_gib=64 * LINE_BYTES / 2**30,

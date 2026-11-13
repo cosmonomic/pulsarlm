@@ -271,7 +271,9 @@ engine::engine(
   page_size(config.page_size),
   vocab_size(vocab_size),
   max_page_bytes(largest_line(config, *this->shards.front())),
-  root(make_root_digest(config.model_name, page_shapes(config, full_layers(*this->shards.front())))),
+  root(make_root_digest(
+      config.model_name, config.model_hash, page_shapes(config, full_layers(*this->shards.front()))
+  )),
   store(std::move(store)),
   sched(
       model_pointers(this->shards),

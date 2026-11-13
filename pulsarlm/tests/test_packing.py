@@ -10,7 +10,7 @@ from tokenizers import Tokenizer, models
 from pulsarlm.checkpoint import (
     PulsarLMModelLoadingError,
     load as load_model,
-    weights_version,
+    model_hash,
 )
 from pulsarlm.migrate import migrate
 from pulsarlm.packing import pack, verify
@@ -66,7 +66,7 @@ def test_a_directory_and_its_archive_load_the_same_model_and_version(tmp_path: P
     with zipfile.ZipFile(archive) as zf:
         assert all(info.compress_type == zipfile.ZIP_STORED for info in zf.infolist())
         assert sorted(archived_weights(zf)) == ["b", "w"]
-    assert weights_version(directory) == weights_version(archive)
+    assert model_hash(directory) == model_hash(archive)
     from_directory = load_model(directory, device=torch.device("cpu"))
     from_archive = load_model(archive, device=torch.device("cpu"))
     assert from_directory.config == from_archive.config

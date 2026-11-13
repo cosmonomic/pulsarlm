@@ -368,7 +368,11 @@ def download_model(
         typer.Option(help="The model's name in pulsarlm. Defaults to the model."),
     ] = None,
     revision: Annotated[
-        str | None, typer.Option(help="A branch, tag or commit of the repository.")
+        str | None,
+        typer.Option(
+            help="A branch, tag or commit of the repository, instead of the one in "
+            "the model's url."
+        ),
     ] = None,
     data_dir: NewModelDataDir = None,
 ) -> None:
@@ -391,18 +395,16 @@ def migrate_model(
             callback=_known_model,
         ),
     ],
-    name: Annotated[
-        str | None,
-        typer.Option(help="The model's name in pulsarlm. Defaults to the model."),
-    ] = None,
-    data_dir: SearchedDataDir = None,
+    directory: Annotated[
+        Path,
+        typer.Argument(
+            help="The model directory.", exists=True, file_okay=False, dir_okay=True
+        ),
+    ],
 ) -> None:
-    """Bring a downloaded model directory to the current format, in place."""
-    checkpoint = importlib.import_module("pulsarlm.checkpoint")
+    """Bring a model directory to the current format, in place."""
     migrating = importlib.import_module("pulsarlm.migrate")
-    directory = checkpoint.model_path(name or model, data_dir)
-    if not directory.is_dir():
-        raise typer.BadParameter(f"{directory} is not a model directory")
+    directory = directory.resolve()
     migrating.migrate(directory, directory, MODELS[model].config_overrides)
     typer.secho(f"migrated {directory}", fg=typer.colors.GREEN)
 

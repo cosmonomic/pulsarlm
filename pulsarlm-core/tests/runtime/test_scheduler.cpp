@@ -433,7 +433,7 @@ std::vector<pulsarlm::page_shape> page_shapes(const std::vector<pulsarlm::kv_lay
 }
 
 digest root() {
-    return pulsarlm::make_root_digest("sum-model", page_shapes(two_full_layers));
+    return pulsarlm::make_root_digest("sum-model", "1", page_shapes(two_full_layers));
 }
 
 // A pool of pool_bytes, or with room for n_lines lines of every layer.

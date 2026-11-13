@@ -24,8 +24,8 @@ def check_sha256(file: Path, expected: str) -> None:
 def download(
     model: str, *, name: str | None, revision: str | None, data_dir: Path | None
 ) -> Path:
-    """Downloads a Hugging Face model into a .download- directory beside the
-    model, checks each weight shard against the SHA-256 the repository records,
+    """Downloads a Hugging Face model, at revision or else the revision of its
+    url, into a .download- directory beside the model, checks each weight shard against the SHA-256 the repository records,
     migrates it into the model directory and removes it. Returns the model
     directory's path. The download directory keeps its name across attempts, so
     an interrupted download resumes."""
@@ -34,8 +34,10 @@ def download(
         raise PulsarLMModelLoadingError(f"{dst} exists")
     dst.parent.mkdir(parents=True, exist_ok=True)
     source = MODELS[model]
-    repository = hugging_face_repository(source.url)
-    info = model_info(repository, revision=revision, files_metadata=True)
+    repository, url_revision = hugging_face_repository(source.url)
+    info = model_info(
+        repository, revision=revision or url_revision, files_metadata=True
+    )
     src = dst.with_name(f".download-{dst.name}")
     snapshot_download(
         repository, revision=info.sha, allow_patterns=UNSHARDED_FILES, local_dir=src

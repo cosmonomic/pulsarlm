@@ -47,7 +47,7 @@ fi
 if [[ ! -d $PULSARLM_DATA_DIR/$model ]]; then
     "$venv/bin/pulsarlm" models download "$model" --revision "$checkpoint_revision"
 else
-    "$venv/bin/pulsarlm" models migrate "$model"
+    "$venv/bin/pulsarlm" models migrate "$model" "$PULSARLM_DATA_DIR/$model"
 fi
 rm -rf "$HF_HOME"
 

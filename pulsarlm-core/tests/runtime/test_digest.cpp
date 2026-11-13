@@ -40,13 +40,13 @@ TEST_CASE("page digests of fewer tokens than a page are empty") {
     REQUIRE(pulsarlm::make_page_digests(parent, {}, 4).empty());
 }
 
-digest root_of(std::string_view model, std::vector<pulsarlm::page_shape> shapes) {
-    return pulsarlm::make_root_digest(model, shapes);
+digest root_of(std::string_view model_name, std::string_view model_hash, std::vector<pulsarlm::page_shape> shapes) {
+    return pulsarlm::make_root_digest(model_name, model_hash, shapes);
 }
 
-TEST_CASE("the root digest changes with the model and every field of every page shape") {
-    digest root = root_of("qwen3-8b@1", {shape, shape});
-    REQUIRE(root == root_of("qwen3-8b@1", {shape, shape}));
+TEST_CASE("the root digest changes with the model name, the model hash and every field of every page shape") {
+    digest root = root_of("qwen3-8b", "1", {shape, shape});
+    REQUIRE(root == root_of("qwen3-8b", "1", {shape, shape}));
 
     pulsarlm::page_shape other_page_size = shape;
     other_page_size.page_size = 8;
@@ -62,14 +62,16 @@ TEST_CASE("the root digest changes with the model and every field of every page 
     values_only.values_only = true;
 
     std::vector<digest> others{
-        root_of("qwen3-8b@2", {shape, shape}),
-        root_of("qwen3-8b@1", {shape}),
-        root_of("qwen3-8b@1", {shape, other_page_size}),
-        root_of("qwen3-8b@1", {shape, other_dtype}),
-        root_of("qwen3-8b@1", {shape, other_layers}),
-        root_of("qwen3-8b@1", {other_heads, shape}),
-        root_of("qwen3-8b@1", {shape, other_head_dim}),
-        root_of("qwen3-8b@1", {shape, values_only}),
+        root_of("qwen3-9b", "1", {shape, shape}),
+        root_of("qwen3-8b", "2", {shape, shape}),
+        root_of("qwen3-8b1", "", {shape, shape}),
+        root_of("qwen3-8b", "1", {shape}),
+        root_of("qwen3-8b", "1", {shape, other_page_size}),
+        root_of("qwen3-8b", "1", {shape, other_dtype}),
+        root_of("qwen3-8b", "1", {shape, other_layers}),
+        root_of("qwen3-8b", "1", {other_heads, shape}),
+        root_of("qwen3-8b", "1", {shape, other_head_dim}),
+        root_of("qwen3-8b", "1", {shape, values_only}),
     };
     for (const digest& other : others) {
         REQUIRE(other != root);

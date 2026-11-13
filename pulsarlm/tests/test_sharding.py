@@ -402,6 +402,7 @@ def test_an_engine_split_over_two_ranks_generates_what_one_gpu_does(
         loop = asyncio.get_running_loop()
         settings = dict(
             model_name="split-qwen3.5",
+            model_hash="1",
             page_size=16,
             kv_dtype=torch.float32,
             kv_cache_gib=1 / 64,

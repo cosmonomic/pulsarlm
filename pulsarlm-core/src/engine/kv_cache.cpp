@@ -258,10 +258,11 @@ kv page_tensors(const page& p, const page_shape& shape) {
     return line_views(p.bytes.view(shape.dtype), shape, shape.n_layers);
 }
 
-digest make_root_digest(std::string_view model, std::span<const page_shape> shapes) {
+digest make_root_digest(std::string_view model_name, std::string_view model_hash, std::span<const page_shape> shapes) {
     std::vector<std::byte> seed;
     append_string(seed, digest_function());
-    append_string(seed, model);
+    append_string(seed, model_name);
+    append_string(seed, model_hash);
     append_u64(seed, shapes.size());
     for (const page_shape& shape : shapes) {
         append_string(seed, c10::toString(shape.dtype));

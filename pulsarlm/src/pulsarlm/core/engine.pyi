@@ -360,6 +360,7 @@ class Engine:
         *,
         devices: list[torch.device],
         model_name: str,
+        model_hash: str,
         page_size: int,
         kv_dtype: torch.dtype,
         kv_cache_gib: float = 4.0,

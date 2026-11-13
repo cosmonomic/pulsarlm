@@ -8,6 +8,11 @@ class ModelSource(NamedTuple):
     config_overrides: dict[str, str]
 
 
+class HuggingFaceRepository(NamedTuple):
+    repository: str
+    revision: str
+
+
 QWEN2 = {"tool_call_syntax": "none", "think_syntax": "none"}
 QWEN2_5 = {"tool_call_syntax": "qwen_json", "think_syntax": "none"}
 QWEN3 = {"tool_call_syntax": "qwen_json", "think_syntax": "qwen"}
@@ -18,7 +23,7 @@ GEMMA4 = {"tool_call_syntax": "gemma", "think_syntax": "gemma"}
 
 
 def hugging_face(repository: str, config_overrides: dict[str, str]) -> ModelSource:
-    return ModelSource(HUGGING_FACE + repository, config_overrides)
+    return ModelSource(f"{HUGGING_FACE}{repository}/tree/main", config_overrides)
 
 
 MODELS = {
@@ -70,7 +75,9 @@ MODELS = {
 }
 
 
-def hugging_face_repository(url: str) -> str:
-    if not url.startswith(HUGGING_FACE):
-        raise ValueError(f"{url} is not a Hugging Face repository")
-    return url.removeprefix(HUGGING_FACE)
+def hugging_face_repository(url: str) -> HuggingFaceRepository:
+    """url is https://huggingface.co/<repository>/tree/<revision>."""
+    repository, tree, revision = url.removeprefix(HUGGING_FACE).partition("/tree/")
+    if not url.startswith(HUGGING_FACE) or not tree or not repository or not revision:
+        raise ValueError(f"{url} is not a Hugging Face repository at a revision")
+    return HuggingFaceRepository(repository, revision)

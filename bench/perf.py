@@ -155,7 +155,7 @@ def run_vllm_server(
     tensor_parallel_size: int,
 ) -> Iterator[Server]:
     command = ["uvx", "--python", "3.12", "--from", vllm, "vllm", "serve"]
-    command += [hugging_face_repository(MODELS[model].url)]
+    command += [hugging_face_repository(MODELS[model].url).repository]
     command += ["--served-model-name", model]
     command += ["--port", str(port), "--dtype", "bfloat16"]
     command += ["--tensor-parallel-size", str(tensor_parallel_size)]

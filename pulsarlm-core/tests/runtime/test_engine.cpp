@@ -152,6 +152,7 @@ pulsarlm::engine_config config(std::size_t n_lines) {
     std::size_t line_bytes = 2 * page_size * 2 * sizeof(float);
     return pulsarlm::engine_config{
         .model_name = "successor",
+        .model_hash = "1",
         .page_size = page_size,
         .kv_dtype = at::kFloat,
         .kv_cache_pool_bytes = n_lines * line_bytes,
@@ -174,7 +175,7 @@ pulsarlm::state one_page_state(const digest& hash, float weight_sum) {
 }
 
 digest root() {
-    return pulsarlm::make_root_digest("successor", pulsarlm::page_shapes(config(16), one_layer));
+    return pulsarlm::make_root_digest("successor", "1", pulsarlm::page_shapes(config(16), one_layer));
 }
 
 TEST_CASE("an engine whose KV cache holds no line is rejected") {

@@ -87,6 +87,7 @@ std::unique_ptr<python_engine> make_engine(
     py::object load_model_shard,
     std::vector<at::Device> devices,
     const std::string& model_name,
+    const std::string& model_hash,
     std::size_t page_size,
     at::ScalarType kv_dtype,
     double kv_cache_gib,
@@ -99,6 +100,7 @@ std::unique_ptr<python_engine> make_engine(
     }
     engine_config engine_settings{
         .model_name = model_name,
+        .model_hash = model_hash,
         .page_size = page_size,
         .kv_dtype = kv_dtype,
         .kv_cache_pool_bytes = static_cast<std::size_t>(kv_cache_gib * (1ull << 30)),
@@ -692,6 +694,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             py::kw_only(),
             "devices"_a,
             "model_name"_a,
+            "model_hash"_a,
             "page_size"_a,
             "kv_dtype"_a,
             "kv_cache_gib"_a = 4.0,
