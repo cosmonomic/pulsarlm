@@ -2,10 +2,13 @@
 transformers renders them."""
 
 import json
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any, Literal, NoReturn
 
-from jinja2.ext import loopcontrols
+from jinja2 import nodes
+from jinja2.ext import Extension, loopcontrols
+from jinja2.parser import Parser
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from tokenizers import Tokenizer
 
@@ -58,10 +61,26 @@ def special_token(value: str | dict | None) -> str | None:
     return value["content"] if isinstance(value, dict) else value
 
 
+class GenerationBlock(Extension):
+    tags = {"generation"}
+
+    def parse(self, parser: Parser) -> nodes.CallBlock:
+        lineno = next(parser.stream).lineno
+        body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
+        return nodes.CallBlock(
+            self.call_method("render_body"), [], [], body, lineno=lineno
+        )
+
+    def render_body(self, caller: Callable[[], str]) -> str:
+        return caller()
+
+
 class ChatTemplate:
     def __init__(self, source: str, tokenizer_config: dict) -> None:
         environment = ImmutableSandboxedEnvironment(
-            trim_blocks=True, lstrip_blocks=True, extensions=[loopcontrols]
+            trim_blocks=True,
+            lstrip_blocks=True,
+            extensions=[loopcontrols, GenerationBlock],
         )
         environment.filters["tojson"] = tojson
         self._template = environment.from_string(

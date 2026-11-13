@@ -107,3 +107,17 @@ def test_the_template_can_read_the_date():
     template = ChatTemplate("{{ strftime_now('%Y') }}", {})
     rendered = template.render([], add_generation_prompt=False)
     assert rendered == str(datetime.now().year)
+
+
+def test_the_generation_tag_renders_its_body():
+    template = ChatTemplate(
+        "{% for m in messages %}{% if m.role == 'assistant' %}"
+        "{% generation %}[{{ m.content }}]{% endgeneration %}"
+        "{% else %}{{ m.content }}{% endif %}{% endfor %}",
+        {},
+    )
+    rendered = template.render(
+        [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}],
+        add_generation_prompt=False,
+    )
+    assert rendered == "a[b]"
