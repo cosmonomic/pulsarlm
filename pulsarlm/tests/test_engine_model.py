@@ -12,6 +12,8 @@ from pulsarlm.core.engine import (
 )
 from pulsarlm.engine_model import engine_model
 
+SYNTAXES = {"tool_call_syntax": "none", "think_syntax": "none"}
+
 ROPE = {
     "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
     "full_attention": {
@@ -43,6 +45,7 @@ def gemma4(model_type: str, **text) -> PulsarLMModelConfig:
             "eos_token_id": [1, 106],
             "text_config": base | text,
         }
+        | SYNTAXES
     )
 
 
@@ -75,6 +78,7 @@ def qwen3_5(**text) -> PulsarLMModelConfig:
             "eos_token_id": [248044],
             "text_config": base | text,
         }
+        | SYNTAXES
     )
 
 
@@ -180,6 +184,7 @@ def test_a_qwen4_exp_checkpoint_maps_its_ple_layers_and_text_eos():
             "eos_token_id": [248046, 248044],
             "text_config": qwen4_exp_text(),
         }
+        | SYNTAXES
     )
     model = engine_model(cfg)
 
@@ -248,6 +253,7 @@ def test_a_qwen3_checkpoint_measures_mass_on_its_top_quarter():
             "rope_theta": 1000000,
             "rms_norm_eps": 1e-6,
         }
+        | SYNTAXES
     )
     assert cfg.eos_ids == [151645]
     assert isinstance(engine_model(cfg), ModelConfig)
@@ -267,7 +273,7 @@ def llama(**text) -> PulsarLMModelConfig:
         "rope_scaling": None,
         "rms_norm_eps": 1e-5,
     }
-    return PulsarLMModelConfig.from_dict(base | text)
+    return PulsarLMModelConfig.from_dict(base | SYNTAXES | text)
 
 
 LLAMA3_SCALING = {

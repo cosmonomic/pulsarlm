@@ -5,8 +5,8 @@ from pathlib import Path
 from huggingface_hub import model_info, snapshot_download
 
 from pulsarlm.checkpoint import PulsarLMModelLoadingError, new_model_path
-from pulsarlm.models import REPOSITORIES
-from pulsarlm.packing import UNSHARDED_FILES, build, weight_shards
+from pulsarlm.migrate import UNSHARDED_FILES, migrate, weight_shards
+from pulsarlm.models import MODELS, hugging_face_repository
 
 
 def check_sha256(file: Path, expected: str) -> None:
@@ -26,14 +26,15 @@ def download(
 ) -> Path:
     """Downloads a Hugging Face model into a .download- directory beside the
     model, checks each weight shard against the SHA-256 the repository records,
-    builds the model directory from it and removes it. Returns the model
+    migrates it into the model directory and removes it. Returns the model
     directory's path. The download directory keeps its name across attempts, so
     an interrupted download resumes."""
     dst = new_model_path(name or model, data_dir)
     if dst.exists():
         raise PulsarLMModelLoadingError(f"{dst} exists")
     dst.parent.mkdir(parents=True, exist_ok=True)
-    repository = REPOSITORIES[model]
+    source = MODELS[model]
+    repository = hugging_face_repository(source.url)
     info = model_info(repository, revision=revision, files_metadata=True)
     src = dst.with_name(f".download-{dst.name}")
     snapshot_download(
@@ -53,6 +54,6 @@ def download(
     }
     for shard in shards:
         check_sha256(shard, sha256s[shard.name])
-    build(src, dst)
+    migrate(src, dst, source.config_overrides)
     shutil.rmtree(src)
     return dst

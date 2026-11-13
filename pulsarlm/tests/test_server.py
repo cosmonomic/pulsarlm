@@ -129,6 +129,8 @@ def load(
         chat_template=ChatTemplate(chat_template, {}),
         model_id=MODEL_ID,
         stop_ids=stop_ids,
+        tool_call_syntax=None,
+        think_syntax=None,
         eviction=EvictionPolicy(cycle_tokens=PAGE_SIZE),
         prefix_cache=True,
         eviction_log=None,

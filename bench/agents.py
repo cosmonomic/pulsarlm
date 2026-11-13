@@ -24,7 +24,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from pulsarlm.models import REPOSITORIES
+from pulsarlm.models import MODELS, hugging_face_repository
 
 METRICS_INTERVAL_S = 0.5
 
@@ -138,7 +138,8 @@ def run_vllm_server(
     tensor_parallel_size: int,
 ) -> Iterator[Server]:
     command = ["uvx", "--python", "3.12", "--from", vllm, "vllm", "serve"]
-    command += [REPOSITORIES[model], "--served-model-name", model]
+    command += [hugging_face_repository(MODELS[model].url)]
+    command += ["--served-model-name", model]
     command += ["--port", str(port), "--dtype", "bfloat16"]
     command += ["--tensor-parallel-size", str(tensor_parallel_size)]
     # Without it vLLM leaves usage.prompt_tokens_details out.

@@ -11,8 +11,10 @@ from pulsarlm.chat import ChatTemplate, stop_ids
 from pulsarlm.core.engine import Engine, EvictionPolicy
 from pulsarlm.engine_model import engine_model
 from pulsarlm.paging import PAGE_SIZE
+from pulsarlm.reply import ThinkSyntax
 from pulsarlm.settings import Settings
 from pulsarlm.store import LocalStore
+from pulsarlm.tools import ToolCallSyntax
 
 
 @dataclass
@@ -22,6 +24,8 @@ class ServedModel:
     tokenizer: Tokenizer
     chat_template: ChatTemplate
     stop_ids: list[int]
+    tool_call_syntax: ToolCallSyntax | None
+    think_syntax: ThinkSyntax | None
     eviction: EvictionPolicy
     prefix_cache: bool
 
@@ -77,6 +81,8 @@ def load_served_model(settings: Settings, path: Path) -> ServedModel:
         tokenizer=tokenizer,
         chat_template=chat_template,
         stop_ids=stops,
+        tool_call_syntax=cfg.tool_call_syntax,
+        think_syntax=cfg.think_syntax,
         eviction=EvictionPolicy(
             n_working=settings.n_working,
             cycle_tokens=settings.cycle_tokens,

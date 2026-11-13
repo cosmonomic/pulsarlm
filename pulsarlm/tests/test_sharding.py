@@ -19,6 +19,7 @@ from pulsarlm.core.engine import Engine, RequestResult, State
 from pulsarlm.engine_model import engine_model
 
 PREFIX = "model.language_model."
+SYNTAXES = {"tool_call_syntax": "none", "think_syntax": "none"}
 QWEN3_5_TEXT = {
     "vocab_size": 300,
     "hidden_size": 64,
@@ -49,7 +50,7 @@ def model_config(
         "model_type": model_type,
         "eos_token_id": 0,
         "text_config": QWEN3_5_TEXT | text,
-    }
+    } | SYNTAXES
     if quantization is not None:
         raw["quantization_config"] = quantization
     return PulsarLMModelConfig.from_dict(raw)
@@ -294,7 +295,7 @@ def test_qwen4_exp_splits_experts_and_the_n_gram_table_across_its_shards(
 
 def test_an_architecture_without_a_split_is_rejected(tmp_path: Path):
     cfg = PulsarLMModelConfig.from_dict(
-        {"model_type": "qwen3", "eos_token_id": 0} | QWEN3_5_TEXT
+        {"model_type": "qwen3", "eos_token_id": 0} | QWEN3_5_TEXT | SYNTAXES
     )
     paths = write_files(tmp_path, {"model.norm.weight": torch.ones(4)})
     with pytest.raises(PulsarLMModelLoadingError, match="do not split"):
@@ -321,7 +322,11 @@ def write_archive(path: Path, cfg_raw: dict, weights: dict[str, Tensor]) -> list
 def test_load_weights_reads_one_rank_s_part_of_a_model(tmp_path: Path, form: str):
     cfg = model_config()
     weights = qwen3_5_weights(cfg)
-    raw = {"model_type": "qwen3_5", "eos_token_id": 0, "text_config": QWEN3_5_TEXT}
+    raw = {
+        "model_type": "qwen3_5",
+        "eos_token_id": 0,
+        "text_config": QWEN3_5_TEXT,
+    } | SYNTAXES
     if form == "archive":
         path = tmp_path / "model.pulsarlm"
         paths = write_archive(path, raw, weights)

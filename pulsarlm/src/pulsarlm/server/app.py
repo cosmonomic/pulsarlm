@@ -25,6 +25,8 @@ def load_server_state(
         chat_template=served.chat_template,
         model_id=settings.model,
         stop_ids=served.stop_ids,
+        tool_call_syntax=served.tool_call_syntax,
+        think_syntax=served.think_syntax,
         eviction=served.eviction,
         prefix_cache=served.prefix_cache,
         eviction_log=None

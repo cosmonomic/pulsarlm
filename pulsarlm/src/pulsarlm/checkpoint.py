@@ -7,13 +7,15 @@ from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple, Self
+from typing import Any, NamedTuple, Self, get_args
 
 import torch
 from tokenizers import Tokenizer
 
 from pulsarlm.chat import ChatTemplate
+from pulsarlm.reply import ThinkSyntax
 from pulsarlm.safetensors_file import SafetensorsFile
+from pulsarlm.tools import ToolCallSyntax
 from torch import Tensor
 from xdg_base_dirs import xdg_data_dirs, xdg_data_home
 
@@ -41,12 +43,27 @@ ARCHITECTURES = DENSE + MULTIMODAL + QWEN3_5_TEXT
 UNUSED_PREFIXES = dict.fromkeys(QWEN3_5 + QWEN3_5_TEXT, ("model.visual.", "mtp."))
 
 
+def config_syntax(raw: dict, key: str, syntaxes: tuple[str, ...]) -> Any:
+    if key not in raw:
+        raise PulsarLMModelLoadingError(
+            f"config.json has no {key}; run pulsarlm models migrate"
+        )
+    value = raw[key]
+    if value == "none":
+        return None
+    if value not in syntaxes:
+        raise PulsarLMModelLoadingError(f"unknown {key} {value!r}")
+    return value
+
+
 @dataclass
 class PulsarLMModelConfig:
     architecture: str
     text: dict
     eos_ids: list[int]
     quantization: dict | None
+    tool_call_syntax: ToolCallSyntax | None
+    think_syntax: ThinkSyntax | None
 
     @classmethod
     def from_dict(cls, raw: dict) -> Self:
@@ -59,6 +76,12 @@ class PulsarLMModelConfig:
             text=raw["text_config"] if architecture in MULTIMODAL else raw,
             eos_ids=eos if isinstance(eos, list) else [eos],
             quantization=raw.get("quantization_config"),
+            tool_call_syntax=config_syntax(
+                raw, "tool_call_syntax", get_args(ToolCallSyntax.__value__)
+            ),
+            think_syntax=config_syntax(
+                raw, "think_syntax", get_args(ThinkSyntax.__value__)
+            ),
         )
 
     @property

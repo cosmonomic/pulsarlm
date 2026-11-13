@@ -24,7 +24,7 @@ from tokenizers import Tokenizer
 from wonderwords import RandomWord
 
 from pulsarlm import checkpoint
-from pulsarlm.models import REPOSITORIES
+from pulsarlm.models import MODELS, hugging_face_repository
 
 INSTRUCTION = "\n\nContinue the story, using as many of the words above as you can."
 METRICS_INTERVAL_S = 0.05
@@ -155,7 +155,8 @@ def run_vllm_server(
     tensor_parallel_size: int,
 ) -> Iterator[Server]:
     command = ["uvx", "--python", "3.12", "--from", vllm, "vllm", "serve"]
-    command += [REPOSITORIES[model], "--served-model-name", model]
+    command += [hugging_face_repository(MODELS[model].url)]
+    command += ["--served-model-name", model]
     command += ["--port", str(port), "--dtype", "bfloat16"]
     command += ["--tensor-parallel-size", str(tensor_parallel_size)]
     command += ["--kv-cache-memory-bytes", str(kv_cache_bytes)]

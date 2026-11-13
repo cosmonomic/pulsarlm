@@ -35,9 +35,9 @@ from pulsarlm.server.openai.schema import (
     Usage,
 )
 from pulsarlm.paging import sink_tokens
-from pulsarlm.reply import Part, ReplyDecoder, tool_call_marker
+from pulsarlm.reply import TOOL_CALL_MARKERS, Part, ReplyDecoder, ThinkSyntax
 from pulsarlm.store import LocalStore
-from pulsarlm.tools import ToolCallError, parse_tool_call
+from pulsarlm.tools import ToolCallError, ToolCallSyntax, parse_tool_call
 
 
 @dataclass
@@ -48,6 +48,8 @@ class ServerState:
     chat_template: ChatTemplate
     model_id: str
     stop_ids: list[int]
+    tool_call_syntax: ToolCallSyntax | None
+    think_syntax: ThinkSyntax | None
     eviction: EvictionPolicy
     prefix_cache: bool
     eviction_log: EvictionLog | None
@@ -94,7 +96,7 @@ async def create_chat_completion(body: ChatCompletionRequest, state: State):
         if body.tools and body.tool_choice == "auto"
         else None
     )
-    if tools is not None and tool_call_marker(state.tokenizer) is None:
+    if tools is not None and state.tool_call_syntax is None:
         raise HTTPException(
             400, f"{state.model_id} has no tool call syntax pulsarlm parses"
         )
@@ -179,7 +181,11 @@ class _Reply:
         self._stop_ids = state.stop_ids
         self._max_tokens = max_tokens
         self._decoder = ReplyDecoder(
-            state.tokenizer, state.stop_ids, tool_calls=tool_calls, prompt=prompt
+            state.tokenizer,
+            state.stop_ids,
+            think_syntax=state.think_syntax,
+            tool_call_syntax=state.tool_call_syntax if tool_calls else None,
+            prompt=prompt,
         )
         self.token_count = 0
         self.finish_reason: FinishReason | None = None
@@ -209,14 +215,15 @@ class _Reply:
 
     def tool_calls(self) -> tuple[list[MessageToolCall], str]:
         """The tool calls, and the text of those that do not parse."""
-        marker = self._decoder.tool_call_marker
-        if marker is None:
+        syntax = self._decoder.tool_call_syntax
+        if syntax is None:
             return [], ""
+        marker = TOOL_CALL_MARKERS[syntax]
         calls: list[MessageToolCall] = []
         unparsed: list[str] = []
         for body in self._decoder.tool_call_bodies:
             try:
-                call = parse_tool_call(marker.syntax, body)
+                call = parse_tool_call(syntax, body)
             except ToolCallError:
                 unparsed.append(marker.opening + body + marker.closing)
                 continue

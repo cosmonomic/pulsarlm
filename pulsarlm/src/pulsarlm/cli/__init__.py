@@ -5,7 +5,7 @@ from typing import Annotated
 
 import typer
 
-from pulsarlm.models import REPOSITORIES, repository_url
+from pulsarlm.models import MODELS
 from pulsarlm.settings import Settings
 
 app = typer.Typer(
@@ -144,7 +144,7 @@ def _positive(value: float) -> float:
 
 
 def _known_model(model: str) -> str:
-    if model not in REPOSITORIES:
+    if model not in MODELS:
         raise typer.BadParameter(
             f"{model} is not a known model; `pulsarlm models list` lists them."
         )
@@ -328,7 +328,7 @@ def chat(
 
 
 models = typer.Typer(
-    help="Download, list, pack and verify models.", add_completion=False
+    help="Download, list, migrate, pack and verify models.", add_completion=False
 )
 app.add_typer(models, name="models")
 
@@ -342,14 +342,14 @@ def models_main(ctx: typer.Context, data_dir: SearchedDataDir = None) -> None:
 
 @models.command("list")
 def list_models(data_dir: SearchedDataDir = None) -> None:
-    """List the models pulsarlm can download, their Hugging Face repositories and
-    their local copies, then the local models it cannot download."""
+    """List the models pulsarlm can download, their repositories and their local
+    copies, then the local models it cannot download."""
     checkpoint = importlib.import_module("pulsarlm.checkpoint")
     local = checkpoint.local_models(data_dir)
-    names = list(REPOSITORIES) + sorted(set(local) - set(REPOSITORIES))
+    names = list(MODELS) + sorted(set(local) - set(MODELS))
     width = max(map(len, names))
     for name in names:
-        repository = repository_url(name) if name in REPOSITORIES else "-"
+        repository = MODELS[name].url if name in MODELS else "-"
         copies = ", ".join(str(path) for path in local.get(name, []))
         typer.echo(f"{name:<{width}}  {repository}  {copies}".rstrip())
 
@@ -380,6 +380,31 @@ def download_model(
         model, name=name, revision=revision, data_dir=data_dir
     )
     typer.secho(f"wrote {directory}", fg=typer.colors.GREEN)
+
+
+@models.command("migrate")
+def migrate_model(
+    model: Annotated[
+        str,
+        typer.Argument(
+            help="A model from `pulsarlm models list`, such as qwen3-8b.",
+            callback=_known_model,
+        ),
+    ],
+    name: Annotated[
+        str | None,
+        typer.Option(help="The model's name in pulsarlm. Defaults to the model."),
+    ] = None,
+    data_dir: SearchedDataDir = None,
+) -> None:
+    """Bring a downloaded model directory to the current format, in place."""
+    checkpoint = importlib.import_module("pulsarlm.checkpoint")
+    migrating = importlib.import_module("pulsarlm.migrate")
+    directory = checkpoint.model_path(name or model, data_dir)
+    if not directory.is_dir():
+        raise typer.BadParameter(f"{directory} is not a model directory")
+    migrating.migrate(directory, directory, MODELS[model].config_overrides)
+    typer.secho(f"migrated {directory}", fg=typer.colors.GREEN)
 
 
 @models.command("pack")

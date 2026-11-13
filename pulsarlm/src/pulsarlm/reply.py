@@ -9,90 +9,92 @@ from pulsarlm.tools import ToolCallSyntax
 type Part = Literal["reasoning", "content"]
 
 
+type ThinkSyntax = Literal["qwen", "gemma"]
+
+
 class ThinkMarker(NamedTuple):
     opening: str
     label: str
     closing: str
 
 
-THINK_MARKERS = (
-    ThinkMarker("<think>", "\n", "</think>"),
-    ThinkMarker("<|channel>", "thought\n", "<channel|>"),
-)
+THINK_MARKERS: dict[ThinkSyntax, ThinkMarker] = {
+    "qwen": ThinkMarker("<think>", "\n", "</think>"),
+    "gemma": ThinkMarker("<|channel>", "thought\n", "<channel|>"),
+}
 
 
 class ToolCallMarker(NamedTuple):
     opening: str
     closing: str
-    syntax: ToolCallSyntax
 
 
-TOOL_CALL_MARKERS = (
-    ToolCallMarker("<tool_call>", "</tool_call>", "qwen"),
-    ToolCallMarker("<|tool_call>", "<tool_call|>", "gemma"),
-)
+TOOL_CALL_MARKERS: dict[ToolCallSyntax, ToolCallMarker] = {
+    "qwen_json": ToolCallMarker("<tool_call>", "</tool_call>"),
+    "qwen_function": ToolCallMarker("<tool_call>", "</tool_call>"),
+    "gemma": ToolCallMarker("<|tool_call>", "<tool_call|>"),
+}
 
 
-def tool_call_marker(tokenizer: Tokenizer) -> ToolCallMarker | None:
-    for marker in TOOL_CALL_MARKERS:
-        if (
-            tokenizer.token_to_id(marker.opening) is not None
-            and tokenizer.token_to_id(marker.closing) is not None
-        ):
-            return marker
-    return None
+def marker_id(tokenizer: Tokenizer, marker: str) -> int:
+    token_id = tokenizer.token_to_id(marker)
+    if token_id is None:
+        raise ValueError(f"the tokenizer has no {marker} token")
+    return token_id
 
 
 class ReplyDecoder:
     """Decodes sampled tokens into reasoning and content text. Stop tokens, think
     markers and the label text after an opening marker decode to nothing. With
-    tool_calls, the text between tool call markers decodes to nothing and is
-    collected in tool_call_bodies instead. A prompt ending inside a think block
-    starts the reply in it."""
+    a tool_call_syntax, the text between tool call markers decodes to nothing and
+    is collected in tool_call_bodies instead. A prompt ending inside a think
+    block starts the reply in it."""
 
     def __init__(
         self,
         tokenizer: Tokenizer,
         stop_ids: list[int],
         *,
-        tool_calls: bool = False,
+        think_syntax: ThinkSyntax | None,
+        tool_call_syntax: ToolCallSyntax | None = None,
         prompt: Sequence[int] = (),
     ) -> None:
         self._tokenizer = tokenizer
         self._stop_ids = stop_ids
         self._decoder = DecodeStream(skip_special_tokens=False)
-        self._labels: dict[int, str] = {}
-        self._closing_ids: set[int] = set()
-        for marker in THINK_MARKERS:
-            opening_id = tokenizer.token_to_id(marker.opening)
-            closing_id = tokenizer.token_to_id(marker.closing)
-            if opening_id is not None and closing_id is not None:
-                self._labels[opening_id] = marker.label
-                self._closing_ids.add(closing_id)
-        marker = tool_call_marker(tokenizer) if tool_calls else None
-        self.tool_call_marker = marker
+        think = None if think_syntax is None else THINK_MARKERS[think_syntax]
+        self._label = "" if think is None else think.label
+        self._think_opening_id = (
+            None if think is None else marker_id(tokenizer, think.opening)
+        )
+        self._think_closing_id = (
+            None if think is None else marker_id(tokenizer, think.closing)
+        )
+        self.tool_call_syntax: ToolCallSyntax | None = tool_call_syntax
+        call = None if tool_call_syntax is None else TOOL_CALL_MARKERS[tool_call_syntax]
         self._call_opening_id = (
-            None if marker is None else tokenizer.token_to_id(marker.opening)
+            None if call is None else marker_id(tokenizer, call.opening)
         )
         self._call_closing_id = (
-            None if marker is None else tokenizer.token_to_id(marker.closing)
+            None if call is None else marker_id(tokenizer, call.closing)
         )
         self.tool_call_bodies: list[str] = []
         self._calling = False
         self._thinking = False
-        self._label = ""
         self._seen_label: str | None = None
         self._content_started = False
         self._resume_think_block(prompt)
 
     def _resume_think_block(self, prompt: Sequence[int]) -> None:
+        if self._think_opening_id is None:
+            return
         opening = max(
-            (i for i, token in enumerate(prompt) if token in self._labels), default=-1
+            (i for i, token in enumerate(prompt) if token == self._think_opening_id),
+            default=-1,
         )
-        if opening < 0 or any(t in self._closing_ids for t in prompt[opening + 1 :]):
+        if opening < 0 or self._think_closing_id in prompt[opening + 1 :]:
             return
         self._thinking = True
-        self._label = self._labels[prompt[opening]]
         after = self._tokenizer.decode(
             list(prompt[opening + 1 :]), skip_special_tokens=False
         )
@@ -113,12 +115,11 @@ class ReplyDecoder:
         if self._calling:
             self.tool_call_bodies[-1] += text
             return "content", ""
-        if token in self._labels:
+        if token == self._think_opening_id:
             self._thinking = True
-            self._label = self._labels[token]
             self._seen_label = ""
             return "reasoning", ""
-        if token in self._closing_ids:
+        if token == self._think_closing_id:
             self._thinking = False
             self._seen_label = None
             return "reasoning", ""

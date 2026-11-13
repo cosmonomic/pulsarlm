@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
-type ToolCallSyntax = Literal["qwen", "gemma"]
+type ToolCallSyntax = Literal["qwen_json", "qwen_function", "gemma"]
 
 GEMMA_QUOTE = '<|"|>'
 
@@ -21,13 +21,14 @@ class ToolCallError(ValueError):
 
 
 def parse_tool_call(syntax: ToolCallSyntax, body: str) -> ToolCall:
-    """Raises ToolCallError when body is not a call in syntax. A qwen call is a
-    JSON object (Qwen2, Qwen3) or XML-like <function=NAME> tags (Qwen3.5)."""
-    if syntax == "qwen":
-        if body.lstrip().startswith("<function="):
+    """Raises ToolCallError when body is not a call in syntax."""
+    match syntax:
+        case "qwen_json":
+            return parse_json_call(body)
+        case "qwen_function":
             return parse_function_call(body)
-        return parse_json_call(body)
-    return GemmaCallParser(body).call()
+        case "gemma":
+            return GemmaCallParser(body).call()
 
 
 def parse_json_call(body: str) -> ToolCall:

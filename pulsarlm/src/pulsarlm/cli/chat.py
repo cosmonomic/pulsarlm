@@ -58,7 +58,12 @@ def new_chat(
                     reasoning_effort=reasoning_effort,
                 )
                 served.eviction.n_sink = sink_tokens(system_tokens)
-                decoder = ReplyDecoder(served.tokenizer, served.stop_ids, prompt=prompt)
+                decoder = ReplyDecoder(
+                    served.tokenizer,
+                    served.stop_ids,
+                    think_syntax=served.think_syntax,
+                    prompt=prompt,
+                )
                 answer = []
                 reasoning_shown = False
                 try:
