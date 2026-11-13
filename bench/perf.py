@@ -34,6 +34,7 @@ METRICS_INTERVAL_S = 0.05
 class Setting:
     engine: Literal["pulsarlm", "vllm"]
     max_context_window: int | None = None
+    eviction_threshold: float = 0.0
     prefix_cache: bool = True
 
 
@@ -45,6 +46,9 @@ SETTINGS = {
     "cap_16k": Setting("pulsarlm", max_context_window=16384),
     "cap_16k_no_prefix_cache": Setting(
         "pulsarlm", max_context_window=16384, prefix_cache=False
+    ),
+    "cap_16k_mass_0.5": Setting(
+        "pulsarlm", max_context_window=16384, eviction_threshold=0.5
     ),
     "vllm": Setting("vllm"),
     "vllm_no_prefix_cache": Setting("vllm", prefix_cache=False),
@@ -131,6 +135,7 @@ def run_pulsarlm_server(
     else:
         command += ["--max_context_window", str(setting.max_context_window)]
         command += ["--n_working", str(n_working)]
+        command += ["--eviction_threshold", str(setting.eviction_threshold)]
     root = f"http://127.0.0.1:{port}"
     base_url = f"{root}/api/openai/v1"
     with run_server(command, base_url, data_dir / "serve.log"):
@@ -677,6 +682,7 @@ SERIES = {
     "cap_16k_no_prefix_cache": Series(
         "Capped @ 16k, no prefix cache", "#104281", filled=False
     ),
+    "cap_16k_mass_0.5": Series("Capped @ 16k, mass eviction 0.5", "#1f8a70"),
     "vllm": Series("vLLM", "#d95926"),
     "vllm_no_prefix_cache": Series("vLLM, no prefix cache", "#d95926", filled=False),
 }
