@@ -35,7 +35,7 @@ jobs:
       packages: write
 
   sdist:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -57,9 +57,9 @@ jobs:
     strategy:
       matrix:
         platform:
-          - runner: ubuntu-latest
+          - runner: ubuntu-26.04
             arch: x86_64
-          - runner: ubuntu-24.04-arm
+          - runner: ubuntu-26.04-arm
             arch: aarch64
         python: [cp313, cp314]
     runs-on: ${{ matrix.platform.runner }}
@@ -99,7 +99,7 @@ jobs:
 
   publish:
     needs: [sdist, wheel]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     environment:
       name: pypi
       url: https://pypi.org/project/pulsarlm/
