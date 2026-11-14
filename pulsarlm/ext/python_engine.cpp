@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include "digest_bytes.hpp"
 #include "pulsarlm/engine.hpp"
 
 namespace pulsarlm {
@@ -85,30 +86,27 @@ python_engine::~python_engine() {
 }
 
 request_handle python_engine::submit(
-    const state& initial_state,
     std::vector<std::int64_t>&& tokens,
+    const std::optional<py::bytes>& initial_digest,
     const sampling_params& sampling,
     std::optional<std::size_t> max_tokens,
     const eviction_policy& eviction,
-    std::uint64_t request_id,
     py::object on_cycle_end,
     py::object on_end
 ) {
     auto buffer = std::make_shared<request_buffer>();
-    request r{initial_state, std::move(tokens), sampling, max_tokens, eviction, request_id};
+    request r{
+        .initial_digest = initial_digest ? std::optional(digest_from_bytes(*initial_digest)) : std::nullopt,
+        .tokens = std::move(tokens),
+        .sampling = sampling,
+        .max_tokens = max_tokens,
+        .eviction = eviction,
+    };
     {
         py::gil_scoped_release nogil;
         core_engine->submit(std::move(r), std::make_unique<buffered_callbacks>(buffer, wake_signal));
     }
     return request_handle(std::move(buffer), std::move(on_cycle_end), std::move(on_end));
-}
-
-std::vector<digest> python_engine::page_digests(const std::vector<std::int64_t>& tokens) const {
-    return core_engine->page_digests(tokens);
-}
-
-std::vector<digest> python_engine::page_keys(const state& s) const {
-    return core_engine->page_keys(s);
 }
 
 eviction_report python_engine::eviction_report_of(const state& s, const eviction_policy& policy) const {

@@ -83,6 +83,7 @@ gate_activation activation(const std::string& name) {
 // sizes each device's KV cache.
 std::unique_ptr<python_engine> make_engine(
     py::object store,
+    py::object loop,
     const any_model_config& model_config,
     py::object load_model_shard,
     std::vector<at::Device> devices,
@@ -108,7 +109,11 @@ std::unique_ptr<python_engine> make_engine(
         .stop_ids = std::move(stop_ids),
         .prefill_tokens_per_step = prefill_tokens_per_step,
     };
-    auto adapter = std::make_unique<python_store>(std::move(store), static_cast<std::size_t>(store_gib * (1ull << 30)));
+    auto adapter = std::make_unique<python_store>(
+        std::move(store),
+        std::move(loop),
+        static_cast<std::size_t>(store_gib * (1ull << 30))
+    );
     model_shard_loader loader = [&load_model_shard](std::size_t rank, std::size_t size) {
         py::gil_scoped_acquire gil;
         return load_model_shard(rank, size).cast<std::unordered_map<std::string, at::Tensor>>();
@@ -187,7 +192,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
         .def_readwrite("score_moments", &layer_sequence::score_moments)
         .def(py::self == py::self);
 
-    py::class_<state>(m, "State")
+    py::class_<state, std::shared_ptr<state>>(m, "State")
         .def(
             py::init([](const std::optional<py::bytes>& head,
                         std::vector<layer_sequence> layers,
@@ -202,24 +207,24 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "layers"_a = std::vector<layer_sequence>(),
             "tail"_a = std::vector<std::int64_t>()
         )
-        .def_property(
+        .def_property_readonly(
             "head",
             [](const state& s) -> std::optional<py::bytes> {
                 return s.head ? std::optional(to_bytes(*s.head)) : std::nullopt;
-            },
-            [](state& s, const std::optional<py::bytes>& head) {
-                s.head = head ? std::optional(digest_from_bytes(*head)) : std::nullopt;
             }
         )
-        .def_readwrite("layers", &state::layers)
-        .def_readwrite("tail", &state::tail);
+        .def_readonly("layers", &state::layers)
+        .def_readonly("tail", &state::tail);
 
-    py::class_<cycle_end>(m, "CycleEnd")
-        .def_readonly("state", &cycle_end::state)
-        .def_readonly("token_count", &cycle_end::token_count);
+    py::class_<cycle_end>(m, "CycleEnd").def_property_readonly("state", [](const cycle_end& ended) {
+        return std::const_pointer_cast<state>(ended.state);
+    });
 
     py::class_<request_result>(m, "RequestResult")
-        .def_readonly("state", &request_result::state)
+        .def_property_readonly(
+            "state",
+            [](const request_result& result) { return std::const_pointer_cast<state>(result.state); }
+        )
         .def_readonly("total_tokens", &request_result::total_tokens)
         .def_readonly("cached_tokens", &request_result::cached_tokens)
         .def_readonly("device_cached_tokens", &request_result::device_cached_tokens);
@@ -689,6 +694,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
         .def(
             py::init(&make_engine),
             "store"_a,
+            "loop"_a,
             "config"_a,
             "load_model_shard"_a,
             py::kw_only(),
@@ -705,27 +711,14 @@ PYBIND11_MODULE(pulsarlm_core, m) {
         .def(
             "submit",
             &python_engine::submit,
-            "initial_state"_a,
             "tokens"_a,
             py::kw_only(),
+            "initial_digest"_a = py::none(),
             "sampling"_a = sampling_params{},
             "max_tokens"_a = py::none(),
             "eviction"_a = eviction_policy{},
-            "request_id"_a = 0,
             "on_cycle_end"_a = py::none(),
             "on_end"_a = py::none()
-        )
-        .def(
-            "page_digests",
-            [](const python_engine& e, const std::vector<std::int64_t>& tokens) {
-                return to_bytes_list(e.page_digests(tokens));
-            },
-            "tokens"_a
-        )
-        .def(
-            "page_keys",
-            [](const python_engine& e, const state& s) { return to_bytes_list(e.page_keys(s)); },
-            "state"_a
         )
         .def("eviction_report_of", &python_engine::eviction_report_of, "state"_a, "eviction"_a)
         .def("stat", &python_engine::stat)

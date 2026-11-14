@@ -44,18 +44,52 @@ using pulsarlm::task;
 
 using token_list = std::vector<std::int64_t>;
 
+using state_pointer = std::shared_ptr<const pulsarlm::state>;
+using lease_id_type = pulsarlm::state::lease_id_type;
+
+struct written_state {
+    lease_id_type lease_id;
+    state_pointer s;
+};
+
+struct state_read {
+    token_list tokens;
+    std::vector<digest> page_digests;
+};
+
+struct store_contents {
+    std::unordered_map<digest, page, digest_hash> pages;
+    std::vector<std::vector<digest>> fetches;
+    std::size_t puts = 0;
+    std::vector<std::pair<lease_id_type, digest>> owners;
+    std::vector<state_pointer> states;
+    std::vector<state_read> state_reads;
+    std::vector<lease_id_type> leases;
+    std::vector<written_state> written_states;
+    std::vector<lease_id_type> released;
+    lease_id_type next_lease_id = 100;
+};
+
 struct request_results {
     token_list tokens;
     std::vector<pulsarlm::cycle_end> cycle_ends;
     std::optional<std::expected<pulsarlm::state, request_error>> end;
+    state_pointer end_state;
     std::size_t total_tokens = 0;
     std::size_t cached_tokens = 0;
     std::size_t device_cached_tokens = 0;
     bool cancelled = false;
+    std::shared_ptr<const store_contents> observed_store;
+    std::vector<std::size_t> writes_at_cycle_ends;
+    std::optional<std::size_t> writes_at_end;
 };
 
 class recording_callbacks final : public pulsarlm::request_callbacks {
     std::shared_ptr<request_results> recorded_results;
+
+    std::size_t observed_writes() const noexcept {
+        return recorded_results->observed_store ? recorded_results->observed_store->written_states.size() : 0;
+    }
 
   public:
     explicit recording_callbacks(std::shared_ptr<request_results> recorded_results)
@@ -66,17 +100,20 @@ class recording_callbacks final : public pulsarlm::request_callbacks {
     }
 
     void on_cycle_end(pulsarlm::cycle_end&& ended) noexcept override {
+        recorded_results->writes_at_cycle_ends.push_back(observed_writes());
         recorded_results->cycle_ends.push_back(std::move(ended));
     }
 
     void on_end(std::expected<pulsarlm::request_result, request_error>&& result) noexcept override {
+        recorded_results->writes_at_end = observed_writes();
         if (result) {
             recorded_results->total_tokens = result->total_tokens;
             recorded_results->cached_tokens = result->cached_tokens;
             recorded_results->device_cached_tokens = result->device_cached_tokens;
+            recorded_results->end_state = result->state;
         }
         recorded_results->end.emplace(std::move(result).transform([](pulsarlm::request_result&& ended) {
-            return std::move(ended.state);
+            return *ended.state;
         }));
     }
 
@@ -96,13 +133,6 @@ constexpr std::int64_t vocab = 1000;
 const std::vector<pulsarlm::kv_layer> two_full_layers{
     pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .n_q_heads = 1},
     pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .n_q_heads = 1},
-};
-
-struct store_contents {
-    std::unordered_map<digest, page, digest_hash> pages;
-    std::vector<std::vector<digest>> fetches;
-    std::size_t puts = 0;
-    std::vector<std::pair<std::uint64_t, digest>> owners;
 };
 
 std::size_t page_bytes_of(const sharded_page& p) {
@@ -146,11 +176,25 @@ void copy_pages_from_host(
     }
 }
 
-// Keeps every page it is put, copied to pageable host memory.
+bool tail_continues(const pulsarlm::state& s, const token_list& tokens, std::size_t start) {
+    return start + s.tail.size() < tokens.size() &&
+           std::equal(s.tail.begin(), s.tail.end(), tokens.begin() + static_cast<std::ptrdiff_t>(start));
+}
+
+// Keeps every page it is written, copied to pageable host memory, and every state, one per head and tail. A lease never
+// drops a page.
 struct memory_store final : pulsarlm::page_store {
     std::shared_ptr<store_contents> contents = std::make_shared<store_contents>();
 
-    task<std::vector<bool>> fetch(
+    // The state holding head and tail replaces the one holding the same.
+    void keep_state(state_pointer s) const {
+        std::erase_if(contents->states, [&](const state_pointer& kept) {
+            return kept->head == s->head && kept->tail == s->tail;
+        });
+        contents->states.push_back(std::move(s));
+    }
+
+    task<std::vector<bool>> read_pages(
         std::span<const digest> hashes,
         std::vector<sharded_page>&& lines,
         std::span<const cudaStream_t> streams
@@ -173,23 +217,61 @@ struct memory_store final : pulsarlm::page_store {
         co_return found;
     }
 
-    task<std::expected<void, pulsarlm::page_error>>
-    put(std::vector<digest>&& keys,
+    task<std::expected<void, pulsarlm::page_error>> write_pages(
+        std::vector<digest>&& keys,
         std::vector<sharded_page>&& pages,
-        std::vector<pulsarlm::page_owner>&& owners,
-        std::span<const cudaStream_t> streams) override {
+        std::vector<std::pair<lease_id_type, page_index_type>>&& owners,
+        std::span<const cudaStream_t> streams
+    ) override {
         std::shared_ptr<store_contents> shared = contents;
         std::vector<digest> put_keys = std::move(keys);
         std::vector<sharded_page> sources = std::move(pages);
         shared->puts++;
-        for (const pulsarlm::page_owner& owner : owners) {
-            shared->owners.emplace_back(owner.request, put_keys[owner.page]);
+        for (const auto& [lease_id, index] : owners) {
+            shared->owners.emplace_back(lease_id, put_keys[index]);
         }
         std::vector<page> copies = copy_pages_to_host(sources, streams);
         for (std::size_t i = 0; i < put_keys.size(); i++) {
             shared->pages.insert_or_assign(put_keys[i], std::move(copies[i]));
         }
         co_return {};
+    }
+
+    task<std::pair<state_pointer, lease_id_type>>
+    read_state(std::span<const std::int64_t> tokens, std::span<const digest> page_digests) override {
+        std::shared_ptr<store_contents> shared = contents;
+        token_list prompt(tokens.begin(), tokens.end());
+        shared->state_reads.push_back(state_read{
+            .tokens = prompt,
+            .page_digests = std::vector<digest>(page_digests.begin(), page_digests.end()),
+        });
+        lease_id_type lease_id = shared->next_lease_id++;
+        shared->leases.push_back(lease_id);
+        for (std::size_t pages = page_digests.size() + 1; pages > 0; pages--) {
+            std::optional<digest> head =
+                pages > 1 ? std::optional(page_digests[pages - 2]) : std::optional<digest>();
+            state_pointer longest;
+            for (const state_pointer& s : shared->states) {
+                if (s->head == head && tail_continues(*s, prompt, (pages - 1) * page_size) &&
+                    (!longest || s->tail.size() > longest->tail.size())) {
+                    longest = s;
+                }
+            }
+            if (longest) {
+                co_return std::pair(longest, lease_id);
+            }
+        }
+        co_return std::pair(std::make_shared<const pulsarlm::state>(), lease_id);
+    }
+
+    task<void> write_state(lease_id_type lease_id, state_pointer&& s) override {
+        contents->written_states.push_back(written_state{.lease_id = lease_id, .s = s});
+        keep_state(std::move(s));
+        co_return;
+    }
+
+    void release(lease_id_type lease_id) noexcept override {
+        contents->released.push_back(lease_id);
     }
 };
 
@@ -472,6 +554,7 @@ struct fixture {
       sched(
           {&model},
           make_cache(model.layers, n_lines, pool_bytes, backing),
+          backing,
           compute_streams(),
           {},
           root(),
@@ -708,16 +791,62 @@ TEST_CASE("a step's new pages of every KV layer reach the store in one put") {
     REQUIRE(f.store->pages.size() == 4);
 }
 
-TEST_CASE("the pages a request's steps put are owned by its id") {
+TEST_CASE("the pages a request's steps write and the states it reaches are its lease's") {
     fixture f(16);
     token_list prompt{1, 2, 3, 4, 5, 6, 7, 8};
-    serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 1, .id = 5}});
+    serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 1}});
 
+    REQUIRE(f.store->leases == std::vector<lease_id_type>{100});
     REQUIRE(f.store->owners.size() == f.store->pages.size());
     for (const auto& [owner, key] : f.store->owners) {
-        REQUIRE(owner == 5);
+        REQUIRE(owner == 100);
         REQUIRE(f.store->pages.contains(key));
     }
+    REQUIRE(f.store->written_states.size() == 1);
+    REQUIRE(f.store->written_states[0].lease_id == 100);
+}
+
+TEST_CASE("a request reads the state for its tokens with their page digests") {
+    fixture f(16);
+    token_list prompt{1, 2, 3, 4, 5, 6, 7, 8, 9};
+    serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 1}});
+
+    REQUIRE(f.store->state_reads.size() == 1);
+    REQUIRE(f.store->state_reads[0].tokens == prompt);
+    REQUIRE((f.store->state_reads[0].page_digests == pulsarlm::make_page_digests(root(), prompt, page_size)));
+}
+
+TEST_CASE("a request's page chain starts from its initial digest and continues past its prompt") {
+    fixture f(16);
+    digest initial{.hi = 3, .lo = 4};
+    token_list prompt{1, 2, 3, 4, 5, 6};
+    std::vector<request_results> results =
+        serve_all(f.sched, {request{.initial_digest = initial, .tokens = prompt, .max_tokens = 5}});
+
+    token_list forwarded = concat(prompt, without_last(results[0].tokens));
+    std::vector<digest> chain = pulsarlm::make_page_digests(initial, forwarded, page_size);
+    REQUIRE(chain.size() == 2);
+    REQUIRE((f.store->state_reads[0].page_digests == std::vector{chain[0]}));
+    REQUIRE((hashes_of(ended_state(results[0])) == chain));
+    REQUIRE(results[0].tokens == continuation(prompt, 5));
+}
+
+TEST_CASE("each state reaches the store before the callback that passes it") {
+    fixture f(16);
+    token_list prompt{1, 2, 3, 4, 5, 6};
+    submission s = make_submission(request{.tokens = prompt, .max_tokens = 6, .eviction = {.cycle_tokens = 4}});
+    s.recorded_results->observed_store = f.store;
+    std::vector<submission> submissions;
+    submissions.push_back(std::move(s));
+    request_results result = serve_submissions(f.sched, std::move(submissions))[0];
+
+    REQUIRE(result.cycle_ends.size() == 2);
+    REQUIRE(result.writes_at_cycle_ends == std::vector<std::size_t>{1, 2});
+    REQUIRE(result.writes_at_end == 3);
+    REQUIRE(f.store->written_states.size() == 3);
+    REQUIRE(f.store->written_states[0].s == result.cycle_ends[0].state);
+    REQUIRE(f.store->written_states[1].s == result.cycle_ends[1].state);
+    REQUIRE(f.store->written_states[2].s == result.end_state);
 }
 
 TEST_CASE("a request continues from the end state of another in the same cache") {
@@ -728,16 +857,13 @@ TEST_CASE("a request continues from the end state of another in the same cache")
         f.sched,
         request{.tokens = prompt, .max_tokens = 5},
         [&](const request_results& first) {
-            return request{
-                .initial_state = ended_state(first),
-                .tokens = concat({first.tokens.back()}, user),
-                .max_tokens = 4
-            };
+            return request{.tokens = concat(concat(prompt, first.tokens), user), .max_tokens = 4};
         }
     );
 
     token_list context = concat(concat(prompt, results[0].tokens), user);
     REQUIRE(results[1].tokens == continuation(context, 4));
+    REQUIRE(results[1].cached_tokens == 8);
     REQUIRE(
         (hashes_of(ended_state(results[1])) ==
          pulsarlm::make_page_digests(root(), concat(context, without_last(results[1].tokens)), page_size))
@@ -757,7 +883,7 @@ TEST_CASE("a request continues from pages another cache fetches from the store")
     fixture second_engine(16, 64, {}, shared_store);
     request_results second = serve_all(
         second_engine.sched,
-        {request{.initial_state = first_end, .tokens = concat({first.tokens.back()}, user), .max_tokens = 4}}
+        {request{.tokens = concat(concat(prompt, first.tokens), user), .max_tokens = 4}}
     )[0];
 
     REQUIRE(second.tokens == continuation(concat(concat(prompt, first.tokens), user), 4));
@@ -773,11 +899,7 @@ TEST_CASE("a request's result counts its tokens and the initial state's full pag
         f.sched,
         request{.tokens = prompt, .max_tokens = 5},
         [&](const request_results& first) {
-            return request{
-                .initial_state = ended_state(first),
-                .tokens = concat({first.tokens.back()}, user),
-                .max_tokens = 4
-            };
+            return request{.tokens = concat(concat(prompt, first.tokens), user), .max_tokens = 4};
         }
     );
 
@@ -797,10 +919,8 @@ TEST_CASE("pages fetched from the store count as cached but not device cached") 
     memory_store shared_store;
     shared_store.contents = first_engine.store;
     fixture second_engine(16, 64, {}, shared_store);
-    request_results second = serve_all(
-        second_engine.sched,
-        {request{.initial_state = ended_state(first), .tokens = {first.tokens.back()}, .max_tokens = 1}}
-    )[0];
+    request_results second =
+        serve_all(second_engine.sched, {request{.tokens = concat(prompt, first.tokens), .max_tokens = 1}})[0];
 
     REQUIRE(second.cached_tokens == 8);
     REQUIRE(second.device_cached_tokens == 0);
@@ -808,15 +928,16 @@ TEST_CASE("pages fetched from the store count as cached but not device cached") 
 
 TEST_CASE("a state page missing from the store ends the request with miss") {
     fixture f(16);
-    pulsarlm::state unknown = full_layers_state({digest{.hi = 1, .lo = 2}}, 2);
-    std::vector<request_results> results = serve_all(
-        f.sched,
-        {request{.initial_state = unknown, .tokens = {3}, .max_tokens = 1}}
-    );
+    token_list prompt{1, 2, 3, 4, 5};
+    f.backing.keep_state(std::make_shared<const pulsarlm::state>(
+        full_layers_state(pulsarlm::make_page_digests(root(), prompt, page_size), 2)
+    ));
+    std::vector<request_results> results = serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 1}});
 
     REQUIRE(results[0].tokens.empty());
     REQUIRE(ended_error(results[0]) == request_error::miss);
     REQUIRE(f.model.forward_count == 0);
+    REQUIRE(f.store->released == f.store->leases);
 }
 
 TEST_CASE("a stop token ends the request after it is emitted") {
@@ -855,6 +976,8 @@ TEST_CASE("a request cancelled before it runs ends with cancelled") {
     REQUIRE(results[0].tokens.empty());
     REQUIRE(ended_error(results[0]) == request_error::cancelled);
     REQUIRE(f.model.forward_count == 0);
+    REQUIRE(f.store->released == f.store->leases);
+    REQUIRE(f.store->written_states.empty());
 }
 
 TEST_CASE("a request cancelled while decoding ends with cancelled after its step") {
@@ -872,6 +995,24 @@ TEST_CASE("a request cancelled while decoding ends with cancelled after its step
 
     REQUIRE(results[0].tokens == continuation(prompt, 3));
     REQUIRE(ended_error(results[0]) == request_error::cancelled);
+    REQUIRE(f.store->released == f.store->leases);
+}
+
+TEST_CASE("a request's lease is released once when the loop stops while it runs") {
+    fixture f(16);
+    f.model.on_forward = [] { event_loop::current()->stop(); };
+    auto recorded_results = std::make_shared<request_results>();
+    {
+        event_loop loop;
+        loop.spawn(f.sched.run());
+        loop.spawn(f.sched.submit(request{.tokens = {1, 2, 3}, .max_tokens = 10}, make_writer(recorded_results)));
+        REQUIRE(loop.run() == nullptr);
+        c10::cuda::getCurrentCUDAStream().synchronize();
+        REQUIRE(f.store->leases.size() == 1);
+        REQUIRE(f.store->released.empty());
+    }
+    REQUIRE(f.store->released == f.store->leases);
+    REQUIRE(ended_error(*recorded_results) == request_error::loop_exited);
 }
 
 TEST_CASE("a request that finds too few free lines ends with oom without waiting") {
@@ -887,6 +1028,9 @@ TEST_CASE("a request that finds too few free lines ends with oom without waiting
     REQUIRE(results[1].tokens.empty());
     REQUIRE(ended_error(results[1]) == request_error::oom);
     REQUIRE(f.model.forward_count == 3);
+    std::vector<lease_id_type> released = f.store->released;
+    std::ranges::sort(released);
+    REQUIRE(released == std::vector<lease_id_type>{100, 101});
 }
 
 TEST_CASE("a request needing more lines than the cache has ends with oom") {
@@ -940,13 +1084,11 @@ TEST_CASE("a cycle ends every cycle_tokens tokens with the state it reached") {
     const std::vector<pulsarlm::cycle_end>& cycle_ends = results[0].cycle_ends;
     REQUIRE(cycle_ends.size() == 2);
     token_list first_pages(prompt.begin(), prompt.begin() + 4);
-    REQUIRE(cycle_ends[0].token_count == 4);
-    REQUIRE((hashes_of(cycle_ends[0].state) == pulsarlm::make_page_digests(root(), first_pages, page_size)));
-    REQUIRE(cycle_ends[0].state.tail.empty());
+    REQUIRE((hashes_of(*cycle_ends[0].state) == pulsarlm::make_page_digests(root(), first_pages, page_size)));
+    REQUIRE(cycle_ends[0].state->tail.empty());
     token_list forwarded = concat(prompt, token_list(generated.begin(), generated.begin() + 2));
-    REQUIRE(cycle_ends[1].token_count == 8);
-    REQUIRE((hashes_of(cycle_ends[1].state) == pulsarlm::make_page_digests(root(), forwarded, page_size)));
-    REQUIRE(cycle_ends[1].state.tail.empty());
+    REQUIRE((hashes_of(*cycle_ends[1].state) == pulsarlm::make_page_digests(root(), forwarded, page_size)));
+    REQUIRE(cycle_ends[1].state->tail.empty());
 }
 
 TEST_CASE("a cycle's end evicts the pages scoring below the threshold outside the sink and working pages") {
@@ -970,9 +1112,8 @@ TEST_CASE("a cycle's end evicts the pages scoring below the threshold outside th
     REQUIRE(results[0].tokens == token_list{first, continuation(concat(kept, {first}), 1)[0]});
     REQUIRE(results[0].cycle_ends.size() == 8);
     const pulsarlm::cycle_end& prefill_end = results[0].cycle_ends[7];
-    REQUIRE((hashes_of(prefill_end.state) == std::vector{chain[0], chain[1], chain[4], chain[7]}));
-    REQUIRE(prefill_end.state.tail.empty());
-    REQUIRE(prefill_end.token_count == 32);
+    REQUIRE((hashes_of(*prefill_end.state) == std::vector{chain[0], chain[1], chain[4], chain[7]}));
+    REQUIRE(prefill_end.state->tail.empty());
     pulsarlm::state end = ended_state(results[0]);
     REQUIRE((hashes_of(end) == std::vector{chain[0], chain[1], chain[4], chain[7]}));
     REQUIRE(end.tail == token_list{first});
@@ -993,7 +1134,7 @@ TEST_CASE("a layer evicts nothing by score during its warm-up") {
 
     // The prompt's 6 sampled pages are fewer than the warm-up's 4 density samples then 4 score samples.
     REQUIRE(
-        (hashes_of(results[0].cycle_ends.back().state) == pulsarlm::make_page_digests(root(), eight_pages, page_size))
+        (hashes_of(*results[0].cycle_ends.back().state) == pulsarlm::make_page_digests(root(), eight_pages, page_size))
     );
 }
 
@@ -1019,7 +1160,7 @@ TEST_CASE("a page's mass sums carry over from the cycles before") {
 
     REQUIRE(f.model.prefill_chunks == std::vector<token_list>{{8}, {8}});
     REQUIRE(results[0].cycle_ends.size() == 2);
-    const pulsarlm::state& reached = results[0].cycle_ends[1].state;
+    const pulsarlm::state& reached = *results[0].cycle_ends[1].state;
     REQUIRE((hashes_of(reached) == pulsarlm::make_page_digests(root(), prompt, page_size)));
     std::vector<float> densities = densities_of(reached);
     REQUIRE(densities.size() == 4);
@@ -1049,9 +1190,9 @@ TEST_CASE("a request resumes with the mass sums and moments of its initial state
                 sequence.density_moments = {pulsarlm::moments{.count = 2, .mean = 0.5, .m2 = 0.25}};
                 sequence.score_moments = pulsarlm::moments{.count = 2, .mean = 0.0, .m2 = 1.0};
             }
+            f.backing.keep_state(std::make_shared<const pulsarlm::state>(std::move(resumed)));
             return request{
-                .initial_state = resumed,
-                .tokens = {first.tokens.back(), 200, 201, 202},
+                .tokens = concat(prompt, {first.tokens.back(), 200, 201, 202}),
                 .max_tokens = 2,
                 .eviction = policy,
             };
@@ -1067,7 +1208,7 @@ TEST_CASE("a request resumes with the mass sums and moments of its initial state
         concat(prompt, {results[0].tokens.back(), 200, 201, 202}),
         page_size
     );
-    const pulsarlm::state& reached = results[1].cycle_ends[0].state;
+    const pulsarlm::state& reached = *results[1].cycle_ends[0].state;
     REQUIRE((hashes_of(reached) == std::vector{resumed_chain[0], resumed_chain[1], resumed_chain[4]}));
 }
 
@@ -1087,7 +1228,7 @@ TEST_CASE("a cycle's end evicts the oldest pages down to max_pages") {
     token_list kept(prompt.begin() + 8, prompt.end());
     std::int64_t first = continuation(prompt, 1)[0];
     REQUIRE(results[0].tokens == token_list{first, continuation(concat(kept, {first}), 1)[0]});
-    REQUIRE((hashes_of(results[0].cycle_ends[0].state) == std::vector{chain[2], chain[3]}));
+    REQUIRE((hashes_of(*results[0].cycle_ends[0].state) == std::vector{chain[2], chain[3]}));
 }
 
 TEST_CASE("a prompt longer than the cache fits when each cycle evicts down to max_pages") {
@@ -1204,67 +1345,6 @@ TEST_CASE("a state's sliding layer holds the pages its window reaches from the t
     REQUIRE(end.tail == token_list{25, 26});
 }
 
-TEST_CASE("validate_state accepts the states the scheduler reaches and rejects others") {
-    fixture f(16, 64, {}, {}, full_and_sliding);
-    token_list history(26);
-    std::iota(history.begin(), history.end(), 1);
-    pulsarlm::state end = ended_state(serve_all(f.sched, {request{.tokens = history, .max_tokens = 0}})[0]);
-    f.sched.validate_state(end);
-    f.sched.validate_state(pulsarlm::state{});
-    f.sched.validate_state(pulsarlm::state{.layers = std::vector<pulsarlm::layer_sequence>(2)});
-
-    pulsarlm::state headless = end;
-    headless.head.reset();
-    REQUIRE_THROWS_AS(f.sched.validate_state(headless), std::invalid_argument);
-    pulsarlm::state one_layer = end;
-    one_layer.layers.pop_back();
-    REQUIRE_THROWS_AS(f.sched.validate_state(one_layer), std::invalid_argument);
-    pulsarlm::state full_window = end;
-    full_window.layers[1] = full_window.layers[0];
-    REQUIRE_THROWS_AS(f.sched.validate_state(full_window), std::invalid_argument);
-    pulsarlm::state empty_window = end;
-    empty_window.layers[1].pages.clear();
-    REQUIRE_THROWS_AS(f.sched.validate_state(empty_window), std::invalid_argument);
-    pulsarlm::state stale_window = end;
-    stale_window.layers[1].pages[0] = end.layers[0].pages[4];
-    REQUIRE_THROWS_AS(f.sched.validate_state(stale_window), std::invalid_argument);
-    pulsarlm::state headless_view = end;
-    headless_view.layers[0].pages.pop_back();
-    REQUIRE_THROWS_AS(f.sched.validate_state(headless_view), std::invalid_argument);
-    pulsarlm::state evicted_view = end;
-    evicted_view.layers[0].pages.erase(evicted_view.layers[0].pages.begin() + 1);
-    evicted_view.layers[0].pages[0].mass_sum = {-1.0f};
-    evicted_view.layers[0].pages[0].weight_sum = 1.0f;
-    evicted_view.layers[0].density_moments = {pulsarlm::moments{.count = 2, .mean = -1.0, .m2 = 0.5}};
-    f.sched.validate_state(evicted_view);
-    pulsarlm::state negative_weight = end;
-    negative_weight.layers[0].pages[0].mass_sum = {1.0f};
-    negative_weight.layers[0].pages[0].weight_sum = -1.0f;
-    REQUIRE_THROWS_AS(f.sched.validate_state(negative_weight), std::invalid_argument);
-    pulsarlm::state weight_without_mass = end;
-    weight_without_mass.layers[0].pages[0].mass_sum = {};
-    weight_without_mass.layers[0].pages[0].weight_sum = 1.0f;
-    REQUIRE_THROWS_AS(f.sched.validate_state(weight_without_mass), std::invalid_argument);
-    pulsarlm::state infinite_mass = end;
-    infinite_mass.layers[0].pages[0].mass_sum = {std::numeric_limits<float>::infinity()};
-    REQUIRE_THROWS_AS(f.sched.validate_state(infinite_mass), std::invalid_argument);
-    pulsarlm::state too_many_heads = end;
-    too_many_heads.layers[0].pages[0].mass_sum = {0.0f, 0.0f};
-    REQUIRE_THROWS_AS(f.sched.validate_state(too_many_heads), std::invalid_argument);
-    pulsarlm::state too_many_moments = end;
-    too_many_moments.layers[0].density_moments = std::vector<pulsarlm::moments>(2);
-    REQUIRE_THROWS_AS(f.sched.validate_state(too_many_moments), std::invalid_argument);
-    pulsarlm::state spread_of_one_sample = end;
-    spread_of_one_sample.layers[0].score_moments = pulsarlm::moments{.count = 1, .m2 = 1.0};
-    REQUIRE_THROWS_AS(f.sched.validate_state(spread_of_one_sample), std::invalid_argument);
-    pulsarlm::state unordered = end;
-    std::swap(unordered.layers[0].pages[0].index, unordered.layers[0].pages[1].index);
-    REQUIRE_THROWS_AS(f.sched.validate_state(unordered), std::invalid_argument);
-    pulsarlm::state misplaced_head = end;
-    misplaced_head.layers[1].pages.back().index++;
-    REQUIRE_THROWS_AS(f.sched.validate_state(misplaced_head), std::invalid_argument);
-}
-
 TEST_CASE("a request resumed on another cache fetches only the window's pages of a sliding layer") {
     fixture first_engine(16, 64, {}, {}, full_and_sliding);
     token_list prompt(20);
@@ -1279,7 +1359,7 @@ TEST_CASE("a request resumed on another cache fetches only the window's pages of
     token_list user{7, 8};
     request_results second = serve_all(
         second_engine.sched,
-        {request{.initial_state = first_end, .tokens = concat({first.tokens.back()}, user), .max_tokens = 4}}
+        {request{.tokens = concat(concat(prompt, first.tokens), user), .max_tokens = 4}}
     )[0];
 
     REQUIRE(second.tokens == continuation(concat(concat(prompt, first.tokens), user), 4));
@@ -1308,10 +1388,9 @@ TEST_CASE("a sliding layer keeps the pages its window reaches whatever the full-
     token_list kept(prompt.begin() + 12, prompt.end());
     std::int64_t first = continuation(prompt, 1)[0];
     REQUIRE(results[0].tokens == token_list{first, continuation(concat(kept, {first}), 1)[0]});
-    const pulsarlm::state& reached = results[0].cycle_ends[0].state;
+    const pulsarlm::state& reached = *results[0].cycle_ends[0].state;
     REQUIRE((hashes_of(reached, 0) == std::vector{chain[3]}));
     REQUIRE((hashes_of(reached, 1) == std::vector{chain[2], chain[3]}));
-    f.sched.validate_state(reached);
 }
 
 TEST_CASE("each full-attention layer evicts by its own attention mass") {
@@ -1332,7 +1411,7 @@ TEST_CASE("each full-attention layer evicts by its own attention mass") {
     std::int64_t first = continuation(pages_of(eight_pages, {0, 1, 4, 6, 7}), 1)[0];
     token_list kept = pages_of(eight_pages, {0, 1, 4, 7});
     REQUIRE(results[0].tokens == concat({first}, continuation(concat(kept, {first}), 2)));
-    const pulsarlm::state& reached = results[0].cycle_ends[7].state;
+    const pulsarlm::state& reached = *results[0].cycle_ends[7].state;
     REQUIRE((hashes_of(reached, 0) == std::vector{chain[0], chain[1], chain[4], chain[7]}));
     REQUIRE((densities_of(reached, 0) == std::vector{0.0f, 1.0f, 1.0f, 0.0f}));
     REQUIRE((hashes_of(reached, 1) == std::vector{chain[0], chain[2], chain[5], chain[7]}));
@@ -1340,7 +1419,6 @@ TEST_CASE("each full-attention layer evicts by its own attention mass") {
     pulsarlm::state end = ended_state(results[0]);
     REQUIRE((hashes_of(end, 0) == std::vector{chain[0], chain[1], chain[4], chain[7]}));
     REQUIRE((hashes_of(end, 1) == std::vector{chain[0], chain[2], chain[5], chain[7]}));
-    f.sched.validate_state(end);
 }
 
 // Layer 0 keeps pages 1 and 4 and layer 1 pages 2 and 5; both drop pages 3 and 6. Pages 1, 2, 4 and 5 stay in the
@@ -1385,12 +1463,7 @@ TEST_CASE("a request resumed from a state with different views per layer keeps t
         f.sched,
         request{.tokens = eight_pages, .max_tokens = 2, .eviction = policy},
         [&](const request_results& done) {
-            return request{
-                .initial_state = ended_state(done),
-                .tokens = {done.tokens[1]},
-                .max_tokens = 2,
-                .eviction = policy,
-            };
+            return request{.tokens = concat(eight_pages, done.tokens), .max_tokens = 2, .eviction = policy};
         }
     );
 
@@ -1440,10 +1513,6 @@ TEST_CASE("a recurrent layer carries its state across steps and keeps the state 
     REQUIRE((hashes_of(end, 0) == std::vector{hashes.back()}));
     REQUIRE(stored_state(f, hashes.back()) == sum_of_first(forwarded, 12));
     REQUIRE(!f.store->pages.contains(pulsarlm::store_key(hashes[1], 0)));
-    f.sched.validate_state(end);
-    pulsarlm::state every_page = end;
-    every_page.layers[0] = every_page.layers[1];
-    REQUIRE_THROWS_AS(f.sched.validate_state(every_page), std::invalid_argument);
 }
 
 TEST_CASE("a request resumes a recurrent layer's state from another cache") {
@@ -1458,7 +1527,7 @@ TEST_CASE("a request resumes a recurrent layer's state from another cache") {
     token_list user{7, 8};
     request_results second = serve_all(
         second_engine.sched,
-        {request{.initial_state = first_end, .tokens = concat({first.tokens.back()}, user), .max_tokens = 4}}
+        {request{.tokens = concat(concat(prompt, first.tokens), user), .max_tokens = 4}}
     )[0];
 
     REQUIRE(second.tokens == continuation(concat(concat(prompt, first.tokens), user), 4));
@@ -1481,7 +1550,7 @@ TEST_CASE("a recurrent layer's state covers the pages eviction drops") {
 
     REQUIRE(results[0].tokens == continuation(prompt, 2));
     std::vector<digest> chain = pulsarlm::make_page_digests(root(), prompt, page_size);
-    const pulsarlm::state& reached = results[0].cycle_ends[0].state;
+    const pulsarlm::state& reached = *results[0].cycle_ends[0].state;
     REQUIRE((hashes_of(reached, 1) == std::vector{chain[2], chain[3]}));
     REQUIRE((hashes_of(reached, 0) == std::vector{chain[3]}));
     REQUIRE(stored_state(f, chain[3]) == sum_of_first(prompt, 16));
@@ -1499,7 +1568,7 @@ TEST_CASE("each state a recurrent request reaches has the state at its head in t
     REQUIRE(results[0].tokens == continuation(prompt, 7));
     std::vector<pulsarlm::state> states;
     for (const pulsarlm::cycle_end& ended : results[0].cycle_ends) {
-        states.push_back(ended.state);
+        states.push_back(*ended.state);
     }
     states.push_back(ended_state(results[0]));
     REQUIRE(states.size() == 6);

@@ -43,24 +43,53 @@ const std::vector<pulsarlm::kv_layer> one_layer{pulsarlm::kv_layer{.n_kv_heads =
 constexpr std::size_t vocab = 100;
 constexpr auto end_timeout = std::chrono::seconds(30);
 
-// Drops puts. A fetch never completes; it counts down fetch_started.
+using lease_id_type = pulsarlm::state::lease_id_type;
+
+struct lease_record {
+    std::mutex mutex;
+    std::vector<lease_id_type> leases;
+    std::vector<lease_id_type> released;
+};
+
+// Drops written pages and states, and returns stored_state for every read. A page read never completes; it counts down
+// fetch_start_latch.
 struct stalling_store final : pulsarlm::page_store {
     std::shared_ptr<std::latch> fetch_start_latch = std::make_shared<std::latch>(1);
+    std::shared_ptr<const pulsarlm::state> stored_state = std::make_shared<const pulsarlm::state>();
+    std::shared_ptr<lease_record> lease_records = std::make_shared<lease_record>();
 
     task<std::vector<bool>>
-    fetch(std::span<const digest>, std::vector<sharded_page>&&, std::span<const cudaStream_t>) override {
+    read_pages(std::span<const digest>, std::vector<sharded_page>&&, std::span<const cudaStream_t>) override {
         auto [never, resolver] = pulsarlm::external_task<>::make();
         fetch_start_latch->count_down();
         co_await std::move(never);
         co_return {};
     }
 
-    task<std::expected<void, pulsarlm::page_error>>
-    put(std::vector<digest>&&,
+    task<std::expected<void, pulsarlm::page_error>> write_pages(
+        std::vector<digest>&&,
         std::vector<sharded_page>&&,
-        std::vector<pulsarlm::page_owner>&&,
-        std::span<const cudaStream_t>) override {
+        std::vector<std::pair<lease_id_type, page_index_type>>&&,
+        std::span<const cudaStream_t>
+    ) override {
         co_return {};
+    }
+
+    task<std::pair<std::shared_ptr<const pulsarlm::state>, lease_id_type>>
+    read_state(std::span<const std::int64_t>, std::span<const digest>) override {
+        std::lock_guard lock(lease_records->mutex);
+        lease_id_type lease_id = lease_records->leases.size() + 1;
+        lease_records->leases.push_back(lease_id);
+        co_return std::pair(stored_state, lease_id);
+    }
+
+    task<void> write_state(lease_id_type, std::shared_ptr<const pulsarlm::state>&&) override {
+        co_return;
+    }
+
+    void release(lease_id_type lease_id) noexcept override {
+        std::lock_guard lock(lease_records->mutex);
+        lease_records->released.push_back(lease_id);
     }
 };
 
@@ -128,7 +157,7 @@ class recording_callbacks final : public pulsarlm::request_callbacks {
         {
             std::lock_guard lock(recorded_results->mutex);
             recorded_results->end.emplace(std::move(result).transform([](pulsarlm::request_result&& ended) {
-                return std::move(ended.state);
+                return *ended.state;
             }));
         }
         recorded_results->end_condition.notify_all();
@@ -222,28 +251,9 @@ TEST_CASE("submit rejects an invalid request without calling its callbacks") {
     auto recorded_results = std::make_shared<request_results>();
 
     REQUIRE_THROWS_AS(e.submit(request{}, record_into(recorded_results)), std::invalid_argument);
-    REQUIRE_THROWS_AS(
-        e.submit(request{.initial_state = {.tail = {1, 2, 3, 4}}}, record_into(recorded_results)),
-        std::invalid_argument
-    );
     REQUIRE_THROWS_AS(e.submit(request{.tokens = {-1}}, record_into(recorded_results)), std::invalid_argument);
     REQUIRE_THROWS_AS(
         e.submit(request{.tokens = {static_cast<std::int64_t>(vocab)}}, record_into(recorded_results)),
-        std::invalid_argument
-    );
-    REQUIRE_THROWS_AS(
-        e.submit(request{.initial_state = {.tail = {200}}, .tokens = {1}}, record_into(recorded_results)),
-        std::invalid_argument
-    );
-    REQUIRE_THROWS_AS(
-        e.submit(request{.initial_state = {.head = digest{.hi = 1, .lo = 2}}, .tokens = {1}}, record_into(recorded_results)),
-        std::invalid_argument
-    );
-    REQUIRE_THROWS_AS(
-        e.submit(
-            request{.initial_state = one_page_state(digest{.hi = 1, .lo = 2}, -1.0f), .tokens = {1}},
-            record_into(recorded_results)
-        ),
         std::invalid_argument
     );
     REQUIRE_THROWS_AS(
@@ -274,20 +284,24 @@ TEST_CASE("submit rejects an invalid request without calling its callbacks") {
     REQUIRE(!recorded_results->end);
 }
 
-TEST_CASE("destroying the engine ends the requests it serves with loop_exited") {
+TEST_CASE("destroying the engine ends the requests it serves with loop_exited and releases their leases") {
+    token_list prompt{1, 2, 3, 4, 5};
     auto store = std::make_unique<stalling_store>();
+    store->stored_state = std::make_shared<const pulsarlm::state>(
+        one_page_state(pulsarlm::make_page_digests(root(), prompt, page_size)[0], 0.0f)
+    );
     std::shared_ptr<std::latch> fetch_start_latch = store->fetch_start_latch;
+    std::shared_ptr<lease_record> lease_records = store->lease_records;
     std::optional<pulsarlm::engine> e;
     e.emplace(std::make_unique<successor_model>(), vocab, config(16), std::move(store));
     auto recorded_results = std::make_shared<request_results>();
-    e->submit(
-        request{.initial_state = one_page_state(digest{.hi = 1, .lo = 2}, 0.0f), .tokens = {1}, .max_tokens = 1},
-        record_into(recorded_results)
-    );
+    e->submit(request{.tokens = prompt, .max_tokens = 1}, record_into(recorded_results));
     fetch_start_latch->wait();
     e.reset();
 
     REQUIRE(ended_with(*recorded_results, request_error::loop_exited));
+    REQUIRE(lease_records->leases == std::vector<lease_id_type>{1});
+    REQUIRE(lease_records->released == std::vector<lease_id_type>{1});
 }
 
 TEST_CASE("a panic ends the requests with loop_exited and leaves its exception") {

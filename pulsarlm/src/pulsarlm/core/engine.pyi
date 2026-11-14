@@ -1,5 +1,5 @@
+import asyncio
 import enum
-from concurrent.futures import Future
 from collections.abc import Callable
 from typing import Literal, Protocol
 
@@ -9,23 +9,36 @@ from torch import Tensor
 type Page = Tensor
 
 class PageStore(Protocol):
-    """Called on the engine's loop thread with the GIL held. A page is one KV
-    layer's line as a host uint8 tensor of its bytes, laid out as only the engine
-    reads it; an owner pairs a request id with the index of a page its step
-    produced. claim takes the pages of a step the store has for the leases owning
-    them and gives the indices of those it needs, and put then hands it their host
-    copies with those pages' owners. fetch and put return
-    without waiting for the store. A fetch whose call raises, or whose future
-    fails, is cancelled, is dropped unfinished or yields a malformed result, misses
-    every page it asked for. An exception raised by claim, which then claims
-    nothing, or by put goes to sys.unraisablehook.
+    """read_pages and read_state run on the event loop given to the Engine; the
+    other methods are called on the engine's loop thread with the GIL held. A page
+    is one KV layer's line as a host uint8 tensor of its bytes, laid out as only
+    the engine reads it; an owner pairs a lease id with the index of a page its
+    request's step produced. read_state gives the newest stored state reaching a
+    proper prefix of tokens, or an empty state, and a new lease keeping its pages
+    until release. claim takes the pages of a step the store has for the leases
+    owning them and gives the indices of those it needs, and write_pages then hands
+    it their host copies with those pages' owners. write_state makes a state the
+    lease's request reached findable, page_keys being its pages. A read_pages that
+    raises or yields a malformed result misses every page it asked for; a
+    read_state that does panics the engine's loop. An exception raised by claim,
+    which then claims nothing, or by write_pages, write_state or release goes to
+    sys.unraisablehook.
     """
 
-    def fetch(self, hashes: list[bytes]) -> Future[list[Page | None]]: ...
-    def claim(self, hashes: list[bytes], owners: list[tuple[int, int]]) -> list[int]: ...
-    def put(
+    async def read_pages(self, hashes: list[bytes]) -> list[Page | None]: ...
+    async def read_state(
+        self, tokens: list[int], page_digests: list[bytes]
+    ) -> tuple[State, int]: ...
+    def claim(
+        self, hashes: list[bytes], owners: list[tuple[int, int]]
+    ) -> list[int]: ...
+    def write_pages(
         self, hashes: list[bytes], pages: list[Page], owners: list[tuple[int, int]]
     ) -> None: ...
+    def write_state(
+        self, lease_id: int, state: State, page_keys: list[bytes]
+    ) -> None: ...
+    def release(self, lease_id: int) -> None: ...
 
 class Moments:
     """The running count, mean and sum of squared deviations from the mean
@@ -76,9 +89,12 @@ class State:
     sequence per KV layer, and may be empty when head is None. tail holds the tokens
     after head."""
 
-    head: bytes | None
-    layers: list[LayerSequence]
-    tail: list[int]
+    @property
+    def head(self) -> bytes | None: ...
+    @property
+    def layers(self) -> list[LayerSequence]: ...
+    @property
+    def tail(self) -> list[int]: ...
     def __init__(
         self,
         head: bytes | None = None,
@@ -87,20 +103,16 @@ class State:
     ) -> None: ...
 
 class CycleEnd:
-    """The state a request reached when an eviction cycle ended, covering the
-    request's first token_count tokens."""
+    """The state a request reached when an eviction cycle ended."""
 
     @property
     def state(self) -> State: ...
-    @property
-    def token_count(self) -> int: ...
 
 class RequestResult:
     """A request's final state, which leaves out the last sampled token, and its
-    token counts. total_tokens: the initial state's history, its full pages and
-    tail, then the request's tokens, then the tokens it sampled. cached_tokens: the
-    tokens of the initial state's full pages, which the request did not forward;
-    its tail is forwarded again. device_cached_tokens: those of them on pages every
+    token counts. total_tokens: the request's tokens, then the tokens it sampled.
+    cached_tokens: the tokens of the full pages of the state it resumed, which the
+    request did not forward; that state's tail is forwarded again. device_cached_tokens: those of them on pages every
     KV layer reading the page had resident in the KV cache when the request
     started, not fetched from the store."""
 
@@ -351,6 +363,7 @@ class Engine:
     def __init__(
         self,
         store: PageStore,
+        loop: asyncio.AbstractEventLoop,
         config: ModelConfig
         | Gemma4Config
         | Qwen3_5Config
@@ -374,25 +387,20 @@ class Engine:
         ValueError for a model the engine does not split over devices."""
     def submit(
         self,
-        initial_state: State,
         tokens: list[int],
         *,
+        initial_digest: bytes | None = None,
         sampling: SamplingParams = ...,
         max_tokens: int | None = None,
         eviction: EvictionPolicy = ...,
-        request_id: int = 0,
         on_cycle_end: Callable[[CycleEnd], None] | None = None,
         on_end: Callable[[RequestResult], None] | None = None,
     ) -> Request:
-        """Raises ValueError for a request the engine cannot serve. The pages the
-        request's steps put reach the store owned by request_id. Request.take calls
+        """Serves tokens, a history chained from initial_digest or from the engine's
+        root without it, from the newest state the store holds for a prefix of
+        them, and writes every state the request reaches to the store. Raises
+        ValueError for a request the engine cannot serve. Request.take calls
         on_cycle_end and on_end on its caller's thread."""
-    def page_digests(self, tokens: list[int]) -> list[bytes]:
-        """The hashes of the full pages of a token history from its start; the last
-        is the head of a state reaching that history."""
-    def page_keys(self, state: State) -> list[bytes]:
-        """The store keys of the pages of state's sequences, which a request
-        resuming from state reads."""
     def eviction_report_of(
         self, state: State, eviction: EvictionPolicy
     ) -> EvictionReport:

@@ -12,20 +12,17 @@
 
 namespace pulsarlm {
 
-// The state a request reached when an eviction cycle ended. It covers the request's first token_count tokens: the
-// initial state's tail, then the request's tokens, then the tokens it sampled.
+// The state a request reached when an eviction cycle ended.
 struct cycle_end {
-    pulsarlm::state state;
-    std::size_t token_count;
+    std::shared_ptr<const pulsarlm::state> state;
 };
 
-// A request's final state, which leaves out the last sampled token, and its token counts. total_tokens: the initial
-// state's history, its full pages and tail, then the request's tokens, then the tokens it sampled. cached_tokens: the
-// tokens of the initial state's full pages, which the request did not forward; its tail is forwarded again.
-// device_cached_tokens: those of them on pages that every KV layer reading the page had resident in the KV cache when
-// the request started, not fetched from the store.
+// A request's final state, which leaves out the last sampled token, and its token counts. total_tokens: the request's
+// tokens, then the tokens it sampled. cached_tokens: the tokens of the full pages of the state it resumed, which it did
+// not forward; that state's tail is forwarded again. device_cached_tokens: those of them on pages that every KV layer
+// reading the page had resident in the KV cache when the request started, not read from the store.
 struct request_result {
-    pulsarlm::state state;
+    std::shared_ptr<const pulsarlm::state> state;
     std::size_t total_tokens;
     std::size_t cached_tokens;
     std::size_t device_cached_tokens;

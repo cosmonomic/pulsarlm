@@ -22,15 +22,14 @@
 
 namespace pulsarlm {
 
-// The tail of initial_state is forwarded again, then tokens; together they hold at least one token. Without
-// max_tokens, the request samples until one of the engine's stop tokens. The pages its steps put are owned by id.
+// tokens is a history chained from initial_digest, or from the engine's root without it, and holds at least one token.
+// Without max_tokens, the request samples until one of the engine's stop tokens.
 struct request {
-    state initial_state;
+    std::optional<digest> initial_digest;
     std::vector<std::int64_t> tokens;
     sampling_params sampling;
     std::optional<std::size_t> max_tokens;
     eviction_policy eviction;
-    std::uint64_t id = 0;
 };
 
 class scheduler {
@@ -43,6 +42,7 @@ class scheduler {
     std::vector<model*> shards;
     // One layer per KV layer, in the models' KV layer order.
     kv_cache cache;
+    page_store& store;
     // Per shard, one kv per KV layer.
     std::vector<std::vector<kv>> lines;
     std::vector<std::optional<std::size_t>> sliding_windows;
@@ -66,9 +66,6 @@ class scheduler {
 
     static event& emplace_event(std::optional<event>& waited);
     static void wake(std::optional<event>& waited) noexcept;
-    // The full pages of KV layer layer's view wholly before the window of a query at view index query.
-    std::size_t passed_pages(std::size_t layer, std::size_t query) const noexcept;
-    state state_of(const sequence& seq) const;
     // The tokens of seq's full history pages that every KV layer reading the page holds resident.
     std::size_t device_cached_tokens(const sequence& seq) const;
     // Per KV layer with pages, lines for its pages, then line_count empty lines; per recurrent layer, a copy of the
@@ -86,17 +83,20 @@ class scheduler {
     // Adds to the moments of each layer that measures mass the full pages outside the sinks that cycle_tokens tokens
     // now follow, given that seq's newest completed full pages just completed.
     void add_sampled_pages(sequence& seq, std::size_t completed);
-    // Returns whether a view changed.
-    bool end_cycle(sequence& seq);
+    // Evicts at the end of seq's cycle and returns whether a view changed.
+    bool evict(sequence& seq);
+    // Writes the state seq reached to the store and passes it to seq's callbacks.
+    task<void> write_cycle_end(sequence& seq);
 
   public:
     // shards[s] runs on cache shard s with streams[s], shards 1 on on worker_loops[s - 1]; the cache holds one layer
-    // per entry of each model's kv_layers(), and the shards agree on which layers are recurrent or sliding. root is the
-    // digest the page chains of a state with no pages start from. A step forwards every decoding sequence and at most
-    // prefill_tokens_per_step tokens of the others.
+    // per entry of each model's kv_layers(), and the shards agree on which layers are recurrent or sliding. store is the
+    // cache's. root is the digest a request's page chain starts from without an initial digest. A step forwards every
+    // decoding sequence and at most prefill_tokens_per_step tokens of the others.
     scheduler(
         std::vector<model*>&& shards,
         kv_cache cache,
+        page_store& store,
         std::vector<cudaStream_t>&& streams,
         std::vector<event_loop*>&& worker_loops,
         digest root,
@@ -104,20 +104,13 @@ class scheduler {
         std::size_t prefill_tokens_per_step
     );
 
-    // Serves r, then ends writer with its result or an error. Appends
-    // the state to writer at the end of each eviction cycle. Ends with oom, never waiting, when the free lines do not
-    // cover the state's pages and one cycle's tokens at the start, or the next cycle's tokens while running; the
-    // caller resubmits.
+    // Serves r from the newest state the store holds for a prefix of its tokens, then ends writer with its result or an
+    // error. Writes the state reached at the end of each eviction cycle to the store, then appends it to writer, and
+    // likewise the end state. Ends with oom, never waiting, when the free lines do not cover the state's pages and one
+    // cycle's tokens at the start, or the next cycle's tokens while running; the caller resubmits.
     task<void> submit(request r, result_writer writer);
     // Steps the running sequences until the loop stops.
     task<void> run();
-    // Throws std::invalid_argument unless s is a state the scheduler reaches: with one sequence per KV layer, a
-    // full-attention layer's ending with head, a sliding layer's ending with head and holding no more pages than its
-    // window reaches, a recurrent layer's head alone; each page holding no mass sum or one per query head its layer
-    // measures, all finite, and a finite non-negative weight sum, 0 without mass sums; each sequence holding no density
-    // moments or one per such head; every moments with a finite mean and a finite non-negative m2, 0 below 2 samples.
-    // Safe to call from any thread.
-    void validate_state(const state& s) const;
     // kv_cache::used_bytes of the scheduler's cache. Safe to call from any thread.
     std::size_t kv_cache_bytes() const noexcept;
 };

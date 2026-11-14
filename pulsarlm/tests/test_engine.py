@@ -1,17 +1,14 @@
 """The engine binding on a small random Qwen3, with an in-memory page store."""
 
 import asyncio
-from concurrent.futures import Future
 
 import pytest
 import torch
 
 from pulsarlm.core.engine import (
-    ActivePage,
     CycleEnd,
     Engine,
     EvictionPolicy,
-    LayerSequence,
     ModelConfig,
     Request,
     RequestError,
@@ -78,33 +75,59 @@ def random_weights() -> dict[str, torch.Tensor]:
 
 
 class MemoryStore:
+    """Keeps every page and state; read_state finds the state covering the most
+    tokens of a proper prefix, as LocalStore does."""
+
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
         self.loop = loop
-        self.pages: dict[bytes, tuple[torch.Tensor, torch.Tensor]] = {}
-        self.fetched_hashes: list[bytes] = []
+        self.pages: dict[bytes, torch.Tensor] = {}
+        self.states: list[tuple[State, list[bytes]]] = []
+        self.read_hashes: list[bytes] = []
+        self.state_reads: list[tuple[list[int], list[bytes]]] = []
+        self.releases: list[int] = []
+        self.lease_count = 0
 
-    def fetch(self, hashes: list[bytes]) -> Future:
-        self.fetched_hashes += hashes
-        return asyncio.run_coroutine_threadsafe(self.lookup(hashes), self.loop)
-
-    async def lookup(self, hashes: list[bytes]) -> list:
+    async def read_pages(self, hashes: list[bytes]) -> list[torch.Tensor | None]:
+        self.read_hashes += hashes
         return [self.pages.get(h) for h in hashes]
+
+    async def read_state(
+        self, tokens: list[int], page_digests: list[bytes]
+    ) -> tuple[State, int]:
+        self.state_reads.append((tokens, page_digests))
+        self.lease_count += 1
+        best, best_count = State(), 0
+        for state, _ in self.states:
+            if state.head is None or state.head not in page_digests:
+                continue
+            start = (page_digests.index(state.head) + 1) * PAGE_SIZE
+            end = start + len(state.tail)
+            if best_count < end < len(tokens) and tokens[start:end] == state.tail:
+                best, best_count = state, end
+        return best, self.lease_count
 
     def claim(self, hashes: list[bytes], owners: list) -> list[int]:
         return [i for i, h in enumerate(hashes) if h not in self.pages]
 
-    def put(self, hashes: list[bytes], pages: list, owners: list) -> None:
+    def write_pages(self, hashes: list[bytes], pages: list, owners: list) -> None:
         self.pages |= zip(hashes, pages)
+
+    def write_state(self, lease_id: int, state: State, page_keys: list[bytes]) -> None:
+        self.states.append((state, page_keys))
+
+    def release(self, lease_id: int) -> None:
+        self.releases.append(lease_id)
 
 
 class FailingStore(MemoryStore):
-    async def lookup(self, hashes: list[bytes]) -> list:
+    async def read_pages(self, hashes: list[bytes]) -> list[torch.Tensor | None]:
         raise ConnectionError("store unreachable")
 
 
 def make_engine(store: MemoryStore, store_pages: int = 0) -> Engine:
     return Engine(
         store,
+        store.loop,
         MODEL,
         lambda rank, size: random_weights(),
         model_name="random-qwen3",
@@ -128,12 +151,9 @@ class Recording:
         self.result = result
 
 
-def submit(
-    engine: Engine, initial_state: State, tokens: list[int], **options
-) -> tuple[Request, Recording]:
+def submit(engine: Engine, tokens: list[int], **options) -> tuple[Request, Recording]:
     recording = Recording()
     request = engine.submit(
-        initial_state,
         tokens,
         on_cycle_end=recording.cycle_ends.append,
         on_end=recording.record_result,
@@ -176,32 +196,36 @@ def test_generates_max_tokens_and_ends_with_a_state():
     async def main():
         store = MemoryStore(asyncio.get_running_loop())
         engine = make_engine(store)
-        tokens, _, end = await run(
-            engine, *submit(engine, State(), PROMPT, max_tokens=8)
-        )
+        tokens, _, end = await run(engine, *submit(engine, PROMPT, max_tokens=8))
 
         assert len(tokens) == 8
         assert all(0 <= t < VOCAB_SIZE for t in tokens)
         assert isinstance(end, State)
         forwarded = len(PROMPT) + len(tokens) - 1
         assert len(end.layers[0].pages) * PAGE_SIZE + len(end.tail) == forwarded
-        assert all(k in store.pages for k in engine.page_keys(end))
+        written_state, page_keys = store.states[-1]
+        assert written_state.head == end.head and written_state.tail == end.tail
+        assert page_keys and all(k in store.pages for k in page_keys)
+        del engine
+        assert store.releases == [1]
 
     asyncio.run(main())
 
 
-def test_page_digests_are_the_page_hashes_of_the_end_state():
+def test_the_end_state_chains_from_the_prompt_digests_the_store_read():
     async def main():
-        engine = make_engine(MemoryStore(asyncio.get_running_loop()))
-        tokens, _, end = await run(
-            engine, *submit(engine, State(), PROMPT, max_tokens=8)
-        )
+        store = MemoryStore(asyncio.get_running_loop())
+        engine = make_engine(store)
+        tokens, _, end = await run(engine, *submit(engine, PROMPT, max_tokens=24))
 
         assert isinstance(end, State)
-        digests = engine.page_digests(PROMPT + tokens[:-1])
-        assert end.head == digests[-1]
-        assert all([p.hash for p in layer.pages] == digests for layer in end.layers)
-        assert engine.page_digests(PROMPT[: PAGE_SIZE - 1]) == []
+        [(read_tokens, digests)] = store.state_reads
+        assert read_tokens == PROMPT
+        assert len(digests) == len(PROMPT) // PAGE_SIZE
+        hashes = [p.hash for p in end.layers[0].pages]
+        assert hashes[: len(digests)] == digests
+        assert len(hashes) == (len(PROMPT) + len(tokens) - 1) // PAGE_SIZE
+        assert all([p.hash for p in layer.pages] == hashes for layer in end.layers)
 
     asyncio.run(main())
 
@@ -211,22 +235,17 @@ def test_another_engine_continues_a_state_from_the_store(store_pages: int):
     async def main():
         store = MemoryStore(asyncio.get_running_loop())
         first = make_engine(store, store_pages)
-        sampled, _, reached = await run(
-            first, *submit(first, State(), PROMPT, max_tokens=8)
-        )
+        sampled, _, reached = await run(first, *submit(first, PROMPT, max_tokens=8))
         assert isinstance(reached, State)
+        _, reached_keys = store.states[-1]
 
-        follow_up = [sampled[-1], 11, 12, 13]
-        expected, _, _ = await run(
-            first, *submit(first, reached, follow_up, max_tokens=8)
-        )
+        history = PROMPT + sampled + [11, 12, 13]
+        expected, _, _ = await run(first, *submit(first, history, max_tokens=8))
 
         second = make_engine(store, store_pages)
-        continued, _, end = await run(
-            second, *submit(second, reached, follow_up, max_tokens=8)
-        )
+        continued, _, end = await run(second, *submit(second, history, max_tokens=8))
 
-        assert store.fetched_hashes == second.page_keys(reached)
+        assert store.read_hashes == reached_keys
         assert continued == expected
         assert isinstance(end, State)
 
@@ -237,22 +256,23 @@ def test_the_result_counts_the_tokens_resumed_on_resident_and_fetched_pages():
     async def main():
         store = MemoryStore(asyncio.get_running_loop())
         first = make_engine(store, store_pages=64)
-        request, recording = submit(first, State(), PROMPT, max_tokens=8)
+        request, recording = submit(first, PROMPT, max_tokens=8)
         sampled, _, reached = await run(first, request, recording)
         assert isinstance(reached, State)
         assert recording.result is not None
         assert recording.result.total_tokens == len(PROMPT) + len(sampled)
         assert recording.result.cached_tokens == 0
 
-        follow_up = [sampled[-1], 11, 12]
+        history = PROMPT + sampled + [11, 12]
         resumed_tokens = len(reached.layers[0].pages) * PAGE_SIZE
-        request, resident = submit(first, reached, follow_up, max_tokens=2)
+        request, resident = submit(first, history, max_tokens=2)
         await run(first, request, resident)
         second = make_engine(store, store_pages=64)
-        request, fetched = submit(second, reached, follow_up, max_tokens=2)
+        request, fetched = submit(second, history, max_tokens=2)
         await run(second, request, fetched)
 
         assert resident.result is not None and fetched.result is not None
+        assert resident.result.total_tokens == len(history) + 2
         assert resident.result.cached_tokens == resumed_tokens
         assert resident.result.device_cached_tokens == resumed_tokens
         assert fetched.result.cached_tokens == resumed_tokens
@@ -265,7 +285,7 @@ def test_pages_past_the_room_of_the_store_pool_are_pageable():
     async def main():
         store = MemoryStore(asyncio.get_running_loop())
         engine = make_engine(store, store_pages=1)
-        await run(engine, *submit(engine, State(), PROMPT, max_tokens=8))
+        await run(engine, *submit(engine, PROMPT, max_tokens=8))
 
         pinned = [page.is_pinned() for page in store.pages.values()]
         assert True in pinned
@@ -278,7 +298,7 @@ def test_a_store_pool_with_room_gives_pinned_pages():
     async def main():
         store = MemoryStore(asyncio.get_running_loop())
         engine = make_engine(store, store_pages=64)
-        await run(engine, *submit(engine, State(), PROMPT, max_tokens=8))
+        await run(engine, *submit(engine, PROMPT, max_tokens=8))
 
         assert store.pages
         assert all(page.is_pinned() for page in store.pages.values())
@@ -288,41 +308,50 @@ def test_a_store_pool_with_room_gives_pinned_pages():
 
 def test_a_page_missing_from_the_store_ends_with_miss():
     async def main():
-        engine = make_engine(MemoryStore(asyncio.get_running_loop()))
-        missing = State(
-            head=bytes(16),
-            layers=[LayerSequence([ActivePage(bytes(16), 0)])] * N_LAYERS,
-        )
-        _, _, end = await run(engine, *submit(engine, missing, [1], max_tokens=1))
+        store = MemoryStore(asyncio.get_running_loop())
+        first = make_engine(store)
+        sampled, _, _ = await run(first, *submit(first, PROMPT, max_tokens=8))
+        store.pages.clear()
+
+        second = make_engine(store)
+        _, _, end = await run(second, *submit(second, PROMPT + sampled, max_tokens=1))
 
         assert end == RequestError.MISS
+        del first, second
+        assert store.releases == [1, 2]
 
     asyncio.run(main())
 
 
-def test_a_failing_fetch_misses():
+def test_a_failing_read_misses():
     async def main():
-        engine = make_engine(FailingStore(asyncio.get_running_loop()))
-        missing = State(
-            head=bytes(16),
-            layers=[LayerSequence([ActivePage(bytes(16), 0)])] * N_LAYERS,
-        )
-        _, _, end = await run(engine, *submit(engine, missing, [1], max_tokens=1))
+        loop = asyncio.get_running_loop()
+        store = MemoryStore(loop)
+        first = make_engine(store)
+        sampled, _, _ = await run(first, *submit(first, PROMPT, max_tokens=8))
+        failing = FailingStore(loop)
+        failing.states = store.states
+
+        second = make_engine(failing)
+        _, _, end = await run(second, *submit(second, PROMPT + sampled, max_tokens=1))
 
         assert end == RequestError.MISS
-        assert engine.exception() is None
+        assert second.exception() is None
 
     asyncio.run(main())
 
 
 def test_cancel_ends_the_request_with_cancelled():
     async def main():
-        engine = make_engine(MemoryStore(asyncio.get_running_loop()))
-        request, recording = submit(engine, State(), PROMPT)
+        store = MemoryStore(asyncio.get_running_loop())
+        engine = make_engine(store)
+        request, recording = submit(engine, PROMPT)
         request.cancel()
         _, _, end = await run(engine, request, recording)
 
         assert end == RequestError.CANCELLED
+        del engine
+        assert store.releases == [1]
 
     asyncio.run(main())
 
@@ -331,7 +360,7 @@ def test_submit_rejects_a_token_outside_the_vocabulary():
     async def main():
         engine = make_engine(MemoryStore(asyncio.get_running_loop()))
         with pytest.raises(ValueError, match="outside"):
-            engine.submit(State(), [VOCAB_SIZE])
+            engine.submit([VOCAB_SIZE])
 
     asyncio.run(main())
 
@@ -347,9 +376,11 @@ def test_submit_rejects_a_token_outside_the_vocabulary():
 def test_a_cache_without_a_line_or_a_negative_store_is_rejected(
     kv_cache_gib: float, store_gib: float, message: str
 ):
+    loop = asyncio.new_event_loop()
     with pytest.raises(ValueError, match=message):
         Engine(
-            MemoryStore(asyncio.new_event_loop()),
+            MemoryStore(loop),
+            loop,
             MODEL,
             lambda rank, size: random_weights(),
             model_name="random-qwen3",
@@ -376,7 +407,7 @@ def test_the_eviction_report_scores_every_page_of_a_layer_measuring_mass():
             cycle_tokens=PAGE_SIZE, max_context_window=8 * PAGE_SIZE
         )
         _, _, end = await run(
-            engine, *submit(engine, State(), PROMPT, max_tokens=8, eviction=eviction)
+            engine, *submit(engine, PROMPT, max_tokens=8, eviction=eviction)
         )
         assert isinstance(end, State)
 
@@ -386,5 +417,14 @@ def test_the_eviction_report_scores_every_page_of_a_layer_measuring_mass():
         for scores in report.layers:
             assert len(scores.page_scores) == len(end.layers[scores.layer].pages)
         assert engine.eviction_report_of(end, EvictionPolicy()).cap_tokens is None
+
+    asyncio.run(main())
+
+
+def test_submit_rejects_a_request_without_tokens():
+    async def main():
+        engine = make_engine(MemoryStore(asyncio.get_running_loop()))
+        with pytest.raises(ValueError, match="no token"):
+            engine.submit([])
 
     asyncio.run(main())

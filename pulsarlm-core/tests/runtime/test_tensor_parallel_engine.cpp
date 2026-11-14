@@ -231,6 +231,8 @@ rank_weights(const c10::Dict<std::string, at::Tensor>& weights, std::int64_t ran
 struct store_contents {
     std::unordered_map<digest, page, pulsarlm::digest_hash> pages;
     std::size_t fetched_pages = 0;
+    std::vector<std::shared_ptr<const pulsarlm::state>> states;
+    pulsarlm::state::lease_id_type next_lease_id = 1;
 };
 
 std::size_t page_bytes_of(const sharded_page& p) {
@@ -274,11 +276,12 @@ void copy_pages_from_host(
     }
 }
 
-// Keeps every page it is put, copied to the host; engines built on one contents share its pages.
+// Keeps every page it is written, copied to the host, and every state; engines built on one contents share them. A
+// lease never drops a page.
 struct memory_store final : pulsarlm::page_store {
     std::shared_ptr<store_contents> contents;
 
-    task<std::vector<bool>> fetch(
+    task<std::vector<bool>> read_pages(
         std::span<const digest> hashes,
         std::vector<sharded_page>&& lines,
         std::span<const cudaStream_t> streams
@@ -301,11 +304,12 @@ struct memory_store final : pulsarlm::page_store {
         co_return found;
     }
 
-    task<std::expected<void, pulsarlm::page_error>>
-    put(std::vector<digest>&& keys,
+    task<std::expected<void, pulsarlm::page_error>> write_pages(
+        std::vector<digest>&& keys,
         std::vector<sharded_page>&& pages,
-        std::vector<pulsarlm::page_owner>&&,
-        std::span<const cudaStream_t> streams) override {
+        std::vector<std::pair<pulsarlm::state::lease_id_type, page_index_type>>&&,
+        std::span<const cudaStream_t> streams
+    ) override {
         std::shared_ptr<store_contents> shared = contents;
         std::vector<digest> put_keys = std::move(keys);
         std::vector<sharded_page> sources = std::move(pages);
@@ -315,6 +319,39 @@ struct memory_store final : pulsarlm::page_store {
         }
         co_return {};
     }
+
+    // The stored state reaching the most tokens of a proper prefix of tokens.
+    task<std::pair<std::shared_ptr<const pulsarlm::state>, pulsarlm::state::lease_id_type>>
+    read_state(std::span<const std::int64_t> tokens, std::span<const digest> page_digests) override {
+        std::shared_ptr<store_contents> shared = contents;
+        std::shared_ptr<const pulsarlm::state> found = std::make_shared<const pulsarlm::state>();
+        std::size_t found_tokens = 0;
+        for (const std::shared_ptr<const pulsarlm::state>& s : shared->states) {
+            std::size_t pages = 0;
+            if (s->head) {
+                auto head = std::ranges::find(page_digests, *s->head);
+                if (head == page_digests.end()) {
+                    continue;
+                }
+                pages = static_cast<std::size_t>(head - page_digests.begin()) + 1;
+            }
+            std::size_t start = pages * page_size;
+            std::size_t covered = start + s->tail.size();
+            if (covered < tokens.size() && covered > found_tokens &&
+                std::ranges::equal(s->tail, tokens.subspan(start, s->tail.size()))) {
+                found = s;
+                found_tokens = covered;
+            }
+        }
+        co_return std::pair(found, shared->next_lease_id++);
+    }
+
+    task<void> write_state(pulsarlm::state::lease_id_type, std::shared_ptr<const pulsarlm::state>&& s) override {
+        contents->states.push_back(std::move(s));
+        co_return;
+    }
+
+    void release(pulsarlm::state::lease_id_type) noexcept override {}
 };
 
 // Filled on the loop thread, read on the test thread.
@@ -343,7 +380,7 @@ class recording_callbacks final : public pulsarlm::request_callbacks {
         {
             std::lock_guard lock(recorded_results->mutex);
             recorded_results->end.emplace(std::move(result).transform([](pulsarlm::request_result&& ended) {
-                return std::move(ended.state);
+                return *ended.state;
             }));
         }
         recorded_results->end_condition.notify_all();
@@ -521,7 +558,7 @@ TEST_CASE("an engine split over two ranks serves as the engine of the whole mode
         std::unique_ptr<pulsarlm::engine> whole_engine = make_engine(weights, kv_heads, 1, whole_contents);
         std::unique_ptr<pulsarlm::engine> split_engine = make_engine(weights, kv_heads, ranks, split_contents);
         const auto first_request = [&] {
-            return pulsarlm::request{.tokens = prompt, .max_tokens = decode_tokens, .eviction = eviction, .id = 1};
+            return pulsarlm::request{.tokens = prompt, .max_tokens = decode_tokens, .eviction = eviction};
         };
         whole = serve(*whole_engine, first_request());
         split = serve(*split_engine, first_request());
@@ -536,17 +573,14 @@ TEST_CASE("an engine split over two ranks serves as the engine of the whole mode
     {
         std::unique_ptr<pulsarlm::engine> whole_engine = make_engine(weights, kv_heads, 1, whole_contents);
         std::unique_ptr<pulsarlm::engine> split_engine = make_engine(weights, kv_heads, ranks, split_contents);
-        const auto resumed_request = [&](const pulsarlm::state& from) {
-            return pulsarlm::request{
-                .initial_state = from,
-                .tokens = continuation,
-                .max_tokens = resume_decode_tokens,
-                .eviction = eviction,
-                .id = 2,
-            };
+        const auto resumed_request = [&](const served& first) {
+            token_list history = prompt;
+            history.insert(history.end(), first.tokens.begin(), first.tokens.end() - 1);
+            history.insert(history.end(), continuation.begin(), continuation.end());
+            return pulsarlm::request{.tokens = history, .max_tokens = resume_decode_tokens, .eviction = eviction};
         };
-        whole_resumed = serve(*whole_engine, resumed_request(whole.end_state));
-        split_resumed = serve(*split_engine, resumed_request(split.end_state));
+        whole_resumed = serve(*whole_engine, resumed_request(whole));
+        split_resumed = serve(*split_engine, resumed_request(split));
     }
     REQUIRE(split_contents->fetched_pages > 0);
     CHECK(split_contents->fetched_pages == whole_contents->fetched_pages);

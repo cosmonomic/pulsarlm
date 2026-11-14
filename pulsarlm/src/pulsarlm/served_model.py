@@ -1,5 +1,6 @@
 """A model loaded with its engine and store, as the server and the terminal chat run it."""
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,27 +14,28 @@ from pulsarlm.engine_model import engine_model
 from pulsarlm.paging import PAGE_SIZE
 from pulsarlm.reply import ThinkSyntax
 from pulsarlm.settings import Settings
-from pulsarlm.store import LocalStore
+from pulsarlm.store import EmptyStore, LocalStore
 from pulsarlm.tools import ToolCallSyntax
 
 
 @dataclass
 class ServedModel:
     engine: Engine
-    store: LocalStore
     tokenizer: Tokenizer
     chat_template: ChatTemplate
     stop_ids: list[int]
     tool_call_syntax: ToolCallSyntax | None
     think_syntax: ThinkSyntax | None
     eviction: EvictionPolicy
-    prefix_cache: bool
 
 
-def load_served_model(settings: Settings, path: Path) -> ServedModel:
+def load_served_model(
+    settings: Settings, path: Path, loop: asyncio.AbstractEventLoop
+) -> ServedModel:
     """eviction is the settings' policy, its n_sink left at the default. Above one
     tensor-parallel GPU, the model is split across cuda:0 on, one GPU's part loaded
-    and on its GPU before the next is read."""
+    and on its GPU before the next is read. The store's reads run on loop. Without
+    the prefix cache, the store keeps nothing."""
     dtype = getattr(torch, settings.dtype)
     tensor_parallel_size = settings.tensor_parallel_size
     devices = (
@@ -53,14 +55,19 @@ def load_served_model(settings: Settings, path: Path) -> ServedModel:
 
     max_context = cfg.max_position_embeddings or None
     stops = stop_ids(tokenizer, cfg.eos_ids)
-    store = LocalStore(
-        PAGE_SIZE,
-        int(settings.store_gib * 2**30),
-        checkpoint.store_path(settings.data_dir) if settings.persist else None,
+    store = (
+        LocalStore(
+            PAGE_SIZE,
+            int(settings.store_gib * 2**30),
+            checkpoint.store_path(settings.data_dir) if settings.persist else None,
+        )
+        if settings.prefix_cache
+        else EmptyStore()
     )
     try:
         engine = Engine(
             store,
+            loop,
             engine_model(cfg),
             load_model_shard,
             devices=devices,
@@ -77,7 +84,6 @@ def load_served_model(settings: Settings, path: Path) -> ServedModel:
         raise checkpoint.PulsarLMModelLoadingError(str(error)) from error
     return ServedModel(
         engine=engine,
-        store=store,
         tokenizer=tokenizer,
         chat_template=chat_template,
         stop_ids=stops,
@@ -90,5 +96,4 @@ def load_served_model(settings: Settings, path: Path) -> ServedModel:
             eviction_threshold=settings.eviction_threshold,
             eviction_warmup=settings.eviction_warmup,
         ),
-        prefix_cache=settings.prefix_cache,
     )

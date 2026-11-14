@@ -36,14 +36,12 @@ from pulsarlm.server.openai.schema import (
 )
 from pulsarlm.paging import sink_tokens
 from pulsarlm.reply import TOOL_CALL_MARKERS, Part, ReplyDecoder, ThinkSyntax
-from pulsarlm.store import LocalStore
 from pulsarlm.tools import ToolCallError, ToolCallSyntax, parse_tool_call
 
 
 @dataclass
 class ServerState:
     engine: AsyncEngine
-    store: LocalStore
     tokenizer: Tokenizer
     chat_template: ChatTemplate
     model_id: str
@@ -51,7 +49,6 @@ class ServerState:
     tool_call_syntax: ToolCallSyntax | None
     think_syntax: ThinkSyntax | None
     eviction: EvictionPolicy
-    prefix_cache: bool
     eviction_log: EvictionLog | None
 
     def eviction_for(self, system_tokens: int) -> EvictionPolicy:
@@ -116,7 +113,6 @@ async def create_chat_completion(body: ChatCompletionRequest, state: State):
     reply = _Reply(state, body.max_tokens, prompt, tool_calls=tools is not None)
     tokens = complete(
         state.engine,
-        state.store,
         prompt,
         sampling=SamplingParams(
             temperature=body.temperature,
@@ -126,7 +122,6 @@ async def create_chat_completion(body: ChatCompletionRequest, state: State):
         ),
         max_tokens=body.max_tokens,
         eviction=state.eviction_for(system_tokens),
-        prefix_cache=state.prefix_cache,
         on_state=None if state.eviction_log is None else states.append,
         on_completed=reply.record_usage,
     )

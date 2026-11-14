@@ -1,5 +1,6 @@
 """The Chat Completions route on a small random Qwen3 and a word-level tokenizer."""
 
+import asyncio
 import json
 import math
 from collections.abc import Callable
@@ -13,7 +14,13 @@ from tokenizers import Tokenizer, models, pre_tokenizers
 
 from pulsarlm.async_engine import AsyncEngine
 from pulsarlm.chat import ChatTemplate, encode_prompt
-from pulsarlm.core.engine import Engine, EvictionPolicy, ModelConfig, RopeParameters
+from pulsarlm.core.engine import (
+    Engine,
+    EvictionPolicy,
+    ModelConfig,
+    RopeParameters,
+    State,
+)
 from pulsarlm.eviction_log import EvictionLog, prompt_sha256
 from pulsarlm.server import create_app
 from pulsarlm.server.openai import ServerState
@@ -101,16 +108,39 @@ IM_END = SPECIAL_TOKENS.index("<|im_end|>")
 FIRST_SAMPLED = len(SPECIAL_TOKENS) + ROLES.index("assistant")
 
 
+class RecordingStore(LocalStore):
+    """Records every state found with the digests it was found by."""
+
+    def __init__(self) -> None:
+        super().__init__(PAGE_SIZE, capacity_bytes=64 * LINE_BYTES)
+        self.state_reads: list[tuple[State, list[bytes]]] = []
+
+    async def read_state(
+        self, tokens: list[int], page_digests: list[bytes]
+    ) -> tuple[State, int]:
+        state, lease_id = await super().read_state(tokens, page_digests)
+        self.state_reads.append((state, page_digests))
+        return state, lease_id
+
+
+def covered_tokens(state: State, page_digests: list[bytes]) -> int:
+    pages = 0 if state.head is None else page_digests.index(state.head) + 1
+    return pages * PAGE_SIZE + len(state.tail)
+
+
 def load(
     stop_ids: list[int] = [IM_END],
     n_lines: int = 64,
     embedding_scale: float = 1.0,
     chat_template: str = CHATML,
+    store: LocalStore | None = None,
 ) -> ServerState:
     tokenizer = word_tokenizer()
-    store = LocalStore(PAGE_SIZE, capacity_bytes=64 * LINE_BYTES)
     engine = Engine(
-        store,
+        LocalStore(PAGE_SIZE, capacity_bytes=64 * LINE_BYTES)
+        if store is None
+        else store,
+        asyncio.get_running_loop(),
         MODEL,
         lambda rank, size: random_weights(embedding_scale),
         model_name=MODEL_ID,
@@ -125,7 +155,6 @@ def load(
     )
     return ServerState(
         engine=AsyncEngine(engine),
-        store=store,
         tokenizer=tokenizer,
         chat_template=ChatTemplate(chat_template, {}),
         model_id=MODEL_ID,
@@ -133,7 +162,6 @@ def load(
         tool_call_syntax=None,
         think_syntax=None,
         eviction=EvictionPolicy(cycle_tokens=PAGE_SIZE),
-        prefix_cache=True,
         eviction_log=None,
     )
 
@@ -221,31 +249,28 @@ def test_a_stream_with_include_usage_ends_with_a_usage_chunk(client):
     }
 
 
-def test_a_follow_up_continues_from_a_stored_state(client):
-    first = post(client, messages=MESSAGES, max_tokens=4).json()
-    reply = first["choices"][0]["message"]["content"]
-    follow_up = MESSAGES + [
-        {"role": "assistant", "content": reply},
-        {"role": "user", "content": "w11"},
-    ]
+def test_a_follow_up_continues_from_a_stored_state():
+    store = RecordingStore()
+    with api_client(lambda: load(store=store)) as client:
+        first = post(client, messages=MESSAGES, max_tokens=4).json()
+        reply = first["choices"][0]["message"]["content"]
+        follow_up = MESSAGES + [
+            {"role": "assistant", "content": reply},
+            {"role": "user", "content": "w11"},
+        ]
+        response = post(client, messages=follow_up, max_tokens=4)
 
-    state = client.app.state.server_state
-    prompt = encode(state, follow_up)
-    with state.store.lease(prompt, state.engine.page_digests(prompt), request_id=0) as (
-        lease,
-        token_count,
-    ):
-        assert token_count >= 2 * PAGE_SIZE
-        full_page_tokens = token_count - len(lease.state.tail)
-    response = post(client, messages=follow_up, max_tokens=4)
     assert response.status_code == 200
+    state, digests = store.state_reads[-1]
+    assert covered_tokens(state, digests) >= 2 * PAGE_SIZE
+    full_page_tokens = covered_tokens(state, digests) - len(state.tail)
     details = response.json()["usage"]["prompt_tokens_details"]
     assert details == {"cached_tokens": full_page_tokens}
 
 
 def test_a_reply_ending_at_any_stop_token_leaves_its_end_state_findable():
-    app = create_app(lambda: load([IM_END, FIRST_SAMPLED]))
-    with TestClient(app, base_url=BASE_URL) as client:
+    store = RecordingStore()
+    with api_client(lambda: load([IM_END, FIRST_SAMPLED], store=store)) as client:
         first = post(client, messages=MESSAGES, max_tokens=4).json()
         assert first["choices"][0]["finish_reason"] == "stop"
         assert first["usage"]["completion_tokens"] == 1
@@ -254,12 +279,10 @@ def test_a_reply_ending_at_any_stop_token_leaves_its_end_state_findable():
             {"role": "assistant", "content": ""},
             {"role": "user", "content": "w11"},
         ]
-        state = app.state.server_state
-        prompt = encode(state, follow_up)
-        with state.store.lease(
-            prompt, state.engine.page_digests(prompt), request_id=0
-        ) as (_, token_count):
-            assert token_count == first["usage"]["prompt_tokens"]
+        assert post(client, messages=follow_up, max_tokens=1).status_code == 200
+
+    state, digests = store.state_reads[-1]
+    assert covered_tokens(state, digests) == first["usage"]["prompt_tokens"]
 
 
 def test_a_seeded_sampled_completion_repeats():

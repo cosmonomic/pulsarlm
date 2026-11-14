@@ -4,7 +4,6 @@ engine split over two ranks on one GPU against the same model on one GPU."""
 import asyncio
 import json
 import zipfile
-from concurrent.futures import Future
 from pathlib import Path
 
 import pytest
@@ -345,30 +344,40 @@ def test_load_weights_reads_one_rank_s_part_of_a_model(tmp_path: Path, form: str
 
 
 class MemoryStore:
-    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
-        self.loop = loop
+    """Keeps every page and the page keys of every state written; finds no state."""
+
+    def __init__(self) -> None:
         self.pages: dict[bytes, Tensor] = {}
+        self.written_keys: list[list[bytes]] = []
+        self.lease_count = 0
 
-    def fetch(self, hashes: list[bytes]) -> Future:
-        return asyncio.run_coroutine_threadsafe(self.lookup(hashes), self.loop)
-
-    async def lookup(self, hashes: list[bytes]) -> list:
+    async def read_pages(self, hashes: list[bytes]) -> list[Tensor | None]:
         return [self.pages.get(h) for h in hashes]
+
+    async def read_state(
+        self, tokens: list[int], page_digests: list[bytes]
+    ) -> tuple[State, int]:
+        self.lease_count += 1
+        return State(), self.lease_count
 
     def claim(self, hashes: list[bytes], owners: list) -> list[int]:
         return [i for i, h in enumerate(hashes) if h not in self.pages]
 
-    def put(self, hashes: list[bytes], pages: list, owners: list) -> None:
+    def write_pages(self, hashes: list[bytes], pages: list, owners: list) -> None:
         self.pages |= zip(hashes, pages)
+
+    def write_state(self, lease_id: int, state: State, page_keys: list[bytes]) -> None:
+        self.written_keys.append(page_keys)
+
+    def release(self, lease_id: int) -> None:
+        pass
 
 
 async def generate(
     engine: Engine, prompt: list[int], max_tokens: int
 ) -> tuple[list[int], State]:
     results: list[RequestResult] = []
-    request = engine.submit(
-        State(), prompt, max_tokens=max_tokens, on_end=results.append
-    )
+    request = engine.submit(prompt, max_tokens=max_tokens, on_end=results.append)
     loop = asyncio.get_running_loop()
     woke = asyncio.Event()
     loop.add_reader(engine.fileno(), woke.set)
@@ -410,8 +419,10 @@ def test_an_engine_split_over_two_ranks_generates_what_one_gpu_does(
             stop_ids=[],
             prefill_tokens_per_step=32,
         )
+        one_gpu_store = MemoryStore()
         one_gpu = Engine(
-            MemoryStore(loop),
+            one_gpu_store,
+            loop,
             engine_model(cfg),
             lambda rank, size: {name: t.to(device) for name, t in weights.items()},
             devices=[device],
@@ -424,8 +435,10 @@ def test_an_engine_split_over_two_ranks_generates_what_one_gpu_does(
             loaded.append(rank)
             return {name: t.to(device) for name, t in parts[rank].items()}
 
+        split_store = MemoryStore()
         split = Engine(
-            MemoryStore(loop),
+            split_store,
+            loop,
             engine_model(cfg),
             load_model_shard,
             devices=[device, device],
@@ -436,6 +449,7 @@ def test_an_engine_split_over_two_ranks_generates_what_one_gpu_does(
         tokens, end = await generate(split, prompt, 12)
         assert len(expected) == 12
         assert tokens == expected
-        assert split.page_keys(end) == one_gpu.page_keys(expected_end)
+        assert end.head == expected_end.head
+        assert split_store.written_keys[-1] == one_gpu_store.written_keys[-1]
 
     asyncio.run(main())

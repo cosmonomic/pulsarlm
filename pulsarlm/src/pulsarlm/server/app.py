@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -16,11 +17,10 @@ from pulsarlm.settings import Settings
 def load_server_state(
     settings: Settings, path: Path, eviction_log: Path | None
 ) -> ServerState:
-    served = load_served_model(settings, path)
+    served = load_served_model(settings, path, asyncio.get_running_loop())
     engine = AsyncEngine(served.engine)
     return ServerState(
         engine=engine,
-        store=served.store,
         tokenizer=served.tokenizer,
         chat_template=served.chat_template,
         model_id=settings.model,
@@ -28,7 +28,6 @@ def load_server_state(
         tool_call_syntax=served.tool_call_syntax,
         think_syntax=served.think_syntax,
         eviction=served.eviction,
-        prefix_cache=served.prefix_cache,
         eviction_log=None
         if eviction_log is None
         else EvictionLog(eviction_log, engine, served.eviction),

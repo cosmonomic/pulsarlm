@@ -34,12 +34,11 @@ def new_chat(
     """Reads user turns until end of input or an interrupt. Raises
     PulsarLMModelLoadingError when no data path holds the model, EngineStopped
     when the engine's loop exited."""
-    served = load_served_model(
-        settings, checkpoint.model_path(settings.model, settings.data_dir)
-    )
+    path = checkpoint.model_path(settings.model, settings.data_dir)
     messages: list[Message] = [{"role": "system", "content": system}] if system else []
 
     async def converse() -> None:
+        served = load_served_model(settings, path, asyncio.get_running_loop())
         async_engine = AsyncEngine(served.engine)
         try:
             while True:
@@ -69,14 +68,12 @@ def new_chat(
                 try:
                     async for token in complete(
                         async_engine,
-                        served.store,
                         prompt,
                         sampling=SamplingParams(
                             temperature=temperature, top_p=top_p, top_k=top_k
                         ),
                         max_tokens=None,
                         eviction=served.eviction,
-                        prefix_cache=served.prefix_cache,
                     ):
                         part, text = decoder.step(token)
                         if not text:

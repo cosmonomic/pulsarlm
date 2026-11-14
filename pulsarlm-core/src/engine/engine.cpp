@@ -54,20 +54,10 @@ void check_attention(const engine_config& config, std::span<const kv_layer> laye
     }
 }
 
-void validate(const request& r, std::size_t page_size, std::size_t vocab_size) {
-    if (r.initial_state.tail.size() >= page_size) {
-        throw std::invalid_argument(
-            std::format(
-                "the initial state's tail holds {} tokens; it must be shorter than a page ({})",
-                r.initial_state.tail.size(),
-                page_size
-            )
-        );
-    }
-    if (r.initial_state.tail.empty() && r.tokens.empty()) {
+void validate(const request& r, std::size_t vocab_size) {
+    if (r.tokens.empty()) {
         throw std::invalid_argument("the request has no token to forward");
     }
-    check_tokens(r.initial_state.tail, vocab_size);
     check_tokens(r.tokens, vocab_size);
     if (r.eviction.n_working < 1) {
         throw std::invalid_argument("eviction.n_working must be at least 1");
@@ -271,16 +261,14 @@ engine::engine(
   page_size(config.page_size),
   vocab_size(vocab_size),
   max_page_bytes(largest_line(config, *this->shards.front())),
-  root(make_root_digest(
-      config.model_name, config.model_hash, page_shapes(config, full_layers(*this->shards.front()))
-  )),
   store(std::move(store)),
   sched(
       model_pointers(this->shards),
       make_cache(config, this->shards, *this->store),
+      *this->store,
       std::vector<cudaStream_t>(streams),
       loop_pointers(worker_loops),
-      root,
+      make_root_digest(config.model_name, config.model_hash, page_shapes(config, full_layers(*this->shards.front()))),
       std::vector<std::int64_t>(config.stop_ids),
       config.prefill_tokens_per_step
   ) {
@@ -360,8 +348,7 @@ void engine::run_worker_loop(std::size_t shard) {
 
 // A submit racing the loop's exit finds loop null; its writer then ends the callbacks with loop_exited.
 void engine::submit(request&& r, std::unique_ptr<request_callbacks> callbacks) {
-    validate(r, page_size, vocab_size);
-    sched.validate_state(r.initial_state);
+    validate(r, vocab_size);
     result_writer writer(std::move(callbacks));
     std::lock_guard lock(mutex);
     if (loop != nullptr) {
@@ -374,26 +361,12 @@ std::exception_ptr engine::exception() const {
     return loop_exception;
 }
 
-std::vector<digest> engine::page_digests(std::span<const std::int64_t> tokens) const {
-    return make_page_digests(root, tokens, page_size);
-}
-
 std::size_t engine::largest_page_bytes() const noexcept {
     return max_page_bytes;
 }
 
 engine_stat engine::stat() const {
     return engine_stat{.kv_cache_bytes = sched.kv_cache_bytes()};
-}
-
-std::vector<digest> engine::page_keys(const state& s) const {
-    std::vector<digest> keys;
-    for (std::size_t layer = 0; layer < s.layers.size(); layer++) {
-        for (const active_page& page : s.layers[layer].pages) {
-            keys.push_back(store_key(page.hash, layer));
-        }
-    }
-    return keys;
 }
 
 eviction_report engine::eviction_report_of(const state& s, const eviction_policy& policy) const {

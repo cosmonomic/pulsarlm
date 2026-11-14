@@ -68,17 +68,14 @@ class python_engine {
     ~python_engine();
 
     request_handle submit(
-        const state& initial_state,
         std::vector<std::int64_t>&& tokens,
+        const std::optional<pybind11::bytes>& initial_digest,
         const sampling_params& sampling,
         std::optional<std::size_t> max_tokens,
         const eviction_policy& eviction,
-        std::uint64_t request_id,
         pybind11::object on_cycle_end,
         pybind11::object on_end
     );
-    std::vector<digest> page_digests(const std::vector<std::int64_t>& tokens) const;
-    std::vector<digest> page_keys(const state& s) const;
     eviction_report eviction_report_of(const state& s, const eviction_policy& policy) const;
     engine_stat stat() const;
     int fileno() const noexcept;

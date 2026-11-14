@@ -53,7 +53,6 @@ class engine {
     std::size_t page_size;
     std::size_t vocab_size;
     std::size_t max_page_bytes;
-    digest root;
     std::unique_ptr<page_store> store;
     scheduler sched;
     mutable std::mutex mutex;
@@ -105,15 +104,10 @@ class engine {
     ~engine();
 
     // Serves r, passing its results to callbacks. Safe to call from any thread. Throws std::invalid_argument, without
-    // calling callbacks, when r breaks a precondition of scheduler::submit, holds a token outside [0, vocab_size), or
-    // starts from a state scheduler::validate_state rejects.
+    // calling callbacks, when r breaks a precondition of scheduler::submit or holds a token outside [0, vocab_size).
     void submit(request&& r, std::unique_ptr<request_callbacks> callbacks);
     // The exception that panicked the loop; null while the loop runs or when it was stopped.
     std::exception_ptr exception() const;
-    // The digests of the full pages of a token history from its start; the last is the head of a state reaching it.
-    std::vector<digest> page_digests(std::span<const std::int64_t> tokens) const;
-    // The store keys of the pages of s's sequences, which a request resuming from s reads. Safe to call from any thread.
-    std::vector<digest> page_keys(const state& s) const;
     // The scores a cycle's end under policy would evict s's pages by. Safe to call from any thread.
     eviction_report eviction_report_of(const state& s, const eviction_policy& policy) const;
     // Safe to call from any thread.

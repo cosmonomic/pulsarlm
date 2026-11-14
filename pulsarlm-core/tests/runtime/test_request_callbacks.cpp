@@ -49,7 +49,7 @@ class recording_callbacks final : public pulsarlm::request_callbacks {
 
     void on_end(std::expected<pulsarlm::request_result, request_error>&& result) noexcept override {
         recorded_results->end.emplace(std::move(result).transform([](pulsarlm::request_result&& ended) {
-            return std::move(ended.state);
+            return *ended.state;
         }));
         recorded_results->end_count++;
     }
@@ -72,14 +72,15 @@ TEST_CASE("the writer passes tokens and cycle ends to its callbacks") {
     result_writer writer = make_writer(recorded_results);
     pulsarlm::digest page_hash{.hi = 3, .lo = 4};
     writer.append(1);
-    writer.append(pulsarlm::cycle_end{.state = pulsarlm::state{.head = page_hash, .tail = {1}}, .token_count = 5});
+    writer.append(
+        pulsarlm::cycle_end{.state = std::make_shared<const pulsarlm::state>(pulsarlm::state{.head = page_hash, .tail = {1}})}
+    );
     writer.append(2);
 
     REQUIRE(recorded_results->tokens == token_list{1, 2});
     REQUIRE(recorded_results->cycle_ends.size() == 1);
-    REQUIRE((recorded_results->cycle_ends[0].state.head == page_hash));
-    REQUIRE(recorded_results->cycle_ends[0].state.tail == token_list{1});
-    REQUIRE(recorded_results->cycle_ends[0].token_count == 5);
+    REQUIRE((recorded_results->cycle_ends[0].state->head == page_hash));
+    REQUIRE(recorded_results->cycle_ends[0].state->tail == token_list{1});
     REQUIRE(!recorded_results->end);
 }
 
@@ -90,7 +91,7 @@ TEST_CASE("the writer ends its callbacks once, then destroys them") {
         pulsarlm::digest page_hash{.hi = 1, .lo = 2};
         writer.end(
             pulsarlm::request_result{
-                .state = pulsarlm::state{.head = page_hash, .tail = {5}},
+                .state = std::make_shared<const pulsarlm::state>(pulsarlm::state{.head = page_hash, .tail = {5}}),
                 .total_tokens = 5,
                 .cached_tokens = 4,
                 .device_cached_tokens = 4,

@@ -46,6 +46,8 @@ struct layer_sequence {
 // absent. tail holds the tokens after head. A sequence's hashes are distinct: they come from one digest chain. A state
 // that breaks this is undefined behaviour.
 struct state {
+    using lease_id_type = std::uint64_t;
+
     std::optional<digest> head;
     std::vector<layer_sequence> layers;
     std::vector<std::int64_t> tail;

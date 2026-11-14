@@ -618,7 +618,7 @@ kv_cache::get(std::span<const std::span<const digest>> hashes, std::span<const c
         for (const layer_line& target : fetch_lines) {
             targets.push_back(fetch_target(target));
         }
-        std::vector<bool> found = co_await store->fetch(fetch_keys, std::move(targets), streams);
+        std::vector<bool> found = co_await store->read_pages(fetch_keys, std::move(targets), streams);
         assert(found.size() == fetch_keys.size());
         for (std::size_t j = 0; j < found.size(); j++) {
             auto [layer, line_id] = fetch_lines[j];
@@ -685,14 +685,14 @@ kv_cache::clone(std::size_t layer, std::uint32_t line_id, std::size_t count, std
 
 task<std::expected<void, page_error>> kv_cache::sync(
     const std::vector<std::vector<digest>>& hashes,
-    const std::vector<std::vector<std::uint64_t>>& owners,
+    const std::vector<std::vector<state::lease_id_type>>& owners,
     const std::vector<std::vector<std::uint32_t>>& line_ids,
     std::span<const cudaStream_t> streams
 ) {
     assert(hashes.size() == layers.size() && owners.size() == layers.size() && line_ids.size() == layers.size());
     std::vector<layer_line> sources;
     std::vector<digest> keys;
-    std::vector<page_owner> page_owners;
+    std::vector<std::pair<state::lease_id_type, page_store::page_index_type>> page_owners;
     std::vector<std::pair<layer_line, digest>> named;
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
         assert(line_ids[layer].size() == hashes[layer].size() && owners[layer].size() == hashes[layer].size());
@@ -706,7 +706,7 @@ task<std::expected<void, page_error>> kv_cache::sync(
                 keys.push_back(store_key(hashes[layer][i], layer));
                 named.emplace_back(layer_line{.layer = layer, .line_id = line_id}, hashes[layer][i]);
             }
-            page_owners.push_back(page_owner{.request = owners[layer][i], .page = found->second});
+            page_owners.emplace_back(owners[layer][i], found->second);
         }
     }
     if (sources.empty()) {
@@ -721,7 +721,7 @@ task<std::expected<void, page_error>> kv_cache::sync(
     for (const auto& [target, hash] : named) {
         assign_hash(target.layer, target.line_id, hash);
     }
-    co_return co_await store->put(std::move(keys), std::move(pages), std::move(page_owners), streams);
+    co_return co_await store->write_pages(std::move(keys), std::move(pages), std::move(page_owners), streams);
 }
 
 void kv_cache::release(std::size_t layer, std::span<const std::uint32_t> line_ids) noexcept {

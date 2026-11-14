@@ -71,13 +71,11 @@ class AsyncEngine:
 
     def submit(
         self,
-        initial_state: State,
         tokens: list[int],
         *,
         sampling: SamplingParams,
         max_tokens: int | None,
         eviction: EvictionPolicy,
-        request_id: int,
         on_cycle_end: Callable[[CycleEnd], None] | None = None,
         on_end: Callable[[RequestResult], None] | None = None,
     ) -> RequestStream:
@@ -87,24 +85,16 @@ class AsyncEngine:
         if (message := self._engine.exception()) is not None:
             raise EngineStopped(message)
         request = self._engine.submit(
-            initial_state,
             tokens,
             sampling=sampling,
             max_tokens=max_tokens,
             eviction=eviction,
-            request_id=request_id,
             on_cycle_end=on_cycle_end,
             on_end=on_end,
         )
         stream = RequestStream(self._engine, request)
         self._streams.add(stream)
         return stream
-
-    def page_digests(self, tokens: list[int]) -> list[bytes]:
-        return self._engine.page_digests(tokens)
-
-    def page_keys(self, state: State) -> list[bytes]:
-        return self._engine.page_keys(state)
 
     def eviction_report_of(
         self, state: State, eviction: EvictionPolicy

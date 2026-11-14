@@ -6,15 +6,16 @@ import pytest
 import torch
 
 from pulsarlm.async_engine import AsyncEngine
-from pulsarlm.completion import complete
+from pulsarlm.completion import CompletionUsage, complete
 from pulsarlm.core.engine import (
     Engine,
     EvictionPolicy,
     ModelConfig,
     RopeParameters,
     SamplingParams,
+    State,
 )
-from pulsarlm.store import LocalStore
+from pulsarlm.store import EmptyStore, LocalStore
 
 N_LAYERS = 2
 N_HEADS = 2
@@ -72,20 +73,37 @@ def random_weights() -> dict[str, torch.Tensor]:
     return weights
 
 
-class CountingStore(LocalStore):
+class RecordingStore(LocalStore):
+    """Records the pages read, every state found with the digests it was found
+    by, and the page keys of every state written."""
+
     def __init__(self) -> None:
         super().__init__(PAGE_SIZE, capacity_bytes=64 * LINE_BYTES)
-        self.fetched_hashes: list[bytes] = []
+        self.read_hashes: list[bytes] = []
+        self.state_reads: list[tuple[State, list[bytes]]] = []
+        self.written_keys: dict[tuple[bytes | None, tuple[int, ...]], list[bytes]] = {}
 
-    def fetch(self, hashes: list[bytes]):
-        self.fetched_hashes += hashes
-        return super().fetch(hashes)
+    async def read_pages(self, hashes: list[bytes]) -> list[torch.Tensor | None]:
+        self.read_hashes += hashes
+        return await super().read_pages(hashes)
+
+    async def read_state(
+        self, tokens: list[int], page_digests: list[bytes]
+    ) -> tuple[State, int]:
+        state, lease_id = await super().read_state(tokens, page_digests)
+        self.state_reads.append((state, page_digests))
+        return state, lease_id
+
+    def write_state(self, lease_id: int, state: State, page_keys: list[bytes]) -> None:
+        self.written_keys[(state.head, tuple(state.tail))] = page_keys
+        super().write_state(lease_id, state, page_keys)
 
 
-def make_engine(store: LocalStore) -> AsyncEngine:
+def make_engine(store: LocalStore | EmptyStore) -> AsyncEngine:
     return AsyncEngine(
         Engine(
             store,
+            asyncio.get_running_loop(),
             MODEL,
             lambda rank, size: random_weights(),
             model_name="random-qwen3",
@@ -102,26 +120,30 @@ def make_engine(store: LocalStore) -> AsyncEngine:
 
 
 async def collect(
-    engine: AsyncEngine, store: LocalStore, prompt: list[int]
+    engine: AsyncEngine, prompt: list[int], usages: list[CompletionUsage] | None = None
 ) -> list[int]:
     tokens = complete(
         engine,
-        store,
         prompt,
         sampling=SamplingParams(),
         max_tokens=8,
         eviction=EvictionPolicy(cycle_tokens=16),
-        prefix_cache=True,
+        on_completed=None if usages is None else usages.append,
     )
     return [token async for token in tokens]
 
 
-def covered_by_lookup(engine: AsyncEngine, store: LocalStore, prompt: list[int]) -> int:
-    with store.lease(prompt, engine.page_digests(prompt), request_id=0) as (
-        _,
-        token_count,
-    ):
-        return token_count
+def covered_tokens(state: State, page_digests: list[bytes]) -> int:
+    pages = 0 if state.head is None else page_digests.index(state.head) + 1
+    return pages * PAGE_SIZE + len(state.tail)
+
+
+async def covered_by_lookup(
+    store: LocalStore, prompt: list[int], page_digests: list[bytes]
+) -> int:
+    state, lease_id = await store.read_state(prompt, page_digests)
+    store.release(lease_id)
+    return covered_tokens(state, page_digests)
 
 
 PROMPT = [(7 * i + 3) % VOCAB_SIZE for i in range(40)]
@@ -131,87 +153,81 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUD
 
 def test_a_follow_up_continues_from_the_end_state():
     async def main():
-        store = CountingStore()
+        store = RecordingStore()
         engine = make_engine(store)
-        reply = await collect(engine, store, PROMPT)
+        reply = await collect(engine, PROMPT)
         follow_up = PROMPT + reply + [11, 12, 13]
+        usages: list[CompletionUsage] = []
 
-        assert (
-            covered_by_lookup(engine, store, follow_up) == len(PROMPT) + len(reply) - 1
-        )
-        assert len(await collect(engine, store, follow_up)) == 8
+        assert len(await collect(engine, follow_up, usages)) == 8
+        state, digests = store.state_reads[-1]
+        assert covered_tokens(state, digests) == len(PROMPT) + len(reply) - 1
+        [usage] = usages
+        assert usage.prompt_tokens == len(follow_up)
+        assert usage.cached_tokens == len(state.layers[0].pages) * PAGE_SIZE
 
     asyncio.run(main())
 
 
 def test_every_cycle_end_state_is_findable():
     async def main():
-        store = CountingStore()
+        store = RecordingStore()
         engine = make_engine(store)
-        await collect(engine, store, PROMPT)
+        await collect(engine, PROMPT)
+        _, digests = store.state_reads[0]
 
-        assert covered_by_lookup(engine, store, PROMPT[:17]) == 16
-        assert covered_by_lookup(engine, store, PROMPT[:33]) == 32
+        assert await covered_by_lookup(store, PROMPT[:17], digests[:1]) == 16
+        assert await covered_by_lookup(store, PROMPT[:33], digests[:2]) == 32
 
     asyncio.run(main())
 
 
-def test_without_prefix_cache_a_request_leaves_no_state_or_page_in_the_store():
+def test_with_the_empty_store_every_request_runs_its_whole_prompt():
     async def main():
-        store = CountingStore()
-        engine = make_engine(store)
-        tokens = complete(
-            engine,
-            store,
-            PROMPT,
-            sampling=SamplingParams(),
-            max_tokens=8,
-            eviction=EvictionPolicy(cycle_tokens=16),
-            prefix_cache=False,
-        )
-        assert len([token async for token in tokens]) == 8
-        assert len(store) == 0
-        assert store.page_count() == 0
+        engine = make_engine(EmptyStore())
+        usages: list[CompletionUsage] = []
+        reply = await collect(engine, PROMPT, usages)
+        follow_up = PROMPT + reply + [11, 12, 13]
+        assert len(await collect(engine, follow_up, usages)) == 8
+
+        assert [usage.cached_tokens for usage in usages] == [0, 0]
+        assert [usage.prompt_tokens for usage in usages] == [
+            len(PROMPT),
+            len(follow_up),
+        ]
 
     asyncio.run(main())
 
 
 def test_another_engine_fetches_the_state_pages_from_the_store():
     async def main():
-        store = CountingStore()
+        store = RecordingStore()
         first = make_engine(store)
-        reply = await collect(first, store, PROMPT)
+        reply = await collect(first, PROMPT)
         follow_up = PROMPT + reply + [11]
 
         second = make_engine(store)
-        with store.lease(follow_up, second.page_digests(follow_up), request_id=0) as (
-            lease,
-            _,
-        ):
-            assert len(lease.state.layers[0].pages) == 2
-            keys = second.page_keys(lease.state)
-        assert len(await collect(second, store, follow_up)) == 8
-        assert store.fetched_hashes == keys
+        assert len(await collect(second, follow_up)) == 8
+        state, _ = store.state_reads[-1]
+        assert len(state.layers[0].pages) == 2
+        assert store.read_hashes == store.written_keys[(state.head, tuple(state.tail))]
 
     asyncio.run(main())
 
 
 def test_closing_early_cancels_and_the_engine_serves_the_next_request():
     async def main():
-        store = CountingStore()
-        engine = make_engine(store)
+        engine = make_engine(RecordingStore())
         tokens = complete(
             engine,
-            store,
             PROMPT,
             sampling=SamplingParams(),
             max_tokens=None,
             eviction=EvictionPolicy(),
-            prefix_cache=True,
         )
         await anext(tokens)
         await tokens.aclose()
 
-        assert len(await collect(engine, store, PROMPT)) == 8
+        assert len(await collect(engine, PROMPT)) == 8
 
     asyncio.run(main())

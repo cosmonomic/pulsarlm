@@ -168,7 +168,7 @@ class kv_cache {
     // per layer, indexed by layer.
 
     // Each layer's hashes are distinct. Gives every page of hashes[layer] a line of that layer in their order, fetching
-    // the pages that are not resident from the store in one fetch, and holds the lines until release. A page another
+    // the pages that are not resident from the store in one read_pages, and holds the lines until release. A page another
     // get is fetching shares that line and fetch. Fails with miss when the store does not have a page.
     task<std::expected<std::vector<std::vector<std::uint32_t>>, page_error>>
     get(std::span<const std::span<const digest>> hashes, std::span<const cudaStream_t> streams);
@@ -179,12 +179,12 @@ class kv_cache {
     std::expected<std::vector<std::uint32_t>, page_error>
     clone(std::size_t layer, std::uint32_t line_id, std::size_t count, std::span<const cudaStream_t> streams);
     // Names the page at line_ids[layer][i], held and unmapped, by hashes[layer][i] and hands each distinct page of a
-    // layer, owned by every owners[layer][i] of its hash, to the store in one put, also when another line caches its
-    // hash: the store may have dropped that page. A hash already cached at another line leaves its line unmapped.
-    // Completes once the put does, and fails as it does.
+    // layer, owned by the lease of every owners[layer][i] of its hash, to the store in one write_pages, also when
+    // another line caches its hash: the store may have dropped that page. A hash already cached at another line leaves
+    // its line unmapped. Completes once the write does, and fails as it does.
     task<std::expected<void, page_error>> sync(
         const std::vector<std::vector<digest>>& hashes,
-        const std::vector<std::vector<std::uint64_t>>& owners,
+        const std::vector<std::vector<state::lease_id_type>>& owners,
         const std::vector<std::vector<std::uint32_t>>& line_ids,
         std::span<const cudaStream_t> streams
     );

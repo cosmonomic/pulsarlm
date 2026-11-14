@@ -93,11 +93,11 @@ void copy_pages_from_host(
     }
 }
 
-// Keeps every page it is put, copied to pageable host memory.
+// Keeps every page it is written, copied to pageable host memory. kv_cache reads and writes no state.
 struct memory_store final : pulsarlm::page_store {
     std::shared_ptr<store_state> state = std::make_shared<store_state>();
 
-    task<std::vector<bool>> fetch(
+    task<std::vector<bool>> read_pages(
         std::span<const digest> hashes,
         std::vector<sharded_page>&& lines,
         std::span<const cudaStream_t> streams
@@ -125,17 +125,18 @@ struct memory_store final : pulsarlm::page_store {
         co_return found;
     }
 
-    task<std::expected<void, page_error>>
-    put(std::vector<digest>&& keys,
+    task<std::expected<void, page_error>> write_pages(
+        std::vector<digest>&& keys,
         std::vector<sharded_page>&& pages,
-        std::vector<pulsarlm::page_owner>&& owners,
-        std::span<const cudaStream_t> streams) override {
+        std::vector<std::pair<pulsarlm::state::lease_id_type, page_index_type>>&& owners,
+        std::span<const cudaStream_t> streams
+    ) override {
         std::shared_ptr<store_state> shared = state;
         std::vector<digest> put_keys = std::move(keys);
         std::vector<sharded_page> sources = std::move(pages);
         shared->puts++;
-        for (const pulsarlm::page_owner& owner : owners) {
-            shared->owners.emplace_back(owner.request, put_keys[owner.page]);
+        for (const auto& [lease_id, index] : owners) {
+            shared->owners.emplace_back(lease_id, put_keys[index]);
         }
         std::vector<page> copies = copy_pages_to_host(sources, streams);
         for (std::size_t i = 0; i < put_keys.size(); i++) {
@@ -143,6 +144,17 @@ struct memory_store final : pulsarlm::page_store {
         }
         co_return {};
     }
+
+    task<std::pair<std::shared_ptr<const pulsarlm::state>, pulsarlm::state::lease_id_type>>
+    read_state(std::span<const std::int64_t>, std::span<const digest>) override {
+        co_return std::pair(std::make_shared<const pulsarlm::state>(), pulsarlm::state::lease_id_type{0});
+    }
+
+    task<void> write_state(pulsarlm::state::lease_id_type, std::shared_ptr<const pulsarlm::state>&&) override {
+        co_return;
+    }
+
+    void release(pulsarlm::state::lease_id_type) noexcept override {}
 };
 
 std::vector<cudaStream_t> compute_streams() {
