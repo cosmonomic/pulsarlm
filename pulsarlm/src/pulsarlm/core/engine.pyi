@@ -20,7 +20,8 @@ class PageStore(Protocol):
     it their host copies with those pages' owners. write_state makes a state the
     lease's request reached findable, page_keys being its pages. A read_pages that
     raises or yields a malformed result misses every page it asked for; a
-    read_state that does panics the engine's loop. An exception raised by claim,
+    read_state that does ends its request with MISS, holding no lease, so the
+    store cleans up what it took. An exception raised by claim,
     which then claims nothing, or by write_pages, write_state or release goes to
     sys.unraisablehook.
     """

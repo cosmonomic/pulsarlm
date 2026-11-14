@@ -124,6 +124,13 @@ class FailingStore(MemoryStore):
         raise ConnectionError("store unreachable")
 
 
+class FailingLookupStore(MemoryStore):
+    async def read_state(
+        self, tokens: list[int], page_digests: list[bytes]
+    ) -> tuple[State, int]:
+        raise ConnectionError("store unreachable")
+
+
 def make_engine(store: MemoryStore, store_pages: int = 0) -> Engine:
     return Engine(
         store,
@@ -337,6 +344,19 @@ def test_a_failing_read_misses():
 
         assert end == RequestError.MISS
         assert second.exception() is None
+
+    asyncio.run(main())
+
+
+def test_a_failing_state_lookup_misses():
+    async def main():
+        store = FailingLookupStore(asyncio.get_running_loop())
+        engine = make_engine(store)
+        sampled, _, end = await run(engine, *submit(engine, PROMPT, max_tokens=8))
+
+        assert sampled == []
+        assert end == RequestError.MISS
+        assert engine.exception() is None
 
     asyncio.run(main())
 

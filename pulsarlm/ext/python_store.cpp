@@ -79,25 +79,22 @@ class read_pages_resolver {
 
 using state_with_lease = std::pair<std::shared_ptr<const state>, state::lease_id_type>;
 
-// The result of a read_state hook on its way to the loop: the leased state, or why there is none. Destroyed with the
-// lease untaken, as when the task awaiting it is gone, it releases the lease through release_hook.
+// The result of a read_state hook on its way to the loop: the leased state, or a miss. Destroyed with the lease untaken,
+// as when the task awaiting it is gone, it releases the lease through release_hook.
 class read_state_result {
     py::object release_hook;
     std::optional<state_with_lease> leased;
-    std::exception_ptr failure;
 
   public:
+    read_state_result() noexcept = default;
     read_state_result(py::object&& release_hook, state_with_lease&& leased) noexcept
     : release_hook(std::move(release_hook)),
       leased(std::move(leased)) {}
-    explicit read_state_result(std::exception_ptr failure) noexcept
-    : failure(std::move(failure)) {}
     read_state_result(const read_state_result&) = delete;
     read_state_result& operator=(const read_state_result&) = delete;
     read_state_result(read_state_result&& other) noexcept
     : release_hook(std::move(other.release_hook)),
-      leased(std::exchange(other.leased, std::nullopt)),
-      failure(std::move(other.failure)) {}
+      leased(std::exchange(other.leased, std::nullopt)) {}
     read_state_result& operator=(read_state_result&&) = delete;
 
     ~read_state_result() {
@@ -116,21 +113,15 @@ class read_state_result {
         release_hook = py::object();
     }
 
-    // Rethrows the failure.
-    state_with_lease take() {
-        if (failure) {
-            std::rethrow_exception(failure);
+    std::expected<state_with_lease, page_error> take() {
+        if (!leased) {
+            return std::unexpected(page_error::miss);
         }
         return *std::exchange(leased, std::nullopt);
     }
 };
 
-std::exception_ptr read_state_failure(const char* message) {
-    return std::make_exception_ptr(std::runtime_error(std::format("the store's read_state failed: {}", message)));
-}
-
-// Resolves its read exactly once; destroyed unresolved, it resolves with a failure. Created and destroyed with the GIL
-// held.
+// Resolves its read exactly once; destroyed unresolved, it resolves with a miss. Created and destroyed with the GIL held.
 class read_state_resolver {
     external_task<read_state_result>::resolver resolver;
     py::object release_hook;
@@ -145,36 +136,33 @@ class read_state_resolver {
 
     ~read_state_resolver() {
         if (!resolved) {
-            resolver.resolve(read_state_result(read_state_failure("the result was dropped")));
+            resolver.resolve(read_state_result());
         }
     }
 
-    void fail(const char* message) {
+    void resolve(read_state_result&& result) {
         resolved = true;
-        resolver.resolve(read_state_result(read_state_failure(message)));
+        resolver.resolve(std::move(result));
     }
 
-    // Called with the GIL held.
+    // Called with the GIL held. A failed or malformed result is a miss.
     void resolve_from(const py::handle& future) {
+        std::shared_ptr<state> stored_state;
+        state::lease_id_type lease_id = 0;
         try {
-            auto result = future.attr("result")().cast<py::tuple>();
-            if (result.size() != 2) {
-                throw std::length_error("the result is not a (State, lease id) tuple");
+            auto returned = future.attr("result")().cast<py::tuple>();
+            if (returned.size() == 2) {
+                lease_id = returned[1].cast<state::lease_id_type>();
+                stored_state = returned[0].cast<std::shared_ptr<state>>();
             }
-            auto stored_state = result[0].cast<std::shared_ptr<state>>();
-            if (!stored_state) {
-                throw std::invalid_argument("the state is None");
-            }
-            auto lease_id = result[1].cast<state::lease_id_type>();
-            resolved = true;
-            resolver.resolve(
-                read_state_result(py::object(release_hook), state_with_lease(std::move(stored_state), lease_id))
-            );
-        } catch (py::error_already_set& e) {
-            fail(e.what());
-        } catch (const std::exception& e) {
-            fail(e.what());
+        } catch (const std::exception&) {
+            stored_state = nullptr;
         }
+        if (!stored_state) {
+            resolve(read_state_result());
+            return;
+        }
+        resolve(read_state_result(py::object(release_hook), state_with_lease(std::move(stored_state), lease_id)));
     }
 };
 
@@ -250,7 +238,7 @@ task<std::vector<bool>> python_store::read_pages(
     co_return found;
 }
 
-task<std::pair<std::shared_ptr<const state>, state::lease_id_type>>
+task<std::expected<std::pair<std::shared_ptr<const state>, state::lease_id_type>, page_error>>
 python_store::read_state(std::span<const std::int64_t> tokens, std::span<const digest> page_digests) {
     auto [state_task, resolver] = external_task<read_state_result>::make();
     {
@@ -265,8 +253,8 @@ python_store::read_state(std::span<const std::int64_t> tokens, std::span<const d
                 .attr("add_done_callback")(py::cpp_function([reader](const py::handle& done) {
                     reader->resolve_from(done);
                 }));
-        } catch (py::error_already_set& e) {
-            reader->fail(e.what());
+        } catch (const std::exception&) {
+            reader->resolve(read_state_result());
         }
     }
     read_state_result result = co_await std::move(state_task);

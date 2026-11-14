@@ -68,6 +68,8 @@ class scheduler {
     static void wake(std::optional<event>& waited) noexcept;
     // The tokens of seq's full history pages that every KV layer reading the page holds resident.
     std::size_t device_cached_tokens(const sequence& seq) const;
+    // Runs seq from its start to its exit, and writes its end state when it finished.
+    task<std::expected<request_result, request_error>> serve(sequence& seq);
     // Per KV layer with pages, lines for its pages, then line_count empty lines; per recurrent layer, a copy of the
     // state at head, or zeros without head, and an empty line. Holds nothing on failure.
     task<std::expected<void, page_error>> take_lines(sequence& seq, std::size_t line_count);
@@ -106,8 +108,9 @@ class scheduler {
 
     // Serves r from the newest state the store holds for a prefix of its tokens, then ends writer with its result or an
     // error. Writes the state reached at the end of each eviction cycle to the store, then appends it to writer, and
-    // likewise the end state. Ends with oom, never waiting, when the free lines do not cover the state's pages and one
-    // cycle's tokens at the start, or the next cycle's tokens while running; the caller resubmits.
+    // likewise the end state, and releases the state's lease before ending writer. Ends with miss when the store's lookup
+    // fails. Ends with oom, never waiting, when the free lines do not cover the state's pages and one cycle's tokens at
+    // the start, or the next cycle's tokens while running; the caller resubmits.
     task<void> submit(request r, result_writer writer);
     // Steps the running sequences until the loop stops.
     task<void> run();

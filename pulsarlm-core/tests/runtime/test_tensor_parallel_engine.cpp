@@ -271,7 +271,9 @@ void copy_pages_from_host(
             c10::cuda::CUDAStreamGuard guard(
                 c10::cuda::getStreamFromExternal(streams[shard.cache_shard], shard.bytes.device().index())
             );
-            shard.bytes.copy_(pages[i].bytes.narrow(0, static_cast<std::int64_t>(shard.host_offset), shard.bytes.numel()));
+            shard.bytes.copy_(
+                pages[i].bytes.narrow(0, static_cast<std::int64_t>(shard.host_offset), shard.bytes.numel())
+            );
         }
     }
 }
@@ -321,7 +323,9 @@ struct memory_store final : pulsarlm::page_store {
     }
 
     // The stored state reaching the most tokens of a proper prefix of tokens.
-    task<std::pair<std::shared_ptr<const pulsarlm::state>, pulsarlm::state::lease_id_type>>
+    task<std::expected<
+        std::pair<std::shared_ptr<const pulsarlm::state>, pulsarlm::state::lease_id_type>,
+        pulsarlm::page_error>>
     read_state(std::span<const std::int64_t> tokens, std::span<const digest> page_digests) override {
         std::shared_ptr<store_contents> shared = contents;
         std::shared_ptr<const pulsarlm::state> found = std::make_shared<const pulsarlm::state>();

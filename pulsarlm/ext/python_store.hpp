@@ -28,8 +28,7 @@ namespace pulsarlm {
 // The coroutines run on loop, an asyncio event loop. A page is its host uint8 tensor; an owner is a (lease id, index
 // into hashes) pair. claim gives the indices of the pages the object takes; write_pages then hands it their host copies,
 // with the owners of those pages. A read_pages that raises, is cancelled or yields a malformed result misses every page
-// it asked for. A read_state that raises, is cancelled or yields a malformed result panics the loop. An exception raised
-// by claim, which then claims nothing, or by write_pages, write_state or release is reported through
+// it asked for, and a read_state that does is a miss, holding no lease. An exception raised by claim, which then claims nothing, or by write_pages, write_state or release is reported through
 // sys.unraisablehook. Host copies take blocks of a pinned host_page_pool, and pageable memory past its room.
 class python_store final : public page_store {
     pybind11::object hooks;
@@ -65,7 +64,7 @@ class python_store final : public page_store {
         std::vector<std::pair<state::lease_id_type, page_index_type>>&& owners,
         std::span<const cudaStream_t> streams
     ) override;
-    task<std::pair<std::shared_ptr<const state>, state::lease_id_type>>
+    task<std::expected<std::pair<std::shared_ptr<const state>, state::lease_id_type>, page_error>>
     read_state(std::span<const std::int64_t> tokens, std::span<const digest> page_digests) override;
     task<void> write_state(state::lease_id_type lease_id, std::shared_ptr<const state>&& s) override;
     void release(state::lease_id_type lease_id) noexcept override;

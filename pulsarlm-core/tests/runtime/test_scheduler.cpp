@@ -68,6 +68,7 @@ struct store_contents {
     std::vector<written_state> written_states;
     std::vector<lease_id_type> released;
     lease_id_type next_lease_id = 100;
+    bool lookup_fails = false;
 };
 
 struct request_results {
@@ -82,6 +83,7 @@ struct request_results {
     std::shared_ptr<const store_contents> observed_store;
     std::vector<std::size_t> writes_at_cycle_ends;
     std::optional<std::size_t> writes_at_end;
+    std::optional<std::size_t> releases_at_end;
 };
 
 class recording_callbacks final : public pulsarlm::request_callbacks {
@@ -106,6 +108,9 @@ class recording_callbacks final : public pulsarlm::request_callbacks {
 
     void on_end(std::expected<pulsarlm::request_result, request_error>&& result) noexcept override {
         recorded_results->writes_at_end = observed_writes();
+        if (recorded_results->observed_store) {
+            recorded_results->releases_at_end = recorded_results->observed_store->released.size();
+        }
         if (result) {
             recorded_results->total_tokens = result->total_tokens;
             recorded_results->cached_tokens = result->cached_tokens;
@@ -237,7 +242,7 @@ struct memory_store final : pulsarlm::page_store {
         co_return {};
     }
 
-    task<std::pair<state_pointer, lease_id_type>>
+    task<std::expected<std::pair<state_pointer, lease_id_type>, pulsarlm::page_error>>
     read_state(std::span<const std::int64_t> tokens, std::span<const digest> page_digests) override {
         std::shared_ptr<store_contents> shared = contents;
         token_list prompt(tokens.begin(), tokens.end());
@@ -245,6 +250,9 @@ struct memory_store final : pulsarlm::page_store {
             .tokens = prompt,
             .page_digests = std::vector<digest>(page_digests.begin(), page_digests.end()),
         });
+        if (shared->lookup_fails) {
+            co_return std::unexpected(pulsarlm::page_error::miss);
+        }
         lease_id_type lease_id = shared->next_lease_id++;
         shared->leases.push_back(lease_id);
         for (std::size_t pages = page_digests.size() + 1; pages > 0; pages--) {
@@ -831,7 +839,7 @@ TEST_CASE("a request's page chain starts from its initial digest and continues p
     REQUIRE(results[0].tokens == continuation(prompt, 5));
 }
 
-TEST_CASE("each state reaches the store before the callback that passes it") {
+TEST_CASE("each state reaches the store, and the lease is released, before the callback that passes it") {
     fixture f(16);
     token_list prompt{1, 2, 3, 4, 5, 6};
     submission s = make_submission(request{.tokens = prompt, .max_tokens = 6, .eviction = {.cycle_tokens = 4}});
@@ -843,6 +851,7 @@ TEST_CASE("each state reaches the store before the callback that passes it") {
     REQUIRE(result.cycle_ends.size() == 2);
     REQUIRE(result.writes_at_cycle_ends == std::vector<std::size_t>{1, 2});
     REQUIRE(result.writes_at_end == 3);
+    REQUIRE(result.releases_at_end == 1);
     REQUIRE(f.store->written_states.size() == 3);
     REQUIRE(f.store->written_states[0].s == result.cycle_ends[0].state);
     REQUIRE(f.store->written_states[1].s == result.cycle_ends[1].state);
@@ -938,6 +947,19 @@ TEST_CASE("a state page missing from the store ends the request with miss") {
     REQUIRE(ended_error(results[0]) == request_error::miss);
     REQUIRE(f.model.forward_count == 0);
     REQUIRE(f.store->released == f.store->leases);
+}
+
+TEST_CASE("a failed state lookup ends the request with miss and leases nothing") {
+    fixture f(16);
+    f.store->lookup_fails = true;
+    std::vector<request_results> results = serve_all(f.sched, {request{.tokens = {1, 2, 3}, .max_tokens = 1}});
+
+    REQUIRE(results[0].tokens.empty());
+    REQUIRE(ended_error(results[0]) == request_error::miss);
+    REQUIRE(f.model.forward_count == 0);
+    REQUIRE(f.store->state_reads.size() == 1);
+    REQUIRE(f.store->leases.empty());
+    REQUIRE(f.store->released.empty());
 }
 
 TEST_CASE("a stop token ends the request after it is emitted") {

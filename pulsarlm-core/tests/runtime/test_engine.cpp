@@ -75,7 +75,7 @@ struct stalling_store final : pulsarlm::page_store {
         co_return {};
     }
 
-    task<std::pair<std::shared_ptr<const pulsarlm::state>, lease_id_type>>
+    task<std::expected<std::pair<std::shared_ptr<const pulsarlm::state>, lease_id_type>, pulsarlm::page_error>>
     read_state(std::span<const std::int64_t>, std::span<const digest>) override {
         std::lock_guard lock(lease_records->mutex);
         lease_id_type lease_id = lease_records->leases.size() + 1;

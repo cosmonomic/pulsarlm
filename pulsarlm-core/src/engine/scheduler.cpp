@@ -86,10 +86,11 @@ at::Tensor zero_page_mass(
     return mass;
 }
 
-// Releases its lease when destroyed, also with a frame destroyed after a panic: the lease is the store's.
+// Releases its lease once: on release, or when destroyed before it, as with a frame destroyed after a panic, since the
+// lease is the store's.
 class lease_guard {
     page_store& store;
-    state::lease_id_type lease_id;
+    std::optional<state::lease_id_type> lease_id;
 
   public:
     lease_guard(page_store& store, state::lease_id_type lease_id) noexcept
@@ -98,7 +99,13 @@ class lease_guard {
     lease_guard(const lease_guard&) = delete;
     lease_guard& operator=(const lease_guard&) = delete;
     ~lease_guard() {
-        store.release(lease_id);
+        release();
+    }
+
+    void release() noexcept {
+        if (lease_id) {
+            store.release(*std::exchange(lease_id, std::nullopt));
+        }
     }
 };
 
@@ -923,7 +930,13 @@ task<void> scheduler::submit(request r, result_writer writer) {
     assert(r.eviction.eviction_threshold >= 0.0 && r.eviction.eviction_threshold <= 1.0);
     digest chain_root = r.initial_digest.value_or(root);
     std::vector<digest> digests = make_page_digests(chain_root, r.tokens, page_size);
-    auto [initial_state, lease_id] = co_await store.read_state(r.tokens, digests);
+    std::expected<std::pair<std::shared_ptr<const state>, state::lease_id_type>, page_error> read =
+        co_await store.read_state(r.tokens, digests);
+    if (!read) {
+        writer.end(std::unexpected(request_error::miss));
+        co_return;
+    }
+    auto& [initial_state, lease_id] = *read;
     lease_guard guard(store, lease_id);
     std::vector<at::Device> devices;
     for (const std::vector<kv>& shard_lines : lines) {
@@ -939,17 +952,21 @@ task<void> scheduler::submit(request r, result_writer writer) {
         writer,
         devices
     );
+    std::expected<request_result, request_error> result = co_await serve(seq);
+    guard.release();
+    writer.end(std::move(result));
+}
+
+task<std::expected<request_result, request_error>> scheduler::serve(sequence& seq) {
     seq.start_cycle();
-    if (writer.cancelled()) {
-        writer.end(std::unexpected(request_error::cancelled));
-        co_return;
+    if (seq.writer.cancelled()) {
+        co_return std::unexpected(request_error::cancelled);
     }
     // take_lines holds the resident pages before it first suspends, so they are the ones counted here.
     seq.device_cached_count = device_cached_tokens(seq);
     std::expected<void, page_error> taken = co_await take_lines(seq, seq.cycle_lines());
     if (!taken) {
-        writer.end(std::unexpected(taken.error() == page_error::miss ? request_error::miss : request_error::oom));
-        co_return;
+        co_return std::unexpected(taken.error() == page_error::miss ? request_error::miss : request_error::oom);
     }
     seq.upload_table(0, streams);
 
@@ -963,23 +980,19 @@ task<void> scheduler::submit(request r, result_writer writer) {
     case exit_reason::finished: {
         auto end_state = std::make_shared<const state>(seq.to_state());
         co_await store.write_state(seq.lease_id, std::shared_ptr<const state>(end_state));
-        writer.end(
-            request_result{
-                .state = std::move(end_state),
-                .total_tokens = seq.prompt_count + seq.generated_count,
-                .cached_tokens = seq.cached_count,
-                .device_cached_tokens = seq.device_cached_count,
-            }
-        );
-        co_return;
+        co_return request_result{
+            .state = std::move(end_state),
+            .total_tokens = seq.prompt_count + seq.generated_count,
+            .cached_tokens = seq.cached_count,
+            .device_cached_tokens = seq.device_cached_count,
+        };
     }
     case exit_reason::cancelled:
-        writer.end(std::unexpected(request_error::cancelled));
-        co_return;
+        co_return std::unexpected(request_error::cancelled);
     case exit_reason::oom:
-        writer.end(std::unexpected(request_error::oom));
-        co_return;
+        co_return std::unexpected(request_error::oom);
     }
+    std::unreachable();
 }
 
 std::size_t scheduler::device_cached_tokens(const sequence& seq) const {

@@ -65,7 +65,8 @@ class page_store {
     ) = 0;
     // The newest stored state reaching a proper prefix of tokens, whose full pages have the digests page_digests, or an
     // empty state when there is none, with a new lease on it. Every page of the state stays readable until release.
-    virtual task<std::pair<std::shared_ptr<const state>, state::lease_id_type>>
+    // Fails with miss, holding no lease, when the lookup fails.
+    virtual task<std::expected<std::pair<std::shared_ptr<const state>, state::lease_id_type>, page_error>>
     read_state(std::span<const std::int64_t> tokens, std::span<const digest> page_digests) = 0;
     // The lease's request reached s, whose pages were written: the lease references them in place of its previous
     // state's, releases the pages written for it that s covers, and s becomes findable.
