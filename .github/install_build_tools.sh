@@ -1,5 +1,5 @@
 #!/bin/bash
-# CUDA 13.2, gcc-toolset-15 and xmake for the wheel build image, on a manylinux_2_34 base.
+# CUDA 13.2, gcc-toolset-15 and xmake for building the wheels, in cibuildwheel's manylinux_2_34 container.
 set -euxo pipefail
 
 dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/$(uname -m | sed s/aarch64/sbsa/)/cuda-rhel9.repo

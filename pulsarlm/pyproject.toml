@@ -61,9 +61,12 @@ cache-keys = [
 [tool.cibuildwheel]
 build = "cp313-manylinux_* cp314-manylinux_*"
 build-frontend = "build[uv]"
+manylinux-x86_64-image = "manylinux_2_34"
+manylinux-aarch64-image = "manylinux_2_34"
 build-verbosity = 1
 
 [tool.cibuildwheel.linux]
+before-all = "bash {package}/../.github/install_build_tools.sh"
 environment = { CUDA_PATH = "/usr/local/cuda-13.2", PATH = "/usr/local/cuda-13.2/bin:/opt/rh/gcc-toolset-15/root/usr/bin:/root/.local/bin:$PATH", XMAKE_ROOT = "y", PULSARLM_CUDA_ARCH = "sm_80,sm_86,sm_89,sm_90,sm_100,sm_120,compute_120" }
 # torch, its CUDA runtime and NCCL are loaded by `import torch` before the extension, so the wheel links them by soname.
 repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel} --exclude 'libtorch*.so' --exclude 'libc10*.so' --exclude libcudart.so.13 --exclude libnvrtc.so.13 --exclude libnccl.so.2"

@@ -56,53 +56,14 @@ jobs:
     runs-on: ${{ matrix.platform.runner }}
     permissions:
       contents: read
-      packages: read
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 0  # hatch-vcs needs the tag, not just the commit
 
-      - name: Log in to the GitHub container registry
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      # The image is built by build-image.yml, tagged with the tree hash of
-      # .github/build-image; a release made right after changing that directory
-      # waits for its build.
-      - name: Wait for the build image
-        id: build_image
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          tag=$(git rev-parse HEAD:.github/build-image)
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          image="ghcr.io/cosmonomic/pulsarlm-build:$tag-${{ matrix.platform.arch }}"
-          deadline=$((SECONDS + 1800))
-          errors=0
-          while true; do
-            if status=$(.github/image_status.sh cosmonomic/pulsarlm-build "$tag-${{ matrix.platform.arch }}"); then
-              if [[ $status == exists ]]; then
-                break
-              fi
-              echo "$image does not exist yet"
-            elif (( ++errors >= 3 )); then
-              echo "::error::could not tell whether $image exists"
-              exit 1
-            fi
-            if (( SECONDS >= deadline )); then
-              echo "::error::$image does not exist; run the Build image workflow for this ref"
-              exit 1
-            fi
-            sleep 60
-          done
-
-      - name: Free disk space and pull the build image
-        run: |
-          df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL &
-          docker pull "ghcr.io/cosmonomic/pulsarlm-build:${{ steps.build_image.outputs.tag }}-${{ matrix.platform.arch }}"
-          wait
-          df -h /
+      - name: Free disk space
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
 
       - uses: pypa/cibuildwheel@v4.3.1
         with:
@@ -110,8 +71,6 @@ jobs:
           output-dir: dist
         env:
           CIBW_BUILD: ${{ matrix.python }}-manylinux_${{ matrix.platform.arch }}
-          CIBW_MANYLINUX_X86_64_IMAGE: ghcr.io/cosmonomic/pulsarlm-build:${{ steps.build_image.outputs.tag }}-x86_64
-          CIBW_MANYLINUX_AARCH64_IMAGE: ghcr.io/cosmonomic/pulsarlm-build:${{ steps.build_image.outputs.tag }}-aarch64
 
       - uses: actions/upload-artifact@v5
         with:
