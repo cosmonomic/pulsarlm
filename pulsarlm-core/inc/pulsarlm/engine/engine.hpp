@@ -17,13 +17,15 @@
 #include <unordered_map>
 #include <vector>
 
-#include "pulsarlm/engine/event_loop.hpp"
 #include "pulsarlm/engine/engine_config.hpp"
+#include "pulsarlm/engine/event_loop.hpp"
+#include "pulsarlm/engine/executor.hpp"
 #include "pulsarlm/engine/eviction_policy.hpp"
 #include "pulsarlm/engine/eviction_report.hpp"
 #include "pulsarlm/engine/model/config.hpp"
 #include "pulsarlm/engine/kv_cache.hpp"
 #include "pulsarlm/engine/model/interface.hpp"
+#include "pulsarlm/engine/request.hpp"
 #include "pulsarlm/engine/request_callbacks.hpp"
 #include "pulsarlm/engine/scheduler.hpp"
 
@@ -54,6 +56,7 @@ class engine {
     std::size_t vocab_size;
     std::size_t max_page_bytes;
     std::unique_ptr<page_store> store;
+    executor exec;
     scheduler sched;
     mutable std::mutex mutex;
     // Set while the loop runs.

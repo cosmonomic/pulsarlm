@@ -55,17 +55,17 @@ async def complete(
         if on_state is not None:
             on_state(state)
 
-    def end(ended: RequestResult) -> None:
+    def end(request_result: RequestResult) -> None:
         nonlocal result
-        result = ended
-        pass_state(ended.state)
+        result = request_result
+        pass_state(request_result.state)
 
     stream = engine.submit(
         prompt,
         sampling=sampling,
         max_tokens=max_tokens,
         eviction=eviction,
-        on_cycle_end=lambda ended: pass_state(ended.state),
+        on_cycle_end=lambda cycle_end: pass_state(cycle_end.state),
         on_end=end,
     )
     try:

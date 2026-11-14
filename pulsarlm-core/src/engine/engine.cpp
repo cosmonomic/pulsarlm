@@ -262,16 +262,16 @@ engine::engine(
   vocab_size(vocab_size),
   max_page_bytes(largest_line(config, *this->shards.front())),
   store(std::move(store)),
-  sched(
+  exec(
       model_pointers(this->shards),
       make_cache(config, this->shards, *this->store),
       *this->store,
       std::vector<cudaStream_t>(streams),
       loop_pointers(worker_loops),
       make_root_digest(config.model_name, config.model_hash, page_shapes(config, full_layers(*this->shards.front()))),
-      std::vector<std::int64_t>(config.stop_ids),
-      config.prefill_tokens_per_step
-  ) {
+      std::vector<std::int64_t>(config.stop_ids)
+  ),
+  sched(exec, config.prefill_tokens_per_step) {
     for (std::size_t shard = 1; shard < devices.size(); shard++) {
         worker_threads.emplace_back([this, shard] { run_worker_loop(shard); });
     }
@@ -366,7 +366,7 @@ std::size_t engine::largest_page_bytes() const noexcept {
 }
 
 engine_stat engine::stat() const {
-    return engine_stat{.kv_cache_bytes = sched.kv_cache_bytes()};
+    return engine_stat{.kv_cache_bytes = exec.kv_cache_bytes()};
 }
 
 eviction_report engine::eviction_report_of(const state& s, const eviction_policy& policy) const {

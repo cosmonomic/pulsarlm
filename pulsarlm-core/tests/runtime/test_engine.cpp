@@ -48,7 +48,7 @@ using lease_id_type = pulsarlm::state::lease_id_type;
 struct lease_record {
     std::mutex mutex;
     std::vector<lease_id_type> leases;
-    std::vector<lease_id_type> released;
+    std::vector<lease_id_type> releases;
 };
 
 // Drops written pages and states, and returns stored_state for every read. A page read never completes; it counts down
@@ -89,7 +89,7 @@ struct stalling_store final : pulsarlm::page_store {
 
     void release(lease_id_type lease_id) noexcept override {
         std::lock_guard lock(lease_records->mutex);
-        lease_records->released.push_back(lease_id);
+        lease_records->releases.push_back(lease_id);
     }
 };
 
@@ -301,7 +301,7 @@ TEST_CASE("destroying the engine ends the requests it serves with loop_exited an
 
     REQUIRE(ended_with(*recorded_results, request_error::loop_exited));
     REQUIRE(lease_records->leases == std::vector<lease_id_type>{1});
-    REQUIRE(lease_records->released == std::vector<lease_id_type>{1});
+    REQUIRE(lease_records->releases == std::vector<lease_id_type>{1});
 }
 
 TEST_CASE("a panic ends the requests with loop_exited and leaves its exception") {

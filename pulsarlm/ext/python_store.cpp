@@ -79,22 +79,22 @@ class read_pages_resolver {
 
 using state_with_lease = std::pair<std::shared_ptr<const state>, state::lease_id_type>;
 
-// The result of a read_state hook on its way to the loop: the leased state, or a miss. Destroyed with the lease untaken,
+// The result of a read_state hook on its way to the loop: the state_and_lease state, or a miss. Destroyed with the lease untaken,
 // as when the task awaiting it is gone, it releases the lease through release_hook.
 class read_state_result {
     py::object release_hook;
-    std::optional<state_with_lease> leased;
+    std::optional<state_with_lease> state_and_lease;
 
   public:
     read_state_result() noexcept = default;
-    read_state_result(py::object&& release_hook, state_with_lease&& leased) noexcept
+    read_state_result(py::object&& release_hook, state_with_lease&& state_and_lease) noexcept
     : release_hook(std::move(release_hook)),
-      leased(std::move(leased)) {}
+      state_and_lease(std::move(state_and_lease)) {}
     read_state_result(const read_state_result&) = delete;
     read_state_result& operator=(const read_state_result&) = delete;
     read_state_result(read_state_result&& other) noexcept
     : release_hook(std::move(other.release_hook)),
-      leased(std::exchange(other.leased, std::nullopt)) {}
+      state_and_lease(std::exchange(other.state_and_lease, std::nullopt)) {}
     read_state_result& operator=(read_state_result&&) = delete;
 
     ~read_state_result() {
@@ -102,9 +102,9 @@ class read_state_result {
             return;
         }
         py::gil_scoped_acquire gil;
-        if (leased) {
+        if (state_and_lease) {
             try {
-                release_hook(leased->second);
+                release_hook(state_and_lease->second);
             } catch (py::error_already_set& e) {
                 e.discard_as_unraisable("pulsarlm page store release");
             } catch (...) {
@@ -114,10 +114,10 @@ class read_state_result {
     }
 
     std::expected<state_with_lease, page_error> take() {
-        if (!leased) {
+        if (!state_and_lease) {
             return std::unexpected(page_error::miss);
         }
-        return *std::exchange(leased, std::nullopt);
+        return *std::exchange(state_and_lease, std::nullopt);
     }
 };
 
@@ -150,10 +150,10 @@ class read_state_resolver {
         std::shared_ptr<state> stored_state;
         state::lease_id_type lease_id = 0;
         try {
-            auto returned = future.attr("result")().cast<py::tuple>();
-            if (returned.size() == 2) {
-                lease_id = returned[1].cast<state::lease_id_type>();
-                stored_state = returned[0].cast<std::shared_ptr<state>>();
+            auto hook_result = future.attr("result")().cast<py::tuple>();
+            if (hook_result.size() == 2) {
+                lease_id = hook_result[1].cast<state::lease_id_type>();
+                stored_state = hook_result[0].cast<std::shared_ptr<state>>();
             }
         } catch (const std::exception&) {
             stored_state = nullptr;
@@ -224,18 +224,18 @@ task<std::vector<bool>> python_store::read_pages(
         }
     }
     fetched_pages pages = co_await std::move(pages_task);
-    std::vector<bool> found(pages.size());
+    std::vector<bool> page_found(pages.size());
     std::vector<sharded_page> targets;
     std::vector<page> arrived;
     for (std::size_t i = 0; i < pages.size(); i++) {
         if (pages[i]) {
-            found[i] = true;
+            page_found[i] = true;
             targets.push_back(std::move(lines[i]));
             arrived.push_back(std::move(*pages[i]));
         }
     }
     co_await copy_from_host(*host_pages, targets, arrived, streams);
-    co_return found;
+    co_return page_found;
 }
 
 task<std::expected<std::pair<std::shared_ptr<const state>, state::lease_id_type>, page_error>>
@@ -281,15 +281,15 @@ task<std::expected<void, page_error>> python_store::write_pages(
     std::vector<std::pair<state::lease_id_type, page_index_type>>&& owners,
     std::span<const cudaStream_t> streams
 ) {
-    std::vector<std::size_t> missing = claim(hashes, owners);
-    std::erase_if(missing, [&](std::size_t i) { return i >= hashes.size(); });
-    if (missing.empty()) {
+    std::vector<std::size_t> missing_indices = claim(hashes, owners);
+    std::erase_if(missing_indices, [&](std::size_t i) { return i >= hashes.size(); });
+    if (missing_indices.empty()) {
         co_return {};
     }
     std::vector<sharded_page> sources;
     std::vector<digest> copied_hashes;
     std::unordered_map<std::size_t, std::size_t> copied_index;
-    for (std::size_t i : missing) {
+    for (std::size_t i : missing_indices) {
         if (copied_index.try_emplace(i, sources.size()).second) {
             sources.push_back(std::move(pages[i]));
             copied_hashes.push_back(hashes[i]);

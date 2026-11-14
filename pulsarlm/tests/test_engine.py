@@ -242,9 +242,9 @@ def test_another_engine_continues_a_state_from_the_store(store_pages: int):
     async def main():
         store = MemoryStore(asyncio.get_running_loop())
         first = make_engine(store, store_pages)
-        sampled, _, reached = await run(first, *submit(first, PROMPT, max_tokens=8))
-        assert isinstance(reached, State)
-        _, reached_keys = store.states[-1]
+        sampled, _, end_state = await run(first, *submit(first, PROMPT, max_tokens=8))
+        assert isinstance(end_state, State)
+        _, end_state_keys = store.states[-1]
 
         history = PROMPT + sampled + [11, 12, 13]
         expected, _, _ = await run(first, *submit(first, history, max_tokens=8))
@@ -252,7 +252,7 @@ def test_another_engine_continues_a_state_from_the_store(store_pages: int):
         second = make_engine(store, store_pages)
         continued, _, end = await run(second, *submit(second, history, max_tokens=8))
 
-        assert store.read_hashes == reached_keys
+        assert store.read_hashes == end_state_keys
         assert continued == expected
         assert isinstance(end, State)
 
@@ -264,14 +264,14 @@ def test_the_result_counts_the_tokens_resumed_on_resident_and_fetched_pages():
         store = MemoryStore(asyncio.get_running_loop())
         first = make_engine(store, store_pages=64)
         request, recording = submit(first, PROMPT, max_tokens=8)
-        sampled, _, reached = await run(first, request, recording)
-        assert isinstance(reached, State)
+        sampled, _, end_state = await run(first, request, recording)
+        assert isinstance(end_state, State)
         assert recording.result is not None
         assert recording.result.total_tokens == len(PROMPT) + len(sampled)
         assert recording.result.cached_tokens == 0
 
         history = PROMPT + sampled + [11, 12]
-        resumed_tokens = len(reached.layers[0].pages) * PAGE_SIZE
+        resumed_tokens = len(end_state.layers[0].pages) * PAGE_SIZE
         request, resident = submit(first, history, max_tokens=2)
         await run(first, request, resident)
         second = make_engine(store, store_pages=64)
@@ -336,10 +336,10 @@ def test_a_failing_read_misses():
         store = MemoryStore(loop)
         first = make_engine(store)
         sampled, _, _ = await run(first, *submit(first, PROMPT, max_tokens=8))
-        failing = FailingStore(loop)
-        failing.states = store.states
+        failing_store = FailingStore(loop)
+        failing_store.states = store.states
 
-        second = make_engine(failing)
+        second = make_engine(failing_store)
         _, _, end = await run(second, *submit(second, PROMPT + sampled, max_tokens=1))
 
         assert end == RequestError.MISS

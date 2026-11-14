@@ -348,9 +348,9 @@ def test_states_and_pages_survive_a_restart(tmp_path: Path):
         assert state.head == current_state(HISTORY[:9]).head
         assert state.layers == current_state(HISTORY[:9]).layers
         assert state.tail == [HISTORY[8]]
-        read = read_page(store, hashes_of(state)[1])
-        assert read is not None
-        assert torch.equal(read, page(1))
+        stored_page = read_page(store, hashes_of(state)[1])
+        assert stored_page is not None
+        assert torch.equal(stored_page, page(1))
 
 
 def test_a_second_process_cannot_open_the_store(tmp_path: Path):

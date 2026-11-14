@@ -101,13 +101,16 @@ class LocalStore:
     async def read_pages(self, hashes: list[bytes]) -> list[Page | None]:
         with self._lock:
             pages = [
-                stored.page if (stored := self._pages.get(h)) is not None else None
+                stored_page.page
+                if (stored_page := self._pages.get(h)) is not None
+                else None
                 for h in hashes
             ]
             in_file = [
                 i
                 for i, h in enumerate(hashes)
-                if (stored := self._pages.get(h)) is not None and stored.page is None
+                if (stored_page := self._pages.get(h)) is not None
+                and stored_page.page is None
             ]
         if self._file is None or not in_file:
             return pages
@@ -117,9 +120,13 @@ class LocalStore:
         with self._lock:
             for i, page in zip(in_file, loaded, strict=True):
                 pages[i] = page
-                stored = self._pages.get(hashes[i])
-                if page is not None and stored is not None and stored.page is None:
-                    stored.page = page
+                stored_page = self._pages.get(hashes[i])
+                if (
+                    page is not None
+                    and stored_page is not None
+                    and stored_page.page is None
+                ):
+                    stored_page.page = page
         return pages
 
     def claim(
