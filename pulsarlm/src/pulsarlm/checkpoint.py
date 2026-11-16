@@ -255,7 +255,11 @@ def load_weights(
     return {
         name: tensor
         if quantized(name, tensor)
-        else tensor.to(device=device, dtype=dtype, non_blocking=True)
+        else tensor.to(
+            device=device,
+            dtype=dtype if tensor.is_floating_point() else None,
+            non_blocking=True,
+        )
         for name, tensor in host
     }
 

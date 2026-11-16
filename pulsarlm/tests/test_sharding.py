@@ -343,6 +343,19 @@ def test_load_weights_reads_one_rank_s_part_of_a_model(tmp_path: Path, form: str
     assert all(torch.equal(whole[name], weights[name]) for name in weights)
 
 
+def test_load_weights_casts_floating_weights_and_keeps_integer_ones(tmp_path: Path):
+    path = tmp_path / "model"
+    (path / "weights").mkdir(parents=True)
+    offsets = torch.tensor([0, 16826, 2**40 + 1])
+    write_files(path / "weights", {"norm.weight": torch.ones(4), "offsets": offsets})
+    loaded = checkpoint.load_weights(
+        path, device=torch.device("cpu"), dtype=torch.bfloat16
+    )
+    assert loaded["norm.weight"].dtype == torch.bfloat16
+    assert loaded["offsets"].dtype == torch.int64
+    assert torch.equal(loaded["offsets"], offsets)
+
+
 class MemoryStore:
     """Keeps every page and the page keys of every state written; finds no state."""
 
