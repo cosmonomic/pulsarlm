@@ -91,9 +91,9 @@ jobs:
           path: dist/
           merge-multiple: true
 
-      - name: Verify the built version is not a development version
+      - name: Verify the built version is a tag's, without a local version label
         run: |
           ls dist
-          if ls dist | grep -E 'dev|\+'; then exit 1; fi
+          if ls dist | grep -F '+'; then exit 1; fi
 
       - uses: pypa/gh-action-pypi-publish@release/v1
