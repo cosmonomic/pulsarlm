@@ -432,7 +432,7 @@ task<std::expected<std::unique_ptr<sequence>, request_error>> executor::start(re
     assert(r.eviction.n_working >= 1 && r.eviction.cycle_tokens >= 1);
     assert(r.eviction.attention_mass_decay > 0.0 && r.eviction.attention_mass_decay <= 1.0);
     assert(r.eviction.eviction_threshold >= 0.0 && r.eviction.eviction_threshold <= 1.0);
-    digest chain_root = r.initial_digest.value_or(root);
+    digest chain_root = r.initial_digest.value_or(make_request_root_digest(root, to_pages(r.eviction, page_size)));
     std::vector<digest> digests = make_page_digests(chain_root, r.tokens, page_size);
     std::expected<std::pair<std::shared_ptr<const state>, state::lease_id_type>, page_error>
         lookup = co_await store.read_state(r.tokens, digests);

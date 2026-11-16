@@ -280,6 +280,24 @@ digest make_root_digest(std::string_view model_name, std::string_view model_hash
     return make_digest(seed);
 }
 
+digest make_request_root_digest(const digest& engine_root, const page_eviction_policy& policy) {
+    if (!policy.can_evict()) {
+        return engine_root;
+    }
+    std::vector<std::byte> seed;
+    append_u64(seed, engine_root.hi);
+    append_u64(seed, engine_root.lo);
+    append_u64(seed, policy.n_sink);
+    append_u64(seed, policy.n_working);
+    append_u64(seed, policy.cycle_tokens);
+    append_u64(seed, policy.max_pages.has_value());
+    append_u64(seed, policy.max_pages.value_or(0));
+    append_u64(seed, std::bit_cast<std::uint64_t>(policy.eviction_threshold));
+    append_u64(seed, policy.eviction_warmup);
+    append_u64(seed, std::bit_cast<std::uint64_t>(policy.attention_mass_decay));
+    return make_digest(seed);
+}
+
 digest store_key(const digest& page, std::size_t layer) {
     std::vector<std::byte> seed;
     append_u64(seed, page.hi);

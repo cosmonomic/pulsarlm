@@ -17,6 +17,7 @@
 
 #include "pulsarlm/digest.hpp"
 #include "pulsarlm/engine/event_loop.hpp"
+#include "pulsarlm/engine/eviction.hpp"
 #include "pulsarlm/engine/line_allocator.hpp"
 #include "pulsarlm/engine/model/interface.hpp"
 #include "pulsarlm/engine/page_store.hpp"
@@ -52,6 +53,13 @@ kv page_tensors(const page& p, const page_shape& shape);
 // its bytes, followed by n_layers, page_size, n_kv_heads, head_dim, values_only and index_head_dim, each as 8
 // little-endian bytes, then the count of state sizes and each size, as 8 little-endian bytes each.
 digest make_root_digest(std::string_view model_name, std::string_view model_hash, std::span<const page_shape> shapes);
+
+// The digest a request's page chain starts from. Under a policy that can evict, a page's KV also depends on when and
+// what the policy evicts, so the root is the digest of engine_root's bytes followed by the policy's n_sink, n_working,
+// cycle_tokens, whether it has max_pages and max_pages (0 without), eviction_threshold, eviction_warmup and
+// attention_mass_decay, each as 8 little-endian bytes, the doubles by their bit patterns. A policy that cannot evict
+// keeps every page, so its root is engine_root.
+digest make_request_root_digest(const digest& engine_root, const page_eviction_policy& policy);
 
 // The key of KV layer layer's page in the store: the digest of the page's digest bytes followed by layer as 8
 // little-endian bytes.

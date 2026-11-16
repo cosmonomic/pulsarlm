@@ -526,6 +526,10 @@ digest root() {
     return pulsarlm::make_root_digest("sum-model", "1", page_shapes(two_full_layers));
 }
 
+digest request_root(const pulsarlm::eviction_policy& policy) {
+    return pulsarlm::make_request_root_digest(root(), pulsarlm::to_pages(policy, page_size));
+}
+
 // A pool of pool_bytes, or with room for n_lines lines of every layer.
 pulsarlm::kv_cache make_cache(
     const std::vector<pulsarlm::kv_layer>& layers,
@@ -1152,19 +1156,14 @@ TEST_CASE("a request resumed mid-cycle ends its cycles where an uninterrupted ru
 TEST_CASE("a cycle's end evicts the pages scoring below the threshold outside the sink and working pages") {
     fixture f(16);
     f.model.is_important = [](std::size_t, std::int64_t token) { return token == 7; };
-    std::vector<request_results> results = serve_all(
-        f.sched,
-        {request{
-            .tokens = eight_pages,
-            .max_tokens = 2,
-            .eviction =
-                {.n_sink = 4, .n_working = 4, .cycle_tokens = 4, .eviction_threshold = 0.5, .eviction_warmup = 0},
-        }}
-    );
+    pulsarlm::eviction_policy
+        policy{.n_sink = 4, .n_working = 4, .cycle_tokens = 4, .eviction_threshold = 0.5, .eviction_warmup = 0};
+    std::vector<request_results> results =
+        serve_all(f.sched, {request{.tokens = eight_pages, .max_tokens = 2, .eviction = policy}});
 
     // Each page is sampled once the next one completes. Pages 2 and 3 go once page 5 completes, page 5 once page 6
     // does, so the last prefill step attends pages 0, 1, 4 and 6 and its own page 7, and page 6 goes at its end.
-    std::vector<digest> chain = pulsarlm::make_page_digests(root(), eight_pages, page_size);
+    std::vector<digest> chain = pulsarlm::make_page_digests(request_root(policy), eight_pages, page_size);
     std::int64_t first = continuation(pages_of(eight_pages, {0, 1, 4, 6, 7}), 1)[0];
     token_list kept_tokens = pages_of(eight_pages, {0, 1, 4, 7});
     REQUIRE(results[0].tokens == token_list{first, continuation(concat(kept_tokens, {first}), 1)[0]});
@@ -1180,19 +1179,15 @@ TEST_CASE("a cycle's end evicts the pages scoring below the threshold outside th
 TEST_CASE("a layer evicts nothing by score during its warm-up") {
     fixture f(16);
     f.model.is_important = [](std::size_t, std::int64_t token) { return token == 7; };
-    std::vector<request_results> results = serve_all(
-        f.sched,
-        {request{
-            .tokens = eight_pages,
-            .max_tokens = 2,
-            .eviction =
-                {.n_sink = 4, .n_working = 4, .cycle_tokens = 4, .eviction_threshold = 0.5, .eviction_warmup = 4},
-        }}
-    );
+    pulsarlm::eviction_policy
+        policy{.n_sink = 4, .n_working = 4, .cycle_tokens = 4, .eviction_threshold = 0.5, .eviction_warmup = 4};
+    std::vector<request_results> results =
+        serve_all(f.sched, {request{.tokens = eight_pages, .max_tokens = 2, .eviction = policy}});
 
     // The prompt's 6 sampled pages are fewer than the warm-up's 4 density samples then 4 score samples.
     REQUIRE(
-        (hashes_of(*results[0].cycle_ends.back().state) == pulsarlm::make_page_digests(root(), eight_pages, page_size))
+        (hashes_of(*results[0].cycle_ends.back().state) ==
+         pulsarlm::make_page_digests(request_root(policy), eight_pages, page_size))
     );
 }
 
@@ -1200,26 +1195,21 @@ TEST_CASE("a page's mass sums carry over from the cycles before") {
     fixture f(16);
     f.model.is_important = [&f](std::size_t, std::int64_t token) { return token == 7 && f.model.forward_count == 1; };
     token_list prompt(eight_pages.begin(), eight_pages.begin() + 16);
-    std::vector<request_results> results = serve_all(
-        f.sched,
-        {request{
-            .tokens = prompt,
-            .max_tokens = 2,
-            .eviction = {
-                .n_sink = 4,
-                .n_working = 4,
-                .cycle_tokens = 8,
-                .eviction_threshold = 0.5,
-                .eviction_warmup = 0,
-                .attention_mass_decay = 0.01
-            },
-        }}
-    );
+    pulsarlm::eviction_policy policy{
+        .n_sink = 4,
+        .n_working = 4,
+        .cycle_tokens = 8,
+        .eviction_threshold = 0.5,
+        .eviction_warmup = 0,
+        .attention_mass_decay = 0.01
+    };
+    std::vector<request_results> results =
+        serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 2, .eviction = policy}});
 
     REQUIRE(f.model.prefill_chunks == std::vector<token_list>{{8}, {8}});
     REQUIRE(results[0].cycle_ends.size() == 2);
     const pulsarlm::state& reached = *results[0].cycle_ends[1].state;
-    REQUIRE((hashes_of(reached) == pulsarlm::make_page_digests(root(), prompt, page_size)));
+    REQUIRE((hashes_of(reached) == pulsarlm::make_page_digests(request_root(policy), prompt, page_size)));
     std::vector<float> densities = densities_of(reached);
     REQUIRE(densities.size() == 4);
     double retained = std::pow(0.99, 8.0);
@@ -1235,12 +1225,7 @@ TEST_CASE("a request resumes with the mass sums and moments of its initial state
         policy{.n_sink = 4, .n_working = 4, .cycle_tokens = 4, .eviction_threshold = 0.5, .eviction_warmup = 0};
     std::vector<request_results> results = serve_in_turn(
         f.sched,
-        request{
-            .tokens = prompt,
-            .max_tokens = 1,
-            .eviction =
-                {.n_sink = 4, .n_working = 16, .cycle_tokens = 16, .eviction_threshold = 0.5, .eviction_warmup = 0}
-        },
+        request{.tokens = prompt, .max_tokens = 1, .eviction = policy},
         [&](const request_results& first) {
             f.model.is_important = [](std::size_t, std::int64_t) { return false; };
             pulsarlm::state resumed = ended_state(first);
@@ -1257,12 +1242,12 @@ TEST_CASE("a request resumes with the mass sums and moments of its initial state
         }
     );
 
-    std::vector<digest> chain = pulsarlm::make_page_digests(root(), prompt, page_size);
+    std::vector<digest> chain = pulsarlm::make_page_digests(request_root(policy), prompt, page_size);
     pulsarlm::state first_end = ended_state(results[0]);
     REQUIRE((hashes_of(first_end) == chain));
     REQUIRE(densities_of(first_end) == std::vector<float>{0.0f, 1.0f, 0.0f, 0.0f});
     std::vector<digest> resumed_chain = pulsarlm::make_page_digests(
-        root(),
+        request_root(policy),
         concat(prompt, {results[0].tokens.back(), 200, 201, 202}),
         page_size
     );
@@ -1273,16 +1258,11 @@ TEST_CASE("a request resumes with the mass sums and moments of its initial state
 TEST_CASE("a cycle's end evicts the oldest pages down to max_pages") {
     fixture f(16);
     token_list prompt{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
-    std::vector<request_results> results = serve_all(
-        f.sched,
-        {request{
-            .tokens = prompt,
-            .max_tokens = 2,
-            .eviction = {.n_sink = 0, .n_working = 4, .cycle_tokens = 16, .max_context_window = 28}
-        }}
-    );
+    pulsarlm::eviction_policy policy{.n_sink = 0, .n_working = 4, .cycle_tokens = 16, .max_context_window = 28};
+    std::vector<request_results> results =
+        serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 2, .eviction = policy}});
 
-    std::vector<digest> chain = pulsarlm::make_page_digests(root(), prompt, page_size);
+    std::vector<digest> chain = pulsarlm::make_page_digests(request_root(policy), prompt, page_size);
     token_list kept_tokens(prompt.begin() + 8, prompt.end());
     std::int64_t first = continuation(prompt, 1)[0];
     REQUIRE(results[0].tokens == token_list{first, continuation(concat(kept_tokens, {first}), 1)[0]});
@@ -1433,16 +1413,11 @@ TEST_CASE("a sliding layer keeps the pages its window reaches whatever the full-
     fixture f(16, 64, {}, {}, layers);
     token_list prompt(16);
     std::iota(prompt.begin(), prompt.end(), 1);
-    std::vector<request_results> results = serve_all(
-        f.sched,
-        {request{
-            .tokens = prompt,
-            .max_tokens = 2,
-            .eviction = {.n_sink = 0, .n_working = 4, .cycle_tokens = 16, .max_context_window = 24}
-        }}
-    );
+    pulsarlm::eviction_policy policy{.n_sink = 0, .n_working = 4, .cycle_tokens = 16, .max_context_window = 24};
+    std::vector<request_results> results =
+        serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 2, .eviction = policy}});
 
-    std::vector<digest> chain = pulsarlm::make_page_digests(root(), prompt, page_size);
+    std::vector<digest> chain = pulsarlm::make_page_digests(request_root(policy), prompt, page_size);
     token_list kept_tokens(prompt.begin() + 12, prompt.end());
     std::int64_t first = continuation(prompt, 1)[0];
     REQUIRE(results[0].tokens == token_list{first, continuation(concat(kept_tokens, {first}), 1)[0]});
@@ -1454,18 +1429,13 @@ TEST_CASE("a sliding layer keeps the pages its window reaches whatever the full-
 TEST_CASE("each full-attention layer evicts by its own attention mass") {
     fixture f(16);
     f.model.is_important = each_layers_own;
-    std::vector<request_results> results = serve_all(
-        f.sched,
-        {request{
-            .tokens = eight_pages,
-            .max_tokens = 3,
-            .eviction =
-                {.n_sink = 4, .n_working = 4, .cycle_tokens = 4, .eviction_threshold = 0.5, .eviction_warmup = 0},
-        }}
-    );
+    pulsarlm::eviction_policy
+        policy{.n_sink = 4, .n_working = 4, .cycle_tokens = 4, .eviction_threshold = 0.5, .eviction_warmup = 0};
+    std::vector<request_results> results =
+        serve_all(f.sched, {request{.tokens = eight_pages, .max_tokens = 3, .eviction = policy}});
 
     // Layer 0, which predicts, evicts as in the single-layer case: its last prefill step attends pages 0, 1, 4, 6 and 7.
-    std::vector<digest> chain = pulsarlm::make_page_digests(root(), eight_pages, page_size);
+    std::vector<digest> chain = pulsarlm::make_page_digests(request_root(policy), eight_pages, page_size);
     std::int64_t first = continuation(pages_of(eight_pages, {0, 1, 4, 6, 7}), 1)[0];
     token_list kept_tokens = pages_of(eight_pages, {0, 1, 4, 7});
     REQUIRE(results[0].tokens == concat({first}, continuation(concat(kept_tokens, {first}), 2)));
@@ -1597,17 +1567,12 @@ TEST_CASE("a recurrent layer's state covers the pages eviction drops") {
     fixture f(16, 64, {}, {}, recurrent_and_full);
     token_list prompt(16);
     std::iota(prompt.begin(), prompt.end(), 1);
-    std::vector<request_results> results = serve_all(
-        f.sched,
-        {request{
-            .tokens = prompt,
-            .max_tokens = 2,
-            .eviction = {.n_sink = 0, .n_working = 4, .cycle_tokens = 16, .max_context_window = 28}
-        }}
-    );
+    pulsarlm::eviction_policy policy{.n_sink = 0, .n_working = 4, .cycle_tokens = 16, .max_context_window = 28};
+    std::vector<request_results> results =
+        serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 2, .eviction = policy}});
 
     REQUIRE(results[0].tokens == continuation(prompt, 2));
-    std::vector<digest> chain = pulsarlm::make_page_digests(root(), prompt, page_size);
+    std::vector<digest> chain = pulsarlm::make_page_digests(request_root(policy), prompt, page_size);
     const pulsarlm::state& reached = *results[0].cycle_ends[0].state;
     REQUIRE((hashes_of(reached, 1) == std::vector{chain[2], chain[3]}));
     REQUIRE((hashes_of(reached, 0) == std::vector{chain[3]}));

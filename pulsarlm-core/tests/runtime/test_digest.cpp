@@ -7,6 +7,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -76,4 +77,40 @@ TEST_CASE("the root digest changes with the model name, the model hash and every
     for (const digest& other : others) {
         REQUIRE(other != root);
     }
+}
+
+TEST_CASE("a request's root digest is the engine's under a policy that cannot evict") {
+    pulsarlm::page_eviction_policy keeps_every_page{.n_sink = 64, .n_working = 512, .cycle_tokens = 512};
+    REQUIRE(pulsarlm::make_request_root_digest(parent, keeps_every_page) == parent);
+    keeps_every_page.cycle_tokens = 1024;
+    REQUIRE(pulsarlm::make_request_root_digest(parent, keeps_every_page) == parent);
+}
+
+TEST_CASE("a request's root digest changes with the engine's root and every field of a policy that can evict") {
+    const pulsarlm::page_eviction_policy policy{
+        .n_sink = 64,
+        .n_working = 512,
+        .cycle_tokens = 512,
+        .max_pages = std::nullopt,
+        .eviction_threshold = 0.5,
+        .eviction_warmup = 32,
+        .attention_mass_decay = 1.0 / 256,
+    };
+    digest root = pulsarlm::make_request_root_digest(parent, policy);
+    REQUIRE(root != parent);
+    REQUIRE(root == pulsarlm::make_request_root_digest(parent, policy));
+
+    std::vector<pulsarlm::page_eviction_policy> others(8, policy);
+    others[0].n_sink = 65;
+    others[1].n_working = 513;
+    others[2].cycle_tokens = 256;
+    others[3].max_pages = 4096;
+    others[4].max_pages = 0;
+    others[5].eviction_threshold = 0.25;
+    others[6].eviction_warmup = 64;
+    others[7].attention_mass_decay = 1.0 / 128;
+    for (const pulsarlm::page_eviction_policy& other : others) {
+        REQUIRE(pulsarlm::make_request_root_digest(parent, other) != root);
+    }
+    REQUIRE(pulsarlm::make_request_root_digest(digest{.hi = 1, .lo = 3}, policy) != root);
 }

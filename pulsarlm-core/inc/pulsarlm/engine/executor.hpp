@@ -76,7 +76,7 @@ class executor {
   public:
     // shards[s] runs on cache shard s with streams[s], shards 1 on on worker_loops[s - 1]; the cache holds one layer
     // per entry of each model's kv_layers(), and the shards agree on which layers are recurrent or sliding. store is the
-    // cache's. root is the digest a request's page chain starts from without an initial digest.
+    // cache's. root is the engine's root digest (make_root_digest).
     executor(
         std::vector<model*>&& shards,
         kv_cache cache,
