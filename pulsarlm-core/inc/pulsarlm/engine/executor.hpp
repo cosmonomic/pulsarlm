@@ -55,6 +55,15 @@ class executor {
     // Per KV layer with pages, lines for its pages, then line_count empty lines; per recurrent layer, a copy of the
     // state at head, or zeros without head, and an empty line. Holds nothing on failure.
     task<std::expected<void, page_error>> take_lines(sequence& seq, std::size_t line_count);
+    // s, the state the store returned for r, extended by the full pages of r's tokens after its head that every layer
+    // with pages caches, up to its cycle's mass window and leaving a token to forward: no query between them adds mass,
+    // so it is the state the request reaches there. s itself when it ends inside the window or the model has recurrent
+    // layers. digests are the digests of r's full pages.
+    std::shared_ptr<const state>
+    extend_with_hot_pages(std::shared_ptr<const state>&& s, const request& r, std::span<const digest> digests) const;
+    // Makes the store keep, for seq's lease, the pages its views hold from history index first_index on, which the
+    // state the store returned does not reference.
+    task<std::expected<void, page_error>> own_pages_from(sequence& seq, std::size_t first_index);
     void release_lines(sequence& seq) noexcept;
     // Drops from each sliding layer's view the pages before the window of the tail's first token, and returns whether
     // any view changed.

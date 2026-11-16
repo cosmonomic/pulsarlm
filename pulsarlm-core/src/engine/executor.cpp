@@ -15,6 +15,7 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <utility>
 #include <vector>
@@ -445,7 +446,11 @@ task<std::expected<std::unique_ptr<sequence>, request_error>> executor::start(re
     if (!lookup) {
         co_return std::unexpected(request_error::miss);
     }
-    auto& [initial_state, lease_id] = *lookup;
+    auto& [stored_state, lease_id] = *lookup;
+    std::size_t stored_pages = stored_state->head
+        ? static_cast<std::size_t>(std::ranges::find(digests, *stored_state->head) - digests.begin()) + 1
+        : 0;
+    std::shared_ptr<const state> initial_state = extend_with_hot_pages(std::move(stored_state), r, digests);
     std::vector<at::Device> devices;
     for (const std::vector<kv>& shard_lines : lines) {
         devices.push_back(shard_lines.front().k.device());
@@ -470,8 +475,81 @@ task<std::expected<std::unique_ptr<sequence>, request_error>> executor::start(re
             line_allocation.error() == page_error::miss ? request_error::miss : request_error::oom
         );
     }
+    if (seq->history_pages > stored_pages && !co_await own_pages_from(*seq, stored_pages)) {
+        release_lines(*seq);
+        seq->lease.release();
+        co_return std::unexpected(request_error::oom);
+    }
     seq->upload_table(0, streams);
     co_return std::move(seq);
+}
+
+std::shared_ptr<const state> executor::extend_with_hot_pages(
+    std::shared_ptr<const state>&& s,
+    const request& r,
+    std::span<const digest> digests
+) const {
+    if (std::ranges::contains(recurrent, true)) {
+        return std::move(s);
+    }
+    std::size_t head_pages = 0;
+    if (s->head) {
+        auto head_digest = std::ranges::find(digests, *s->head);
+        assert(head_digest != digests.end());
+        head_pages = static_cast<std::size_t>(head_digest - digests.begin()) + 1;
+    }
+    page_eviction_policy policy = to_pages(r.eviction, page_size);
+    std::size_t resumed_end = head_pages * page_size + s->tail.size();
+    std::size_t cycle_end = (resumed_end / policy.cycle_tokens + 1) * policy.cycle_tokens;
+    std::size_t window_start = cycle_end - policy.mass_tokens;
+    if (resumed_end > window_start) {
+        return std::move(s);
+    }
+    std::size_t page_limit = std::min(window_start, r.tokens.size() - 1) / page_size;
+    std::size_t end_page = head_pages;
+    while (end_page < page_limit &&
+           std::ranges::all_of(
+               std::views::iota(std::size_t{0}, cache.layer_count()),
+               [&](std::size_t layer) { return cache.contains(layer, digests[end_page]); }
+           )) {
+        end_page++;
+    }
+    if (end_page == head_pages) {
+        return std::move(s);
+    }
+    state extended{.head = digests[end_page - 1], .layers = s->layers, .tail = {}};
+    extended.layers.resize(cache.layer_count());
+    for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
+        std::vector<active_page>& pages = extended.layers[layer].pages;
+        for (std::size_t index = head_pages; index < end_page; index++) {
+            pages.push_back(active_page{.hash = digests[index], .index = index});
+        }
+        const std::optional<std::size_t>& window = sliding_windows[layer];
+        std::size_t next_query = pages.size() * page_size;
+        if (window && next_query + 1 > *window) {
+            std::size_t passed = std::min((next_query + 1 - *window) / page_size, pages.size());
+            pages.erase(pages.begin(), pages.begin() + static_cast<std::ptrdiff_t>(passed));
+        }
+    }
+    return std::make_shared<const state>(std::move(extended));
+}
+
+task<std::expected<void, page_error>> executor::own_pages_from(sequence& seq, std::size_t first_index) {
+    std::size_t n_layers = cache.layer_count();
+    std::vector<std::vector<digest>> hashes(n_layers);
+    std::vector<std::vector<state::lease_id_type>> owners(n_layers);
+    std::vector<std::vector<std::uint32_t>> line_ids(n_layers);
+    for (std::size_t layer = 0; layer < n_layers; layer++) {
+        const layer_view& view = seq.layers[layer];
+        for (std::size_t page = 0; page < view.pages.size(); page++) {
+            if (view.indices[page] >= first_index) {
+                hashes[layer].push_back(view.pages[page]);
+                owners[layer].push_back(seq.lease.id());
+                line_ids[layer].push_back(view.lines[page]);
+            }
+        }
+    }
+    co_return co_await cache.sync(hashes, owners, line_ids, streams);
 }
 
 task<std::expected<request_result, request_error>> executor::finish(sequence& seq) {

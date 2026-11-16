@@ -186,7 +186,8 @@ class kv_cache {
     // Gives count unmapped lines of layer holding a copy of the page at its held line_id, held until release.
     std::expected<std::vector<std::uint32_t>, page_error>
     clone(std::size_t layer, std::uint32_t line_id, std::size_t count, std::span<const cudaStream_t> streams);
-    // Names the page at line_ids[layer][i], held and unmapped, by hashes[layer][i] and hands each distinct page of a
+    // Names the page at line_ids[layer][i], held and unmapped or already named hashes[layer][i], by hashes[layer][i]
+    // and hands each distinct page of a
     // layer, owned by the lease of every owners[layer][i] of its hash, to the store in one write_pages, also when
     // another line caches its hash: the store may have dropped that page. A hash already cached at another line leaves
     // its line unmapped. Completes once the write does, and fails as it does.

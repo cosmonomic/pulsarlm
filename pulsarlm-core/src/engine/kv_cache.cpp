@@ -718,7 +718,8 @@ task<std::expected<void, page_error>> kv_cache::sync(
         std::unordered_map<digest, std::size_t, digest_hash> put_index;
         for (std::size_t i = 0; i < hashes[layer].size(); i++) {
             std::uint32_t line_id = line_ids[layer][i];
-            assert(line(layer, line_id).ref > 0 && !line(layer, line_id).hash);
+            const cache_line& synced = line(layer, line_id);
+            assert(synced.ref > 0 && (!synced.hash || *synced.hash == hashes[layer][i]));
             auto [found, inserted] = put_index.try_emplace(hashes[layer][i], sources.size());
             if (inserted) {
                 sources.push_back(layer_line{.layer = layer, .line_id = line_id});
