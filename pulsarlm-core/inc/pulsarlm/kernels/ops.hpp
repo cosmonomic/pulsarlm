@@ -80,10 +80,15 @@ void write_kv_cuda(
     const at::Tensor& seqlens_k
 );
 
-// int32 [n_layers, tables.size(), width]: row s of each layer holds the first width entries of that layer's row of
-// tables[s], a contiguous int32 [n_layers, capacity] device tensor, and zeros past capacity. The tables stay alive
-// until the stream has run the gather.
-at::Tensor gather_page_tables_cuda(std::span<const at::Tensor> tables, int64_t n_layers, int64_t width);
+// int32 [n_layers, tables.size(), width]: row s of each layer holds the first page_counts[s] entries of that layer's
+// row of tables[s], a contiguous int32 [n_layers, capacity] device tensor, then zeros. The tables stay alive until the
+// stream has run the gather.
+at::Tensor gather_page_tables_cuda(
+    std::span<const at::Tensor> tables,
+    std::span<const std::size_t> page_counts,
+    int64_t n_layers,
+    int64_t width
+);
 
 // int64 [rows]: per row of scores [rows, vocab], argmax(x / T + g) with each g drawn from Gumbel(0, 1), which is
 // index i with probability softmax(x / T)_i; a row with T <= 0 takes argmax(x). temperatures is fp32 [rows]; draws is
@@ -196,12 +201,14 @@ at::Tensor attn_indexed_cuda(
 // rounded, of the raw keys [b * ratio, (b + 1) * ratio) of its view, then its RMSNorm by norm_weight (fp32, 1 + weight)
 // as rmsnorm_cuda computes it, then Hugging Face's partial RoPE of its first 2 * inv_freq.size(0) dims at the position
 // page_positions gives key b * ratio (see attn_decode_cuda), cos and sin rounded to the dtype. index_keys is [lines,
-// page_size, dim] with each line packed, page_tables and page_positions int32 [sequences, max_pages] whose view keys
-// are max_pages * page_size, and ratio divides the page size.
+// page_size, dim] with each line packed, page_tables and page_positions int32 [sequences, max_pages], and ratio divides
+// the page size. key_counts is int32 [sequences], the keys in each view; a block starting at or past its view's key
+// count is zeros, its page_tables entries unread.
 at::Tensor index_blocks_cuda(
     const at::Tensor& index_keys,
     const at::Tensor& page_tables,
     const at::Tensor& page_positions,
+    const at::Tensor& key_counts,
     const at::Tensor& norm_weight,
     const at::Tensor& inv_freq,
     int64_t ratio,

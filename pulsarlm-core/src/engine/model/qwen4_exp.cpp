@@ -330,6 +330,7 @@ at::Tensor qwen4_exp_model::selected_blocks(
         lines.index_keys,
         page_tables,
         page_positions,
+        key_counts,
         w.index_k_norm,
         index_inv_freq,
         ratio,

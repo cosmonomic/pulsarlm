@@ -64,10 +64,13 @@ TEST_CASE("index_blocks_cuda pools, norms and ropes each view block", "[ops][cud
     auto page_positions = int32_cuda({0, 16, 32, 0, 48, 112}).view({2, max_pages});
     auto norm_weight = (1.0 + 0.1 * at::randn({kDim})).to(at::kCUDA);
 
+    auto key_counts = int32_cuda({max_pages * kPageSize, max_pages * kPageSize});
+
     at::Tensor blocks = pulsarlm::index_blocks_cuda(
         index_keys,
         page_tables,
         page_positions,
+        key_counts,
         norm_weight,
         inv_freq(),
         kRatio,
@@ -84,6 +87,38 @@ TEST_CASE("index_blocks_cuda pools, norms and ropes each view block", "[ops][cud
     auto expected = reference_rope(normed, positions);
     const double tolerance = dtype == at::kFloat ? 1e-5 : 1e-2;
     CHECK(at::allclose(blocks.to(at::kFloat), expected.to(at::kFloat), tolerance, tolerance));
+}
+
+TEST_CASE("index_blocks_cuda zeros the blocks past a view's keys without reading their pages", "[ops][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    at::manual_seed(5);
+    auto opts = at::device(at::kCUDA).dtype(at::kBFloat16);
+    const int64_t lines = 6, max_pages = 3;
+    constexpr int32_t not_a_line = 1065353216;
+    auto index_keys = at::randn({lines, kPageSize, kDim}, opts);
+    auto page_tables = int32_cuda({4, 1, 5, 2, not_a_line, not_a_line}).view({2, max_pages});
+    auto page_positions = int32_cuda({0, 16, 32, 0, 0, 0}).view({2, max_pages});
+    auto key_counts = int32_cuda({max_pages * kPageSize, kPageSize});
+    auto norm_weight = (1.0 + 0.1 * at::randn({kDim})).to(at::kCUDA);
+
+    at::Tensor blocks = pulsarlm::index_blocks_cuda(
+        index_keys,
+        page_tables,
+        page_positions,
+        key_counts,
+        norm_weight,
+        inv_freq(),
+        kRatio,
+        kEps
+    );
+    c10::cuda::device_synchronize();
+
+    const int64_t page_blocks = kPageSize / kRatio;
+    auto past_keys = blocks[1].narrow(0, page_blocks, blocks.size(1) - page_blocks);
+    CHECK(at::equal(past_keys, at::zeros_like(past_keys)));
+    CHECK(blocks[1].narrow(0, 0, page_blocks).abs().sum().item<float>() > 0.0f);
 }
 
 TEST_CASE("index_scores_cuda sums the relu of each head's score over a row's complete blocks", "[ops][cuda]") {

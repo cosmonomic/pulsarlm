@@ -68,6 +68,7 @@ __global__ void index_blocks_kernel(
     int max_pages,
     int page_size,
     const int32_t* __restrict__ page_positions,
+    const int32_t* __restrict__ key_counts,
     const float* __restrict__ norm_weight,
     const float* __restrict__ inv_freq,
     int rotary_dim,
@@ -83,6 +84,10 @@ __global__ void index_blocks_kernel(
     const int dim = blockDim.x;
     const int d = threadIdx.x;
     const int first_key = block * ratio;
+    if (first_key >= key_counts[s]) {
+        blocks[static_cast<int64_t>(blockIdx.x) * dim + d] = static_cast<scalar_t>(0.0f);
+        return;
+    }
     const int line = page_tables[static_cast<int64_t>(s) * max_pages + first_key / page_size];
     const scalar_t* keys = index_keys + line * line_stride + static_cast<int64_t>(first_key % page_size) * dim;
     float sum = 0.0f;
@@ -416,6 +421,7 @@ at::Tensor index_blocks_cuda(
     const at::Tensor& index_keys,
     const at::Tensor& page_tables,
     const at::Tensor& page_positions,
+    const at::Tensor& key_counts,
     const at::Tensor& norm_weight,
     const at::Tensor& inv_freq,
     int64_t ratio,
@@ -451,6 +457,11 @@ at::Tensor index_blocks_cuda(
         "index_blocks: inv_freq must be contiguous fp32 CUDA [rotary_dim / 2], rotary_dim at most the index dim"
     );
     const int64_t sequences = page_tables.size(0);
+    TORCH_CHECK(
+        key_counts.is_cuda() && key_counts.scalar_type() == at::kInt && key_counts.dim() == 1 &&
+            key_counts.size(0) == sequences && key_counts.is_contiguous(),
+        "index_blocks: key_counts must be contiguous int32 CUDA [sequences]"
+    );
     const int64_t max_blocks = page_tables.size(1) * page_size / ratio;
     at::Tensor blocks = at::empty({sequences, max_blocks, dim}, index_keys.options());
     if (blocks.numel() == 0) {
@@ -466,6 +477,7 @@ at::Tensor index_blocks_cuda(
                 static_cast<int>(page_tables.size(1)),
                 static_cast<int>(page_size),
                 page_positions.const_data_ptr<int32_t>(),
+                key_counts.const_data_ptr<int32_t>(),
                 norm_weight.const_data_ptr<float>(),
                 inv_freq.const_data_ptr<float>(),
                 static_cast<int>(2 * inv_freq.size(0)),

@@ -282,12 +282,18 @@ at::Tensor executor::batch::page_tables(
     std::size_t shard
 ) {
     std::vector<at::Tensor> tables;
-    std::size_t width = 0;
+    std::vector<std::size_t> page_counts;
     for (const batch_entry& e : group) {
         tables.push_back(positions ? e.seq->position_tables[shard] : e.seq->tables[shard]);
-        width = std::max(width, e.seq->table_width());
+        page_counts.push_back(e.seq->table_width());
     }
-    return gather_page_tables_cuda(tables, static_cast<std::int64_t>(n_kv_layers), static_cast<std::int64_t>(width));
+    std::size_t width = std::ranges::max(page_counts);
+    return gather_page_tables_cuda(
+        tables,
+        page_counts,
+        static_cast<std::int64_t>(n_kv_layers),
+        static_cast<std::int64_t>(width)
+    );
 }
 
 void executor::batch::enqueue(
