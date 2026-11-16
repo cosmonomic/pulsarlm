@@ -89,7 +89,7 @@ TEST_CASE("index_blocks_cuda pools, norms and ropes each view block", "[ops][cud
     CHECK(at::allclose(blocks.to(at::kFloat), expected.to(at::kFloat), tolerance, tolerance));
 }
 
-TEST_CASE("index_blocks_cuda zeros the blocks past a view's keys without reading their pages", "[ops][cuda]") {
+TEST_CASE("index_blocks_cuda zeros the blocks ending past a view's keys without reading them", "[ops][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
@@ -100,7 +100,8 @@ TEST_CASE("index_blocks_cuda zeros the blocks past a view's keys without reading
     auto index_keys = at::randn({lines, kPageSize, kDim}, opts);
     auto page_tables = int32_cuda({4, 1, 5, 2, not_a_line, not_a_line}).view({2, max_pages});
     auto page_positions = int32_cuda({0, 16, 32, 0, 0, 0}).view({2, max_pages});
-    auto key_counts = int32_cuda({max_pages * kPageSize, kPageSize});
+    const int64_t complete_blocks = 3;
+    auto key_counts = int32_cuda({max_pages * kPageSize, complete_blocks * kRatio + 2});
     auto norm_weight = (1.0 + 0.1 * at::randn({kDim})).to(at::kCUDA);
 
     at::Tensor blocks = pulsarlm::index_blocks_cuda(
@@ -115,10 +116,9 @@ TEST_CASE("index_blocks_cuda zeros the blocks past a view's keys without reading
     );
     c10::cuda::device_synchronize();
 
-    const int64_t page_blocks = kPageSize / kRatio;
-    auto past_keys = blocks[1].narrow(0, page_blocks, blocks.size(1) - page_blocks);
+    auto past_keys = blocks[1].narrow(0, complete_blocks, blocks.size(1) - complete_blocks);
     CHECK(at::equal(past_keys, at::zeros_like(past_keys)));
-    CHECK(blocks[1].narrow(0, 0, page_blocks).abs().sum().item<float>() > 0.0f);
+    CHECK(blocks[1].narrow(0, 0, complete_blocks).abs().sum().item<float>() > 0.0f);
 }
 
 TEST_CASE("index_scores_cuda sums the relu of each head's score over a row's complete blocks", "[ops][cuda]") {

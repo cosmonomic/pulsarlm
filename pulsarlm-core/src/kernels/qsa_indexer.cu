@@ -84,7 +84,7 @@ __global__ void index_blocks_kernel(
     const int dim = blockDim.x;
     const int d = threadIdx.x;
     const int first_key = block * ratio;
-    if (first_key >= key_counts[s]) {
+    if (first_key + ratio > key_counts[s]) {
         blocks[static_cast<int64_t>(blockIdx.x) * dim + d] = static_cast<scalar_t>(0.0f);
         return;
     }

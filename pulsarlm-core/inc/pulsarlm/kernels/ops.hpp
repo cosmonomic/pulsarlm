@@ -202,8 +202,8 @@ at::Tensor attn_indexed_cuda(
 // as rmsnorm_cuda computes it, then Hugging Face's partial RoPE of its first 2 * inv_freq.size(0) dims at the position
 // page_positions gives key b * ratio (see attn_decode_cuda), cos and sin rounded to the dtype. index_keys is [lines,
 // page_size, dim] with each line packed, page_tables and page_positions int32 [sequences, max_pages], and ratio divides
-// the page size. key_counts is int32 [sequences], the keys in each view; a block starting at or past its view's key
-// count is zeros, its page_tables entries unread.
+// the page size. key_counts is int32 [sequences], the keys in each view; a block ending past its view's key count is
+// zeros, its keys unread.
 at::Tensor index_blocks_cuda(
     const at::Tensor& index_keys,
     const at::Tensor& page_tables,

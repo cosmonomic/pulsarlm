@@ -68,8 +68,10 @@ __global__ void write_kv_kernel(
 ) {
     const int t = blockIdx.x;
     int s = t;
-    int index = seqlens_k[t] - 1;
-    if (cu_seqlens_q) {
+    int index = 0;
+    if (!cu_seqlens_q) {
+        index = seqlens_k[t] - 1;
+    } else {
         int lo = 0, hi = num_seqs;
         while (hi - lo > 1) {
             const int mid = (lo + hi) >> 1;
