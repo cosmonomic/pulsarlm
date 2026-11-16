@@ -88,6 +88,7 @@ template <int lanes> __device__ __forceinline__ float lane_sum(float value) {
 template <typename scalar_t>
 __global__ void causal_conv_kernel(
     const scalar_t* __restrict__ x,
+    int64_t x_row_stride,
     const scalar_t* __restrict__ weight,
     const scalar_t* __restrict__ conv_pool,
     int64_t line_stride,
@@ -112,7 +113,7 @@ __global__ void causal_conv_kernel(
     float sum = 0.0f;
     for (int j = 0; j < kernel; j++) {
         const int input = token - first - history + j * dilation;
-        const scalar_t value = input >= 0 ? x[static_cast<int64_t>(first + input) * channels + channel]
+        const scalar_t value = input >= 0 ? x[static_cast<int64_t>(first + input) * x_row_stride + channel]
                                           : old[history + input];
         sum += static_cast<float>(weight[channel * kernel + j]) * static_cast<float>(value);
     }
@@ -123,6 +124,7 @@ __global__ void causal_conv_kernel(
 template <typename scalar_t>
 __global__ void conv_state_kernel(
     const scalar_t* __restrict__ x,
+    int64_t x_row_stride,
     scalar_t* __restrict__ conv_pool,
     int64_t line_stride,
     line_rows rows,
@@ -145,7 +147,7 @@ __global__ void conv_state_kernel(
         old[i] = running[i];
     }
     auto window = [&](int i) {
-        return i < history ? old[i] : x[static_cast<int64_t>(first + i - history) * channels + channel];
+        return i < history ? old[i] : x[static_cast<int64_t>(first + i - history) * x_row_stride + channel];
     };
     const int page_end = page_end_tokens[s];
     if (page_end > 0) {
@@ -172,6 +174,7 @@ struct delta_rule_params {
     int value_heads;
     int value_dim;
     float key_dim_sqrt;
+    int64_t gate_row_stride;
 };
 
 // A CTA's place in the batch: sequence s, value head head, value columns [first_column, first_column + kColumns).
@@ -267,7 +270,7 @@ __global__ void __launch_bounds__(kStepThreads) delta_rule_step_kernel(
         }
     }
     const float v = static_cast<float>(row[2 * block.key_dim + block.head * p.value_dim + column]);
-    const int64_t gate = static_cast<int64_t>(block.s) * p.value_heads + block.head;
+    const int64_t gate = static_cast<int64_t>(block.s) * p.gate_row_stride + block.head;
     const float gain = expf(log_decay_of(static_cast<float>(a[gate]), p, block.head));
     const float beta = beta_of(b[gate]);
     const float q_scale = rsqrtf(lane_sum<kStepLanes>(qq) + 1e-6f) / p.key_dim_sqrt;
@@ -454,7 +457,7 @@ __global__ void __launch_bounds__(kChunkThreads) delta_rule_chunk_kernel(
         });
         if (threadIdx.x < kChunk) {
             const int t = threadIdx.x;
-            const int64_t gate = static_cast<int64_t>(first + chunk_first + t) * p.value_heads + block.head;
+            const int64_t gate = static_cast<int64_t>(first + chunk_first + t) * p.gate_row_stride + block.head;
             decay[t] = t < tokens ? log_decay_of(static_cast<float>(a[gate]), p, block.head) : 0.0f;
             beta[t] = t < tokens ? beta_of(b[gate]) : 0.0f;
         }
@@ -644,10 +647,14 @@ __global__ void gated_rmsnorm_kernel(
     const scalar_t* __restrict__ weight,
     scalar_t* __restrict__ y,
     int64_t dim,
+    int64_t rows_per_token,
+    int64_t z_token_stride,
     float eps,
     gate_activation activation
 ) {
     const int64_t offset = static_cast<int64_t>(blockIdx.x) * dim;
+    const int64_t z_offset = static_cast<int64_t>(blockIdx.x) / rows_per_token * z_token_stride +
+        static_cast<int64_t>(blockIdx.x) % rows_per_token * dim;
     float local = 0.0f;
     for (int64_t i = threadIdx.x; i < dim; i += blockDim.x) {
         const float v = static_cast<float>(x[offset + i]);
@@ -666,7 +673,7 @@ __global__ void gated_rmsnorm_kernel(
     for (int64_t i = threadIdx.x; i < dim; i += blockDim.x) {
         const float normed = rounded<scalar_t>(static_cast<float>(x[offset + i]) * inv_rms);
         const float scaled = rounded<scalar_t>(static_cast<float>(weight[i]) * normed);
-        const float gate = static_cast<float>(z[offset + i]);
+        const float gate = static_cast<float>(z[z_offset + i]);
         y[offset + i] = static_cast<scalar_t>(
             scaled * (activation == gate_activation::silu ? silu(gate) : sigmoid(gate))
         );
@@ -684,7 +691,11 @@ void check_ragged(
     const std::optional<at::Tensor>& cu_seqlens_q,
     const at::Tensor& page_end_tokens
 ) {
-    TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.is_contiguous(), op, ": x must be a contiguous CUDA [tokens, dim]");
+    TORCH_CHECK(
+        x.is_cuda() && x.dim() == 2 && x.stride(1) == 1,
+        op,
+        ": x must be CUDA [tokens, dim], each row contiguous"
+    );
     TORCH_CHECK(
         rows.is_cuda() && rows.scalar_type() == at::kInt && rows.dim() == 2 && rows.size(1) >= 2 && rows.stride(1) == 1,
         op,
@@ -765,7 +776,7 @@ at::Tensor causal_conv_cuda(
             conv_pool.size(2) == history && conv_pool.stride(2) == 1 && conv_pool.stride(1) == history,
         "causal_conv: conv_pool must be [lines, channels, (kernel - 1) * dilation] in x's dtype, each line packed"
     );
-    at::Tensor out = at::empty_like(x);
+    at::Tensor out = at::empty(x.sizes(), x.options());
     const int64_t total = x.size(0);
     if (rows.size(0) == 0) {
         return out;
@@ -775,6 +786,7 @@ at::Tensor causal_conv_cuda(
         if (total > 0) {
             causal_conv_kernel<scalar_t><<<blocks_for(total * channels), kConvThreads, 0, stream>>>(
                 x.const_data_ptr<scalar_t>(),
+                x.stride(0),
                 weight.const_data_ptr<scalar_t>(),
                 conv_pool.const_data_ptr<scalar_t>(),
                 conv_pool.stride(0),
@@ -790,6 +802,7 @@ at::Tensor causal_conv_cuda(
         }
         conv_state_kernel<scalar_t><<<blocks_for(rows.size(0) * channels), kConvThreads, 0, stream>>>(
             x.const_data_ptr<scalar_t>(),
+            x.stride(0),
             conv_pool.mutable_data_ptr<scalar_t>(),
             conv_pool.stride(0),
             rows_of(rows),
@@ -816,6 +829,7 @@ at::Tensor gated_delta_rule_cuda(
     int64_t key_heads
 ) {
     check_ragged("gated_delta_rule", x, rows, cu_seqlens_q, page_end_tokens);
+    TORCH_CHECK(x.is_contiguous(), "gated_delta_rule: x must be contiguous");
     TORCH_CHECK(
         state_pool.is_cuda() && state_pool.scalar_type() == at::kFloat && state_pool.dim() == 4 &&
             state_pool.stride(3) == 1 && state_pool.stride(2) == state_pool.size(3) &&
@@ -844,8 +858,9 @@ at::Tensor gated_delta_rule_cuda(
     for (const at::Tensor* gate : {&a, &b}) {
         TORCH_CHECK(
             gate->scalar_type() == x.scalar_type() && gate->dim() == 2 && gate->size(0) == total &&
-                gate->size(1) == value_heads && gate->is_contiguous(),
-            "gated_delta_rule: a and b must be contiguous [tokens, value heads] in x's dtype"
+                gate->size(1) == value_heads && gate->stride(1) == 1 && gate->stride(0) == a.stride(0),
+            "gated_delta_rule: a and b must be [tokens, value heads] in x's dtype, each row contiguous, their rows "
+            "equally far apart"
         );
     }
     for (const at::Tensor* head_values : {&dt_bias, &neg_a}) {
@@ -872,6 +887,7 @@ at::Tensor gated_delta_rule_cuda(
         static_cast<int>(value_heads),
         static_cast<int>(value_dim),
         static_cast<float>(std::sqrt(static_cast<double>(key_dim))),
+        a.stride(0),
     };
     const auto blocks = static_cast<int>(num_seqs * value_heads * (value_dim / kColumns));
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -911,11 +927,13 @@ at::Tensor gated_rmsnorm_cuda(
     gate_activation activation
 ) {
     TORCH_CHECK(x.is_cuda() && x.is_contiguous(), "gated_rmsnorm: x must be a contiguous CUDA tensor");
-    TORCH_CHECK(
-        z.sizes() == x.sizes() && z.scalar_type() == x.scalar_type() && z.is_contiguous(),
-        "gated_rmsnorm: z must be contiguous, of x's shape and dtype"
-    );
     const int64_t dim = x.size(-1);
+    TORCH_CHECK(
+        z.sizes() == x.sizes() && z.scalar_type() == x.scalar_type() && x.dim() >= 2 && x.dim() <= 3 &&
+            z.stride(-1) == 1 && (z.dim() == 2 || z.stride(1) == dim),
+        "gated_rmsnorm: z must be of x's shape and dtype, [tokens, dim] or [tokens, rows, dim], each token's rows "
+        "packed"
+    );
     TORCH_CHECK(
         weight.scalar_type() == x.scalar_type() && weight.dim() == 1 && weight.size(0) == dim &&
             weight.is_contiguous(),
@@ -940,6 +958,8 @@ at::Tensor gated_rmsnorm_cuda(
                 weight.const_data_ptr<scalar_t>(),
                 y.mutable_data_ptr<scalar_t>(),
                 dim,
+                x.dim() == 3 ? x.size(1) : 1,
+                z.stride(0),
                 static_cast<float>(eps),
                 activation
             );

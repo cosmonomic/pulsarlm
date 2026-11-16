@@ -131,8 +131,11 @@ qwen4_exp_model::qwen4_exp_model(
     };
     auto hyper_connection = [&](const std::string& p) {
         return hyper_connection_weights{
-            .mixer = mixer(p),
-            .block_inject_weight = need(weights, p + "block_inject_weight.weight"),
+            .hc_norm = zero_centered(need(weights, p + "hc_norm.weight")),
+            .down_and_inject = at::cat(
+                {need(weights, p + "input_mix_weight_down.weight"), need(weights, p + "block_inject_weight.weight")}
+            ),
+            .input_mix_weight_up = need(weights, p + "input_mix_weight_up.weight"),
         };
     };
     hyper_connection_mixer = mixer("hyper_connection_mixer.");
@@ -159,16 +162,19 @@ qwen4_exp_model::qwen4_exp_model(
             .attn_hyper_connection = hyper_connection(p + "attn_hyper_connection."),
             .mlp_hyper_connection = hyper_connection(p + "mlp_hyper_connection."),
             .moe = moe_weights{
-                .router = need(weights, p + "mlp.gate.weight"),
+                .router_and_gate = at::cat(
+                    {need(weights, p + "mlp.gate.weight"), need(weights, p + "mlp.shared_expert_gate.weight")}
+                ),
                 .experts_gate_up_proj = need(weights, p + "mlp.experts.gate_up_proj"),
                 .experts_down_proj = need(weights, p + "mlp.experts.down_proj"),
-                .shared_gate_proj = need(weights, p + "mlp.shared_expert.gate_proj.weight"),
-                .shared_up_proj = need(weights, p + "mlp.shared_expert.up_proj.weight"),
+                .shared_gate_up_proj = at::cat(
+                    {need(weights, p + "mlp.shared_expert.gate_proj.weight"),
+                     need(weights, p + "mlp.shared_expert.up_proj.weight")}
+                ),
                 .shared_down_proj = need(weights, p + "mlp.shared_expert.down_proj.weight"),
-                .shared_expert_gate = need(weights, p + "mlp.shared_expert_gate.weight"),
             },
         };
-        if (w.moe.router.size(0) < c.num_experts_per_tok || c.num_experts_per_tok < 1) {
+        if (w.moe.router_and_gate.size(0) - 1 < c.num_experts_per_tok || c.num_experts_per_tok < 1) {
             throw std::invalid_argument("qwen4_exp_model: num_experts_per_tok must be between 1 and the experts");
         }
         kv_layer_of.push_back(kv_specs.size());
@@ -199,10 +205,12 @@ qwen4_exp_model::qwen4_exp_model(
             );
         } else {
             w.deltanet = deltanet_weights{
-                .in_proj_qkv = need(weights, p + "linear_attn.in_proj_qkv.weight"),
-                .in_proj_z = need(weights, p + "linear_attn.in_proj_z.weight"),
-                .in_proj_b = need(weights, p + "linear_attn.in_proj_b.weight"),
-                .in_proj_a = need(weights, p + "linear_attn.in_proj_a.weight"),
+                .in_proj = at::cat(
+                    {need(weights, p + "linear_attn.in_proj_qkv.weight"),
+                     need(weights, p + "linear_attn.in_proj_a.weight"),
+                     need(weights, p + "linear_attn.in_proj_b.weight"),
+                     need(weights, p + "linear_attn.in_proj_z.weight")}
+                ),
                 .conv = need(weights, p + "linear_attn.conv1d.weight"),
                 .dt_bias = need(weights, p + "linear_attn.dt_bias").to(at::kFloat),
                 .neg_a = -need(weights, p + "linear_attn.A_log").to(at::kFloat).exp(),
@@ -369,9 +377,7 @@ at::Tensor qwen4_exp_model::selected_blocks(
 }
 
 at::Tensor qwen4_exp_model::stream_norm(const at::Tensor& x, const at::Tensor& weight) const {
-    at::Tensor streams = x.to(at::kFloat).view({x.size(0), -1, config.hidden_size});
-    at::Tensor normed = streams * at::rsqrt(streams.pow(2).mean(-1, true) + config.rms_norm_eps);
-    return (normed.flatten(1) * weight).to(x.scalar_type());
+    return stream_rmsnorm_cuda(x.contiguous(), weight, x.size(1) / config.hidden_size, config.rms_norm_eps);
 }
 
 at::Tensor qwen4_exp_model::mixed_streams(const at::Tensor& normed, const mixer_weights& w) const {
@@ -383,12 +389,16 @@ at::Tensor qwen4_exp_model::mixed_streams(const at::Tensor& normed, const mixer_
 }
 
 qwen4_exp_model::mixed_input qwen4_exp_model::mix(const at::Tensor& x, const hyper_connection_weights& w) const {
-    at::Tensor normed = stream_norm(x, w.mixer.hc_norm);
-    return mixed_input{
-        .input = mixed_streams(normed, w.mixer),
-        .injection_weights = 2 *
-            at::sigmoid(at::linear(normed, w.block_inject_weight) / static_cast<double>(config.hc_count)),
-    };
+    at::Tensor normed = stream_norm(x, w.hc_norm);
+    at::Tensor projected = at::linear(normed, w.down_and_inject);
+    const std::int64_t rank = w.input_mix_weight_up.size(1);
+    at::Tensor mix_weights = at::silu(projected.narrow(1, 0, rank) / static_cast<double>(config.hc_count));
+    auto [input, injection_weights] = hyper_connection_mix_cuda(
+        normed,
+        at::linear(mix_weights, w.input_mix_weight_up),
+        projected.narrow(1, rank, config.hc_count)
+    );
+    return mixed_input{.input = input, .injection_weights = injection_weights};
 }
 
 at::Tensor qwen4_exp_model::final_mix(const at::Tensor& x) const {
@@ -493,8 +503,11 @@ at::Tensor qwen4_exp_model::deltanet(
         cu_seqlens_q = g.cu_seqlens_q;
     }
 
+    const std::int64_t channels = w.conv.size(0);
+    const std::int64_t value_heads = heads.linear_n_value_heads;
+    at::Tensor projected = at::linear(h, w.in_proj);
     at::Tensor convolved = causal_conv_cuda(
-        at::linear(h, w.in_proj_qkv),
+        projected.narrow(1, 0, channels),
         w.conv,
         lines[conv_layer].k,
         g.page_tables.select(0, static_cast<std::int64_t>(conv_layer)),
@@ -504,8 +517,8 @@ at::Tensor qwen4_exp_model::deltanet(
     );
     at::Tensor core = gated_delta_rule_cuda(
         convolved,
-        at::linear(h, w.in_proj_a),
-        at::linear(h, w.in_proj_b),
+        projected.narrow(1, channels, value_heads),
+        projected.narrow(1, channels + value_heads, value_heads),
         w.dt_bias,
         w.neg_a,
         lines[state_layer].k,
@@ -514,7 +527,8 @@ at::Tensor qwen4_exp_model::deltanet(
         g.page_end_tokens,
         heads.linear_n_key_heads
     );
-    at::Tensor z = at::linear(h, w.in_proj_z).view(core.sizes());
+    at::Tensor z = projected.narrow(1, channels + 2 * value_heads, value_heads * c.linear_value_head_dim)
+                       .view(core.sizes());
     at::Tensor gated = gated_rmsnorm_cuda(core, z, w.norm, c.rms_norm_eps, c.linear_output_gate);
     at::Tensor out = at::linear(gated.view({ntok, heads.linear_n_value_heads * c.linear_value_head_dim}), w.out_proj);
     comm.all_reduce(out);
@@ -523,9 +537,9 @@ at::Tensor qwen4_exp_model::deltanet(
 
 at::Tensor qwen4_exp_model::moe(const at::Tensor& h, std::int64_t layer) const {
     const moe_weights& m = layers[layer].moe;
-    at::Tensor probabilities = at::softmax(at::linear(h, m.router), -1, at::kFloat);
-    auto [top_weights, top_experts] = at::topk(probabilities, config.num_experts_per_tok, -1);
-    top_weights = top_weights / top_weights.sum(-1, true);
+    at::Tensor logits = at::linear(h, m.router_and_gate);
+    const std::int64_t experts = m.router_and_gate.size(0) - 1;
+    auto [top_weights, top_experts] = route_top_k_cuda(logits.narrow(1, 0, experts), config.num_experts_per_tok);
     at::Tensor routed = routed_experts(
         h,
         top_experts,
@@ -534,11 +548,8 @@ at::Tensor qwen4_exp_model::moe(const at::Tensor& h, std::int64_t layer) const {
         m.experts_down_proj,
         [](const at::Tensor& x) { return at::silu(x); }
     );
-    at::Tensor shared = at::linear(
-        at::silu(at::linear(h, m.shared_gate_proj)) * at::linear(h, m.shared_up_proj),
-        m.shared_down_proj
-    );
-    at::Tensor out = routed + at::sigmoid(at::linear(h, m.shared_expert_gate)) * shared;
+    at::Tensor shared = at::linear(silu_mul_cuda(at::linear(h, m.shared_gate_up_proj)), m.shared_down_proj);
+    at::Tensor out = routed + at::sigmoid(logits.narrow(1, experts, 1)) * shared;
     comm.all_reduce(out);
     return out;
 }
@@ -636,7 +647,7 @@ qwen4_exp_model::ple(const at::Tensor& x, std::int64_t layer, const group_batch&
 
 at::Tensor qwen4_exp_model::group_forward(const group_batch& g, std::span<const kv> lines) const {
     auto inject = [](const at::Tensor& x, const at::Tensor& out, const mixed_input& mixed) {
-        return x + (out.unsqueeze(1) * mixed.injection_weights.unsqueeze(-1)).flatten(1);
+        return hyper_connection_inject_cuda(x, out, mixed.injection_weights);
     };
     at::Tensor x = lookup(embed_tokens, first_vocab_row, g.tokens).repeat({1, config.hc_count});
     for (std::int64_t layer = 0; layer < n_layers; layer++) {

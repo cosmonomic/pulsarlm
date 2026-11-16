@@ -303,3 +303,74 @@ TEST_CASE("gated_rmsnorm scales the normalized x by weight and the gate of z", "
     at::Tensor zeros = at::zeros_like(x);
     CHECK(at::equal(pulsarlm::gated_rmsnorm_cuda(zeros, z, weight, eps, activation), zeros));
 }
+
+TEST_CASE("causal_conv reads x's rows wherever they lie", "[ops][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const ragged_case batch = GENERATE(prefill_case(), decode_case());
+    const int64_t channels = 24;
+    const int64_t kernel = 4;
+    auto opts = at::device(at::kCUDA).dtype(at::kBFloat16);
+    at::Tensor x = at::randn({batch.total(), channels + 5}, opts).narrow(1, 2, channels);
+    at::Tensor weight = at::randn({channels, 1, kernel}, opts);
+    at::Tensor strided_pool = spaced_pool({channels, kernel - 1}, at::kBFloat16);
+    at::Tensor packed_pool = strided_pool.clone();
+    at::Tensor rows = line_rows(kRunning, kBoundary);
+    at::Tensor page_ends = int32_cuda(batch.page_ends);
+
+    at::Tensor strided = pulsarlm::causal_conv_cuda(x, weight, strided_pool, rows, batch.cu_seqlens_q(), page_ends, 1);
+    at::Tensor packed =
+        pulsarlm::causal_conv_cuda(x.contiguous(), weight, packed_pool, rows, batch.cu_seqlens_q(), page_ends, 1);
+
+    CHECK(at::equal(strided, packed));
+    CHECK(at::equal(strided_pool, packed_pool));
+}
+
+TEST_CASE("gated_delta_rule reads a's and b's rows wherever they lie", "[ops][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const ragged_case batch = GENERATE(prefill_case(), decode_case());
+    const int64_t key_heads = 2;
+    const int64_t key_dim = 32;
+    const int64_t value_heads = 4;
+    const int64_t value_dim = 16;
+    auto opts = at::device(at::kCUDA).dtype(at::kBFloat16);
+    auto fp32 = at::device(at::kCUDA).dtype(at::kFloat);
+    at::Tensor x = at::randn({batch.total(), 2 * key_heads * key_dim + value_heads * value_dim}, opts);
+    at::Tensor gates = at::randn({batch.total(), 2 * value_heads + 3}, opts);
+    at::Tensor a = gates.narrow(1, 0, value_heads);
+    at::Tensor b = gates.narrow(1, value_heads, value_heads);
+    at::Tensor dt_bias = at::randn({value_heads}, fp32);
+    at::Tensor neg_a = -(at::randn({value_heads}, fp32) * 0.5).exp();
+    at::Tensor strided_pool = spaced_pool({value_heads, key_dim, value_dim}, at::kFloat);
+    at::Tensor packed_pool = strided_pool.clone();
+    at::Tensor rows = line_rows(kRunning, kBoundary);
+    at::Tensor page_ends = int32_cuda(batch.page_ends);
+
+    at::Tensor strided = pulsarlm::gated_delta_rule_cuda(
+        x, a, b, dt_bias, neg_a, strided_pool, rows, batch.cu_seqlens_q(), page_ends, key_heads
+    );
+    at::Tensor packed = pulsarlm::gated_delta_rule_cuda(
+        x, a.contiguous(), b.contiguous(), dt_bias, neg_a, packed_pool, rows, batch.cu_seqlens_q(), page_ends, key_heads
+    );
+
+    CHECK(at::equal(strided, packed));
+    CHECK(at::equal(strided_pool, packed_pool));
+}
+
+TEST_CASE("gated_rmsnorm reads z's tokens wherever they lie", "[ops][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    auto opts = at::device(at::kCUDA).dtype(at::kBFloat16);
+    at::Tensor x = at::randn({6, 4, 128}, opts);
+    at::Tensor z = at::randn({6, 4 * 128 + 7}, opts).narrow(1, 3, 4 * 128).view({6, 4, 128});
+    at::Tensor weight = at::randn({128}, opts);
+
+    at::Tensor strided = pulsarlm::gated_rmsnorm_cuda(x, z, weight, 1e-6, pulsarlm::gate_activation::sigmoid);
+    at::Tensor packed = pulsarlm::gated_rmsnorm_cuda(x, z.contiguous(), weight, 1e-6, pulsarlm::gate_activation::sigmoid);
+
+    CHECK(at::equal(strided, packed));
+}

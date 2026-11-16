@@ -16,14 +16,40 @@ namespace pulsarlm {
 // RMSNorm over x's last axis, in fp32. weight is in x's dtype or fp32.
 at::Tensor rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, double eps);
 
+// The RMSNorm of each of x's n_streams streams over its hidden entries, in fp32, times weight, in x's dtype. x is
+// contiguous [tokens, n_streams * hidden], weight fp32 [n_streams * hidden].
+at::Tensor stream_rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, int64_t n_streams, double eps);
+
+// A hyper-connection's block input and injection weights from its normed streams [tokens, hc * hidden], their gate
+// logits [tokens, hc * hidden] and the injection logits [tokens, hc], whose rows may lie apart: the mean over streams
+// of sigmoid(gate) times the stream [tokens, hidden], and 2 * sigmoid(inject_logits / hc) [tokens, hc], each
+// operation rounded to the dtype as the ATen ops round it.
+std::tuple<at::Tensor, at::Tensor> hyper_connection_mix_cuda(
+    const at::Tensor& normed,
+    const at::Tensor& gate_logits,
+    const at::Tensor& inject_logits
+);
+
+// x [tokens, hc * hidden] plus, in each stream, the block output out [tokens, hidden] times that stream's injection
+// weight [tokens, hc], the product rounded to the dtype.
+at::Tensor hyper_connection_inject_cuda(const at::Tensor& x, const at::Tensor& out, const at::Tensor& injection_weights);
+
+// A router's choice per token from its logits [tokens, experts], whose rows may lie apart: (weights, experts), the k
+// most probable experts by the softmax in fp32 as int64 [tokens, k], in descending order with the lower expert first
+// among equal probabilities, and their probabilities divided by their sum as fp32 [tokens, k].
+std::tuple<at::Tensor, at::Tensor> route_top_k_cuda(const at::Tensor& logits, int64_t k);
+
+// silu(x[:, :n]) * x[:, n:] for contiguous x [tokens, 2 * n], silu rounded to the dtype before the product.
+at::Tensor silu_mul_cuda(const at::Tensor& x);
+
 // The Gated DeltaNet ops run a ragged batch: sequence s holds tokens [cu_seqlens_q[s], cu_seqlens_q[s + 1]) of x, or
 // token s alone without cu_seqlens_q. rows [num_seqs, >= 2] int32 holds each sequence's running line, whose state the
 // sequence continues and which then holds the state after its last token, and its boundary line, which receives the
 // state after its first page_end_tokens[s] tokens when page_end_tokens[s] > 0. A pool's lines lie any number of
 // elements apart, a state pool's lines 16-byte aligned.
 
-// silu of the causal depthwise convolution of x [tokens, channels] by weight [channels, 1, kernel] with its taps
-// dilation tokens apart, in x's dtype. A line of conv_pool [lines, channels, (kernel - 1) * dilation] holds the
+// silu of the causal depthwise convolution of x [tokens, channels], whose rows may lie apart, by weight [channels, 1,
+// kernel] with its taps dilation tokens apart, contiguous in x's dtype. A line of conv_pool [lines, channels, (kernel - 1) * dilation] holds the
 // (kernel - 1) * dilation inputs before a sequence's next token.
 at::Tensor causal_conv_cuda(
     const at::Tensor& x,
@@ -38,7 +64,8 @@ at::Tensor causal_conv_cuda(
 // The gated delta rule's outputs [tokens, value heads, value dim] in x's dtype. Each row of x [tokens, 2 * key_heads *
 // key dim + value heads * value dim] holds the token's query heads, key heads and value heads; value head h reads key
 // head h / (value heads / key_heads). Queries and keys are L2-normalized, with 1e-6 added to the sum of squares, and
-// queries scaled by 1 / sqrt(key dim). a and b are [tokens, value heads] in x's dtype: the state decays by
+// queries scaled by 1 / sqrt(key dim). x is contiguous. a and b are [tokens, value heads] in x's dtype, their rows
+// equally far apart: the state decays by
 // exp(neg_a * softplus(a + dt_bias)) and learns at sigmoid(b), rounded to x's dtype; dt_bias and neg_a are fp32
 // [value heads]. A line of state_pool, fp32 [lines, value heads, key dim, value dim], holds a sequence's state.
 at::Tensor gated_delta_rule_cuda(
@@ -55,7 +82,8 @@ at::Tensor gated_delta_rule_cuda(
 );
 
 // weight * RMSNorm(x) * activation(z) over the last axis, the normalized x and its product with weight each rounded to
-// x's dtype. z and weight are in x's dtype.
+// x's dtype. x is contiguous [tokens, dim] or [tokens, rows, dim]; z, of x's shape, may hold its tokens apart, each
+// token's rows packed. z and weight are in x's dtype.
 at::Tensor gated_rmsnorm_cuda(
     const at::Tensor& x,
     const at::Tensor& z,

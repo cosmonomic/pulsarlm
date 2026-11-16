@@ -54,10 +54,7 @@ class qwen4_exp_model : public model {
     };
 
     struct deltanet_weights {
-        at::Tensor in_proj_qkv;
-        at::Tensor in_proj_z;
-        at::Tensor in_proj_b;
-        at::Tensor in_proj_a;
+        at::Tensor in_proj;  // the rows of in_proj_qkv, in_proj_a, in_proj_b, then in_proj_z
         at::Tensor conv;  // [conv channels, 1, linear_conv_kernel]
         at::Tensor dt_bias;  // fp32
         at::Tensor neg_a;  // fp32 -exp(A_log)
@@ -66,13 +63,11 @@ class qwen4_exp_model : public model {
     };
 
     struct moe_weights {
-        at::Tensor router;  // [num_experts, hidden]
+        at::Tensor router_and_gate;  // [num_experts + 1, hidden]: the router's rows, then shared_expert_gate's
         at::Tensor experts_gate_up_proj;  // [num_experts, 2 * moe_intermediate_size, hidden]
         at::Tensor experts_down_proj;  // [num_experts, hidden, moe_intermediate_size]
-        at::Tensor shared_gate_proj;
-        at::Tensor shared_up_proj;
+        at::Tensor shared_gate_up_proj;  // the rows of the shared expert's gate_proj, then its up_proj
         at::Tensor shared_down_proj;
-        at::Tensor shared_expert_gate;  // [1, hidden]
     };
 
     struct mixer_weights {
@@ -82,8 +77,9 @@ class qwen4_exp_model : public model {
     };
 
     struct hyper_connection_weights {
-        mixer_weights mixer;
-        at::Tensor block_inject_weight;
+        at::Tensor hc_norm;  // fp32 1 + weight, [hc_count * hidden], one RMSNorm per stream
+        at::Tensor down_and_inject;  // the rows of input_mix_weight_down, then block_inject_weight
+        at::Tensor input_mix_weight_up;
     };
 
     struct ple_weights {
@@ -160,7 +156,7 @@ class qwen4_exp_model : public model {
         const at::Tensor& page_positions
     ) const;
     at::Tensor stream_norm(const at::Tensor& x, const at::Tensor& weight) const;
-    // The mix of the normed streams [ntok, hc_count * hidden] a sublayer or the head reads.
+    // The mix of the normed streams [ntok, hc_count * hidden] the head reads.
     at::Tensor mixed_streams(const at::Tensor& normed, const mixer_weights& w) const;
     mixed_input mix(const at::Tensor& x, const hyper_connection_weights& w) const;
     at::Tensor final_mix(const at::Tensor& x) const;
