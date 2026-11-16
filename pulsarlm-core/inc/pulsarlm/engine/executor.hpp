@@ -63,9 +63,9 @@ class executor {
     task<void> forward_on_shard(batch& b, std::size_t shard);
     task<void> synchronize_shards();
     task<void> write_back(batch& b);
-    // Adds to the moments of each layer that measures mass the full pages outside the sinks that cycle_tokens tokens
-    // now follow, given that seq's newest completed full pages just completed.
-    void add_sampled_pages(sequence& seq, std::size_t completed);
+    // At the end of seq's cycle, adds to the moments of each layer that measures mass its full pages outside the sinks
+    // whose last token is at least cycle_tokens and less than twice cycle_tokens before that end.
+    void add_sampled_pages(sequence& seq);
     // Evicts at the end of seq's cycle and returns whether a view changed.
     bool evict(sequence& seq);
     // Writes the state seq reached to the store and passes it to seq's callbacks.

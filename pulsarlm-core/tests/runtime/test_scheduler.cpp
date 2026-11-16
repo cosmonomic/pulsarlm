@@ -1153,6 +1153,107 @@ TEST_CASE("a request resumed mid-cycle ends its cycles where an uninterrupted ru
     }
 }
 
+TEST_CASE("only the queries of a cycle's last mass_tokens tokens add mass") {
+    auto densities_after_first_cycle = [](std::optional<std::size_t> mass_tokens) {
+        fixture f(16, 4);
+        f.model.is_important = [&f](std::size_t, std::int64_t token) {
+            return token == 100 && f.model.forward_count == 1;
+        };
+        pulsarlm::eviction_policy policy{
+            .n_sink = 4,
+            .n_working = 4,
+            .cycle_tokens = 8,
+            .mass_tokens = mass_tokens,
+            .eviction_threshold = 0.5,
+            .eviction_warmup = 0,
+        };
+        token_list prompt(eight_pages.begin(), eight_pages.begin() + 8);
+        request_results result = serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 2, .eviction = policy}})[0];
+        REQUIRE(f.model.prefill_chunks == std::vector<token_list>{{4}, {4}});
+        REQUIRE(result.cycle_ends.size() == 1);
+        return densities_of(*result.cycle_ends[0].state);
+    };
+
+    REQUIRE(densities_after_first_cycle(4) == std::vector<float>{0.0f, 0.0f});
+    REQUIRE(densities_after_first_cycle(std::nullopt)[0] > 0.0f);
+}
+
+TEST_CASE("a state before its cycle's mass window holds the eviction state of the cycle's start") {
+    fixture f(16, 4);
+    f.model.is_important = [](std::size_t, std::int64_t token) { return token == 7; };
+    pulsarlm::eviction_policy policy{
+        .n_sink = 4,
+        .n_working = 16,
+        .cycle_tokens = 8,
+        .mass_tokens = 4,
+        .eviction_threshold = 0.5,
+        .eviction_warmup = 0,
+    };
+    token_list prompt(eight_pages.begin(), eight_pages.begin() + 20);
+    request_results result = serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 1, .eviction = policy}})[0];
+
+    REQUIRE(result.cycle_ends.size() == 2);
+    const pulsarlm::state& cycle_start = *result.cycle_ends[1].state;
+    pulsarlm::state end = ended_state(result);
+    for (std::size_t layer = 0; layer < end.layers.size(); layer++) {
+        const pulsarlm::layer_sequence& started = cycle_start.layers[layer];
+        const pulsarlm::layer_sequence& ended = end.layers[layer];
+        REQUIRE(ended.pages.size() == started.pages.size() + 1);
+        REQUIRE(std::ranges::equal(std::span(ended.pages).first(started.pages.size()), started.pages));
+        REQUIRE(ended.pages.back().weight_sum == 0.0f);
+        REQUIRE((ended.density_moments == started.density_moments));
+        REQUIRE((ended.score_moments == started.score_moments));
+    }
+    REQUIRE(cycle_start.layers[0].density_moments[0].count == 1);
+}
+
+TEST_CASE("a request resumed mid-cycle reaches the eviction state of an uninterrupted run over its tokens") {
+    // The fake model weighs every key of a step by all of the step's queries, so both runs split their steps alike.
+    pulsarlm::eviction_policy policy{
+        .n_sink = 4,
+        .n_working = 4,
+        .cycle_tokens = 8,
+        .eviction_threshold = 0.5,
+        .eviction_warmup = 0,
+    };
+    auto important = [](std::size_t, std::int64_t token) { return token == 7; };
+    token_list prompt(eight_pages.begin(), eight_pages.begin() + 12);
+    token_list rest(eight_pages.begin() + 13, eight_pages.end());
+    fixture resumed_engine(16, 4);
+    resumed_engine.model.is_important = important;
+    std::vector<request_results> resumed = serve_in_turn(
+        resumed_engine.sched,
+        request{.tokens = prompt, .max_tokens = 1, .eviction = policy},
+        [&](const request_results& first) {
+            return request{.tokens = concat(concat(prompt, first.tokens), rest), .max_tokens = 1, .eviction = policy};
+        }
+    );
+    token_list context = concat(concat(prompt, resumed[0].tokens), rest);
+    fixture uninterrupted_engine(16, 4);
+    uninterrupted_engine.model.is_important = important;
+    request_results uninterrupted = serve_all(
+        uninterrupted_engine.sched,
+        {request{.tokens = context, .max_tokens = 1, .eviction = policy}}
+    )[0];
+
+    REQUIRE(resumed[0].cycle_ends.size() == 1);
+    REQUIRE(uninterrupted.cycle_ends.size() == 3);
+    REQUIRE(resumed[1].cycle_ends.size() == 2);
+    for (std::size_t i = 0; i < 2; i++) {
+        const pulsarlm::state& resumed_end = *resumed[1].cycle_ends[i].state;
+        const pulsarlm::state& uninterrupted_end = *uninterrupted.cycle_ends[i + 1].state;
+        REQUIRE((hashes_of(resumed_end) == hashes_of(uninterrupted_end)));
+        std::vector<float> resumed_densities = densities_of(resumed_end);
+        std::vector<float> uninterrupted_densities = densities_of(uninterrupted_end);
+        for (std::size_t page = 0; page < resumed_densities.size(); page++) {
+            REQUIRE_THAT(resumed_densities[page], Catch::Matchers::WithinAbs(uninterrupted_densities[page], 1e-6));
+        }
+        REQUIRE(
+            resumed_end.layers[0].density_moments[0].count == uninterrupted_end.layers[0].density_moments[0].count
+        );
+    }
+}
+
 TEST_CASE("a cycle's end evicts the pages scoring below the threshold outside the sink and working pages") {
     fixture f(16);
     f.model.is_important = [](std::size_t, std::int64_t token) { return token == 7; };

@@ -159,6 +159,8 @@ sequence::sequence(
     cached_count = history_pages * page_size;
     std::size_t resumed_end = cached_count + last_state->tail.size();
     next_cycle_end = (resumed_end / eviction.cycle_tokens + 1) * eviction.cycle_tokens;
+    std::size_t window_start = next_cycle_end - eviction.mass_tokens;
+    measured_end = resumed_end > window_start ? resumed_end : next_cycle_end - eviction.cycle_tokens;
     prompt_count = r.tokens.size();
     update_held();
 }
@@ -274,6 +276,17 @@ std::size_t sequence::history_position() const noexcept {
 
 void sequence::start_next_cycle() noexcept {
     next_cycle_end += eviction.cycle_tokens;
+}
+
+std::size_t sequence::measured_start() const noexcept {
+    return std::max(next_cycle_end - eviction.mass_tokens, measured_end);
+}
+
+void sequence::fill_query_weights(std::span<float> weights) const noexcept {
+    std::size_t start = history_position();
+    std::size_t unmeasured = std::min(weights.size(), std::max(measured_start(), start) - start);
+    std::fill_n(weights.begin(), unmeasured, 0.0f);
+    query_weights(weights.subspan(unmeasured), eviction.attention_mass_decay);
 }
 
 bool sequence::ends_cycle(std::size_t token_count) const noexcept {

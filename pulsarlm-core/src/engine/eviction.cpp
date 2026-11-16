@@ -85,6 +85,7 @@ page_eviction_policy to_pages(const eviction_policy& policy, std::size_t page_si
         .n_sink = ceil_div(policy.n_sink, page_size),
         .n_working = ceil_div(policy.n_working, page_size),
         .cycle_tokens = policy.cycle_tokens,
+        .mass_tokens = policy.mass_tokens.value_or(policy.cycle_tokens),
         .max_pages = max_pages,
         .eviction_threshold = policy.eviction_threshold,
         .eviction_warmup = policy.eviction_warmup * ceil_div(policy.cycle_tokens, page_size),

@@ -107,6 +107,8 @@ class executor::batch {
 
     static group_batch make_group(std::span<const batch_entry> group, std::size_t page_size, bool prefill);
     static bool measures_mass(std::span<const batch_entry> group) noexcept;
+    // Whether e forwards a query that adds mass.
+    static bool measures_mass(const batch_entry& e) noexcept;
     // The group's tables of lines, or of positions with positions, on shard's device, as group_batch lays them out.
     static at::Tensor
     page_tables(std::span<const batch_entry> group, std::size_t n_kv_layers, bool positions, std::size_t shard);
@@ -257,7 +259,7 @@ group_batch executor::batch::make_group(std::span<const batch_entry> group, std:
         std::span<float> weights(g.query_weights.mutable_data_ptr<float>(), token_count);
         std::size_t first = 0;
         for (const batch_entry& e : group) {
-            pulsarlm::query_weights(weights.subspan(first, e.token_count), e.seq->eviction.attention_mass_decay);
+            e.seq->fill_query_weights(weights.subspan(first, e.token_count));
             first += e.token_count;
         }
     }
@@ -265,7 +267,11 @@ group_batch executor::batch::make_group(std::span<const batch_entry> group, std:
 }
 
 bool executor::batch::measures_mass(std::span<const batch_entry> group) noexcept {
-    return std::ranges::any_of(group, [](const batch_entry& e) { return e.seq->eviction.can_evict(); });
+    return std::ranges::any_of(group, [](const batch_entry& e) { return measures_mass(e); });
+}
+
+bool executor::batch::measures_mass(const batch_entry& e) noexcept {
+    return e.seq->eviction.can_evict() && e.seq->history_position() + e.token_count > e.seq->measured_start();
 }
 
 at::Tensor executor::batch::page_tables(
@@ -660,7 +666,8 @@ task<void> executor::write_back(batch& b) {
     for (std::size_t i = 0; i < b.entries.size(); i++) {
         const batch_entry& e = b.entries[i];
         sequence& seq = *e.seq;
-        if (seq.eviction.can_evict()) {
+        if (batch::measures_mass(e)) {
+            std::size_t step_end = seq.history_position() + e.token_count;
             std::vector<batch::layer_step_mass> step_mass = b.step_mass(i, mass_heads);
             for (std::size_t layer = 0; layer < n_layers; layer++) {
                 if (mass_heads[layer] > 0) {
@@ -670,16 +677,14 @@ task<void> executor::write_back(batch& b) {
                         view.weight_sum,
                         step_mass[layer].mass_sum,
                         step_mass[layer].weight_sum,
-                        e.token_count,
+                        step_end - seq.measured_end,
                         seq.eviction.attention_mass_decay
                     );
                 }
             }
+            seq.measured_end = step_end;
         }
         std::size_t completed_count = seq.advance(e.token_count);
-        if (seq.eviction.can_evict() && completed_count > 0) {
-            add_sampled_pages(seq, completed_count);
-        }
         if (completed_count > 0) {
             for (std::size_t layer = 0; layer < n_layers; layer++) {
                 if (recurrent[layer]) {
@@ -750,6 +755,7 @@ task<void> executor::write_back(batch& b) {
         }
         bool views_changed = release_passed_pages(seq);
         if (e.ends_cycle) {
+            add_sampled_pages(seq);
             views_changed = evict(seq) || views_changed;
             co_await write_cycle_end(seq);
             seq.start_next_cycle();
@@ -782,22 +788,25 @@ task<void> executor::write_back(batch& b) {
     }
 }
 
-// The pages after a full page fill at least cycle_tokens tokens once cycle_pages full pages follow it in the view, while
-// eviction drops only pages older than those, as it does when n_working is at least cycle_tokens.
-void executor::add_sampled_pages(sequence& seq, std::size_t completed_count) {
-    std::size_t n_sink = seq.eviction.n_sink;
-    std::size_t cycle_pages = ceil_div(seq.eviction.cycle_tokens, page_size);
+void executor::add_sampled_pages(sequence& seq) {
+    if (!seq.eviction.can_evict()) {
+        return;
+    }
+    std::size_t cycle_end = seq.next_cycle_end;
+    std::size_t cycle_tokens = seq.eviction.cycle_tokens;
     for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
         std::size_t heads = mass_heads[layer];
         if (heads == 0) {
             continue;
         }
         layer_view& view = seq.layers[layer];
-        std::size_t after = view.pages.size();
-        std::size_t before = after - completed_count;
-        std::size_t first = std::max(n_sink, before > cycle_pages ? before - cycle_pages : 0);
-        std::size_t last = after > cycle_pages ? after - cycle_pages : 0;
-        for (std::size_t page = first; page < last; page++) {
+        for (std::size_t page = 0; page < view.pages.size(); page++) {
+            std::size_t index = view.indices[page];
+            std::size_t page_end = (index + 1) * page_size;
+            if (index < seq.eviction.n_sink || page_end + cycle_tokens > cycle_end ||
+                page_end + 2 * cycle_tokens <= cycle_end) {
+                continue;
+            }
             add_sampled_page(
                 view.density_moments,
                 view.score_moments,

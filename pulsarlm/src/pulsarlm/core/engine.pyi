@@ -160,6 +160,7 @@ class EvictionPolicy:
     n_sink: int
     n_working: int
     cycle_tokens: int
+    mass_tokens: int | None
     max_context_window: int | None
     eviction_threshold: float
     eviction_warmup: int
@@ -170,6 +171,7 @@ class EvictionPolicy:
         n_sink: int = 1024,
         n_working: int = 8192,
         cycle_tokens: int = 512,
+        mass_tokens: int | None = None,
         max_context_window: int | None = None,
         eviction_threshold: float = 0.0,
         eviction_warmup: int = 1,

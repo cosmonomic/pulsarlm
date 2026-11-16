@@ -15,6 +15,7 @@ class Settings:
     persist: bool
     prefix_cache: bool
     cycle_tokens: int
+    mass_tokens: int | None
     n_working: int
     eviction_threshold: float
     eviction_warmup: int

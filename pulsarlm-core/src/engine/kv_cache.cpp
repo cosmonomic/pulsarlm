@@ -290,6 +290,7 @@ digest make_request_root_digest(const digest& engine_root, const page_eviction_p
     append_u64(seed, policy.n_sink);
     append_u64(seed, policy.n_working);
     append_u64(seed, policy.cycle_tokens);
+    append_u64(seed, policy.mass_tokens);
     append_u64(seed, policy.max_pages.has_value());
     append_u64(seed, policy.max_pages.value_or(0));
     append_u64(seed, std::bit_cast<std::uint64_t>(policy.eviction_threshold));

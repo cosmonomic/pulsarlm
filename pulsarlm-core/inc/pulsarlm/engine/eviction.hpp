@@ -19,6 +19,7 @@ struct page_eviction_policy {
     std::size_t n_sink;
     std::size_t n_working;
     std::size_t cycle_tokens;
+    std::size_t mass_tokens;
     std::optional<std::size_t> max_pages;
     double eviction_threshold;
     std::size_t eviction_warmup;

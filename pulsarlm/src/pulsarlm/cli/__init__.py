@@ -98,6 +98,15 @@ CycleTokens = Annotated[
         rich_help_panel="Eviction",
     ),
 ]
+MassTokens = Annotated[
+    int | None,
+    typer.Option(
+        "--mass_tokens",
+        help="Last tokens of each eviction cycle whose queries measure attention mass "
+        "(default: the whole cycle).",
+        rich_help_panel="Eviction",
+    ),
+]
 NWorking = Annotated[
     int,
     typer.Option(
@@ -182,6 +191,7 @@ def serve(
     persist: Persist = False,
     prefix_cache: PrefixCache = True,
     cycle_tokens: CycleTokens = 512,
+    mass_tokens: MassTokens = None,
     n_working: NWorking = 8192,
     eviction_threshold: EvictionThreshold = 0.0,
     eviction_warmup: EvictionWarmup = 1,
@@ -213,6 +223,7 @@ def serve(
                 persist=persist,
                 prefix_cache=prefix_cache,
                 cycle_tokens=cycle_tokens,
+                mass_tokens=mass_tokens,
                 n_working=n_working,
                 eviction_threshold=eviction_threshold,
                 eviction_warmup=eviction_warmup,
@@ -285,6 +296,7 @@ def chat(
     persist: Persist = False,
     prefix_cache: PrefixCache = True,
     cycle_tokens: CycleTokens = 512,
+    mass_tokens: MassTokens = None,
     n_working: NWorking = 8192,
     eviction_threshold: EvictionThreshold = 0.0,
     eviction_warmup: EvictionWarmup = 1,
@@ -307,6 +319,7 @@ def chat(
                 persist=persist,
                 prefix_cache=prefix_cache,
                 cycle_tokens=cycle_tokens,
+                mass_tokens=mass_tokens,
                 n_working=n_working,
                 eviction_threshold=eviction_threshold,
                 eviction_warmup=eviction_warmup,

@@ -58,6 +58,7 @@ class ServerState:
             n_sink=sink_tokens(system_tokens),
             n_working=self.eviction.n_working,
             cycle_tokens=self.eviction.cycle_tokens,
+            mass_tokens=self.eviction.mass_tokens,
             max_context_window=self.eviction.max_context_window,
             eviction_threshold=self.eviction.eviction_threshold,
             eviction_warmup=self.eviction.eviction_warmup,

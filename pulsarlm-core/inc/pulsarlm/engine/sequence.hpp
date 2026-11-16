@@ -111,6 +111,8 @@ class sequence {
     // The history position, in tokens, at which the eviction cycle ends: a multiple of cycle_tokens, and past the end of
     // the resumed state, so that forwarding its tail again never reaches a cycle end that state already passed.
     std::size_t next_cycle_end = 0;
+    // The history position up to which the layers' mass_sum and weight_sum hold the queries' mass.
+    std::size_t measured_end = 0;
     // The request's tokens.
     std::size_t prompt_count = 0;
     // The tokens of the resumed state's full pages, and of those every layer reading them had resident at the start.
@@ -150,6 +152,11 @@ class sequence {
     // The tokens of the history up to the next token: its full pages, then tail.
     std::size_t history_position() const noexcept;
     void start_next_cycle() noexcept;
+    // The history position from which the cycle's queries add mass: the cycle's last mass_tokens tokens, less those
+    // the masses already hold.
+    std::size_t measured_start() const noexcept;
+    // The weight of each of the next token_count tokens' queries (query_weights), 0 for those before measured_start.
+    void fill_query_weights(std::span<float> weights) const noexcept;
     // Whether forwarding token_count more tokens ends the eviction cycle.
     bool ends_cycle(std::size_t token_count) const noexcept;
     // The tokens the cycle can still forward: no more than its length allows, nor than the request will forward.

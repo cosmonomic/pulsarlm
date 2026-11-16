@@ -91,6 +91,7 @@ TEST_CASE("a request's root digest changes with the engine's root and every fiel
         .n_sink = 64,
         .n_working = 512,
         .cycle_tokens = 512,
+        .mass_tokens = 512,
         .max_pages = std::nullopt,
         .eviction_threshold = 0.5,
         .eviction_warmup = 32,
@@ -100,7 +101,7 @@ TEST_CASE("a request's root digest changes with the engine's root and every fiel
     REQUIRE(root != parent);
     REQUIRE(root == pulsarlm::make_request_root_digest(parent, policy));
 
-    std::vector<pulsarlm::page_eviction_policy> others(8, policy);
+    std::vector<pulsarlm::page_eviction_policy> others(9, policy);
     others[0].n_sink = 65;
     others[1].n_working = 513;
     others[2].cycle_tokens = 256;
@@ -109,6 +110,7 @@ TEST_CASE("a request's root digest changes with the engine's root and every fiel
     others[5].eviction_threshold = 0.25;
     others[6].eviction_warmup = 64;
     others[7].attention_mass_decay = 1.0 / 128;
+    others[8].mass_tokens = 256;
     for (const pulsarlm::page_eviction_policy& other : others) {
         REQUIRE(pulsarlm::make_request_root_digest(parent, other) != root);
     }

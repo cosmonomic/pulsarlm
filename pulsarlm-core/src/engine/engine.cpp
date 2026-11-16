@@ -65,6 +65,15 @@ void validate(const request& r, std::size_t vocab_size) {
     if (r.eviction.cycle_tokens < 1) {
         throw std::invalid_argument("eviction.cycle_tokens must be at least 1");
     }
+    if (r.eviction.mass_tokens && (*r.eviction.mass_tokens < 1 || *r.eviction.mass_tokens > r.eviction.cycle_tokens)) {
+        throw std::invalid_argument(
+            std::format(
+                "eviction.mass_tokens {} is outside [1, cycle_tokens {}]",
+                *r.eviction.mass_tokens,
+                r.eviction.cycle_tokens
+            )
+        );
+    }
     if (!(r.eviction.attention_mass_decay > 0.0 && r.eviction.attention_mass_decay <= 1.0)) {
         throw std::invalid_argument(
             std::format("eviction.attention_mass_decay {} is outside (0, 1]", r.eviction.attention_mass_decay)

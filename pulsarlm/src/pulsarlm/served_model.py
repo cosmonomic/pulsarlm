@@ -92,6 +92,7 @@ def load_served_model(
         eviction=EvictionPolicy(
             n_working=settings.n_working,
             cycle_tokens=settings.cycle_tokens,
+            mass_tokens=settings.mass_tokens,
             max_context_window=settings.max_context_window or max_context,
             eviction_threshold=settings.eviction_threshold,
             eviction_warmup=settings.eviction_warmup,
