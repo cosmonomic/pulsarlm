@@ -227,7 +227,8 @@ PYBIND11_MODULE(pulsarlm_core, m) {
         )
         .def_readonly("total_tokens", &request_result::total_tokens)
         .def_readonly("cached_tokens", &request_result::cached_tokens)
-        .def_readonly("device_cached_tokens", &request_result::device_cached_tokens);
+        .def_readonly("device_cached_tokens", &request_result::device_cached_tokens)
+        .def_readonly("peak_device_memory", &request_result::peak_device_memory);
 
     py::class_<engine_stat>(m, "EngineStat").def_readonly("kv_cache_bytes", &engine_stat::kv_cache_bytes);
 

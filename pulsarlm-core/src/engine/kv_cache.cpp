@@ -787,6 +787,10 @@ std::size_t kv_cache::used_bytes() const noexcept {
     return std::atomic_ref(used_line_bytes).load(std::memory_order_relaxed);
 }
 
+std::size_t kv_cache::line_block_bytes(std::size_t layer) const noexcept {
+    return classes[layers[layer].block_class].block_bytes;
+}
+
 std::size_t kv_cache::layer_count() const noexcept {
     return layers.size();
 }

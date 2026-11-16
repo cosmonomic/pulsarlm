@@ -11,6 +11,7 @@ from pulsarlm.served_model import load_served_model
 from pulsarlm.server.metrics import router as metrics_router
 from pulsarlm.server.openai import ServerState
 from pulsarlm.server.openai import router as openai_router
+from pulsarlm.server.telemetry import start_telemetry
 from pulsarlm.settings import Settings
 
 
@@ -31,6 +32,7 @@ def load_server_state(
         eviction_log=None
         if eviction_log is None
         else EvictionLog(eviction_log, engine, served.eviction),
+        telemetry=start_telemetry(engine.stat, settings.model),
     )
 
 
@@ -44,6 +46,7 @@ def create_app(load: Callable[[], ServerState]) -> FastAPI:
             yield
         finally:
             app.state.server_state.engine.close()
+            app.state.server_state.telemetry.shutdown()
             del app.state.server_state
 
     app = FastAPI(lifespan=lifespan)

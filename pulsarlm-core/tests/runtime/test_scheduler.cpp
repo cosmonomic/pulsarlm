@@ -16,6 +16,7 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -80,6 +81,7 @@ struct request_results {
     std::size_t total_tokens = 0;
     std::size_t cached_tokens = 0;
     std::size_t device_cached_tokens = 0;
+    std::size_t peak_device_memory = 0;
     bool cancelled = false;
     std::shared_ptr<const store_contents> observed_store;
     std::vector<std::size_t> writes_at_cycle_ends;
@@ -116,6 +118,7 @@ class recording_callbacks final : public pulsarlm::request_callbacks {
             recorded_results->total_tokens = result->total_tokens;
             recorded_results->cached_tokens = result->cached_tokens;
             recorded_results->device_cached_tokens = result->device_cached_tokens;
+            recorded_results->peak_device_memory = result->peak_device_memory;
             recorded_results->end_state = result->state;
         }
         recorded_results->end.emplace(std::move(result).transform([](pulsarlm::request_result&& ended) {
@@ -1497,6 +1500,26 @@ TEST_CASE("a prompt longer than the cache fits when each cycle evicts down to ma
     REQUIRE(results[0].tokens == token_list{first, continuation(concat(last_cycle, {first}), 1)[0]});
     REQUIRE(results[0].cycle_ends.size() == 4);
     REQUIRE(hashes_of(ended_state(results[0])).size() == 2);
+}
+
+TEST_CASE("a request that needs every line of the pool peaks at the whole pool") {
+    fixture f(4);
+    token_list prompt(32);
+    std::iota(prompt.begin(), prompt.end(), 1);
+    std::vector<request_results> results = serve_all(
+        f.sched,
+        {request{
+            .tokens = prompt,
+            .max_tokens = 2,
+            .eviction = {.n_sink = 0, .n_working = 4, .cycle_tokens = 8, .max_context_window = 20}
+        }}
+    );
+
+    std::size_t pool_bytes = 0;
+    for (const pulsarlm::page_shape& shape : page_shapes(two_full_layers)) {
+        pool_bytes += 4 * std::bit_ceil(pulsarlm::line_bytes(shape));
+    }
+    REQUIRE(results[0].peak_device_memory == pool_bytes);
 }
 
 TEST_CASE("prefill forwards at most the step's prefill tokens") {

@@ -65,6 +65,8 @@ class executor {
     // state the store returned does not reference.
     task<std::expected<void, page_error>> own_pages_from(sequence& seq, std::size_t first_index);
     void release_lines(sequence& seq) noexcept;
+    // Raises seq's peak_device_memory to the bytes of each device's pool its lines take now.
+    void record_device_memory(sequence& seq) const noexcept;
     // Drops from each sliding layer's view the pages before the window of the tail's first token, and returns whether
     // any view changed.
     bool release_passed_pages(sequence& seq);

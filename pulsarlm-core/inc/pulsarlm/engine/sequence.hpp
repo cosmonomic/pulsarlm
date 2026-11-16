@@ -118,6 +118,7 @@ class sequence {
     // The tokens of the resumed state's full pages, and of those every layer reading them had resident at the start.
     std::size_t cached_count = 0;
     std::size_t device_cached_count = 0;
+    std::size_t peak_device_memory = 0;
 
     // Resumes initial_state, the newest stored state reaching a prefix of r's tokens, leased from store by lease_id.
     // digests are the digests of the full pages of r's tokens, chained from root.

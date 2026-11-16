@@ -9,6 +9,7 @@ from typing import Annotated
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRouter
+from opentelemetry.util.types import AttributeValue
 from tokenizers import Tokenizer
 
 from pulsarlm.async_engine import AsyncEngine, EngineStopped
@@ -36,6 +37,7 @@ from pulsarlm.server.openai.schema import (
 )
 from pulsarlm.paging import sink_tokens
 from pulsarlm.reply import TOOL_CALL_MARKERS, Part, ReplyDecoder, ThinkSyntax
+from pulsarlm.server.telemetry import RequestTelemetry, Telemetry
 from pulsarlm.tools import ToolCallError, ToolCallSyntax, parse_tool_call
 
 
@@ -50,6 +52,7 @@ class ServerState:
     think_syntax: ThinkSyntax | None
     eviction: EvictionPolicy
     eviction_log: EvictionLog | None
+    telemetry: Telemetry
 
     def eviction_for(self, system_tokens: int) -> EvictionPolicy:
         """The default policy, sinking the system message's tokens, or the first
@@ -111,7 +114,22 @@ async def create_chat_completion(body: ChatCompletionRequest, state: State):
         raise HTTPException(400, f"chat template: {error}") from error
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     states: list[EngineState] = []
-    reply = _Reply(state, body.max_tokens, prompt, tool_calls=tools is not None)
+    request_attributes: dict[str, AttributeValue] = {
+        "gen_ai.response.id": completion_id,
+        "gen_ai.request.temperature": body.temperature,
+        "gen_ai.request.top_p": body.top_p,
+    }
+    if body.max_tokens is not None:
+        request_attributes["gen_ai.request.max_tokens"] = body.max_tokens
+    reply = _Reply(
+        state,
+        RequestTelemetry(
+            state.telemetry, body.model, state.model_id, request_attributes
+        ),
+        body.max_tokens,
+        prompt,
+        tool_calls=tools is not None,
+    )
     tokens = complete(
         state.engine,
         prompt,
@@ -169,6 +187,7 @@ class _Reply:
     def __init__(
         self,
         state: ServerState,
+        telemetry: RequestTelemetry,
         max_tokens: int | None,
         prompt: list[int],
         *,
@@ -176,6 +195,7 @@ class _Reply:
     ) -> None:
         self._stop_ids = state.stop_ids
         self._max_tokens = max_tokens
+        self._telemetry = telemetry
         self._decoder = ReplyDecoder(
             state.tokenizer,
             state.stop_ids,
@@ -189,6 +209,9 @@ class _Reply:
 
     def record_usage(self, usage: CompletionUsage) -> None:
         self.usage = usage
+
+    def record_failure(self, failure: HTTPException) -> None:
+        self._telemetry.fail(str(failure.status_code))
 
     def usage_body(self) -> Usage:
         assert self.usage is not None
@@ -233,10 +256,15 @@ class _Reply:
             )
         return calls, "".join(unparsed)
 
-    def final_finish_reason(self, calls: list[MessageToolCall]) -> FinishReason:
-        if self.finish_reason in (None, "stop") and calls:
-            return "tool_calls"
-        return self.finish_reason or "stop"
+    def finish(self, calls: list[MessageToolCall]) -> FinishReason:
+        """The final finish reason, once the reply ended with calls; records the
+        request's telemetry."""
+        assert self.usage is not None
+        finish_reason: FinishReason = self.finish_reason or "stop"
+        if finish_reason == "stop" and calls:
+            finish_reason = "tool_calls"
+        self._telemetry.finish(self.usage, finish_reason)
+        return finish_reason
 
 
 async def _texts(
@@ -266,7 +294,9 @@ async def _full_completion(
         async for part, text in _texts(reply, tokens):
             texts[part].append(text)
     except (EngineStopped, CompletionError) as error:
-        raise _http_error(error) from error
+        failure = _http_error(error)
+        reply.record_failure(failure)
+        raise failure from error
     calls, unparsed = reply.tool_calls()
     content = "".join(texts["content"]) + unparsed
 
@@ -283,7 +313,7 @@ async def _full_completion(
                     reasoning="".join(texts["reasoning"]) or None,
                     tool_calls=calls or None,
                 ),
-                finish_reason=reply.final_finish_reason(calls),
+                finish_reason=reply.finish(calls),
             )
         ],
         usage=reply.usage_body(),
@@ -321,6 +351,7 @@ def _stream_completion(
                     yield chunk(ChatCompletionChunkDelta(content=text))
         except (EngineStopped, CompletionError) as error:
             failure = _http_error(error)
+            reply.record_failure(failure)
             yield f"data: {json.dumps({'error': {'message': failure.detail, 'code': failure.status_code}})}\n\n"
         else:
             calls, unparsed = reply.tool_calls()
@@ -335,7 +366,7 @@ def _stream_completion(
                         ]
                     )
                 )
-            yield chunk(ChatCompletionChunkDelta(), reply.final_finish_reason(calls))
+            yield chunk(ChatCompletionChunkDelta(), reply.finish(calls))
             if body.stream_options is not None and body.stream_options.include_usage:
                 usage = ChatCompletionChunk(
                     id=completion_id,

@@ -115,7 +115,9 @@ class RequestResult:
     cached_tokens: the tokens of the full pages of the state it resumed, which the
     request did not forward; that state's tail is forwarded again. device_cached_tokens: those of them on pages every
     KV layer reading the page had resident in the KV cache when the request
-    started, not fetched from the store."""
+    started, not fetched from the store. peak_device_memory: the most bytes of
+    each device's KV cache pool that the request's lines took at once, lines it
+    shared with other requests included."""
 
     @property
     def state(self) -> State: ...
@@ -125,6 +127,8 @@ class RequestResult:
     def cached_tokens(self) -> int: ...
     @property
     def device_cached_tokens(self) -> int: ...
+    @property
+    def peak_device_memory(self) -> int: ...
 
 class RequestError(enum.Enum):
     MISS = ...

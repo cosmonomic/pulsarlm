@@ -21,11 +21,14 @@ struct cycle_end {
 // tokens, then the tokens it sampled. cached_tokens: the tokens of the full pages of the state it resumed, which it did
 // not forward; that state's tail is forwarded again. device_cached_tokens: those of them on pages that every KV layer
 // reading the page had resident in the KV cache when the request started, not read from the store.
+// peak_device_memory: the most bytes of each device's KV cache pool that the request's lines took at once, lines it
+// shared with other requests included.
 struct request_result {
     std::shared_ptr<const pulsarlm::state> state;
     std::size_t total_tokens;
     std::size_t cached_tokens;
     std::size_t device_cached_tokens;
+    std::size_t peak_device_memory;
 };
 
 enum class request_error { miss, oom, cancelled, loop_exited };

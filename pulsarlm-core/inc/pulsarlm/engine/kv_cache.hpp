@@ -207,6 +207,8 @@ class kv_cache {
     // The bytes of each shard's pool that lines in use take: lines get, allocate or clone gave and release has not
     // taken back, not lines only caching a page. Safe to call from any thread.
     std::size_t used_bytes() const noexcept;
+    // The bytes of each shard's pool that one line of layer takes.
+    std::size_t line_block_bytes(std::size_t layer) const noexcept;
     std::size_t layer_count() const noexcept;
     std::size_t shard_count() const noexcept;
     // [n_lines, page_size, n_kv_heads, head_dim] views of shard's pool, indexed by line id, lines a block apart.

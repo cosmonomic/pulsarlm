@@ -570,6 +570,7 @@ task<std::expected<request_result, request_error>> executor::finish(sequence& se
             .total_tokens = seq.prompt_count + seq.generated_count,
             .cached_tokens = seq.cached_count,
             .device_cached_tokens = seq.device_cached_count,
+            .peak_device_memory = seq.peak_device_memory,
         };
         break;
     }
@@ -679,7 +680,16 @@ task<std::expected<void, page_error>> executor::take_lines(sequence& seq, std::s
             cache.release(layer, (*page_lines)[layer]);
         }
     }
+    record_device_memory(seq);
     co_return std::expected<void, page_error>{};
+}
+
+void executor::record_device_memory(sequence& seq) const noexcept {
+    std::size_t bytes = 0;
+    for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
+        bytes += seq.layers[layer].lines.size() * cache.line_block_bytes(layer);
+    }
+    seq.peak_device_memory = std::max(seq.peak_device_memory, bytes);
 }
 
 void executor::release_lines(sequence& seq) noexcept {
@@ -865,6 +875,7 @@ task<void> executor::write_back(batch& b) {
                 }
                 view.append_lines((*allocation)[layer]);
             }
+            record_device_memory(seq);
         }
         if (first_stale_page) {
             seq.upload_table(*first_stale_page, streams);

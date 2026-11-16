@@ -1,5 +1,6 @@
 """Completes a token prompt from the newest stored state that reaches a prefix of it."""
 
+import time
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 
@@ -24,12 +25,19 @@ class CompletionError(Exception):
 class CompletionUsage:
     """cached_tokens: the prompt tokens the request did not forward, as they were
     on full pages of the state it resumed. device_cached_tokens: those of them on
-    pages the engine had resident, not fetched from the store."""
+    pages the engine had resident, not fetched from the store.
+    peak_device_memory: the most bytes of each device's KV cache pool the
+    request's lines took at once, lines shared with other requests included.
+    time_to_first_token_s runs from the submission to the first token, None
+    without one; decode_time_s from the first token to the last."""
 
     prompt_tokens: int
     cached_tokens: int
     device_cached_tokens: int
+    peak_device_memory: int
     completion_tokens: int
+    time_to_first_token_s: float | None
+    decode_time_s: float
 
 
 async def complete(
@@ -49,6 +57,8 @@ async def complete(
     EngineStopped when its loop exited. Closing the iterator early cancels the
     request."""
     completion_tokens = 0
+    first_token_at: float | None = None
+    last_token_at = 0.0
     result: RequestResult | None = None
 
     def pass_state(state: State) -> None:
@@ -60,6 +70,7 @@ async def complete(
         result = request_result
         pass_state(request_result.state)
 
+    submitted_at = time.monotonic()
     stream = engine.submit(
         prompt,
         sampling=sampling,
@@ -70,6 +81,9 @@ async def complete(
     )
     try:
         async for token in stream:
+            last_token_at = time.monotonic()
+            if first_token_at is None:
+                first_token_at = last_token_at
             completion_tokens += 1
             yield token
     except RequestFailed as failure:
@@ -83,6 +97,13 @@ async def complete(
                 prompt_tokens=len(prompt),
                 cached_tokens=result.cached_tokens,
                 device_cached_tokens=result.device_cached_tokens,
+                peak_device_memory=result.peak_device_memory,
                 completion_tokens=completion_tokens,
+                time_to_first_token_s=None
+                if first_token_at is None
+                else first_token_at - submitted_at,
+                decode_time_s=0.0
+                if first_token_at is None
+                else last_token_at - first_token_at,
             )
         )

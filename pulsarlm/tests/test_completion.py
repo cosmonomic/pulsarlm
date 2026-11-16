@@ -169,6 +169,21 @@ def test_a_follow_up_continues_from_the_end_state():
     asyncio.run(main())
 
 
+def test_usage_times_the_first_token_and_the_decode():
+    async def main():
+        engine = make_engine(EmptyStore())
+        usages: list[CompletionUsage] = []
+        await collect(engine, PROMPT, usages)
+
+        [usage] = usages
+        assert usage.time_to_first_token_s is not None
+        assert usage.time_to_first_token_s > 0
+        assert usage.decode_time_s > 0
+        assert usage.peak_device_memory > 0
+
+    asyncio.run(main())
+
+
 def test_every_cycle_end_state_is_findable():
     async def main():
         store = RecordingStore()

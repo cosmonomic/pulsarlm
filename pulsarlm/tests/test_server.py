@@ -12,6 +12,10 @@ import torch
 from fastapi.testclient import TestClient
 from tokenizers import Tokenizer, models, pre_tokenizers
 
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import SpanKind
+
 from pulsarlm.async_engine import AsyncEngine
 from pulsarlm.chat import ChatTemplate, encode_prompt
 from pulsarlm.core.engine import (
@@ -26,6 +30,7 @@ from pulsarlm.server import create_app
 from pulsarlm.server.openai import ServerState
 from pulsarlm.server.openai.routes import template_messages
 from pulsarlm.server.openai.schema import ChatMessage
+from pulsarlm.server.telemetry import start_telemetry
 from pulsarlm.store import LocalStore
 
 N_LAYERS = 2
@@ -163,6 +168,7 @@ def load(
         think_syntax=None,
         eviction=EvictionPolicy(cycle_tokens=PAGE_SIZE),
         eviction_log=None,
+        telemetry=start_telemetry(engine.stat, MODEL_ID),
     )
 
 
@@ -406,10 +412,98 @@ def test_the_eviction_log_leaves_out_evicted_pages(tmp_path):
         assert len(starts) < full // PAGE_SIZE
 
 
-def test_metrics_count_no_kv_cache_bytes_once_requests_end(client):
+def metric_value(text: str, name: str) -> float:
+    [line] = [line for line in text.splitlines() if line.startswith(f"{name}{{")]
+    return float(line.rsplit(" ", 1)[1])
+
+
+def test_metrics_count_no_device_memory_once_requests_end(client):
     post(client, messages=MESSAGES, max_tokens=4)
 
     response = client.get("http://testserver/metrics")
 
     assert response.status_code == 200
-    assert f'pulsarlm:kv_cache_bytes{{model_name="{MODEL_ID}"}} 0\n' in response.text
+    assert metric_value(response.text, "pulsarlm_device_memory_bytes") == 0
+
+
+def test_metrics_count_the_tokens_of_finished_requests(client):
+    post(client, messages=MESSAGES, max_tokens=4)
+    follow_up = post(client, messages=MESSAGES, max_tokens=4).json()["usage"]
+
+    text = client.get("http://testserver/metrics").text
+
+    cached = follow_up["prompt_tokens_details"]["cached_tokens"]
+    assert cached > 0
+    assert (
+        metric_value(text, "pulsarlm_usage_input_tokens_sum")
+        == 2 * follow_up["prompt_tokens"]
+    )
+    assert (
+        metric_value(text, "pulsarlm_usage_input_tokens_on_device_sum")
+        + metric_value(text, "pulsarlm_usage_input_tokens_in_store_sum")
+        == cached
+    )
+
+
+def test_metrics_hold_the_gen_ai_server_histograms_of_finished_requests(client):
+    post(client, messages=MESSAGES, max_tokens=4)
+
+    text = client.get("http://testserver/metrics").text
+
+    for name in (
+        "gen_ai_server_request_duration_seconds",
+        "gen_ai_server_time_to_first_token_seconds",
+        "gen_ai_server_time_per_output_token_seconds",
+    ):
+        [count] = [
+            line for line in text.splitlines() if line.startswith(f"{name}_count{{")
+        ]
+        assert 'gen_ai_operation_name="chat"' in count
+        assert 'gen_ai_provider_name="pulsarlm"' in count
+        assert f'gen_ai_request_model="{MODEL_ID}"' in count
+        assert count.endswith(" 1.0")
+
+
+def test_a_finished_request_ends_one_request_span_with_its_usage(client):
+    exporter = InMemorySpanExporter()
+    state: ServerState = client.app.state.server_state
+    state.telemetry.tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    response = post(client, messages=MESSAGES, max_tokens=4).json()
+    usage = response["usage"]
+
+    [span] = exporter.get_finished_spans()
+    attributes = span.attributes or {}
+    assert span.name == "request"
+    assert span.kind == SpanKind.SERVER
+    assert attributes["gen_ai.operation.name"] == "chat"
+    assert attributes["gen_ai.response.model"] == MODEL_ID
+    assert attributes["gen_ai.response.id"] == response["id"]
+    assert attributes["gen_ai.response.finish_reasons"] == (
+        response["choices"][0]["finish_reason"],
+    )
+    assert attributes["gen_ai.usage.input_tokens"] == usage["prompt_tokens"]
+    assert attributes["gen_ai.usage.output_tokens"] == usage["completion_tokens"]
+    assert attributes["gen_ai.request.max_tokens"] == 4
+    peak_device_memory = attributes["pulsarlm.usage.peak_device_memory"]
+    time_to_first_token = attributes["pulsarlm.time_to_first_token"]
+    duration = attributes["pulsarlm.request.duration"]
+    assert isinstance(peak_device_memory, int)
+    assert isinstance(time_to_first_token, float)
+    assert isinstance(duration, float)
+    assert peak_device_memory > 0
+    assert 0 < time_to_first_token <= duration
+
+
+def test_the_server_exports_its_unexported_spans_when_it_shuts_down():
+    exporter = InMemorySpanExporter()
+    app = create_app(load)
+    with TestClient(app, base_url=BASE_URL) as client:
+        state: ServerState = app.state.server_state
+        state.telemetry.tracer_provider.add_span_processor(
+            BatchSpanProcessor(exporter, schedule_delay_millis=3_600_000)
+        )
+        post(client, messages=MESSAGES, max_tokens=4)
+        assert exporter.get_finished_spans() == ()
+
+    assert len(exporter.get_finished_spans()) == 1
