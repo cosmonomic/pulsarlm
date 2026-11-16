@@ -24,6 +24,7 @@ from typing import Annotated, Any, Literal
 import httpx
 import typer
 import uvicorn
+from scipy.stats import binomtest
 from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import (
     ExportMetricsServiceRequest,
     ExportMetricsServiceResponse,
@@ -162,6 +163,8 @@ class Setting:
     eviction_threshold: float = 0.0
     prefix_cache: bool = True
     mass_tokens: int | None = None
+    # None takes the run's n_working.
+    n_working: int | None = None
 
 
 SETTINGS = {
@@ -175,6 +178,17 @@ SETTINGS = {
     ),
     "cap_64k_mass_0.5": Setting(
         "pulsarlm", max_context_window=65536, eviction_threshold=0.5
+    ),
+    "cap_16k": Setting("pulsarlm", max_context_window=16384),
+    "mass_0.5": Setting("pulsarlm", eviction_threshold=0.5),
+    "cap_16k_mass_0.25": Setting(
+        "pulsarlm", max_context_window=16384, eviction_threshold=0.25
+    ),
+    "cap_16k_mass_0.75": Setting(
+        "pulsarlm", max_context_window=16384, eviction_threshold=0.75
+    ),
+    "cap_16k_mass_0.5_working_8k": Setting(
+        "pulsarlm", max_context_window=16384, eviction_threshold=0.5, n_working=8192
     ),
     "cap_16k_mass_0.5_mass_tokens_128": Setting(
         "pulsarlm", max_context_window=16384, eviction_threshold=0.5, mass_tokens=128
@@ -243,6 +257,8 @@ def run_pulsarlm_server(
     command += ["--kv_cache_gib", str(kv_cache_gib), "--store_gib", str(store_gib)]
     command += ["--prefill_tokens_per_step", str(prefill_tokens_per_step)]
     command += ["--eviction_threshold", str(setting.eviction_threshold)]
+    working = n_working if setting.n_working is None else setting.n_working
+    command += ["--n_working", str(working)]
     if not setting.prefix_cache:
         command += ["--no_prefix_cache"]
     if setting.max_context_window is None:
@@ -250,7 +266,6 @@ def run_pulsarlm_server(
         command += ["--max_context_window", str(max_context)]
     else:
         command += ["--max_context_window", str(setting.max_context_window)]
-        command += ["--n_working", str(n_working)]
     if setting.mass_tokens is not None:
         command += ["--mass_tokens", str(setting.mass_tokens)]
     root = f"http://127.0.0.1:{port}"
@@ -712,6 +727,48 @@ def paired_difference(
     )
 
 
+def sign_test(
+    values: dict[str, float], reference: dict[str, float]
+) -> tuple[int, int, float]:
+    """The tasks where values is higher, those where reference is, and the
+    two-sided p-value of the exact sign test on those discordant tasks."""
+    tasks = values.keys() & reference.keys()
+    higher = sum(values[t] > reference[t] for t in tasks)
+    lower = sum(values[t] < reference[t] for t in tasks)
+    p = binomtest(higher, higher + lower).pvalue if higher + lower else 1.0
+    return higher, lower, p
+
+
+def turns_ratio(
+    turns: dict[str, float], reference_runs: list[dict[str, TaskRun]]
+) -> tuple[float, float, float]:
+    """The median turns over the tasks divided by the median of each reference
+    run, averaged over the reference runs, and its 95% interval from a paired
+    bootstrap over the tasks every run holds."""
+    tasks = sorted(set(turns).intersection(*reference_runs))
+    if not tasks:
+        return float("nan"), float("nan"), float("nan")
+    reference = [[float(run[t].steps) for t in tasks] for run in reference_runs]
+    values = [turns[t] for t in tasks]
+
+    def mean_ratio(indices: list[int]) -> float:
+        median = statistics.median(values[i] for i in indices)
+        return statistics.fmean(
+            median / statistics.median(run[i] for i in indices) for run in reference
+        )
+
+    rng = random.Random(0)
+    ratios = sorted(
+        mean_ratio(rng.choices(range(len(tasks)), k=len(tasks)))
+        for _ in range(BOOTSTRAP_RESAMPLES)
+    )
+    return (
+        mean_ratio(list(range(len(tasks)))),
+        ratios[int(0.025 * BOOTSTRAP_RESAMPLES)],
+        ratios[int(0.975 * BOOTSTRAP_RESAMPLES) - 1],
+    )
+
+
 def per_task(runs: list[dict[str, TaskRun]], measure: str) -> dict[str, float]:
     """Each task's measure averaged over the repeats that ran it."""
     values: dict[str, list[float]] = {}
@@ -828,11 +885,12 @@ def vllm_cached_share(directories: list[Path]) -> float:
 @app.command()
 def report(
     results: Path = Path("bench/results/agents"),
-    reference: str = "vllm",
+    reference: str = "full_kv",
 ) -> None:
-    """Prints per setting the tasks solved, the median turns, the capped and
-    looping runs and the re-fetch rate, each against reference with a paired
-    bootstrap over the tasks, then from the server's spans its finished requests,
+    """Prints per setting the tasks solved, against reference's per-task mean
+    with a paired bootstrap and an exact sign test over the tasks, the median
+    turns and their ratio to reference's runs, the capped and looping runs and
+    the re-fetch rate, then from the server's spans its finished requests,
     time to first token percentiles, prefill throughput over the time to first
     token, decode throughput past each request's first token, cached share and,
     for pulsarlm, the share read from the store, and the KV cache bytes in use."""
@@ -845,19 +903,25 @@ def report(
 
     print(
         f"{'setting':<34}{'runs':>5}{'solved':>8}{'Δ solved [95% CI]':>24}"
-        f"{'turns':>7}{'capped':>8}{'looped':>8}{'re-fetch':>10}"
+        f"{'+/−':>8}{'sign p':>8}{'turns':>7}{'× turns [95% CI]':>22}"
+        f"{'capped':>8}{'looped':>8}{'re-fetch':>10}"
     )
+    reference_solved = per_task(runs[reference], "solved")
     for name, repeats in runs.items():
         solved = per_task(repeats, "solved")
-        delta, low, high = paired_difference(
-            solved, per_task(runs[reference], "solved")
+        delta, low, high = paired_difference(solved, reference_solved)
+        higher, lower, p = sign_test(solved, reference_solved)
+        turns, turns_low, turns_high = turns_ratio(
+            per_task(repeats, "steps"), runs[reference]
         )
         all_runs = [run for repeat in repeats for run in repeat.values()]
         reads = sum(r.reads for r in all_runs)
         print(
             f"{name:<34}{len(all_runs):>5}{100 * statistics.fmean(solved.values()):>7.0f}%"
             f"{f'{100 * delta:+.0f} [{100 * low:+.0f}, {100 * high:+.0f}]':>24}"
+            f"{f'{higher}/{lower}':>8}{p:>8.3f}"
             f"{statistics.median(r.steps for r in all_runs):>7.0f}"
+            f"{f'{turns:.2f} [{turns_low:.2f}, {turns_high:.2f}]':>22}"
             f"{sum(r.capped for r in all_runs):>8}{sum(r.looped for r in all_runs):>8}"
             f"{(sum(r.refetches for r in all_runs) / reads if reads else float('nan')):>10.2f}"
         )
