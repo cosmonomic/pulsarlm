@@ -455,7 +455,6 @@ task<std::expected<std::unique_ptr<sequence>, request_error>> executor::start(re
         writer,
         devices
     ));
-    seq->start_cycle();
     // take_lines holds the resident pages before it first suspends, so they are the ones counted here.
     seq->device_cached_count = device_cached_tokens(*seq);
     std::expected<void, page_error> line_allocation = co_await take_lines(*seq, seq->cycle_lines());
@@ -753,7 +752,7 @@ task<void> executor::write_back(batch& b) {
         if (e.ends_cycle) {
             views_changed = evict(seq) || views_changed;
             co_await write_cycle_end(seq);
-            seq.start_cycle();
+            seq.start_next_cycle();
         }
         std::optional<std::size_t> first_stale_page;
         if (views_changed) {

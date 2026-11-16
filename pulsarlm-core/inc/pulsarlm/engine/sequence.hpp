@@ -108,10 +108,9 @@ class sequence {
     // Set once the sequence leaves the running set.
     std::optional<event> exit_event;
     page_eviction_policy eviction;
-    // covered_count when the eviction cycle began.
-    std::size_t cycle_start = 0;
-    // The tokens forwarded so far: the resumed state's tail, then the request's tokens after it, then sampled tokens.
-    std::size_t covered_count = 0;
+    // The history position, in tokens, at which the eviction cycle ends: a multiple of cycle_tokens, and past the end of
+    // the resumed state, so that forwarding its tail again never reaches a cycle end that state already passed.
+    std::size_t next_cycle_end = 0;
     // The request's tokens.
     std::size_t prompt_count = 0;
     // The tokens of the resumed state's full pages, and of those every layer reading them had resident at the start.
@@ -148,7 +147,9 @@ class sequence {
     // Moves the first count pending tokens to tail, then the pages they complete to every layer with pages, and returns
     // how many pages they complete.
     std::size_t advance(std::size_t count);
-    void start_cycle() noexcept;
+    // The tokens of the history up to the next token: its full pages, then tail.
+    std::size_t history_position() const noexcept;
+    void start_next_cycle() noexcept;
     // Whether forwarding token_count more tokens ends the eviction cycle.
     bool ends_cycle(std::size_t token_count) const noexcept;
     // The tokens the cycle can still forward: no more than its length allows, nor than the request will forward.

@@ -1114,6 +1114,41 @@ TEST_CASE("a cycle ends every cycle_tokens tokens with the state it reached") {
     REQUIRE(cycle_ends[1].state->tail.empty());
 }
 
+TEST_CASE("a request resumed mid-cycle ends its cycles where an uninterrupted run over its tokens does") {
+    token_list prompt{1, 2, 3, 4, 5, 6};
+    token_list user{7, 8};
+    fixture resumed_engine(16);
+    std::vector<request_results> resumed = serve_in_turn(
+        resumed_engine.sched,
+        request{.tokens = prompt, .max_tokens = 2, .eviction = {.cycle_tokens = 8}},
+        [&](const request_results& first) {
+            return request{
+                .tokens = concat(concat(prompt, first.tokens), user),
+                .max_tokens = 10,
+                .eviction = {.cycle_tokens = 8},
+            };
+        }
+    );
+    token_list context = concat(concat(prompt, resumed[0].tokens), user);
+    fixture uninterrupted_engine(16);
+    request_results uninterrupted = serve_all(
+        uninterrupted_engine.sched,
+        {request{.tokens = context, .max_tokens = 10, .eviction = {.cycle_tokens = 8}}}
+    )[0];
+
+    REQUIRE(resumed[0].cycle_ends.empty());
+    REQUIRE(ended_state(resumed[0]).tail.size() == 3);
+    REQUIRE(resumed[1].tokens == uninterrupted.tokens);
+    REQUIRE(uninterrupted.cycle_ends.size() == 2);
+    REQUIRE(resumed[1].cycle_ends.size() == 2);
+    for (std::size_t i = 0; i < 2; i++) {
+        const pulsarlm::state& resumed_end = *resumed[1].cycle_ends[i].state;
+        const pulsarlm::state& uninterrupted_end = *uninterrupted.cycle_ends[i].state;
+        REQUIRE((hashes_of(resumed_end) == hashes_of(uninterrupted_end)));
+        REQUIRE(resumed_end.tail == uninterrupted_end.tail);
+    }
+}
+
 TEST_CASE("a cycle's end evicts the pages scoring below the threshold outside the sink and working pages") {
     fixture f(16);
     f.model.is_important = [](std::size_t, std::int64_t token) { return token == 7; };

@@ -157,6 +157,8 @@ sequence::sequence(
         }
     }
     cached_count = history_pages * page_size;
+    std::size_t resumed_end = cached_count + last_state->tail.size();
+    next_cycle_end = (resumed_end / eviction.cycle_tokens + 1) * eviction.cycle_tokens;
     prompt_count = r.tokens.size();
     update_held();
 }
@@ -197,7 +199,6 @@ std::size_t sequence::advance(std::size_t count) {
     assert(count <= pending_tokens.size());
     tail.insert(tail.end(), pending_tokens.begin(), pending_tokens.begin() + count);
     pending_tokens.erase(pending_tokens.begin(), pending_tokens.begin() + count);
-    covered_count += count;
     std::size_t full_page_count = tail.size() / page_size;
     if (full_page_count == 0) {
         return 0;
@@ -267,16 +268,20 @@ state sequence::to_state() const {
     return s;
 }
 
-void sequence::start_cycle() noexcept {
-    cycle_start = covered_count;
+std::size_t sequence::history_position() const noexcept {
+    return history_pages * page_size + tail.size();
+}
+
+void sequence::start_next_cycle() noexcept {
+    next_cycle_end += eviction.cycle_tokens;
 }
 
 bool sequence::ends_cycle(std::size_t token_count) const noexcept {
-    return covered_count + token_count - cycle_start >= eviction.cycle_tokens;
+    return history_position() + token_count >= next_cycle_end;
 }
 
 std::size_t sequence::cycle_tokens_left() const noexcept {
-    std::size_t left = eviction.cycle_tokens - (covered_count - cycle_start);
+    std::size_t left = next_cycle_end - history_position();
     if (max_tokens) {
         // Every token sampled from here is forwarded but the last.
         std::size_t samples_left = *max_tokens - generated_count;
