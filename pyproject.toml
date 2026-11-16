@@ -9,7 +9,9 @@ benchmark = [
     "matplotlib",
     "openai",
     "wonderwords",
-    "harbor>=0.25.0",
+    "mini-swe-agent==2.4.2",
+    "mcp",
+    "swebench==5.0.2",
     "scipy>=1.18.1",
 ]
 
