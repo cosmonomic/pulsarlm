@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -18,7 +19,8 @@
 
 namespace pulsarlm {
 
-// A page_store backed by a Python object with these methods, called on the loop thread with the GIL held:
+// A page_store backed by a Python object with these methods, called with the GIL held, claim, write_pages and
+// write_state on the store's hook thread and the others on the engine's loop thread:
 //   async read_pages(hashes: list[bytes]) -> list[Tensor | None]
 //   async read_state(tokens: list[int], page_digests: list[bytes]) -> tuple[State, int]
 //   claim(hashes: list[bytes], owners: list[tuple[int, int]]) -> list[int]
@@ -40,12 +42,22 @@ class python_store final : public page_store {
     // write_pages, so the writes run one at a time, the others waiting for write_done.
     bool writing = false;
     std::optional<event> write_done;
+    // Runs the hooks that take the GIL for a page or state write, so that the engine's loop never waits for it.
+    std::unique_ptr<event_loop> hook_loop;
+    std::thread hook_thread;
 
     // Calls the hook coroutine_function and runs its coroutine on the loop; returns its concurrent.futures.Future.
     template <typename... argument_types>
     pybind11::object start_coroutine(const char* coroutine_function, argument_types&&... arguments);
-    std::vector<std::size_t>
-    claim(std::span<const digest> hashes, std::span<const std::pair<state::lease_id_type, page_index_type>> owners);
+    // The hooks run on hook_loop.
+    task<std::vector<std::size_t>>
+    claim(std::vector<digest> hashes, std::vector<std::pair<state::lease_id_type, page_index_type>> owners);
+    task<void> hand_pages(
+        std::vector<digest> hashes,
+        std::vector<page> pages,
+        std::vector<std::pair<state::lease_id_type, page_index_type>> owners
+    );
+    task<void> hand_state(state::lease_id_type lease_id, std::shared_ptr<const state> s);
     // write_pages once no other write runs.
     task<std::expected<void, page_error>> write_pages_alone(
         std::vector<digest>&& hashes,

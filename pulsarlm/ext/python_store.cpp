@@ -186,17 +186,33 @@ std::vector<digest> page_keys(const state& s) {
 
 }  // namespace
 
+// A panic on the hook thread terminates the process: the engine's loop would wait for the hook forever.
 python_store::python_store(py::object&& hooks, py::object&& loop, std::size_t host_page_bytes)
 : hooks(std::move(hooks)),
   loop(std::move(loop)),
   run_coroutine_threadsafe(py::module_::import("asyncio").attr("run_coroutine_threadsafe")),
-  host_page_bytes(host_page_bytes) {}
+  host_page_bytes(host_page_bytes),
+  hook_loop(std::make_unique<event_loop>()) {
+    hook_thread = std::thread([this] {
+        if (std::exception_ptr thrown = hook_loop->run()) {
+            std::rethrow_exception(thrown);
+        }
+    });
+}
 
 void python_store::size_host_pages(std::size_t largest_page_bytes) {
     host_pages.emplace(host_page_bytes, largest_page_bytes);
 }
 
+// The hook thread may be waiting for the GIL, which the destroying thread then lets go while it joins.
 python_store::~python_store() {
+    hook_loop->stop();
+    if (Py_IsInitialized() && PyGILState_Check()) {
+        py::gil_scoped_release released;
+        hook_thread.join();
+    } else {
+        hook_thread.join();
+    }
     if (hooks) {
         py::gil_scoped_acquire gil;
         hooks = py::object();
@@ -261,18 +277,41 @@ python_store::read_state(std::span<const std::int64_t> tokens, std::span<const d
     co_return result.take();
 }
 
-std::vector<std::size_t> python_store::claim(
-    std::span<const digest> hashes,
-    std::span<const std::pair<state::lease_id_type, page_index_type>> owners
-) {
+task<std::vector<std::size_t>>
+python_store::claim(std::vector<digest> hashes, std::vector<std::pair<state::lease_id_type, page_index_type>> owners) {
     py::gil_scoped_acquire gil;
     try {
-        return hooks.attr("claim")(to_bytes_list(hashes), owners_to_python(owners)).cast<std::vector<std::size_t>>();
+        co_return hooks.attr("claim")(to_bytes_list(hashes), owners_to_python(owners)).cast<std::vector<std::size_t>>();
     } catch (py::error_already_set& e) {
         e.discard_as_unraisable("pulsarlm page store claim");
     } catch (const py::cast_error&) {
     }
-    return {};
+    co_return std::vector<std::size_t>();
+}
+
+task<void> python_store::hand_pages(
+    std::vector<digest> hashes,
+    std::vector<page> pages,
+    std::vector<std::pair<state::lease_id_type, page_index_type>> owners
+) {
+    py::gil_scoped_acquire gil;
+    try {
+        hooks.attr("write_pages")(to_bytes_list(hashes), pages_to_python(std::move(pages)), owners_to_python(owners));
+    } catch (py::error_already_set& e) {
+        e.discard_as_unraisable("pulsarlm page store write_pages");
+    }
+    co_return;
+}
+
+task<void> python_store::hand_state(state::lease_id_type lease_id, std::shared_ptr<const state> s) {
+    std::vector<digest> keys = page_keys(*s);
+    py::gil_scoped_acquire gil;
+    try {
+        hooks.attr("write_state")(lease_id, std::const_pointer_cast<state>(std::move(s)), to_bytes_list(keys));
+    } catch (py::error_already_set& e) {
+        e.discard_as_unraisable("pulsarlm page store write_state");
+    }
+    co_return;
 }
 
 // The awaiters a set event scheduled no longer refer to it, so it is destroyed right away.
@@ -305,7 +344,7 @@ task<std::expected<void, page_error>> python_store::write_pages_alone(
     std::vector<std::pair<state::lease_id_type, page_index_type>>&& owners,
     std::span<const cudaStream_t> streams
 ) {
-    std::vector<std::size_t> missing_indices = claim(hashes, owners);
+    std::vector<std::size_t> missing_indices = co_await run_on(*hook_loop, claim(hashes, owners));
     std::erase_if(missing_indices, [&](std::size_t i) { return i >= hashes.size(); });
     if (missing_indices.empty()) {
         co_return {};
@@ -329,28 +368,12 @@ task<std::expected<void, page_error>> python_store::write_pages_alone(
             copied_owners.emplace_back(lease_id, it->second);
         }
     }
-    py::gil_scoped_acquire gil;
-    try {
-        hooks.attr("write_pages")(
-            to_bytes_list(copied_hashes),
-            pages_to_python(std::move(*copies)),
-            owners_to_python(copied_owners)
-        );
-    } catch (py::error_already_set& e) {
-        e.discard_as_unraisable("pulsarlm page store write_pages");
-    }
+    co_await run_on(*hook_loop, hand_pages(std::move(copied_hashes), std::move(*copies), std::move(copied_owners)));
     co_return {};
 }
 
 task<void> python_store::write_state(state::lease_id_type lease_id, std::shared_ptr<const state>&& s) {
-    std::vector<digest> keys = page_keys(*s);
-    py::gil_scoped_acquire gil;
-    try {
-        hooks.attr("write_state")(lease_id, std::const_pointer_cast<state>(std::move(s)), to_bytes_list(keys));
-    } catch (py::error_already_set& e) {
-        e.discard_as_unraisable("pulsarlm page store write_state");
-    }
-    co_return;
+    co_await run_on(*hook_loop, hand_state(lease_id, std::move(s)));
 }
 
 void python_store::release(state::lease_id_type lease_id) noexcept {
