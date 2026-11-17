@@ -202,7 +202,7 @@ at::Tensor qwen3_5_moe_model::deltanet(
         g.page_end_tokens,
         /*dilation=*/1
     );
-    at::Tensor core = gated_delta_rule_cuda(
+    at::Tensor gated = gated_delta_rule_cuda(
         convolved,
         at::linear(h, w.in_proj_a),
         at::linear(h, w.in_proj_b),
@@ -212,11 +212,13 @@ at::Tensor qwen3_5_moe_model::deltanet(
         g.page_tables.select(0, static_cast<std::int64_t>(state_layer)),
         cu_seqlens_q,
         g.page_end_tokens,
-        c.linear_n_key_heads
+        c.linear_n_key_heads,
+        at::linear(h, w.in_proj_z),
+        w.norm,
+        c.rms_norm_eps,
+        gate_activation::silu
     );
-    at::Tensor z = at::linear(h, w.in_proj_z).view(core.sizes());
-    at::Tensor gated = gated_rmsnorm_cuda(core, z, w.norm, c.rms_norm_eps, gate_activation::silu);
-    return at::linear(gated.view({ntok, c.linear_n_value_heads * c.linear_value_head_dim}), w.out_proj);
+    return at::linear(gated, w.out_proj);
 }
 
 at::Tensor qwen3_5_moe_model::moe(const at::Tensor& h, std::int64_t layer) const {

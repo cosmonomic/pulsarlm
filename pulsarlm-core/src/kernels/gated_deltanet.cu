@@ -1,3 +1,4 @@
+#include "pulsarlm/kernels/arrival_counters.cuh"
 #include "pulsarlm/kernels/dependent_launch.cuh"
 #include "pulsarlm/kernels/ops.hpp"
 
@@ -83,6 +84,49 @@ template <int lanes> __device__ __forceinline__ float lane_sum(float value) {
         value += __shfl_xor_sync(0xffffffffu, value, offset);
     }
     return value;
+}
+
+// weight * RMSNorm(o) * activation(z) of each value head's output o.
+template <typename scalar_t> struct output_gate {
+    const scalar_t* z;
+    int64_t z_row_stride;
+    const scalar_t* weight;
+    float eps;
+    gate_activation activation;
+};
+
+// y = weight * RMSNorm(x) * activation(z) over dim elements, the normalized x and its product with weight each rounded
+// to scalar_t, the CTA's threads striding them. blockDim.x is a power of two and sums holds blockDim.x floats. y may
+// be x.
+template <typename scalar_t>
+__device__ void gate_row(
+    const scalar_t* x,
+    const scalar_t* __restrict__ z,
+    const output_gate<scalar_t>& gate,
+    scalar_t* y,
+    int dim,
+    float* sums
+) {
+    float local = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        const float v = static_cast<float>(x[i]);
+        local += v * v;
+    }
+    sums[threadIdx.x] = local;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sums[threadIdx.x] += sums[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float inv_rms = rsqrtf(sums[0] / static_cast<float>(dim) + gate.eps);
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        const float normed = rounded<scalar_t>(static_cast<float>(x[i]) * inv_rms);
+        const float scaled = rounded<scalar_t>(static_cast<float>(gate.weight[i]) * normed);
+        const float g = static_cast<float>(z[i]);
+        y[i] = static_cast<scalar_t>(scaled * (gate.activation == gate_activation::silu ? silu(g) : sigmoid(g)));
+    }
 }
 
 // One thread per (token, channel). Reads the running lines only: conv_state_kernel writes them afterwards.
@@ -294,7 +338,9 @@ __global__ void __launch_bounds__(kStepThreads) delta_rule_step_kernel(
     const scalar_t* __restrict__ a,
     const scalar_t* __restrict__ b,
     delta_rule_params p,
-    scalar_t* __restrict__ out
+    output_gate<scalar_t> output,
+    int32_t* __restrict__ head_counters,
+    scalar_t* out
 ) {
     wait_for_prior_kernels();
     allow_next_kernel();
@@ -362,9 +408,15 @@ __global__ void __launch_bounds__(kStepThreads) delta_rule_step_kernel(
             }
         }
     }
+    const int64_t head_row = static_cast<int64_t>(block.s) * p.value_heads + block.head;
+    scalar_t* head_out = out + head_row * p.value_dim;
     if (row_lane == 0) {
-        out[(static_cast<int64_t>(block.s) * p.value_heads + block.head) * p.value_dim +
-            column] = static_cast<scalar_t>(gain * q_state + qk * delta);
+        head_out[column] = static_cast<scalar_t>(gain * q_state + qk * delta);
+    }
+    if (last_to_arrive(head_counters + head_row, p.value_dim / kColumns)) {
+        __shared__ float sums[kStepThreads];
+        const scalar_t* z = output.z + block.s * output.z_row_stride + block.head * p.value_dim;
+        gate_row(head_out, z, output, head_out, p.value_dim, sums);
     }
 }
 
@@ -698,47 +750,17 @@ __global__ void __launch_bounds__(kChunkThreads) delta_rule_chunk_kernel(
     store_state(block.running_state(p));
 }
 
-// One CTA per row. blockDim.x is a power of two.
+// One CTA per (token, value head) of out [tokens, value heads, value dim], gated in place. blockDim.x is a power of
+// two.
 template <typename scalar_t>
-__global__ void gated_rmsnorm_kernel(
-    const scalar_t* __restrict__ x,
-    const scalar_t* __restrict__ z,
-    const scalar_t* __restrict__ weight,
-    scalar_t* __restrict__ y,
-    int64_t dim,
-    int64_t rows_per_token,
-    int64_t z_token_stride,
-    float eps,
-    gate_activation activation
-) {
+__global__ void output_gate_kernel(scalar_t* out, output_gate<scalar_t> gate, int value_heads, int value_dim) {
     wait_for_prior_kernels();
     allow_next_kernel();
-    const int64_t offset = static_cast<int64_t>(blockIdx.x) * dim;
-    const int64_t z_offset = static_cast<int64_t>(blockIdx.x) / rows_per_token * z_token_stride +
-        static_cast<int64_t>(blockIdx.x) % rows_per_token * dim;
-    float local = 0.0f;
-    for (int64_t i = threadIdx.x; i < dim; i += blockDim.x) {
-        const float v = static_cast<float>(x[offset + i]);
-        local += v * v;
-    }
-    extern __shared__ float shared[];
-    shared[threadIdx.x] = local;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            shared[threadIdx.x] += shared[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-    const float inv_rms = rsqrtf(shared[0] / static_cast<float>(dim) + eps);
-    for (int64_t i = threadIdx.x; i < dim; i += blockDim.x) {
-        const float normed = rounded<scalar_t>(static_cast<float>(x[offset + i]) * inv_rms);
-        const float scaled = rounded<scalar_t>(static_cast<float>(weight[i]) * normed);
-        const float gate = static_cast<float>(z[z_offset + i]);
-        y[offset + i] = static_cast<scalar_t>(
-            scaled * (activation == gate_activation::silu ? silu(gate) : sigmoid(gate))
-        );
-    }
+    extern __shared__ float sums[];
+    const int64_t token = blockIdx.x / value_heads;
+    const int head = static_cast<int>(blockIdx.x % value_heads);
+    scalar_t* row = out + static_cast<int64_t>(blockIdx.x) * value_dim;
+    gate_row(row, gate.z + token * gate.z_row_stride + head * value_dim, gate, row, value_dim, sums);
 }
 
 int blocks_for(int64_t threads) {
@@ -920,7 +942,11 @@ at::Tensor gated_delta_rule_cuda(
     const at::Tensor& rows,
     const std::optional<at::Tensor>& cu_seqlens_q,
     const at::Tensor& page_end_tokens,
-    int64_t key_heads
+    int64_t key_heads,
+    const at::Tensor& z,
+    const at::Tensor& norm_weight,
+    double eps,
+    gate_activation activation
 ) {
     check_ragged("gated_delta_rule", x, rows, cu_seqlens_q, page_end_tokens);
     TORCH_CHECK(x.is_contiguous(), "gated_delta_rule: x must be contiguous");
@@ -960,7 +986,17 @@ at::Tensor gated_delta_rule_cuda(
             "gated_delta_rule: dt_bias and neg_a must be contiguous CUDA fp32 [value heads]"
         );
     }
-    at::Tensor out = at::empty({total, value_heads, value_dim}, x.options());
+    TORCH_CHECK(
+        z.scalar_type() == x.scalar_type() && z.dim() == 2 && z.size(0) == total &&
+            z.size(1) == value_heads * value_dim && z.stride(1) == 1,
+        "gated_delta_rule: z must be [tokens, value heads * value dim] in x's dtype, each row contiguous"
+    );
+    TORCH_CHECK(
+        norm_weight.scalar_type() == x.scalar_type() && norm_weight.dim() == 1 && norm_weight.size(0) == value_dim &&
+            norm_weight.is_contiguous(),
+        "gated_delta_rule: norm_weight must be contiguous [value dim] in x's dtype"
+    );
+    at::Tensor out = at::empty({total, value_heads * value_dim}, x.options());
     const int64_t num_seqs = rows.size(0);
     if (num_seqs == 0) {
         return out;
@@ -980,6 +1016,10 @@ at::Tensor gated_delta_rule_cuda(
         a.stride(0),
     };
     const auto blocks = static_cast<int>(num_seqs * value_heads * (value_dim / kColumns));
+    int gate_threads = 1;
+    while (gate_threads < std::min<int64_t>(1024, value_dim)) {
+        gate_threads <<= 1;
+    }
     auto stream = at::cuda::getCurrentCUDAStream();
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "gated_delta_rule_cuda", [&] {
         dispatch_key_dim(key_dim, [&](auto key_dim_tag) {
@@ -988,6 +1028,13 @@ at::Tensor gated_delta_rule_cuda(
             const scalar_t* a_data = a.const_data_ptr<scalar_t>();
             const scalar_t* b_data = b.const_data_ptr<scalar_t>();
             scalar_t* out_data = out.mutable_data_ptr<scalar_t>();
+            const output_gate<scalar_t> gate{
+                z.const_data_ptr<scalar_t>(),
+                z.stride(0),
+                norm_weight.const_data_ptr<scalar_t>(),
+                static_cast<float>(eps),
+                activation,
+            };
             if (!cu_seqlens_q.has_value()) {
                 launch_dependent(
                     delta_rule_step_kernel<scalar_t, kKeyDim>,
@@ -999,6 +1046,8 @@ at::Tensor gated_delta_rule_cuda(
                     a_data,
                     b_data,
                     params,
+                    gate,
+                    arrival_counters(num_seqs * value_heads),
                     out_data
                 );
             } else {
@@ -1023,63 +1072,25 @@ at::Tensor gated_delta_rule_cuda(
                     params,
                     out_data
                 );
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
+                if (total > 0) {
+                    launch_dependent(
+                        output_gate_kernel<scalar_t>,
+                        static_cast<int>(total * value_heads),
+                        gate_threads,
+                        gate_threads * sizeof(float),
+                        stream,
+                        out_data,
+                        gate,
+                        static_cast<int>(value_heads),
+                        static_cast<int>(value_dim)
+                    );
+                }
             }
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         });
     });
     return out;
-}
-
-at::Tensor gated_rmsnorm_cuda(
-    const at::Tensor& x,
-    const at::Tensor& z,
-    const at::Tensor& weight,
-    double eps,
-    gate_activation activation
-) {
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous(), "gated_rmsnorm: x must be a contiguous CUDA tensor");
-    const int64_t dim = x.size(-1);
-    TORCH_CHECK(
-        z.sizes() == x.sizes() && z.scalar_type() == x.scalar_type() && x.dim() >= 2 && x.dim() <= 3 &&
-            z.stride(-1) == 1 && (z.dim() == 2 || z.stride(1) == dim),
-        "gated_rmsnorm: z must be of x's shape and dtype, [tokens, dim] or [tokens, rows, dim], each token's rows "
-        "packed"
-    );
-    TORCH_CHECK(
-        weight.scalar_type() == x.scalar_type() && weight.dim() == 1 && weight.size(0) == dim && weight.is_contiguous(),
-        "gated_rmsnorm: weight must be contiguous [dim] in x's dtype"
-    );
-    at::Tensor y = at::empty_like(x);
-    const int64_t rows = dim == 0 ? 0 : x.numel() / dim;
-    if (rows == 0) {
-        return y;
-    }
-    const int64_t max_threads = std::min<int64_t>(1024, dim);
-    int threads = 1;
-    while (threads < max_threads) {
-        threads <<= 1;
-    }
-    auto stream = at::cuda::getCurrentCUDAStream();
-    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "gated_rmsnorm_cuda", [&] {
-        launch_dependent(
-            gated_rmsnorm_kernel<scalar_t>,
-            static_cast<int>(rows),
-            threads,
-            static_cast<size_t>(threads) * sizeof(float),
-            stream,
-            x.const_data_ptr<scalar_t>(),
-            z.const_data_ptr<scalar_t>(),
-            weight.const_data_ptr<scalar_t>(),
-            y.mutable_data_ptr<scalar_t>(),
-            dim,
-            x.dim() == 3 ? x.size(1) : 1,
-            z.stride(0),
-            static_cast<float>(eps),
-            activation
-        );
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-    });
-    return y;
 }
 
 }  // namespace pulsarlm

@@ -525,7 +525,7 @@ at::Tensor qwen4_exp_model::deltanet(
         g.page_end_tokens,
         /*dilation=*/1
     );
-    at::Tensor core = gated_delta_rule_cuda(
+    at::Tensor gated = gated_delta_rule_cuda(
         convolved,
         projected.narrow(1, channels, value_heads),
         projected.narrow(1, channels + value_heads, value_heads),
@@ -535,15 +535,13 @@ at::Tensor qwen4_exp_model::deltanet(
         g.page_tables.select(0, static_cast<std::int64_t>(state_layer)),
         cu_seqlens_q,
         g.page_end_tokens,
-        heads.linear_n_key_heads
+        heads.linear_n_key_heads,
+        projected.narrow(1, channels + 2 * value_heads, value_heads * c.linear_value_head_dim),
+        w.norm,
+        c.rms_norm_eps,
+        c.linear_output_gate
     );
-    at::Tensor z = projected.narrow(1, channels + 2 * value_heads, value_heads * c.linear_value_head_dim)
-                       .view(core.sizes());
-    at::Tensor gated = gated_rmsnorm_cuda(core, z, w.norm, c.rms_norm_eps, c.linear_output_gate);
-    at::Tensor out = small_batch_linear_cuda(
-        gated.view({ntok, heads.linear_n_value_heads * c.linear_value_head_dim}),
-        w.out_proj
-    );
+    at::Tensor out = small_batch_linear_cuda(gated, w.out_proj);
     comm.all_reduce(out);
     return out;
 }

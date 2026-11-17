@@ -118,13 +118,15 @@ at::Tensor causal_conv_cuda(
     std::int64_t dilation
 );
 
-// The gated delta rule's outputs [tokens, value heads, value dim] in x's dtype. Each row of x [tokens, 2 * key_heads *
-// key dim + value heads * value dim] holds the token's query heads, key heads and value heads; value head h reads key
-// head h / (value heads / key_heads). Queries and keys are L2-normalized, with 1e-6 added to the sum of squares, and
-// queries scaled by 1 / sqrt(key dim). x is contiguous. a and b are [tokens, value heads] in x's dtype, their rows
-// equally far apart: the state decays by
-// exp(neg_a * softplus(a + dt_bias)) and learns at sigmoid(b), rounded to x's dtype; dt_bias and neg_a are fp32
-// [value heads]. A line of state_pool, fp32 [lines, value heads, key dim, value dim], holds a sequence's state.
+// The gated delta rule's gated outputs [tokens, value heads * value dim] in x's dtype. Each row of x [tokens, 2 *
+// key_heads * key dim + value heads * value dim] holds the token's query heads, key heads and value heads; value head h
+// reads key head h / (value heads / key_heads). Queries and keys are L2-normalized, with 1e-6 added to the sum of
+// squares, and queries scaled by 1 / sqrt(key dim). x is contiguous. a and b are [tokens, value heads] in x's dtype,
+// their rows equally far apart: the state decays by exp(neg_a * softplus(a + dt_bias)) and learns at sigmoid(b),
+// rounded to x's dtype; dt_bias and neg_a are fp32 [value heads]. A line of state_pool, fp32 [lines, value heads, key
+// dim, value dim], holds a sequence's state. Each value head's output o, rounded to x's dtype, leaves as norm_weight *
+// RMSNorm(o) * activation(z), the normalized o and its product with norm_weight each rounded to x's dtype; z is
+// [tokens, value heads * value dim] and norm_weight [value dim], both in x's dtype, each row of z contiguous.
 at::Tensor gated_delta_rule_cuda(
     const at::Tensor& x,
     const at::Tensor& a,
@@ -135,16 +137,9 @@ at::Tensor gated_delta_rule_cuda(
     const at::Tensor& rows,
     const std::optional<at::Tensor>& cu_seqlens_q,
     const at::Tensor& page_end_tokens,
-    int64_t key_heads
-);
-
-// weight * RMSNorm(x) * activation(z) over the last axis, the normalized x and its product with weight each rounded to
-// x's dtype. x is contiguous [tokens, dim] or [tokens, rows, dim]; z, of x's shape, may hold its tokens apart, each
-// token's rows packed. z and weight are in x's dtype.
-at::Tensor gated_rmsnorm_cuda(
-    const at::Tensor& x,
+    int64_t key_heads,
     const at::Tensor& z,
-    const at::Tensor& weight,
+    const at::Tensor& norm_weight,
     double eps,
     gate_activation activation
 );
