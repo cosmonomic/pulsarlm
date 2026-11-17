@@ -236,7 +236,7 @@ at::Tensor qwen3_5_moe_model::moe(const at::Tensor& h, std::int64_t layer) const
         m.experts_down_proj,
         expert_activation::silu
     );
-    return routed + at::sigmoid(at::linear(h, m.shared_expert_gate)) * shared;
+    return sigmoid_gated_add_cuda(routed, at::linear(h, m.shared_expert_gate), shared);
 }
 
 at::Tensor qwen3_5_moe_model::group_forward(const group_batch& g, std::span<const kv> lines) const {

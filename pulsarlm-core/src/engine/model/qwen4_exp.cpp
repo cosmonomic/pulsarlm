@@ -389,13 +389,18 @@ at::Tensor qwen4_exp_model::mixed_streams(const at::Tensor& normed, const mixer_
 }
 
 qwen4_exp_model::mixed_input qwen4_exp_model::mix(const at::Tensor& x, const hyper_connection_weights& w) const {
-    at::Tensor normed = stream_norm(x, w.hc_norm);
-    at::Tensor projected = at::linear(normed, w.down_and_inject);
+    auto [normed, projected] = stream_rmsnorm_linear_cuda(
+        x.contiguous(),
+        w.hc_norm,
+        x.size(1) / config.hidden_size,
+        config.rms_norm_eps,
+        w.down_and_inject
+    );
     const std::int64_t rank = w.input_mix_weight_up.size(1);
-    at::Tensor mix_weights = at::silu(projected.narrow(1, 0, rank) / static_cast<double>(config.hc_count));
     auto [input, injection_weights] = hyper_connection_mix_cuda(
         normed,
-        at::linear(mix_weights, w.input_mix_weight_up),
+        projected.narrow(1, 0, rank),
+        w.input_mix_weight_up,
         projected.narrow(1, rank, config.hc_count)
     );
     return mixed_input{.input = input, .injection_weights = injection_weights};
@@ -418,7 +423,7 @@ at::Tensor qwen4_exp_model::attention(
 
     at::Tensor query_gate = at::linear(h, w.q_proj).view({ntok, heads.n_heads, 2 * c.head_dim});
     at::Tensor q = rmsnorm_cuda(query_gate.narrow(-1, 0, c.head_dim), w.q_norm, c.rms_norm_eps);
-    at::Tensor gate = query_gate.narrow(-1, c.head_dim, c.head_dim).reshape({ntok, heads.n_heads * c.head_dim});
+    at::Tensor gate = query_gate.narrow(-1, c.head_dim, c.head_dim);
     q = rope_q(q.view({ntok, heads.n_heads * c.head_dim}), g.pos, heads.n_heads, c.head_dim, rope);
     at::Tensor k = rmsnorm_cuda(
         at::linear(h, w.k_proj).view({ntok, heads.n_kv_heads, c.head_dim}),
@@ -483,7 +488,10 @@ at::Tensor qwen4_exp_model::attention(
         cu_view_pages,
         query_weights
     );
-    at::Tensor out = at::linear(o.reshape({ntok, heads.n_heads * c.head_dim}) * at::sigmoid(gate), w.o_proj);
+    at::Tensor out = at::linear(
+        sigmoid_gated_cuda(o.view({ntok, heads.n_heads, c.head_dim}), gate).view({ntok, heads.n_heads * c.head_dim}),
+        w.o_proj
+    );
     comm.all_reduce(out);
     return out;
 }
@@ -550,7 +558,7 @@ at::Tensor qwen4_exp_model::moe(const at::Tensor& h, std::int64_t layer) const {
         expert_activation::silu
     );
     at::Tensor shared = at::linear(silu_mul_cuda(at::linear(h, m.shared_gate_up_proj)), m.shared_down_proj);
-    at::Tensor out = routed + at::sigmoid(logits.narrow(1, experts, 1)) * shared;
+    at::Tensor out = sigmoid_gated_add_cuda(routed, logits.narrow(1, experts, 1), shared);
     comm.all_reduce(out);
     return out;
 }

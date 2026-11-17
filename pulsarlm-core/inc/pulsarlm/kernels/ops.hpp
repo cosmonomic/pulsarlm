@@ -21,19 +21,39 @@ at::Tensor rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, double ep
 // contiguous [tokens, n_streams * hidden], weight fp32 [n_streams * hidden].
 at::Tensor stream_rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, int64_t n_streams, double eps);
 
-// A hyper-connection's block input and injection weights from its normed streams [tokens, hc * hidden], their gate
-// logits [tokens, hc * hidden] and the injection logits [tokens, hc], whose rows may lie apart: the mean over streams
-// of sigmoid(gate) times the stream [tokens, hidden], and 2 * sigmoid(inject_logits / hc) [tokens, hc], each
-// operation rounded to the dtype as the ATen ops round it.
+// Each stream's RMSNorm of x as stream_rmsnorm_cuda computes it, and that normed x times weight^T [out,
+// n_streams * hidden], in x's dtype: (normed, projected). Batches of up to 4 tokens run as one kernel.
+std::tuple<at::Tensor, at::Tensor> stream_rmsnorm_linear_cuda(
+    const at::Tensor& x,
+    const at::Tensor& norm_weight,
+    int64_t n_streams,
+    double eps,
+    const at::Tensor& weight
+);
+
+// A hyper-connection's block input and injection weights from its normed streams [tokens, hc * hidden], its low-rank
+// mix logits [tokens, rank], the up projection [hc * hidden, rank] and the injection logits [tokens, hc], whose rows
+// may lie apart: with gate logits silu(mix_logits / hc) times up^T, the mean over streams of sigmoid(gate) times the
+// stream [tokens, hidden], and 2 * sigmoid(inject_logits / hc) [tokens, hc], each operation rounded to the dtype as the
+// ATen ops round it. Batches of up to 4 tokens run as one kernel.
 std::tuple<at::Tensor, at::Tensor> hyper_connection_mix_cuda(
     const at::Tensor& normed,
-    const at::Tensor& gate_logits,
+    const at::Tensor& mix_logits,
+    const at::Tensor& up_weight,
     const at::Tensor& inject_logits
 );
 
 // x [tokens, hc * hidden] plus, in each stream, the block output out [tokens, hidden] times that stream's injection
 // weight [tokens, hc], the product rounded to the dtype.
 at::Tensor hyper_connection_inject_cuda(const at::Tensor& x, const at::Tensor& out, const at::Tensor& injection_weights);
+
+// x + sigmoid(gate_logits) * y for x and y contiguous [rows, columns] and gate_logits [rows, 1], whose rows may lie
+// apart, each operation rounded to the dtype as the ATen ops round it.
+at::Tensor sigmoid_gated_add_cuda(const at::Tensor& x, const at::Tensor& gate_logits, const at::Tensor& y);
+
+// y * sigmoid(gate_logits) for y contiguous [rows, columns] or [rows, middle, columns] and gate_logits of its sizes with
+// a contiguous last axis, each operation rounded to the dtype as the ATen ops round it.
+at::Tensor sigmoid_gated_cuda(const at::Tensor& y, const at::Tensor& gate_logits);
 
 // A router's choice per token from its logits [tokens, experts], whose rows may lie apart: (weights, experts), the k
 // most probable experts by the softmax in fp32 as int64 [tokens, k], in descending order with the lower expert first
