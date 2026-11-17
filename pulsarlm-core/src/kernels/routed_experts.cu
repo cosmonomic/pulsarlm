@@ -1,3 +1,4 @@
+#include "pulsarlm/kernels/arrival_counters.cuh"
 #include "pulsarlm/kernels/dependent_launch.cuh"
 #include "pulsarlm/kernels/mma.cuh"
 #include "pulsarlm/kernels/ops.hpp"
@@ -139,7 +140,9 @@ __device__ __forceinline__ int staged_offset(int row, int vector) {
 // up rows [n + n0, n + n0 + 32), x's rows are those of the tile's sorted tokens, and out [rows, n] holds
 // activation(gate) * up. Otherwise the block is the rows [n0, n0 + 64), x's rows are the tile's rows, and out
 // [rows, n] holds the products. With partial, split blockIdx.z of the gated product covers chunks_per_split chunks of
-// k and writes its fp32 gate and up sums into partial [gridDim.z, rows of every tile, 2 * n] in place of out.
+// k and writes its fp32 gate and up sums into partial [gridDim.z, rows of every tile, 2 * n]; the last split of a
+// block to finish, found through block_counters [gridDim.x * gridDim.y], sums the splits in split order and writes
+// out.
 template <typename scalar_t, bool bf16, bool gated>
 __global__ void __launch_bounds__(kGemmThreads) expert_tile_gemm_kernel(
     const scalar_t* __restrict__ x,
@@ -154,8 +157,9 @@ __global__ void __launch_bounds__(kGemmThreads) expert_tile_gemm_kernel(
     expert_activation activation,
     scalar_t* __restrict__ out,
     int chunks_per_split,
-    float* __restrict__ partial,
-    int64_t partial_rows
+    float* partial,
+    int64_t partial_rows,
+    int32_t* __restrict__ block_counters
 ) {
     wait_for_prior_kernels();
     allow_next_kernel();
@@ -289,6 +293,29 @@ __global__ void __launch_bounds__(kGemmThreads) expert_tile_gemm_kernel(
             }
         }
     }
+    if constexpr (gated) {
+        if (partial == nullptr ||
+            !last_to_arrive(block_counters + blockIdx.x * gridDim.y + blockIdx.y, static_cast<int>(gridDim.z))) {
+            return;
+        }
+        for (int index = tid; index < rows * kBlockColumns; index += kGemmThreads) {
+            const int64_t row = first_row + index / kBlockColumns;
+            const int column = n0 + index % kBlockColumns;
+            if (column >= n) {
+                continue;
+            }
+            float gate = 0.0f;
+            float up = 0.0f;
+            for (int split = 0; split < static_cast<int>(gridDim.z); split++) {
+                const float* partial_row = partial + (split * partial_rows + row) * 2 * n;
+                gate += partial_row[column];
+                up += partial_row[n + column];
+            }
+            out[row * n + column] = static_cast<scalar_t>(
+                __fmul_rn(rounded<scalar_t>(activated(rounded<scalar_t>(gate), activation)), rounded<scalar_t>(up))
+            );
+        }
+    }
 }
 
 // One thread per (sorted row, column), the fp32 form of expert_tile_gemm_kernel.
@@ -326,37 +353,6 @@ __global__ void expert_rows_scalar_kernel(
         return sum;
     };
     out[index] = gated ? activated(dot(column), activation) * dot(n + column) : dot(column);
-}
-
-// Sums the splits of expert_tile_gemm_kernel's gated product in split order and writes activation(gate) * up as its
-// unsplit form does, one thread per (row, column).
-template <typename scalar_t>
-__global__ void join_gate_up_splits_kernel(
-    const float* __restrict__ partial,
-    int splits,
-    int64_t rows,
-    int n,
-    expert_activation activation,
-    scalar_t* __restrict__ out
-) {
-    wait_for_prior_kernels();
-    allow_next_kernel();
-    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index >= rows * n) {
-        return;
-    }
-    const int64_t row = index / n;
-    const int column = static_cast<int>(index % n);
-    float gate = 0.0f;
-    float up = 0.0f;
-    for (int split = 0; split < splits; split++) {
-        const float* partial_row = partial + (split * rows + row) * 2 * n;
-        gate += partial_row[column];
-        up += partial_row[n + column];
-    }
-    out[index] = static_cast<scalar_t>(
-        __fmul_rn(rounded<scalar_t>(activated(rounded<scalar_t>(gate), activation)), rounded<scalar_t>(up))
-    );
 }
 
 // Sums each token's expert outputs weighted by top_weights in fp32 in top_k order, one thread per (token, column).
@@ -441,25 +437,10 @@ void launch_tile_gemms(
         activations.mutable_data_ptr<scalar_t>(),
         static_cast<int>(chunks_per_split),
         used_splits > 1 ? partial.mutable_data_ptr<float>() : nullptr,
-        assignments
+        assignments,
+        used_splits > 1 ? arrival_counters(gate_up_grid.x * gate_up_grid.y) : nullptr
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    if (used_splits > 1) {
-        launch_dependent(
-            join_gate_up_splits_kernel<scalar_t>,
-            element_blocks(assignments * intermediate),
-            kElementThreads,
-            0,
-            stream,
-            partial.const_data_ptr<float>(),
-            static_cast<int>(used_splits),
-            assignments,
-            static_cast<int>(intermediate),
-            activation,
-            activations.mutable_data_ptr<scalar_t>()
-        );
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-    }
     const dim3 down_grid(
         static_cast<unsigned>(max_tiles),
         static_cast<unsigned>((hidden + kTileWeightRows - 1) / kTileWeightRows)
@@ -483,7 +464,8 @@ void launch_tile_gemms(
         expert_out.mutable_data_ptr<scalar_t>(),
         static_cast<int>((intermediate + kChunkK - 1) / kChunkK),
         nullptr,
-        assignments
+        assignments,
+        nullptr
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
