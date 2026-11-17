@@ -127,12 +127,46 @@ __global__ void index_blocks_kernel(
     blocks[static_cast<int64_t>(blockIdx.x) * dim + d] = out;
 }
 
-constexpr int kSelectThreads = 256;
+constexpr int kSelectThreads = 1024;
 
 // A score's place in descending order as an unsigned key: scores are -inf or non-negative, and the bits of a
 // non-negative float order as its value; -inf takes 0, below every block that can be chosen.
 __device__ __forceinline__ uint32_t score_key(float score) {
     return score == -CUDART_INF_F ? 0u : __float_as_uint(score) + 1u;
+}
+
+// The sum of value over threads [0, threadIdx.x) of the block; sums holds kSelectThreads / 32 entries.
+__device__ int block_exclusive_sum(int value, int* sums) {
+    static_assert(kSelectThreads % 32 == 0 && kSelectThreads / 32 <= 32, "one warp scans the warp sums");
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    int inclusive = value;
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        const int other = __shfl_up_sync(0xffffffffu, inclusive, offset);
+        if (lane >= offset) {
+            inclusive += other;
+        }
+    }
+    if (lane == 31) {
+        sums[warp] = inclusive;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        int warp_sum = lane < kSelectThreads / 32 ? sums[lane] : 0;
+        for (int offset = 1; offset < 32; offset <<= 1) {
+            const int other = __shfl_up_sync(0xffffffffu, warp_sum, offset);
+            if (lane >= offset) {
+                warp_sum += other;
+            }
+        }
+        if (lane < kSelectThreads / 32) {
+            sums[lane] = warp_sum;
+        }
+    }
+    __syncthreads();
+    const int result = inclusive - value + (warp > 0 ? sums[warp - 1] : 0);
+    __syncthreads();
+    return result;
 }
 
 // One CTA per row. The k-th largest key comes from four radix passes of 8 bits over the row; the blocks above it are
@@ -150,7 +184,8 @@ __global__ void select_blocks_kernel(
     __shared__ uint32_t histogram[256];
     __shared__ uint32_t prefix;
     __shared__ int remaining;
-    __shared__ int tie_counts[kSelectThreads];
+    __shared__ int warp_sums[kSelectThreads / 32];
+    static_assert(kSelectThreads >= 256, "a thread per radix digit");
     const int64_t row = blockIdx.x;
     const float* row_scores = scores + row * max_blocks;
     uint32_t* row_bits = reinterpret_cast<uint32_t*>(selected) + row * words;
@@ -176,13 +211,13 @@ __global__ void select_blocks_kernel(
             }
         }
         __syncthreads();
-        if (tid == 0) {
-            int above = 0;
-            int digit = 255;
-            for (; digit > 0 && above + static_cast<int>(histogram[digit]) < remaining; --digit) {
-                above += static_cast<int>(histogram[digit]);
-            }
-            remaining -= above;
+        // Thread t below 256 holds digit 255 - t, so the digits run from the highest.
+        const int digit = 255 - tid;
+        const int count = tid < 256 ? static_cast<int>(histogram[digit]) : 0;
+        const int wanted = remaining;
+        const int above = block_exclusive_sum(count, warp_sums);
+        if (tid < 256 && (above + count >= wanted || digit == 0) && above < wanted) {
+            remaining = wanted - above;
             prefix |= static_cast<uint32_t>(digit) << shift;
         }
         __syncthreads();
@@ -196,12 +231,7 @@ __global__ void select_blocks_kernel(
     for (int64_t b = first; b < end; ++b) {
         ties += score_key(row_scores[b]) == threshold;
     }
-    tie_counts[tid] = ties;
-    __syncthreads();
-    int tie_rank = 0;
-    for (int t = 0; t < tid; ++t) {
-        tie_rank += tie_counts[t];
-    }
+    int tie_rank = block_exclusive_sum(ties, warp_sums);
     for (int64_t b = first; b < end; ++b) {
         const uint32_t key = score_key(row_scores[b]);
         bool chosen = key > threshold;
