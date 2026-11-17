@@ -146,6 +146,7 @@ def make_engine(store: MemoryStore, store_pages: int = 0) -> Engine:
         devices=[DEVICE],
         stop_ids=[],
         prefill_tokens_per_step=64,
+        decode_graphs=True,
     )
 
 
@@ -412,6 +413,7 @@ def test_a_cache_without_a_line_or_a_negative_store_is_rejected(
             devices=[DEVICE],
             stop_ids=[],
             prefill_tokens_per_step=64,
+            decode_graphs=True,
         )
 
 

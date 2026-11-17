@@ -115,6 +115,7 @@ def make_engine(store: LocalStore | EmptyStore) -> AsyncEngine:
             devices=[DEVICE],
             stop_ids=[],
             prefill_tokens_per_step=64,
+            decode_graphs=True,
         )
     )
 

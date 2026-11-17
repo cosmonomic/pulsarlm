@@ -584,7 +584,8 @@ struct fixture {
           compute_streams(),
           {},
           root(),
-          std::move(stop_ids)
+          std::move(stop_ids),
+          false
       ),
       sched(exec, prefill_tokens_per_step) {}
 

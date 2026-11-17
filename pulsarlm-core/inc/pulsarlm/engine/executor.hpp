@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "pulsarlm/digest.hpp"
+#include "pulsarlm/engine/decode_graphs.hpp"
 #include "pulsarlm/engine/event_loop.hpp"
 #include "pulsarlm/engine/kv_cache.hpp"
 #include "pulsarlm/engine/model/interface.hpp"
@@ -35,6 +36,8 @@ class executor {
     page_store& store;
     // Per shard, one kv per KV layer.
     std::vector<std::vector<kv>> lines;
+    // One per shard, or none when decode groups forward without graphs.
+    std::vector<std::unique_ptr<decode_graphs>> graphs;
     std::vector<std::optional<std::size_t>> sliding_windows;
     std::vector<bool> recurrent;
     // Per KV layer, the query heads it measures mass and evicts pages in: those of every attention layer reading a
@@ -87,7 +90,8 @@ class executor {
   public:
     // shards[s] runs on cache shard s with streams[s], shards 1 on on worker_loops[s - 1]; the cache holds one layer
     // per entry of each model's kv_layers(), and the shards agree on which layers are recurrent or sliding. store is the
-    // cache's. root is the engine's root digest (make_root_digest).
+    // cache's. root is the engine's root digest (make_root_digest). With capture_decode, decode groups forward through
+    // decode_graphs.
     executor(
         std::vector<model*>&& shards,
         kv_cache cache,
@@ -95,7 +99,8 @@ class executor {
         std::vector<cudaStream_t>&& streams,
         std::vector<event_loop*>&& worker_loops,
         digest root,
-        std::vector<std::int64_t>&& stop_ids
+        std::vector<std::int64_t>&& stop_ids,
+        bool capture_decode
     );
 
     // The sequence of r, resuming the newest state the store holds for a prefix of its tokens, with lines for its

@@ -94,7 +94,8 @@ std::unique_ptr<python_engine> make_engine(
     double kv_cache_gib,
     double store_gib,
     std::vector<std::int64_t> stop_ids,
-    std::size_t prefill_tokens_per_step
+    std::size_t prefill_tokens_per_step,
+    bool decode_graphs
 ) {
     if (!(kv_cache_gib > 0.0) || !(store_gib >= 0.0)) {
         throw std::invalid_argument("kv_cache_gib must be positive and store_gib not negative");
@@ -108,6 +109,7 @@ std::unique_ptr<python_engine> make_engine(
         .devices = std::move(devices),
         .stop_ids = std::move(stop_ids),
         .prefill_tokens_per_step = prefill_tokens_per_step,
+        .decode_graphs = decode_graphs,
     };
     auto adapter = std::make_unique<python_store>(
         std::move(store),
@@ -711,7 +713,8 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "kv_cache_gib"_a = 4.0,
             "store_gib"_a,
             "stop_ids"_a,
-            "prefill_tokens_per_step"_a
+            "prefill_tokens_per_step"_a,
+            "decode_graphs"_a
         )
         .def(
             "submit",

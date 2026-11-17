@@ -79,6 +79,7 @@ def load_served_model(
             store_gib=settings.store_gib,
             stop_ids=stops,
             prefill_tokens_per_step=settings.prefill_tokens_per_step,
+            decode_graphs=settings.decode_graphs,
         )
     except ValueError as error:
         raise checkpoint.PulsarLMModelLoadingError(str(error)) from error

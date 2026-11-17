@@ -157,6 +157,7 @@ def load(
         devices=[DEVICE],
         stop_ids=stop_ids,
         prefill_tokens_per_step=64,
+        decode_graphs=True,
     )
     return ServerState(
         engine=AsyncEngine(engine),

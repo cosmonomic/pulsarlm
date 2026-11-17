@@ -1,7 +1,11 @@
 #include "pulsarlm/engine/model/qwen3.hpp"
 
+#include "pulsarlm/engine/decode_graphs.hpp"
+
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAFunctions.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -11,7 +15,8 @@
 #include <vector>
 
 // qwen3_model's paged forward against a dense ATen Qwen3: chunked prefill then decode over pages scattered across the
-// lines, checking the logits, the unrotated K the lines hold, and the per-page attention mass.
+// lines, checking the logits, the unrotated K the lines hold, and the per-page attention mass. The decode steps forward
+// through the model or through decode_graphs.
 
 namespace {
 
@@ -171,6 +176,7 @@ pulsarlm::group_batch step(const at::Tensor& tokens, std::int64_t first, std::in
         .tokens = tokens.narrow(0, first, last - first),
         .pos = at::arange(first, last, cuda(at::kLong)),
         .page_tables = every_layer(int32_cuda(view_lines).view({1, -1})),
+        .page_end_tokens = int32_cuda({static_cast<std::int32_t>(last / page_size * page_size > first ? last / page_size * page_size - first : 0)}),
         .page_positions = every_layer(
             (at::arange(static_cast<std::int64_t>(view_lines.size()), cuda(at::kInt)) * page_size).view({1, -1})
         ),
@@ -196,7 +202,9 @@ double max_relative_error(const at::Tensor& got, const at::Tensor& expected) {
     return ((got.to(at::kFloat) - expected).abs().max() / expected.abs().max()).item<double>();
 }
 
-void check_against_dense(at::ScalarType dtype, double tolerance) {
+void check_against_dense(at::ScalarType dtype, double tolerance, bool graphs) {
+    // A CUDA graph is captured on a stream other than the default one.
+    c10::cuda::CUDAStreamGuard guard(c10::cuda::getStreamFromPool());
     weights w(dtype);
     pulsarlm::qwen3_model model(
         pulsarlm::dense_config{
@@ -220,6 +228,8 @@ void check_against_dense(at::ScalarType dtype, double tolerance) {
         );
     }
 
+    pulsarlm::decode_graphs decode(model, kv);
+
     const std::int64_t n_tokens = 40;
     auto tokens = at::randint(vocab, {n_tokens}, cuda(at::kLong));
     dense_output dense = dense_forward(w, tokens);
@@ -234,7 +244,12 @@ void check_against_dense(at::ScalarType dtype, double tolerance) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
         pulsarlm::step_batch batch;
         (c.prefill ? batch.prefill_group : batch.decode_group) = step(tokens, c.first, c.last, c.prefill);
-        pulsarlm::step_logits logits = model.forward(batch, kv);
+        pulsarlm::step_logits logits;
+        if (graphs && !c.prefill) {
+            logits.decode_logits = decode.forward(*batch.decode_group);
+        } else {
+            logits = model.forward(batch, kv);
+        }
         const pulsarlm::group_batch& g = c.prefill ? *batch.prefill_group : *batch.decode_group;
 
         auto expected_logits = dense.logits.narrow(0, c.first, c.last - c.first);
@@ -259,12 +274,20 @@ TEST_CASE("Qwen3 matches a dense forward in fp32", "[model][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
-    check_against_dense(at::kFloat, 1e-4);
+    check_against_dense(at::kFloat, 1e-4, false);
 }
 
 TEST_CASE("Qwen3 matches a dense forward in bf16", "[model][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
-    check_against_dense(at::kBFloat16, 1e-2);
+    check_against_dense(at::kBFloat16, 1e-2, false);
+}
+
+TEST_CASE("Qwen3's decode steps replayed from CUDA graphs match a dense forward", "[model][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    check_against_dense(at::kFloat, 1e-4, true);
+    check_against_dense(at::kBFloat16, 1e-2, true);
 }

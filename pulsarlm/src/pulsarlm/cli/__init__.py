@@ -74,6 +74,13 @@ PrefillTokensPerStep = Annotated[
         rich_help_panel="Memory",
     ),
 ]
+DecodeGraphs = Annotated[
+    bool,
+    typer.Option(
+        "--decode_graphs/--no_decode_graphs",
+        help="Replay decode steps from CUDA graphs.",
+    ),
+]
 StoreGib = Annotated[
     float,
     typer.Option(
@@ -187,6 +194,7 @@ def serve(
     dtype: WeightDType = DType.bfloat16,
     kv_cache_gib: KvCacheGib = 4.0,
     prefill_tokens_per_step: PrefillTokensPerStep = 512,
+    decode_graphs: DecodeGraphs = True,
     store_gib: StoreGib = 4.0,
     persist: Persist = False,
     prefix_cache: PrefixCache = True,
@@ -219,6 +227,7 @@ def serve(
                 dtype=dtype,
                 kv_cache_gib=kv_cache_gib,
                 prefill_tokens_per_step=prefill_tokens_per_step,
+                decode_graphs=decode_graphs,
                 store_gib=store_gib,
                 persist=persist,
                 prefix_cache=prefix_cache,
@@ -292,6 +301,7 @@ def chat(
     dtype: WeightDType = DType.bfloat16,
     kv_cache_gib: KvCacheGib = 4.0,
     prefill_tokens_per_step: PrefillTokensPerStep = 512,
+    decode_graphs: DecodeGraphs = True,
     store_gib: StoreGib = 4.0,
     persist: Persist = False,
     prefix_cache: PrefixCache = True,
@@ -315,6 +325,7 @@ def chat(
                 dtype=dtype,
                 kv_cache_gib=kv_cache_gib,
                 prefill_tokens_per_step=prefill_tokens_per_step,
+                decode_graphs=decode_graphs,
                 store_gib=store_gib,
                 persist=persist,
                 prefix_cache=prefix_cache,
