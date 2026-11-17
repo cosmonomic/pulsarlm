@@ -119,6 +119,39 @@ TEST_CASE("routed_experts routes each token to its most probable experts by its 
     CHECK(max_relative_error(got, expected) < (dtype == at::kFloat ? 1e-5 : 2e-2));
 }
 
+// Logits of four distinct values, so that a token's k-th expert ties with others. Each token takes the experts of a
+// stable descending sort of its probabilities, the lower expert first among equals, weighted by their renormalized
+// probabilities, as the top_experts form given those does.
+TEST_CASE("routed_experts takes the lower expert among tied router logits", "[ops][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const int64_t tokens = 64;
+    const int64_t top_k = GENERATE(1, 3, 8);
+    // 2048 experts give each routing thread two of them.
+    const int64_t experts = GENERATE(kExperts, int64_t{2048});
+    const int64_t hidden = 96;
+    const int64_t intermediate = 40;
+    INFO("top_k " << top_k << " experts " << experts);
+    at::manual_seed(13);
+    at::Tensor h = at::randn({tokens, hidden}, cuda(at::kFloat));
+    at::Tensor gate_up_proj = at::randn({experts, 2 * intermediate, hidden}, cuda(at::kFloat)) / std::sqrt(hidden);
+    at::Tensor down_proj = at::randn({experts, hidden, intermediate}, cuda(at::kFloat)) / std::sqrt(intermediate);
+    at::Tensor router_logits = at::floor(at::rand({tokens, experts}, cuda(at::kFloat)) * 4.0);
+    const auto activation = pulsarlm::expert_activation::silu;
+
+    at::Tensor got = pulsarlm::routed_experts_cuda(h, router_logits, top_k, 0, gate_up_proj, down_proj, activation);
+
+    at::Tensor probabilities = at::softmax(router_logits, -1, at::kFloat);
+    auto [sorted, order] = at::sort(probabilities, /*stable=*/true, /*dim=*/-1, /*descending=*/true);
+    at::Tensor top_experts = order.narrow(1, 0, top_k).contiguous();
+    at::Tensor top_probabilities = sorted.narrow(1, 0, top_k);
+    at::Tensor top_weights = (top_probabilities / top_probabilities.sum(-1, true)).contiguous();
+    at::Tensor
+        expected = pulsarlm::routed_experts_cuda(h, top_experts, top_weights, gate_up_proj, down_proj, activation);
+    CHECK(max_relative_error(got, expected) < 1e-6);
+}
+
 TEST_CASE("routed_experts over each GPU's held experts sums to routed_experts over all of them", "[ops][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");

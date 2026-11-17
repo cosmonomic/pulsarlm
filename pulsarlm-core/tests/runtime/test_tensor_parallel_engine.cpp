@@ -395,7 +395,8 @@ class recording_callbacks final : public pulsarlm::request_callbacks {
     }
 };
 
-pulsarlm::engine_config engine_config(std::size_t shard_count) {
+// With decode_graphs, decoding sequences replay graphs over views of up to 1024 tokens.
+pulsarlm::engine_config engine_config(std::size_t shard_count, bool decode_graphs = false) {
     return pulsarlm::engine_config{
         .model_name = "qwen3_5-test",
         .model_hash = "1",
@@ -405,6 +406,8 @@ pulsarlm::engine_config engine_config(std::size_t shard_count) {
         .devices = std::vector<at::Device>(shard_count, at::Device(at::kCUDA, 0)),
         .stop_ids = {},
         .prefill_tokens_per_step = 32,
+        .decode_graphs = decode_graphs,
+        .max_context_window = decode_graphs ? std::optional<std::size_t>(1024) : std::nullopt,
     };
 }
 
@@ -413,7 +416,8 @@ std::unique_ptr<pulsarlm::engine> make_engine(
     const c10::Dict<std::string, at::Tensor>& weights,
     std::int64_t kv_heads,
     std::size_t shard_count,
-    const std::shared_ptr<store_contents>& contents
+    const std::shared_ptr<store_contents>& contents,
+    bool decode_graphs = false
 ) {
     std::vector<std::unique_ptr<pulsarlm::model>> shards;
     if (shard_count == 1) {
@@ -435,7 +439,12 @@ std::unique_ptr<pulsarlm::engine> make_engine(
     }
     auto store = std::make_unique<memory_store>();
     store->contents = contents;
-    return std::make_unique<pulsarlm::engine>(std::move(shards), vocab, engine_config(shard_count), std::move(store));
+    return std::make_unique<pulsarlm::engine>(
+        std::move(shards),
+        vocab,
+        engine_config(shard_count, decode_graphs),
+        std::move(store)
+    );
 }
 
 struct served {
@@ -595,4 +604,59 @@ TEST_CASE("an engine split over two ranks serves as the engine of the whole mode
     const store_comparison stores = compare_stores(*split_contents, *whole_contents);
     INFO(stores.identical_pages << " of " << whole_contents->pages.size() << " pages equal byte for byte");
     CHECK(stores.largest_error < tolerance);
+}
+
+pulsarlm::request sampled_request() {
+    return pulsarlm::request{
+        .tokens = random_tokens(prompt_tokens, 3),
+        .sampling = pulsarlm::sampling_params{.temperature = 0.8, .seed = 7},
+        .max_tokens = decode_tokens,
+        .eviction = eviction,
+    };
+}
+
+// Most decode steps complete no page, so each is launched before the previous one is written back and every rank reads
+// its awaited tokens from its own samples: a rank sampling differently would forward another token and change the
+// logits of every rank.
+TEST_CASE("an engine split over two ranks samples as the whole model while its steps overlap", "[runtime][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const c10::Dict<std::string, at::Tensor> weights = full_weights(n_kv_heads);
+    served whole;
+    served split;
+    {
+        auto whole_contents = std::make_shared<store_contents>();
+        auto split_contents = std::make_shared<store_contents>();
+        std::unique_ptr<pulsarlm::engine> whole_engine = make_engine(weights, n_kv_heads, 1, whole_contents);
+        std::unique_ptr<pulsarlm::engine> split_engine = make_engine(weights, n_kv_heads, ranks, split_contents);
+        whole = serve(*whole_engine, sampled_request());
+        split = serve(*split_engine, sampled_request());
+    }
+    REQUIRE(whole.tokens.size() == decode_tokens);
+    CHECK(split.tokens == whole.tokens);
+    check_same_state(split.end_state, whole.end_state);
+}
+
+// The ranks of a communicator on one device cannot capture graphs at once, so the graphs run on one rank: each replay
+// fills its awaited tokens from the previous step's samples.
+TEST_CASE("decode graphs sample as the eager forward while steps overlap", "[runtime][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const c10::Dict<std::string, at::Tensor> weights = full_weights(n_kv_heads);
+    served eager;
+    served replayed;
+    {
+        auto eager_contents = std::make_shared<store_contents>();
+        auto replayed_contents = std::make_shared<store_contents>();
+        std::unique_ptr<pulsarlm::engine> eager_engine = make_engine(weights, n_kv_heads, 1, eager_contents);
+        std::unique_ptr<pulsarlm::engine>
+            replayed_engine = make_engine(weights, n_kv_heads, 1, replayed_contents, /*decode_graphs=*/true);
+        eager = serve(*eager_engine, sampled_request());
+        replayed = serve(*replayed_engine, sampled_request());
+    }
+    REQUIRE(eager.tokens.size() == decode_tokens);
+    CHECK(replayed.tokens == eager.tokens);
+    check_same_state(replayed.end_state, eager.end_state);
 }

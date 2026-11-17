@@ -72,6 +72,10 @@ at::Tensor sigmoid_gated_cuda(const at::Tensor& y, const at::Tensor& gate_logits
 // silu(x[:, :n]) * x[:, n:] for contiguous x [tokens, 2 * n], silu rounded to the dtype before the product.
 at::Tensor silu_mul_cuda(const at::Tensor& x);
 
+// Replaces in place each negative token -(r + 1) of tokens (contiguous int64 [rows]) by samples[r], an earlier
+// step's sampled tokens (int64) on tokens' device; the other tokens stay.
+void fill_awaited_tokens_cuda(const at::Tensor& tokens, const at::Tensor& samples);
+
 // x [tokens, in] times weight^T [out, in] in x's dtype, as at::linear; batches of 1 to 4 fp16 or bf16 tokens run as one
 // matrix-vector kernel, others through cuBLAS.
 at::Tensor small_batch_linear_cuda(const at::Tensor& x, const at::Tensor& weight);

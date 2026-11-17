@@ -1,5 +1,7 @@
 #include "pulsarlm/engine/decode_graphs.hpp"
 
+#include "pulsarlm/kernels/ops.hpp"
+
 #include <ATen/ATen.h>
 
 #include <algorithm>
@@ -22,10 +24,12 @@ decode_graphs::decode_graphs(
     model& shard_model,
     std::span<const kv> lines,
     std::size_t width,
-    std::vector<std::size_t> mass_heads
+    std::vector<std::size_t> mass_heads,
+    at::Tensor samples
 )
 : shard_model(shard_model),
   lines(lines.begin(), lines.end()),
+  samples(std::move(samples)),
   width(static_cast<std::int64_t>(width)),
   mass_heads(std::move(mass_heads)) {
     auto floats = this->lines.front().k.options().dtype(at::kFloat);
@@ -83,6 +87,7 @@ std::unique_ptr<decode_graphs::captured_forward> decode_graphs::capture(std::int
     const group_batch& inputs = captured->inputs;
     // Thread-local capture leaves the other GPUs' threads free to launch while this one captures.
     captured->graph.capture_begin({0, 0}, cudaStreamCaptureModeThreadLocal);
+    fill_awaited_tokens_cuda(inputs.tokens, samples);
     captured->logits = *shard_model.forward(step_batch{.decode_group = inputs}, lines).decode_logits;
     captured->graph.capture_end();
     return captured;

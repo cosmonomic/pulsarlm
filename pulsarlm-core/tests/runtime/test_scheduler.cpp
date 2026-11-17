@@ -1840,6 +1840,28 @@ TEST_CASE("a request resumes a recurrent layer's state from another cache") {
     REQUIRE((first_engine.store->fetches == std::vector<std::vector<digest>>{keys}));
 }
 
+// The stop token 24 is sampled while the step forwarding it runs, which updates the recurrent layer's running state and
+// is withdrawn. The end state's head and its recurrent state are those of a step-by-step run, so a request resumed from
+// them on another cache continues as the uninterrupted tokens do.
+TEST_CASE("a recurrent request stopped while its next step runs resumes from the state it reached") {
+    fixture first_engine(16, 64, {24}, {}, recurrent_and_full);
+    token_list prompt{1, 2, 3};
+    request_results first = serve_all(first_engine.sched, {request{.tokens = prompt, .max_tokens = 10}})[0];
+    REQUIRE(first.tokens == token_list{6, 12, 24});
+    pulsarlm::state first_end = ended_state(first);
+    REQUIRE((hashes_of(first_end, 1) == pulsarlm::make_page_digests(root(), token_list{1, 2, 3, 6}, page_size)));
+    REQUIRE(first_end.tail == token_list{12});
+
+    memory_store shared_store;
+    shared_store.contents = first_engine.store;
+    fixture second_engine(16, 64, {}, shared_store, recurrent_and_full);
+    token_list history = concat(concat(prompt, first.tokens), token_list{7, 8});
+    request_results second = serve_all(second_engine.sched, {request{.tokens = history, .max_tokens = 4}})[0];
+
+    REQUIRE(second.tokens == continuation(history, 4));
+    REQUIRE(second.cached_tokens == page_size);
+}
+
 TEST_CASE("a recurrent layer's state covers the pages eviction drops") {
     fixture f(16, 64, {}, {}, recurrent_and_full);
     token_list prompt(16);

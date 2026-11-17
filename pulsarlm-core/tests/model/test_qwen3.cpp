@@ -230,8 +230,15 @@ void check_against_dense(at::ScalarType dtype, double tolerance, bool graphs) {
         );
     }
 
-    pulsarlm::decode_graphs
-        decode(model, kv, view_lines.size(), std::vector<std::size_t>(n_layers, static_cast<std::size_t>(n_heads)));
+    // The graphs read each decode step's token from row 2 of samples.
+    at::Tensor samples = at::zeros({4}, cuda(at::kLong));
+    pulsarlm::decode_graphs decode(
+        model,
+        kv,
+        view_lines.size(),
+        std::vector<std::size_t>(n_layers, static_cast<std::size_t>(n_heads)),
+        samples
+    );
 
     const std::int64_t n_tokens = 40;
     auto tokens = at::randint(vocab, {n_tokens}, cuda(at::kLong));
@@ -249,6 +256,8 @@ void check_against_dense(at::ScalarType dtype, double tolerance, bool graphs) {
         (c.prefill ? batch.prefill_group : batch.decode_group) = step(tokens, c.first, c.last, c.prefill);
         pulsarlm::step_logits logits;
         if (graphs && !c.prefill) {
+            samples[2] = tokens[c.first];
+            batch.decode_group->tokens.fill_(-3);
             logits.decode_logits = decode.forward(*batch.decode_group);
         } else {
             logits = model.forward(batch, kv);

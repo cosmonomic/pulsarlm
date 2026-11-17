@@ -54,8 +54,10 @@ class executor {
     std::size_t page_size;
     digest root;
     std::vector<std::int64_t> stop_ids;
-    // Per shard, the tokens the latest launched step sampled, on the shard's device; every shard samples them alike.
-    std::vector<at::Tensor> latest_sampled;
+    // Per shard, int64 [max_sampled_rows] on its device: the tokens the latest launched step sampled, every shard
+    // sampling them alike.
+    std::vector<at::Tensor> samples;
+    static constexpr std::int64_t max_sampled_rows = 4096;
 
     // The tokens of seq's full history pages that every KV layer reading the page holds resident.
     std::size_t device_cached_tokens(const sequence& seq) const;
@@ -139,6 +141,7 @@ class executor {
     // Launches one step of entries, decoding entries first: advances each sequence by its tokens, then queues the
     // forward and the sampling on every shard without waiting for them. A decoding entry whose token is awaited reads
     // it from the previous launched step's samples on the GPUs, which needs that step to be quiet and this one too.
+    // A step samples at most max_sampled_rows tokens.
     task<launched_step> launch(std::vector<batch_entry> entries);
     // Waits for step, then sets each awaited token it sampled, writes the pages it completed, evicts and writes the
     // state at a cycle end, and takes lines for the next tokens. Sets the exit reason of each sequence that finished,

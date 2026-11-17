@@ -99,9 +99,9 @@ class executor::batch {
     std::size_t decode_count = 0;
     // Pinned host tensors.
     step_batch inputs;
-    // The decode group's rows whose token is awaited, and the rows of the previous launched step's samples holding them.
-    std::vector<std::int64_t> fed_rows;
-    std::vector<std::int64_t> fed_from;
+    // Whether a decode entry's token is awaited, -(r + 1) in the decode group's tokens for row r of the previous
+    // launched step's samples.
+    bool awaits_tokens = false;
     // Per entry that samples, in entry order: its params and draw.
     std::vector<sampling_params> sample_params;
     std::vector<sampling_draw> sample_draws;
@@ -150,18 +150,18 @@ class executor::batch {
         std::size_t shard,
         std::size_t width
     );
-    // Queues on stream shard's copies of the inputs, the awaited tokens from latest_sampled, its forward, the copies
-    // of its page mass to the host and the sampling, and returns the sampled tokens on the shard's device; shard 0
-    // also queues their copy to the host. mass_heads is the shard's part of the executor's. graphs is the shard's when
-    // decode_replays. Every shard's call may run at once, each on its own thread.
-    at::Tensor enqueue(
+    // Queues on stream shard's copies of the inputs, the filling of the awaited tokens from samples, its forward, the
+    // copies of its page mass to the host and the sampling into samples; shard 0 also queues the copy of the sampled
+    // tokens to the host. mass_heads is the shard's part of the executor's. graphs is the shard's when decode_replays.
+    // Every shard's call may run at once, each on its own thread.
+    void enqueue(
         model& shard_model,
         std::span<const kv> lines,
         const std::vector<std::size_t>& mass_heads,
         cudaStream_t stream,
         std::size_t shard,
         decode_graphs* graphs,
-        const at::Tensor& latest_sampled
+        const at::Tensor& samples
     );
     // Joins the shards' page mass, each shard's heads after the previous shards', once their copies completed.
     void join_mass(
@@ -224,6 +224,9 @@ executor::executor(
         }
     }
     assert(page_size > 0);
+    for (std::size_t shard = 0; shard < this->shards.size(); shard++) {
+        samples.push_back(at::zeros({max_sampled_rows}, lines[shard].front().k.options().dtype(at::kLong)));
+    }
     if (graph_pages) {
         for (std::size_t shard = 0; shard < this->shards.size(); shard++) {
             c10::cuda::CUDAGuard device_guard(lines[shard].front().k.device());
@@ -232,7 +235,8 @@ executor::executor(
                     *this->shards[shard],
                     lines[shard],
                     *graph_pages,
-                    shard_mass_heads[shard]
+                    shard_mass_heads[shard],
+                    samples[shard]
                 )
             );
         }
@@ -262,13 +266,9 @@ executor::batch::batch(
     if (entries.size() > decode_count) {
         inputs.prefill_group = make_group(entry_span.subspan(decode_count), page_size, true);
     }
-    for (std::size_t i = 0; i < decode_count; i++) {
-        const sequence& seq = *entries[i].seq;
-        if (seq.pending_tokens.front() == sequence::awaited_token) {
-            fed_rows.push_back(static_cast<std::int64_t>(i));
-            fed_from.push_back(static_cast<std::int64_t>(seq.awaited_row));
-        }
-    }
+    awaits_tokens = std::ranges::any_of(entry_span.first(decode_count), [](const batch_entry& e) {
+        return e.seq->pending_tokens.front() == sequence::awaited_token;
+    });
     for (const batch_entry& e : entries) {
         if (e.samples) {
             sample_params.push_back(e.seq->sampling);
@@ -303,7 +303,9 @@ group_batch executor::batch::make_group(std::span<const batch_entry> group, std:
         const sequence& seq = *group[s].seq;
         std::size_t first_position = seq.next_position();
         for (std::size_t i = 0; i < group[s].token_count; i++) {
-            tokens[first_row + i] = seq.pending_tokens[i];
+            const std::int64_t token = seq.pending_tokens[i];
+            tokens[first_row + i] = token == sequence::awaited_token ? -static_cast<std::int64_t>(seq.awaited_row) - 1
+                                                                     : token;
             positions[first_row + i] = static_cast<std::int64_t>(first_position + i);
         }
         for (std::size_t layer = 0; layer < n_layers; layer++) {
@@ -382,14 +384,14 @@ at::Tensor executor::batch::page_tables(
     );
 }
 
-at::Tensor executor::batch::enqueue(
+void executor::batch::enqueue(
     model& shard_model,
     std::span<const kv> lines,
     const std::vector<std::size_t>& mass_heads,
     cudaStream_t stream,
     std::size_t shard,
     decode_graphs* graphs,
-    const at::Tensor& latest_sampled
+    const at::Tensor& samples
 ) {
     at::Device device = lines.front().k.device();
     c10::cuda::CUDAStreamGuard guard(c10::cuda::getStreamFromExternal(stream, device.index()));
@@ -398,10 +400,8 @@ at::Tensor executor::batch::enqueue(
     at::Tensor decode_on_device, prefill_on_device;
     if (inputs.decode_group) {
         on_device.decode_group = to_device(*inputs.decode_group, device);
-        if (!fed_rows.empty()) {
-            at::Tensor rows = to_device(at::tensor(fed_rows, at::kLong).pin_memory(), device);
-            at::Tensor from = to_device(at::tensor(fed_from, at::kLong).pin_memory(), device);
-            on_device.decode_group->tokens.index_copy_(0, rows, latest_sampled.index_select(0, from));
+        if (awaits_tokens && !decode_replays) {
+            fill_awaited_tokens_cuda(on_device.decode_group->tokens, samples);
         }
         std::span<batch_entry> group = entry_span.first(decode_count);
         on_device.decode_group->page_tables = page_tables(group, lines.size(), false, shard, decode_width);
@@ -452,14 +452,14 @@ at::Tensor executor::batch::enqueue(
         }
     }
     if (rows.empty()) {
-        return at::Tensor();
+        return;
     }
     at::Tensor tokens = sample(at::stack(rows), sample_params, sample_draws);
+    samples.narrow(0, 0, tokens.size(0)).copy_(tokens);
     if (shard == 0) {
         sampled_tokens = pinned({static_cast<std::int64_t>(rows.size())}, at::kLong);
         sampled_tokens.copy_(tokens, /*non_blocking=*/true);
     }
-    return tokens;
 }
 
 std::vector<executor::batch::layer_step_mass>
@@ -880,7 +880,12 @@ task<executor::launched_step> executor::launch(std::vector<batch_entry> entries)
     advance(*b);
     b->shard_decode_mass.assign(shards.size(), at::Tensor());
     b->shard_prefill_mass.assign(shards.size(), at::Tensor());
-    latest_sampled.resize(shards.size());
+    TORCH_CHECK(
+        static_cast<std::int64_t>(b->sample_params.size()) <= max_sampled_rows,
+        "executor: a step samples at most ",
+        max_sampled_rows,
+        " tokens"
+    );
     std::vector<external_task<>> other_shards;
     for (std::size_t shard = 1; shard < shards.size(); shard++) {
         other_shards.push_back(run_on(*worker_loops[shard - 1], enqueue_on_shard(*b, shard)));
@@ -897,14 +902,14 @@ task<executor::launched_step> executor::launch(std::vector<batch_entry> entries)
 
 task<void> executor::enqueue_on_shard(batch& b, std::size_t shard) {
     c10::cuda::CUDAGuard device_guard(lines[shard].front().k.device());
-    latest_sampled[shard] = b.enqueue(
+    b.enqueue(
         *shards[shard],
         lines[shard],
         shard_mass_heads[shard],
         streams[shard],
         shard,
         graphs.empty() ? nullptr : graphs[shard].get(),
-        latest_sampled[shard]
+        samples[shard]
     );
     co_return;
 }
