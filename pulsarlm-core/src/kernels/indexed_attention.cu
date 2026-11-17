@@ -187,6 +187,76 @@ __global__ void mark_selected_pages_kernel(
     }
 }
 
+constexpr int kSlotThreads = 1024;
+
+// The sum of value over threads [0, threadIdx.x) of a kSlotThreads-thread block; sums holds kSlotThreads / 32 entries.
+__device__ int exclusive_block_sum(int value, int* sums) {
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    int inclusive = value;
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        const int other = __shfl_up_sync(0xffffffffu, inclusive, offset);
+        if (lane >= offset) {
+            inclusive += other;
+        }
+    }
+    if (lane == 31) {
+        sums[warp] = inclusive;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        int warp_sum = sums[lane];
+        for (int offset = 1; offset < 32; offset <<= 1) {
+            const int other = __shfl_up_sync(0xffffffffu, warp_sum, offset);
+            if (lane >= offset) {
+                warp_sum += other;
+            }
+        }
+        sums[lane] = warp_sum;
+    }
+    __syncthreads();
+    return inclusive - value + (warp > 0 ? sums[warp - 1] : 0);
+}
+
+// One CTA, for a batch of one query per sequence: page_slots[i] is the selected view pages up to and including view
+// page i of the flattened [num_seqs, max_pages] tables, less one, a page being selected when the query of its sequence
+// selects one of its blocks. Each thread takes a run of consecutive pages.
+template <typename scalar_t>
+__global__ void __launch_bounds__(kSlotThreads) single_query_page_slots_kernel(
+    const attn::paged_attn_params<scalar_t> p,
+    const block_selection selection,
+    int page_size,
+    int32_t* __restrict__ page_slots
+) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
+    __shared__ int warp_sums[kSlotThreads / 32];
+    const int total = p.num_seqs * p.max_pages;
+    const int run = (total + kSlotThreads - 1) / kSlotThreads;
+    const int first = min(static_cast<int>(threadIdx.x) * run, total);
+    const int last = min(first + run, total);
+    const int page_blocks = page_size / selection.block_size;
+    auto selected = [&](int i) {
+        const int s = i / p.max_pages;
+        const int first_block = i % p.max_pages * page_blocks;
+        for (int b = first_block; b < first_block + page_blocks; ++b) {
+            if (b / 32 < selection.words && ((selection.word(s, b / 32) >> (b % 32)) & 1u)) {
+                return 1;
+            }
+        }
+        return 0;
+    };
+    int count = 0;
+    for (int i = first; i < last; ++i) {
+        count += selected(i);
+    }
+    int slots = exclusive_block_sum(count, warp_sums);
+    for (int i = first; i < last; ++i) {
+        slots += selected(i);
+        page_slots[i] = slots - 1;
+    }
+}
+
 // Copies the keys of each sequence's selected view pages into rotated_k, rotated to their view positions, as
 // rotate_view_keys_kernel, one CTA per row of rotated_k. page_slots[view page] is the page's row of rotated_k, the
 // selected pages before it, and differs from the previous page's for a selected page, so a row's page is the first
@@ -672,22 +742,38 @@ void launch_indexed_tc(
     const int64_t grid = b.total_q * b.n_kv_heads;
     const auto params = b.params<scalar_t>();
     const int64_t view_pages = b.num_seqs * b.max_pages;
-    auto selected_pages = at::zeros({view_pages}, b.page_tables.options());
-    const int64_t marks = b.total_q * selection.words;
-    launch_dependent(
-        mark_selected_pages_kernel<scalar_t>,
-        static_cast<int>((marks + 255) / 256),
-        256,
-        0,
-        stream,
-        params,
-        selection,
-        static_cast<int>(b.total_q),
-        static_cast<int>(b.page_size),
-        selected_pages.data_ptr<int32_t>()
-    );
+    at::Tensor page_slots;
+    if (b.total_q == b.num_seqs) {
+        page_slots = at::empty({view_pages}, b.page_tables.options());
+        launch_dependent(
+            single_query_page_slots_kernel<scalar_t>,
+            1,
+            kSlotThreads,
+            0,
+            stream,
+            params,
+            selection,
+            static_cast<int>(b.page_size),
+            page_slots.data_ptr<int32_t>()
+        );
+    } else {
+        auto selected_pages = at::zeros({view_pages}, b.page_tables.options());
+        const int64_t marks = b.total_q * selection.words;
+        launch_dependent(
+            mark_selected_pages_kernel<scalar_t>,
+            static_cast<int>((marks + 255) / 256),
+            256,
+            0,
+            stream,
+            params,
+            selection,
+            static_cast<int>(b.total_q),
+            static_cast<int>(b.page_size),
+            selected_pages.data_ptr<int32_t>()
+        );
+        page_slots = at::cumsum(selected_pages, 0, at::kInt) - 1;
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    at::Tensor page_slots = at::cumsum(selected_pages, 0, at::kInt) - 1;
     const int64_t slot_count = std::min(view_pages, b.total_q * max_selected_blocks);
     auto rotated_k = at::empty({slot_count, b.page_size, b.n_kv_heads, b.head_dim}, b.k_pool.options());
     launch_dependent(
