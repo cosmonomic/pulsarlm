@@ -5,6 +5,7 @@
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
 
+#include <climits>
 #include <tuple>
 
 namespace pulsarlm {
@@ -18,39 +19,52 @@ template <typename scalar_t> __device__ __forceinline__ float rounded(float valu
     return static_cast<float>(static_cast<scalar_t>(value));
 }
 
-// The block's maximum of value, the lowest index among equal values; every thread receives it.
-__device__ void block_argmax(float& value, int& index, float* values, int* indices) {
-    values[threadIdx.x] = value;
-    indices[threadIdx.x] = index;
-    __syncthreads();
-    for (int stride = kThreads / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            const float other = values[threadIdx.x + stride];
-            const int other_index = indices[threadIdx.x + stride];
-            if (other > values[threadIdx.x] || (other == values[threadIdx.x] && other_index < indices[threadIdx.x])) {
-                values[threadIdx.x] = other;
-                indices[threadIdx.x] = other_index;
-            }
+constexpr int kWarps = kThreads / 32;
+
+__device__ void warp_argmax(float& value, int& index) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float other = __shfl_xor_sync(0xffffffffu, value, offset);
+        const int other_index = __shfl_xor_sync(0xffffffffu, index, offset);
+        if (other > value || (other == value && other_index < index)) {
+            value = other;
+            index = other_index;
         }
-        __syncthreads();
     }
-    value = values[0];
-    index = indices[0];
+}
+
+// The block's maximum of value, the lowest index among equal values; every thread receives it. values and indices
+// hold kWarps entries.
+__device__ void block_argmax(float& value, int& index, float* values, int* indices) {
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    warp_argmax(value, index);
+    if (lane == 0) {
+        values[warp] = value;
+        indices[warp] = index;
+    }
+    __syncthreads();
+    value = lane < kWarps ? values[lane] : -INFINITY;
+    index = lane < kWarps ? indices[lane] : INT_MAX;
+    warp_argmax(value, index);
     __syncthreads();
 }
 
 __device__ float block_sum(float value, float* values) {
-    values[threadIdx.x] = value;
-    __syncthreads();
-    for (int stride = kThreads / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            values[threadIdx.x] += values[threadIdx.x + stride];
-        }
-        __syncthreads();
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_xor_sync(0xffffffffu, value, offset);
     }
-    const float sum = values[0];
+    if (lane == 0) {
+        values[warp] = value;
+    }
     __syncthreads();
-    return sum;
+    value = lane < kWarps ? values[lane] : 0.0f;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_xor_sync(0xffffffffu, value, offset);
+    }
+    __syncthreads();
+    return value;
 }
 
 // One CTA per token: the softmax of its logits in fp32, its top k experts by probability, the lower expert first among
@@ -65,8 +79,8 @@ __global__ void route_top_k_kernel(
     int64_t* __restrict__ chosen
 ) {
     extern __shared__ float probabilities[];
-    __shared__ float values[kThreads];
-    __shared__ int indices[kThreads];
+    __shared__ float values[kWarps];
+    __shared__ int indices[kWarps];
     __shared__ float top[kMaxTopK];
     const scalar_t* row = logits + static_cast<int64_t>(blockIdx.x) * row_stride;
 
