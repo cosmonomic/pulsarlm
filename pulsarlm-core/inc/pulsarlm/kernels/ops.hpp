@@ -2,6 +2,7 @@
 
 #include <ATen/core/Tensor.h>
 
+#include "pulsarlm/kernels/expert_activation.hpp"
 #include "pulsarlm/kernels/gate_activation.hpp"
 #include "pulsarlm/kernels/rope.hpp"
 
@@ -41,6 +42,20 @@ std::tuple<at::Tensor, at::Tensor> route_top_k_cuda(const at::Tensor& logits, in
 
 // silu(x[:, :n]) * x[:, n:] for contiguous x [tokens, 2 * n], silu rounded to the dtype before the product.
 at::Tensor silu_mul_cuda(const at::Tensor& x);
+
+// Each token's sum over its top_k experts of top_weights times down_proj(activation(gate) * up) of its row of h
+// [tokens, hidden], with top_experts (int64) and top_weights (fp32) [tokens, top_k], gate_up_proj
+// [experts, 2 * intermediate, hidden], gate rows first, and down_proj [experts, hidden, intermediate]. gate, up and each
+// expert's output are rounded to the dtype, the activation before the product with up, and the weighted outputs are
+// summed in fp32 in top_k order. Nothing is read back to the host.
+at::Tensor routed_experts_cuda(
+    const at::Tensor& h,
+    const at::Tensor& top_experts,
+    const at::Tensor& top_weights,
+    const at::Tensor& gate_up_proj,
+    const at::Tensor& down_proj,
+    expert_activation activation
+);
 
 // The Gated DeltaNet ops run a ragged batch: sequence s holds tokens [cu_seqlens_q[s], cu_seqlens_q[s + 1]) of x, or
 // token s alone without cu_seqlens_q. rows [num_seqs, >= 2] int32 holds each sequence's running line, whose state the

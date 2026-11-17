@@ -228,13 +228,13 @@ at::Tensor qwen3_5_moe_model::moe(const at::Tensor& h, std::int64_t layer) const
     at::Tensor probabilities = at::softmax(at::linear(h, m.router), -1, at::kFloat);
     auto [top_weights, top_experts] = at::topk(probabilities, config.num_experts_per_tok, -1);
     top_weights = top_weights / top_weights.sum(-1, true);
-    at::Tensor routed = routed_experts(
+    at::Tensor routed = routed_experts_cuda(
         h,
         top_experts,
         top_weights,
         m.experts_gate_up_proj,
         m.experts_down_proj,
-        [](const at::Tensor& x) { return at::silu(x); }
+        expert_activation::silu
     );
     return routed + at::sigmoid(at::linear(h, m.shared_expert_gate)) * shared;
 }

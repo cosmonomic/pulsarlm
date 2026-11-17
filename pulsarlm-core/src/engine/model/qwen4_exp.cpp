@@ -541,13 +541,13 @@ at::Tensor qwen4_exp_model::moe(const at::Tensor& h, std::int64_t layer) const {
     at::Tensor logits = at::linear(h, m.router_and_gate);
     const std::int64_t experts = m.router_and_gate.size(0) - 1;
     auto [top_weights, top_experts] = route_top_k_cuda(logits.narrow(1, 0, experts), config.num_experts_per_tok);
-    at::Tensor routed = routed_experts(
+    at::Tensor routed = routed_experts_cuda(
         h,
         top_experts,
         top_weights,
         m.experts_gate_up_proj,
         m.experts_down_proj,
-        [](const at::Tensor& x) { return at::silu(x); }
+        expert_activation::silu
     );
     at::Tensor shared = at::linear(silu_mul_cuda(at::linear(h, m.shared_gate_up_proj)), m.shared_down_proj);
     at::Tensor out = routed + at::sigmoid(logits.narrow(1, experts, 1)) * shared;

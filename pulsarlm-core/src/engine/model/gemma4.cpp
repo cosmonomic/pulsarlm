@@ -209,13 +209,13 @@ at::Tensor gemma4_model::experts(const at::Tensor& x, std::int64_t layer) const 
     at::Tensor expert_scale = w.router_per_expert_scale.index_select(0, top_experts.flatten())
                                   .view(top_experts.sizes());
     top_weights = top_weights / top_weights.sum(-1, true) * expert_scale.to(at::kFloat);
-    return routed_experts(
+    return routed_experts_cuda(
         rmsnorm_cuda(x, w.pre_feedforward_layernorm_2, eps),
         top_experts,
         top_weights,
         w.experts_gate_up_proj,
         w.experts_down_proj,
-        gelu_tanh
+        expert_activation::gelu_tanh
     );
 }
 
