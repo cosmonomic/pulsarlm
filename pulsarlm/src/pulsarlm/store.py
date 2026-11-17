@@ -20,6 +20,21 @@ def state_key(state: State) -> StateKey:
     return state.head or NO_PAGES, tuple(state.tail)
 
 
+@dataclass(frozen=True)
+class StoreStat:
+    """A store's contents at one moment. page_bytes is what the stored pages take
+    in RAM, at most about capacity_bytes beyond the pages running requests'
+    leases keep; dropped_states counts the states dropped to fit the capacity
+    since the store started."""
+
+    page_bytes: int
+    capacity_bytes: int
+    pages: int
+    states: int
+    leases: int
+    dropped_states: int
+
+
 @dataclass
 class StoredPage:
     page: Page | None
@@ -72,6 +87,7 @@ class LocalStore:
         self._lease_ids = count()
         # By lease id, the write of a step's pages that claim began and write_pages ends.
         self._step_puts: dict[int, list[bytes]] = {}
+        self._dropped_states = 0
         self._clock = count()
         self._file = None if path is None else StoreFile(path)
         if self._file is not None:
@@ -235,18 +251,16 @@ class LocalStore:
                 self._dereference(keys)
             self._fit()
 
-    def __len__(self) -> int:
+    def stat(self) -> StoreStat:
         with self._lock:
-            return len(self._states)
-
-    def page_count(self) -> int:
-        with self._lock:
-            return len(self._pages)
-
-    def byte_count(self) -> int:
-        """The bytes the stored pages take."""
-        with self._lock:
-            return self._page_bytes
+            return StoreStat(
+                page_bytes=self._page_bytes,
+                capacity_bytes=self._capacity_bytes,
+                pages=len(self._pages),
+                states=len(self._states),
+                leases=len(self._leases),
+                dropped_states=self._dropped_states,
+            )
 
     def _find(self, prompt: list[int], page_digests: list[bytes]) -> StoredState:
         for page_count in range(len(page_digests), -1, -1):
@@ -308,6 +322,7 @@ class LocalStore:
                 del self._tails[head]
             self._dereference(dropped.page_keys)
             deleted_states.append(key)
+            self._dropped_states += 1
             deleted_pages += self._delete_unused_pages()
         if self._file is not None and (deleted_states or deleted_pages):
             self._file.delete(deleted_states, deleted_pages)
@@ -353,3 +368,13 @@ class EmptyStore:
 
     def release(self, lease_id: int) -> None:
         pass
+
+    def stat(self) -> StoreStat:
+        return StoreStat(
+            page_bytes=0,
+            capacity_bytes=0,
+            pages=0,
+            states=0,
+            leases=0,
+            dropped_states=0,
+        )

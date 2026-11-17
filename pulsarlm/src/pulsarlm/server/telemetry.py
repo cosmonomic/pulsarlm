@@ -19,16 +19,17 @@ from prometheus_client import CollectorRegistry
 
 from pulsarlm.completion import CompletionUsage
 from pulsarlm.core.engine import EngineStat
+from pulsarlm.store import StoreStat
 
 PROVIDER_NAME = "pulsarlm"
 REQUEST_DURATION = "gen_ai.server.request.duration"
 TIME_TO_FIRST_TOKEN = "gen_ai.server.time_to_first_token"
 TIME_PER_OUTPUT_TOKEN = "gen_ai.server.time_per_output_token"
-PEAK_DEVICE_MEMORY = "pulsarlm.usage.peak_device_memory"
-INPUT_TOKENS = "pulsarlm.usage.input_tokens"
-OUTPUT_TOKENS = "pulsarlm.usage.output_tokens"
-INPUT_TOKENS_ON_DEVICE = "pulsarlm.usage.input_tokens_on_device"
-INPUT_TOKENS_IN_STORE = "pulsarlm.usage.input_tokens_in_store"
+PEAK_DEVICE_MEMORY = "pulsarlm.engine.usage.peak_device_memory"
+INPUT_TOKENS = "pulsarlm.engine.usage.input_tokens"
+OUTPUT_TOKENS = "pulsarlm.engine.usage.output_tokens"
+INPUT_TOKENS_ON_DEVICE = "pulsarlm.engine.usage.input_tokens_on_device"
+INPUT_TOKENS_IN_STORE = "pulsarlm.engine.usage.input_tokens_in_store"
 # The GenAI semantic conventions' bounds for token histograms.
 TOKEN_BUCKETS = tuple(float(4**exponent) for exponent in range(14))
 BUCKET_BOUNDARIES = {
@@ -92,7 +93,8 @@ BUCKET_BOUNDARIES = {
 @dataclass(frozen=True)
 class Telemetry:
     """The GenAI model server metrics of the OpenTelemetry semantic conventions,
-    and pulsarlm's own under pulsarlm.*. registry serves them in the Prometheus
+    and pulsarlm's own: the engine's under pulsarlm.engine.*, the store's under
+    pulsarlm.store.*. registry serves them in the Prometheus
     text format; they are also pushed over OTLP when the OTEL_EXPORTER_OTLP_ENDPOINT
     or OTEL_EXPORTER_OTLP_METRICS_ENDPOINT environment variable is set. tracer's
     spans are pushed over OTLP when OTEL_EXPORTER_OTLP_ENDPOINT or
@@ -110,6 +112,7 @@ class Telemetry:
     output_tokens: Histogram
     input_tokens_on_device: Histogram
     input_tokens_in_store: Histogram
+    store_stat: Callable[[], StoreStat]
 
     def shutdown(self) -> None:
         """Exports what the providers hold, then stops them."""
@@ -121,7 +124,13 @@ def exports_over_otlp(signal_endpoint: str) -> bool:
     return bool({"OTEL_EXPORTER_OTLP_ENDPOINT", signal_endpoint} & set(os.environ))
 
 
-def start_telemetry(stat: Callable[[], EngineStat], model: str) -> Telemetry:
+def utilization(stat: StoreStat) -> float:
+    return stat.page_bytes / stat.capacity_bytes if stat.capacity_bytes else 0.0
+
+
+def start_telemetry(
+    stat: Callable[[], EngineStat], store_stat: Callable[[], StoreStat], model: str
+) -> Telemetry:
     resource = Resource.create({"service.name": PROVIDER_NAME})
     tracer_provider = TracerProvider(resource=resource, shutdown_on_exit=False)
     if exports_over_otlp("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"):
@@ -144,17 +153,70 @@ def start_telemetry(stat: Callable[[], EngineStat], model: str) -> Telemetry:
     )
     meter = meter_provider.get_meter(PROVIDER_NAME)
 
+    attributes = {"gen_ai.provider.name": PROVIDER_NAME, "gen_ai.response.model": model}
+
     def device_memory(_: CallbackOptions) -> Iterable[Observation]:
-        yield Observation(
-            stat().kv_cache_bytes,
-            {"gen_ai.provider.name": PROVIDER_NAME, "gen_ai.response.model": model},
-        )
+        yield Observation(stat().kv_cache_bytes, attributes)
 
     meter.create_observable_gauge(
-        "pulsarlm.device_memory",
+        "pulsarlm.engine.device_memory",
         callbacks=[device_memory],
         unit="By",
         description="Bytes of the KV cache that running requests use.",
+    )
+
+    def store_observation(
+        value: Callable[[StoreStat], float],
+    ) -> Callable[[CallbackOptions], Iterable[Observation]]:
+        def observe(_: CallbackOptions) -> Iterable[Observation]:
+            yield Observation(value(store_stat()), attributes)
+
+        return observe
+
+    for name, value, unit, description in (
+        (
+            "pulsarlm.store.usage",
+            lambda s: s.page_bytes,
+            "By",
+            "Bytes of host memory the store's pages take.",
+        ),
+        (
+            "pulsarlm.store.limit",
+            lambda s: s.capacity_bytes,
+            "By",
+            "The store's capacity in bytes, which running requests' pages can exceed.",
+        ),
+        (
+            "pulsarlm.store.utilization",
+            utilization,
+            "1",
+            "The store's usage over its limit.",
+        ),
+        ("pulsarlm.store.pages", lambda s: s.pages, "{page}", "Pages in the store."),
+        (
+            "pulsarlm.store.states",
+            lambda s: s.states,
+            "{state}",
+            "States in the store.",
+        ),
+        (
+            "pulsarlm.store.leases",
+            lambda s: s.leases,
+            "{lease}",
+            "Running requests holding the store's pages.",
+        ),
+    ):
+        meter.create_observable_gauge(
+            name,
+            callbacks=[store_observation(value)],
+            unit=unit,
+            description=description,
+        )
+    meter.create_observable_counter(
+        "pulsarlm.store.dropped_states",
+        callbacks=[store_observation(lambda s: s.dropped_states)],
+        unit="{state}",
+        description="States the store dropped to fit its capacity.",
     )
     return Telemetry(
         registry=registry,
@@ -182,6 +244,7 @@ def start_telemetry(stat: Callable[[], EngineStat], model: str) -> Telemetry:
             unit="{token}",
             description="Prompt tokens of the resumed state fetched from the store.",
         ),
+        store_stat=store_stat,
     )
 
 
@@ -212,6 +275,7 @@ class RequestTelemetry:
         telemetry = self._telemetry
         attributes = self._metric_attributes
         store_tokens = usage.cached_tokens - usage.device_cached_tokens
+        store = telemetry.store_stat()
         telemetry.request_duration.record(duration, attributes)
         if usage.time_to_first_token_s is not None:
             telemetry.time_to_first_token.record(
@@ -233,15 +297,17 @@ class RequestTelemetry:
                 "gen_ai.response.finish_reasons": (finish_reason,),
                 "gen_ai.usage.input_tokens": usage.prompt_tokens,
                 "gen_ai.usage.output_tokens": usage.completion_tokens,
-                "pulsarlm.request.duration": duration,
-                "pulsarlm.decode.duration": usage.decode_time_s,
-                "pulsarlm.usage.input_tokens_on_device": usage.device_cached_tokens,
-                "pulsarlm.usage.input_tokens_in_store": store_tokens,
-                "pulsarlm.usage.peak_device_memory": usage.peak_device_memory,
+                "pulsarlm.engine.request.duration": duration,
+                "pulsarlm.engine.decode.duration": usage.decode_time_s,
+                "pulsarlm.engine.usage.input_tokens_on_device": usage.device_cached_tokens,
+                "pulsarlm.engine.usage.input_tokens_in_store": store_tokens,
+                "pulsarlm.engine.usage.peak_device_memory": usage.peak_device_memory,
+                "pulsarlm.store.usage": store.page_bytes,
+                "pulsarlm.store.utilization": utilization(store),
             }
         )
         if usage.time_to_first_token_s is not None:
-            span_attributes["pulsarlm.time_to_first_token"] = (
+            span_attributes["pulsarlm.engine.time_to_first_token"] = (
                 usage.time_to_first_token_s
             )
         telemetry.tracer.start_span(

@@ -32,7 +32,7 @@ def load_server_state(
         eviction_log=None
         if eviction_log is None
         else EvictionLog(eviction_log, engine, served.eviction),
-        telemetry=start_telemetry(engine.stat, settings.model),
+        telemetry=start_telemetry(engine.stat, served.store.stat, settings.model),
     )
 
 

@@ -21,6 +21,7 @@ from pulsarlm.tools import ToolCallSyntax
 @dataclass
 class ServedModel:
     engine: Engine
+    store: LocalStore | EmptyStore
     tokenizer: Tokenizer
     chat_template: ChatTemplate
     stop_ids: list[int]
@@ -90,6 +91,7 @@ def load_served_model(
         raise checkpoint.PulsarLMModelLoadingError(str(error)) from error
     return ServedModel(
         engine=engine,
+        store=store,
         tokenizer=tokenizer,
         chat_template=chat_template,
         stop_ids=stops,

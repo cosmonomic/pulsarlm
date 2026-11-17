@@ -168,7 +168,7 @@ def test_dropping_a_state_from_the_lru_deletes_the_pages_only_it_references():
     other = [50 + t for t in HISTORY[:8]]
     run_request(store, first, first)
     run_request(store, other, other)
-    assert len(store) == 1
+    assert store.stat().states == 1
     assert not any(stored(store, h) for h in page_digests(first))
     assert all(stored(store, h) for h in page_digests(other))
 
@@ -281,7 +281,7 @@ def test_a_page_put_again_by_a_later_request_stays_for_it():
 def test_rewriting_a_state_keeps_its_pages():
     store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY)
     run_request(store, HISTORY, HISTORY[:9], HISTORY[:9])
-    assert len(store) == 1
+    assert store.stat().states == 1
     assert all(stored(store, h) for h in page_digests(HISTORY[:9]))
 
 
@@ -296,20 +296,20 @@ def test_the_store_drops_least_recently_used_states_until_its_pages_fit():
 
     assert all(stored(store, h) for h in page_digests(used) + page_digests(newest))
     assert not any(stored(store, h) for h in page_digests(unused))
-    assert store.byte_count() == 4 * PAGE_BYTES
+    assert store.stat().page_bytes == 4 * PAGE_BYTES
 
 
 def test_the_newest_state_stays_above_the_capacity():
     store = LocalStore(PAGE_SIZE, capacity_bytes=PAGE_BYTES)
     run_request(store, HISTORY, HISTORY[:9])
-    assert len(store) == 1
-    assert store.byte_count() == 2 * PAGE_BYTES
+    assert store.stat().states == 1
+    assert store.stat().page_bytes == 2 * PAGE_BYTES
 
 
 def test_a_page_no_request_owns_is_deleted_by_its_put():
     store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY)
     put_pages(store, page_digests(HISTORY))
-    assert store.page_count() == 0
+    assert store.stat().pages == 0
 
 
 def in_another_process(path: Path, script: str) -> subprocess.CompletedProcess[str]:
@@ -341,8 +341,8 @@ def test_states_and_pages_survive_a_restart(tmp_path: Path):
     assert wrote.returncode == 0, wrote.stderr
 
     store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=path)
-    assert len(store) == 1
-    assert store.byte_count() == 2 * PAGE_BYTES
+    assert store.stat().states == 1
+    assert store.stat().page_bytes == 2 * PAGE_BYTES
     with lookup(store, HISTORY) as (state, covered):
         assert covered == 9
         assert state.head == current_state(HISTORY[:9]).head
@@ -376,8 +376,8 @@ def test_a_restart_deletes_pages_no_state_references(tmp_path: Path):
     assert wrote.returncode == 0, wrote.stderr
 
     store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=path)
-    assert store.page_count() == 0
-    assert store.byte_count() == 0
+    assert store.stat().pages == 0
+    assert store.stat().page_bytes == 0
 
 
 def test_a_restart_drops_a_state_missing_a_page(tmp_path: Path):
@@ -396,8 +396,8 @@ def test_a_restart_drops_a_state_missing_a_page(tmp_path: Path):
         )
 
     store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=path)
-    assert len(store) == 0
-    assert store.page_count() == 0
+    assert store.stat().states == 0
+    assert store.stat().pages == 0
 
 
 def test_a_file_another_version_wrote_is_emptied(tmp_path: Path):
@@ -414,8 +414,8 @@ def test_a_file_another_version_wrote_is_emptied(tmp_path: Path):
         connection.execute("UPDATE version SET version = '0.0.0'")
 
     store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=path)
-    assert len(store) == 0
-    assert store.page_count() == 0
+    assert store.stat().states == 0
+    assert store.stat().pages == 0
     with lookup(store, HISTORY) as (_, covered):
         assert covered == 0
 
@@ -437,7 +437,7 @@ def test_recency_survives_a_restart(tmp_path: Path):
 
     store = LocalStore(PAGE_SIZE, capacity_bytes=2 * PAGE_BYTES, path=path)
     used = [10 + t for t in HISTORY[:8]]
-    assert len(store) == 1
+    assert store.stat().states == 1
     with lookup(store, used + [1]) as (_, covered):
         assert covered == len(used)
 
@@ -460,15 +460,15 @@ def test_a_smaller_capacity_after_a_restart_deletes_states_from_the_file(
         path,
         """
         store = LocalStore(PAGE_SIZE, capacity_bytes=PAGE_BYTES, path=store_path)
-        assert len(store) == 1
+        assert store.stat().states == 1
         """,
     )
     assert shrunk.returncode == 0, shrunk.stderr
 
     store = LocalStore(PAGE_SIZE, capacity_bytes=ROOMY, path=path)
     second = [20 + t for t in HISTORY[:8]]
-    assert len(store) == 1
-    assert store.byte_count() == 2 * PAGE_BYTES
+    assert store.stat().states == 1
+    assert store.stat().page_bytes == 2 * PAGE_BYTES
     with lookup(store, second + [1]) as (_, covered):
         assert covered == len(second)
 
@@ -495,7 +495,7 @@ def test_write_state_moves_the_lease_off_the_pages_of_its_previous_state():
         write(store, state_of([first, second]), lease_id)
         put_pages(store, [third], lease_id)
         write(store, state_of([first, third]), lease_id)
-        assert len(store) == 1
+        assert store.stat().states == 1
         assert not stored(store, second)
         assert stored(store, first) and stored(store, third)
 

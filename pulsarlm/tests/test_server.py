@@ -141,10 +141,10 @@ def load(
     store: LocalStore | None = None,
 ) -> ServerState:
     tokenizer = word_tokenizer()
+    if store is None:
+        store = LocalStore(PAGE_SIZE, capacity_bytes=64 * LINE_BYTES)
     engine = Engine(
-        LocalStore(PAGE_SIZE, capacity_bytes=64 * LINE_BYTES)
-        if store is None
-        else store,
+        store,
         asyncio.get_running_loop(),
         MODEL,
         lambda rank, size: random_weights(embedding_scale),
@@ -170,7 +170,7 @@ def load(
         think_syntax=None,
         eviction=EvictionPolicy(cycle_tokens=PAGE_SIZE),
         eviction_log=None,
-        telemetry=start_telemetry(engine.stat, MODEL_ID),
+        telemetry=start_telemetry(engine.stat, store.stat, MODEL_ID),
     )
 
 
@@ -425,7 +425,7 @@ def test_metrics_count_no_device_memory_once_requests_end(client):
     response = client.get("http://testserver/metrics")
 
     assert response.status_code == 200
-    assert metric_value(response.text, "pulsarlm_device_memory_bytes") == 0
+    assert metric_value(response.text, "pulsarlm_engine_device_memory_bytes") == 0
 
 
 def test_metrics_count_the_tokens_of_finished_requests(client):
@@ -437,14 +437,32 @@ def test_metrics_count_the_tokens_of_finished_requests(client):
     cached = follow_up["prompt_tokens_details"]["cached_tokens"]
     assert cached > 0
     assert (
-        metric_value(text, "pulsarlm_usage_input_tokens_sum")
+        metric_value(text, "pulsarlm_engine_usage_input_tokens_sum")
         == 2 * follow_up["prompt_tokens"]
     )
     assert (
-        metric_value(text, "pulsarlm_usage_input_tokens_on_device_sum")
-        + metric_value(text, "pulsarlm_usage_input_tokens_in_store_sum")
+        metric_value(text, "pulsarlm_engine_usage_input_tokens_on_device_sum")
+        + metric_value(text, "pulsarlm_engine_usage_input_tokens_in_store_sum")
         == cached
     )
+
+
+def test_metrics_report_the_store_s_pages_states_and_capacity(client):
+    post(client, messages=MESSAGES, max_tokens=4)
+
+    text = client.get("http://testserver/metrics").text
+
+    stat = client.app.state.server_state.telemetry.store_stat()
+    assert stat.pages > 0
+    assert metric_value(text, "pulsarlm_store_usage_bytes") == stat.page_bytes
+    assert metric_value(text, "pulsarlm_store_limit_bytes") == 64 * LINE_BYTES
+    assert metric_value(text, "pulsarlm_store_utilization") == pytest.approx(
+        stat.page_bytes / (64 * LINE_BYTES)
+    )
+    assert metric_value(text, "pulsarlm_store_pages") == stat.pages
+    assert metric_value(text, "pulsarlm_store_states") == stat.states
+    assert metric_value(text, "pulsarlm_store_leases") == 0
+    assert metric_value(text, "pulsarlm_store_dropped_states_total") == 0
 
 
 def test_metrics_hold_the_gen_ai_server_histograms_of_finished_requests(client):
@@ -487,14 +505,16 @@ def test_a_finished_request_ends_one_request_span_with_its_usage(client):
     assert attributes["gen_ai.usage.input_tokens"] == usage["prompt_tokens"]
     assert attributes["gen_ai.usage.output_tokens"] == usage["completion_tokens"]
     assert attributes["gen_ai.request.max_tokens"] == 4
-    peak_device_memory = attributes["pulsarlm.usage.peak_device_memory"]
-    time_to_first_token = attributes["pulsarlm.time_to_first_token"]
-    duration = attributes["pulsarlm.request.duration"]
+    peak_device_memory = attributes["pulsarlm.engine.usage.peak_device_memory"]
+    time_to_first_token = attributes["pulsarlm.engine.time_to_first_token"]
+    duration = attributes["pulsarlm.engine.request.duration"]
     assert isinstance(peak_device_memory, int)
     assert isinstance(time_to_first_token, float)
     assert isinstance(duration, float)
     assert peak_device_memory > 0
     assert 0 < time_to_first_token <= duration
+    assert attributes["pulsarlm.store.usage"] > 0
+    assert 0 < attributes["pulsarlm.store.utilization"] <= 1
 
 
 def test_the_server_exports_its_unexported_spans_when_it_shuts_down():

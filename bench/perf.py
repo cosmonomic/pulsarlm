@@ -200,7 +200,7 @@ def gauge(text: str, name: str) -> float:
 def kv_cache_bytes(metrics: str, engine: str, pool_bytes: int) -> float:
     if engine == "vllm":
         return gauge(metrics, "vllm:kv_cache_usage_perc") * pool_bytes
-    return gauge(metrics, "pulsarlm_device_memory_bytes")
+    return gauge(metrics, "pulsarlm_engine_device_memory_bytes")
 
 
 async def peak_kv_cache_bytes(
