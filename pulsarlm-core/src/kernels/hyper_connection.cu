@@ -151,9 +151,10 @@ __device__ __forceinline__ void add_dots(
     }
 }
 
-// Every CTA normalizes each token's streams into shared memory, a warp per (token, stream), and writes its share of
-// normed; then its warps split the columns of kLinearRows rows of weight and their sums meet in shared memory.
-template <typename scalar_t, int TOKENS>
+// Each CTA takes kLinearRows rows of weight. One pass over the columns sums, per (token, stream), the squares of x and
+// the products of x, norm_weight and each row, so the stream's inverse RMS scales the products once at the end; the
+// CTA then writes its share of normed as stream_rmsnorm_kernel computes it.
+template <typename scalar_t, int TOKENS, int STREAMS>
 __global__ void __launch_bounds__(kThreads) stream_rmsnorm_linear_kernel(
     const scalar_t* __restrict__ x,
     const float* __restrict__ norm_weight,
@@ -161,77 +162,88 @@ __global__ void __launch_bounds__(kThreads) stream_rmsnorm_linear_kernel(
     int64_t weight_row_stride,
     scalar_t* __restrict__ normed,
     scalar_t* __restrict__ projected,
-    int64_t streams,
-    int64_t hidden,
+    int hidden,
     int64_t rows,
     float eps
 ) {
-    extern __shared__ __align__(16) unsigned char shared_memory[];
-    auto* staged = reinterpret_cast<scalar_t*>(shared_memory);
-    auto* inv_rms = reinterpret_cast<float*>(staged + TOKENS * streams * hidden);
-    __shared__ float warp_sums[kWarps][kLinearRows][TOKENS];
+    __shared__ float warp_dots[kWarps][kLinearRows][TOKENS][STREAMS];
+    __shared__ float warp_squares[kWarps][TOKENS][STREAMS];
+    __shared__ float inv_rms[TOKENS][STREAMS];
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
-    const int64_t width = streams * hidden;
-    for (int64_t j = warp; j < TOKENS * streams; j += kWarps) {
-        const scalar_t* stream = x + j * hidden;
-        float squares = 0.0f;
-        for (int64_t i = lane; i < hidden; i += 32) {
-            const float v = static_cast<float>(stream[i]);
-            squares += v * v;
-        }
-        squares = warp_sum(squares);
-        if (lane == 0) {
-            inv_rms[j] = rsqrtf(squares / static_cast<float>(hidden) + eps);
-        }
-    }
-    __syncthreads();
-    // Every CTA stages all of normed and writes the vectors [first, first + share) of it.
-    const int vectors = static_cast<int>(width / 8);
-    const int share = (TOKENS * vectors + static_cast<int>(gridDim.x) - 1) / static_cast<int>(gridDim.x);
-    const int first = static_cast<int>(blockIdx.x) * share;
-    for (int t = 0; t < TOKENS; t++) {
-        for (int v = static_cast<int>(threadIdx.x); v < vectors; v += kThreads) {
-            const int column = v * 8;
-            const float scale = inv_rms[t * streams + column / static_cast<int>(hidden)];
-            const uint4 loaded = *reinterpret_cast<const uint4*>(x + t * width + column);
-            const auto* values = reinterpret_cast<const scalar_t*>(&loaded);
-            const float4 low = *reinterpret_cast<const float4*>(norm_weight + column);
-            const float4 high = *reinterpret_cast<const float4*>(norm_weight + column + 4);
-            const float gains[8] = {low.x, low.y, low.z, low.w, high.x, high.y, high.z, high.w};
-            uint4 stored;
-            auto* out = reinterpret_cast<scalar_t*>(&stored);
-#pragma unroll
-            for (int i = 0; i < 8; i++) {
-                out[i] = static_cast<scalar_t>(static_cast<float>(values[i]) * scale * gains[i]);
-            }
-            *reinterpret_cast<uint4*>(staged + t * width + column) = stored;
-            const int index = t * vectors + v;
-            if (index >= first && index < first + share) {
-                *reinterpret_cast<uint4*>(normed + t * width + column) = stored;
-            }
-        }
-    }
-    __syncthreads();
-    const int64_t first_row = blockIdx.x * kLinearRows;
-    float sums[kLinearRows][TOKENS] = {};
-    for (int64_t k = threadIdx.x * 8; k < width; k += kThreads * 8) {
-#pragma unroll
-        for (int r = 0; r < kLinearRows; r++) {
-            if (first_row + r < rows) {
-                add_dots<scalar_t, TOKENS>(weight + (first_row + r) * weight_row_stride + k, staged + k, width, sums[r]);
-            }
-        }
-    }
-#pragma unroll
-    for (int r = 0; r < kLinearRows; r++) {
+    const int width = STREAMS * hidden;
+    const int64_t first_row = static_cast<int64_t>(blockIdx.x) * kLinearRows;
+    float dots[kLinearRows][TOKENS][STREAMS] = {};
+    float squares[TOKENS][STREAMS] = {};
+    for (int k = threadIdx.x * 8; k < width; k += kThreads * 8) {
+        const int stream = k / hidden;
+        const float4 low = *reinterpret_cast<const float4*>(norm_weight + k);
+        const float4 high = *reinterpret_cast<const float4*>(norm_weight + k + 4);
+        const float gains[8] = {low.x, low.y, low.z, low.w, high.x, high.y, high.z, high.w};
+        float scaled[TOKENS][8];
 #pragma unroll
         for (int t = 0; t < TOKENS; t++) {
-            const float sum = warp_sum(sums[r][t]);
-            if (lane == 0) {
-                warp_sums[warp][r][t] = sum;
+            const uint4 loaded = *reinterpret_cast<const uint4*>(x + t * width + k);
+            const auto* values = reinterpret_cast<const scalar_t*>(&loaded);
+            float token_squares = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const float v = static_cast<float>(values[i]);
+                token_squares += v * v;
+                scaled[t][i] = v * gains[i];
+            }
+#pragma unroll
+            for (int s = 0; s < STREAMS; s++) {
+                squares[t][s] += s == stream ? token_squares : 0.0f;
             }
         }
+#pragma unroll
+        for (int r = 0; r < kLinearRows; r++) {
+            if (first_row + r >= rows) {
+                continue;
+            }
+            const uint4 loaded = *reinterpret_cast<const uint4*>(weight + (first_row + r) * weight_row_stride + k);
+            const auto* weights = reinterpret_cast<const scalar_t*>(&loaded);
+#pragma unroll
+            for (int t = 0; t < TOKENS; t++) {
+                float dot = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    dot += scaled[t][i] * static_cast<float>(weights[i]);
+                }
+#pragma unroll
+                for (int s = 0; s < STREAMS; s++) {
+                    dots[r][t][s] += s == stream ? dot : 0.0f;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < TOKENS; t++) {
+#pragma unroll
+        for (int s = 0; s < STREAMS; s++) {
+            const float total = warp_sum(squares[t][s]);
+            if (lane == 0) {
+                warp_squares[warp][t][s] = total;
+            }
+#pragma unroll
+            for (int r = 0; r < kLinearRows; r++) {
+                const float dot = warp_sum(dots[r][t][s]);
+                if (lane == 0) {
+                    warp_dots[warp][r][t][s] = dot;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < TOKENS * STREAMS) {
+        const int t = threadIdx.x / STREAMS;
+        const int s = threadIdx.x % STREAMS;
+        float total = 0.0f;
+        for (int w = 0; w < kWarps; w++) {
+            total += warp_squares[w][t][s];
+        }
+        inv_rms[t][s] = rsqrtf(total / static_cast<float>(hidden) + eps);
     }
     __syncthreads();
     if (threadIdx.x < kLinearRows * TOKENS) {
@@ -239,11 +251,34 @@ __global__ void __launch_bounds__(kThreads) stream_rmsnorm_linear_kernel(
         const int t = threadIdx.x % TOKENS;
         if (first_row + r < rows) {
             float sum = 0.0f;
-            for (int w = 0; w < kWarps; w++) {
-                sum += warp_sums[w][r][t];
+            for (int s = 0; s < STREAMS; s++) {
+                float dot = 0.0f;
+                for (int w = 0; w < kWarps; w++) {
+                    dot += warp_dots[w][r][t][s];
+                }
+                sum += inv_rms[t][s] * dot;
             }
             projected[t * rows + first_row + r] = static_cast<scalar_t>(sum);
         }
+    }
+    // The CTA's share of normed, in 8-element vectors.
+    const int vectors = width / 8;
+    const int share = (TOKENS * vectors + static_cast<int>(gridDim.x) - 1) / static_cast<int>(gridDim.x);
+    for (int index = static_cast<int>(blockIdx.x) * share + threadIdx.x;
+         index < min((static_cast<int>(blockIdx.x) + 1) * share, TOKENS * vectors);
+         index += kThreads) {
+        const int t = index / vectors;
+        const int k = index % vectors * 8;
+        const float scale = inv_rms[t][k / hidden];
+        const uint4 loaded = *reinterpret_cast<const uint4*>(x + t * width + k);
+        const auto* values = reinterpret_cast<const scalar_t*>(&loaded);
+        uint4 stored;
+        auto* out = reinterpret_cast<scalar_t*>(&stored);
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            out[i] = static_cast<scalar_t>(static_cast<float>(values[i]) * scale * norm_weight[k + i]);
+        }
+        *reinterpret_cast<uint4*>(normed + t * width + k) = stored;
     }
 }
 
@@ -398,8 +433,9 @@ std::tuple<at::Tensor, at::Tensor> stream_rmsnorm_linear_cuda(
         weight.is_cuda() && weight.dim() == 2 && weight.size(1) == x.size(1) && weight.scalar_type() == x.scalar_type(),
         "stream_rmsnorm_linear: weight must be CUDA [out, n_streams * hidden] in x's dtype"
     );
+    // The fused kernel is compiled for Qwen3.8-Flash-Next's 4 streams.
     const bool vectors = x.size(0) >= 1 && x.size(0) <= kVectorTokens && x.scalar_type() != at::kFloat &&
-        x.is_contiguous() && n_streams >= 1 && x.size(1) % n_streams == 0 && (x.size(1) / n_streams) % 8 == 0 && vector_rows(x, x.size(1)) &&
+        x.is_contiguous() && n_streams == 4 && x.size(1) % n_streams == 0 && (x.size(1) / n_streams) % 8 == 0 && vector_rows(x, x.size(1)) &&
         vector_rows(weight, weight.stride(0)) && reinterpret_cast<uintptr_t>(norm_weight.const_data_ptr()) % 16 == 0;
     if (!vectors) {
         at::Tensor normed = stream_rmsnorm_cuda(x, norm_weight, n_streams, eps);
@@ -414,26 +450,21 @@ std::tuple<at::Tensor, at::Tensor> stream_rmsnorm_linear_cuda(
     const int64_t rows = weight.size(0);
     at::Tensor normed = at::empty_like(x);
     at::Tensor projected = at::empty({tokens, rows}, x.options());
-    const size_t shared = static_cast<size_t>(x.numel()) * x.element_size() + tokens * n_streams * sizeof(float);
     auto stream = at::cuda::getCurrentCUDAStream();
     AT_DISPATCH_REDUCED_FLOATING_TYPES(x.scalar_type(), "stream_rmsnorm_linear_cuda", [&] {
         dispatch_tokens(tokens, [&](auto tokens_tag) {
-            auto kernel = stream_rmsnorm_linear_kernel<scalar_t, decltype(tokens_tag)::value>;
-            C10_CUDA_CHECK(
-                cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared))
-            );
-            kernel<<<static_cast<unsigned>((rows + kLinearRows - 1) / kLinearRows), kThreads, shared, stream>>>(
-                x.const_data_ptr<scalar_t>(),
-                norm_weight.const_data_ptr<float>(),
-                weight.const_data_ptr<scalar_t>(),
-                weight.stride(0),
-                normed.mutable_data_ptr<scalar_t>(),
-                projected.mutable_data_ptr<scalar_t>(),
-                n_streams,
-                x.size(1) / n_streams,
-                rows,
-                static_cast<float>(eps)
-            );
+            stream_rmsnorm_linear_kernel<scalar_t, decltype(tokens_tag)::value, 4>
+                <<<static_cast<unsigned>((rows + kLinearRows - 1) / kLinearRows), kThreads, 0, stream>>>(
+                    x.const_data_ptr<scalar_t>(),
+                    norm_weight.const_data_ptr<float>(),
+                    weight.const_data_ptr<scalar_t>(),
+                    weight.stride(0),
+                    normed.mutable_data_ptr<scalar_t>(),
+                    projected.mutable_data_ptr<scalar_t>(),
+                    static_cast<int>(x.size(1) / n_streams),
+                    rows,
+                    static_cast<float>(eps)
+                );
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         });
     });
