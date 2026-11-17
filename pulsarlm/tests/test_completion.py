@@ -116,6 +116,7 @@ def make_engine(store: LocalStore | EmptyStore) -> AsyncEngine:
             stop_ids=[],
             prefill_tokens_per_step=64,
             decode_graphs=True,
+            max_context_window=4096,
         )
     )
 

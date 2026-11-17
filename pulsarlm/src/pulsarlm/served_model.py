@@ -80,6 +80,7 @@ def load_served_model(
             stop_ids=stops,
             prefill_tokens_per_step=settings.prefill_tokens_per_step,
             decode_graphs=settings.decode_graphs,
+            max_context_window=settings.max_context_window or max_context,
         )
     except ValueError as error:
         raise checkpoint.PulsarLMModelLoadingError(str(error)) from error

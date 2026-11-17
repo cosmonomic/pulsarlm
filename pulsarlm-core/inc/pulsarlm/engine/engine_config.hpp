@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -13,8 +14,10 @@ namespace pulsarlm {
 // model_name names the model and model_hash its files' version; with the page shapes of the whole model's KV layers
 // they make the root digest. Shard s of the model runs on devices[s], its part of the KV layers' lines sharing one pool of
 // kv_cache_pool_bytes there, which must hold a line of every KV layer. A step forwards every decoding sequence and at
-// most prefill_tokens_per_step tokens of the others. With decode_graphs, the decoding sequences' forward is replayed
-// from CUDA graphs (decode_graphs.hpp).
+// most prefill_tokens_per_step tokens of the others. With decode_graphs and max_context_window, the decoding sequences'
+// forward is replayed from CUDA graphs (decode_graphs.hpp) over page tables wide enough for a view of
+// max_context_window tokens, the requests' eviction_policy::max_context_window; a step with a wider view runs without a
+// graph.
 struct engine_config {
     std::string model_name;
     std::string model_hash;
@@ -25,6 +28,7 @@ struct engine_config {
     std::vector<std::int64_t> stop_ids;
     std::size_t prefill_tokens_per_step;
     bool decode_graphs = false;
+    std::optional<std::size_t> max_context_window;
 };
 
 }  // namespace pulsarlm

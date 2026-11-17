@@ -171,6 +171,14 @@ std::vector<communicator> make_communicators(std::span<const at::Device> devices
     return communicator::make(devices);
 }
 
+// The pages of a view of max_context_window tokens, its last page partly filled, when decode graphs are on.
+std::optional<std::size_t> graph_pages(const engine_config& config) {
+    if (!config.decode_graphs || !config.max_context_window) {
+        return std::nullopt;
+    }
+    return (*config.max_context_window + config.page_size - 1) / config.page_size + 1;
+}
+
 std::size_t largest_line(const engine_config& config, const model& shard) {
     std::size_t largest = 0;
     for (const page_shape& shape : page_shapes(config, full_layers(shard))) {
@@ -279,7 +287,7 @@ engine::engine(
       loop_pointers(worker_loops),
       make_root_digest(config.model_name, config.model_hash, page_shapes(config, full_layers(*this->shards.front()))),
       std::vector<std::int64_t>(config.stop_ids),
-      config.decode_graphs
+      graph_pages(config)
   ),
   sched(exec, config.prefill_tokens_per_step) {
     for (std::size_t shard = 1; shard < devices.size(); shard++) {

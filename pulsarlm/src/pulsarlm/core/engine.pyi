@@ -388,11 +388,13 @@ class Engine:
         stop_ids: list[int],
         prefill_tokens_per_step: int,
         decode_graphs: bool,
+        max_context_window: int | None,
     ) -> None:
         """Runs the model of config split over devices: load_model_shard(rank,
         len(devices)) gives rank's weights on devices[rank], each rank loaded
         before the next. Each device's KV cache takes kv_cache_gib. With
-        decode_graphs, decode steps replay from CUDA graphs. Raises
+        decode_graphs, decode steps whose views hold at most max_context_window
+        tokens replay from CUDA graphs captured before serving. Raises
         ValueError for a model the engine does not split over devices."""
     def submit(
         self,

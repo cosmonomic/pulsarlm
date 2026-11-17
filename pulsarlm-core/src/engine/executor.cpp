@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <bit>
+#include <exception>
+#include <thread>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -105,12 +107,16 @@ class executor::batch {
     at::Tensor decode_mass;
     at::Tensor prefill_mass;
 
-    batch(std::span<const batch_entry> step_entries, std::size_t page_size);
+    // The decode group's page-table width, and whether its forward replays a graph.
+    std::size_t decode_width = 0;
+    bool decode_replays = false;
+
+    // With graph_pages, a decode group whose tables fit graph_pages pages takes tables that wide and replays a graph.
+    batch(std::span<const batch_entry> step_entries, std::size_t page_size, std::optional<std::size_t> graph_pages);
 
     static group_batch make_group(std::span<const batch_entry> group, std::size_t page_size, bool prefill);
-    // The page-table width of the group is its widest sequence's, for a decode group raised to a power of two, as each
-    // decode width is a CUDA graph to capture.
-    static std::size_t table_width(std::span<const batch_entry> group, bool prefill) noexcept;
+    // The widest table among the group's sequences.
+    static std::size_t table_width(std::span<const batch_entry> group) noexcept;
     static bool measures_mass(std::span<const batch_entry> group) noexcept;
     // Whether e forwards a query that adds mass.
     static bool measures_mass(const batch_entry& e) noexcept;
@@ -124,8 +130,7 @@ class executor::batch {
     );
     // Queues on stream shard's copies of the inputs, its forward and the copies of its page mass to the host; shard 0
     // also queues the sampling and the copy of the sampled tokens to the host. mass_heads is the shard's part of the
-    // executor's. The decode group forwards through graphs unless it is null. Every shard's call may run at once, each
-    // on its own thread.
+    // executor's. graphs is the shard's when decode_replays. Every shard's call may run at once, each on its own thread.
     void enqueue(
         model& shard_model,
         std::span<const kv> lines,
@@ -158,7 +163,7 @@ executor::executor(
     std::vector<event_loop*>&& worker_loops,
     digest root,
     std::vector<std::int64_t>&& stop_ids,
-    bool capture_decode
+    std::optional<std::size_t> graph_pages
 )
 : shards(std::move(shards)),
   cache(std::move(cache)),
@@ -167,7 +172,8 @@ executor::executor(
   worker_loops(std::move(worker_loops)),
   page_size(0),
   root(root),
-  stop_ids(std::move(stop_ids)) {
+  stop_ids(std::move(stop_ids)),
+  graph_pages(graph_pages) {
     assert(this->shards.size() == this->cache.shard_count() && this->streams.size() == this->shards.size());
     assert(this->worker_loops.size() + 1 == this->shards.size());
     shard_mass_heads.resize(this->shards.size());
@@ -194,14 +200,27 @@ executor::executor(
         }
     }
     assert(page_size > 0);
-    if (capture_decode) {
+    if (graph_pages) {
         for (std::size_t shard = 0; shard < this->shards.size(); shard++) {
-            graphs.push_back(std::make_unique<decode_graphs>(*this->shards[shard], lines[shard]));
+            c10::cuda::CUDAGuard device_guard(lines[shard].front().k.device());
+            graphs.push_back(
+                std::make_unique<decode_graphs>(
+                    *this->shards[shard],
+                    lines[shard],
+                    *graph_pages,
+                    shard_mass_heads[shard]
+                )
+            );
         }
+        capture_decode_graphs();
     }
 }
 
-executor::batch::batch(std::span<const batch_entry> step_entries, std::size_t page_size)
+executor::batch::batch(
+    std::span<const batch_entry> step_entries,
+    std::size_t page_size,
+    std::optional<std::size_t> graph_pages
+)
 : entries(step_entries.begin(), step_entries.end()) {
     auto first_prefill = std::ranges::find_if(entries, [](const batch_entry& e) {
         return e.seq->pending_tokens.size() > 1;
@@ -210,6 +229,11 @@ executor::batch::batch(std::span<const batch_entry> step_entries, std::size_t pa
     std::span<const batch_entry> entry_span(entries);
     if (decode_count > 0) {
         inputs.decode_group = make_group(entry_span.first(decode_count), page_size, false);
+        decode_width = table_width(entry_span.first(decode_count));
+        decode_replays = graph_pages && decode_width <= *graph_pages;
+        if (decode_replays) {
+            decode_width = *graph_pages;
+        }
     }
     if (entries.size() > decode_count) {
         inputs.prefill_group = make_group(entry_span.subspan(decode_count), page_size, true);
@@ -271,8 +295,7 @@ group_batch executor::batch::make_group(std::span<const batch_entry> group, std:
             std::int32_t* row = cu_view_pages + layer * (group.size() + 1);
             row[0] = 0;
             for (std::size_t s = 0; s < group.size(); s++) {
-                std::size_t pages = prefill ? group[s].seq->layers[layer].lines.size() : table_width(group, prefill);
-                row[s + 1] = row[s] + static_cast<std::int32_t>(pages);
+                row[s + 1] = row[s] + static_cast<std::int32_t>(group[s].seq->layers[layer].lines.size());
             }
         }
         std::span<float> weights(g.query_weights.mutable_data_ptr<float>(), token_count);
@@ -285,12 +308,12 @@ group_batch executor::batch::make_group(std::span<const batch_entry> group, std:
     return g;
 }
 
-std::size_t executor::batch::table_width(std::span<const batch_entry> group, bool prefill) noexcept {
+std::size_t executor::batch::table_width(std::span<const batch_entry> group) noexcept {
     std::size_t width = 0;
     for (const batch_entry& e : group) {
         width = std::max(width, e.seq->table_width());
     }
-    return prefill ? width : std::bit_ceil(width);
+    return width;
 }
 
 bool executor::batch::measures_mass(std::span<const batch_entry> group) noexcept {
@@ -338,9 +361,8 @@ void executor::batch::enqueue(
     if (inputs.decode_group) {
         on_device.decode_group = to_device(*inputs.decode_group, device);
         std::span<batch_entry> group = entry_span.first(decode_count);
-        std::size_t width = table_width(group, false);
-        on_device.decode_group->page_tables = page_tables(group, lines.size(), false, shard, width);
-        on_device.decode_group->page_positions = page_tables(group, lines.size(), true, shard, width);
+        on_device.decode_group->page_tables = page_tables(group, lines.size(), false, shard, decode_width);
+        on_device.decode_group->page_positions = page_tables(group, lines.size(), true, shard, decode_width);
         if (inputs.decode_group->cu_view_pages.defined()) {
             decode_on_device = zero_page_mass(*on_device.decode_group, inputs.decode_group->cu_view_pages, mass_heads);
         }
@@ -348,7 +370,7 @@ void executor::batch::enqueue(
     if (inputs.prefill_group) {
         on_device.prefill_group = to_device(*inputs.prefill_group, device);
         std::span<batch_entry> group = entry_span.subspan(decode_count);
-        std::size_t width = table_width(group, true);
+        std::size_t width = table_width(group);
         on_device.prefill_group->page_tables = page_tables(group, lines.size(), false, shard, width);
         on_device.prefill_group->page_positions = page_tables(group, lines.size(), true, shard, width);
         const at::Tensor& cu_seqlens_q = on_device.prefill_group->cu_seqlens_q;
@@ -362,7 +384,7 @@ void executor::batch::enqueue(
         }
     }
     step_logits logits;
-    if (graphs != nullptr && on_device.decode_group) {
+    if (decode_replays) {
         group_batch decode_group = std::move(*on_device.decode_group);
         on_device.decode_group.reset();
         logits = shard_model.forward(on_device, lines);
@@ -623,7 +645,7 @@ task<std::expected<request_result, request_error>> executor::finish(sequence& se
 }
 
 task<void> executor::step(std::span<const batch_entry> entries) {
-    batch b(entries, page_size);
+    batch b(entries, page_size, graph_pages);
     co_await launch(b);
     co_await write_back(b);
 }
@@ -780,6 +802,35 @@ task<void> executor::forward_on_shard(batch& b, std::size_t shard) {
         );
     }
     co_await synchronize(streams[shard]);
+}
+
+// Each shard on its own thread, as the eager forwards' collectives need every shard at once.
+void executor::capture_decode_graphs() {
+    std::vector<std::exception_ptr> failures(shards.size());
+    std::vector<std::thread> threads;
+    for (std::size_t shard = 0; shard < shards.size(); shard++) {
+        threads.emplace_back([this, shard, &failures] {
+            try {
+                at::Device device = lines[shard].front().k.device();
+                c10::cuda::CUDAGuard device_guard(device);
+                c10::cuda::CUDAStreamGuard stream_guard(
+                    c10::cuda::getStreamFromExternal(streams[shard], device.index())
+                );
+                graphs[shard]->capture_startup();
+                C10_CUDA_CHECK(cudaStreamSynchronize(streams[shard]));
+            } catch (...) {
+                failures[shard] = std::current_exception();
+            }
+        });
+    }
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+    for (const std::exception_ptr& failure : failures) {
+        if (failure) {
+            std::rethrow_exception(failure);
+        }
+    }
 }
 
 task<void> executor::synchronize_shards() {

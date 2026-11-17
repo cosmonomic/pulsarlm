@@ -189,14 +189,16 @@ void copy_pages_from_host(
             c10::cuda::CUDAStreamGuard guard(
                 c10::cuda::getStreamFromExternal(streams[shard.cache_shard], shard.bytes.device().index())
             );
-            shard.bytes.copy_(pages[i].bytes.narrow(0, static_cast<std::int64_t>(shard.host_offset), shard.bytes.numel()));
+            shard.bytes.copy_(
+                pages[i].bytes.narrow(0, static_cast<std::int64_t>(shard.host_offset), shard.bytes.numel())
+            );
         }
     }
 }
 
 bool tail_continues(const pulsarlm::state& s, const token_list& tokens, std::size_t start) {
     return start + s.tail.size() < tokens.size() &&
-           std::equal(s.tail.begin(), s.tail.end(), tokens.begin() + static_cast<std::ptrdiff_t>(start));
+        std::equal(s.tail.begin(), s.tail.end(), tokens.begin() + static_cast<std::ptrdiff_t>(start));
 }
 
 // Keeps every page it is written, copied to pageable host memory, and every state, one per head and tail. A lease never
@@ -259,18 +261,19 @@ struct memory_store final : pulsarlm::page_store {
     read_state(std::span<const std::int64_t> tokens, std::span<const digest> page_digests) override {
         std::shared_ptr<store_contents> shared = contents;
         token_list prompt(tokens.begin(), tokens.end());
-        shared->state_reads.push_back(state_read{
-            .tokens = prompt,
-            .page_digests = std::vector<digest>(page_digests.begin(), page_digests.end()),
-        });
+        shared->state_reads.push_back(
+            state_read{
+                .tokens = prompt,
+                .page_digests = std::vector<digest>(page_digests.begin(), page_digests.end()),
+            }
+        );
         if (shared->lookup_fails) {
             co_return std::unexpected(pulsarlm::page_error::miss);
         }
         lease_id_type lease_id = shared->next_lease_id++;
         shared->leases.push_back(lease_id);
         for (std::size_t pages = page_digests.size() + 1; pages > 0; pages--) {
-            std::optional<digest> head =
-                pages > 1 ? std::optional(page_digests[pages - 2]) : std::optional<digest>();
+            std::optional<digest> head = pages > 1 ? std::optional(page_digests[pages - 2]) : std::optional<digest>();
             state_pointer longest;
             for (const state_pointer& s : shared->states) {
                 if (s->head == head && tail_continues(*s, prompt, (pages - 1) * page_size) &&
@@ -585,7 +588,7 @@ struct fixture {
           {},
           root(),
           std::move(stop_ids),
-          false
+          std::nullopt
       ),
       sched(exec, prefill_tokens_per_step) {}
 
@@ -684,7 +687,8 @@ bool each_layers_own(std::size_t layer, std::int64_t token) {
 token_list pages_of(const token_list& tokens, const std::vector<std::size_t>& pages) {
     token_list kept_tokens;
     for (std::size_t page : pages) {
-        kept_tokens.insert(kept_tokens.end(), tokens.begin() + page * page_size, tokens.begin() + (page + 1) * page_size);
+        kept_tokens
+            .insert(kept_tokens.end(), tokens.begin() + page * page_size, tokens.begin() + (page + 1) * page_size);
     }
     return kept_tokens;
 }
@@ -847,8 +851,10 @@ TEST_CASE("a request's page chain starts from its initial digest and continues p
     fixture f(16);
     digest initial{.hi = 3, .lo = 4};
     token_list prompt{1, 2, 3, 4, 5, 6};
-    std::vector<request_results> results =
-        serve_all(f.sched, {request{.initial_digest = initial, .tokens = prompt, .max_tokens = 5}});
+    std::vector<request_results> results = serve_all(
+        f.sched,
+        {request{.initial_digest = initial, .tokens = prompt, .max_tokens = 5}}
+    );
 
     token_list forwarded = concat(prompt, without_last(results[0].tokens));
     std::vector<digest> chain = pulsarlm::make_page_digests(initial, forwarded, page_size);
@@ -947,8 +953,10 @@ TEST_CASE("pages fetched from the store count as cached but not device cached") 
     memory_store shared_store;
     shared_store.contents = first_engine.store;
     fixture second_engine(16, 64, {}, shared_store);
-    request_results second =
-        serve_all(second_engine.sched, {request{.tokens = concat(prompt, first.tokens), .max_tokens = 1}})[0];
+    request_results second = serve_all(
+        second_engine.sched,
+        {request{.tokens = concat(prompt, first.tokens), .max_tokens = 1}}
+    )[0];
 
     REQUIRE(second.cached_tokens == 8);
     REQUIRE(second.device_cached_tokens == 0);
@@ -957,9 +965,11 @@ TEST_CASE("pages fetched from the store count as cached but not device cached") 
 TEST_CASE("a state page missing from the store ends the request with miss") {
     fixture f(16);
     token_list prompt{1, 2, 3, 4, 5};
-    f.backing.keep_state(std::make_shared<const pulsarlm::state>(
-        full_layers_state(pulsarlm::make_page_digests(root(), prompt, page_size), 2)
-    ));
+    f.backing.keep_state(
+        std::make_shared<const pulsarlm::state>(
+            full_layers_state(pulsarlm::make_page_digests(root(), prompt, page_size), 2)
+        )
+    );
     std::vector<request_results> results = serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 1}});
 
     REQUIRE(results[0].tokens.empty());

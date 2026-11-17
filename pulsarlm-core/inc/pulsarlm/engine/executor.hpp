@@ -38,6 +38,8 @@ class executor {
     std::vector<std::vector<kv>> lines;
     // One per shard, or none when decode groups forward without graphs.
     std::vector<std::unique_ptr<decode_graphs>> graphs;
+    // The page-table width of the decode graphs, the pages of the longest view they cover.
+    std::optional<std::size_t> graph_pages;
     std::vector<std::optional<std::size_t>> sliding_windows;
     std::vector<bool> recurrent;
     // Per KV layer, the query heads it measures mass and evicts pages in: those of every attention layer reading a
@@ -68,6 +70,8 @@ class executor {
     // state the store returned does not reference.
     task<std::expected<void, page_error>> own_pages_from(sequence& seq, std::size_t first_index);
     void release_lines(sequence& seq) noexcept;
+    // Captures each shard's decode graphs of up to decode_graphs::startup_sequences sequences, every shard at once.
+    void capture_decode_graphs();
     // Raises seq's peak_device_memory to the bytes of each device's pool its lines take now.
     void record_device_memory(sequence& seq) const noexcept;
     // Drops from each sliding layer's view the pages before the window of the tail's first token, and returns whether
@@ -90,8 +94,8 @@ class executor {
   public:
     // shards[s] runs on cache shard s with streams[s], shards 1 on on worker_loops[s - 1]; the cache holds one layer
     // per entry of each model's kv_layers(), and the shards agree on which layers are recurrent or sliding. store is the
-    // cache's. root is the engine's root digest (make_root_digest). With capture_decode, decode groups forward through
-    // decode_graphs.
+    // cache's. root is the engine's root digest (make_root_digest). With graph_pages, a decode group whose sequences'
+    // tables fit graph_pages pages replays a decode_graphs graph over tables that wide.
     executor(
         std::vector<model*>&& shards,
         kv_cache cache,
@@ -100,7 +104,7 @@ class executor {
         std::vector<event_loop*>&& worker_loops,
         digest root,
         std::vector<std::int64_t>&& stop_ids,
-        bool capture_decode
+        std::optional<std::size_t> graph_pages
     );
 
     // The sequence of r, resuming the newest state the store holds for a prefix of its tokens, with lines for its

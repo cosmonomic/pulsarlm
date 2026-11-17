@@ -147,6 +147,7 @@ def make_engine(store: MemoryStore, store_pages: int = 0) -> Engine:
         stop_ids=[],
         prefill_tokens_per_step=64,
         decode_graphs=True,
+        max_context_window=4096,
     )
 
 
@@ -372,7 +373,8 @@ def test_cancel_ends_the_request_with_cancelled():
 
         assert end == RequestError.CANCELLED
         del engine
-        assert store.releases == [1]
+        # The cancellation may arrive before the request reads its state, which takes the lease.
+        assert store.releases == list(range(1, store.lease_count + 1))
 
     asyncio.run(main())
 
@@ -414,6 +416,7 @@ def test_a_cache_without_a_line_or_a_negative_store_is_rejected(
             stop_ids=[],
             prefill_tokens_per_step=64,
             decode_graphs=True,
+            max_context_window=4096,
         )
 
 

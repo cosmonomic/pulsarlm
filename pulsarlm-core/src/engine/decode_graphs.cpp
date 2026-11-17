@@ -2,8 +2,8 @@
 
 #include <ATen/ATen.h>
 
+#include <algorithm>
 #include <cstddef>
-#include <optional>
 #include <utility>
 
 namespace pulsarlm {
@@ -16,51 +16,114 @@ void copy_defined(const at::Tensor& to, const at::Tensor& from) {
     }
 }
 
-at::Tensor empty_like_defined(const at::Tensor& t) {
-    return t.defined() ? at::empty_like(t) : t;
-}
-
 }  // namespace
 
-decode_graphs::decode_graphs(model& shard_model, std::span<const kv> lines)
+decode_graphs::decode_graphs(
+    model& shard_model,
+    std::span<const kv> lines,
+    std::size_t width,
+    std::vector<std::size_t> mass_heads
+)
 : shard_model(shard_model),
-  lines(lines.begin(), lines.end()) {}
-
-std::unique_ptr<decode_graphs::captured_forward> decode_graphs::capture(const group_batch& g) {
-    auto captured = std::make_unique<captured_forward>();
-    group_batch& inputs = captured->inputs;
-    inputs = group_batch{
-        .tokens = at::empty_like(g.tokens),
-        .pos = at::empty_like(g.pos),
-        .page_tables = at::empty_like(g.page_tables),
-        .page_end_tokens = at::empty_like(g.page_end_tokens),
-        .key_counts = at::empty_like(g.key_counts),
-        .page_positions = at::empty_like(g.page_positions),
-        .cu_view_pages = empty_like_defined(g.cu_view_pages),
-        .query_weights = empty_like_defined(g.query_weights),
-    };
-    for (std::size_t layer = 0; layer < g.page_mass_sum.size(); layer++) {
-        inputs.page_mass_sum.push_back(empty_like_defined(g.page_mass_sum[layer]));
-        inputs.page_weight_sum.push_back(empty_like_defined(g.page_weight_sum[layer]));
+  lines(lines.begin(), lines.end()),
+  width(static_cast<std::int64_t>(width)),
+  mass_heads(std::move(mass_heads)) {
+    auto floats = this->lines.front().k.options().dtype(at::kFloat);
+    const std::int64_t rows = startup_sequences * this->width;
+    for (std::size_t heads : this->mass_heads) {
+        shared_mass_sum.push_back(
+            heads > 0 ? at::empty({rows, static_cast<std::int64_t>(heads)}, floats) : at::Tensor()
+        );
+        shared_weight_sum.push_back(heads > 0 ? at::empty({rows}, floats) : at::Tensor());
     }
-    // Thread-local capture leaves the other GPUs' threads free to launch while this one captures.
-    captured->graph.capture_begin({0, 0}, cudaStreamCaptureModeThreadLocal);
-    for (std::size_t layer = 0; layer < inputs.page_mass_sum.size(); layer++) {
-        if (inputs.page_mass_sum[layer].defined()) {
-            inputs.page_mass_sum[layer].zero_();
-            inputs.page_weight_sum[layer].zero_();
+}
+
+std::size_t decode_graphs::page_width() const noexcept {
+    return static_cast<std::size_t>(width);
+}
+
+group_batch decode_graphs::make_inputs(std::int64_t sequences, bool measures_mass) const {
+    auto device = lines.front().k.options();
+    auto ints = device.dtype(at::kInt);
+    auto longs = device.dtype(at::kLong);
+    const auto layers = static_cast<std::int64_t>(lines.size());
+    group_batch inputs{
+        .tokens = at::zeros({sequences}, longs),
+        .pos = at::zeros({sequences}, longs),
+        .page_tables = at::zeros({layers, sequences, width}, ints),
+        .page_end_tokens = at::zeros({sequences}, ints),
+        .key_counts = at::ones({layers, sequences}, ints),
+        .page_positions = at::zeros({layers, sequences, width}, ints),
+    };
+    if (measures_mass) {
+        // Each view is the one page its key lies on.
+        inputs.cu_view_pages = at::arange(sequences + 1, ints).unsqueeze(0).repeat({layers, 1});
+        inputs.query_weights = at::zeros({sequences}, device.dtype(at::kFloat));
+        const std::int64_t rows = sequences * width;
+        auto floats = device.dtype(at::kFloat);
+        for (std::size_t layer = 0; layer < mass_heads.size(); layer++) {
+            if (mass_heads[layer] == 0) {
+                inputs.page_mass_sum.emplace_back();
+                inputs.page_weight_sum.emplace_back();
+            } else if (sequences <= startup_sequences) {
+                inputs.page_mass_sum.push_back(shared_mass_sum[layer].narrow(0, 0, rows));
+                inputs.page_weight_sum.push_back(shared_weight_sum[layer].narrow(0, 0, rows));
+            } else {
+                inputs.page_mass_sum.push_back(at::empty({rows, static_cast<std::int64_t>(mass_heads[layer])}, floats));
+                inputs.page_weight_sum.push_back(at::empty({rows}, floats));
+            }
         }
     }
+    return inputs;
+}
+
+std::unique_ptr<decode_graphs::captured_forward> decode_graphs::capture(std::int64_t sequences, bool measures_mass) {
+    auto captured = std::make_unique<captured_forward>();
+    captured->inputs = make_inputs(sequences, measures_mass);
+    const group_batch& inputs = captured->inputs;
+    // Thread-local capture leaves the other GPUs' threads free to launch while this one captures.
+    captured->graph.capture_begin({0, 0}, cudaStreamCaptureModeThreadLocal);
     captured->logits = *shard_model.forward(step_batch{.decode_group = inputs}, lines).decode_logits;
     captured->graph.capture_end();
     return captured;
 }
 
+// A capture cannot create what the forward creates at its first run, such as cuBLAS handles and RoPE tables, so an eager
+// forward of each kind runs first. Its tables point every view at line 0, which it zeroes first so that the forward
+// reads no uninitialized memory; no sequence holds a line yet.
+void decode_graphs::capture_startup() {
+    for (const kv& layer : lines) {
+        for (const at::Tensor& part : {layer.k, layer.v, layer.index_keys}) {
+            if (part.defined()) {
+                part.select(0, 0).zero_();
+            }
+        }
+    }
+    const bool measures = std::ranges::any_of(mass_heads, [](std::size_t heads) { return heads > 0; });
+    shard_model.forward(step_batch{.decode_group = make_inputs(1, false)}, lines);
+    if (measures) {
+        shard_model.forward(step_batch{.decode_group = make_inputs(1, true)}, lines);
+    }
+    const bool any_mass = std::ranges::any_of(mass_heads, [](std::size_t heads) { return heads > 0; });
+    for (std::int64_t sequences = 1; sequences <= startup_sequences; sequences++) {
+        for (bool measures_mass : {false, true}) {
+            if (measures_mass && !any_mass) {
+                continue;
+            }
+            std::unique_ptr<captured_forward>& captured = forwards[{sequences, measures_mass}];
+            if (!captured) {
+                captured = capture(sequences, measures_mass);
+            }
+        }
+    }
+}
+
 at::Tensor decode_graphs::forward(const group_batch& g) {
-    shape group_shape{g.page_tables.size(1), g.page_tables.size(2), g.cu_view_pages.defined()};
-    std::unique_ptr<captured_forward>& captured = forwards[group_shape];
+    const std::int64_t sequences = g.page_tables.size(1);
+    const bool measures_mass = g.cu_view_pages.defined();
+    std::unique_ptr<captured_forward>& captured = forwards[{sequences, measures_mass}];
     if (!captured) {
-        captured = capture(g);
+        captured = capture(sequences, measures_mass);
     }
     group_batch& inputs = captured->inputs;
     inputs.tokens.copy_(g.tokens);
@@ -71,10 +134,21 @@ at::Tensor decode_graphs::forward(const group_batch& g) {
     inputs.page_positions.copy_(g.page_positions);
     copy_defined(inputs.cu_view_pages, g.cu_view_pages);
     copy_defined(inputs.query_weights, g.query_weights);
+    // The graph adds the step's mass into the rows of its views, which start from zero.
+    for (std::size_t layer = 0; layer < g.page_mass_sum.size(); layer++) {
+        if (g.page_mass_sum[layer].defined()) {
+            inputs.page_mass_sum[layer].narrow(0, 0, g.page_mass_sum[layer].size(0)).zero_();
+            inputs.page_weight_sum[layer].narrow(0, 0, g.page_weight_sum[layer].size(0)).zero_();
+        }
+    }
     captured->graph.replay();
     for (std::size_t layer = 0; layer < g.page_mass_sum.size(); layer++) {
-        copy_defined(g.page_mass_sum[layer], inputs.page_mass_sum[layer]);
-        copy_defined(g.page_weight_sum[layer], inputs.page_weight_sum[layer]);
+        if (g.page_mass_sum[layer].defined()) {
+            g.page_mass_sum[layer].copy_(inputs.page_mass_sum[layer].narrow(0, 0, g.page_mass_sum[layer].size(0)));
+            g.page_weight_sum[layer].copy_(
+                inputs.page_weight_sum[layer].narrow(0, 0, g.page_weight_sum[layer].size(0))
+            );
+        }
     }
     return captured->logits;
 }

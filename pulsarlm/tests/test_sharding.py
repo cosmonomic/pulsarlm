@@ -432,6 +432,7 @@ def test_an_engine_split_over_two_ranks_generates_what_one_gpu_does(
             stop_ids=[],
             prefill_tokens_per_step=32,
             decode_graphs=False,
+            max_context_window=4096,
         )
         one_gpu_store = MemoryStore()
         one_gpu = Engine(

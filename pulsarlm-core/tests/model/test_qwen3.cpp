@@ -176,7 +176,9 @@ pulsarlm::group_batch step(const at::Tensor& tokens, std::int64_t first, std::in
         .tokens = tokens.narrow(0, first, last - first),
         .pos = at::arange(first, last, cuda(at::kLong)),
         .page_tables = every_layer(int32_cuda(view_lines).view({1, -1})),
-        .page_end_tokens = int32_cuda({static_cast<std::int32_t>(last / page_size * page_size > first ? last / page_size * page_size - first : 0)}),
+        .page_end_tokens = int32_cuda(
+            {static_cast<std::int32_t>(last / page_size * page_size > first ? last / page_size * page_size - first : 0)}
+        ),
         .page_positions = every_layer(
             (at::arange(static_cast<std::int64_t>(view_lines.size()), cuda(at::kInt)) * page_size).view({1, -1})
         ),
@@ -228,7 +230,8 @@ void check_against_dense(at::ScalarType dtype, double tolerance, bool graphs) {
         );
     }
 
-    pulsarlm::decode_graphs decode(model, kv);
+    pulsarlm::decode_graphs
+        decode(model, kv, view_lines.size(), std::vector<std::size_t>(n_layers, static_cast<std::size_t>(n_heads)));
 
     const std::int64_t n_tokens = 40;
     auto tokens = at::randint(vocab, {n_tokens}, cuda(at::kLong));
@@ -253,7 +256,9 @@ void check_against_dense(at::ScalarType dtype, double tolerance, bool graphs) {
         const pulsarlm::group_batch& g = c.prefill ? *batch.prefill_group : *batch.decode_group;
 
         auto expected_logits = dense.logits.narrow(0, c.first, c.last - c.first);
-        CHECK(max_relative_error(*(c.prefill ? logits.prefill_logits : logits.decode_logits), expected_logits) < tolerance);
+        CHECK(
+            max_relative_error(*(c.prefill ? logits.prefill_logits : logits.decode_logits), expected_logits) < tolerance
+        );
         for (std::int64_t layer = 0; layer < n_layers; layer++) {
             dense_mass expected = dense_page_mass(dense, layer, c.first, c.last);
             CHECK(max_relative_error(g.page_mass_sum[layer], expected.mass_sum) < tolerance);
