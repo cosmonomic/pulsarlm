@@ -480,8 +480,7 @@ __global__ void __launch_bounds__(NWARPS * 32) paged_decode_split_kernel(
     float* __restrict__ o_partial,
     float* __restrict__ m_partial,
     float* __restrict__ l_partial,
-    int nsplits,
-    int tiles_per_split
+    int nsplits
 ) {
     wait_for_prior_kernels();
     allow_next_kernel();
@@ -502,8 +501,13 @@ __global__ void __launch_bounds__(NWARPS * 32) paged_decode_split_kernel(
     begin_group<scalar_t, HEAD_DIM, NWARPS>(p, s, g, tiles.sQ, tiles.Mrow, tiles.Lrow);
     __syncthreads();
     // Slices start on page boundaries, so every page's max is one CTA's.
+    // The splits share the tiles from the window's first page to the view's last key, in whole pages.
     constexpr int TILES_PER_PAGE = decode_tiles_per_page(PAGE_SIZE, HEAD_DIM);
-    const int first_tile = first / decode_tiles<scalar_t, HEAD_DIM, NWARPS>::KEY_TILE / TILES_PER_PAGE * TILES_PER_PAGE;
+    constexpr int KEY_TILE = decode_tiles<scalar_t, HEAD_DIM, NWARPS>::KEY_TILE;
+    const int first_tile = first / KEY_TILE / TILES_PER_PAGE * TILES_PER_PAGE;
+    const int attended_tiles = (ctx_len - 1) / KEY_TILE + 1 - first_tile;
+    const int tiles_per_split = ((attended_tiles + nsplits - 1) / nsplits + TILES_PER_PAGE - 1) / TILES_PER_PAGE *
+        TILES_PER_PAGE;
     const int t_start = first_tile + split * tiles_per_split;
     tc_attend_tiles<scalar_t, PAGE_SIZE, HEAD_DIM, BF16, NWARPS>(
         p,
@@ -666,8 +670,6 @@ void launch_tc_decode(const attn::paged_attn_batch& b, int64_t forced_splits, cu
         return;
     }
 
-    const int64_t pages_per_split = ((attended_tiles + nsplits - 1) / nsplits + tiles_per_page - 1) / tiles_per_page;
-    const int tiles_per_split = static_cast<int>(pages_per_split * tiles_per_page);
     auto o_partial = at::empty({b.num_seqs, b.n_kv_heads, nsplits, group, b.head_dim}, fopts);
     auto m_partial = at::empty({b.num_seqs, b.n_kv_heads, nsplits, group}, fopts);
     auto l_partial = at::empty({b.num_seqs, b.n_kv_heads, nsplits, group}, fopts);
@@ -691,8 +693,7 @@ void launch_tc_decode(const attn::paged_attn_batch& b, int64_t forced_splits, cu
                 o_partial.data_ptr<float>(),
                 m_partial.data_ptr<float>(),
                 l_partial.data_ptr<float>(),
-                nsplits,
-                tiles_per_split
+                nsplits
             );
         });
     });

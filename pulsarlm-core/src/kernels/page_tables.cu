@@ -12,7 +12,7 @@
 namespace pulsarlm {
 namespace {
 
-// One block per (layer, sequence); threads stride over the row's width.
+// One block per (layer, sequence); threads stride over the sequence's pages.
 __global__ void gather_page_tables_kernel(
     const int64_t* __restrict__ table_addresses,
     const int32_t* __restrict__ capacities,
@@ -29,8 +29,8 @@ __global__ void gather_page_tables_kernel(
     const auto* row = reinterpret_cast<const int32_t*>(table_addresses[s]) +
         static_cast<int64_t>(layer) * capacities[s];
     int32_t* out_row = out + static_cast<int64_t>(blockIdx.x) * width;
-    for (int j = threadIdx.x; j < width; j += blockDim.x) {
-        out_row[j] = j < page_count ? row[j] : 0;
+    for (int j = threadIdx.x; j < page_count; j += blockDim.x) {
+        out_row[j] = row[j];
     }
 }
 

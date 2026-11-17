@@ -44,10 +44,12 @@ __global__ void index_scores_kernel(
     if (block >= max_blocks) {
         return;
     }
-    float score = -CUDART_INF_F;
-    if (block < row_blocks[row]) {
+    if (block >= row_blocks[row]) {
+        return;
+    }
+    float score = 0.0f;
+    {
         const scalar_t* key = blocks + (row_sequence[row] * max_blocks + block) * dim;
-        score = 0.0f;
         for (int h = 0; h < heads; ++h) {
             float dot = 0.0f;
             for (int d = 0; d < dim; ++d) {
@@ -60,7 +62,7 @@ __global__ void index_scores_kernel(
     scores[row * max_blocks + block] = score;
 }
 
-// One CTA per (sequence, block), one thread per index dim: the mean of the block's raw keys in fp32, rounded, then
+// One CTA per (sequence, run of blocks striding by gridDim.y), one thread per index dim: the mean of the block's raw keys in fp32, rounded, then
 // rmsnorm_cuda's RMSNorm and index_rope's rotation at the block's first key under the sequence's layout, each product
 // and sum rounded as the ATen ops round them.
 template <typename scalar_t>
@@ -84,55 +86,56 @@ __global__ void index_blocks_kernel(
     allow_next_kernel();
     extern __shared__ float pooled[];
     __shared__ float total;
-    const int s = blockIdx.x / max_blocks;
-    const int block = blockIdx.x % max_blocks;
+    const int s = blockIdx.x;
     const int dim = blockDim.x;
     const int d = threadIdx.x;
-    const int first_key = block * ratio;
-    if (first_key + ratio > key_counts[s]) {
-        blocks[static_cast<int64_t>(blockIdx.x) * dim + d] = static_cast<scalar_t>(0.0f);
-        return;
-    }
-    const int line = page_tables[static_cast<int64_t>(s) * max_pages + first_key / page_size];
-    const scalar_t* keys = index_keys + line * line_stride + static_cast<int64_t>(first_key % page_size) * dim;
-    float sum = 0.0f;
-    for (int k = 0; k < ratio; ++k) {
-        sum += static_cast<float>(keys[static_cast<int64_t>(k) * dim + d]);
-    }
-    const float mean = static_cast<float>(static_cast<scalar_t>(sum / static_cast<float>(ratio)));
-    pooled[d] = mean * mean;
-    __syncthreads();
-    if (d == 0) {
-        float squares = 0.0f;
-        for (int i = 0; i < dim; ++i) {
-            squares += pooled[i];
+    const int complete_blocks = key_counts[s] / ratio;
+    for (int block = blockIdx.y; block < complete_blocks; block += gridDim.y) {
+        const int first_key = block * ratio;
+        const int line = page_tables[static_cast<int64_t>(s) * max_pages + first_key / page_size];
+        const scalar_t* keys = index_keys + line * line_stride + static_cast<int64_t>(first_key % page_size) * dim;
+        float sum = 0.0f;
+        for (int k = 0; k < ratio; ++k) {
+            sum += static_cast<float>(keys[static_cast<int64_t>(k) * dim + d]);
         }
-        total = squares;
-    }
-    __syncthreads();
-    const float inv_rms = rsqrtf(total / static_cast<float>(dim) + eps);
-    const float normed = static_cast<float>(static_cast<scalar_t>(mean * inv_rms * norm_weight[d]));
-    __syncthreads();
-    pooled[d] = normed;
-    __syncthreads();
+        const float mean = static_cast<float>(static_cast<scalar_t>(sum / static_cast<float>(ratio)));
+        pooled[d] = mean * mean;
+        __syncthreads();
+        if (d == 0) {
+            float squares = 0.0f;
+            for (int i = 0; i < dim; ++i) {
+                squares += pooled[i];
+            }
+            total = squares;
+        }
+        __syncthreads();
+        const float inv_rms = rsqrtf(total / static_cast<float>(dim) + eps);
+        const float normed = static_cast<float>(static_cast<scalar_t>(mean * inv_rms * norm_weight[d]));
+        __syncthreads();
+        pooled[d] = normed;
+        __syncthreads();
 
-    const int position = page_positions[static_cast<int64_t>(s) * max_pages + first_key / page_size] +
-        first_key % page_size;
-    scalar_t out = static_cast<scalar_t>(normed);
-    if (d < rotary_dim) {
-        const int half = rotary_dim / 2;
-        const float angle = static_cast<float>(position) * inv_freq[d % half];
-        const float cos_a = static_cast<float>(static_cast<scalar_t>(cosf(angle)));
-        const float sin_a = static_cast<float>(static_cast<scalar_t>(sinf(angle)));
-        const float pair = d < half ? -pooled[d + half] : pooled[d - half];
-        const float cosine_part = static_cast<float>(static_cast<scalar_t>(normed * cos_a));
-        const float sine_part = static_cast<float>(static_cast<scalar_t>(pair * sin_a));
-        out = static_cast<scalar_t>(cosine_part + sine_part);
+        const int position = page_positions[static_cast<int64_t>(s) * max_pages + first_key / page_size] +
+            first_key % page_size;
+        scalar_t out = static_cast<scalar_t>(normed);
+        if (d < rotary_dim) {
+            const int half = rotary_dim / 2;
+            const float angle = static_cast<float>(position) * inv_freq[d % half];
+            const float cos_a = static_cast<float>(static_cast<scalar_t>(cosf(angle)));
+            const float sin_a = static_cast<float>(static_cast<scalar_t>(sinf(angle)));
+            const float pair = d < half ? -pooled[d + half] : pooled[d - half];
+            const float cosine_part = static_cast<float>(static_cast<scalar_t>(normed * cos_a));
+            const float sine_part = static_cast<float>(static_cast<scalar_t>(pair * sin_a));
+            out = static_cast<scalar_t>(cosine_part + sine_part);
+        }
+        blocks[(static_cast<int64_t>(s) * max_blocks + block) * dim + d] = out;
+        __syncthreads();
     }
-    blocks[static_cast<int64_t>(blockIdx.x) * dim + d] = out;
 }
 
 constexpr int kSelectThreads = 1024;
+// The CTAs along a sequence's blocks in index_blocks_kernel.
+constexpr int64_t kBlockRuns = 1024;
 
 // A score's place in descending order as an unsigned key: scores are -inf or non-negative, and the bits of a
 // non-negative float order as its value; -inf takes 0, below every block that can be chosen.
@@ -195,6 +198,7 @@ __global__ void select_blocks_kernel(
     static_assert(kSelectThreads >= 256, "a thread per radix digit");
     const int64_t row = blockIdx.x;
     const float* row_scores = scores + row * max_blocks;
+    const int64_t scored_blocks = min(row_blocks[row], max_blocks);
     uint32_t* row_bits = reinterpret_cast<uint32_t*>(selected) + row * words;
     const int tid = threadIdx.x;
     for (int w = tid; w < words; w += kSelectThreads) {
@@ -211,7 +215,7 @@ __global__ void select_blocks_kernel(
         }
         __syncthreads();
         const uint32_t high_mask = shift == 24 ? 0u : ~0u << (shift + 8);
-        for (int64_t b = tid; b < max_blocks; b += kSelectThreads) {
+        for (int64_t b = tid; b < scored_blocks; b += kSelectThreads) {
             const uint32_t key = score_key(row_scores[b]);
             if ((key & high_mask) == prefix) {
                 atomicAdd(&histogram[(key >> shift) & 255u], 1u);
@@ -231,9 +235,9 @@ __global__ void select_blocks_kernel(
     }
     // prefix is the k-th largest key; remaining, the blocks equal to it among the first k.
     const uint32_t threshold = prefix;
-    const int64_t chunk = (max_blocks + kSelectThreads - 1) / kSelectThreads;
+    const int64_t chunk = (scored_blocks + kSelectThreads - 1) / kSelectThreads;
     const int64_t first = tid * chunk;
-    const int64_t end = min(first + chunk, max_blocks);
+    const int64_t end = min(first + chunk, scored_blocks);
     int ties = 0;
     for (int64_t b = first; b < end; ++b) {
         ties += score_key(row_scores[b]) == threshold;
@@ -260,6 +264,8 @@ __global__ void select_blocks_kernel(
 }
 
 constexpr int kScoreTileBlocks = 64;
+// The CTAs along a row's blocks; each strides over the runs of kScoreChunkTiles tiles.
+constexpr int64_t kScoreChunkRuns = 64;
 constexpr int kScoreChunkTiles = 4;
 constexpr int kScoreWarps = 4;
 
@@ -293,8 +299,13 @@ __global__ void __launch_bounds__(kScoreWarps * 32) index_scores_tc_kernel(
     const int tile_rows = 16 / heads;
     const int64_t first_row = static_cast<int64_t>(blockIdx.x) * tile_rows;
     const int rows_here = rows - first_row < tile_rows ? static_cast<int>(rows - first_row) : tile_rows;
-    const int64_t first_block = static_cast<int64_t>(blockIdx.y) * kScoreChunkTiles * kScoreTileBlocks;
+    __shared__ int64_t scored_blocks;
     if (tid == 0) {
+        int64_t most = 0;
+        for (int r = 0; r < rows_here; ++r) {
+            most = max(most, min(row_blocks[first_row + r], max_blocks));
+        }
+        scored_blocks = most;
         int count = 0;
         for (int r = 0; r < rows_here; ++r) {
             const int64_t sequence = row_sequence[first_row + r];
@@ -310,55 +321,61 @@ __global__ void __launch_bounds__(kScoreWarps * 32) index_scores_tc_kernel(
     }
     __syncthreads();
 
-    for (int pass = 0; pass < sequence_count; ++pass) {
-        const int64_t sequence = sequences[pass];
-        for (int i = tid; i < 16 * DIM; i += kScoreWarps * 32) {
-            const int m = i / DIM, d = i % DIM;
-            const int r = m / heads;
-            scalar_t value = static_cast<scalar_t>(0);
-            if (r < rows_here && row_sequence[first_row + r] == sequence) {
-                value = queries[((first_row + r) * heads + m % heads) * DIM + d];
-            }
-            sQ[attn::swizzled_offset<DIM>(m, d)] = value;
-        }
-        for (int t = 0; t < kScoreChunkTiles; ++t) {
-            const int64_t tile_first = first_block + static_cast<int64_t>(t) * kScoreTileBlocks;
-            if (tile_first >= max_blocks) {
-                break;
-            }
-            for (int c = tid; c < kScoreTileBlocks * kRowChunks; c += kScoreWarps * 32) {
-                const int n = c / kRowChunks;
-                const int d = (c % kRowChunks) * kChunkElems;
-                const int64_t block = min(tile_first + n, max_blocks - 1);
-                attn::cp_async_16(
-                    sK + attn::swizzled_offset<DIM>(n, d),
-                    blocks + (sequence * max_blocks + block) * DIM + d,
-                    tile_first + n < max_blocks ? 16 : 0
-                );
-            }
-            attn::cp_async_commit();
-            attn::cp_async_wait<0>();
-            __syncthreads();
-            attn::tile_qkt<scalar_t, kScoreTileBlocks, DIM, BF16, SCORE_STRIDE, true>(sQ, sK, sS, warp, kScoreWarps);
-            __syncthreads();
-            for (int i = tid; i < rows_here * kScoreTileBlocks; i += kScoreWarps * 32) {
-                const int r = i / kScoreTileBlocks, n = i % kScoreTileBlocks;
-                const int64_t row = first_row + r;
-                const int64_t block = tile_first + n;
-                if (row_sequence[row] != sequence || block >= max_blocks) {
-                    continue;
+    for (int64_t first_block = static_cast<int64_t>(blockIdx.y) * kScoreChunkTiles * kScoreTileBlocks;
+         first_block < scored_blocks;
+         first_block += static_cast<int64_t>(gridDim.y) * kScoreChunkTiles * kScoreTileBlocks) {
+        for (int pass = 0; pass < sequence_count; ++pass) {
+            const int64_t sequence = sequences[pass];
+            for (int i = tid; i < 16 * DIM; i += kScoreWarps * 32) {
+                const int m = i / DIM, d = i % DIM;
+                const int r = m / heads;
+                scalar_t value = static_cast<scalar_t>(0);
+                if (r < rows_here && row_sequence[first_row + r] == sequence) {
+                    value = queries[((first_row + r) * heads + m % heads) * DIM + d];
                 }
-                float score = -CUDART_INF_F;
-                if (block < row_blocks[row]) {
-                    score = 0.0f;
+                sQ[attn::swizzled_offset<DIM>(m, d)] = value;
+            }
+            for (int t = 0; t < kScoreChunkTiles; ++t) {
+                const int64_t tile_first = first_block + static_cast<int64_t>(t) * kScoreTileBlocks;
+                if (tile_first >= scored_blocks) {
+                    break;
+                }
+                for (int c = tid; c < kScoreTileBlocks * kRowChunks; c += kScoreWarps * 32) {
+                    const int n = c / kRowChunks;
+                    const int d = (c % kRowChunks) * kChunkElems;
+                    const int64_t block = min(tile_first + n, max_blocks - 1);
+                    attn::cp_async_16(
+                        sK + attn::swizzled_offset<DIM>(n, d),
+                        blocks + (sequence * max_blocks + block) * DIM + d,
+                        tile_first + n < max_blocks ? 16 : 0
+                    );
+                }
+                attn::cp_async_commit();
+                attn::cp_async_wait<0>();
+                __syncthreads();
+                attn::tile_qkt<scalar_t, kScoreTileBlocks, DIM, BF16, SCORE_STRIDE, true>(
+                    sQ,
+                    sK,
+                    sS,
+                    warp,
+                    kScoreWarps
+                );
+                __syncthreads();
+                for (int i = tid; i < rows_here * kScoreTileBlocks; i += kScoreWarps * 32) {
+                    const int r = i / kScoreTileBlocks, n = i % kScoreTileBlocks;
+                    const int64_t row = first_row + r;
+                    const int64_t block = tile_first + n;
+                    if (row_sequence[row] != sequence || block >= min(row_blocks[row], max_blocks)) {
+                        continue;
+                    }
+                    float score = 0.0f;
                     for (int h = 0; h < heads; ++h) {
                         score += fmaxf(sS[(r * heads + h) * SCORE_STRIDE + n], 0.0f);
                     }
-                    score *= scale;
+                    scores[row * max_blocks + block] = score * scale;
                 }
-                scores[row * max_blocks + block] = score;
+                __syncthreads();
             }
-            __syncthreads();
         }
     }
 }
@@ -401,9 +418,10 @@ at::Tensor index_scores_cuda(
         const int tile_rows = 16 / heads;
         const dim3 tc_grid(
             static_cast<unsigned>((rows + tile_rows - 1) / tile_rows),
-            static_cast<unsigned>(
-                (max_blocks + kScoreChunkTiles * kScoreTileBlocks - 1) / (kScoreChunkTiles * kScoreTileBlocks)
-            )
+            static_cast<unsigned>(std::min<int64_t>(
+                (max_blocks + kScoreChunkTiles * kScoreTileBlocks - 1) / (kScoreChunkTiles * kScoreTileBlocks),
+                kScoreChunkRuns
+            ))
         );
         auto tc_stream = at::cuda::getCurrentCUDAStream();
         attn::dispatch_tensor_core_dtype(queries.scalar_type(), [&](auto type_tag, auto bf16_tag) {
@@ -519,7 +537,7 @@ at::Tensor index_blocks_cuda(
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, index_keys.scalar_type(), "index_blocks_cuda", [&] {
         launch_dependent(
             index_blocks_kernel<scalar_t>,
-            static_cast<int>(sequences * max_blocks),
+            dim3(static_cast<unsigned>(sequences), static_cast<unsigned>(std::min<int64_t>(max_blocks, kBlockRuns))),
             static_cast<int>(dim),
             dim * sizeof(float),
             stream,

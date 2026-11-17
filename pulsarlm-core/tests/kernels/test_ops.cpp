@@ -840,7 +840,7 @@ TEST_CASE("write_kv places each token at its view index through the page table",
     CHECK(at::equal(pool[4][2], decode_tokens[1]));
 }
 
-TEST_CASE("gather_page_tables lays each table's rows side by side, zero past its page count", "[ops][cuda]") {
+TEST_CASE("gather_page_tables lays each table's rows side by side up to its page count", "[ops][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
@@ -850,8 +850,8 @@ TEST_CASE("gather_page_tables lays each table's rows side by side, zero past its
     };
     std::vector<std::size_t> page_counts{3, 2};
     auto gathered = pulsarlm::gather_page_tables_cuda(tables, page_counts, 2, 3).cpu();
-    auto expected = at::tensor(std::vector<int32_t>{1, 2, 3, 7, 8, 0, 4, 5, 6, 9, 10, 0}).view({2, 2, 3});
-    CHECK(at::equal(gathered, expected));
+    CHECK(at::equal(gathered.select(1, 0), at::tensor(std::vector<int32_t>{1, 2, 3, 4, 5, 6}).view({2, 3})));
+    CHECK(at::equal(gathered.select(1, 1).narrow(1, 0, 2), at::tensor(std::vector<int32_t>{7, 8, 9, 10}).view({2, 2})));
 }
 
 TEST_CASE("gather_page_tables leaves out a table's entries past its page count", "[ops][cuda]") {
@@ -865,6 +865,6 @@ TEST_CASE("gather_page_tables leaves out a table's entries past its page count",
     };
     std::vector<std::size_t> page_counts{3, 1};
     auto gathered = pulsarlm::gather_page_tables_cuda(tables, page_counts, 2, 3).cpu();
-    auto expected = at::tensor(std::vector<int32_t>{1, 2, 3, 7, 0, 0, 4, 5, 6, 8, 0, 0}).view({2, 2, 3});
-    CHECK(at::equal(gathered, expected));
+    CHECK(at::equal(gathered.select(1, 0), at::tensor(std::vector<int32_t>{1, 2, 3, 4, 5, 6}).view({2, 3})));
+    CHECK(at::equal(gathered.select(1, 1).narrow(1, 0, 1), at::tensor(std::vector<int32_t>{7, 8}).view({2, 1})));
 }

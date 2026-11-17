@@ -45,7 +45,8 @@ std::tuple<at::Tensor, at::Tensor> hyper_connection_mix_cuda(
 
 // x [tokens, hc * hidden] plus, in each stream, the block output out [tokens, hidden] times that stream's injection
 // weight [tokens, hc], the product rounded to the dtype.
-at::Tensor hyper_connection_inject_cuda(const at::Tensor& x, const at::Tensor& out, const at::Tensor& injection_weights);
+at::Tensor
+hyper_connection_inject_cuda(const at::Tensor& x, const at::Tensor& out, const at::Tensor& injection_weights);
 
 // x + sigmoid(gate_logits) * y for x and y contiguous [rows, columns] and gate_logits [rows, 1], whose rows may lie
 // apart, each operation rounded to the dtype as the ATen ops round it.
@@ -144,8 +145,8 @@ void write_kv_cuda(
 );
 
 // int32 [n_layers, tables.size(), width]: row s of each layer holds the first page_counts[s] entries of that layer's
-// row of tables[s], a contiguous int32 [n_layers, capacity] device tensor, then zeros. The tables stay alive until the
-// stream has run the gather.
+// row of tables[s], a contiguous int32 [n_layers, capacity] device tensor; the entries past them are left unwritten. The
+// tables stay alive until the stream has run the gather.
 at::Tensor gather_page_tables_cuda(
     std::span<const at::Tensor> tables,
     std::span<const std::size_t> page_counts,
@@ -268,7 +269,7 @@ at::Tensor attn_indexed_cuda(
 // page_positions gives key b * ratio (see attn_decode_cuda), cos and sin rounded to the dtype. index_keys is [lines,
 // page_size, dim] with each line packed, page_tables and page_positions int32 [sequences, max_pages], and ratio divides
 // the page size. key_counts is int32 [sequences], the keys in each view; a block ending past its view's key count is
-// zeros, its keys unread.
+// left unwritten, its keys unread.
 at::Tensor index_blocks_cuda(
     const at::Tensor& index_keys,
     const at::Tensor& page_tables,
@@ -280,9 +281,9 @@ at::Tensor index_blocks_cuda(
     double eps
 );
 
-// QSA's selection, int32 [rows, words] as attn_indexed_cuda reads it: row r's top min(top, max_blocks) blocks by scores
-// (index_scores_cuda's), the lower block first among equal scores and no block scoring -inf, then the block
-// row_blocks[r] when it starts at or before view_index[r]. row_blocks and view_index are int64 [rows]; words * 32
+// QSA's selection, int32 [rows, words] as attn_indexed_cuda reads it: row r's top min(top, row_blocks[r]) blocks below
+// row_blocks[r] by scores (index_scores_cuda's), the lower block first among equal scores, then the block row_blocks[r]
+// when it starts at or before view_index[r]. row_blocks and view_index are int64 [rows]; words * 32
 // exceeds max_blocks.
 at::Tensor select_blocks_cuda(
     const at::Tensor& scores,
@@ -296,7 +297,7 @@ at::Tensor select_blocks_cuda(
 // QSA's block scores, fp32 [rows, max_blocks]: for query row r of sequence row_sequence[r], block b below row_blocks[r]
 // scores scale times the sum over its heads of relu(queries[r, h] . blocks[row_sequence[r], b]), dot products
 // accumulated in fp32, on the tensor cores for fp16 and bf16 with heads dividing 16 and a dim of 64, 128 or 256;
-// the blocks past row_blocks[r] score -inf. queries [rows, heads, dim] and blocks [sequences, max_blocks, dim] share a
+// the blocks past row_blocks[r] are left unwritten. queries [rows, heads, dim] and blocks [sequences, max_blocks, dim] share a
 // dtype; row_sequence and row_blocks are int64 [rows].
 at::Tensor index_scores_cuda(
     const at::Tensor& queries,
