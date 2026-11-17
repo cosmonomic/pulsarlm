@@ -550,11 +550,10 @@ at::Tensor qwen4_exp_model::moe(const at::Tensor& h, std::int64_t layer) const {
     const moe_weights& m = layers[layer].moe;
     at::Tensor logits = small_batch_linear_cuda(h, m.router_and_gate);
     const std::int64_t experts = m.router_and_gate.size(0) - 1;
-    auto [top_weights, top_experts] = route_top_k_cuda(logits.narrow(1, 0, experts), config.num_experts_per_tok);
     at::Tensor routed = routed_experts_cuda(
         h,
-        top_experts,
-        top_weights,
+        logits.narrow(1, 0, experts),
+        config.num_experts_per_tok,
         m.experts_gate_up_proj,
         m.experts_down_proj,
         expert_activation::silu

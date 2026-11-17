@@ -67,6 +67,22 @@ __global__ void sigmoid_gated_kernel(
     );
 }
 
+// One thread per output element: silu of the gate half, rounded, times the up half, rounded.
+template <typename scalar_t>
+__global__ void silu_mul_kernel(const scalar_t* __restrict__ x, scalar_t* __restrict__ y, int64_t tokens, int64_t n) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
+    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= tokens * n) {
+        return;
+    }
+    const int64_t token = index / n;
+    const int64_t i = index % n;
+    const float gate = static_cast<float>(x[token * 2 * n + i]);
+    const float activated = rounded<scalar_t>(gate / (1.0f + expf(-gate)));
+    y[index] = static_cast<scalar_t>(__fmul_rn(activated, static_cast<float>(x[token * 2 * n + n + i])));
+}
+
 unsigned blocks_for(int64_t elements) {
     return static_cast<unsigned>((elements + kThreads - 1) / kThreads);
 }
@@ -145,6 +161,35 @@ at::Tensor sigmoid_gated_cuda(const at::Tensor& y, const at::Tensor& gate_logits
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     });
     return out;
+}
+
+at::Tensor silu_mul_cuda(const at::Tensor& x) {
+    TORCH_CHECK(
+        x.is_cuda() && x.dim() == 2 && x.is_contiguous() && x.size(1) % 2 == 0,
+        "silu_mul: x must be contiguous CUDA [tokens, 2 * n]"
+    );
+    const int64_t tokens = x.size(0);
+    const int64_t n = x.size(1) / 2;
+    at::Tensor y = at::empty({tokens, n}, x.options());
+    if (y.numel() == 0) {
+        return y;
+    }
+    auto stream = at::cuda::getCurrentCUDAStream();
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "silu_mul_cuda", [&] {
+        launch_dependent(
+            silu_mul_kernel<scalar_t>,
+            blocks_for(y.numel()),
+            kThreads,
+            0,
+            stream,
+            x.const_data_ptr<scalar_t>(),
+            y.mutable_data_ptr<scalar_t>(),
+            tokens,
+            n
+        );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    });
+    return y;
 }
 
 }  // namespace pulsarlm

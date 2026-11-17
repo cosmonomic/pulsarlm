@@ -13,6 +13,7 @@
 #include <cuda_pipeline.h>
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -21,7 +22,9 @@ namespace pulsarlm {
 namespace {
 
 constexpr int kSortThreads = 1024;
+constexpr int kSortWarps = kSortThreads / 32;
 constexpr int64_t kMaxExperts = 4096;
+constexpr int64_t kMaxTopK = 64;
 constexpr int kTileRows = 16;
 constexpr int kTileWeightRows = 64;
 constexpr int kChunkK = 64;
@@ -47,27 +50,134 @@ __device__ __forceinline__ float activated(float x, expert_activation activation
     return 0.5f * x * (1.0f + tanhf(kBeta * (x + kKappa * cube)));
 }
 
-// Runs as one CTA. position_of[a] is the row of assignment a among the assignments sorted by expert, sorted_token and
+__device__ void warp_argmax(float& value, int& index) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float other = __shfl_xor_sync(0xffffffffu, value, offset);
+        const int other_index = __shfl_xor_sync(0xffffffffu, index, offset);
+        if (other > value || (other == value && other_index < index)) {
+            value = other;
+            index = other_index;
+        }
+    }
+}
+
+// The CTA's maximum of value, the lowest index among equal values; every thread receives it.
+__device__ void block_argmax(float& value, int& index) {
+    __shared__ float values[kSortWarps];
+    __shared__ int indices[kSortWarps];
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    warp_argmax(value, index);
+    if (lane == 0) {
+        values[warp] = value;
+        indices[warp] = index;
+    }
+    __syncthreads();
+    value = lane < kSortWarps ? values[lane] : -INFINITY;
+    index = lane < kSortWarps ? indices[lane] : INT_MAX;
+    warp_argmax(value, index);
+    __syncthreads();
+}
+
+__device__ float block_sum(float value) {
+    __shared__ float values[kSortWarps];
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_xor_sync(0xffffffffu, value, offset);
+    }
+    if (lane == 0) {
+        values[warp] = value;
+    }
+    __syncthreads();
+    value = lane < kSortWarps ? values[lane] : 0.0f;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_xor_sync(0xffffffffu, value, offset);
+    }
+    __syncthreads();
+    return value;
+}
+
+// Token blockIdx.x's top k experts by the softmax of its logits row in fp32, in descending order with the lower expert
+// first among equal probabilities, into chosen [tokens, k], and their probabilities divided by their sum into weights
+// [tokens, k]. probabilities holds experts floats.
+template <typename scalar_t>
+__device__ void route_token(
+    const scalar_t* __restrict__ row,
+    int experts,
+    int k,
+    float* probabilities,
+    float* __restrict__ weights,
+    int64_t* chosen
+) {
+    __shared__ float top[kMaxTopK];
+    float max_logit = -INFINITY;
+    int unused = 0;
+    for (int e = threadIdx.x; e < experts; e += kSortThreads) {
+        max_logit = fmaxf(max_logit, static_cast<float>(row[e]));
+    }
+    block_argmax(max_logit, unused);
+    float local = 0.0f;
+    for (int e = threadIdx.x; e < experts; e += kSortThreads) {
+        const float shifted = expf(static_cast<float>(row[e]) - max_logit);
+        probabilities[e] = shifted;
+        local += shifted;
+    }
+    const float total = block_sum(local);
+    // A NaN probability ranks below every other, as -inf, so that the top k stay among the experts.
+    for (int e = threadIdx.x; e < experts; e += kSortThreads) {
+        const float probability = probabilities[e] / total;
+        probabilities[e] = isnan(probability) ? -INFINITY : probability;
+    }
+    __syncthreads();
+
+    for (int j = 0; j < k; j++) {
+        float best = -INFINITY;
+        int best_index = experts;
+        for (int e = threadIdx.x; e < experts; e += kSortThreads) {
+            if (probabilities[e] > best || (probabilities[e] == best && e < best_index)) {
+                best = probabilities[e];
+                best_index = e;
+            }
+        }
+        block_argmax(best, best_index);
+        if (threadIdx.x == 0) {
+            top[j] = best;
+            chosen[static_cast<int64_t>(blockIdx.x) * k + j] = best_index;
+            probabilities[best_index] = -INFINITY;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float sum = 0.0f;
+        for (int j = 0; j < k; j++) {
+            sum += top[j];
+        }
+        for (int j = 0; j < k; j++) {
+            weights[static_cast<int64_t>(blockIdx.x) * k + j] = top[j] / sum;
+        }
+    }
+}
+
+// Run by one CTA. position_of[a] is the row of assignment a among the assignments sorted by expert, sorted_token and
 // sorted_expert are the token and expert of each row, and tiles [3, max_tiles] holds each tile's expert, first row and
 // rows, at most kTileRows rows of one expert. The tiles past the experts' have no rows. The rows of one expert are in
-// no fixed order.
-__global__ void __launch_bounds__(kSortThreads) sort_assignments_kernel(
-    const int64_t* __restrict__ assigned_experts,
+// no fixed order. expert_counters holds 2 * experts entries.
+__device__ void sort_assignments(
+    const int64_t* assigned_experts,
     int assignments,
     int top_k,
     int experts,
     int max_tiles,
+    int32_t* expert_counters,
     int32_t* __restrict__ position_of,
     int32_t* __restrict__ sorted_token,
     int32_t* __restrict__ sorted_expert,
     int32_t* __restrict__ tiles
 ) {
-    wait_for_prior_kernels();
-    allow_next_kernel();
     int32_t* tile_expert = tiles;
     int32_t* tile_first_row = tiles + max_tiles;
     int32_t* tile_rows = tiles + 2 * max_tiles;
-    extern __shared__ int32_t expert_counters[];
     int32_t* counts = expert_counters;
     int32_t* cursors = expert_counters + experts;
     __shared__ int32_t segment_rows[kSortThreads];
@@ -126,6 +236,79 @@ __global__ void __launch_bounds__(kSortThreads) sort_assignments_kernel(
         position_of[a] = position;
         sorted_token[position] = a / top_k;
         sorted_expert[position] = e;
+    }
+}
+
+// One CTA, sort_assignments of the assignments top_experts [tokens, top_k] holds.
+__global__ void __launch_bounds__(kSortThreads) sort_assignments_kernel(
+    const int64_t* __restrict__ top_experts,
+    int assignments,
+    int top_k,
+    int experts,
+    int max_tiles,
+    int32_t* __restrict__ position_of,
+    int32_t* __restrict__ sorted_token,
+    int32_t* __restrict__ sorted_expert,
+    int32_t* __restrict__ tiles
+) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
+    extern __shared__ int32_t expert_counters[];
+    sort_assignments(
+        top_experts,
+        assignments,
+        top_k,
+        experts,
+        max_tiles,
+        expert_counters,
+        position_of,
+        sorted_token,
+        sorted_expert,
+        tiles
+    );
+}
+
+// One CTA per token, route_token of its row of logits [tokens, experts], then sort_assignments of every token's
+// experts in the last CTA to finish, found through arrivals.
+template <typename scalar_t>
+__global__ void __launch_bounds__(kSortThreads) route_and_sort_kernel(
+    const scalar_t* __restrict__ logits,
+    int64_t logits_row_stride,
+    int experts,
+    int top_k,
+    int max_tiles,
+    float* __restrict__ top_weights,
+    int64_t* top_experts,
+    int32_t* __restrict__ arrivals,
+    int32_t* __restrict__ position_of,
+    int32_t* __restrict__ sorted_token,
+    int32_t* __restrict__ sorted_expert,
+    int32_t* __restrict__ tiles
+) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
+    extern __shared__ int32_t shared_words[];
+    route_token(
+        logits + static_cast<int64_t>(blockIdx.x) * logits_row_stride,
+        experts,
+        top_k,
+        reinterpret_cast<float*>(shared_words),
+        top_weights,
+        top_experts
+    );
+    if (last_to_arrive(arrivals, static_cast<int>(gridDim.x))) {
+        sort_assignments(
+            top_experts,
+            static_cast<int>(gridDim.x) * top_k,
+            top_k,
+            experts,
+            max_tiles,
+            shared_words,
+            position_of,
+            sorted_token,
+            sorted_expert,
+            tiles
+        );
     }
 }
 
@@ -474,30 +657,12 @@ bool aligned_rows(const at::Tensor& t, int64_t row_stride) {
     return reinterpret_cast<uintptr_t>(t.const_data_ptr()) % 16 == 0 && row_stride * t.element_size() % 16 == 0;
 }
 
-}  // namespace
-
-at::Tensor routed_experts_cuda(
-    const at::Tensor& h,
-    const at::Tensor& top_experts,
-    const at::Tensor& top_weights,
-    const at::Tensor& gate_up_proj,
-    const at::Tensor& down_proj,
-    expert_activation activation
-) {
+void check_experts(const at::Tensor& h, const at::Tensor& gate_up_proj, const at::Tensor& down_proj) {
     TORCH_CHECK(
         h.is_cuda() && h.dim() == 2 && h.stride(1) == 1,
         "routed_experts: h must be CUDA [tokens, hidden], each row contiguous"
     );
-    const int64_t tokens = h.size(0);
     const int64_t hidden = h.size(1);
-    TORCH_CHECK(
-        top_experts.scalar_type() == at::kLong && top_weights.scalar_type() == at::kFloat && top_experts.dim() == 2 &&
-            top_experts.size(0) == tokens && top_experts.sizes() == top_weights.sizes() &&
-            top_experts.is_contiguous() && top_weights.is_contiguous() && top_experts.device() == h.device() &&
-            top_weights.device() == h.device(),
-        "routed_experts: top_experts must be contiguous int64 and top_weights contiguous fp32 [tokens, top_k] on h's "
-        "device"
-    );
     TORCH_CHECK(
         gate_up_proj.dim() == 3 && down_proj.dim() == 3 && gate_up_proj.size(0) == down_proj.size(0) &&
             gate_up_proj.size(2) == hidden && down_proj.size(1) == hidden &&
@@ -508,9 +673,26 @@ at::Tensor routed_experts_cuda(
         "intermediate], each row contiguous, in h's dtype on h's device"
     );
     const int64_t experts = gate_up_proj.size(0);
-    const int64_t intermediate = down_proj.size(2);
-    const int64_t top_k = top_experts.size(1);
     TORCH_CHECK(experts >= 1 && experts <= kMaxExperts, "routed_experts: experts must be between 1 and ", kMaxExperts);
+}
+
+// The routed experts' output for top_k assignments per token of h. sort(position_of, sorted_token, sorted_expert,
+// tiles, max_tiles) launches the kernel that sorts the assignments as sort_assignments does and leaves their weights in
+// top_weights [tokens, top_k].
+template <typename Sort>
+at::Tensor run_experts(
+    const at::Tensor& h,
+    int64_t top_k,
+    const at::Tensor& top_weights,
+    const at::Tensor& gate_up_proj,
+    const at::Tensor& down_proj,
+    expert_activation activation,
+    Sort&& sort
+) {
+    const int64_t tokens = h.size(0);
+    const int64_t hidden = h.size(1);
+    const int64_t experts = gate_up_proj.size(0);
+    const int64_t intermediate = down_proj.size(2);
     at::Tensor out = at::empty({tokens, hidden}, h.options());
     const int64_t assignments = tokens * top_k;
     if (assignments == 0) {
@@ -524,24 +706,8 @@ at::Tensor routed_experts_cuda(
     int32_t* sorted_token = position_of + assignments;
     int32_t* sorted_expert = sorted_token + assignments;
     int32_t* tiles = sorted_expert + assignments;
+    sort(position_of, sorted_token, sorted_expert, tiles, max_tiles);
     auto stream = at::cuda::getCurrentCUDAStream();
-    launch_dependent(
-        sort_assignments_kernel,
-        1,
-        kSortThreads,
-        2 * experts * sizeof(int32_t),
-        stream,
-        top_experts.const_data_ptr<int64_t>(),
-        static_cast<int>(assignments),
-        static_cast<int>(top_k),
-        static_cast<int>(experts),
-        static_cast<int>(max_tiles),
-        position_of,
-        sorted_token,
-        sorted_expert,
-        tiles
-    );
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     at::Tensor activations = at::empty({assignments, intermediate}, h.options());
     at::Tensor expert_out = at::empty({assignments, hidden}, h.options());
@@ -642,6 +808,107 @@ at::Tensor routed_experts_cuda(
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     });
     return out;
+}
+
+}  // namespace
+
+at::Tensor routed_experts_cuda(
+    const at::Tensor& h,
+    const at::Tensor& top_experts,
+    const at::Tensor& top_weights,
+    const at::Tensor& gate_up_proj,
+    const at::Tensor& down_proj,
+    expert_activation activation
+) {
+    check_experts(h, gate_up_proj, down_proj);
+    TORCH_CHECK(
+        top_experts.scalar_type() == at::kLong && top_weights.scalar_type() == at::kFloat && top_experts.dim() == 2 &&
+            top_experts.size(0) == h.size(0) && top_experts.sizes() == top_weights.sizes() &&
+            top_experts.is_contiguous() && top_weights.is_contiguous() && top_experts.device() == h.device() &&
+            top_weights.device() == h.device(),
+        "routed_experts: top_experts must be contiguous int64 and top_weights contiguous fp32 [tokens, top_k] on h's "
+        "device"
+    );
+    const int64_t experts = gate_up_proj.size(0);
+    const int64_t top_k = top_experts.size(1);
+    auto sort =
+        [&](int32_t* position_of, int32_t* sorted_token, int32_t* sorted_expert, int32_t* tiles, int64_t max_tiles) {
+            launch_dependent(
+                sort_assignments_kernel,
+                1,
+                kSortThreads,
+                2 * experts * sizeof(int32_t),
+                at::cuda::getCurrentCUDAStream(),
+                top_experts.const_data_ptr<int64_t>(),
+                static_cast<int>(h.size(0) * top_k),
+                static_cast<int>(top_k),
+                static_cast<int>(experts),
+                static_cast<int>(max_tiles),
+                position_of,
+                sorted_token,
+                sorted_expert,
+                tiles
+            );
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        };
+    return run_experts(h, top_k, top_weights, gate_up_proj, down_proj, activation, sort);
+}
+
+at::Tensor routed_experts_cuda(
+    const at::Tensor& h,
+    const at::Tensor& router_logits,
+    int64_t top_k,
+    const at::Tensor& gate_up_proj,
+    const at::Tensor& down_proj,
+    expert_activation activation
+) {
+    check_experts(h, gate_up_proj, down_proj);
+    const int64_t tokens = h.size(0);
+    const int64_t experts = gate_up_proj.size(0);
+    TORCH_CHECK(
+        router_logits.is_cuda() && router_logits.dim() == 2 && router_logits.size(0) == tokens &&
+            router_logits.size(1) == experts && router_logits.stride(1) == 1 && router_logits.device() == h.device(),
+        "routed_experts: router_logits must be [tokens, experts] on h's device, each row contiguous"
+    );
+    TORCH_CHECK(
+        top_k >= 1 && top_k <= experts && top_k <= kMaxTopK,
+        "routed_experts: top_k must be between 1 and the experts, at most ",
+        kMaxTopK
+    );
+    at::Tensor top_weights = at::empty({tokens, top_k}, h.options().dtype(at::kFloat));
+    at::Tensor top_experts = at::empty({tokens, top_k}, h.options().dtype(at::kLong));
+    auto sort =
+        [&](int32_t* position_of, int32_t* sorted_token, int32_t* sorted_expert, int32_t* tiles, int64_t max_tiles) {
+            AT_DISPATCH_FLOATING_TYPES_AND2(
+                at::kHalf,
+                at::kBFloat16,
+                router_logits.scalar_type(),
+                "routed_experts_cuda",
+                [&] {
+                    launch_dependent(
+                        route_and_sort_kernel<scalar_t>,
+                        static_cast<unsigned>(tokens),
+                        kSortThreads,
+                        2 * experts * sizeof(int32_t),
+                        at::cuda::getCurrentCUDAStream(),
+                        router_logits.const_data_ptr<scalar_t>(),
+                        router_logits.stride(0),
+                        static_cast<int>(experts),
+                        static_cast<int>(top_k),
+                        static_cast<int>(max_tiles),
+                        top_weights.mutable_data_ptr<float>(),
+                        top_experts.mutable_data_ptr<int64_t>(),
+                        arrival_counters(1),
+                        position_of,
+                        sorted_token,
+                        sorted_expert,
+                        tiles
+                    );
+                    C10_CUDA_KERNEL_LAUNCH_CHECK();
+                }
+            );
+        };
+    return run_experts(h, top_k, top_weights, gate_up_proj, down_proj, activation, sort);
 }
 
 }  // namespace pulsarlm

@@ -134,23 +134,6 @@ TEST_CASE("hyper_connection_inject adds the block output to each stream by its w
     CHECK(at::equal(got, expected));
 }
 
-TEST_CASE("route_top_k picks each token's most probable experts and renormalizes them", "[ops][cuda]") {
-    if (c10::cuda::device_count() == 0) {
-        SKIP("no CUDA device");
-    }
-    const auto dtype = GENERATE(at::kFloat, at::kBFloat16);
-    const int64_t experts = GENERATE(16, 512);
-    const int64_t k = 10;
-    at::Tensor logits = at::randn({kTokens, experts + 1}, at::device(at::kCUDA).dtype(dtype)).narrow(1, 0, experts);
-
-    auto [weights, chosen] = pulsarlm::route_top_k_cuda(logits, k);
-
-    at::Tensor probabilities = at::softmax(logits, -1, at::kFloat);
-    at::Tensor top = std::get<0>(at::topk(probabilities, k, -1));
-    CHECK(at::allclose(probabilities.gather(1, chosen), top, 1e-6, 0.0));
-    CHECK(at::allclose(weights, top / top.sum(-1, true), 1e-6, 1e-6));
-}
-
 TEST_CASE("silu_mul multiplies silu of the gate half by the up half", "[ops][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");

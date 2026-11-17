@@ -227,13 +227,10 @@ at::Tensor qwen3_5_moe_model::moe(const at::Tensor& h, std::int64_t layer) const
         at::silu(at::linear(h, m.shared_gate_proj)) * at::linear(h, m.shared_up_proj),
         m.shared_down_proj
     );
-    at::Tensor probabilities = at::softmax(at::linear(h, m.router), -1, at::kFloat);
-    auto [top_weights, top_experts] = at::topk(probabilities, config.num_experts_per_tok, -1);
-    top_weights = top_weights / top_weights.sum(-1, true);
     at::Tensor routed = routed_experts_cuda(
         h,
-        top_experts,
-        top_weights,
+        at::linear(h, m.router),
+        config.num_experts_per_tok,
         m.experts_gate_up_proj,
         m.experts_down_proj,
         expert_activation::silu

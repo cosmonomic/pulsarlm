@@ -69,11 +69,6 @@ at::Tensor sigmoid_gated_add_cuda(const at::Tensor& x, const at::Tensor& gate_lo
 // a contiguous last axis, each operation rounded to the dtype as the ATen ops round it.
 at::Tensor sigmoid_gated_cuda(const at::Tensor& y, const at::Tensor& gate_logits);
 
-// A router's choice per token from its logits [tokens, experts], whose rows may lie apart: (weights, experts), the k
-// most probable experts by the softmax in fp32 as int64 [tokens, k], in descending order with the lower expert first
-// among equal probabilities, and their probabilities divided by their sum as fp32 [tokens, k].
-std::tuple<at::Tensor, at::Tensor> route_top_k_cuda(const at::Tensor& logits, int64_t k);
-
 // silu(x[:, :n]) * x[:, n:] for contiguous x [tokens, 2 * n], silu rounded to the dtype before the product.
 at::Tensor silu_mul_cuda(const at::Tensor& x);
 
@@ -94,6 +89,18 @@ at::Tensor routed_experts_cuda(
     const at::Tensor& h,
     const at::Tensor& top_experts,
     const at::Tensor& top_weights,
+    const at::Tensor& gate_up_proj,
+    const at::Tensor& down_proj,
+    expert_activation activation
+);
+
+// routed_experts_cuda with each token's top_k experts by the softmax in fp32 of its router_logits [tokens, experts],
+// whose rows may lie apart, in descending order with the lower expert first among equal probabilities, weighted by
+// their probabilities divided by their sum.
+at::Tensor routed_experts_cuda(
+    const at::Tensor& h,
+    const at::Tensor& router_logits,
+    int64_t top_k,
     const at::Tensor& gate_up_proj,
     const at::Tensor& down_proj,
     expert_activation activation
