@@ -108,8 +108,8 @@ class executor::batch {
     batch(std::span<const batch_entry> step_entries, std::size_t page_size);
 
     static group_batch make_group(std::span<const batch_entry> group, std::size_t page_size, bool prefill);
-    // The page-table width of the group is its widest sequence's, raised to a power of two for a decode group so that
-    // few widths occur.
+    // The page-table width of the group is its widest sequence's, for a decode group raised to a power of two, as each
+    // decode width is a CUDA graph to capture.
     static std::size_t table_width(std::span<const batch_entry> group, bool prefill) noexcept;
     static bool measures_mass(std::span<const batch_entry> group) noexcept;
     // Whether e forwards a query that adds mass.
