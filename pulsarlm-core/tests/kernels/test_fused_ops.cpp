@@ -196,3 +196,36 @@ TEST_CASE("small_batch_linear and small_batch_gated_linear match at::linear", "[
         )
     );
 }
+
+TEST_CASE("injected_stream_rmsnorm_linear injects, normalizes and projects the streams", "[ops][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const auto dtype = GENERATE(at::kFloat, at::kBFloat16);
+    // Up to 4 tokens run as one kernel, 5 through the separate ops.
+    const int64_t tokens = GENERATE(1, 4, 5);
+    const double eps = 1e-6;
+    auto opts = at::device(at::kCUDA).dtype(dtype);
+    at::Tensor x = at::randn({tokens, kStreams * kHidden}, opts);
+    at::Tensor out = at::randn({tokens, kHidden}, opts);
+    at::Tensor injection_weights = at::randn({tokens, kStreams}, opts);
+    at::Tensor norm_weight = (1.0 + 0.1 * at::randn({kStreams * kHidden})).to(at::kCUDA);
+    at::Tensor weight = at::randn({68, kStreams * kHidden}, opts) / 20.0;
+
+    auto [summed, normed, projected] = pulsarlm::injected_stream_rmsnorm_linear_cuda(
+        x,
+        out,
+        injection_weights,
+        norm_weight,
+        kStreams,
+        eps,
+        weight
+    );
+
+    at::Tensor expected_summed = pulsarlm::hyper_connection_inject_cuda(x, out, injection_weights);
+    CHECK(at::equal(summed, expected_summed));
+    at::Tensor expected_normed = pulsarlm::stream_rmsnorm_cuda(expected_summed, norm_weight, kStreams, eps);
+    CHECK(at::allclose(normed.to(at::kFloat), expected_normed.to(at::kFloat), tolerance(dtype), tolerance(dtype)));
+    at::Tensor expected = at::linear(expected_normed.to(at::kFloat), weight.to(at::kFloat));
+    CHECK(at::allclose(projected.to(at::kFloat), expected, tolerance(dtype), tolerance(dtype)));
+}

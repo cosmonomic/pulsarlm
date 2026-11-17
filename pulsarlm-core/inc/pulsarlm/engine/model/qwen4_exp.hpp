@@ -159,6 +159,15 @@ class qwen4_exp_model : public model {
     // The mix of the normed streams [ntok, hc_count * hidden] the head reads.
     at::Tensor mixed_streams(const at::Tensor& normed, const mixer_weights& w) const;
     mixed_input mix(const at::Tensor& x, const hyper_connection_weights& w) const;
+    // The streams x plus the block output out injected by injection_weights, and their mix by w.
+    std::pair<at::Tensor, mixed_input> injected_mix(
+        const at::Tensor& x,
+        const at::Tensor& out,
+        const at::Tensor& injection_weights,
+        const hyper_connection_weights& w
+    ) const;
+    mixed_input
+    mix_normed(const at::Tensor& normed, const at::Tensor& projected, const hyper_connection_weights& w) const;
     at::Tensor final_mix(const at::Tensor& x) const;
     at::Tensor
     attention(const at::Tensor& h, std::int64_t layer, const group_batch& g, std::span<const kv> lines) const;

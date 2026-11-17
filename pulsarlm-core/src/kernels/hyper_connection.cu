@@ -7,6 +7,7 @@
 #include <c10/cuda/CUDAStream.h>
 
 #include <algorithm>
+#include <optional>
 #include <tuple>
 #include <type_traits>
 
@@ -155,15 +156,50 @@ add_dots(const scalar_t* __restrict__ row, const scalar_t* staged, int64_t stage
     }
 }
 
-// Each CTA takes kLinearRows rows of weight. One pass over the columns sums, per (token, stream), the squares of x and
-// the products of x, norm_weight and each row, so the stream's inverse RMS scales the products once at the end; the
-// CTA then writes its share of normed as stream_rmsnorm_kernel computes it.
-template <typename scalar_t, int TOKENS, int STREAMS>
+// The 8 streams' values of token t at column k: x's, or with INJECTED, x plus the block output at the column's hidden
+// index times the stream's injection weight, as hyper_connection_inject_kernel rounds them.
+template <typename scalar_t, bool INJECTED, int STREAMS>
+__device__ __forceinline__ void stream_values(
+    const scalar_t* __restrict__ x,
+    const scalar_t* __restrict__ block_out,
+    const scalar_t* __restrict__ injection_weights,
+    int t,
+    int k,
+    int hidden,
+    float (&values)[8]
+) {
+    const uint4 loaded = *reinterpret_cast<const uint4*>(x + t * STREAMS * hidden + k);
+    const auto* x_values = reinterpret_cast<const scalar_t*>(&loaded);
+    if constexpr (INJECTED) {
+        const uint4 out_loaded = *reinterpret_cast<const uint4*>(block_out + t * hidden + k % hidden);
+        const auto* out_values = reinterpret_cast<const scalar_t*>(&out_loaded);
+        const float injection = static_cast<float>(injection_weights[t * STREAMS + k / hidden]);
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const float injected = rounded<scalar_t>(__fmul_rn(static_cast<float>(out_values[i]), injection));
+            values[i] = rounded<scalar_t>(static_cast<float>(x_values[i]) + injected);
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            values[i] = static_cast<float>(x_values[i]);
+        }
+    }
+}
+
+// Each CTA takes kLinearRows rows of weight. One pass over the columns sums, per (token, stream), the squares of the
+// streams' values (stream_values) and their products with norm_weight and each row, so the stream's inverse RMS scales
+// the products once at the end; the CTA then writes its share of normed as stream_rmsnorm_kernel computes it and, with
+// INJECTED, of the values into summed.
+template <typename scalar_t, int TOKENS, int STREAMS, bool INJECTED>
 __global__ void __launch_bounds__(kThreads) stream_rmsnorm_linear_kernel(
     const scalar_t* __restrict__ x,
+    const scalar_t* __restrict__ block_out,
+    const scalar_t* __restrict__ injection_weights,
     const float* __restrict__ norm_weight,
     const scalar_t* __restrict__ weight,
     int64_t weight_row_stride,
+    scalar_t* __restrict__ summed,
     scalar_t* __restrict__ normed,
     scalar_t* __restrict__ projected,
     int hidden,
@@ -189,14 +225,13 @@ __global__ void __launch_bounds__(kThreads) stream_rmsnorm_linear_kernel(
         float scaled[TOKENS][8];
 #pragma unroll
         for (int t = 0; t < TOKENS; t++) {
-            const uint4 loaded = *reinterpret_cast<const uint4*>(x + t * width + k);
-            const auto* values = reinterpret_cast<const scalar_t*>(&loaded);
+            float values[8];
+            stream_values<scalar_t, INJECTED, STREAMS>(x, block_out, injection_weights, t, k, hidden, values);
             float token_squares = 0.0f;
 #pragma unroll
             for (int i = 0; i < 8; i++) {
-                const float v = static_cast<float>(values[i]);
-                token_squares += v * v;
-                scaled[t][i] = v * gains[i];
+                token_squares += values[i] * values[i];
+                scaled[t][i] = values[i] * gains[i];
             }
 #pragma unroll
             for (int s = 0; s < STREAMS; s++) {
@@ -267,7 +302,7 @@ __global__ void __launch_bounds__(kThreads) stream_rmsnorm_linear_kernel(
             projected[t * rows + first_row + r] = static_cast<scalar_t>(sum);
         }
     }
-    // The CTA's share of normed, in 8-element vectors.
+    // The CTA's share of normed and summed, in 8-element vectors.
     const int vectors = width / 8;
     const int share = (TOKENS * vectors + static_cast<int>(gridDim.x) - 1) / static_cast<int>(gridDim.x);
     for (int index = static_cast<int>(blockIdx.x) * share + threadIdx.x;
@@ -276,15 +311,22 @@ __global__ void __launch_bounds__(kThreads) stream_rmsnorm_linear_kernel(
         const int t = index / vectors;
         const int k = index % vectors * 8;
         const float scale = inv_rms[t][k / hidden];
-        const uint4 loaded = *reinterpret_cast<const uint4*>(x + t * width + k);
-        const auto* values = reinterpret_cast<const scalar_t*>(&loaded);
+        float values[8];
+        stream_values<scalar_t, INJECTED, STREAMS>(x, block_out, injection_weights, t, k, hidden, values);
         uint4 stored;
         auto* out = reinterpret_cast<scalar_t*>(&stored);
 #pragma unroll
         for (int i = 0; i < 8; i++) {
-            out[i] = static_cast<scalar_t>(static_cast<float>(values[i]) * scale * norm_weight[k + i]);
+            out[i] = static_cast<scalar_t>(values[i] * scale * norm_weight[k + i]);
         }
         *reinterpret_cast<uint4*>(normed + t * width + k) = stored;
+        if constexpr (INJECTED) {
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                out[i] = static_cast<scalar_t>(values[i]);
+            }
+            *reinterpret_cast<uint4*>(summed + t * width + k) = stored;
+        }
     }
 }
 
@@ -449,6 +491,86 @@ at::Tensor stream_rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, in
     return y;
 }
 
+namespace {
+
+// Whether x, a block output and injection weights when injected, norm_weight and weight take the fused kernel: 1 to
+// kVectorTokens fp16 or bf16 tokens of 4 streams whose hidden size and rows hold whole 16-byte vectors.
+bool fused_norm_linear(
+    const at::Tensor& x,
+    const std::optional<at::Tensor>& block_out,
+    const at::Tensor& norm_weight,
+    int64_t n_streams,
+    const at::Tensor& weight
+) {
+    return x.size(0) >= 1 && x.size(0) <= kVectorTokens && x.scalar_type() != at::kFloat && x.is_contiguous() &&
+        n_streams == 4 && x.size(1) % n_streams == 0 && (x.size(1) / n_streams) % 8 == 0 && vector_rows(x, x.size(1)) &&
+        vector_rows(weight, weight.stride(0)) && reinterpret_cast<uintptr_t>(norm_weight.const_data_ptr()) % 16 == 0 &&
+        (!block_out || (block_out->is_contiguous() && vector_rows(*block_out, block_out->size(1))));
+}
+
+template <bool INJECTED>
+void launch_norm_linear(
+    const at::Tensor& x,
+    const at::Tensor& block_out,
+    const at::Tensor& injection_weights,
+    const at::Tensor& norm_weight,
+    int64_t n_streams,
+    double eps,
+    const at::Tensor& weight,
+    const at::Tensor& summed,
+    const at::Tensor& normed,
+    const at::Tensor& projected
+) {
+    const int64_t rows = weight.size(0);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    AT_DISPATCH_REDUCED_FLOATING_TYPES(x.scalar_type(), "stream_rmsnorm_linear_cuda", [&] {
+        dispatch_tokens(x.size(0), [&](auto tokens_tag) {
+            launch_dependent(
+                stream_rmsnorm_linear_kernel<scalar_t, decltype(tokens_tag)::value, 4, INJECTED>,
+                static_cast<unsigned>((rows + kLinearRows - 1) / kLinearRows),
+                kThreads,
+                0,
+                stream,
+                x.const_data_ptr<scalar_t>(),
+                INJECTED ? block_out.const_data_ptr<scalar_t>() : nullptr,
+                INJECTED ? injection_weights.const_data_ptr<scalar_t>() : nullptr,
+                norm_weight.const_data_ptr<float>(),
+                weight.const_data_ptr<scalar_t>(),
+                weight.stride(0),
+                INJECTED ? summed.mutable_data_ptr<scalar_t>() : nullptr,
+                normed.mutable_data_ptr<scalar_t>(),
+                projected.mutable_data_ptr<scalar_t>(),
+                static_cast<int>(x.size(1) / n_streams),
+                rows,
+                static_cast<float>(eps)
+            );
+        });
+    });
+}
+
+void check_norm_linear(
+    const at::Tensor& x,
+    const at::Tensor& norm_weight,
+    int64_t n_streams,
+    const at::Tensor& weight
+) {
+    TORCH_CHECK(
+        x.is_cuda() && x.dim() == 2 && n_streams >= 1 && x.size(1) % n_streams == 0,
+        "stream_rmsnorm_linear: x must be CUDA [tokens, n_streams * hidden]"
+    );
+    TORCH_CHECK(
+        weight.is_cuda() && weight.dim() == 2 && weight.size(1) == x.size(1) && weight.scalar_type() == x.scalar_type(),
+        "stream_rmsnorm_linear: weight must be CUDA [out, n_streams * hidden] in x's dtype"
+    );
+    TORCH_CHECK(
+        norm_weight.is_cuda() && norm_weight.scalar_type() == at::kFloat && norm_weight.dim() == 1 &&
+            norm_weight.size(0) == x.size(1) && norm_weight.is_contiguous(),
+        "stream_rmsnorm_linear: norm_weight must be contiguous CUDA fp32 [n_streams * hidden]"
+    );
+}
+
+}  // namespace
+
 std::tuple<at::Tensor, at::Tensor> stream_rmsnorm_linear_cuda(
     const at::Tensor& x,
     const at::Tensor& norm_weight,
@@ -456,51 +578,46 @@ std::tuple<at::Tensor, at::Tensor> stream_rmsnorm_linear_cuda(
     double eps,
     const at::Tensor& weight
 ) {
-    TORCH_CHECK(
-        weight.is_cuda() && weight.dim() == 2 && weight.size(1) == x.size(1) && weight.scalar_type() == x.scalar_type(),
-        "stream_rmsnorm_linear: weight must be CUDA [out, n_streams * hidden] in x's dtype"
-    );
-    // The fused kernel is compiled for Qwen3.8-Flash-Next's 4 streams.
-    const bool vectors = x.size(0) >= 1 && x.size(0) <= kVectorTokens && x.scalar_type() != at::kFloat &&
-        x.is_contiguous() && n_streams == 4 && x.size(1) % n_streams == 0 && (x.size(1) / n_streams) % 8 == 0 &&
-        vector_rows(x, x.size(1)) && vector_rows(weight, weight.stride(0)) &&
-        reinterpret_cast<uintptr_t>(norm_weight.const_data_ptr()) % 16 == 0;
-    if (!vectors) {
+    check_norm_linear(x, norm_weight, n_streams, weight);
+    if (!fused_norm_linear(x, std::nullopt, norm_weight, n_streams, weight)) {
         at::Tensor normed = stream_rmsnorm_cuda(x, norm_weight, n_streams, eps);
         return {normed, at::linear(normed, weight)};
     }
-    TORCH_CHECK(
-        norm_weight.is_cuda() && norm_weight.scalar_type() == at::kFloat && norm_weight.dim() == 1 &&
-            norm_weight.size(0) == x.size(1) && norm_weight.is_contiguous() && x.size(1) % n_streams == 0,
-        "stream_rmsnorm_linear: norm_weight must be contiguous CUDA fp32 [n_streams * hidden]"
-    );
-    const int64_t tokens = x.size(0);
-    const int64_t rows = weight.size(0);
     at::Tensor normed = at::empty_like(x);
-    at::Tensor projected = at::empty({tokens, rows}, x.options());
-    auto stream = at::cuda::getCurrentCUDAStream();
-    AT_DISPATCH_REDUCED_FLOATING_TYPES(x.scalar_type(), "stream_rmsnorm_linear_cuda", [&] {
-        dispatch_tokens(tokens, [&](auto tokens_tag) {
-            launch_dependent(
-                stream_rmsnorm_linear_kernel<scalar_t, decltype(tokens_tag)::value, 4>,
-                static_cast<unsigned>((rows + kLinearRows - 1) / kLinearRows),
-                kThreads,
-                0,
-                stream,
-                x.const_data_ptr<scalar_t>(),
-                norm_weight.const_data_ptr<float>(),
-                weight.const_data_ptr<scalar_t>(),
-                weight.stride(0),
-                normed.mutable_data_ptr<scalar_t>(),
-                projected.mutable_data_ptr<scalar_t>(),
-                static_cast<int>(x.size(1) / n_streams),
-                rows,
-                static_cast<float>(eps)
-            );
-            C10_CUDA_KERNEL_LAUNCH_CHECK();
-        });
-    });
+    at::Tensor projected = at::empty({x.size(0), weight.size(0)}, x.options());
+    launch_norm_linear<
+        false>(x, at::Tensor(), at::Tensor(), norm_weight, n_streams, eps, weight, at::Tensor(), normed, projected);
     return {normed, projected};
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> injected_stream_rmsnorm_linear_cuda(
+    const at::Tensor& x,
+    const at::Tensor& out,
+    const at::Tensor& injection_weights,
+    const at::Tensor& norm_weight,
+    int64_t n_streams,
+    double eps,
+    const at::Tensor& weight
+) {
+    check_norm_linear(x, norm_weight, n_streams, weight);
+    if (!fused_norm_linear(x, out, norm_weight, n_streams, weight) || !injection_weights.is_contiguous() ||
+        out.dim() != 2 || out.size(1) * n_streams != x.size(1)) {
+        at::Tensor summed = hyper_connection_inject_cuda(x, out, injection_weights);
+        auto [normed, projected] = stream_rmsnorm_linear_cuda(summed, norm_weight, n_streams, eps, weight);
+        return {summed, normed, projected};
+    }
+    TORCH_CHECK(
+        out.size(0) == x.size(0) && out.scalar_type() == x.scalar_type() && injection_weights.dim() == 2 &&
+            injection_weights.size(0) == x.size(0) && injection_weights.size(1) == n_streams &&
+            injection_weights.scalar_type() == x.scalar_type(),
+        "injected_stream_rmsnorm_linear: out must be [tokens, hidden] and injection_weights [tokens, n_streams] in x's "
+        "dtype"
+    );
+    at::Tensor summed = at::empty_like(x);
+    at::Tensor normed = at::empty_like(x);
+    at::Tensor projected = at::empty({x.size(0), weight.size(0)}, x.options());
+    launch_norm_linear<true>(x, out, injection_weights, norm_weight, n_streams, eps, weight, summed, normed, projected);
+    return {summed, normed, projected};
 }
 
 std::tuple<at::Tensor, at::Tensor> hyper_connection_mix_cuda(

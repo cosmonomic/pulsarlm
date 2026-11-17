@@ -398,6 +398,32 @@ qwen4_exp_model::mixed_input qwen4_exp_model::mix(const at::Tensor& x, const hyp
         config.rms_norm_eps,
         w.down_and_inject
     );
+    return mix_normed(normed, projected, w);
+}
+
+std::pair<at::Tensor, qwen4_exp_model::mixed_input> qwen4_exp_model::injected_mix(
+    const at::Tensor& x,
+    const at::Tensor& out,
+    const at::Tensor& injection_weights,
+    const hyper_connection_weights& w
+) const {
+    auto [summed, normed, projected] = injected_stream_rmsnorm_linear_cuda(
+        x.contiguous(),
+        out.contiguous(),
+        injection_weights,
+        w.hc_norm,
+        x.size(1) / config.hidden_size,
+        config.rms_norm_eps,
+        w.down_and_inject
+    );
+    return {summed, mix_normed(normed, projected, w)};
+}
+
+qwen4_exp_model::mixed_input qwen4_exp_model::mix_normed(
+    const at::Tensor& normed,
+    const at::Tensor& projected,
+    const hyper_connection_weights& w
+) const {
     const std::int64_t rank = w.input_mix_weight_up.size(1);
     auto [input, injection_weights] = hyper_connection_mix_cuda(
         normed,
@@ -667,25 +693,40 @@ qwen4_exp_model::ple(const at::Tensor& x, std::int64_t layer, const group_batch&
     return gated + convolved;
 }
 
+// A block's output joins the streams in the next mix's kernel, so x lags it until then.
 at::Tensor qwen4_exp_model::group_forward(const group_batch& g, std::span<const kv> lines) const {
-    auto inject = [](const at::Tensor& x, const at::Tensor& out, const mixed_input& mixed) {
-        return hyper_connection_inject_cuda(x, out, mixed.injection_weights);
-    };
     at::Tensor x = lookup(embed_tokens, first_vocab_row, g.tokens).repeat({1, config.hc_count});
+    // The last block's output and its injection weights, not yet added to x.
+    std::optional<std::pair<at::Tensor, at::Tensor>> pending;
+    auto inject_pending = [&] {
+        if (pending) {
+            x = hyper_connection_inject_cuda(x, pending->first, pending->second);
+            pending.reset();
+        }
+    };
+    auto mix_pending = [&](const hyper_connection_weights& w) {
+        if (!pending) {
+            return mix(x, w);
+        }
+        auto [summed, mixed] = injected_mix(x, pending->first, pending->second, w);
+        x = summed;
+        pending.reset();
+        return mixed;
+    };
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
         const layer_weights& w = layers[layer];
         if (w.ple) {
+            inject_pending();
             x = x + ple(x, layer, g, lines);
         }
-        mixed_input mixed = mix(x, w.attn_hyper_connection);
-        x = inject(
-            x,
-            indexed_attention(layer) ? attention(mixed.input, layer, g, lines) : deltanet(mixed.input, layer, g, lines),
-            mixed
-        );
-        mixed = mix(x, w.mlp_hyper_connection);
-        x = inject(x, moe(mixed.input, layer), mixed);
+        mixed_input mixed = mix_pending(w.attn_hyper_connection);
+        at::Tensor out = indexed_attention(layer) ? attention(mixed.input, layer, g, lines)
+                                                  : deltanet(mixed.input, layer, g, lines);
+        pending.emplace(out, mixed.injection_weights);
+        mixed = mix_pending(w.mlp_hyper_connection);
+        pending.emplace(moe(mixed.input, layer), mixed.injection_weights);
     }
+    inject_pending();
     return logits(final_mix(logit_inputs(x, g)));
 }
 
