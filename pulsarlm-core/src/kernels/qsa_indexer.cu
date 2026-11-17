@@ -19,13 +19,52 @@ namespace {
 
 constexpr int kBlocksPerCta = 128;
 
+// Where query row r, counted from first_row, of a ragged batch lies: sequence s holds rows [cu_seqlens_q[s],
+// cu_seqlens_q[s + 1]), or row s alone without cu_seqlens_q, and its rows are the last of its view of key_counts[s]
+// keys.
+struct query_rows {
+    const int32_t* key_counts;
+    const int32_t* cu_seqlens_q;
+    int num_seqs;
+    int64_t first_row;
+    int ratio;
+
+    __device__ int sequence(int64_t r) const {
+        const int64_t row = first_row + r;
+        if (cu_seqlens_q == nullptr) {
+            return static_cast<int>(row);
+        }
+        int lo = 0, hi = num_seqs;
+        while (hi - lo > 1) {
+            const int mid = (lo + hi) / 2;
+            if (cu_seqlens_q[mid] <= row) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo;
+    }
+
+    __device__ int64_t view_index(int64_t r) const {
+        const int s = sequence(r);
+        const int64_t first = cu_seqlens_q == nullptr ? s : cu_seqlens_q[s];
+        const int64_t count = cu_seqlens_q == nullptr ? 1 : cu_seqlens_q[s + 1] - first;
+        return key_counts[s] - count + (first_row + r - first);
+    }
+
+    // The blocks of the view that end at or before the row's key.
+    __device__ int64_t complete_blocks(int64_t r) const {
+        return (view_index(r) + 1) / ratio;
+    }
+};
+
 // One CTA per (query row, run of kBlocksPerCta blocks), one thread per block; the row's query heads sit in shared memory.
 template <typename scalar_t>
 __global__ void index_scores_kernel(
     const scalar_t* __restrict__ queries,
     const scalar_t* __restrict__ blocks,
-    const int64_t* __restrict__ row_sequence,
-    const int64_t* __restrict__ row_blocks,
+    const query_rows layout,
     int heads,
     int dim,
     int64_t max_blocks,
@@ -44,12 +83,12 @@ __global__ void index_scores_kernel(
     if (block >= max_blocks) {
         return;
     }
-    if (block >= row_blocks[row]) {
+    if (block >= layout.complete_blocks(row)) {
         return;
     }
     float score = 0.0f;
     {
-        const scalar_t* key = blocks + (row_sequence[row] * max_blocks + block) * dim;
+        const scalar_t* key = blocks + (layout.sequence(row) * max_blocks + block) * dim;
         for (int h = 0; h < heads; ++h) {
             float dot = 0.0f;
             for (int d = 0; d < dim; ++d) {
@@ -133,6 +172,55 @@ __global__ void index_blocks_kernel(
     }
 }
 
+// One CTA per (token, head), one thread per dim, a power of two: rmsnorm_cuda's RMSNorm of the head's columns of
+// index_qk, then the rotation index_blocks_kernel gives a block's first key, at the token's position.
+template <typename scalar_t>
+__global__ void index_queries_kernel(
+    const scalar_t* __restrict__ index_qk,
+    int64_t row_stride,
+    const float* __restrict__ norm_weight,
+    const float* __restrict__ inv_freq,
+    int rotary_dim,
+    const int64_t* __restrict__ positions,
+    int heads,
+    float eps,
+    scalar_t* __restrict__ queries
+) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
+    extern __shared__ float pooled[];
+    const int token = blockIdx.x / heads;
+    const int head = blockIdx.x % heads;
+    const int dim = blockDim.x;
+    const int d = threadIdx.x;
+    const float value = static_cast<float>(index_qk[token * row_stride + head * dim + d]);
+    pooled[d] = value * value;
+    __syncthreads();
+    for (int stride = dim / 2; stride > 0; stride >>= 1) {
+        if (d < stride) {
+            pooled[d] += pooled[d + stride];
+        }
+        __syncthreads();
+    }
+    const float inv_rms = rsqrtf(pooled[0] / static_cast<float>(dim) + eps);
+    __syncthreads();
+    const float normed = static_cast<float>(static_cast<scalar_t>(value * inv_rms * norm_weight[d]));
+    pooled[d] = normed;
+    __syncthreads();
+    scalar_t out = static_cast<scalar_t>(normed);
+    if (d < rotary_dim) {
+        const int half = rotary_dim / 2;
+        const float angle = static_cast<float>(positions[token]) * inv_freq[d % half];
+        const float cos_a = static_cast<float>(static_cast<scalar_t>(cosf(angle)));
+        const float sin_a = static_cast<float>(static_cast<scalar_t>(sinf(angle)));
+        const float pair = d < half ? -pooled[d + half] : pooled[d - half];
+        const float cosine_part = static_cast<float>(static_cast<scalar_t>(normed * cos_a));
+        const float sine_part = static_cast<float>(static_cast<scalar_t>(pair * sin_a));
+        out = static_cast<scalar_t>(cosine_part + sine_part);
+    }
+    queries[static_cast<int64_t>(blockIdx.x) * dim + d] = out;
+}
+
 constexpr int kSelectThreads = 1024;
 // The CTAs along a sequence's blocks in index_blocks_kernel.
 constexpr int64_t kBlockRuns = 1024;
@@ -182,8 +270,7 @@ __device__ int block_exclusive_sum(int value, int* sums) {
 __global__ void select_blocks_kernel(
     const float* __restrict__ scores,
     int64_t max_blocks,
-    const int64_t* __restrict__ row_blocks,
-    const int64_t* __restrict__ view_index,
+    const query_rows layout,
     int top,
     int ratio,
     int words,
@@ -198,7 +285,7 @@ __global__ void select_blocks_kernel(
     static_assert(kSelectThreads >= 256, "a thread per radix digit");
     const int64_t row = blockIdx.x;
     const float* row_scores = scores + row * max_blocks;
-    const int64_t scored_blocks = min(row_blocks[row], max_blocks);
+    const int64_t scored_blocks = min(layout.complete_blocks(row), max_blocks);
     uint32_t* row_bits = reinterpret_cast<uint32_t*>(selected) + row * words;
     const int tid = threadIdx.x;
     for (int w = tid; w < words; w += kSelectThreads) {
@@ -256,8 +343,8 @@ __global__ void select_blocks_kernel(
     }
     __syncthreads();
     if (tid == 0) {
-        const int64_t tail = row_blocks[row];
-        if (tail * ratio <= view_index[row]) {
+        const int64_t tail = layout.complete_blocks(row);
+        if (tail * ratio <= layout.view_index(row)) {
             atomicOr(&row_bits[tail / 32], 1u << (tail % 32));
         }
     }
@@ -276,8 +363,7 @@ template <typename scalar_t, bool BF16, int DIM>
 __global__ void __launch_bounds__(kScoreWarps * 32) index_scores_tc_kernel(
     const scalar_t* __restrict__ queries,
     const scalar_t* __restrict__ blocks,
-    const int64_t* __restrict__ row_sequence,
-    const int64_t* __restrict__ row_blocks,
+    const query_rows layout,
     int64_t rows,
     int heads,
     int64_t max_blocks,
@@ -303,12 +389,12 @@ __global__ void __launch_bounds__(kScoreWarps * 32) index_scores_tc_kernel(
     if (tid == 0) {
         int64_t most = 0;
         for (int r = 0; r < rows_here; ++r) {
-            most = max(most, min(row_blocks[first_row + r], max_blocks));
+            most = max(most, min(layout.complete_blocks(first_row + r), max_blocks));
         }
         scored_blocks = most;
         int count = 0;
         for (int r = 0; r < rows_here; ++r) {
-            const int64_t sequence = row_sequence[first_row + r];
+            const int64_t sequence = layout.sequence(first_row + r);
             bool seen = false;
             for (int i = 0; i < count; ++i) {
                 seen |= sequences[i] == sequence;
@@ -330,7 +416,7 @@ __global__ void __launch_bounds__(kScoreWarps * 32) index_scores_tc_kernel(
                 const int m = i / DIM, d = i % DIM;
                 const int r = m / heads;
                 scalar_t value = static_cast<scalar_t>(0);
-                if (r < rows_here && row_sequence[first_row + r] == sequence) {
+                if (r < rows_here && layout.sequence(first_row + r) == sequence) {
                     value = queries[((first_row + r) * heads + m % heads) * DIM + d];
                 }
                 sQ[attn::swizzled_offset<DIM>(m, d)] = value;
@@ -365,7 +451,7 @@ __global__ void __launch_bounds__(kScoreWarps * 32) index_scores_tc_kernel(
                     const int r = i / kScoreTileBlocks, n = i % kScoreTileBlocks;
                     const int64_t row = first_row + r;
                     const int64_t block = tile_first + n;
-                    if (row_sequence[row] != sequence || block >= min(row_blocks[row], max_blocks)) {
+                    if (layout.sequence(row) != sequence || block >= min(layout.complete_blocks(row), max_blocks)) {
                         continue;
                     }
                     float score = 0.0f;
@@ -379,13 +465,46 @@ __global__ void __launch_bounds__(kScoreWarps * 32) index_scores_tc_kernel(
         }
     }
 }
+// The layout of rows of a batch whose views hold key_counts keys, checked.
+query_rows rows_of(
+    const char* op,
+    const at::Tensor& key_counts,
+    const std::optional<at::Tensor>& cu_seqlens_q,
+    int64_t first_row,
+    int64_t ratio
+) {
+    TORCH_CHECK(
+        key_counts.is_cuda() && key_counts.scalar_type() == at::kInt && key_counts.dim() == 1 &&
+            key_counts.is_contiguous(),
+        op,
+        ": key_counts must be contiguous int32 CUDA [sequences]"
+    );
+    TORCH_CHECK(
+        !cu_seqlens_q ||
+            (cu_seqlens_q->is_cuda() && cu_seqlens_q->scalar_type() == at::kInt && cu_seqlens_q->is_contiguous() &&
+             cu_seqlens_q->dim() == 1 && cu_seqlens_q->size(0) == key_counts.size(0) + 1),
+        op,
+        ": cu_seqlens_q must be contiguous int32 CUDA [sequences + 1]"
+    );
+    TORCH_CHECK(ratio >= 1 && first_row >= 0, op, ": ratio must be positive and first_row not negative");
+    return query_rows{
+        .key_counts = key_counts.const_data_ptr<int32_t>(),
+        .cu_seqlens_q = cu_seqlens_q ? cu_seqlens_q->const_data_ptr<int32_t>() : nullptr,
+        .num_seqs = static_cast<int>(key_counts.size(0)),
+        .first_row = first_row,
+        .ratio = static_cast<int>(ratio),
+    };
+}
+
 }  // namespace
 
 at::Tensor index_scores_cuda(
     const at::Tensor& queries,
     const at::Tensor& blocks,
-    const at::Tensor& row_sequence,
-    const at::Tensor& row_blocks,
+    const at::Tensor& key_counts,
+    const std::optional<at::Tensor>& cu_seqlens_q,
+    int64_t first_row,
+    int64_t ratio,
     double scale
 ) {
     TORCH_CHECK(
@@ -398,13 +517,7 @@ at::Tensor index_scores_cuda(
         "index_scores: blocks must be contiguous CUDA [sequences, max_blocks, dim] in the queries' dtype"
     );
     const int64_t rows = queries.size(0);
-    for (const at::Tensor* per_row : {&row_sequence, &row_blocks}) {
-        TORCH_CHECK(
-            per_row->is_cuda() && per_row->scalar_type() == at::kLong && per_row->dim() == 1 &&
-                per_row->size(0) == rows && per_row->is_contiguous(),
-            "index_scores: row_sequence and row_blocks must be contiguous int64 CUDA [rows]"
-        );
-    }
+    const query_rows layout = rows_of("index_scores", key_counts, cu_seqlens_q, first_row, ratio);
     const int64_t max_blocks = blocks.size(1);
     at::Tensor scores = at::empty({rows, max_blocks}, queries.options().dtype(at::kFloat));
     if (rows == 0 || max_blocks == 0) {
@@ -435,8 +548,7 @@ at::Tensor index_scores_cuda(
                     tc_stream,
                     queries.const_data_ptr<scalar_t>(),
                     blocks.const_data_ptr<scalar_t>(),
-                    row_sequence.const_data_ptr<int64_t>(),
-                    row_blocks.const_data_ptr<int64_t>(),
+                    layout,
                     rows,
                     heads,
                     max_blocks,
@@ -470,8 +582,7 @@ at::Tensor index_scores_cuda(
             stream,
             queries.const_data_ptr<scalar_t>(),
             blocks.const_data_ptr<scalar_t>(),
-            row_sequence.const_data_ptr<int64_t>(),
-            row_blocks.const_data_ptr<int64_t>(),
+            layout,
             heads,
             dim,
             max_blocks,
@@ -481,6 +592,60 @@ at::Tensor index_scores_cuda(
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     });
     return scores;
+}
+
+at::Tensor index_queries_cuda(
+    const at::Tensor& index_qk,
+    const at::Tensor& norm_weight,
+    const at::Tensor& inv_freq,
+    const at::Tensor& positions,
+    int64_t n_heads,
+    double eps
+) {
+    const int64_t dim = norm_weight.numel();
+    TORCH_CHECK(
+        index_qk.is_cuda() && index_qk.dim() == 2 && index_qk.stride(1) == 1 && index_qk.size(1) >= n_heads * dim,
+        "index_queries: index_qk must be CUDA [tokens, >= n_heads * dim], each row contiguous"
+    );
+    TORCH_CHECK(
+        norm_weight.is_cuda() && norm_weight.scalar_type() == at::kFloat && norm_weight.is_contiguous() && dim >= 1 &&
+            dim <= 1024 && (dim & (dim - 1)) == 0,
+        "index_queries: norm_weight must be contiguous fp32 CUDA [dim], dim a power of two up to 1024"
+    );
+    TORCH_CHECK(
+        inv_freq.is_cuda() && inv_freq.scalar_type() == at::kFloat && inv_freq.dim() == 1 &&
+            2 * inv_freq.size(0) <= dim && inv_freq.is_contiguous(),
+        "index_queries: inv_freq must be contiguous fp32 CUDA [rotary_dim / 2], rotary_dim at most the dim"
+    );
+    TORCH_CHECK(
+        positions.is_cuda() && positions.scalar_type() == at::kLong && positions.dim() == 1 &&
+            positions.size(0) == index_qk.size(0) && positions.is_contiguous(),
+        "index_queries: positions must be contiguous int64 CUDA [tokens]"
+    );
+    at::Tensor queries = at::empty({index_qk.size(0), n_heads, dim}, index_qk.options());
+    if (queries.numel() == 0) {
+        return queries;
+    }
+    auto stream = at::cuda::getCurrentCUDAStream();
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, index_qk.scalar_type(), "index_queries_cuda", [&] {
+        launch_dependent(
+            index_queries_kernel<scalar_t>,
+            static_cast<int>(index_qk.size(0) * n_heads),
+            static_cast<int>(dim),
+            dim * sizeof(float),
+            stream,
+            index_qk.const_data_ptr<scalar_t>(),
+            index_qk.stride(0),
+            norm_weight.const_data_ptr<float>(),
+            inv_freq.const_data_ptr<float>(),
+            static_cast<int>(2 * inv_freq.size(0)),
+            positions.const_data_ptr<int64_t>(),
+            static_cast<int>(n_heads),
+            static_cast<float>(eps),
+            queries.mutable_data_ptr<scalar_t>()
+        );
+    });
+    return queries;
 }
 
 at::Tensor index_blocks_cuda(
@@ -563,8 +728,9 @@ at::Tensor index_blocks_cuda(
 
 at::Tensor select_blocks_cuda(
     const at::Tensor& scores,
-    const at::Tensor& row_blocks,
-    const at::Tensor& view_index,
+    const at::Tensor& key_counts,
+    const std::optional<at::Tensor>& cu_seqlens_q,
+    int64_t first_row,
     int64_t top,
     int64_t ratio,
     int64_t words
@@ -574,13 +740,7 @@ at::Tensor select_blocks_cuda(
         "select_blocks: scores must be contiguous fp32 CUDA [rows, max_blocks]"
     );
     const int64_t rows = scores.size(0);
-    for (const at::Tensor* per_row : {&row_blocks, &view_index}) {
-        TORCH_CHECK(
-            per_row->is_cuda() && per_row->scalar_type() == at::kLong && per_row->dim() == 1 &&
-                per_row->size(0) == rows && per_row->is_contiguous(),
-            "select_blocks: row_blocks and view_index must be contiguous int64 CUDA [rows]"
-        );
-    }
+    const query_rows layout = rows_of("select_blocks", key_counts, cu_seqlens_q, first_row, ratio);
     TORCH_CHECK(
         top >= 1 && words * 32 > scores.size(1),
         "select_blocks: top must be positive and words cover a block past the scores"
@@ -598,8 +758,7 @@ at::Tensor select_blocks_cuda(
         stream,
         scores.const_data_ptr<float>(),
         scores.size(1),
-        row_blocks.const_data_ptr<int64_t>(),
-        view_index.const_data_ptr<int64_t>(),
+        layout,
         static_cast<int>(std::min(top, scores.size(1))),
         static_cast<int>(ratio),
         static_cast<int>(words),

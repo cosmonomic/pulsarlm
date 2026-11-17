@@ -270,7 +270,7 @@ at::Tensor attn_indexed_cuda(
     const at::Tensor& k_pool,
     const at::Tensor& v_pool,
     const at::Tensor& page_tables,
-    const at::Tensor& cu_seqlens_q,
+    const std::optional<at::Tensor>& cu_seqlens_q,
     const at::Tensor& seqlens_k,
     const at::Tensor& page_positions,
     const rope_parameters& rope,
@@ -282,6 +282,19 @@ at::Tensor attn_indexed_cuda(
     const std::optional<at::Tensor>& weight_sum,
     const std::optional<at::Tensor>& cu_view_pages,
     const std::optional<at::Tensor>& query_weights
+);
+
+// QSA's index queries [tokens, n_heads, dim] from the first n_heads * dim columns of index_qk [tokens, >= n_heads *
+// dim], each row contiguous: each head's RMSNorm by norm_weight (fp32, 1 + weight) as rmsnorm_cuda computes it, then
+// Hugging Face's partial RoPE of its first 2 * inv_freq.size(0) dims at the token's position (int64 [tokens]), as
+// index_blocks_cuda rotates a block. dim is a power of two up to 1024.
+at::Tensor index_queries_cuda(
+    const at::Tensor& index_qk,
+    const at::Tensor& norm_weight,
+    const at::Tensor& inv_freq,
+    const at::Tensor& positions,
+    int64_t n_heads,
+    double eps
 );
 
 // QSA's blocks [sequences, max_blocks, dim] in index_keys' dtype: block b of sequence s is the mean, in fp32 and
@@ -302,29 +315,34 @@ at::Tensor index_blocks_cuda(
     double eps
 );
 
-// QSA's selection, int32 [rows, words] as attn_indexed_cuda reads it: row r's top min(top, row_blocks[r]) blocks below
-// row_blocks[r] by scores (index_scores_cuda's), the lower block first among equal scores, then the block row_blocks[r]
-// when it starts at or before view_index[r]. row_blocks and view_index are int64 [rows]; words * 32
-// exceeds max_blocks.
+// QSA's selection, int32 [rows, words] as attn_indexed_cuda reads it: row r's top min(top, complete blocks) of its
+// complete blocks by scores (index_scores_cuda's), the lower block first among equal scores, then the block after them
+// when it starts at or before the row's view index. The rows are laid out as index_scores_cuda's; words * 32 exceeds
+// max_blocks.
 at::Tensor select_blocks_cuda(
     const at::Tensor& scores,
-    const at::Tensor& row_blocks,
-    const at::Tensor& view_index,
+    const at::Tensor& key_counts,
+    const std::optional<at::Tensor>& cu_seqlens_q,
+    int64_t first_row,
     int64_t top,
     int64_t ratio,
     int64_t words
 );
 
-// QSA's block scores, fp32 [rows, max_blocks]: for query row r of sequence row_sequence[r], block b below row_blocks[r]
-// scores scale times the sum over its heads of relu(queries[r, h] . blocks[row_sequence[r], b]), dot products
-// accumulated in fp32, on the tensor cores for fp16 and bf16 with heads dividing 16 and a dim of 64, 128 or 256;
-// the blocks past row_blocks[r] are left unwritten. queries [rows, heads, dim] and blocks [sequences, max_blocks, dim] share a
-// dtype; row_sequence and row_blocks are int64 [rows].
+// QSA's block scores, fp32 [rows, max_blocks]: block b among row r's complete blocks of sequence s scores scale
+// times the sum over its heads of relu(queries[r, h] . blocks[s, b]), dot products accumulated in fp32, on the tensor
+// cores for fp16 and bf16 with heads dividing 16 and a dim of 64, 128 or 256; the other blocks are left unwritten.
+// queries [rows, heads, dim] and blocks [sequences, max_blocks, dim] share a dtype. Row r is row first_row + r of a
+// ragged batch in which sequence s holds rows [cu_seqlens_q[s], cu_seqlens_q[s + 1]), or row s alone without
+// cu_seqlens_q (int32 [sequences + 1]), the last rows of its view of key_counts[s] keys (int32 [sequences]); its
+// complete blocks are the blocks of ratio keys ending at or before its key.
 at::Tensor index_scores_cuda(
     const at::Tensor& queries,
     const at::Tensor& blocks,
-    const at::Tensor& row_sequence,
-    const at::Tensor& row_blocks,
+    const at::Tensor& key_counts,
+    const std::optional<at::Tensor>& cu_seqlens_q,
+    int64_t first_row,
+    int64_t ratio,
     double scale
 );
 

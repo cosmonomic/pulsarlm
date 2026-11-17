@@ -299,22 +299,6 @@ bool qwen4_exp_model::indexed_attention(std::int64_t layer) const {
     return config.layer_types[layer] == qwen4_exp_layer_type::indexed_attention;
 }
 
-at::Tensor qwen4_exp_model::index_rope(const at::Tensor& x, const at::Tensor& positions) const {
-    const std::int64_t rotary_dim = 2 * index_inv_freq.size(0);
-    at::Tensor freqs = positions.to(at::kFloat).unsqueeze(-1) * index_inv_freq;
-    at::Tensor angles = at::cat({freqs, freqs}, -1);
-    std::vector<std::int64_t> sizes = angles.sizes().vec();
-    while (static_cast<std::int64_t>(sizes.size()) < x.dim()) {
-        sizes.insert(sizes.end() - 1, 1);
-    }
-    at::Tensor cos = angles.cos().to(x.scalar_type()).view(sizes);
-    at::Tensor sin = angles.sin().to(x.scalar_type()).view(sizes);
-    at::Tensor rotated = x.narrow(-1, 0, rotary_dim);
-    const std::int64_t half = rotary_dim / 2;
-    at::Tensor rotated_half = at::cat({-rotated.narrow(-1, half, half), rotated.narrow(-1, 0, half)}, -1);
-    return at::cat({rotated * cos + rotated_half * sin, x.narrow(-1, rotary_dim, x.size(-1) - rotary_dim)}, -1);
-}
-
 // Hugging Face takes a query's top blocks with torch.topk, whose order among equal scores is unspecified; here the lower
 // block wins.
 at::Tensor qwen4_exp_model::selected_blocks(
@@ -322,19 +306,17 @@ at::Tensor qwen4_exp_model::selected_blocks(
     const at::Tensor& queries,
     const kv& lines,
     const at::Tensor& page_tables,
-    const at::Tensor& cu_seqlens_q,
+    const std::optional<at::Tensor>& cu_seqlens_q,
     const at::Tensor& key_counts,
     const at::Tensor& page_positions
 ) const {
     const qwen4_exp_config& c = config;
     const std::int64_t ratio = c.indexer_compress_ratio;
     const std::int64_t ntok = queries.size(0);
-    const std::int64_t num_seqs = page_tables.size(0);
     const std::int64_t page_size = lines.index_keys.size(1);
     TORCH_CHECK(page_size % ratio == 0, "qwen4_exp_model: a page must hold whole index blocks");
     const std::int64_t max_blocks = page_tables.size(1) * page_size / ratio;
     const std::int64_t words = max_blocks / 32 + 1;
-    const auto longs = queries.options().dtype(at::kLong);
 
     at::Tensor blocks = index_blocks_cuda(
         lines.index_keys,
@@ -347,35 +329,24 @@ at::Tensor qwen4_exp_model::selected_blocks(
         c.rms_norm_eps
     );
 
-    at::Tensor starts = cu_seqlens_q.to(at::kLong);
-    at::Tensor counts = starts.narrow(0, 1, num_seqs) - starts.narrow(0, 0, num_seqs);
-    at::Tensor sequence_of = at::repeat_interleave(counts, std::optional<std::int64_t>(ntok));
-    at::Tensor view_index = key_counts.to(at::kLong).index_select(0, sequence_of) -
-        counts.index_select(0, sequence_of) + at::arange(ntok, longs) - starts.index_select(0, sequence_of);
-    at::Tensor complete_blocks = at::floor_divide(view_index + 1, ratio);
-
     const std::int64_t chunk_rows = std::max<std::int64_t>(1, (std::int64_t{1} << 26) / max_blocks);
     std::vector<at::Tensor> selected;
     for (std::int64_t first = 0; first < ntok; first += chunk_rows) {
         const std::int64_t rows = std::min(chunk_rows, ntok - first);
-        at::Tensor row_blocks = complete_blocks.narrow(0, first, rows).contiguous();
         at::Tensor scores = index_scores_cuda(
             queries.narrow(0, first, rows).contiguous(),
             blocks,
-            sequence_of.narrow(0, first, rows).contiguous(),
-            row_blocks,
+            key_counts,
+            cu_seqlens_q,
+            first,
+            ratio,
             1.0 / std::sqrt(static_cast<double>(c.indexer_head_dim))
         );
-        selected.push_back(select_blocks_cuda(
-            scores,
-            row_blocks,
-            view_index.narrow(0, first, rows).contiguous(),
-            c.indexer_budget / ratio,
-            ratio,
-            words
-        ));
+        selected.push_back(
+            select_blocks_cuda(scores, key_counts, cu_seqlens_q, first, c.indexer_budget / ratio, ratio, words)
+        );
     }
-    return at::cat(selected);
+    return selected.size() == 1 ? selected.front() : at::cat(selected);
 }
 
 at::Tensor qwen4_exp_model::stream_norm(const at::Tensor& x, const at::Tensor& weight) const {
@@ -470,29 +441,26 @@ at::Tensor qwen4_exp_model::attention(
     at::Tensor page_tables = g.page_tables.select(0, layer_row);
     at::Tensor page_positions = g.page_positions.select(0, layer_row);
     at::Tensor key_counts = g.key_counts.select(0, layer_row);
-    std::optional<at::Tensor> cu_seqlens_write;
-    at::Tensor cu_seqlens_q;
+    std::optional<at::Tensor> cu_seqlens_q;
     if (g.is_prefill()) {
-        cu_seqlens_write = g.cu_seqlens_q;
         cu_seqlens_q = g.cu_seqlens_q;
-    } else {
-        cu_seqlens_q = at::arange(page_tables.size(0) + 1, page_tables.options());
     }
-    write_kv_cuda(line.k, line.v, k, v, page_tables, cu_seqlens_write, key_counts);
+    write_kv_cuda(line.k, line.v, k, v, page_tables, cu_seqlens_q, key_counts);
 
     at::Tensor index_qk = projected.narrow(1, query_rows + 2 * key_rows, projected.size(1) - query_rows - 2 * key_rows);
-    at::Tensor index_queries = rmsnorm_cuda(
-        index_qk.narrow(1, 0, c.indexer_n_heads * c.indexer_head_dim)
-            .view({ntok, c.indexer_n_heads, c.indexer_head_dim}),
+    at::Tensor index_queries = index_queries_cuda(
+        index_qk,
         w.index_q_norm,
+        index_inv_freq,
+        g.pos,
+        c.indexer_n_heads,
         c.rms_norm_eps
     );
-    index_queries = index_rope(index_queries, g.pos);
     at::Tensor index_keys = index_qk.narrow(1, c.indexer_n_heads * c.indexer_head_dim, c.indexer_head_dim)
                                 .contiguous()
                                 .view({ntok, 1, -1});
     at::Tensor index_pool = line.index_keys.unsqueeze(2);
-    write_kv_cuda(index_pool, index_pool, index_keys, index_keys, page_tables, cu_seqlens_write, key_counts);
+    write_kv_cuda(index_pool, index_pool, index_keys, index_keys, page_tables, cu_seqlens_q, key_counts);
     at::Tensor
         selected = selected_blocks(w, index_queries, line, page_tables, cu_seqlens_q, key_counts, page_positions);
 

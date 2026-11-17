@@ -43,8 +43,11 @@ struct block_selection {
     }
 };
 
-// The sequence of query token qtok, by binary search over cu_seqlens_q.
+// The sequence of query token qtok, by binary search over cu_seqlens_q, or qtok without it.
 template <typename scalar_t> __device__ int sequence_of(const attn::paged_attn_params<scalar_t>& p, int qtok) {
+    if (p.cu_seqlens_q == nullptr) {
+        return qtok;
+    }
     int lo = 0, hi = p.num_seqs;
     while (hi - lo > 1) {
         const int mid = (lo + hi) >> 1;
@@ -71,8 +74,8 @@ __global__ void attn_indexed_scalar_kernel(const attn::paged_attn_params<scalar_
     const int half = head_dim / 2;
 
     const int s = sequence_of(p, qtok);
-    const int q0 = p.cu_seqlens_q[s];
-    const int seq_q = p.cu_seqlens_q[s + 1] - q0;
+    const int q0 = p.cu_seqlens_q ? p.cu_seqlens_q[s] : s;
+    const int seq_q = p.cu_seqlens_q ? p.cu_seqlens_q[s + 1] - q0 : 1;
     const int ctx_len = p.seqlens_k[s];
     const int query_pos = ctx_len - seq_q + (qtok - q0);
     const attn::key_positions layout = attn::sequence_key_positions(p, s, PAGE_SIZE);
@@ -358,8 +361,8 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
     const int rows = p.group;
     const int first_head = g * p.group;
     const int s = sequence_of(p, qtok);
-    const int q0 = p.cu_seqlens_q[s];
-    const int seq_q = p.cu_seqlens_q[s + 1] - q0;
+    const int q0 = p.cu_seqlens_q ? p.cu_seqlens_q[s] : s;
+    const int seq_q = p.cu_seqlens_q ? p.cu_seqlens_q[s + 1] - q0 : 1;
     const int ctx_len = p.seqlens_k[s];
     const int query_pos = ctx_len - seq_q + (qtok - q0);
     const int tile_blocks = KEY_TILE / selection.block_size;
@@ -865,7 +868,7 @@ at::Tensor attn_indexed_cuda(
     const at::Tensor& k_pool,
     const at::Tensor& v_pool,
     const at::Tensor& page_tables,
-    const at::Tensor& cu_seqlens_q,
+    const std::optional<at::Tensor>& cu_seqlens_q,
     const at::Tensor& seqlens_k,
     const at::Tensor& page_positions,
     const rope_parameters& rope,

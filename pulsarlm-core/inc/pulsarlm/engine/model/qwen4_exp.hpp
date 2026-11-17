@@ -142,16 +142,13 @@ class qwen4_exp_model : public model {
     at::Tensor lookup(const at::Tensor& table, std::int64_t first_row, const at::Tensor& ids) const;
     // The logits [rows, vocab_size] of the final mix x [rows, hidden], from every GPU's part of lm_head.
     at::Tensor logits(const at::Tensor& x) const;
-    // x [..., indexer_head_dim] with its first rotary_dim dims rotated as Hugging Face rotates them, at positions
-    // [...] (x's leading dims, or all but its last two).
-    at::Tensor index_rope(const at::Tensor& x, const at::Tensor& positions) const;
     // int32 [ntok, words]: each query's selected blocks, as attn_indexed_cuda reads them.
     at::Tensor selected_blocks(
         const attention_weights& w,
         const at::Tensor& queries,
         const kv& lines,
         const at::Tensor& page_tables,
-        const at::Tensor& cu_seqlens_q,
+        const std::optional<at::Tensor>& cu_seqlens_q,
         const at::Tensor& key_counts,
         const at::Tensor& page_positions
     ) const;
