@@ -275,7 +275,31 @@ std::vector<std::size_t> python_store::claim(
     return {};
 }
 
+// The awaiters a set event scheduled no longer refer to it, so it is destroyed right away.
 task<std::expected<void, page_error>> python_store::write_pages(
+    std::vector<digest>&& hashes,
+    std::vector<sharded_page>&& pages,
+    std::vector<std::pair<state::lease_id_type, page_index_type>>&& owners,
+    std::span<const cudaStream_t> streams
+) {
+    while (writing) {
+        if (!write_done) {
+            write_done.emplace();
+        }
+        co_await *write_done;
+    }
+    writing = true;
+    std::expected<void, page_error>
+        written = co_await write_pages_alone(std::move(hashes), std::move(pages), std::move(owners), streams);
+    writing = false;
+    if (write_done) {
+        write_done->set();
+        write_done.reset();
+    }
+    co_return written;
+}
+
+task<std::expected<void, page_error>> python_store::write_pages_alone(
     std::vector<digest>&& hashes,
     std::vector<sharded_page>&& pages,
     std::vector<std::pair<state::lease_id_type, page_index_type>>&& owners,

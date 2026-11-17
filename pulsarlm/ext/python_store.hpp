@@ -36,12 +36,23 @@ class python_store final : public page_store {
     pybind11::object run_coroutine_threadsafe;
     std::size_t host_page_bytes;
     std::optional<host_page_pool> host_pages;
+    // Whether a write is between its claim and its write_pages hook: the object pairs each claim with the next
+    // write_pages, so the writes run one at a time, the others waiting for write_done.
+    bool writing = false;
+    std::optional<event> write_done;
 
     // Calls the hook coroutine_function and runs its coroutine on the loop; returns its concurrent.futures.Future.
     template <typename... argument_types>
     pybind11::object start_coroutine(const char* coroutine_function, argument_types&&... arguments);
     std::vector<std::size_t>
     claim(std::span<const digest> hashes, std::span<const std::pair<state::lease_id_type, page_index_type>> owners);
+    // write_pages once no other write runs.
+    task<std::expected<void, page_error>> write_pages_alone(
+        std::vector<digest>&& hashes,
+        std::vector<sharded_page>&& pages,
+        std::vector<std::pair<state::lease_id_type, page_index_type>>&& owners,
+        std::span<const cudaStream_t> streams
+    );
 
   public:
     // host_page_bytes sizes the pool, which size_host_pages makes before the engine reads or writes a page.
