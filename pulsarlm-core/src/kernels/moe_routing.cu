@@ -100,8 +100,10 @@ __global__ void route_top_k_kernel(
         local += shifted;
     }
     const float total = block_sum(local, values);
+    // A NaN probability ranks below every other, as -inf, so that the top k stay among the experts.
     for (int e = threadIdx.x; e < experts; e += kThreads) {
-        probabilities[e] /= total;
+        const float probability = probabilities[e] / total;
+        probabilities[e] = isnan(probability) ? -INFINITY : probability;
     }
     __syncthreads();
 
