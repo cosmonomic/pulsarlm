@@ -60,7 +60,7 @@ Multi-turn chat sessions with Gemma 4 12B are evaluated on a single NVIDIA RTX 5
 For each turn, a 4,096-token user message and a model reply of at most 256 tokens are appended,
 and sessions grow to approximately 128k tokens of context.
 Both engines are allotted a 4 GiB KV cache
-and prefill at most 256 prompt tokens per step.
+and prefill at most 512 prompt tokens per step.
 In the "Capped @ 16k" configuration, eviction limits the attention view to 16,384 tokens;
 in the "no prefix cache" configurations, the entire conversation is recomputed at every turn.
 The vLLM baseline is version 0.31.0.

@@ -549,7 +549,7 @@ def run(
     kv_cache_gib: float = 18.0,
     store_gib: float = 8.0,
     n_working: int = 1024,
-    prefill_tokens_per_step: int = 256,
+    prefill_tokens_per_step: int = 512,
     vllm: str = "vllm==0.31.0",
     tensor_parallel_size: int = 4,
     container_executable: str = "docker",
