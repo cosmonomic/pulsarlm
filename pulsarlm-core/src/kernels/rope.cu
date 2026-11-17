@@ -1,3 +1,4 @@
+#include "pulsarlm/kernels/dependent_launch.cuh"
 #include "pulsarlm/kernels/ops.hpp"
 #include "pulsarlm/kernels/rope_tables.hpp"
 
@@ -65,6 +66,8 @@ __global__ void rope_kernel(
     int64_t seq,
     int64_t head_dim
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int64_t blk = blockIdx.x;
     const int64_t s = blk % seq;
     const int64_t h = head_dim / 2;
@@ -108,7 +111,12 @@ at::Tensor rope_cuda(const at::Tensor& x, const at::Tensor& pos, const rope_para
     auto stream = at::cuda::getCurrentCUDAStream();
 
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, xc.scalar_type(), "rope_cuda", [&] {
-        rope_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+        launch_dependent(
+            rope_kernel<scalar_t>,
+            blocks,
+            threads,
+            0,
+            stream,
             xc.data_ptr<scalar_t>(),
             pc.data_ptr<int64_t>(),
             quadrants_per_position.data_ptr<double>(),

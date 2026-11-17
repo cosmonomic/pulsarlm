@@ -1,3 +1,4 @@
+#include "pulsarlm/kernels/dependent_launch.cuh"
 #include "pulsarlm/kernels/ops.hpp"
 
 #include <ATen/ATen.h>
@@ -22,6 +23,8 @@ __global__ void rmsnorm_kernel(
     int64_t dim,
     double eps
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int64_t row = blockIdx.x;
     const scalar_t* xr = x + row * dim;
     scalar_t* yr = y + row * dim;
@@ -80,7 +83,12 @@ at::Tensor rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, double ep
 
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, xc.scalar_type(), "rmsnorm_cuda", [&] {
         if (wc.scalar_type() == xc.scalar_type()) {
-            rmsnorm_kernel<scalar_t, scalar_t><<<rows, threads, smem, stream>>>(
+            launch_dependent(
+                rmsnorm_kernel<scalar_t, scalar_t>,
+                rows,
+                threads,
+                smem,
+                stream,
                 xc.data_ptr<scalar_t>(),
                 wc.data_ptr<scalar_t>(),
                 y.data_ptr<scalar_t>(),
@@ -88,7 +96,12 @@ at::Tensor rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, double ep
                 eps
             );
         } else {
-            rmsnorm_kernel<scalar_t, float><<<rows, threads, smem, stream>>>(
+            launch_dependent(
+                rmsnorm_kernel<scalar_t, float>,
+                rows,
+                threads,
+                smem,
+                stream,
                 xc.data_ptr<scalar_t>(),
                 wc.data_ptr<float>(),
                 y.data_ptr<scalar_t>(),

@@ -1,3 +1,4 @@
+#include "pulsarlm/kernels/dependent_launch.cuh"
 #include "pulsarlm/kernels/attn_common.cuh"
 
 #include "pulsarlm/kernels/attn_tiles.cuh"
@@ -31,6 +32,8 @@ __global__ void index_scores_kernel(
     float scale,
     float* __restrict__ scores
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     extern __shared__ float query[];
     const int64_t row = blockIdx.x;
     for (int i = threadIdx.x; i < heads * dim; i += blockDim.x) {
@@ -77,6 +80,8 @@ __global__ void index_blocks_kernel(
     float eps,
     scalar_t* __restrict__ blocks
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     extern __shared__ float pooled[];
     __shared__ float total;
     const int s = blockIdx.x / max_blocks;
@@ -181,6 +186,8 @@ __global__ void select_blocks_kernel(
     int words,
     int32_t* __restrict__ selected
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     __shared__ uint32_t histogram[256];
     __shared__ uint32_t prefix;
     __shared__ int remaining;
@@ -271,6 +278,8 @@ __global__ void __launch_bounds__(kScoreWarps * 32) index_scores_tc_kernel(
     float scale,
     float* __restrict__ scores
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     constexpr int SCORE_STRIDE = kScoreTileBlocks + 1;
     constexpr int kChunkElems = 16 / sizeof(scalar_t);
     constexpr int kRowChunks = DIM / kChunkElems;
@@ -400,18 +409,22 @@ at::Tensor index_scores_cuda(
         attn::dispatch_tensor_core_dtype(queries.scalar_type(), [&](auto type_tag, auto bf16_tag) {
             using scalar_t = typename decltype(type_tag)::type;
             auto launch = [&](auto dim_tag) {
-                index_scores_tc_kernel<scalar_t, decltype(bf16_tag)::value, decltype(dim_tag)::value>
-                    <<<tc_grid, kScoreWarps * 32, 0, tc_stream>>>(
-                        queries.const_data_ptr<scalar_t>(),
-                        blocks.const_data_ptr<scalar_t>(),
-                        row_sequence.const_data_ptr<int64_t>(),
-                        row_blocks.const_data_ptr<int64_t>(),
-                        rows,
-                        heads,
-                        max_blocks,
-                        static_cast<float>(scale),
-                        scores.mutable_data_ptr<float>()
-                    );
+                launch_dependent(
+                    index_scores_tc_kernel<scalar_t, decltype(bf16_tag)::value, decltype(dim_tag)::value>,
+                    tc_grid,
+                    kScoreWarps * 32,
+                    0,
+                    tc_stream,
+                    queries.const_data_ptr<scalar_t>(),
+                    blocks.const_data_ptr<scalar_t>(),
+                    row_sequence.const_data_ptr<int64_t>(),
+                    row_blocks.const_data_ptr<int64_t>(),
+                    rows,
+                    heads,
+                    max_blocks,
+                    static_cast<float>(scale),
+                    scores.mutable_data_ptr<float>()
+                );
             };
             if (dim == 64) {
                 launch(std::integral_constant<int, 64>{});
@@ -431,7 +444,12 @@ at::Tensor index_scores_cuda(
     const size_t shared = static_cast<size_t>(heads) * dim * sizeof(float);
     auto stream = at::cuda::getCurrentCUDAStream();
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, queries.scalar_type(), "index_scores_cuda", [&] {
-        index_scores_kernel<scalar_t><<<grid, kBlocksPerCta, shared, stream>>>(
+        launch_dependent(
+            index_scores_kernel<scalar_t>,
+            grid,
+            kBlocksPerCta,
+            shared,
+            stream,
             queries.const_data_ptr<scalar_t>(),
             blocks.const_data_ptr<scalar_t>(),
             row_sequence.const_data_ptr<int64_t>(),
@@ -499,23 +517,27 @@ at::Tensor index_blocks_cuda(
     }
     auto stream = at::cuda::getCurrentCUDAStream();
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, index_keys.scalar_type(), "index_blocks_cuda", [&] {
-        index_blocks_kernel<scalar_t>
-            <<<static_cast<int>(sequences * max_blocks), static_cast<int>(dim), dim * sizeof(float), stream>>>(
-                index_keys.const_data_ptr<scalar_t>(),
-                index_keys.stride(0),
-                page_tables.const_data_ptr<int32_t>(),
-                static_cast<int>(page_tables.size(1)),
-                static_cast<int>(page_size),
-                page_positions.const_data_ptr<int32_t>(),
-                key_counts.const_data_ptr<int32_t>(),
-                norm_weight.const_data_ptr<float>(),
-                inv_freq.const_data_ptr<float>(),
-                static_cast<int>(2 * inv_freq.size(0)),
-                static_cast<int>(ratio),
-                static_cast<int>(max_blocks),
-                static_cast<float>(eps),
-                blocks.mutable_data_ptr<scalar_t>()
-            );
+        launch_dependent(
+            index_blocks_kernel<scalar_t>,
+            static_cast<int>(sequences * max_blocks),
+            static_cast<int>(dim),
+            dim * sizeof(float),
+            stream,
+            index_keys.const_data_ptr<scalar_t>(),
+            index_keys.stride(0),
+            page_tables.const_data_ptr<int32_t>(),
+            static_cast<int>(page_tables.size(1)),
+            static_cast<int>(page_size),
+            page_positions.const_data_ptr<int32_t>(),
+            key_counts.const_data_ptr<int32_t>(),
+            norm_weight.const_data_ptr<float>(),
+            inv_freq.const_data_ptr<float>(),
+            static_cast<int>(2 * inv_freq.size(0)),
+            static_cast<int>(ratio),
+            static_cast<int>(max_blocks),
+            static_cast<float>(eps),
+            blocks.mutable_data_ptr<scalar_t>()
+        );
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     });
     return blocks;
@@ -550,7 +572,12 @@ at::Tensor select_blocks_cuda(
         return selected;
     }
     auto stream = at::cuda::getCurrentCUDAStream();
-    select_blocks_kernel<<<static_cast<int>(rows), kSelectThreads, 0, stream>>>(
+    launch_dependent(
+        select_blocks_kernel,
+        static_cast<int>(rows),
+        kSelectThreads,
+        0,
+        stream,
         scores.const_data_ptr<float>(),
         scores.size(1),
         row_blocks.const_data_ptr<int64_t>(),

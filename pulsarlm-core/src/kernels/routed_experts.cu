@@ -1,3 +1,4 @@
+#include "pulsarlm/kernels/dependent_launch.cuh"
 #include "pulsarlm/kernels/mma.cuh"
 #include "pulsarlm/kernels/ops.hpp"
 
@@ -60,6 +61,8 @@ __global__ void __launch_bounds__(kSortThreads) sort_assignments_kernel(
     int32_t* __restrict__ sorted_expert,
     int32_t* __restrict__ tiles
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     int32_t* tile_expert = tiles;
     int32_t* tile_first_row = tiles + max_tiles;
     int32_t* tile_rows = tiles + 2 * max_tiles;
@@ -154,6 +157,8 @@ __global__ void __launch_bounds__(kGemmThreads) expert_tile_gemm_kernel(
     float* __restrict__ partial,
     int64_t partial_rows
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int rows = tiles[2 * gridDim.x + blockIdx.x];
     if (rows == 0) {
         return;
@@ -302,6 +307,8 @@ __global__ void expert_rows_scalar_kernel(
     expert_activation activation,
     float* __restrict__ out
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= rows * n) {
         return;
@@ -332,6 +339,8 @@ __global__ void join_gate_up_splits_kernel(
     expert_activation activation,
     scalar_t* __restrict__ out
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= rows * n) {
         return;
@@ -361,6 +370,8 @@ __global__ void combine_experts_kernel(
     int hidden,
     scalar_t* __restrict__ out
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= tokens * hidden) {
         return;
@@ -411,7 +422,12 @@ void launch_tile_gemms(
         static_cast<unsigned>((intermediate + kTileWeightRows / 2 - 1) / (kTileWeightRows / 2)),
         static_cast<unsigned>(used_splits)
     );
-    expert_tile_gemm_kernel<scalar_t, bf16, true><<<gate_up_grid, kGemmThreads, 0, stream>>>(
+    launch_dependent(
+        expert_tile_gemm_kernel<scalar_t, bf16, true>,
+        gate_up_grid,
+        kGemmThreads,
+        0,
+        stream,
         h.const_data_ptr<scalar_t>(),
         h.stride(0),
         sorted_token,
@@ -429,7 +445,12 @@ void launch_tile_gemms(
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     if (used_splits > 1) {
-        join_gate_up_splits_kernel<scalar_t><<<element_blocks(assignments * intermediate), kElementThreads, 0, stream>>>(
+        launch_dependent(
+            join_gate_up_splits_kernel<scalar_t>,
+            element_blocks(assignments * intermediate),
+            kElementThreads,
+            0,
+            stream,
             partial.const_data_ptr<float>(),
             static_cast<int>(used_splits),
             assignments,
@@ -443,7 +464,12 @@ void launch_tile_gemms(
         static_cast<unsigned>(max_tiles),
         static_cast<unsigned>((hidden + kTileWeightRows - 1) / kTileWeightRows)
     );
-    expert_tile_gemm_kernel<scalar_t, bf16, false><<<down_grid, kGemmThreads, 0, stream>>>(
+    launch_dependent(
+        expert_tile_gemm_kernel<scalar_t, bf16, false>,
+        down_grid,
+        kGemmThreads,
+        0,
+        stream,
         activations.const_data_ptr<scalar_t>(),
         intermediate,
         sorted_token,
@@ -508,10 +534,7 @@ at::Tensor routed_experts_cuda(
     if (assignments == 0) {
         return out.zero_();
     }
-    TORCH_CHECK(
-        assignments <= std::numeric_limits<int32_t>::max() / kTileRows,
-        "routed_experts: too many assignments"
-    );
+    TORCH_CHECK(assignments <= std::numeric_limits<int32_t>::max() / kTileRows, "routed_experts: too many assignments");
 
     const int64_t max_tiles = std::min(assignments, assignments / kTileRows + std::min(experts, assignments));
     at::Tensor indices = at::empty({3 * assignments + 3 * max_tiles}, h.options().dtype(at::kInt));
@@ -520,7 +543,12 @@ at::Tensor routed_experts_cuda(
     int32_t* sorted_expert = sorted_token + assignments;
     int32_t* tiles = sorted_expert + assignments;
     auto stream = at::cuda::getCurrentCUDAStream();
-    sort_assignments_kernel<<<1, kSortThreads, 2 * experts * sizeof(int32_t), stream>>>(
+    launch_dependent(
+        sort_assignments_kernel,
+        1,
+        kSortThreads,
+        2 * experts * sizeof(int32_t),
+        stream,
         top_experts.const_data_ptr<int64_t>(),
         static_cast<int>(assignments),
         static_cast<int>(top_k),
@@ -536,7 +564,12 @@ at::Tensor routed_experts_cuda(
     at::Tensor activations = at::empty({assignments, intermediate}, h.options());
     at::Tensor expert_out = at::empty({assignments, hidden}, h.options());
     if (h.scalar_type() == at::kFloat) {
-        expert_rows_scalar_kernel<true><<<element_blocks(assignments * intermediate), kElementThreads, 0, stream>>>(
+        launch_dependent(
+            expert_rows_scalar_kernel<true>,
+            element_blocks(assignments * intermediate),
+            kElementThreads,
+            0,
+            stream,
             h.const_data_ptr<float>(),
             h.stride(0),
             sorted_token,
@@ -551,7 +584,12 @@ at::Tensor routed_experts_cuda(
             activations.mutable_data_ptr<float>()
         );
         C10_CUDA_KERNEL_LAUNCH_CHECK();
-        expert_rows_scalar_kernel<false><<<element_blocks(assignments * hidden), kElementThreads, 0, stream>>>(
+        launch_dependent(
+            expert_rows_scalar_kernel<false>,
+            element_blocks(assignments * hidden),
+            kElementThreads,
+            0,
+            stream,
             activations.const_data_ptr<float>(),
             intermediate,
             sorted_token,
@@ -579,17 +617,38 @@ at::Tensor routed_experts_cuda(
         );
         if (h.scalar_type() == at::kBFloat16) {
             launch_tile_gemms<at::BFloat16, true>(
-                h, gate_up_proj, down_proj, activation, sorted_token, tiles, max_tiles, activations, expert_out
+                h,
+                gate_up_proj,
+                down_proj,
+                activation,
+                sorted_token,
+                tiles,
+                max_tiles,
+                activations,
+                expert_out
             );
         } else {
             launch_tile_gemms<at::Half, false>(
-                h, gate_up_proj, down_proj, activation, sorted_token, tiles, max_tiles, activations, expert_out
+                h,
+                gate_up_proj,
+                down_proj,
+                activation,
+                sorted_token,
+                tiles,
+                max_tiles,
+                activations,
+                expert_out
             );
         }
     }
 
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, h.scalar_type(), "routed_experts_cuda", [&] {
-        combine_experts_kernel<scalar_t><<<element_blocks(tokens * hidden), kElementThreads, 0, stream>>>(
+        launch_dependent(
+            combine_experts_kernel<scalar_t>,
+            element_blocks(tokens * hidden),
+            kElementThreads,
+            0,
+            stream,
             expert_out.const_data_ptr<scalar_t>(),
             top_weights.const_data_ptr<float>(),
             position_of,

@@ -1,3 +1,4 @@
+#include "pulsarlm/kernels/dependent_launch.cuh"
 #include "pulsarlm/kernels/attn_common.cuh"
 
 #include "pulsarlm/kernels/ops.hpp"
@@ -24,6 +25,8 @@ namespace {
 // each page's max score into the page's mass_sum; the softmaxes combine with the flash
 // rescale.
 template <typename scalar_t, int PAGE_SIZE> __global__ void attn_scalar_kernel(const paged_attn_params<scalar_t> p) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int tid = threadIdx.x;
     const int blk = blockIdx.x;
     const int qtok = blk / p.n_q_heads;
@@ -300,8 +303,14 @@ void launch_attn_scalar(const paged_attn_batch& batch, cudaStream_t stream) {
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, batch.q.scalar_type(), "attn_scalar", [&] {
         dispatch_page_size("attn_scalar", batch.page_size, [&](auto page_size_tag) {
             constexpr int PS = decltype(page_size_tag)::value;
-            attn_scalar_kernel<scalar_t, PS>
-                <<<static_cast<int>(blocks), kThreads, smem, stream>>>(batch.params<scalar_t>());
+            launch_dependent(
+                attn_scalar_kernel<scalar_t, PS>,
+                static_cast<int>(blocks),
+                kThreads,
+                smem,
+                stream,
+                batch.params<scalar_t>()
+            );
         });
     });
 }

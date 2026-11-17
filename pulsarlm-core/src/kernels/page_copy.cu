@@ -1,3 +1,4 @@
+#include "pulsarlm/kernels/dependent_launch.cuh"
 #include "pulsarlm/kernels/page_copy.hpp"
 
 #include <ATen/ATen.h>
@@ -43,6 +44,8 @@ __global__ void copy_segments_to_host_kernel(
     unsigned char* __restrict__ host,
     const int64_t* __restrict__ segments
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const segment s = segment_of_block(segments);
     copy_bytes(device + s.device_offset, host + s.host_offset, s.bytes);
 }
@@ -53,6 +56,8 @@ __global__ void copy_segments_from_host_kernel(
     const unsigned char* __restrict__ host,
     const int64_t* __restrict__ segments
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const segment s = segment_of_block(segments);
     copy_bytes(host + s.host_offset, device + s.device_offset, s.bytes);
 }
@@ -81,7 +86,12 @@ void copy_segments_to_host_cuda(const at::Tensor& device, const at::Tensor& host
         return;
     }
     const auto blocks = static_cast<int>(segments.size(0));
-    copy_segments_to_host_kernel<<<blocks, kCopyThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+    launch_dependent(
+        copy_segments_to_host_kernel,
+        blocks,
+        kCopyThreads,
+        0,
+        at::cuda::getCurrentCUDAStream(),
         device.data_ptr<unsigned char>(),
         host.data_ptr<unsigned char>(),
         segments.data_ptr<int64_t>()
@@ -95,7 +105,12 @@ void copy_segments_from_host_cuda(const at::Tensor& device, const at::Tensor& ho
         return;
     }
     const auto blocks = static_cast<int>(segments.size(0));
-    copy_segments_from_host_kernel<<<blocks, kCopyThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+    launch_dependent(
+        copy_segments_from_host_kernel,
+        blocks,
+        kCopyThreads,
+        0,
+        at::cuda::getCurrentCUDAStream(),
         device.data_ptr<unsigned char>(),
         host.data_ptr<unsigned char>(),
         segments.data_ptr<int64_t>()

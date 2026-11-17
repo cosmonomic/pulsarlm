@@ -1,3 +1,4 @@
+#include "pulsarlm/kernels/dependent_launch.cuh"
 #include "pulsarlm/kernels/ops.hpp"
 
 #include <ATen/ATen.h>
@@ -32,6 +33,8 @@ __global__ void gumbel_race_kernel(
     int64_t vocab,
     unsigned long long* __restrict__ best
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int64_t row = blockIdx.y;
     const scalar_t* row_scores = scores + row * vocab;
     const float temperature = temperatures[row];
@@ -108,7 +111,12 @@ at::Tensor gumbel_race_cuda(const at::Tensor& scores, const at::Tensor& temperat
         static_cast<unsigned>(rows)
     );
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, scores.scalar_type(), "gumbel_race_cuda", [&] {
-        gumbel_race_kernel<scalar_t><<<grid, kRaceThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        launch_dependent(
+            gumbel_race_kernel<scalar_t>,
+            grid,
+            kRaceThreads,
+            0,
+            at::cuda::getCurrentCUDAStream(),
             scores.data_ptr<scalar_t>(),
             temperatures.data_ptr<float>(),
             draws.data_ptr<int64_t>(),

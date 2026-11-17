@@ -1,5 +1,6 @@
 #pragma once
 
+#include "pulsarlm/kernels/dependent_launch.cuh"
 #include "pulsarlm/kernels/attn_params.cuh"
 #include "pulsarlm/kernels/attn_tiles.cuh"
 
@@ -60,6 +61,8 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
     const paged_attn_params<scalar_t> p,
     const scalar_t* __restrict__ rotated_k  // [num_seqs * max_pages, page_size, n_kv_heads, head_dim]
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     constexpr int KEY_TILE = PAGE_SIZE * KEY_PAGES;
     // sS row stride. A stride of exactly KEY_TILE puts every row of a column on one
     // shared bank, and the two warp-0 sweeps below read a whole column at once.

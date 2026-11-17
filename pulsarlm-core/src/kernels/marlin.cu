@@ -1,3 +1,4 @@
+#include "pulsarlm/kernels/dependent_launch.cuh"
 #include "pulsarlm/kernels/dequant_gemm_common.cuh"
 
 #include "pulsarlm/kernels/ops.hpp"
@@ -203,6 +204,8 @@ __global__ void repack_weight_kernel(
     int k_tiles,
     int64_t total
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     constexpr int n_subtiles = tile_n / 8;
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= total) {
@@ -226,6 +229,8 @@ __global__ void repack_weight_kernel(
 
 __global__ void
 transpose_scale_kernel(const float* __restrict__ scale, float* __restrict__ scale_marlin, int rows, int groups) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= static_cast<int64_t>(rows) * groups) {
         return;
@@ -264,6 +269,8 @@ __global__ void __launch_bounds__(pipe.n_warps * 32) marlin_kernel(
     int group_size,
     int chunks_per_split
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     constexpr int tile_m = tile.m, tile_n = tile.n, tile_k = tile.k;
     constexpr int stages = pipe.stages, n_warps = pipe.n_warps;
     constexpr int n_threads = n_warps * 32;
@@ -423,18 +430,27 @@ std::tuple<at::Tensor, at::Tensor> repack(
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     constexpr int threads = 256;
     if (total > 0) {
-        repack_weight_kernel<weight_format, layout_tile_n>
-            <<<static_cast<unsigned>(ceil_div(total, threads)), threads, 0, stream>>>(
-                static_cast<const typename weight_format::source_type*>(source.const_data_ptr()),
-                weight_marlin.data_ptr<int32_t>(),
-                static_cast<int>(n),
-                static_cast<int>(k),
-                static_cast<int>(ceil_div(k, word_span_k)),
-                total
-            );
+        launch_dependent(
+            repack_weight_kernel<weight_format, layout_tile_n>,
+            static_cast<unsigned>(ceil_div(total, threads)),
+            threads,
+            0,
+            stream,
+            static_cast<const typename weight_format::source_type*>(source.const_data_ptr()),
+            weight_marlin.data_ptr<int32_t>(),
+            static_cast<int>(n),
+            static_cast<int>(k),
+            static_cast<int>(ceil_div(k, word_span_k)),
+            total
+        );
     }
     if (scale.numel() > 0) {
-        transpose_scale_kernel<<<static_cast<unsigned>(ceil_div(scale.numel(), threads)), threads, 0, stream>>>(
+        launch_dependent(
+            transpose_scale_kernel,
+            static_cast<unsigned>(ceil_div(scale.numel(), threads)),
+            threads,
+            0,
+            stream,
             scale.data_ptr<float>(),
             scale_marlin.data_ptr<float>(),
             static_cast<int>(scale_rows),
@@ -460,22 +476,26 @@ void launch(
 ) {
     const int k = static_cast<int>(x.size(1));
     constexpr tile_sizes tile{.m = tile_m, .n = layout_tile_n, .k = launch_tile_k};
-    marlin_kernel<weight_format, tile, launch_pipeline, scalar_type, split>
-        <<<grid, launch_pipeline.n_warps * 32, 0, stream>>>(
-            x.data_ptr<scalar_type>(),
-            weight_marlin.data_ptr<int32_t>(),
-            scale_marlin.data_ptr<float>(),
-            y.data_ptr<scalar_type>(),
-            y_partial,
-            static_cast<int>(x.size(0)),
-            n,
-            k,
-            static_cast<int>(ceil_div(k, word_span_k)),
-            static_cast<int>(scale_marlin.size(1)),
-            block_n,
-            group_size,
-            chunks_per_split
-        );
+    launch_dependent(
+        marlin_kernel<weight_format, tile, launch_pipeline, scalar_type, split>,
+        grid,
+        launch_pipeline.n_warps * 32,
+        0,
+        stream,
+        x.data_ptr<scalar_type>(),
+        weight_marlin.data_ptr<int32_t>(),
+        scale_marlin.data_ptr<float>(),
+        y.data_ptr<scalar_type>(),
+        y_partial,
+        static_cast<int>(x.size(0)),
+        n,
+        k,
+        static_cast<int>(ceil_div(k, word_span_k)),
+        static_cast<int>(scale_marlin.size(1)),
+        block_n,
+        group_size,
+        chunks_per_split
+    );
 }
 
 template <class weight_format, int tile_m, typename scalar_type>

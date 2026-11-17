@@ -1,3 +1,4 @@
+#include "pulsarlm/kernels/dependent_launch.cuh"
 #include "pulsarlm/kernels/dequant_gemm_common.cuh"
 
 #include "pulsarlm/kernels/ops.hpp"
@@ -163,6 +164,8 @@ __global__ void __launch_bounds__(NTHREADS) gemm_int4_kernel(
     int group_size,
     int chunks_per_split
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     constexpr int MROW = BM / 16;  // MMA row-tiles stacked in the M dimension
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
@@ -289,8 +292,23 @@ void launch(
     int group_size,
     int cps
 ) {
-    gemm_int4_kernel<BM, scalar_t, BF16, SPLIT>
-        <<<grid, NTHREADS, 0, stream>>>(x, wp, ws, y, yp, M, N, K, group_size, cps);
+    launch_dependent(
+        gemm_int4_kernel<BM, scalar_t, BF16, SPLIT>,
+        grid,
+        NTHREADS,
+        0,
+        stream,
+        x,
+        wp,
+        ws,
+        y,
+        yp,
+        M,
+        N,
+        K,
+        group_size,
+        cps
+    );
 }
 
 // Dispatch the split (grid.z = ksplits, fp32 partials) or non-split (grid.z = 1,

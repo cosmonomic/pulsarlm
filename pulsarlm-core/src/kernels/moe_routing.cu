@@ -1,3 +1,4 @@
+#include "pulsarlm/kernels/dependent_launch.cuh"
 #include "pulsarlm/kernels/ops.hpp"
 
 #include <ATen/ATen.h>
@@ -78,6 +79,8 @@ __global__ void route_top_k_kernel(
     float* __restrict__ weights,
     int64_t* __restrict__ chosen
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     extern __shared__ float probabilities[];
     __shared__ float values[kWarps];
     __shared__ int indices[kWarps];
@@ -133,6 +136,8 @@ __global__ void route_top_k_kernel(
 // One thread per output element: silu of the gate half, rounded, times the up half, rounded.
 template <typename scalar_t>
 __global__ void silu_mul_kernel(const scalar_t* __restrict__ x, scalar_t* __restrict__ y, int64_t tokens, int64_t n) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= tokens * n) {
         return;
@@ -168,7 +173,12 @@ std::tuple<at::Tensor, at::Tensor> route_top_k_cuda(const at::Tensor& logits, in
     const size_t shared = static_cast<size_t>(experts) * sizeof(float);
     auto stream = at::cuda::getCurrentCUDAStream();
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, logits.scalar_type(), "route_top_k_cuda", [&] {
-        route_top_k_kernel<scalar_t><<<static_cast<unsigned>(tokens), kThreads, shared, stream>>>(
+        launch_dependent(
+            route_top_k_kernel<scalar_t>,
+            static_cast<unsigned>(tokens),
+            kThreads,
+            shared,
+            stream,
             logits.const_data_ptr<scalar_t>(),
             logits.stride(0),
             static_cast<int>(experts),
@@ -194,7 +204,12 @@ at::Tensor silu_mul_cuda(const at::Tensor& x) {
     }
     auto stream = at::cuda::getCurrentCUDAStream();
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "silu_mul_cuda", [&] {
-        silu_mul_kernel<scalar_t><<<static_cast<unsigned>((y.numel() + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
+        launch_dependent(
+            silu_mul_kernel<scalar_t>,
+            static_cast<unsigned>((y.numel() + kThreads - 1) / kThreads),
+            kThreads,
+            0,
+            stream,
             x.const_data_ptr<scalar_t>(),
             y.mutable_data_ptr<scalar_t>(),
             tokens,

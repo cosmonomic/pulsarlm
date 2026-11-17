@@ -1,3 +1,4 @@
+#include "pulsarlm/kernels/dependent_launch.cuh"
 #include "pulsarlm/kernels/attn_common.cuh"
 
 #include "pulsarlm/kernels/attn_tuning.hpp"
@@ -29,6 +30,8 @@ namespace {
 template <typename scalar_t>
 __global__ void
 rotate_view_keys_kernel(const attn::paged_attn_params<scalar_t> p, int page_size, scalar_t* __restrict__ rotated_k) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int s = blockIdx.x / p.max_pages;
     const int view_page = blockIdx.x % p.max_pages;
     const int ctx_len = p.seqlens_k[s];
@@ -70,7 +73,12 @@ template <typename scalar_t, bool BF16> void launch_tc_prefill(const attn::paged
     const auto params = b.params<scalar_t>();
     const int64_t view_pages = b.num_seqs * b.max_pages;
     auto rotated_k = at::empty({view_pages, b.page_size, b.n_kv_heads, b.head_dim}, b.k_pool.options());
-    rotate_view_keys_kernel<scalar_t><<<static_cast<int>(view_pages), 256, 0, stream>>>(
+    launch_dependent(
+        rotate_view_keys_kernel<scalar_t>,
+        static_cast<int>(view_pages),
+        256,
+        0,
+        stream,
         params,
         static_cast<int>(b.page_size),
         rotated_k.data_ptr<scalar_t>()
@@ -87,7 +95,15 @@ template <typename scalar_t, bool BF16> void launch_tc_prefill(const attn::paged
             const auto kernel = attn::
                 attn_prefill_tc_kernel<scalar_t, BS, HD, BF16, NWARPS, KEY_PAGES, kTuning.prefill_ctas_per_sm>;
             attn::allow_shared_memory(kernel, smem);
-            kernel<<<static_cast<int>(grid), NWARPS * 32, smem, stream>>>(params, rotated_k.data_ptr<scalar_t>());
+            launch_dependent(
+                kernel,
+                static_cast<int>(grid),
+                NWARPS * 32,
+                smem,
+                stream,
+                params,
+                rotated_k.data_ptr<scalar_t>()
+            );
         });
     });
 }

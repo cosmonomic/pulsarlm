@@ -1,3 +1,4 @@
+#include "pulsarlm/kernels/dependent_launch.cuh"
 #include "pulsarlm/kernels/attn_common.cuh"
 
 #include "pulsarlm/kernels/attn_tiles.cuh"
@@ -59,6 +60,8 @@ template <typename scalar_t> __device__ int sequence_of(const attn::paged_attn_p
 // One CTA per (query token, query head), as attn_scalar_kernel, its threads striding over pages up to the query's.
 template <typename scalar_t, int PAGE_SIZE>
 __global__ void attn_indexed_scalar_kernel(const attn::paged_attn_params<scalar_t> p, const block_selection selection) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int tid = threadIdx.x;
     const int blk = blockIdx.x;
     const int qtok = blk / p.n_q_heads;
@@ -167,6 +170,8 @@ __global__ void mark_selected_pages_kernel(
     int page_size,
     int32_t* __restrict__ selected_pages
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= static_cast<int64_t>(total_q) * selection.words) {
         return;
@@ -193,6 +198,8 @@ __global__ void rotate_indexed_keys_kernel(
     const int32_t* __restrict__ page_slots,
     scalar_t* __restrict__ rotated_k
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int slot = static_cast<int>(blockIdx.x);
     const int view_pages = p.num_seqs * p.max_pages;
     int first = 0;
@@ -257,6 +264,8 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
     float* __restrict__ partial,  // [query tokens * KV groups * splits, 16, partial_row_floats], with splits above 1
     int32_t* __restrict__ listed_scratch  // [query tokens * KV groups * splits, kMaxListedBlocks]
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     constexpr int KEY_TILE = PAGE_SIZE * KEY_PAGES;
     constexpr int SCORE_STRIDE = KEY_TILE + 1;
     constexpr int kSweepLanes = 4;
@@ -329,7 +338,11 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
         const int row = c / kRowChunks;
         const int col = (c % kRowChunks) * kChunkElems;
         const scalar_t* source = p.q + (static_cast<int64_t>(qtok) * p.n_q_heads + first_head + row) * HEAD_DIM + col;
-        attn::cp_async_16(sQ + attn::swizzled_offset<HEAD_DIM>(row, col), row < rows ? source : p.q, row < rows ? 16 : 0);
+        attn::cp_async_16(
+            sQ + attn::swizzled_offset<HEAD_DIM>(row, col),
+            row < rows ? source : p.q,
+            row < rows ? 16 : 0
+        );
     }
     attn::cp_async_commit();
     attn::cp_async_wait<0>();
@@ -443,7 +456,8 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
     auto next_tile = [&](int slot) {
         for (int c = tid; c < KEY_TILE; c += NWARPS * 32) {
             const int index = next_listed + c / selection.block_size;
-            const int key = index < listed ? listed_blocks[index] * selection.block_size + c % selection.block_size : -1;
+            const int key = index < listed ? listed_blocks[index] * selection.block_size + c % selection.block_size
+                                           : -1;
             key_index[slot][c] = key <= query_pos ? key : -1;
         }
         const bool found = next_listed < listed;
@@ -461,11 +475,10 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
             const int key = key_index[slot][row];
             const int view_page = max(key, 0) / PAGE_SIZE;
             const int offset = max(key, 0) % PAGE_SIZE;
-            const scalar_t* src = keys
-                ? rotated_k + static_cast<int64_t>(seq_slots[view_page]) * rotated_page_stride +
+            const scalar_t* src = keys ? rotated_k + static_cast<int64_t>(seq_slots[view_page]) * rotated_page_stride +
                     offset * rotated_token_stride + static_cast<int64_t>(g) * HEAD_DIM + d
-                : p.v_pool + static_cast<int64_t>(seq_table[view_page]) * p.page_stride + offset * p.token_stride +
-                    g * p.head_stride + d;
+                                       : p.v_pool + static_cast<int64_t>(seq_table[view_page]) * p.page_stride +
+                    offset * p.token_stride + g * p.head_stride + d;
             attn::cp_async_16(dst + attn::swizzled_offset<HEAD_DIM>(row, d), src, key >= 0 ? 16 : 0);
         }
         attn::cp_async_commit();
@@ -604,6 +617,8 @@ __global__ void combine_indexed_splits_kernel(
     int splits,
     const float* __restrict__ partial
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int qtok = blockIdx.x / p.n_q_heads;
     const int head = blockIdx.x % p.n_q_heads;
     const int row_floats = partial_row_floats(p.head_dim);
@@ -659,7 +674,12 @@ void launch_indexed_tc(
     const int64_t view_pages = b.num_seqs * b.max_pages;
     auto selected_pages = at::zeros({view_pages}, b.page_tables.options());
     const int64_t marks = b.total_q * selection.words;
-    mark_selected_pages_kernel<scalar_t><<<static_cast<int>((marks + 255) / 256), 256, 0, stream>>>(
+    launch_dependent(
+        mark_selected_pages_kernel<scalar_t>,
+        static_cast<int>((marks + 255) / 256),
+        256,
+        0,
+        stream,
         params,
         selection,
         static_cast<int>(b.total_q),
@@ -670,7 +690,12 @@ void launch_indexed_tc(
     at::Tensor page_slots = at::cumsum(selected_pages, 0, at::kInt) - 1;
     const int64_t slot_count = std::min(view_pages, b.total_q * max_selected_blocks);
     auto rotated_k = at::empty({slot_count, b.page_size, b.n_kv_heads, b.head_dim}, b.k_pool.options());
-    rotate_indexed_keys_kernel<scalar_t><<<static_cast<int>(slot_count), 256, 0, stream>>>(
+    launch_dependent(
+        rotate_indexed_keys_kernel<scalar_t>,
+        static_cast<int>(slot_count),
+        256,
+        0,
+        stream,
         params,
         static_cast<int>(b.page_size),
         page_slots.const_data_ptr<int32_t>(),
@@ -693,12 +718,14 @@ void launch_indexed_tc(
             at::Tensor listed_scratch = at::empty({grid * splits, kMaxListedBlocks}, b.page_tables.options());
             at::Tensor partial;
             if (splits > 1) {
-                partial = at::empty(
-                    {grid * splits, 16, partial_row_floats(HD)},
-                    b.q.options().dtype(at::kFloat)
-                );
+                partial = at::empty({grid * splits, 16, partial_row_floats(HD)}, b.q.options().dtype(at::kFloat));
             }
-            kernel<<<static_cast<int>(grid * splits), NWARPS * 32, smem, stream>>>(
+            launch_dependent(
+                kernel,
+                static_cast<int>(grid * splits),
+                NWARPS * 32,
+                smem,
+                stream,
                 params,
                 selection,
                 rotated_k.data_ptr<scalar_t>(),
@@ -709,12 +736,16 @@ void launch_indexed_tc(
             );
             C10_CUDA_KERNEL_LAUNCH_CHECK();
             if (splits > 1) {
-                combine_indexed_splits_kernel<scalar_t>
-                    <<<static_cast<int>(b.total_q * b.n_q_heads), 128, 0, stream>>>(
-                        params,
-                        splits,
-                        partial.const_data_ptr<float>()
-                    );
+                launch_dependent(
+                    combine_indexed_splits_kernel<scalar_t>,
+                    static_cast<int>(b.total_q * b.n_q_heads),
+                    128,
+                    0,
+                    stream,
+                    params,
+                    splits,
+                    partial.const_data_ptr<float>()
+                );
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
             }
         });
@@ -727,8 +758,15 @@ void launch_indexed_scalar(const attn::paged_attn_batch& b, const block_selectio
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, b.q.scalar_type(), "attn_indexed_scalar", [&] {
         attn::dispatch_page_size("attn_indexed", b.page_size, [&](auto page_size_tag) {
             constexpr int PS = decltype(page_size_tag)::value;
-            attn_indexed_scalar_kernel<scalar_t, PS>
-                <<<static_cast<int>(blocks), attn::kThreads, smem, stream>>>(b.params<scalar_t>(), selection);
+            launch_dependent(
+                attn_indexed_scalar_kernel<scalar_t, PS>,
+                static_cast<int>(blocks),
+                attn::kThreads,
+                smem,
+                stream,
+                b.params<scalar_t>(),
+                selection
+            );
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         });
     });

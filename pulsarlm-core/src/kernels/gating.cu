@@ -1,3 +1,4 @@
+#include "pulsarlm/kernels/dependent_launch.cuh"
 #include "pulsarlm/kernels/ops.hpp"
 
 #include <ATen/ATen.h>
@@ -28,6 +29,8 @@ __global__ void sigmoid_gated_add_kernel(
     int64_t elements,
     int64_t columns
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= elements) {
         return;
@@ -50,6 +53,8 @@ __global__ void sigmoid_gated_kernel(
     int64_t middle,
     int64_t columns
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= elements) {
         return;
@@ -57,7 +62,9 @@ __global__ void sigmoid_gated_kernel(
     const int64_t column = index % columns;
     const int64_t position = index / columns;
     const int64_t gate_index = position / middle * gate_row_stride + position % middle * gate_middle_stride + column;
-    out[index] = static_cast<scalar_t>(__fmul_rn(static_cast<float>(y[index]), rounded_sigmoid(gate_logits[gate_index])));
+    out[index] = static_cast<scalar_t>(
+        __fmul_rn(static_cast<float>(y[index]), rounded_sigmoid(gate_logits[gate_index]))
+    );
 }
 
 unsigned blocks_for(int64_t elements) {
@@ -83,7 +90,12 @@ at::Tensor sigmoid_gated_add_cuda(const at::Tensor& x, const at::Tensor& gate_lo
     }
     auto stream = at::cuda::getCurrentCUDAStream();
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "sigmoid_gated_add_cuda", [&] {
-        sigmoid_gated_add_kernel<scalar_t><<<blocks_for(x.numel()), kThreads, 0, stream>>>(
+        launch_dependent(
+            sigmoid_gated_add_kernel<scalar_t>,
+            blocks_for(x.numel()),
+            kThreads,
+            0,
+            stream,
             x.const_data_ptr<scalar_t>(),
             gate_logits.const_data_ptr<scalar_t>(),
             gate_logits.stride(0),
@@ -103,8 +115,8 @@ at::Tensor sigmoid_gated_cuda(const at::Tensor& y, const at::Tensor& gate_logits
         "sigmoid_gated: y must be contiguous CUDA [rows, columns] or [rows, middle, columns]"
     );
     TORCH_CHECK(
-        gate_logits.sizes() == y.sizes() && gate_logits.stride(-1) == 1 && gate_logits.scalar_type() == y.scalar_type() &&
-            gate_logits.device() == y.device(),
+        gate_logits.sizes() == y.sizes() && gate_logits.stride(-1) == 1 &&
+            gate_logits.scalar_type() == y.scalar_type() && gate_logits.device() == y.device(),
         "sigmoid_gated: gate_logits must be shaped as y in its dtype, its last axis contiguous"
     );
     at::Tensor out = at::empty_like(y);
@@ -115,7 +127,12 @@ at::Tensor sigmoid_gated_cuda(const at::Tensor& y, const at::Tensor& gate_logits
     const int64_t middle_stride = y.dim() == 3 ? gate_logits.stride(1) : 0;
     auto stream = at::cuda::getCurrentCUDAStream();
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, y.scalar_type(), "sigmoid_gated_cuda", [&] {
-        sigmoid_gated_kernel<scalar_t><<<blocks_for(y.numel()), kThreads, 0, stream>>>(
+        launch_dependent(
+            sigmoid_gated_kernel<scalar_t>,
+            blocks_for(y.numel()),
+            kThreads,
+            0,
+            stream,
             y.const_data_ptr<scalar_t>(),
             gate_logits.const_data_ptr<scalar_t>(),
             gate_logits.stride(0),

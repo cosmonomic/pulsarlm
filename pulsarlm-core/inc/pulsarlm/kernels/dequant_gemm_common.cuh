@@ -1,5 +1,6 @@
 #pragma once
 
+#include "pulsarlm/kernels/dependent_launch.cuh"
 #include <ATen/cuda/CUDAContext.h>
 
 #include <cuda_runtime.h>
@@ -100,6 +101,8 @@ constexpr int combine_threads = 256;
 template <typename scalar_type>
 __global__ void
 combine_partials_kernel(scalar_type* __restrict__ y, const float* __restrict__ y_partial, int64_t total, int splits) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= total) {
         return;

@@ -1,3 +1,4 @@
+#include "pulsarlm/kernels/dependent_launch.cuh"
 #include "pulsarlm/kernels/ops.hpp"
 
 #include <ATen/ATen.h>
@@ -20,10 +21,13 @@ __global__ void gather_page_tables_kernel(
     int num_seqs,
     int width
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int layer = blockIdx.x / num_seqs;
     const int s = blockIdx.x % num_seqs;
     const int page_count = page_counts[s];
-    const auto* row = reinterpret_cast<const int32_t*>(table_addresses[s]) + static_cast<int64_t>(layer) * capacities[s];
+    const auto* row = reinterpret_cast<const int32_t*>(table_addresses[s]) +
+        static_cast<int64_t>(layer) * capacities[s];
     int32_t* out_row = out + static_cast<int64_t>(blockIdx.x) * width;
     for (int j = threadIdx.x; j < width; j += blockDim.x) {
         out_row[j] = j < page_count ? row[j] : 0;
@@ -71,7 +75,12 @@ at::Tensor gather_page_tables_cuda(
     at::Tensor device_addresses = addresses.to(options.dtype(at::kLong), /*non_blocking=*/true);
     at::Tensor device_capacities = capacities.to(options.dtype(at::kInt), /*non_blocking=*/true);
     at::Tensor device_counts = counts.to(options.dtype(at::kInt), /*non_blocking=*/true);
-    gather_page_tables_kernel<<<static_cast<int>(n_layers * num_seqs), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+    launch_dependent(
+        gather_page_tables_kernel,
+        static_cast<int>(n_layers * num_seqs),
+        128,
+        0,
+        at::cuda::getCurrentCUDAStream(),
         device_addresses.const_data_ptr<int64_t>(),
         device_capacities.const_data_ptr<int32_t>(),
         device_counts.const_data_ptr<int32_t>(),

@@ -1,3 +1,4 @@
+#include "pulsarlm/kernels/dependent_launch.cuh"
 #include "pulsarlm/kernels/ops.hpp"
 
 #include <ATen/ATen.h>
@@ -100,6 +101,8 @@ __global__ void causal_conv_kernel(
     int dilation,
     scalar_t* __restrict__ out
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= total * channels) {
         return;
@@ -133,6 +136,8 @@ __global__ void conv_state_kernel(
     int channels,
     int history
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= static_cast<int64_t>(tokens.num_seqs) * channels) {
         return;
@@ -241,6 +246,8 @@ __global__ void __launch_bounds__(kStepThreads) delta_rule_step_kernel(
     delta_rule_params p,
     scalar_t* __restrict__ out
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     constexpr int kQuads = KEY_DIM / 32;
     const delta_rule_block block(p, KEY_DIM);
     const int block_column = threadIdx.x / kStepLanes;
@@ -306,8 +313,8 @@ __global__ void __launch_bounds__(kStepThreads) delta_rule_step_kernel(
         }
     }
     if (row_lane == 0) {
-        out[(static_cast<int64_t>(block.s) * p.value_heads + block.head) * p.value_dim + column] =
-            static_cast<scalar_t>(gain * q_state + qk * delta);
+        out[(static_cast<int64_t>(block.s) * p.value_heads + block.head) * p.value_dim +
+            column] = static_cast<scalar_t>(gain * q_state + qk * delta);
     }
 }
 
@@ -357,6 +364,8 @@ __global__ void __launch_bounds__(kChunkThreads) delta_rule_chunk_kernel(
     delta_rule_params p,
     scalar_t* __restrict__ out
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     using tile = delta_rule_chunk_tile<KEY_DIM>;
     constexpr int kChunk = tile::chunk;
     constexpr int kRowStride = tile::row_stride;
@@ -553,8 +562,8 @@ __global__ void __launch_bounds__(kChunkThreads) delta_rule_chunk_kernel(
                 if (j >= tokens) {
                     break;
                 }
-                const float delta =
-                    __shfl_sync(0xffffffffu, beta[j] * residual[j / kSolveLanes], j % kSolveLanes, kSolveLanes);
+                const float
+                    delta = __shfl_sync(0xffffffffu, beta[j] * residual[j / kSolveLanes], j % kSolveLanes, kSolveLanes);
                 if (g == j % kSolveLanes) {
                     deltas[j * kColumns + c] = delta;
                 }
@@ -628,8 +637,8 @@ __global__ void __launch_bounds__(kChunkThreads) delta_rule_chunk_kernel(
 
         for (int i = threadIdx.x; i < tokens * kColumns; i += blockDim.x) {
             const int64_t token = first + chunk_first + i / kColumns;
-            out[(token * p.value_heads + block.head) * p.value_dim + block.first_column + i % kColumns] =
-                static_cast<scalar_t>(outputs[i]);
+            out[(token * p.value_heads + block.head) * p.value_dim + block.first_column +
+                i % kColumns] = static_cast<scalar_t>(outputs[i]);
         }
         if (chunk_end == page_end) {
             store_state(block.boundary(p));
@@ -652,6 +661,8 @@ __global__ void gated_rmsnorm_kernel(
     float eps,
     gate_activation activation
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int64_t offset = static_cast<int64_t>(blockIdx.x) * dim;
     const int64_t z_offset = static_cast<int64_t>(blockIdx.x) / rows_per_token * z_token_stride +
         static_cast<int64_t>(blockIdx.x) % rows_per_token * dim;
@@ -784,7 +795,12 @@ at::Tensor causal_conv_cuda(
     auto stream = at::cuda::getCurrentCUDAStream();
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "causal_conv_cuda", [&] {
         if (total > 0) {
-            causal_conv_kernel<scalar_t><<<blocks_for(total * channels), kConvThreads, 0, stream>>>(
+            launch_dependent(
+                causal_conv_kernel<scalar_t>,
+                blocks_for(total * channels),
+                kConvThreads,
+                0,
+                stream,
                 x.const_data_ptr<scalar_t>(),
                 x.stride(0),
                 weight.const_data_ptr<scalar_t>(),
@@ -800,7 +816,12 @@ at::Tensor causal_conv_cuda(
             );
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
-        conv_state_kernel<scalar_t><<<blocks_for(rows.size(0) * channels), kConvThreads, 0, stream>>>(
+        launch_dependent(
+            conv_state_kernel<scalar_t>,
+            blocks_for(rows.size(0) * channels),
+            kConvThreads,
+            0,
+            stream,
             x.const_data_ptr<scalar_t>(),
             x.stride(0),
             conv_pool.mutable_data_ptr<scalar_t>(),
@@ -845,11 +866,7 @@ at::Tensor gated_delta_rule_cuda(
         key_heads > 0 && value_heads % key_heads == 0,
         "gated_delta_rule: the value heads must be a multiple of the key heads"
     );
-    TORCH_CHECK(
-        value_dim % kColumns == 0,
-        "gated_delta_rule: the value head dim must be a multiple of ",
-        kColumns
-    );
+    TORCH_CHECK(value_dim % kColumns == 0, "gated_delta_rule: the value head dim must be a multiple of ", kColumns);
     TORCH_CHECK(
         x.size(1) == 2 * key_heads * key_dim + value_heads * value_dim,
         "gated_delta_rule: x must be [tokens, 2 * key heads * key dim + value heads * value dim]"
@@ -899,8 +916,18 @@ at::Tensor gated_delta_rule_cuda(
             const scalar_t* b_data = b.const_data_ptr<scalar_t>();
             scalar_t* out_data = out.mutable_data_ptr<scalar_t>();
             if (!cu_seqlens_q.has_value()) {
-                delta_rule_step_kernel<scalar_t, kKeyDim>
-                    <<<blocks, kStepThreads, 0, stream>>>(x_data, a_data, b_data, params, out_data);
+                launch_dependent(
+                    delta_rule_step_kernel<scalar_t, kKeyDim>,
+                    blocks,
+                    kStepThreads,
+                    0,
+                    stream,
+                    x_data,
+                    a_data,
+                    b_data,
+                    params,
+                    out_data
+                );
             } else {
                 const auto kernel = delta_rule_chunk_kernel<scalar_t, kKeyDim>;
                 constexpr size_t bytes = delta_rule_chunk_tile<kKeyDim>::bytes;
@@ -911,7 +938,18 @@ at::Tensor gated_delta_rule_cuda(
                         static_cast<int>(bytes)
                     ));
                 }
-                kernel<<<blocks, kChunkThreads, bytes, stream>>>(x_data, a_data, b_data, params, out_data);
+                launch_dependent(
+                    kernel,
+                    blocks,
+                    kChunkThreads,
+                    bytes,
+                    stream,
+                    x_data,
+                    a_data,
+                    b_data,
+                    params,
+                    out_data
+                );
             }
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         });
@@ -935,8 +973,7 @@ at::Tensor gated_rmsnorm_cuda(
         "packed"
     );
     TORCH_CHECK(
-        weight.scalar_type() == x.scalar_type() && weight.dim() == 1 && weight.size(0) == dim &&
-            weight.is_contiguous(),
+        weight.scalar_type() == x.scalar_type() && weight.dim() == 1 && weight.size(0) == dim && weight.is_contiguous(),
         "gated_rmsnorm: weight must be contiguous [dim] in x's dtype"
     );
     at::Tensor y = at::empty_like(x);
@@ -951,18 +988,22 @@ at::Tensor gated_rmsnorm_cuda(
     }
     auto stream = at::cuda::getCurrentCUDAStream();
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "gated_rmsnorm_cuda", [&] {
-        gated_rmsnorm_kernel<scalar_t>
-            <<<static_cast<int>(rows), threads, static_cast<size_t>(threads) * sizeof(float), stream>>>(
-                x.const_data_ptr<scalar_t>(),
-                z.const_data_ptr<scalar_t>(),
-                weight.const_data_ptr<scalar_t>(),
-                y.mutable_data_ptr<scalar_t>(),
-                dim,
-                x.dim() == 3 ? x.size(1) : 1,
-                z.stride(0),
-                static_cast<float>(eps),
-                activation
-            );
+        launch_dependent(
+            gated_rmsnorm_kernel<scalar_t>,
+            static_cast<int>(rows),
+            threads,
+            static_cast<size_t>(threads) * sizeof(float),
+            stream,
+            x.const_data_ptr<scalar_t>(),
+            z.const_data_ptr<scalar_t>(),
+            weight.const_data_ptr<scalar_t>(),
+            y.mutable_data_ptr<scalar_t>(),
+            dim,
+            x.dim() == 3 ? x.size(1) : 1,
+            z.stride(0),
+            static_cast<float>(eps),
+            activation
+        );
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     });
     return y;

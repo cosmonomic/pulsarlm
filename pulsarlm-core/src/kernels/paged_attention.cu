@@ -1,3 +1,4 @@
+#include "pulsarlm/kernels/dependent_launch.cuh"
 #include "pulsarlm/kernels/attn_common.cuh"
 
 #include "pulsarlm/kernels/attn_tiles.cuh"
@@ -66,6 +67,8 @@ __global__ void write_kv_kernel(
     int64_t token_stride,
     int64_t head_stride
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int t = blockIdx.x;
     int s = t;
     int index = 0;
@@ -431,6 +434,8 @@ __device__ __forceinline__ float* page_weight_entries(const paged_attn_params<sc
 // Single-CTA tensor-core decode: one CTA per (seq s, kv head g) attends the whole view.
 template <typename scalar_t, int PAGE_SIZE, int HEAD_DIM, bool BF16, int NWARPS>
 __global__ void __launch_bounds__(NWARPS * 32) attn_decode_tc_kernel(const paged_attn_params<scalar_t> p) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int tid = threadIdx.x;
     const int s = blockIdx.x / p.n_kv_heads;
     const int g = blockIdx.x % p.n_kv_heads;
@@ -478,6 +483,8 @@ __global__ void __launch_bounds__(NWARPS * 32) paged_decode_split_kernel(
     int nsplits,
     int tiles_per_split
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     const int tid = threadIdx.x;
     const int split = blockIdx.x % nsplits;
     const int sg = blockIdx.x / nsplits;
@@ -539,6 +546,8 @@ __global__ void paged_decode_combine_kernel(
     const float* __restrict__ l_partial,
     int nsplits
 ) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
     extern __shared__ float combine_shared[];
     float* scratch = combine_shared;
     float* weight = combine_shared + kThreads;
@@ -651,7 +660,7 @@ void launch_tc_decode(const attn::paged_attn_batch& b, int64_t forced_splits, cu
                 constexpr size_t smem = decode_tiles<scalar_t, HD, NWARPS>::bytes();
                 const auto kernel = attn_decode_tc_kernel<scalar_t, BS, HD, BF16, NWARPS>;
                 attn::allow_shared_memory(kernel, smem);
-                kernel<<<static_cast<int>(base_ctas), NWARPS * 32, smem, stream>>>(p);
+                launch_dependent(kernel, static_cast<int>(base_ctas), NWARPS * 32, smem, stream, p);
             });
         });
         return;
@@ -672,7 +681,12 @@ void launch_tc_decode(const attn::paged_attn_batch& b, int64_t forced_splits, cu
             constexpr size_t smem = decode_tiles<scalar_t, HD, NWARPS>::bytes();
             const auto kernel = paged_decode_split_kernel<scalar_t, BS, HD, BF16, NWARPS>;
             attn::allow_shared_memory(kernel, smem);
-            kernel<<<static_cast<int>(base_ctas * nsplits), NWARPS * 32, smem, stream>>>(
+            launch_dependent(
+                kernel,
+                static_cast<int>(base_ctas * nsplits),
+                NWARPS * 32,
+                smem,
+                stream,
                 p,
                 o_partial.data_ptr<float>(),
                 m_partial.data_ptr<float>(),
@@ -683,15 +697,19 @@ void launch_tc_decode(const attn::paged_attn_batch& b, int64_t forced_splits, cu
         });
     });
     const size_t combine_smem = sizeof(float) * (kThreads + nsplits);
-    paged_decode_combine_kernel<scalar_t>
-        <<<static_cast<int>(b.num_seqs * b.n_q_heads), kThreads, combine_smem, stream>>>(
-            p,
-            lse_out.data_ptr<float>(),
-            o_partial.data_ptr<float>(),
-            m_partial.data_ptr<float>(),
-            l_partial.data_ptr<float>(),
-            nsplits
-        );
+    launch_dependent(
+        paged_decode_combine_kernel<scalar_t>,
+        static_cast<int>(b.num_seqs * b.n_q_heads),
+        kThreads,
+        combine_smem,
+        stream,
+        p,
+        lse_out.data_ptr<float>(),
+        o_partial.data_ptr<float>(),
+        m_partial.data_ptr<float>(),
+        l_partial.data_ptr<float>(),
+        nsplits
+    );
 }
 
 }  // namespace
@@ -798,7 +816,12 @@ void write_kv_cuda(
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, k_pool.scalar_type(), "write_kv_cuda", [&] {
         attn::dispatch_page_size("write_kv", page_size, [&](auto page_size_tag) {
             constexpr int BS = decltype(page_size_tag)::value;
-            write_kv_kernel<scalar_t, BS><<<static_cast<int>(num_new_tokens), threads, 0, stream>>>(
+            launch_dependent(
+                write_kv_kernel<scalar_t, BS>,
+                static_cast<int>(num_new_tokens),
+                threads,
+                0,
+                stream,
                 k_pool.data_ptr<scalar_t>(),
                 v_pool.data_ptr<scalar_t>(),
                 kn.data_ptr<scalar_t>(),
