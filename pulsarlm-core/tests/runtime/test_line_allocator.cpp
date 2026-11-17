@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -133,4 +134,102 @@ TEST_CASE("a held cached line keeps its region from reclaim until released") {
     REQUIRE(!try_take(lines, small));
     lines.release(large, cached, true);
     REQUIRE(try_take(lines, small).has_value());
+}
+
+TEST_CASE("a take matches a brute-force search over regions of many words") {
+    // Regions of 4096 units of 16 bytes, 64 words; the classes span orders below, at and above a word.
+    const std::vector<std::size_t> sizes{16, 64, 512, 2048, 16384, 65536};
+    const std::size_t region_bytes = 65536;
+    const std::size_t region_count = 3;
+    line_allocator lines(sizes, region_count * region_bytes);
+    std::vector<std::vector<bool>> taken_units(region_count, std::vector<bool>(region_bytes / 16, false));
+    std::vector<std::vector<std::pair<std::size_t, std::uint32_t>>> held(region_count);
+
+    auto first_free = [&](std::size_t region, std::size_t units) -> std::optional<std::size_t> {
+        for (std::size_t first = 0; first < taken_units[region].size(); first += units) {
+            bool free = true;
+            for (std::size_t unit = first; unit < first + units && free; unit++) {
+                free = !taken_units[region][unit];
+            }
+            if (free) {
+                return first;
+            }
+        }
+        return std::nullopt;
+    };
+    auto largest_free_units = [&](std::size_t region) {
+        for (std::size_t units = region_bytes / 16; units > 0; units /= 2) {
+            if (first_free(region, units)) {
+                return units;
+            }
+        }
+        return std::size_t{0};
+    };
+
+    std::uint64_t state = 7;
+    auto next = [&](std::uint64_t bound) {
+        state = state * 6364136223846793005ull + 1442695040888963407ull;
+        return (state >> 33) % bound;
+    };
+    for (std::size_t step = 0; step < 4000; step++) {
+        bool releases = next(3) == 0;
+        std::size_t loaded = 0;
+        for (const auto& region_lines : held) {
+            loaded += region_lines.size();
+        }
+        if (releases && loaded > 0) {
+            std::size_t region = next(region_count);
+            while (held[region].empty()) {
+                region = (region + 1) % region_count;
+            }
+            std::size_t index = next(held[region].size());
+            auto [block_class, line_id] = held[region][index];
+            held[region].erase(held[region].begin() + static_cast<std::ptrdiff_t>(index));
+            lines.release(block_class, line_id, false);
+            std::size_t first = line_id * sizes[block_class] % region_bytes / 16;
+            for (std::size_t unit = first; unit < first + sizes[block_class] / 16; unit++) {
+                taken_units[region][unit] = false;
+            }
+            continue;
+        }
+        std::size_t block_class = next(sizes.size() - 1);
+        std::size_t units = sizes[block_class] / 16;
+        std::optional<std::size_t> expected_region;
+        std::size_t expected_room = 0;
+        for (std::size_t region = 0; region < region_count; region++) {
+            std::size_t room = largest_free_units(region);
+            bool open = !held[region].empty() && room >= units;
+            bool better = !expected_region || held[*expected_region].empty() || room < expected_room;
+            if (open && better) {
+                expected_region = region;
+                expected_room = room;
+            }
+        }
+        if (!expected_region) {
+            for (std::size_t region = 0; region < region_count && !expected_region; region++) {
+                if (held[region].empty()) {
+                    expected_region = region;
+                }
+            }
+        }
+        std::optional<std::uint32_t> line_id = [&] {
+            line_allocator::transaction taking(lines);
+            std::optional<std::uint32_t> id = taking.take(block_class);
+            taking.commit();
+            return id;
+        }();
+        REQUIRE(line_id.has_value() == expected_region.has_value());
+        if (!line_id) {
+            continue;
+        }
+        std::size_t region = *line_id * sizes[block_class] / region_bytes;
+        std::size_t first = *line_id * sizes[block_class] % region_bytes / 16;
+        INFO("step " << step << " class " << block_class);
+        REQUIRE(region == *expected_region);
+        REQUIRE(first_free(region, units) == first);
+        for (std::size_t unit = first; unit < first + units; unit++) {
+            taken_units[region][unit] = true;
+        }
+        held[region].emplace_back(block_class, *line_id);
+    }
 }

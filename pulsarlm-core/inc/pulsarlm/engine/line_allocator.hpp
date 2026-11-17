@@ -42,7 +42,6 @@ class line_allocator {
 
     std::span<std::uint64_t> units_of(std::uint32_t r) noexcept;
     std::span<const std::uint64_t> units_of(std::uint32_t r) const noexcept;
-    bool units_free(std::uint32_t r, std::size_t first, std::size_t count) const noexcept;
     void set_units(std::uint32_t r, std::size_t first, std::size_t count, bool taken) noexcept;
     // The first unit of a free block of order in region r.
     std::optional<std::size_t> free_block(std::uint32_t r, std::size_t order) const noexcept;

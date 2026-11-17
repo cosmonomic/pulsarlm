@@ -23,6 +23,26 @@ std::size_t largest(std::span<const std::size_t> sizes) {
     return *std::ranges::max_element(sizes);
 }
 
+constexpr std::size_t word_order = 6;
+
+// The bits at the multiples of 2^order within a word, order below word_order.
+constexpr std::uint64_t block_starts(std::size_t order) {
+    std::uint64_t starts = 0;
+    for (std::size_t bit = 0; bit < 64; bit += std::size_t{1} << order) {
+        starts |= std::uint64_t{1} << bit;
+    }
+    return starts;
+}
+
+// The starts of word's free aligned blocks of 2^order units, order below word_order. Bit i of the fold is the OR of
+// the word's bits [i, i + 2^order).
+std::uint64_t free_block_starts(std::uint64_t word, std::size_t order) {
+    for (std::size_t shift = 1; shift < (std::size_t{1} << order); shift <<= 1) {
+        word |= word >> shift;
+    }
+    return ~word & block_starts(order);
+}
+
 }  // namespace
 
 line_allocator::line_allocator(std::span<const std::size_t> block_bytes, std::size_t pool_bytes)
@@ -66,36 +86,61 @@ std::span<const std::uint64_t> line_allocator::units_of(std::uint32_t r) const n
     return std::span(taken_units).subspan(r * region_words, region_words);
 }
 
-bool line_allocator::units_free(std::uint32_t r, std::size_t first, std::size_t count) const noexcept {
-    std::span<const std::uint64_t> units = units_of(r);
-    for (std::size_t unit = first; unit < first + count; unit++) {
-        if ((units[unit / 64] >> (unit % 64)) & 1) {
-            return false;
-        }
-    }
-    return true;
-}
-
+// Blocks are aligned to their size, a power of two, so one shorter than a word lies within one word.
 void line_allocator::set_units(std::uint32_t r, std::size_t first, std::size_t count, bool taken) noexcept {
     std::span<std::uint64_t> units = units_of(r);
-    for (std::size_t unit = first; unit < first + count; unit++) {
-        std::uint64_t bit = std::uint64_t{1} << (unit % 64);
-        units[unit / 64] = taken ? units[unit / 64] | bit : units[unit / 64] & ~bit;
+    if (count >= 64) {
+        std::fill_n(units.begin() + static_cast<std::ptrdiff_t>(first / 64), count / 64, taken ? ~std::uint64_t{0} : 0);
+        return;
     }
+    std::uint64_t bits = ((std::uint64_t{1} << count) - 1) << (first % 64);
+    units[first / 64] = taken ? units[first / 64] | bits : units[first / 64] & ~bits;
 }
 
 std::optional<std::size_t> line_allocator::free_block(std::uint32_t r, std::size_t order) const noexcept {
-    std::size_t count = std::size_t{1} << order;
-    for (std::size_t first = 0; first < region_units; first += count) {
-        if (units_free(r, first, count)) {
-            return first;
+    std::span<const std::uint64_t> units = units_of(r);
+    if (order >= word_order) {
+        std::size_t block_words = std::size_t{1} << (order - word_order);
+        for (std::size_t first = 0; first < units.size(); first += block_words) {
+            if (std::all_of(units.begin() + static_cast<std::ptrdiff_t>(first),
+                            units.begin() + static_cast<std::ptrdiff_t>(first + block_words),
+                            [](std::uint64_t word) { return word == 0; })) {
+                return first * 64;
+            }
+        }
+        return std::nullopt;
+    }
+    std::uint64_t in_region = region_units >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << region_units) - 1;
+    for (std::size_t w = 0; w < units.size(); w++) {
+        if (std::uint64_t starts = free_block_starts(units[w], order) & in_region) {
+            return w * 64 + static_cast<std::size_t>(std::countr_zero(starts));
         }
     }
     return std::nullopt;
 }
 
+// A run of free words ending at word w holds an aligned free block of 2^j words when 2^j divides w + 1 and the run is
+// at least 2^j long.
 std::optional<std::size_t> line_allocator::largest_free_order(std::uint32_t r) const noexcept {
-    for (std::size_t order = std::countr_zero(region_units) + 1; order > 0; order--) {
+    std::span<const std::uint64_t> units = units_of(r);
+    if (region_units >= 64) {
+        std::optional<std::size_t> largest_words_order;
+        std::size_t run = 0;
+        for (std::size_t w = 0; w < units.size(); w++) {
+            run = units[w] == 0 ? run + 1 : 0;
+            if (run > 0) {
+                auto order = static_cast<std::size_t>(
+                    std::min(std::countr_zero(w + 1), std::bit_width(run) - 1)
+                );
+                largest_words_order = std::max(largest_words_order.value_or(0), order);
+            }
+        }
+        if (largest_words_order) {
+            return word_order + *largest_words_order;
+        }
+    }
+    std::size_t orders = std::min<std::size_t>(word_order, static_cast<std::size_t>(std::countr_zero(region_units)) + 1);
+    for (std::size_t order = orders; order > 0; order--) {
         if (free_block(r, order - 1)) {
             return order - 1;
         }
