@@ -160,6 +160,10 @@ class event_loop {
 // cudaLaunchHostFunc also runs after a CUDA error; an error panics.
 task<void> synchronize(cudaStream_t stream);
 
+// Completes once the work queued on stream before the call has finished, whatever is queued after it, with the
+// stream's status. Uses cudaStreamAddCallback, as synchronize does.
+external_task<cudaError_t> completion_of(cudaStream_t stream);
+
 // Runs root_task as a root task of target and completes with its result once it does. Safe to call from any thread. A
 // panic in root_task panics target, and the returned task then never completes.
 template <typename value_type> external_task<value_type> run_on(event_loop& target, task<value_type> root_task);

@@ -62,10 +62,12 @@ class layer_view {
 };
 
 // A request being served. Its tokens move from pending to tail as steps forward them, and the pages the tail fills
-// join every layer's view, the last of them head.
+// join every layer's view, the last of them head. A step advances the sequence when it is launched; a token it samples
+// is awaited_token until the step is written back.
 class sequence {
   public:
     enum class exit_reason { finished, cancelled, oom };
+    static constexpr std::int64_t awaited_token = -1;
 
   private:
     result_writer& writer;
@@ -107,6 +109,13 @@ class sequence {
     std::optional<exit_reason> end_reason;
     // Set once the sequence leaves the running set.
     std::optional<event> exit_event;
+    // The launched steps the sequence is in that are not written back yet.
+    std::size_t steps_in_flight = 0;
+    // Whether a launched step forwards the sequence's last tokens: it samples the last token max_tokens allows, or it
+    // forwards the last pending tokens and does not sample.
+    bool last_step_launched = false;
+    // While a pending token is awaited_token: the row of its step's sampled tokens that holds it.
+    std::size_t awaited_row = 0;
     page_eviction_policy eviction;
     // The history position, in tokens, at which the eviction cycle ends: a multiple of cycle_tokens, and past the end of
     // the resumed state, so that forwarding its tail again never reaches a cycle end that state already passed.
@@ -148,8 +157,13 @@ class sequence {
     void update_held();
     bool may_sample() const noexcept;
     // Moves the first count pending tokens to tail, then the pages they complete to every layer with pages, and returns
-    // how many pages they complete.
+    // how many pages they complete. The tokens of the pages it completes are not awaited_token.
     std::size_t advance(std::size_t count);
+    // Sets the token at history position index, in tail or pending, which was awaited_token.
+    void resolve_token(std::size_t index, std::int64_t token);
+    // Undoes the advance by one token of the latest launched step, which completed no page, and its sample if it took
+    // one: the token it forwarded returns to pending.
+    void withdraw_latest_step();
     // The tokens of the history up to the next token: its full pages, then tail.
     std::size_t history_position() const noexcept;
     void start_next_cycle() noexcept;

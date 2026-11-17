@@ -25,9 +25,12 @@ class scheduler {
 
     static event& emplace_event(std::optional<event>& waited);
     static void wake(std::optional<event>& waited) noexcept;
-    // The next step's entries, once a sequence runs: every decoding sequence, then the others' tokens up to
-    // prefill_tokens_per_step, never past the end of a sequence's cycle.
-    task<std::vector<batch_entry>> next_entries();
+    // The next step's entries: every decoding sequence, then the others' tokens up to prefill_tokens_per_step, never
+    // past the end of a sequence's cycle. Leaves out the sequences whose last step is launched.
+    std::vector<batch_entry> next_entries() const;
+    // Writes step back, ends the sequences in it whose callbacks are cancelled, and lets each sequence that exited
+    // leave once no launched step holds it.
+    task<void> retire(executor::launched_step& step);
 
   public:
     scheduler(executor& exec, std::size_t prefill_tokens_per_step);
@@ -38,8 +41,8 @@ class scheduler {
     // store's lookup fails. Ends with oom, never waiting, when the free lines do not cover the state's pages and one
     // cycle's tokens at the start, or the next cycle's tokens while running; the caller resubmits.
     task<void> submit(request r, result_writer writer);
-    // Steps the running sequences until the loop stops. A sequence whose callbacks are cancelled leaves after the
-    // step it is in.
+    // Steps the running sequences until the loop stops, launching each step before the previous one is written back
+    // when both are quiet (executor::quiet). A sequence whose callbacks are cancelled leaves after the steps it is in.
     task<void> run();
 };
 

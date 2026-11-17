@@ -234,6 +234,24 @@ std::size_t sequence::advance(std::size_t count) {
     return full_page_count;
 }
 
+void sequence::resolve_token(std::size_t index, std::int64_t token) {
+    std::size_t offset = index - history_pages * page_size;
+    std::int64_t& awaited = offset < tail.size() ? tail[offset] : pending_tokens[offset - tail.size()];
+    assert(awaited == awaited_token);
+    awaited = token;
+}
+
+void sequence::withdraw_latest_step() {
+    assert(!tail.empty() && pending_tokens.size() <= 1);
+    if (!pending_tokens.empty()) {
+        generated_count--;
+        draw_count--;
+    }
+    pending_tokens.assign(1, tail.back());
+    tail.pop_back();
+    last_step_launched = false;
+}
+
 std::size_t sequence::passed_pages(std::size_t layer, std::size_t query) const noexcept {
     const std::optional<std::size_t>& window = sliding_windows[layer];
     if (!window || query + 1 <= *window) {

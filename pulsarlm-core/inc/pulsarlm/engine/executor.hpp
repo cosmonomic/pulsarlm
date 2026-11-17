@@ -54,6 +54,8 @@ class executor {
     std::size_t page_size;
     digest root;
     std::vector<std::int64_t> stop_ids;
+    // Per shard, the tokens the latest launched step sampled, on the shard's device; every shard samples them alike.
+    std::vector<at::Tensor> latest_sampled;
 
     // The tokens of seq's full history pages that every KV layer reading the page holds resident.
     std::size_t device_cached_tokens(const sequence& seq) const;
@@ -77,10 +79,11 @@ class executor {
     // Drops from each sliding layer's view the pages before the window of the tail's first token, and returns whether
     // any view changed.
     bool release_passed_pages(sequence& seq);
-    task<void> launch(batch& b);
-    task<void> forward_on_shard(batch& b, std::size_t shard);
+    // Advances each entry's sequence by its tokens (sequence::advance), records the pages they complete in b, and
+    // appends each token the step samples to pending as awaited_token.
+    void advance(batch& b);
+    task<void> enqueue_on_shard(batch& b, std::size_t shard);
     task<void> synchronize_shards();
-    task<void> write_back(batch& b);
     // At the end of seq's cycle, adds to the moments of each layer that measures mass its full pages outside the sinks
     // whose last token is at least cycle_tokens and less than twice cycle_tokens before that end.
     void add_sampled_pages(sequence& seq);
@@ -92,6 +95,25 @@ class executor {
     friend class sequence;
 
   public:
+    // A step queued on every shard and not written back yet.
+    class launched_step {
+        std::unique_ptr<batch> queued;
+
+        explicit launched_step(std::unique_ptr<batch> queued) noexcept;
+
+        friend class executor;
+
+      public:
+        launched_step(launched_step&&) noexcept;
+        launched_step& operator=(launched_step&&) noexcept;
+        ~launched_step();
+
+        // Whether the step completes no page and ends no cycle (executor::quiet).
+        bool quiet() const noexcept;
+        // The sequences of the step's entries, in entry order.
+        std::vector<sequence*> sequences() const;
+    };
+
     // shards[s] runs on cache shard s with streams[s], shards 1 on on worker_loops[s - 1]; the cache holds one layer
     // per entry of each model's kv_layers(), and the shards agree on which layers are recurrent or sliding. store is the
     // cache's. root is the engine's root digest (make_root_digest). With graph_pages, a decode group whose sequences'
@@ -111,11 +133,19 @@ class executor {
     // first cycle. Fails with miss when the lookup or a page read fails, and with oom when the free lines do not cover
     // the state's pages and one cycle's tokens; its lease is then released.
     task<std::expected<std::unique_ptr<sequence>, request_error>> start(request&& r, result_writer& writer);
-    // Runs one step of entries, decoding entries first: the forward on every shard and the sampling, then advancing
-    // each sequence, writing its new pages, evicting and writing its state at a cycle end, and taking lines for its
-    // next tokens. Sets the exit reason of each sequence that finished, by a stop token or max_tokens, or ran out of
-    // lines.
-    task<void> step(std::span<const batch_entry> entries);
+    // Whether a step of entries completes no page and ends no cycle: its write-back then queues no work on the GPUs
+    // and changes no view, so the next step can be launched before it, and its tokens need no awaited token's value.
+    bool quiet(std::span<const batch_entry> entries) const noexcept;
+    // Launches one step of entries, decoding entries first: advances each sequence by its tokens, then queues the
+    // forward and the sampling on every shard without waiting for them. A decoding entry whose token is awaited reads
+    // it from the previous launched step's samples on the GPUs, which needs that step to be quiet and this one too.
+    task<launched_step> launch(std::vector<batch_entry> entries);
+    // Waits for step, then sets each awaited token it sampled, writes the pages it completed, evicts and writes the
+    // state at a cycle end, and takes lines for the next tokens. Sets the exit reason of each sequence that finished,
+    // by a stop token or max_tokens, or ran out of lines. A sequence stopped by a token while in a later launched step
+    // withdraws that step's token (sequence::withdraw_latest_step); entries of sequences that exited before are
+    // skipped. Steps are written back in launch order.
+    task<void> write_back(launched_step& step);
     // Releases seq's lines, writes its end state when it finished, and releases its lease; seq exited.
     task<std::expected<request_result, request_error>> finish(sequence& seq);
     // kv_cache::used_bytes of the executor's cache. Safe to call from any thread.

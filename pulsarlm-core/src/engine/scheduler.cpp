@@ -52,29 +52,48 @@ task<void> scheduler::submit(request r, result_writer writer) {
 }
 
 task<void> scheduler::run() {
+    std::optional<executor::launched_step> in_flight;
     for (;;) {
-        std::vector<batch_entry> entries = co_await next_entries();
-        co_await exec.step(entries);
-        for (const batch_entry& e : entries) {
-            if (!e.seq->end_reason && e.seq->writer.cancelled()) {
-                e.seq->end_reason = sequence::exit_reason::cancelled;
-            }
+        std::vector<batch_entry> entries = next_entries();
+        if (in_flight && (entries.empty() || !in_flight->quiet() || !exec.quiet(entries))) {
+            co_await retire(*in_flight);
+            in_flight.reset();
+            continue;
         }
-        std::erase_if(running_sequences, [](const sequence* seq) { return seq->end_reason.has_value(); });
-        for (const batch_entry& e : entries) {
-            if (e.seq->end_reason) {
-                e.seq->exit_event->set();
-            }
+        if (entries.empty()) {
+            co_await emplace_event(join_event);
+            continue;
+        }
+        executor::launched_step launched = co_await exec.launch(std::move(entries));
+        if (in_flight) {
+            co_await retire(*in_flight);
+        }
+        in_flight = std::move(launched);
+    }
+}
+
+task<void> scheduler::retire(executor::launched_step& step) {
+    std::vector<sequence*> stepped = step.sequences();
+    co_await exec.write_back(step);
+    for (sequence* seq : stepped) {
+        if (!seq->end_reason && seq->writer.cancelled()) {
+            seq->end_reason = sequence::exit_reason::cancelled;
+        }
+    }
+    std::erase_if(running_sequences, [](const sequence* seq) { return seq->end_reason.has_value(); });
+    for (sequence* seq : stepped) {
+        if (seq->end_reason && seq->steps_in_flight == 0) {
+            seq->exit_event->set();
         }
     }
 }
 
-task<std::vector<batch_entry>> scheduler::next_entries() {
-    while (running_sequences.empty()) {
-        co_await emplace_event(join_event);
-    }
+std::vector<batch_entry> scheduler::next_entries() const {
     std::vector<batch_entry> entries;
     for (sequence* seq : running_sequences) {
+        if (seq->last_step_launched || seq->end_reason) {
+            continue;
+        }
         assert(!seq->pending_tokens.empty());
         if (seq->pending_tokens.size() == 1) {
             entries.push_back(
@@ -92,6 +111,9 @@ task<std::vector<batch_entry>> scheduler::next_entries() {
         if (budget == 0) {
             break;
         }
+        if (seq->last_step_launched || seq->end_reason) {
+            continue;
+        }
         if (seq->pending_tokens.size() > 1) {
             std::size_t count = std::min({seq->pending_tokens.size(), budget, seq->cycle_tokens_left()});
             budget -= count;
@@ -105,7 +127,7 @@ task<std::vector<batch_entry>> scheduler::next_entries() {
             );
         }
     }
-    co_return entries;
+    return entries;
 }
 
 }  // namespace pulsarlm

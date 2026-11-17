@@ -1558,6 +1558,45 @@ TEST_CASE("running requests are forwarded in one step") {
     REQUIRE(f.model.decode_sizes == std::vector<std::int64_t>{2, 2});
 }
 
+// The prefill completes a page; the decode steps at tail positions 1 and 2 complete none, so the second is launched
+// before the first is written back; the decode at tail position 3 completes a page, so it waits for the step before.
+TEST_CASE("a step completing no page is launched before the previous such step is written back") {
+    fixture f(16);
+    token_list prompt{1, 2, 3, 4, 5};
+    submission s = make_submission(request{.tokens = prompt, .max_tokens = 4});
+    std::vector<std::size_t> tokens_at_forward;
+    f.model.on_forward = [&tokens_at_forward, recorded_results = s.recorded_results] {
+        tokens_at_forward.push_back(recorded_results->tokens.size());
+    };
+    std::vector<submission> submissions;
+    submissions.push_back(std::move(s));
+    std::vector<request_results> results = serve_submissions(f.sched, std::move(submissions));
+
+    REQUIRE(results[0].tokens == continuation(prompt, 4));
+    REQUIRE(tokens_at_forward == std::vector<std::size_t>{0, 1, 1, 3});
+}
+
+// Both requests' decode steps at tail positions 1 and 2 overlap. The first request's stop token, sampled at position
+// 1, ends it while the step forwarding that token is launched; that step's token returns to pending, and the second
+// request's next step reads its awaited token from the second row of that step's samples.
+TEST_CASE("a stop token sampled while the next step runs ends the request with the state it reached") {
+    token_list first{1, 2, 3};
+    token_list second{5, 0, 0};
+    REQUIRE(continuation(first, 3) == token_list{6, 12, 24});
+    fixture f(16, 64, {24});
+    std::vector<request_results> results = serve_all(
+        f.sched,
+        {request{.tokens = first, .max_tokens = 10}, request{.tokens = second, .max_tokens = 6}}
+    );
+
+    REQUIRE(results[0].tokens == token_list{6, 12, 24});
+    pulsarlm::state end = ended_state(results[0]);
+    REQUIRE((hashes_of(end) == pulsarlm::make_page_digests(root(), token_list{1, 2, 3, 6}, page_size)));
+    REQUIRE(end.tail == token_list{12});
+    REQUIRE(results[1].tokens == continuation(second, 6));
+    REQUIRE(f.store->releases == f.store->leases);
+}
+
 const std::vector<pulsarlm::kv_layer> full_and_sliding{
     pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .n_q_heads = 1},
     pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .sliding_window = 5},
