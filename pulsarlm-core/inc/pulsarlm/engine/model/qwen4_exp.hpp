@@ -64,8 +64,11 @@ class qwen4_exp_model : public model {
 
     struct moe_weights {
         at::Tensor router_and_gate;  // [num_experts + 1, hidden]: the router's rows, then shared_expert_gate's
-        at::Tensor experts_gate_up_proj;  // [num_experts, 2 * moe_intermediate_size, hidden]
-        at::Tensor experts_down_proj;  // [num_experts, hidden, moe_intermediate_size]
+        // The held experts [first_expert, first_expert + held): every expert's part of the intermediate rows, or
+        // whole experts, num_experts / GPUs of them.
+        at::Tensor experts_gate_up_proj;  // [held, 2 * intermediate rows, hidden]
+        at::Tensor experts_down_proj;  // [held, hidden, intermediate rows]
+        std::int64_t first_expert;
         at::Tensor shared_gate_up_proj;  // the rows of the shared expert's gate_proj, then its up_proj
         at::Tensor shared_down_proj;
     };

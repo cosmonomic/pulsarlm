@@ -8,6 +8,7 @@ class Settings:
     data_dir: Path | None
     device: str
     tensor_parallel_size: int
+    expert_parallel: bool
     dtype: str
     kv_cache_gib: float
     prefill_tokens_per_step: int

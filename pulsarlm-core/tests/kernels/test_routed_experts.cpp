@@ -110,13 +110,50 @@ TEST_CASE("routed_experts routes each token to its most probable experts by its 
     at::Tensor router_logits = at::randn({tokens, kExperts + 3}, cuda(dtype)).narrow(1, 0, kExperts);
     const auto activation = pulsarlm::expert_activation::silu;
 
-    at::Tensor got = pulsarlm::routed_experts_cuda(h, router_logits, top_k, gate_up_proj, down_proj, activation);
+    at::Tensor got = pulsarlm::routed_experts_cuda(h, router_logits, top_k, 0, gate_up_proj, down_proj, activation);
 
     at::Tensor probabilities = at::softmax(router_logits, -1, at::kFloat);
     auto [top_probabilities, top_experts] = at::topk(probabilities, top_k, -1);
     at::Tensor top_weights = top_probabilities / top_probabilities.sum(-1, true);
     at::Tensor expected = reference(h, top_experts, top_weights, gate_up_proj, down_proj, activation);
     CHECK(max_relative_error(got, expected) < (dtype == at::kFloat ? 1e-5 : 2e-2));
+}
+
+TEST_CASE("routed_experts over each GPU's held experts sums to routed_experts over all of them", "[ops][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const auto dtype = GENERATE(at::kFloat, at::kBFloat16);
+    const int64_t tokens = GENERATE(1, 4, 300);
+    const int64_t top_k = 8;
+    const int64_t hidden = 96;
+    const int64_t intermediate = 40;
+    const int64_t gpus = 4;
+    const int64_t held = kExperts / gpus;
+    INFO("dtype " << dtype << " tokens " << tokens);
+    at::manual_seed(11);
+    at::Tensor h = at::randn({tokens, hidden}, cuda(dtype));
+    at::Tensor gate_up_proj = at::randn({kExperts, 2 * intermediate, hidden}, cuda(dtype)) / std::sqrt(hidden);
+    at::Tensor down_proj = at::randn({kExperts, hidden, intermediate}, cuda(dtype)) / std::sqrt(intermediate);
+    at::Tensor router_logits = at::randn({tokens, kExperts}, cuda(dtype));
+    const auto activation = pulsarlm::expert_activation::silu;
+
+    at::Tensor whole = pulsarlm::routed_experts_cuda(h, router_logits, top_k, 0, gate_up_proj, down_proj, activation);
+    at::Tensor summed = at::zeros({tokens, hidden}, cuda(at::kFloat));
+    for (int64_t gpu = 0; gpu < gpus; gpu++) {
+        summed += pulsarlm::routed_experts_cuda(
+                      h,
+                      router_logits,
+                      top_k,
+                      gpu * held,
+                      gate_up_proj.narrow(0, gpu * held, held),
+                      down_proj.narrow(0, gpu * held, held),
+                      activation
+        )
+                      .to(at::kFloat);
+    }
+
+    CHECK(max_relative_error(summed, whole) < (dtype == at::kFloat ? 1e-5 : 2e-2));
 }
 
 TEST_CASE("routed_experts replays from a CUDA graph with new inputs", "[ops][cuda]") {

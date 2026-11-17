@@ -647,9 +647,16 @@ at::Tensor part(
 // The vocabulary padded to a multiple of 64, as vLLM pads it before splitting it.
 constexpr std::int64_t padded_vocab = (vocab + 63) / 64 * 64;
 
-// Of a whole-model weight, the part GPU rank of gpus holds, as vLLM v0.31.0 splits Qwen4-Exp.
-at::Tensor
-rank_part(const split_dims& dims, const std::string& name, const at::Tensor& t, std::size_t rank, std::size_t gpus) {
+// Of a whole-model weight, the part GPU rank of gpus holds, as vLLM v0.31.0 splits Qwen4-Exp, whole experts with
+// expert_parallel.
+at::Tensor rank_part(
+    const split_dims& dims,
+    const std::string& name,
+    const at::Tensor& t,
+    std::size_t rank,
+    std::size_t gpus,
+    bool expert_parallel
+) {
     const std::int64_t key_dim = dims.key_channels();
     const std::int64_t value_dim = dims.value_channels();
     auto ends = [&](const char* suffix) { return name.ends_with(suffix); };
@@ -683,6 +690,9 @@ rank_part(const split_dims& dims, const std::string& name, const at::Tensor& t, 
         ends("mlp.shared_expert.gate_proj.weight") || ends("mlp.shared_expert.up_proj.weight")) {
         return part(t, 0, 0, t.size(0), rank, gpus);
     }
+    if (expert_parallel && (ends("mlp.experts.gate_up_proj") || ends("mlp.experts.down_proj"))) {
+        return part(t, 0, 0, t.size(0), rank, gpus);
+    }
     if (ends("mlp.experts.gate_up_proj")) {
         const std::int64_t intermediate = t.size(1) / 2;
         return at::cat(
@@ -697,11 +707,15 @@ rank_part(const split_dims& dims, const std::string& name, const at::Tensor& t, 
 }
 
 // GPU rank's weights: each weight's part, and its rows of the n-gram table as two shards.
-c10::Dict<std::string, at::Tensor> rank_weights(const weights& w, std::size_t rank, std::size_t gpus) {
+c10::Dict<std::string, at::Tensor>
+rank_weights(const weights& w, std::size_t rank, std::size_t gpus, bool expert_parallel) {
     c10::Dict<std::string, at::Tensor> parts;
     for (const auto& entry : w.named_tensors) {
         if (entry.key().find("ngram_embedding.shard_") == std::string::npos) {
-            parts.insert(entry.key(), rank_part(w.dims, entry.key(), entry.value(), rank, gpus).contiguous());
+            parts.insert(
+                entry.key(),
+                rank_part(w.dims, entry.key(), entry.value(), rank, gpus, expert_parallel).contiguous()
+            );
         }
     }
     const std::string table = std::format(
@@ -809,7 +823,8 @@ void check_sharded(
     double tolerance,
     std::int64_t experts_per_token,
     std::int64_t budget,
-    std::size_t gpus
+    std::size_t gpus,
+    bool expert_parallel = false
 ) {
     weights w(dtype, dims);
     pulsarlm::qwen4_exp_config config = model_config(w.dims, experts_per_token, budget);
@@ -825,7 +840,13 @@ void check_sharded(
     std::vector<std::vector<pulsarlm::kv>> lines;
     std::vector<c10::cuda::CUDAStream> streams;
     for (std::size_t rank = 0; rank < gpus; rank++) {
-        shards.push_back(std::make_unique<pulsarlm::qwen4_exp_model>(config, rank_weights(w, rank, gpus), ranks[rank]));
+        shards.push_back(
+            std::make_unique<pulsarlm::qwen4_exp_model>(
+                config,
+                rank_weights(w, rank, gpus, expert_parallel),
+                ranks[rank]
+            )
+        );
         std::vector<pulsarlm::kv_layer> rank_specs = shards.back()->kv_layers();
         REQUIRE(rank_specs.size() == specs.size());
         lines.push_back(make_lines(rank_specs, dtype));
@@ -929,6 +950,38 @@ TEST_CASE("Qwen4-Exp split across 2 GPUs matches a dense forward in bf16", "[mod
         SKIP("no CUDA device");
     }
     check_sharded(base_dims, at::kBFloat16, 5e-2, n_experts, n_tokens * compress_ratio, 2);
+}
+
+TEST_CASE("Qwen4-Exp with whole experts on each of 2 GPUs matches a dense forward in fp32", "[model][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    check_sharded(base_dims, at::kFloat, 1e-4, 2, 8, 2, /*expert_parallel=*/true);
+}
+
+TEST_CASE("Qwen4-Exp with whole experts on each of 4 GPUs matches a dense forward in fp32", "[model][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    check_sharded(four_way_dims, at::kFloat, 1e-4, 2, 8, 4, /*expert_parallel=*/true);
+}
+
+TEST_CASE("Qwen4-Exp rejects held experts that are neither every expert nor an even share", "[model][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    weights w(at::kFloat, base_dims);
+    c10::Dict<std::string, at::Tensor> parts = rank_weights(w, 0, 2, /*expert_parallel=*/true);
+    for (const auto& entry : w.named_tensors) {
+        if (entry.key().ends_with("mlp.experts.gate_up_proj") || entry.key().ends_with("mlp.experts.down_proj")) {
+            parts.insert_or_assign(entry.key(), entry.value().narrow(0, 0, 3).contiguous());
+        }
+    }
+    std::vector<pulsarlm::communicator> ranks = pulsarlm::communicator::make_on_one_device(at::Device(at::kCUDA, 0), 2);
+    REQUIRE_THROWS_AS(
+        pulsarlm::qwen4_exp_model(model_config(w.dims, 2, 8), parts, ranks.front()),
+        std::invalid_argument
+    );
 }
 
 // The test model's 2 Gated DeltaNet key heads do not split across 4 GPUs.

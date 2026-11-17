@@ -57,6 +57,14 @@ TensorParallelSize = Annotated[
         help="GPUs the model is split across, cuda:0 on; above 1, --device is unused.",
     ),
 ]
+ExpertParallel = Annotated[
+    bool,
+    typer.Option(
+        "--expert_parallel",
+        help="Split the routed experts across the --tensor_parallel_size GPUs, each "
+        "GPU holding whole experts, instead of every expert's intermediate rows.",
+    ),
+]
 WeightDType = Annotated[DType, typer.Option(help="Weight and KV cache dtype.")]
 KvCacheGib = Annotated[
     float,
@@ -191,6 +199,7 @@ def serve(
     data_dir: SearchedDataDir = None,
     device: Device = "cuda",
     tensor_parallel_size: TensorParallelSize = 1,
+    expert_parallel: ExpertParallel = False,
     dtype: WeightDType = DType.bfloat16,
     kv_cache_gib: KvCacheGib = 4.0,
     prefill_tokens_per_step: PrefillTokensPerStep = 512,
@@ -224,6 +233,7 @@ def serve(
                 data_dir=data_dir,
                 device=device,
                 tensor_parallel_size=tensor_parallel_size,
+                expert_parallel=expert_parallel,
                 dtype=dtype,
                 kv_cache_gib=kv_cache_gib,
                 prefill_tokens_per_step=prefill_tokens_per_step,
@@ -298,6 +308,7 @@ def chat(
     data_dir: SearchedDataDir = None,
     device: Device = "cuda",
     tensor_parallel_size: TensorParallelSize = 1,
+    expert_parallel: ExpertParallel = False,
     dtype: WeightDType = DType.bfloat16,
     kv_cache_gib: KvCacheGib = 4.0,
     prefill_tokens_per_step: PrefillTokensPerStep = 512,
@@ -322,6 +333,7 @@ def chat(
                 data_dir=data_dir,
                 device=device,
                 tensor_parallel_size=tensor_parallel_size,
+                expert_parallel=expert_parallel,
                 dtype=dtype,
                 kv_cache_gib=kv_cache_gib,
                 prefill_tokens_per_step=prefill_tokens_per_step,

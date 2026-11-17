@@ -50,7 +50,11 @@ def load_served_model(
 
     def load_model_shard(rank: int, size: int) -> dict[str, torch.Tensor]:
         return checkpoint.load(
-            path, device=devices[rank], dtype=dtype, shard=(rank, size)
+            path,
+            device=devices[rank],
+            dtype=dtype,
+            shard=(rank, size),
+            expert_parallel=settings.expert_parallel,
         ).weights
 
     max_context = cfg.max_position_embeddings or None

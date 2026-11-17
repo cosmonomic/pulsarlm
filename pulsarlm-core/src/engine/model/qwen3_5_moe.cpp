@@ -231,6 +231,7 @@ at::Tensor qwen3_5_moe_model::moe(const at::Tensor& h, std::int64_t layer) const
         h,
         at::linear(h, m.router),
         config.num_experts_per_tok,
+        0,
         m.experts_gate_up_proj,
         m.experts_down_proj,
         expert_activation::silu

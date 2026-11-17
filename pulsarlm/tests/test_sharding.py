@@ -292,6 +292,52 @@ def test_qwen4_exp_splits_experts_and_the_n_gram_table_across_its_shards(
     assert all(torch.equal(part[p + "mlp.gate.weight"], router) for part in parts)
 
 
+def test_expert_parallel_qwen4_exp_holds_whole_experts_on_each_rank(tmp_path: Path):
+    cfg = model_config("qwen4_exp")
+    generator = torch.Generator().manual_seed(2)
+    p = PREFIX + "layers.0."
+    gate_up = torch.randn(4, 2 * 8, 64, generator=generator)
+    down = torch.randn(4, 64, 8, generator=generator)
+    shared_gate = torch.randn(8, 64, generator=generator)
+    router = torch.randn(4, 64, generator=generator)
+    paths = write_files(
+        tmp_path,
+        {
+            p + "mlp.experts.gate_up_proj": gate_up,
+            p + "mlp.experts.down_proj": down,
+            p + "mlp.shared_expert.gate_proj.weight": shared_gate,
+            p + "mlp.gate.weight": router,
+        },
+    )
+    files = [SafetensorsFile.of_file(path) for path in paths]
+    parts = [
+        dict(sharding.rank_weights(files, cfg, rank, 2, expert_parallel=True))
+        for rank in range(2)
+    ]
+    assert torch.equal(parts[1][p + "mlp.experts.gate_up_proj"], gate_up[2:])
+    assert torch.equal(parts[1][p + "mlp.experts.down_proj"], down[2:])
+    assert torch.equal(
+        parts[1][p + "mlp.shared_expert.gate_proj.weight"], shared_gate[4:]
+    )
+    assert all(torch.equal(part[p + "mlp.gate.weight"], router) for part in parts)
+
+
+def test_expert_parallel_is_rejected_for_a_model_without_split_experts(
+    tmp_path: Path,
+):
+    paths = write_files(tmp_path, {"model.norm.weight": torch.ones(4)})
+    with pytest.raises(PulsarLMModelLoadingError, match="experts"):
+        list(
+            sharding.rank_weights(
+                [SafetensorsFile.of_file(p) for p in paths],
+                model_config(),
+                0,
+                2,
+                expert_parallel=True,
+            )
+        )
+
+
 def test_an_architecture_without_a_split_is_rejected(tmp_path: Path):
     cfg = PulsarLMModelConfig.from_dict(
         {"model_type": "qwen3", "eos_token_id": 0} | QWEN3_5_TEXT | SYNTAXES

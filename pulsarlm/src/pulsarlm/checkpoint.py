@@ -239,17 +239,21 @@ def load_weights(
     dtype: torch.dtype | None = None,
     unused_prefixes: tuple[str, ...] = (),
     shard: tuple[int, int] = (0, 1),
+    expert_parallel: bool = False,
 ) -> dict[str, Tensor]:
     """With shard (rank, size) of more than one GPU, GPU rank's part of the
-    weights (pulsarlm.sharding), read without the rest. Each tensor reaches the
-    device before the next is read."""
+    weights (pulsarlm.sharding), read without the rest, its routed experts whole
+    with expert_parallel. Each tensor reaches the device before the next is
+    read."""
     files = weight_files(path)
     rank, size = shard
     if size > 1:
         sharding = importlib.import_module("pulsarlm.sharding")
         with model_root(path) as root:
             config = load_config(root)
-        host = sharding.rank_weights(files, config, rank, size, unused_prefixes)
+        host = sharding.rank_weights(
+            files, config, rank, size, unused_prefixes, expert_parallel
+        )
     else:
         host = whole_weights(files, unused_prefixes)
     return {
@@ -294,6 +298,7 @@ def load(
     device: torch.device,
     dtype: torch.dtype | None = None,
     shard: tuple[int, int] = (0, 1),
+    expert_parallel: bool = False,
 ) -> PulsarLMModel:
     """The model directory or archive at path."""
     with model_root(path) as root:
@@ -308,6 +313,7 @@ def load(
             dtype=dtype,
             unused_prefixes=UNUSED_PREFIXES.get(config.architecture, ()),
             shard=shard,
+            expert_parallel=expert_parallel,
         ),
     )
 

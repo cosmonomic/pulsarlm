@@ -174,8 +174,19 @@ qwen4_exp_model::qwen4_exp_model(
                 .shared_down_proj = need(weights, p + "mlp.shared_expert.down_proj.weight"),
             },
         };
-        if (w.moe.router_and_gate.size(0) - 1 < c.num_experts_per_tok || c.num_experts_per_tok < 1) {
+        const std::int64_t experts = w.moe.router_and_gate.size(0) - 1;
+        if (experts < c.num_experts_per_tok || c.num_experts_per_tok < 1) {
             throw std::invalid_argument("qwen4_exp_model: num_experts_per_tok must be between 1 and the experts");
+        }
+        const std::int64_t held_experts = w.moe.experts_gate_up_proj.size(0);
+        if (held_experts == experts) {
+            w.moe.first_expert = 0;
+        } else if (held_experts * gpus == experts) {
+            w.moe.first_expert = rank * held_experts;
+        } else {
+            throw std::invalid_argument(
+                std::format("qwen4_exp_model: {} experts held of {} over {} GPUs", held_experts, experts, gpus)
+            );
         }
         kv_layer_of.push_back(kv_specs.size());
         if (indexed_attention(layer)) {
@@ -554,6 +565,7 @@ at::Tensor qwen4_exp_model::moe(const at::Tensor& h, std::int64_t layer) const {
         h,
         logits.narrow(1, 0, experts),
         config.num_experts_per_tok,
+        m.first_expert,
         m.experts_gate_up_proj,
         m.experts_down_proj,
         expert_activation::silu

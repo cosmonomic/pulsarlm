@@ -159,14 +159,17 @@ __device__ void route_token(
     }
 }
 
-// Run by one CTA. position_of[a] is the row of assignment a among the assignments sorted by expert, sorted_token and
-// sorted_expert are the token and expert of each row, and tiles [3, max_tiles] holds each tile's expert, first row and
-// rows, at most kTileRows rows of one expert. The tiles past the experts' have no rows. The rows of one expert are in
-// no fixed order. expert_counters holds 2 * experts entries.
+// Run by one CTA, over the assignments to the held experts [first_expert, first_expert + experts), numbered from 0
+// here. position_of[a] is the row of assignment a among them sorted by expert, -1 for an assignment to another expert;
+// sorted_token and sorted_expert are the token and held expert of each row, sorted_expert -1 for the rows past them;
+// tiles [3, max_tiles] holds each tile's held expert, first row and rows, at most kTileRows rows of one expert. The
+// tiles past the experts' have no rows. The rows of one expert are in no fixed order. expert_counters holds 2 *
+// experts entries.
 __device__ void sort_assignments(
     const int64_t* assigned_experts,
     int assignments,
     int top_k,
+    int first_expert,
     int experts,
     int max_tiles,
     int32_t* expert_counters,
@@ -187,17 +190,21 @@ __device__ void sort_assignments(
         counts[e] = 0;
     }
     __syncthreads();
+    auto held = [&](int a) { return static_cast<int>(assigned_experts[a] - first_expert); };
     for (int a = tid; a < assignments; a += kSortThreads) {
-        atomicAdd(&counts[assigned_experts[a]], 1);
+        const int e = held(a);
+        if (e >= 0 && e < experts) {
+            atomicAdd(&counts[e], 1);
+        }
     }
     __syncthreads();
 
     const int segment = (experts + kSortThreads - 1) / kSortThreads;
-    const int first_expert = min(tid * segment, experts);
-    const int end_expert = min(first_expert + segment, experts);
+    const int segment_first = min(tid * segment, experts);
+    const int segment_end = min(segment_first + segment, experts);
     int rows = 0;
     int tile_count = 0;
-    for (int e = first_expert; e < end_expert; e++) {
+    for (int e = segment_first; e < segment_end; e++) {
         rows += counts[e];
         tile_count += (counts[e] + kTileRows - 1) / kTileRows;
     }
@@ -214,7 +221,7 @@ __device__ void sort_assignments(
     }
     int row = segment_rows[tid] - rows;
     int tile = segment_tiles[tid] - tile_count;
-    for (int e = first_expert; e < end_expert; e++) {
+    for (int e = segment_first; e < segment_end; e++) {
         cursors[e] = row;
         for (int first = 0; first < counts[e]; first += kTileRows) {
             tile_expert[tile] = e;
@@ -229,9 +236,17 @@ __device__ void sort_assignments(
         tile_first_row[t] = 0;
         tile_rows[t] = 0;
     }
+    for (int r = segment_rows[kSortThreads - 1] + tid; r < assignments; r += kSortThreads) {
+        sorted_token[r] = 0;
+        sorted_expert[r] = -1;
+    }
     __syncthreads();
     for (int a = tid; a < assignments; a += kSortThreads) {
-        const auto e = static_cast<int>(assigned_experts[a]);
+        const int e = held(a);
+        if (e < 0 || e >= experts) {
+            position_of[a] = -1;
+            continue;
+        }
         const int position = atomicAdd(&cursors[e], 1);
         position_of[a] = position;
         sorted_token[position] = a / top_k;
@@ -258,6 +273,7 @@ __global__ void __launch_bounds__(kSortThreads) sort_assignments_kernel(
         top_experts,
         assignments,
         top_k,
+        0,
         experts,
         max_tiles,
         expert_counters,
@@ -269,13 +285,16 @@ __global__ void __launch_bounds__(kSortThreads) sort_assignments_kernel(
 }
 
 // One CTA per token, route_token of its row of logits [tokens, experts], then sort_assignments of every token's
-// experts in the last CTA to finish, found through arrivals.
+// assignments to the held experts [first_expert, first_expert + held_experts) in the last CTA to finish, found through
+// arrivals.
 template <typename scalar_t>
 __global__ void __launch_bounds__(kSortThreads) route_and_sort_kernel(
     const scalar_t* __restrict__ logits,
     int64_t logits_row_stride,
     int experts,
     int top_k,
+    int first_expert,
+    int held_experts,
     int max_tiles,
     float* __restrict__ top_weights,
     int64_t* top_experts,
@@ -301,7 +320,8 @@ __global__ void __launch_bounds__(kSortThreads) route_and_sort_kernel(
             top_experts,
             static_cast<int>(gridDim.x) * top_k,
             top_k,
-            experts,
+            first_expert,
+            held_experts,
             max_tiles,
             shared_words,
             position_of,
@@ -525,6 +545,9 @@ __global__ void expert_rows_scalar_kernel(
     }
     const int64_t row = index / n;
     const int column = static_cast<int>(index % n);
+    if (sorted_expert[row] < 0) {
+        return;
+    }
     const float* x_row = x + (gated ? sorted_token[row] : row) * x_row_stride;
     const float* expert_weights = weights + static_cast<int64_t>(sorted_expert[row]) * expert_stride;
     auto dot = [&](int64_t weight_row) {
@@ -538,7 +561,8 @@ __global__ void expert_rows_scalar_kernel(
     out[index] = gated ? activated(dot(column), activation) * dot(n + column) : dot(column);
 }
 
-// Sums each token's expert outputs weighted by top_weights in fp32 in top_k order, one thread per (token, column).
+// Sums each token's expert outputs weighted by top_weights in fp32 in top_k order, one thread per (token, column),
+// skipping the assignments without a row.
 template <typename scalar_t>
 __global__ void combine_experts_kernel(
     const scalar_t* __restrict__ expert_out,
@@ -560,8 +584,11 @@ __global__ void combine_experts_kernel(
     float sum = 0.0f;
     for (int j = 0; j < top_k; j++) {
         const int64_t assignment = token * top_k + j;
-        sum += top_weights[assignment] *
-            static_cast<float>(expert_out[static_cast<int64_t>(position_of[assignment]) * hidden + column]);
+        const int32_t position = position_of[assignment];
+        if (position >= 0) {
+            sum += top_weights[assignment] *
+                static_cast<float>(expert_out[static_cast<int64_t>(position) * hidden + column]);
+        }
     }
     out[index] = static_cast<scalar_t>(sum);
 }
@@ -858,17 +885,25 @@ at::Tensor routed_experts_cuda(
     const at::Tensor& h,
     const at::Tensor& router_logits,
     int64_t top_k,
+    int64_t first_expert,
     const at::Tensor& gate_up_proj,
     const at::Tensor& down_proj,
     expert_activation activation
 ) {
     check_experts(h, gate_up_proj, down_proj);
     const int64_t tokens = h.size(0);
-    const int64_t experts = gate_up_proj.size(0);
+    const int64_t held_experts = gate_up_proj.size(0);
     TORCH_CHECK(
         router_logits.is_cuda() && router_logits.dim() == 2 && router_logits.size(0) == tokens &&
-            router_logits.size(1) == experts && router_logits.stride(1) == 1 && router_logits.device() == h.device(),
-        "routed_experts: router_logits must be [tokens, experts] on h's device, each row contiguous"
+            router_logits.stride(1) == 1 && router_logits.device() == h.device(),
+        "routed_experts: router_logits must be CUDA [tokens, experts] on h's device, each row contiguous"
+    );
+    const int64_t experts = router_logits.size(1);
+    TORCH_CHECK(
+        experts <= kMaxExperts && first_expert >= 0 && first_expert + held_experts <= experts,
+        "routed_experts: the held experts [first_expert, first_expert + gate_up_proj.size(0)) must lie within the "
+        "router's experts, at most ",
+        kMaxExperts
     );
     TORCH_CHECK(
         top_k >= 1 && top_k <= experts && top_k <= kMaxTopK,
@@ -889,12 +924,14 @@ at::Tensor routed_experts_cuda(
                         route_and_sort_kernel<scalar_t>,
                         static_cast<unsigned>(tokens),
                         kSortThreads,
-                        2 * experts * sizeof(int32_t),
+                        std::max(experts, 2 * held_experts) * sizeof(int32_t),
                         at::cuda::getCurrentCUDAStream(),
                         router_logits.const_data_ptr<scalar_t>(),
                         router_logits.stride(0),
                         static_cast<int>(experts),
                         static_cast<int>(top_k),
+                        static_cast<int>(first_expert),
+                        static_cast<int>(held_experts),
                         static_cast<int>(max_tiles),
                         top_weights.mutable_data_ptr<float>(),
                         top_experts.mutable_data_ptr<int64_t>(),

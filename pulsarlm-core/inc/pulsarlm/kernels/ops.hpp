@@ -96,11 +96,13 @@ at::Tensor routed_experts_cuda(
 
 // routed_experts_cuda with each token's top_k experts by the softmax in fp32 of its router_logits [tokens, experts],
 // whose rows may lie apart, in descending order with the lower expert first among equal probabilities, weighted by
-// their probabilities divided by their sum.
+// their probabilities divided by their sum. gate_up_proj and down_proj hold the experts [first_expert, first_expert +
+// gate_up_proj.size(0)); the assignments to the other experts are left out of the sums.
 at::Tensor routed_experts_cuda(
     const at::Tensor& h,
     const at::Tensor& router_logits,
     int64_t top_k,
+    int64_t first_expert,
     const at::Tensor& gate_up_proj,
     const at::Tensor& down_proj,
     expert_activation activation

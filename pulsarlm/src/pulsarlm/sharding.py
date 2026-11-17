@@ -1,6 +1,8 @@
 """Each GPU's part of a checkpoint's weights under tensor parallelism, as vLLM
 v0.31.0 splits Qwen3.5 and Qwen4-Exp: GPU rank of size holds the rank-th of
-size equal parts of each split dimension, and every other weight whole."""
+size equal parts of each split dimension, and every other weight whole. Under
+expert parallelism, a GPU holds the rank-th of size equal parts of the routed
+experts, each whole."""
 
 import re
 from collections.abc import Iterator
@@ -12,6 +14,7 @@ from pulsarlm.checkpoint import PulsarLMModelConfig, PulsarLMModelLoadingError
 from pulsarlm.safetensors_file import SafetensorsFile
 
 _SPLIT_ARCHITECTURES = ("qwen3_5", "qwen3_5_text", "qwen4_exp")
+_EXPERT_PARALLEL_ARCHITECTURES = ("qwen4_exp",)
 _NGRAM_SHARD = re.compile(r"(.*ngram_embedding\.)shard_(\d+)\.weight")
 _SCALE_SUFFIX = "_scale_inv"
 _VOCAB_MULTIPLE = 64
@@ -38,6 +41,7 @@ class _Split:
     config: PulsarLMModelConfig
     rank: int
     size: int
+    expert_parallel: bool
 
     def part(self, count: int, what: str, first: int = 0) -> tuple[int, int]:
         if count % self.size:
@@ -131,6 +135,10 @@ class _Split:
             ("mlp.down_proj.weight", "mlp.shared_expert.down_proj.weight")
         ):
             return _Ranges(1, (self.part(shape[1], "intermediate columns"),))
+        if self.expert_parallel and name.endswith(
+            ("mlp.experts.gate_up_proj", "mlp.experts.down_proj")
+        ):
+            return _Ranges(0, (self.part(shape[0], "experts"),))
         if name.endswith("mlp.experts.gate_up_proj"):
             intermediate = shape[1] // 2
             return _Ranges(
@@ -217,6 +225,7 @@ def rank_weights(
     rank: int,
     size: int,
     unused_prefixes: tuple[str, ...] = (),
+    expert_parallel: bool = False,
 ) -> Iterator[tuple[str, Tensor]]:
     """GPU rank's part of each weight in files, on the host, one at a time. A PLE
     layer's n-gram table is one shard_0 of its rows of the table its shards make
@@ -225,7 +234,13 @@ def rank_weights(
         raise PulsarLMModelLoadingError(
             f"{config.architecture} models do not split across GPUs"
         )
-    split = _Split(config=config, rank=rank, size=size)
+    if expert_parallel and config.architecture not in _EXPERT_PARALLEL_ARCHITECTURES:
+        raise PulsarLMModelLoadingError(
+            f"{config.architecture} models do not split their experts across GPUs"
+        )
+    split = _Split(
+        config=config, rank=rank, size=size, expert_parallel=expert_parallel
+    )
     index = {}
     for f in files:
         for name in f.keys():
