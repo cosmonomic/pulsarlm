@@ -16,6 +16,7 @@
 #include "pulsarlm/engine/kv_cache.hpp"
 #include "pulsarlm/engine/model/interface.hpp"
 #include "pulsarlm/engine/page_store.hpp"
+#include "pulsarlm/engine/pending_writes.hpp"
 #include "pulsarlm/engine/request.hpp"
 #include "pulsarlm/engine/request_callbacks.hpp"
 
@@ -56,6 +57,9 @@ class executor {
     std::size_t page_size;
     digest root;
     std::vector<std::int64_t> stop_ids;
+    // The page writes write-backs spawned, at most max_store_writes at once.
+    pending_writes store_writes;
+    static constexpr std::size_t max_store_writes = 8;
     // Per shard, int64 [max_sampled_rows] on its device: the tokens the latest launched step sampled, every shard
     // sampling them alike.
     std::vector<at::Tensor> samples;
@@ -89,6 +93,14 @@ class executor {
     // sequences whose pages it fills, and appends each token the step samples to pending as awaited_token.
     void advance(batch& b);
     task<void> enqueue_on_shard(batch& b, std::size_t shard);
+    // Syncs the pages of hashes, owners and line_ids (kv_cache::sync) on the copy streams, then ends the write in
+    // store_writes and in each of writers.
+    task<void> async_write_back(
+        std::vector<std::vector<digest>> hashes,
+        std::vector<std::vector<state::lease_id_type>> owners,
+        std::vector<std::vector<std::uint32_t>> line_ids,
+        std::vector<std::shared_ptr<pending_writes>> writers
+    );
     task<void> synchronize_shards();
     // At the end of seq's cycle, adds to the moments of each layer that measures mass its full pages outside the sinks
     // whose last token is at least cycle_tokens and less than twice cycle_tokens before that end.
@@ -151,7 +163,9 @@ class executor {
     // A step samples at most max_sampled_rows tokens.
     task<launched_step> launch(std::vector<batch_entry> entries);
     // Waits for step, then completes the pages its tokens filled, sets each awaited token it sampled, writes the
-    // completed pages, evicts and writes the state at a cycle end, and takes lines for the next tokens. Sets the exit reason of each sequence that finished,
+    // completed pages, evicts and writes the state at a cycle end, and takes lines for the next tokens. The pages of a
+    // sequence writing no state are written by a spawned task; a sequence writing its state waits for its pages' writes
+    // first, and a failed write ends its sequence with oom at a later write-back. Sets the exit reason of each sequence that finished,
     // by a stop token or max_tokens, or ran out of lines. A sequence stopped by a token while in a later launched step
     // withdraws that step's token (sequence::withdraw_latest_step); entries of sequences that exited before are
     // skipped. Steps are written back in launch order.

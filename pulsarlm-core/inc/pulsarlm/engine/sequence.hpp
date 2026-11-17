@@ -16,6 +16,7 @@
 #include "pulsarlm/engine/eviction.hpp"
 #include "pulsarlm/engine/executor.hpp"
 #include "pulsarlm/engine/page_store.hpp"
+#include "pulsarlm/engine/pending_writes.hpp"
 #include "pulsarlm/engine/request.hpp"
 #include "pulsarlm/engine/request_callbacks.hpp"
 #include "pulsarlm/engine/sampling.hpp"
@@ -105,6 +106,8 @@ class sequence {
     bool state_pending = false;
     // Per KV layer, for a recurrent layer, the line holding the state at head.
     std::vector<std::uint32_t> head_state_lines;
+    // The writes of the sequence's pages to the store not waited for; shared with the tasks writing them.
+    std::shared_ptr<pending_writes> page_writes = std::make_shared<pending_writes>();
     // Per shard, int32 [n_kv_layers, capacity] on its device: each view page's line, and the RoPE position of its
     // first key. Columns past those of a layer's lines are unused.
     std::vector<at::Tensor> tables;

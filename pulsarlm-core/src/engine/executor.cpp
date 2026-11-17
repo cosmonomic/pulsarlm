@@ -966,10 +966,17 @@ task<void> executor::write_back(launched_step& step) {
     for (const batch_entry& e : b.entries) {
         exited.push_back(e.seq->end_reason.has_value());
     }
+    // The pages of the sequences reaching a state, written now with state_writers' states, and those a spawned task
+    // writes.
     std::vector<std::vector<digest>> new_hashes(n_layers);
     std::vector<std::vector<state::lease_id_type>> new_owners(n_layers);
     std::vector<std::vector<std::uint32_t>> new_lines(n_layers);
+    std::vector<std::vector<digest>> spawned_hashes(n_layers);
+    std::vector<std::vector<state::lease_id_type>> spawned_owners(n_layers);
+    std::vector<std::vector<std::uint32_t>> spawned_lines(n_layers);
+    std::vector<std::shared_ptr<pending_writes>> spawned_writers;
     std::vector<sequence*> page_writers;
+    std::vector<sequence*> state_reachers;
     std::vector<sequence*> state_writers;
     const std::int64_t* next_sampled = b.sampled_tokens.defined() ? b.sampled_tokens.const_data_ptr<std::int64_t>()
                                                                   : nullptr;
@@ -983,29 +990,15 @@ task<void> executor::write_back(launched_step& step) {
         if (exited[i]) {
             continue;
         }
+        if (seq.page_writes->any_failed()) {
+            seq.end_reason = sequence::exit_reason::oom;
+            continue;
+        }
         std::size_t completed_count = seq.complete_pages(b.step_ends[i]);
-        if (completed_count > 0) {
-            for (std::size_t layer = 0; layer < n_layers; layer++) {
-                if (recurrent[layer]) {
-                    continue;
-                }
-                const layer_view& view = seq.layers[layer];
-                std::size_t first_new_page = view.pages.size() - completed_count;
-                new_hashes[layer]
-                    .insert(new_hashes[layer].end(), view.pages.begin() + first_new_page, view.pages.end());
-                new_owners[layer].resize(new_hashes[layer].size(), seq.lease.id());
-                new_lines[layer].insert(
-                    new_lines[layer].end(),
-                    view.lines.begin() + first_new_page,
-                    view.lines.begin() + view.pages.size()
-                );
-            }
-            if (has_recurrent) {
-                assert(!b.boundary_lines[i].empty());
-                seq.state_pending = true;
-                seq.head_state_lines = b.boundary_lines[i];
-            }
-            page_writers.push_back(&seq);
+        if (completed_count > 0 && has_recurrent) {
+            assert(!b.boundary_lines[i].empty());
+            seq.state_pending = true;
+            seq.head_state_lines = b.boundary_lines[i];
         }
         if (b.measured[i]) {
             std::vector<batch::layer_step_mass> step_mass = b.step_mass(i, mass_heads);
@@ -1037,8 +1030,36 @@ task<void> executor::write_back(launched_step& step) {
         if (b.ends_sequence[i]) {
             seq.end_reason = sequence::exit_reason::finished;
         }
-        if (seq.state_pending && (e.ends_cycle || seq.end_reason == sequence::exit_reason::finished)) {
-            state_writers.push_back(&seq);
+        const bool reaches_state = e.ends_cycle || seq.end_reason == sequence::exit_reason::finished;
+        if (reaches_state) {
+            state_reachers.push_back(&seq);
+            if (seq.state_pending) {
+                state_writers.push_back(&seq);
+            }
+        }
+        if (completed_count > 0) {
+            auto& hashes = reaches_state ? new_hashes : spawned_hashes;
+            auto& owners = reaches_state ? new_owners : spawned_owners;
+            auto& line_ids = reaches_state ? new_lines : spawned_lines;
+            for (std::size_t layer = 0; layer < n_layers; layer++) {
+                if (recurrent[layer]) {
+                    continue;
+                }
+                const layer_view& view = seq.layers[layer];
+                std::size_t first_new_page = view.pages.size() - completed_count;
+                hashes[layer].insert(hashes[layer].end(), view.pages.begin() + first_new_page, view.pages.end());
+                owners[layer].resize(hashes[layer].size(), seq.lease.id());
+                line_ids[layer].insert(
+                    line_ids[layer].end(),
+                    view.lines.begin() + first_new_page,
+                    view.lines.begin() + view.pages.size()
+                );
+            }
+            if (reaches_state) {
+                page_writers.push_back(&seq);
+            } else {
+                spawned_writers.push_back(seq.page_writes);
+            }
         }
     }
     for (sequence* seq : state_writers) {
@@ -1056,6 +1077,28 @@ task<void> executor::write_back(launched_step& step) {
         at::Device device = lines[shard].front().k.device();
         b.ends[shard].block(c10::cuda::getStreamFromExternal(copy_streams[shard], device.index()));
     }
+    if (!spawned_writers.empty()) {
+        while (store_writes.size() >= max_store_writes) {
+            co_await store_writes.wait();
+        }
+        store_writes.start();
+        for (const std::shared_ptr<pending_writes>& writer : spawned_writers) {
+            writer->start();
+        }
+        event_loop::current()->spawn(async_write_back(
+            std::move(spawned_hashes),
+            std::move(spawned_owners),
+            std::move(spawned_lines),
+            std::move(spawned_writers)
+        ));
+    }
+    // A state names only pages the store has.
+    for (sequence* seq : state_reachers) {
+        co_await seq->page_writes->wait();
+        if (seq->page_writes->any_failed()) {
+            seq->end_reason = sequence::exit_reason::oom;
+        }
+    }
     std::expected<void, page_error> sync_result = co_await cache.sync(new_hashes, new_owners, new_lines, copy_streams);
     if (!sync_result) {
         for (sequence* seq : page_writers) {
@@ -1066,6 +1109,9 @@ task<void> executor::write_back(launched_step& step) {
         }
     } else {
         for (sequence* seq : state_writers) {
+            if (seq->end_reason == sequence::exit_reason::oom) {
+                continue;
+            }
             seq->state_pending = false;
             for (std::size_t layer = 0; layer < n_layers; layer++) {
                 if (recurrent[layer]) {
@@ -1121,6 +1167,19 @@ task<void> executor::write_back(launched_step& step) {
             seq.upload_table(*first_stale_page, streams);
         }
     }
+}
+
+task<void> executor::async_write_back(
+    std::vector<std::vector<digest>> hashes,
+    std::vector<std::vector<state::lease_id_type>> owners,
+    std::vector<std::vector<std::uint32_t>> line_ids,
+    std::vector<std::shared_ptr<pending_writes>> writers
+) {
+    std::expected<void, page_error> written = co_await cache.sync(hashes, owners, line_ids, copy_streams);
+    for (const std::shared_ptr<pending_writes>& writer : writers) {
+        writer->finish(written.has_value());
+    }
+    store_writes.finish(written.has_value());
 }
 
 void executor::add_sampled_pages(sequence& seq) {

@@ -71,6 +71,8 @@ struct store_contents {
     std::vector<lease_id_type> releases;
     lease_id_type next_lease_id = 100;
     bool lookup_fails = false;
+    // The put, counting from 1, that fails with oom.
+    std::optional<std::size_t> failing_put;
 };
 
 struct request_results {
@@ -247,6 +249,9 @@ struct memory_store final : pulsarlm::page_store {
         std::vector<digest> put_keys = std::move(keys);
         std::vector<sharded_page> sources = std::move(pages);
         shared->puts++;
+        if (shared->failing_put == shared->puts) {
+            co_return std::unexpected(pulsarlm::page_error::oom);
+        }
         for (const auto& [lease_id, index] : owners) {
             shared->owners.emplace_back(lease_id, put_keys[index]);
         }
@@ -288,7 +293,13 @@ struct memory_store final : pulsarlm::page_store {
         co_return std::pair(std::make_shared<const pulsarlm::state>(), lease_id);
     }
 
+    // A state names only pages the store has.
     task<void> write_state(lease_id_type lease_id, state_pointer&& s) override {
+        for (std::size_t layer = 0; layer < s->layers.size(); layer++) {
+            for (const pulsarlm::active_page& named : s->layers[layer].pages) {
+                CHECK(contents->pages.contains(pulsarlm::store_key(named.hash, layer)));
+            }
+        }
         contents->written_states.push_back(written_state{.lease_id = lease_id, .s = s});
         keep_state(std::move(s));
         co_return;
@@ -1019,6 +1030,20 @@ TEST_CASE("max_tokens 0 forwards the tokens and ends with their state") {
     REQUIRE((hashes_of(end) == pulsarlm::make_page_digests(root(), prompt, page_size)));
     REQUIRE(end.tail == token_list{9});
     REQUIRE(f.store->pages.size() == 4);
+}
+
+// The prefill's page goes to the store in a write the write-back does not wait for; its failure ends the request with
+// oom at the next write-back.
+TEST_CASE("a page write that fails after its write-back ends the request with oom") {
+    fixture f(16);
+    f.store->failing_put = 1;
+    token_list prompt{1, 2, 3, 4, 5};
+    std::vector<request_results> results = serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 10}});
+
+    REQUIRE(ended_error(results[0]) == request_error::oom);
+    REQUIRE(results[0].tokens.size() < 10);
+    REQUIRE(f.store->releases == f.store->leases);
+    REQUIRE(f.store->written_states.empty());
 }
 
 TEST_CASE("a request cancelled before it runs ends with cancelled") {

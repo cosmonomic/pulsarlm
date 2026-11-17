@@ -190,7 +190,8 @@ class kv_cache {
     // and hands each distinct page of a
     // layer, owned by the lease of every owners[layer][i] of its hash, to the store in one write_pages, also when
     // another line caches its hash: the store may have dropped that page. A hash already cached at another line leaves
-    // its line unmapped. Completes once the write does, and fails as it does.
+    // its line unmapped. Holds the lines it copies until the write completes, so the caller may release them before.
+    // Completes once the write does, and fails as it does.
     task<std::expected<void, page_error>> sync(
         const std::vector<std::vector<digest>>& hashes,
         const std::vector<std::vector<state::lease_id_type>>& owners,

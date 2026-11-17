@@ -741,7 +741,16 @@ task<std::expected<void, page_error>> kv_cache::sync(
     for (const auto& [target, hash] : named) {
         assign_hash(target.layer, target.line_id, hash);
     }
-    co_return co_await store->write_pages(std::move(keys), std::move(pages), std::move(page_owners), streams);
+    // Held until the copies read them, whatever the caller releases meanwhile.
+    for (const layer_line& source : sources) {
+        line(source.layer, source.line_id).ref++;
+    }
+    std::expected<void, page_error>
+        written = co_await store->write_pages(std::move(keys), std::move(pages), std::move(page_owners), streams);
+    for (const layer_line& source : sources) {
+        release(source.layer, std::span(&source.line_id, 1));
+    }
+    co_return written;
 }
 
 void kv_cache::release(std::size_t layer, std::span<const std::uint32_t> line_ids) noexcept {

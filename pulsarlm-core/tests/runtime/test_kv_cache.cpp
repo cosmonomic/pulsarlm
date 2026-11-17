@@ -48,7 +48,9 @@ struct store_state {
     std::vector<std::vector<digest>> fetches;
     std::size_t puts = 0;
     std::vector<std::pair<std::uint64_t, digest>> owners;
+    // Whether read_pages, or write_pages, waits for its gate to open before copying.
     bool gated = false;
+    bool puts_gated = false;
     std::vector<external_task<>::resolver> gates;
 };
 
@@ -139,6 +141,11 @@ struct memory_store final : pulsarlm::page_store {
         shared->puts++;
         for (const auto& [lease_id, index] : owners) {
             shared->owners.emplace_back(lease_id, put_keys[index]);
+        }
+        if (shared->puts_gated) {
+            auto [gate, opener] = external_task<>::make();
+            shared->gates.push_back(opener);
+            co_await std::move(gate);
         }
         std::vector<page> copies = copy_pages_to_host(sources, streams);
         for (std::size_t i = 0; i < put_keys.size(); i++) {
@@ -582,6 +589,37 @@ TEST_CASE("get copies the store's pages into their lines") {
         REQUIRE(line_filled_with(fixture.kv, (*got)[j], static_cast<float>(j + 1)));
     }
     release(fixture.kv, *got);
+}
+
+// Releases the synced line while its write waits at the gate: the cache has no other line, and the sync still holds
+// that one, so an allocation fails; then opens the gate.
+task<void> release_during_write(pulsarlm::kv_cache* kv, std::shared_ptr<store_state> store, line_ids synced) {
+    release(*kv, synced);
+    REQUIRE(allocate(*kv, 1) == oom);
+    REQUIRE(store->gates.size() == 1);
+    store->gates.front().resolve();
+    co_return;
+}
+
+TEST_CASE("sync holds the lines it copies until the write completes, released or not") {
+    memory_store backing;
+    backing.state->puts_gated = true;
+    cache_fixture fixture(1, std::move(backing));
+    line_ids synced = allocate(fixture.kv, 1).value();
+    fill_line(fixture.kv, synced.front(), 7.0f);
+
+    std::expected<void, page_error> sync_result;
+    std::size_t remaining = 1;
+    {
+        event_loop loop;
+        loop.spawn(sync_into(&fixture.kv, {hash_of(7)}, synced, &sync_result, &remaining));
+        loop.spawn(release_during_write(&fixture.kv, fixture.store, synced));
+        REQUIRE(loop.run() == nullptr);
+    }
+
+    REQUIRE(sync_result.has_value());
+    REQUIRE(stored_tensors(*fixture.store, key_of(7)).k.eq(7.0f).all().item<bool>());
+    require_all_free(fixture.kv, 1);
 }
 
 TEST_CASE("a get and a sync run together") {
