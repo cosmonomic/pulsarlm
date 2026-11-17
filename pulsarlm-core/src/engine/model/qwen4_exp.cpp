@@ -180,13 +180,15 @@ qwen4_exp_model::qwen4_exp_model(
         kv_layer_of.push_back(kv_specs.size());
         if (indexed_attention(layer)) {
             w.attention = attention_weights{
-                .q_proj = permute_queries(need(weights, p + "self_attn.q_proj.weight"), heads.n_heads, permutation),
-                .k_proj = permute_heads(need(weights, p + "self_attn.k_proj.weight"), heads.n_kv_heads, permutation),
-                .v_proj = need(weights, p + "self_attn.v_proj.weight"),
+                .projections = at::cat(
+                    {permute_queries(need(weights, p + "self_attn.q_proj.weight"), heads.n_heads, permutation),
+                     permute_heads(need(weights, p + "self_attn.k_proj.weight"), heads.n_kv_heads, permutation),
+                     need(weights, p + "self_attn.v_proj.weight"),
+                     need(weights, p + "self_attn.indexer.index_qk_proj.weight")}
+                ),
                 .o_proj = need(weights, p + "self_attn.o_proj.weight"),
                 .q_norm = zero_centered(need(weights, p + "self_attn.q_norm.weight")).index_select(0, permutation),
                 .k_norm = zero_centered(need(weights, p + "self_attn.k_norm.weight")).index_select(0, permutation),
-                .index_qk_proj = need(weights, p + "self_attn.indexer.index_qk_proj.weight"),
                 .index_q_norm = zero_centered(need(weights, p + "self_attn.indexer.q_layernorm.weight")),
                 .index_k_norm = zero_centered(need(weights, p + "self_attn.indexer.k_layernorm.weight")),
             };
@@ -421,16 +423,21 @@ at::Tensor qwen4_exp_model::attention(
     const std::int64_t ntok = h.size(0);
     const std::size_t kv_index = kv_layer_of[layer];
 
-    at::Tensor query_gate = at::linear(h, w.q_proj).view({ntok, heads.n_heads, 2 * c.head_dim});
+    const std::int64_t query_rows = heads.n_heads * 2 * c.head_dim;
+    const std::int64_t key_rows = heads.n_kv_heads * c.head_dim;
+    at::Tensor projected = small_batch_linear_cuda(h, w.projections);
+    at::Tensor query_gate = projected.narrow(1, 0, query_rows).view({ntok, heads.n_heads, 2 * c.head_dim});
     at::Tensor q = rmsnorm_cuda(query_gate.narrow(-1, 0, c.head_dim), w.q_norm, c.rms_norm_eps);
     at::Tensor gate = query_gate.narrow(-1, c.head_dim, c.head_dim);
     q = rope_q(q.view({ntok, heads.n_heads * c.head_dim}), g.pos, heads.n_heads, c.head_dim, rope);
     at::Tensor k = rmsnorm_cuda(
-        at::linear(h, w.k_proj).view({ntok, heads.n_kv_heads, c.head_dim}),
+        projected.narrow(1, query_rows, key_rows).view({ntok, heads.n_kv_heads, c.head_dim}),
         w.k_norm,
         c.rms_norm_eps
     );
-    at::Tensor v = at::linear(h, w.v_proj).view({ntok, heads.n_kv_heads, c.head_dim}).contiguous();
+    at::Tensor v = projected.narrow(1, query_rows + key_rows, key_rows)
+                       .view({ntok, heads.n_kv_heads, c.head_dim})
+                       .contiguous();
 
     const kv& line = lines[kv_index];
     const auto layer_row = static_cast<std::int64_t>(kv_index);
@@ -447,7 +454,7 @@ at::Tensor qwen4_exp_model::attention(
     }
     write_kv_cuda(line.k, line.v, k, v, page_tables, cu_seqlens_write, key_counts);
 
-    at::Tensor index_qk = at::linear(h, w.index_qk_proj);
+    at::Tensor index_qk = projected.narrow(1, query_rows + 2 * key_rows, projected.size(1) - query_rows - 2 * key_rows);
     at::Tensor index_queries = rmsnorm_cuda(
         index_qk.narrow(1, 0, c.indexer_n_heads * c.indexer_head_dim)
             .view({ntok, c.indexer_n_heads, c.indexer_head_dim}),
@@ -488,7 +495,7 @@ at::Tensor qwen4_exp_model::attention(
         cu_view_pages,
         query_weights
     );
-    at::Tensor out = at::linear(
+    at::Tensor out = small_batch_linear_cuda(
         sigmoid_gated_cuda(o.view({ntok, heads.n_heads, c.head_dim}), gate).view({ntok, heads.n_heads * c.head_dim}),
         w.o_proj
     );
@@ -514,7 +521,7 @@ at::Tensor qwen4_exp_model::deltanet(
 
     const std::int64_t channels = w.conv.size(0);
     const std::int64_t value_heads = heads.linear_n_value_heads;
-    at::Tensor projected = at::linear(h, w.in_proj);
+    at::Tensor projected = small_batch_linear_cuda(h, w.in_proj);
     at::Tensor convolved = causal_conv_cuda(
         projected.narrow(1, 0, channels),
         w.conv,
@@ -539,14 +546,17 @@ at::Tensor qwen4_exp_model::deltanet(
     at::Tensor z = projected.narrow(1, channels + 2 * value_heads, value_heads * c.linear_value_head_dim)
                        .view(core.sizes());
     at::Tensor gated = gated_rmsnorm_cuda(core, z, w.norm, c.rms_norm_eps, c.linear_output_gate);
-    at::Tensor out = at::linear(gated.view({ntok, heads.linear_n_value_heads * c.linear_value_head_dim}), w.out_proj);
+    at::Tensor out = small_batch_linear_cuda(
+        gated.view({ntok, heads.linear_n_value_heads * c.linear_value_head_dim}),
+        w.out_proj
+    );
     comm.all_reduce(out);
     return out;
 }
 
 at::Tensor qwen4_exp_model::moe(const at::Tensor& h, std::int64_t layer) const {
     const moe_weights& m = layers[layer].moe;
-    at::Tensor logits = at::linear(h, m.router_and_gate);
+    at::Tensor logits = small_batch_linear_cuda(h, m.router_and_gate);
     const std::int64_t experts = m.router_and_gate.size(0) - 1;
     auto [top_weights, top_experts] = route_top_k_cuda(logits.narrow(1, 0, experts), config.num_experts_per_tok);
     at::Tensor routed = routed_experts_cuda(
@@ -557,7 +567,10 @@ at::Tensor qwen4_exp_model::moe(const at::Tensor& h, std::int64_t layer) const {
         m.experts_down_proj,
         expert_activation::silu
     );
-    at::Tensor shared = at::linear(silu_mul_cuda(at::linear(h, m.shared_gate_up_proj)), m.shared_down_proj);
+    at::Tensor shared = small_batch_linear_cuda(
+        small_batch_gated_linear_cuda(h, m.shared_gate_up_proj),
+        m.shared_down_proj
+    );
     at::Tensor out = sigmoid_gated_add_cuda(routed, logits.narrow(1, experts, 1), shared);
     comm.all_reduce(out);
     return out;

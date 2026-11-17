@@ -42,13 +42,13 @@ namespace pulsarlm {
 class qwen4_exp_model : public model {
     // Query and key heads are stored with their dims permuted as qwen3_5_model stores them.
     struct attention_weights {
-        at::Tensor q_proj;  // [n_heads * 2 * head_dim, hidden], each head's query then gate
-        at::Tensor k_proj;
-        at::Tensor v_proj;
+        // The rows of q_proj [n_heads * 2 * head_dim, hidden], each head's query then gate, of k_proj, of v_proj, then
+        // of the indexer's index_qk_proj [(indexer_n_heads + 1) * indexer_head_dim, hidden], its query heads then its
+        // key.
+        at::Tensor projections;
         at::Tensor o_proj;
         at::Tensor q_norm;  // fp32 1 + weight
         at::Tensor k_norm;
-        at::Tensor index_qk_proj;  // [(indexer_n_heads + 1) * indexer_head_dim, hidden], the query heads then the key
         at::Tensor index_q_norm;  // fp32 1 + weight
         at::Tensor index_k_norm;
     };

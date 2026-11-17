@@ -64,6 +64,14 @@ std::tuple<at::Tensor, at::Tensor> route_top_k_cuda(const at::Tensor& logits, in
 // silu(x[:, :n]) * x[:, n:] for contiguous x [tokens, 2 * n], silu rounded to the dtype before the product.
 at::Tensor silu_mul_cuda(const at::Tensor& x);
 
+// x [tokens, in] times weight^T [out, in] in x's dtype, as at::linear; batches of 1 to 4 fp16 or bf16 tokens run as one
+// matrix-vector kernel, others through cuBLAS.
+at::Tensor small_batch_linear_cuda(const at::Tensor& x, const at::Tensor& weight);
+
+// silu(x gate^T) * (x up^T) for gate_up [2 * out, in], the gate rows first, as silu_mul_cuda(at::linear(x, gate_up));
+// batches of 1 to 4 fp16 or bf16 tokens run as one kernel, others through cuBLAS and silu_mul_cuda.
+at::Tensor small_batch_gated_linear_cuda(const at::Tensor& x, const at::Tensor& gate_up);
+
 // Each token's sum over its top_k experts of top_weights times down_proj(activation(gate) * up) of its row of h
 // [tokens, hidden], with top_experts (int64) and top_weights (fp32) [tokens, top_k], gate_up_proj
 // [experts, 2 * intermediate, hidden], gate rows first, and down_proj [experts, hidden, intermediate]. gate, up and each

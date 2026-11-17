@@ -84,7 +84,8 @@ TEST_CASE("hyper_connection_mix gates and averages the streams and weighs the in
     at::Tensor mix_weights = at::silu(projected.narrow(1, 0, rank) / static_cast<double>(kStreams));
     at::Tensor gates = at::sigmoid(at::linear(mix_weights, up_weight)).view({tokens, kStreams, kHidden});
     at::Tensor expected_input = (gates * normed.view({tokens, kStreams, kHidden})).mean(-2);
-    at::Tensor expected_injection = 2 * at::sigmoid(projected.narrow(1, rank, kStreams) / static_cast<double>(kStreams));
+    at::Tensor expected_injection = 2 *
+        at::sigmoid(projected.narrow(1, rank, kStreams) / static_cast<double>(kStreams));
     CHECK(at::allclose(input.to(at::kFloat), expected_input.to(at::kFloat), tolerance(dtype), tolerance(dtype)));
     CHECK(at::equal(injection_weights, expected_injection));
 }
@@ -98,19 +99,23 @@ TEST_CASE("sigmoid_gated_add and sigmoid_gated round as the ATen ops do", "[ops]
     at::Tensor x = at::randn({kTokens, kHidden}, opts);
     at::Tensor y = at::randn({kTokens, kHidden}, opts);
     at::Tensor logits = at::randn({kTokens, 3}, opts);
-    CHECK(at::equal(
-        pulsarlm::sigmoid_gated_add_cuda(x, logits.narrow(1, 2, 1), y),
-        x + at::sigmoid(logits.narrow(1, 2, 1)) * y
-    ));
+    CHECK(
+        at::equal(
+            pulsarlm::sigmoid_gated_add_cuda(x, logits.narrow(1, 2, 1), y),
+            x + at::sigmoid(logits.narrow(1, 2, 1)) * y
+        )
+    );
 
     at::Tensor heads = at::randn({kTokens, 3, 2 * kHidden}, opts);
     at::Tensor o = at::randn({kTokens, 3, kHidden}, opts);
     at::Tensor gate = heads.narrow(-1, kHidden, kHidden);
     CHECK(at::equal(pulsarlm::sigmoid_gated_cuda(o, gate), o * at::sigmoid(gate)));
-    CHECK(at::equal(
-        pulsarlm::sigmoid_gated_cuda(o.view({kTokens, -1}), gate.reshape({kTokens, -1})),
-        o.view({kTokens, -1}) * at::sigmoid(gate.reshape({kTokens, -1}))
-    ));
+    CHECK(
+        at::equal(
+            pulsarlm::sigmoid_gated_cuda(o.view({kTokens, -1}), gate.reshape({kTokens, -1})),
+            o.view({kTokens, -1}) * at::sigmoid(gate.reshape({kTokens, -1}))
+        )
+    );
 }
 
 TEST_CASE("hyper_connection_inject adds the block output to each stream by its weight", "[ops][cuda]") {
@@ -157,4 +162,37 @@ TEST_CASE("silu_mul multiplies silu of the gate half by the up half", "[ops][cud
 
     at::Tensor expected = at::silu(x.narrow(1, 0, kHidden)) * x.narrow(1, kHidden, kHidden);
     CHECK(at::allclose(got.to(at::kFloat), expected.to(at::kFloat), tolerance(dtype), tolerance(dtype)));
+}
+
+TEST_CASE("small_batch_linear and small_batch_gated_linear match at::linear", "[ops][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const auto dtype = GENERATE(at::kFloat, at::kBFloat16);
+    // Up to 4 tokens run as one kernel, 5 through cuBLAS.
+    const int64_t tokens = GENERATE(1, 3, 4, 5);
+    auto opts = at::device(at::kCUDA).dtype(dtype);
+    at::Tensor x = at::randn({tokens, 2 * kStreams * kHidden}, opts);
+    // 70 columns leave a CTA's last rows past the weight.
+    at::Tensor weight = at::randn({70, 2 * kStreams * kHidden}, opts) / 20.0;
+    at::Tensor gate_up = at::randn({2 * 70, 2 * kStreams * kHidden}, opts) / 20.0;
+
+    at::Tensor expected = at::linear(x.to(at::kFloat), weight.to(at::kFloat));
+    CHECK(
+        at::allclose(
+            pulsarlm::small_batch_linear_cuda(x, weight).to(at::kFloat),
+            expected,
+            tolerance(dtype),
+            tolerance(dtype)
+        )
+    );
+    at::Tensor projected = at::linear(x.to(at::kFloat), gate_up.to(at::kFloat)).to(dtype);
+    CHECK(
+        at::allclose(
+            pulsarlm::small_batch_gated_linear_cuda(x, gate_up).to(at::kFloat),
+            pulsarlm::silu_mul_cuda(projected).to(at::kFloat),
+            tolerance(dtype),
+            tolerance(dtype)
+        )
+    );
 }
