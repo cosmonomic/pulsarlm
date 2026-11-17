@@ -180,7 +180,8 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
     const pulsarlm::rope_parameters rope{.theta = 1e4, .partial_rotary_factor = 0.25};
     const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
     at::manual_seed(7);
-    // 64 queries of the first view run one split per (query token, KV group), 24 run 2 and 1 runs 16.
+    // On an RTX 5090 (170 SMs) or an H200 (132 SMs), 64 queries of the first view run one split per (query token, KV
+    // group), 24 run 2 and 1 runs 16.
     const int64_t first_queries = GENERATE(64, 24, 1);
     view_batch b = make_batch(page_size, first_queries == 64 ? 4 * page_size : 3 * page_size + 5, first_queries);
     auto opts = at::device(at::kCUDA).dtype(dtype);

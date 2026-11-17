@@ -183,22 +183,35 @@ __global__ void mark_selected_pages_kernel(
 }
 
 // Copies the keys of each sequence's selected view pages into rotated_k, rotated to their view positions, as
-// rotate_view_keys_kernel. page_slots[view page] is the page's row of rotated_k, the selected pages before it, and
-// differs from the previous page's for a selected page.
+// rotate_view_keys_kernel, one CTA per row of rotated_k. page_slots[view page] is the page's row of rotated_k, the
+// selected pages before it, and differs from the previous page's for a selected page, so a row's page is the first
+// whose slot reaches it.
 template <typename scalar_t>
 __global__ void rotate_indexed_keys_kernel(
     const attn::paged_attn_params<scalar_t> p,
     int page_size,
     const int32_t* __restrict__ page_slots,
-    int slot_count,
     scalar_t* __restrict__ rotated_k
 ) {
-    const int s = blockIdx.x / p.max_pages;
-    const int view_page = blockIdx.x % p.max_pages;
+    const int slot = static_cast<int>(blockIdx.x);
+    const int view_pages = p.num_seqs * p.max_pages;
+    int first = 0;
+    int last = view_pages;
+    while (first < last) {
+        const int middle = (first + last) / 2;
+        if (page_slots[middle] < slot) {
+            first = middle + 1;
+        } else {
+            last = middle;
+        }
+    }
+    if (first == view_pages || page_slots[first] != slot) {
+        return;
+    }
+    const int s = first / p.max_pages;
+    const int view_page = first % p.max_pages;
     const int keys = min(page_size, p.seqlens_k[s] - view_page * page_size);
-    const int slot = page_slots[blockIdx.x];
-    const bool selected = slot != (blockIdx.x == 0 ? -1 : page_slots[blockIdx.x - 1]);
-    if (keys <= 0 || !selected || slot >= slot_count) {
+    if (keys <= 0) {
         return;
     }
     const int half = p.head_dim / 2;
@@ -223,6 +236,9 @@ __global__ void rotate_indexed_keys_kernel(
     }
 }
 
+// The most blocks one query may select.
+constexpr int kMaxListedBlocks = 1024;
+
 // A partial row holds the max scaled score, the weight sum and the weighted values [head_dim].
 constexpr int partial_row_floats(int head_dim) {
     return 2 + head_dim;
@@ -238,7 +254,8 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
     const scalar_t* __restrict__ rotated_k,  // [selected pages, page_size, n_kv_heads, head_dim]
     const int32_t* __restrict__ page_slots,  // [num_seqs * max_pages], each selected view page's row of rotated_k
     int splits,
-    float* __restrict__ partial  // [query tokens * KV groups * splits, 16, partial_row_floats], with splits above 1
+    float* __restrict__ partial,  // [query tokens * KV groups * splits, 16, partial_row_floats], with splits above 1
+    int32_t* __restrict__ listed_scratch  // [query tokens * KV groups * splits, kMaxListedBlocks]
 ) {
     constexpr int KEY_TILE = PAGE_SIZE * KEY_PAGES;
     constexpr int SCORE_STRIDE = KEY_TILE + 1;
@@ -290,9 +307,9 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
     // The view index of each key of the staged tiles, -1 past the selection or the query: the tile K holds, then the
     // one V holds, as the pipeline stages K a tile ahead of V.
     __shared__ int key_index[2][KEY_TILE];
-    // The next selected block, as the selection word holding it and that word's bits from it on.
-    __shared__ int cursor_word;
-    __shared__ uint32_t cursor_bits;
+    // The CTA's selected blocks at or before the query, in view order.
+    int32_t* listed_blocks = listed_scratch + static_cast<int64_t>(blockIdx.x) * kMaxListedBlocks;
+    __shared__ int listed_counts[NWARPS];
     // Each row's max scaled score over the page its tiles are in; selected blocks come in view order, so a page's
     // keys are consecutive across tiles.
     __shared__ int run_page[16];
@@ -308,14 +325,14 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
         }
     };
 
-    for (int i = tid; i < 16 * HEAD_DIM; i += NWARPS * 32) {
-        const int row = i / HEAD_DIM, col = i % HEAD_DIM;
-        scalar_t v = static_cast<scalar_t>(0);
-        if (row < rows) {
-            v = p.q[(static_cast<int64_t>(qtok) * p.n_q_heads + first_head + row) * HEAD_DIM + col];
-        }
-        sQ[attn::swizzled_offset<HEAD_DIM>(row, col)] = v;
+    for (int c = tid; c < 16 * kRowChunks; c += NWARPS * 32) {
+        const int row = c / kRowChunks;
+        const int col = (c % kRowChunks) * kChunkElems;
+        const scalar_t* source = p.q + (static_cast<int64_t>(qtok) * p.n_q_heads + first_head + row) * HEAD_DIM + col;
+        attn::cp_async_16(sQ + attn::swizzled_offset<HEAD_DIM>(row, col), row < rows ? source : p.q, row < rows ? 16 : 0);
     }
+    attn::cp_async_commit();
+    attn::cp_async_wait<0>();
     constexpr int kSlabs = attn::pv_slabs_per_warp<HEAD_DIM, NWARPS>();
     float out_acc[kSlabs * attn::kPvSlabAccums] = {};
     for (int i = tid; i < 16 * KEY_TILE; i += NWARPS * 32) {
@@ -375,46 +392,64 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
         }
     }
     __syncthreads();
-    if (tid == 0) {
-        cursor_word = min(first_block / 32, selection.words);
-        cursor_bits = cursor_word < selection.words
-            ? selection.word(qtok, cursor_word) & ~((1u << (first_block % 32)) - 1u)
-            : 0u;
+    // Each thread lists the blocks of a run of consecutive words, after the runs of the threads before it.
+    const int last_block = min(end_block - 1, query_pos / selection.block_size);
+    const int first_word = first_block / 32;
+    const int end_word = last_block >= first_block ? min(selection.words, last_block / 32 + 1) : first_word;
+    const int run_words = max(end_word - first_word, 0) / (NWARPS * 32) + 1;
+    auto run_bits = [&](int w) {
+        uint32_t bits = selection.word(qtok, w);
+        if (w == first_word) {
+            bits &= ~0u << (first_block % 32);
+        }
+        if (w == last_block / 32 && last_block % 32 != 31) {
+            bits &= (2u << (last_block % 32)) - 1u;
+        }
+        return bits;
+    };
+    const int run_first = first_word + tid * run_words;
+    const int run_end = min(run_first + run_words, end_word);
+    int run_count = 0;
+    for (int w = run_first; w < run_end; ++w) {
+        run_count += __popc(run_bits(w));
+    }
+    int listed_before = run_count;
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        const int other = __shfl_up_sync(0xffffffffu, listed_before, offset);
+        if (lane >= offset) {
+            listed_before += other;
+        }
+    }
+    if (lane == 31) {
+        listed_counts[warp] = listed_before;
+    }
+    listed_before -= run_count;
+    __syncthreads();
+    int listed = 0;
+    for (int w = 0; w < NWARPS; ++w) {
+        listed_before += w < warp ? listed_counts[w] : 0;
+        listed += listed_counts[w];
+    }
+    for (int w = run_first; w < run_end; ++w) {
+        for (uint32_t bits = run_bits(w); bits != 0; bits &= bits - 1) {
+            listed_blocks[listed_before++] = w * 32 + __ffs(bits) - 1;
+        }
     }
     __syncthreads();
 
-    // Fills key_index[slot] with the next tile_blocks selected blocks at or before the query, from the cursor on; false
-    // when none is left. Thread 0 walks the bits; every thread returns the same.
-    __shared__ bool tile_found;
+    // Fills key_index[slot] with the next tile_blocks listed blocks' keys at or before the query, -1 past them; false
+    // when none is left. Every thread keeps the same next_listed.
+    int next_listed = 0;
     auto next_tile = [&](int slot) {
-        if (tid == 0) {
-            int filled = 0;
-            while (filled < tile_blocks && cursor_word < selection.words) {
-                if (cursor_bits == 0) {
-                    if (++cursor_word < selection.words) {
-                        cursor_bits = selection.word(qtok, cursor_word);
-                    }
-                    continue;
-                }
-                const int block = cursor_word * 32 + __ffs(cursor_bits) - 1;
-                if (block * selection.block_size > query_pos || block >= end_block) {
-                    cursor_word = selection.words;
-                    break;
-                }
-                cursor_bits &= cursor_bits - 1;
-                for (int k = 0; k < selection.block_size; ++k) {
-                    const int key = block * selection.block_size + k;
-                    key_index[slot][filled * selection.block_size + k] = key <= query_pos ? key : -1;
-                }
-                ++filled;
-            }
-            for (int c = filled * selection.block_size; c < KEY_TILE; ++c) {
-                key_index[slot][c] = -1;
-            }
-            tile_found = filled > 0;
+        for (int c = tid; c < KEY_TILE; c += NWARPS * 32) {
+            const int index = next_listed + c / selection.block_size;
+            const int key = index < listed ? listed_blocks[index] * selection.block_size + c % selection.block_size : -1;
+            key_index[slot][c] = key <= query_pos ? key : -1;
         }
+        const bool found = next_listed < listed;
+        next_listed += tile_blocks;
         __syncthreads();
-        return tile_found;
+        return found;
     };
 
     // Stages the keys of key_index[slot], K from rotated_k or V from the pool, zeros past the selection. Always commits
@@ -600,13 +635,13 @@ __global__ void combine_indexed_splits_kernel(
 }
 
 // The splits of each (query token, KV group) are the largest power of two, at most kMaxSplits, that keeps the grid
-// within kSplitGridTarget CTAs.
-constexpr int64_t kSplitGridTarget = 128;
-constexpr int64_t kMaxSplits = 16;
+// within the device's SMs.
+constexpr int64_t kMaxSplits = 32;
 
 int indexed_splits(int64_t groups) {
+    const int64_t sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
     int64_t splits = 1;
-    while (splits < kMaxSplits && groups * splits * 2 <= kSplitGridTarget) {
+    while (splits < kMaxSplits && groups * splits * 2 <= sms) {
         splits *= 2;
     }
     return static_cast<int>(splits);
@@ -635,11 +670,10 @@ void launch_indexed_tc(
     at::Tensor page_slots = at::cumsum(selected_pages, 0, at::kInt) - 1;
     const int64_t slot_count = std::min(view_pages, b.total_q * max_selected_blocks);
     auto rotated_k = at::empty({slot_count, b.page_size, b.n_kv_heads, b.head_dim}, b.k_pool.options());
-    rotate_indexed_keys_kernel<scalar_t><<<static_cast<int>(view_pages), 256, 0, stream>>>(
+    rotate_indexed_keys_kernel<scalar_t><<<static_cast<int>(slot_count), 256, 0, stream>>>(
         params,
         static_cast<int>(b.page_size),
         page_slots.const_data_ptr<int32_t>(),
-        static_cast<int>(slot_count),
         rotated_k.data_ptr<scalar_t>()
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -656,6 +690,7 @@ void launch_indexed_tc(
                 kernel = attn_indexed_tc_kernel<scalar_t, BS, HD, BF16, NWARPS, KEY_PAGES, kTuning.prefill_ctas_per_sm>;
             attn::allow_shared_memory(kernel, smem);
             const int splits = indexed_splits(grid);
+            at::Tensor listed_scratch = at::empty({grid * splits, kMaxListedBlocks}, b.page_tables.options());
             at::Tensor partial;
             if (splits > 1) {
                 partial = at::empty(
@@ -669,7 +704,8 @@ void launch_indexed_tc(
                 rotated_k.data_ptr<scalar_t>(),
                 page_slots.const_data_ptr<int32_t>(),
                 splits,
-                splits > 1 ? partial.data_ptr<float>() : nullptr
+                splits > 1 ? partial.data_ptr<float>() : nullptr,
+                listed_scratch.data_ptr<int32_t>()
             );
             C10_CUDA_KERNEL_LAUNCH_CHECK();
             if (splits > 1) {
@@ -740,7 +776,11 @@ at::Tensor attn_indexed_cuda(
         block_size >= 1 && b.page_size % block_size == 0,
         "attn_indexed: block_size must be at least 1 and divide the page size"
     );
-    TORCH_CHECK(max_selected_blocks >= 1, "attn_indexed: max_selected_blocks must be at least 1");
+    TORCH_CHECK(
+        max_selected_blocks >= 1 && max_selected_blocks <= kMaxListedBlocks,
+        "attn_indexed: max_selected_blocks must be between 1 and ",
+        kMaxListedBlocks
+    );
     TORCH_CHECK(
         selected.is_cuda() && selected.scalar_type() == at::kInt && selected.dim() == 2 &&
             selected.size(0) == b.total_q && selected.is_contiguous() &&
