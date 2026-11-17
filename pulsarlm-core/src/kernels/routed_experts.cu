@@ -27,6 +27,8 @@ constexpr int kChunkVectors = kChunkK / 8;
 constexpr int kStages = 3;
 constexpr int kGemmThreads = 128;
 constexpr int kElementThreads = 256;
+// The gated product splits k until its grid reaches this many CTAs per SM.
+constexpr int64_t kSplitTargetPerSm = 2;
 
 template <typename scalar_t> __device__ __forceinline__ float rounded(float value) {
     return static_cast<float>(static_cast<scalar_t>(value));
@@ -133,7 +135,8 @@ __device__ __forceinline__ int staged_offset(int row, int vector) {
 // sort_assignments_kernel's tiles, block of weight rows). With gated, the block is the gate rows [n0, n0 + 32) and the
 // up rows [n + n0, n + n0 + 32), x's rows are those of the tile's sorted tokens, and out [rows, n] holds
 // activation(gate) * up. Otherwise the block is the rows [n0, n0 + 64), x's rows are the tile's rows, and out
-// [rows, n] holds the products.
+// [rows, n] holds the products. With partial, split blockIdx.z of the gated product covers chunks_per_split chunks of
+// k and writes its fp32 gate and up sums into partial [gridDim.z, rows of every tile, 2 * n] in place of out.
 template <typename scalar_t, bool bf16, bool gated>
 __global__ void __launch_bounds__(kGemmThreads) expert_tile_gemm_kernel(
     const scalar_t* __restrict__ x,
@@ -146,7 +149,10 @@ __global__ void __launch_bounds__(kGemmThreads) expert_tile_gemm_kernel(
     int k,
     const int32_t* __restrict__ tiles,
     expert_activation activation,
-    scalar_t* __restrict__ out
+    scalar_t* __restrict__ out,
+    int chunks_per_split,
+    float* __restrict__ partial,
+    int64_t partial_rows
 ) {
     const int rows = tiles[2 * gridDim.x + blockIdx.x];
     if (rows == 0) {
@@ -217,10 +223,11 @@ __global__ void __launch_bounds__(kGemmThreads) expert_tile_gemm_kernel(
 
     float first_fragment[4] = {};
     float second_fragment[4] = {};
-    const int chunks = (k + kChunkK - 1) / kChunkK;
+    const int first_chunk = static_cast<int>(blockIdx.z) * chunks_per_split;
+    const int chunks = min((k + kChunkK - 1) / kChunkK - first_chunk, chunks_per_split);
     for (int chunk = 0; chunk < kStages - 1; chunk++) {
         if (chunk < chunks) {
-            stage(chunk, chunk);
+            stage(chunk, first_chunk + chunk);
         }
         __pipeline_commit();
     }
@@ -229,7 +236,7 @@ __global__ void __launch_bounds__(kGemmThreads) expert_tile_gemm_kernel(
         __syncthreads();
         const int next = chunk + kStages - 1;
         if (next < chunks) {
-            stage(next % kStages, next);
+            stage(next % kStages, first_chunk + next);
         }
         __pipeline_commit();
         const scalar_t* x_tile = staged_x[chunk % kStages];
@@ -258,7 +265,11 @@ __global__ void __launch_bounds__(kGemmThreads) expert_tile_gemm_kernel(
         scalar_t* out_row = out + static_cast<int64_t>(first_row + row) * n;
         if constexpr (gated) {
             const int column = n0 + 8 * warp + pair + i % 2;
-            if (column < n) {
+            if (column < n && partial != nullptr) {
+                float* partial_row = partial + (blockIdx.z * partial_rows + first_row + row) * 2 * n;
+                partial_row[column] = first_fragment[i];
+                partial_row[n + column] = second_fragment[i];
+            } else if (column < n) {
                 const float gate = rounded<scalar_t>(first_fragment[i]);
                 const float up = rounded<scalar_t>(second_fragment[i]);
                 out_row[column] = static_cast<scalar_t>(__fmul_rn(rounded<scalar_t>(activated(gate, activation)), up));
@@ -310,6 +321,35 @@ __global__ void expert_rows_scalar_kernel(
     out[index] = gated ? activated(dot(column), activation) * dot(n + column) : dot(column);
 }
 
+// Sums the splits of expert_tile_gemm_kernel's gated product in split order and writes activation(gate) * up as its
+// unsplit form does, one thread per (row, column).
+template <typename scalar_t>
+__global__ void join_gate_up_splits_kernel(
+    const float* __restrict__ partial,
+    int splits,
+    int64_t rows,
+    int n,
+    expert_activation activation,
+    scalar_t* __restrict__ out
+) {
+    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= rows * n) {
+        return;
+    }
+    const int64_t row = index / n;
+    const int column = static_cast<int>(index % n);
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (int split = 0; split < splits; split++) {
+        const float* partial_row = partial + (split * rows + row) * 2 * n;
+        gate += partial_row[column];
+        up += partial_row[n + column];
+    }
+    out[index] = static_cast<scalar_t>(
+        __fmul_rn(rounded<scalar_t>(activated(rounded<scalar_t>(gate), activation)), rounded<scalar_t>(up))
+    );
+}
+
 // Sums each token's expert outputs weighted by top_weights in fp32 in top_k order, one thread per (token, column).
 template <typename scalar_t>
 __global__ void combine_experts_kernel(
@@ -336,6 +376,10 @@ __global__ void combine_experts_kernel(
     out[index] = static_cast<scalar_t>(sum);
 }
 
+unsigned element_blocks(int64_t elements) {
+    return static_cast<unsigned>((elements + kElementThreads - 1) / kElementThreads);
+}
+
 template <typename scalar_t, bool bf16>
 void launch_tile_gemms(
     const at::Tensor& h,
@@ -350,10 +394,22 @@ void launch_tile_gemms(
 ) {
     const int64_t hidden = h.size(1);
     const int64_t intermediate = down_proj.size(2);
+    const int64_t assignments = activations.size(0);
     auto stream = at::cuda::getCurrentCUDAStream();
+    const int64_t gate_up_blocks = max_tiles * ((intermediate + kTileWeightRows / 2 - 1) / (kTileWeightRows / 2));
+    const int64_t chunks = (hidden + kChunkK - 1) / kChunkK;
+    const int64_t sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    const int64_t splits = std::clamp<int64_t>(kSplitTargetPerSm * sms / gate_up_blocks, 1, chunks);
+    const int64_t chunks_per_split = (chunks + splits - 1) / splits;
+    const int64_t used_splits = (chunks + chunks_per_split - 1) / chunks_per_split;
+    at::Tensor partial;
+    if (used_splits > 1) {
+        partial = at::empty({used_splits, assignments, 2 * intermediate}, h.options().dtype(at::kFloat));
+    }
     const dim3 gate_up_grid(
         static_cast<unsigned>(max_tiles),
-        static_cast<unsigned>((intermediate + kTileWeightRows / 2 - 1) / (kTileWeightRows / 2))
+        static_cast<unsigned>((intermediate + kTileWeightRows / 2 - 1) / (kTileWeightRows / 2)),
+        static_cast<unsigned>(used_splits)
     );
     expert_tile_gemm_kernel<scalar_t, bf16, true><<<gate_up_grid, kGemmThreads, 0, stream>>>(
         h.const_data_ptr<scalar_t>(),
@@ -366,9 +422,23 @@ void launch_tile_gemms(
         static_cast<int>(hidden),
         tiles,
         activation,
-        activations.mutable_data_ptr<scalar_t>()
+        activations.mutable_data_ptr<scalar_t>(),
+        static_cast<int>(chunks_per_split),
+        used_splits > 1 ? partial.mutable_data_ptr<float>() : nullptr,
+        assignments
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (used_splits > 1) {
+        join_gate_up_splits_kernel<scalar_t><<<element_blocks(assignments * intermediate), kElementThreads, 0, stream>>>(
+            partial.const_data_ptr<float>(),
+            static_cast<int>(used_splits),
+            assignments,
+            static_cast<int>(intermediate),
+            activation,
+            activations.mutable_data_ptr<scalar_t>()
+        );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
     const dim3 down_grid(
         static_cast<unsigned>(max_tiles),
         static_cast<unsigned>((hidden + kTileWeightRows - 1) / kTileWeightRows)
@@ -384,17 +454,16 @@ void launch_tile_gemms(
         static_cast<int>(intermediate),
         tiles,
         activation,
-        expert_out.mutable_data_ptr<scalar_t>()
+        expert_out.mutable_data_ptr<scalar_t>(),
+        static_cast<int>((intermediate + kChunkK - 1) / kChunkK),
+        nullptr,
+        assignments
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 bool aligned_rows(const at::Tensor& t, int64_t row_stride) {
     return reinterpret_cast<uintptr_t>(t.const_data_ptr()) % 16 == 0 && row_stride * t.element_size() % 16 == 0;
-}
-
-unsigned element_blocks(int64_t elements) {
-    return static_cast<unsigned>((elements + kElementThreads - 1) / kElementThreads);
 }
 
 }  // namespace
