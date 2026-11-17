@@ -520,6 +520,10 @@ std::vector<cudaStream_t> compute_streams() {
     return {c10::cuda::getCurrentCUDAStream().stream()};
 }
 
+std::vector<cudaStream_t> copy_streams() {
+    return {c10::cuda::getStreamFromPool(true).stream()};
+}
+
 std::vector<pulsarlm::page_shape> page_shapes(const std::vector<pulsarlm::kv_layer>& layers) {
     std::vector<pulsarlm::page_shape> shapes;
     for (const pulsarlm::kv_layer& layer : layers) {
@@ -585,6 +589,7 @@ struct fixture {
           make_cache(model.layers, n_lines, pool_bytes, backing),
           backing,
           compute_streams(),
+          copy_streams(),
           {},
           root(),
           std::move(stop_ids),
@@ -1031,7 +1036,9 @@ TEST_CASE("a request cancelled before it runs ends with cancelled") {
     REQUIRE(f.store->written_states.empty());
 }
 
-TEST_CASE("a request cancelled while decoding ends with cancelled after its step") {
+// The third forward launches the third step before the second is written back; that write-back sees the cancellation,
+// so the third step's token is dropped.
+TEST_CASE("a request cancelled while decoding ends with cancelled at the next write-back") {
     fixture f(16);
     token_list prompt{1, 2, 3};
     submission s = make_submission(request{.tokens = prompt, .max_tokens = 10});
@@ -1044,7 +1051,8 @@ TEST_CASE("a request cancelled while decoding ends with cancelled after its step
     submissions.push_back(std::move(s));
     std::vector<request_results> results = serve_submissions(f.sched, std::move(submissions));
 
-    REQUIRE(results[0].tokens == continuation(prompt, 3));
+    REQUIRE(results[0].tokens == continuation(prompt, 2));
+    REQUIRE(f.model.forward_count == 3);
     REQUIRE(ended_error(results[0]) == request_error::cancelled);
     REQUIRE(f.store->releases == f.store->leases);
 }
@@ -1558,9 +1566,9 @@ TEST_CASE("running requests are forwarded in one step") {
     REQUIRE(f.model.decode_sizes == std::vector<std::int64_t>{2, 2});
 }
 
-// The prefill completes a page; the decode steps at tail positions 1 and 2 complete none, so the second is launched
-// before the first is written back; the decode at tail position 3 completes a page, so it waits for the step before.
-TEST_CASE("a step completing no page is launched before the previous such step is written back") {
+// Each step is launched before the one before it is written back, page completions included: when the n-th step is
+// launched, the tokens of the first n - 2 steps have reached the callbacks.
+TEST_CASE("each step is launched before the step before it is written back") {
     fixture f(16);
     token_list prompt{1, 2, 3, 4, 5};
     submission s = make_submission(request{.tokens = prompt, .max_tokens = 4});
@@ -1573,7 +1581,7 @@ TEST_CASE("a step completing no page is launched before the previous such step i
     std::vector<request_results> results = serve_submissions(f.sched, std::move(submissions));
 
     REQUIRE(results[0].tokens == continuation(prompt, 4));
-    REQUIRE(tokens_at_forward == std::vector<std::size_t>{0, 1, 1, 3});
+    REQUIRE(tokens_at_forward == std::vector<std::size_t>{0, 0, 1, 2});
 }
 
 // Both requests' decode steps at tail positions 1 and 2 overlap. The first request's stop token, sampled at position
@@ -1601,6 +1609,25 @@ const std::vector<pulsarlm::kv_layer> full_and_sliding{
     pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .n_q_heads = 1},
     pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .sliding_window = 5},
 };
+
+// With a sliding layer, a step completing a page releases the pages that leave the window at its write-back, so the
+// next step waits for it: the prefill and the decode at tail position 3 complete pages; the decode steps at tail
+// positions 1 and 2 overlap.
+TEST_CASE("with a sliding layer, a step after one completing a page waits for its write-back") {
+    fixture f(16, 64, {}, {}, full_and_sliding);
+    token_list prompt{1, 2, 3, 4, 5};
+    submission s = make_submission(request{.tokens = prompt, .max_tokens = 4});
+    std::vector<std::size_t> tokens_at_forward;
+    f.model.on_forward = [&tokens_at_forward, recorded_results = s.recorded_results] {
+        tokens_at_forward.push_back(recorded_results->tokens.size());
+    };
+    std::vector<submission> submissions;
+    submissions.push_back(std::move(s));
+    std::vector<request_results> results = serve_submissions(f.sched, std::move(submissions));
+
+    REQUIRE(results[0].tokens == continuation(prompt, 4));
+    REQUIRE(tokens_at_forward == std::vector<std::size_t>{0, 1, 1, 3});
+}
 
 // Each request holds at most 7 full-attention lines and 3 sliding lines at a time: the window's page and a cycle's 2
 // pages. The pool holds those 20 lines; holding passed pages too, one request would end with oom.
@@ -1840,17 +1867,22 @@ TEST_CASE("a request resumes a recurrent layer's state from another cache") {
     REQUIRE((first_engine.store->fetches == std::vector<std::vector<digest>>{keys}));
 }
 
-// The stop token 24 is sampled while the step forwarding it runs, which updates the recurrent layer's running state and
-// is withdrawn. The end state's head and its recurrent state are those of a step-by-step run, so a request resumed from
-// them on another cache continues as the uninterrupted tokens do.
+// The stop token is sampled while the step forwarding it runs, which updates the recurrent layer's running state and
+// is withdrawn; forwarding 96 also completes the page [12, 24, 48, 96] and writes its end state into the boundary line
+// the head's is not in. The end state's head and its recurrent state are those of a step-by-step run, so a request
+// resumed from them on another cache continues as the uninterrupted tokens do.
 TEST_CASE("a recurrent request stopped while its next step runs resumes from the state it reached") {
-    fixture first_engine(16, 64, {24}, {}, recurrent_and_full);
     token_list prompt{1, 2, 3};
+    REQUIRE(continuation(prompt, 5) == token_list{6, 12, 24, 48, 96});
+    const std::int64_t stop = GENERATE(24, 96);
+    INFO("stop " << stop);
+    fixture first_engine(16, 64, {stop}, {}, recurrent_and_full);
     request_results first = serve_all(first_engine.sched, {request{.tokens = prompt, .max_tokens = 10}})[0];
-    REQUIRE(first.tokens == token_list{6, 12, 24});
+    token_list generated = continuation(prompt, stop == 24 ? 3 : 5);
+    REQUIRE(first.tokens == generated);
     pulsarlm::state first_end = ended_state(first);
     REQUIRE((hashes_of(first_end, 1) == pulsarlm::make_page_digests(root(), token_list{1, 2, 3, 6}, page_size)));
-    REQUIRE(first_end.tail == token_list{12});
+    REQUIRE(first_end.tail == token_list(generated.begin() + 1, generated.end() - 1));
 
     memory_store shared_store;
     shared_store.contents = first_engine.store;

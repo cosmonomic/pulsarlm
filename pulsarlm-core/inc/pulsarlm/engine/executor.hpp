@@ -49,6 +49,8 @@ class executor {
     std::vector<std::vector<std::size_t>> shard_mass_heads;
     // One stream per shard.
     std::vector<cudaStream_t> streams;
+    // Per shard, the stream a write-back's copies to the store run on, after its step and alongside the next.
+    std::vector<cudaStream_t> copy_streams;
     // The loops of shards 1 on: shard s's forward runs on worker_loops[s - 1]; shard 0's on the executor's loop.
     std::vector<event_loop*> worker_loops;
     std::size_t page_size;
@@ -62,7 +64,7 @@ class executor {
     // The tokens of seq's full history pages that every KV layer reading the page holds resident.
     std::size_t device_cached_tokens(const sequence& seq) const;
     // Per KV layer with pages, lines for its pages, then line_count empty lines; per recurrent layer, a copy of the
-    // state at head, or zeros without head, and an empty line. Holds nothing on failure.
+    // state at head, or zeros without head, and two empty lines. Holds nothing on failure.
     task<std::expected<void, page_error>> take_lines(sequence& seq, std::size_t line_count);
     // s, the state the store returned for r, extended by the full pages of r's tokens after its head that every layer
     // with pages caches, up to its cycle's mass window and leaving a token to forward: no query between them adds mass,
@@ -81,8 +83,10 @@ class executor {
     // Drops from each sliding layer's view the pages before the window of the tail's first token, and returns whether
     // any view changed.
     bool release_passed_pages(sequence& seq);
-    // Advances each entry's sequence by its tokens (sequence::advance), records the pages they complete in b, and
-    // appends each token the step samples to pending as awaited_token.
+    // Whether e's tokens fill a page of its sequence.
+    bool completes_page(const batch_entry& e) const noexcept;
+    // Moves each entry's tokens to its sequence's tail (sequence::advance), switches the boundary lines of the
+    // sequences whose pages it fills, and appends each token the step samples to pending as awaited_token.
     void advance(batch& b);
     task<void> enqueue_on_shard(batch& b, std::size_t shard);
     task<void> synchronize_shards();
@@ -110,13 +114,14 @@ class executor {
         launched_step& operator=(launched_step&&) noexcept;
         ~launched_step();
 
-        // Whether the step completes no page and ends no cycle (executor::quiet).
+        // Whether the step lets the next one launch before its write-back (executor::quiet).
         bool quiet() const noexcept;
         // The sequences of the step's entries, in entry order.
         std::vector<sequence*> sequences() const;
     };
 
-    // shards[s] runs on cache shard s with streams[s], shards 1 on on worker_loops[s - 1]; the cache holds one layer
+    // shards[s] runs on cache shard s with streams[s], shards 1 on on worker_loops[s - 1], and its write-backs' copies
+    // to the store on copy_streams[s], which the caller synchronizes before freeing what the copies read; the cache holds one layer
     // per entry of each model's kv_layers(), and the shards agree on which layers are recurrent or sliding. store is the
     // cache's. root is the engine's root digest (make_root_digest). With graph_pages, a decode group whose sequences'
     // tables fit graph_pages pages replays a decode_graphs graph over tables that wide.
@@ -125,6 +130,7 @@ class executor {
         kv_cache cache,
         page_store& store,
         std::vector<cudaStream_t>&& streams,
+        std::vector<cudaStream_t>&& copy_streams,
         std::vector<event_loop*>&& worker_loops,
         digest root,
         std::vector<std::int64_t>&& stop_ids,
@@ -135,16 +141,17 @@ class executor {
     // first cycle. Fails with miss when the lookup or a page read fails, and with oom when the free lines do not cover
     // the state's pages and one cycle's tokens; its lease is then released.
     task<std::expected<std::unique_ptr<sequence>, request_error>> start(request&& r, result_writer& writer);
-    // Whether a step of entries completes no page and ends no cycle: its write-back then queues no work on the GPUs
-    // and changes no view, so the next step can be launched before it, and its tokens need no awaited token's value.
+    // Whether a step of entries ends no cycle and, in a model with sliding layers, completes no page: its write-back
+    // then changes no view or table that the next step reads, and copies to the store only lines the next step does not
+    // write, so the next step can be launched before it.
     bool quiet(std::span<const batch_entry> entries) const noexcept;
     // Launches one step of entries, decoding entries first: advances each sequence by its tokens, then queues the
     // forward and the sampling on every shard without waiting for them. A decoding entry whose token is awaited reads
     // it from the previous launched step's samples on the GPUs, which needs that step to be quiet and this one too.
     // A step samples at most max_sampled_rows tokens.
     task<launched_step> launch(std::vector<batch_entry> entries);
-    // Waits for step, then sets each awaited token it sampled, writes the pages it completed, evicts and writes the
-    // state at a cycle end, and takes lines for the next tokens. Sets the exit reason of each sequence that finished,
+    // Waits for step, then completes the pages its tokens filled, sets each awaited token it sampled, writes the
+    // completed pages, evicts and writes the state at a cycle end, and takes lines for the next tokens. Sets the exit reason of each sequence that finished,
     // by a stop token or max_tokens, or ran out of lines. A sequence stopped by a token while in a later launched step
     // withdraws that step's token (sequence::withdraw_latest_step); entries of sequences that exited before are
     // skipped. Steps are written back in launch order.

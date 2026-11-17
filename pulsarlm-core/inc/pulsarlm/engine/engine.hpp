@@ -51,6 +51,8 @@ class engine {
     std::vector<std::unique_ptr<model>> shards;
     std::vector<at::Device> devices;
     std::vector<cudaStream_t> streams;
+    // Per device, the stream the copies of written-back steps to the store run on.
+    std::vector<cudaStream_t> copy_streams;
     std::vector<std::unique_ptr<event_loop>> worker_loops;
     std::size_t page_size;
     std::size_t vocab_size;

@@ -197,11 +197,14 @@ bool sequence::may_sample() const noexcept {
     return !max_tokens || generated_count < *max_tokens;
 }
 
-std::size_t sequence::advance(std::size_t count) {
+void sequence::advance(std::size_t count) {
     assert(count <= pending_tokens.size());
     tail.insert(tail.end(), pending_tokens.begin(), pending_tokens.begin() + count);
     pending_tokens.erase(pending_tokens.begin(), pending_tokens.begin() + count);
-    std::size_t full_page_count = tail.size() / page_size;
+}
+
+std::size_t sequence::complete_pages(std::size_t end) {
+    std::size_t full_page_count = std::min(tail.size(), end - history_pages * page_size) / page_size;
     if (full_page_count == 0) {
         return 0;
     }
@@ -210,8 +213,10 @@ std::size_t sequence::advance(std::size_t count) {
         if (next_prompt_digest < prompt_digests.size()) {
             full_page_digests.push_back(prompt_digests[next_prompt_digest++]);
         } else {
+            std::span<const std::int64_t> tokens = std::span(tail).subspan(page * page_size, page_size);
+            assert(!std::ranges::contains(tokens, awaited_token));
             const digest& parent = full_page_digests.empty() ? head.value_or(root) : full_page_digests.back();
-            full_page_digests.push_back(make_digest(parent, std::span(tail).subspan(page * page_size, page_size)));
+            full_page_digests.push_back(make_digest(parent, tokens));
         }
     }
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
@@ -232,6 +237,18 @@ std::size_t sequence::advance(std::size_t count) {
     head = full_page_digests.back();
     tail.erase(tail.begin(), tail.begin() + full_page_count * page_size);
     return full_page_count;
+}
+
+std::vector<std::uint32_t> sequence::switch_boundary_lines() {
+    std::vector<std::uint32_t> written(layers.size(), 0);
+    for (std::size_t layer = 0; layer < layers.size(); layer++) {
+        if (recurrent[layer]) {
+            std::vector<std::uint32_t>& lines = layers[layer].lines;
+            written[layer] = lines[1];
+            std::swap(lines[1], lines[2]);
+        }
+    }
+    return written;
 }
 
 void sequence::resolve_token(std::size_t index, std::int64_t token) {
@@ -329,17 +346,23 @@ std::size_t sequence::table_width() const noexcept {
     return width;
 }
 
-void sequence::upload_table(std::size_t first_page, std::span<const cudaStream_t> streams) {
+void sequence::upload_table(
+    std::size_t first_page,
+    std::span<const cudaStream_t> streams,
+    std::optional<std::size_t> end_page
+) {
     auto n_layers = static_cast<std::int64_t>(layers.size());
-    auto page_count = static_cast<std::int64_t>(table_width());
-    if (tables.front().size(1) < page_count) {
-        std::int64_t capacity = std::max<std::int64_t>(page_count, 2 * tables.front().size(1));
+    auto width = static_cast<std::int64_t>(table_width());
+    if (tables.front().size(1) < width) {
+        std::int64_t capacity = std::max<std::int64_t>(width, 2 * tables.front().size(1));
         for (std::size_t shard = 0; shard < tables.size(); shard++) {
             tables[shard] = at::empty({n_layers, capacity}, tables[shard].options());
             position_tables[shard] = at::empty_like(tables[shard]);
         }
         first_page = 0;
+        end_page.reset();
     }
+    auto page_count = static_cast<std::int64_t>(end_page.value_or(table_width()));
     auto first = static_cast<std::int64_t>(first_page);
     if (first == page_count) {
         return;
@@ -377,7 +400,7 @@ std::vector<std::size_t> sequence::missing_lines() const {
     std::vector<std::size_t> counts;
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
         std::size_t held_count = layers[layer].lines.size();
-        std::size_t needed = recurrent[layer] ? 2 : ceil_div(next_index(layer) + left, page_size);
+        std::size_t needed = recurrent[layer] ? 3 : ceil_div(next_index(layer) + left, page_size);
         counts.push_back(needed > held_count ? needed - held_count : 0);
     }
     return counts;

@@ -44,7 +44,8 @@ class lease_guard {
 // in the history, then the pages of tail and pending. A layer that measures mass keeps, per line, mass_heads mass_sum
 // values and one weight_sum (add_step_mass), as of the last step that measured them, 0 for a page never measured, and
 // the moments of the pages it sampled (add_sampled_page). A recurrent layer has no pages: its lines are the one its
-// state is updated in, then the one a step writes the state at its newest page end into.
+// state is updated in, then the one the next step completing a page writes the state at that page's end into, then
+// the other such line, which the step before it wrote.
 class layer_view {
   public:
     std::vector<digest> pages;
@@ -62,8 +63,8 @@ class layer_view {
 };
 
 // A request being served. Its tokens move from pending to tail as steps forward them, and the pages the tail fills
-// join every layer's view, the last of them head. A step advances the sequence when it is launched; a token it samples
-// is awaited_token until the step is written back.
+// join every layer's view, the last of them head. A step moves its tokens to tail when it is launched, and its
+// write-back completes the pages they fill; a token it samples is awaited_token until the step is written back.
 class sequence {
   public:
     enum class exit_reason { finished, cancelled, oom };
@@ -100,8 +101,10 @@ class sequence {
     // The ascending history indices of the full pages some layer with pages holds. A full page's RoPE position is its
     // rank here times the page size, in every layer; the pages of tail and pending follow the last.
     std::vector<std::size_t> held_pages;
-    // Whether the recurrent layers' second lines hold the state at head, which the store does not have yet.
+    // Whether head_state_lines hold the state at head, which the store does not have yet.
     bool state_pending = false;
+    // Per KV layer, for a recurrent layer, the line holding the state at head.
+    std::vector<std::uint32_t> head_state_lines;
     // Per shard, int32 [n_kv_layers, capacity] on its device: each view page's line, and the RoPE position of its
     // first key. Columns past those of a layer's lines are unused.
     std::vector<at::Tensor> tables;
@@ -156,13 +159,18 @@ class sequence {
     // Sets held from the layers' indices, after pages left them.
     void update_held();
     bool may_sample() const noexcept;
-    // Moves the first count pending tokens to tail, then the pages they complete to every layer with pages, and returns
-    // how many pages they complete. The tokens of the pages it completes are not awaited_token.
-    std::size_t advance(std::size_t count);
+    // Moves the first count pending tokens to tail.
+    void advance(std::size_t count);
+    // Moves the full pages of tail before history position end to every layer with pages, and returns how many. The
+    // tokens of those pages are not awaited_token.
+    std::size_t complete_pages(std::size_t end);
+    // For a step completing a page: returns, per KV layer, the line that step writes the state at the page's end into
+    // (0 for a layer with pages), and makes the other boundary line the next such line.
+    std::vector<std::uint32_t> switch_boundary_lines();
     // Sets the token at history position index, in tail or pending, which was awaited_token.
     void resolve_token(std::size_t index, std::int64_t token);
-    // Undoes the advance by one token of the latest launched step, which completed no page, and its sample if it took
-    // one: the token it forwarded returns to pending.
+    // Undoes the advance by one token of the latest launched step, whose pages are not completed yet, and its sample if
+    // it took one: the token it forwarded returns to pending.
     void withdraw_latest_step();
     // The tokens of the history up to the next token: its full pages, then tail.
     std::size_t history_position() const noexcept;
@@ -178,9 +186,13 @@ class sequence {
     std::size_t cycle_tokens_left() const noexcept;
     // The columns of table the lines take.
     std::size_t table_width() const noexcept;
-    // Queues on each shard's stream the upload of the lines and positions from column first_page on into its tables,
-    // all of them when the tables grow.
-    void upload_table(std::size_t first_page, std::span<const cudaStream_t> streams);
+    // Queues on each shard's stream the upload of the lines and positions of columns [first_page, end_page) into its
+    // tables, end_page the table width without it, all of them when the tables grow.
+    void upload_table(
+        std::size_t first_page,
+        std::span<const cudaStream_t> streams,
+        std::optional<std::size_t> end_page = std::nullopt
+    );
     // One line per page the cycle's tokens fill, in each KV layer with pages. Called at the start of a cycle, with an
     // empty tail.
     std::size_t cycle_lines() const noexcept;

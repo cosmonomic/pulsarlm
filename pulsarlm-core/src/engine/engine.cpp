@@ -107,10 +107,11 @@ std::vector<at::Device> checked_devices(const engine_config& config, std::size_t
     return config.devices;
 }
 
-std::vector<cudaStream_t> make_streams(std::span<const at::Device> devices) {
+// From the high-priority pool with high_priority, apart from the compute streams of the low-priority one.
+std::vector<cudaStream_t> make_streams(std::span<const at::Device> devices, bool high_priority) {
     std::vector<cudaStream_t> streams;
     for (const at::Device& device : devices) {
-        streams.push_back(c10::cuda::getStreamFromPool(false, device.index()).stream());
+        streams.push_back(c10::cuda::getStreamFromPool(high_priority, device.index()).stream());
     }
     return streams;
 }
@@ -273,7 +274,8 @@ engine::engine(
 )
 : shards(std::move(shards)),
   devices(checked_devices(config, this->shards.size())),
-  streams(make_streams(devices)),
+  streams(make_streams(devices, false)),
+  copy_streams(make_streams(devices, true)),
   worker_loops(make_worker_loops(devices.size())),
   page_size(config.page_size),
   vocab_size(vocab_size),
@@ -284,6 +286,7 @@ engine::engine(
       make_cache(config, this->shards, *this->store),
       *this->store,
       std::vector<cudaStream_t>(streams),
+      std::vector<cudaStream_t>(copy_streams),
       loop_pointers(worker_loops),
       make_root_digest(config.model_name, config.model_hash, page_shapes(config, full_layers(*this->shards.front()))),
       std::vector<std::int64_t>(config.stop_ids),
@@ -337,6 +340,9 @@ void engine::run_loop(std::latch& started) {
             worker.join();
         }
         for (cudaStream_t stream : streams) {
+            cudaStreamSynchronize(stream);
+        }
+        for (cudaStream_t stream : copy_streams) {
             cudaStreamSynchronize(stream);
         }
         {
