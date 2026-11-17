@@ -123,6 +123,56 @@ __global__ void causal_conv_kernel(
     out[index] = static_cast<scalar_t>(silu(rounded<scalar_t>(sum)));
 }
 
+// One thread per (sequence, channel) of a batch of one token per sequence: causal_conv_kernel's output for the token,
+// then conv_state_kernel's update of the sequence's lines.
+template <typename scalar_t>
+__global__ void single_token_conv_kernel(
+    const scalar_t* __restrict__ x,
+    int64_t x_row_stride,
+    const scalar_t* __restrict__ weight,
+    scalar_t* __restrict__ conv_pool,
+    int64_t line_stride,
+    line_rows rows,
+    const int32_t* __restrict__ page_end_tokens,
+    int num_seqs,
+    int channels,
+    int kernel,
+    int dilation,
+    scalar_t* __restrict__ out
+) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
+    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= static_cast<int64_t>(num_seqs) * channels) {
+        return;
+    }
+    const int s = static_cast<int>(index / channels);
+    const int channel = static_cast<int>(index % channels);
+    const int history = (kernel - 1) * dilation;
+    const int64_t channel_offset = static_cast<int64_t>(channel) * history;
+    scalar_t* running = conv_pool + rows.running_line(s) * line_stride + channel_offset;
+    scalar_t old[kMaxConvHistory];
+    for (int i = 0; i < history; i++) {
+        old[i] = running[i];
+    }
+    const scalar_t token = x[static_cast<int64_t>(s) * x_row_stride + channel];
+    auto window = [&](int i) { return i < history ? old[i] : token; };
+    float sum = 0.0f;
+    for (int j = 0; j < kernel; j++) {
+        sum += static_cast<float>(weight[channel * kernel + j]) * static_cast<float>(window(j * dilation));
+    }
+    out[index] = static_cast<scalar_t>(silu(rounded<scalar_t>(sum)));
+    if (page_end_tokens[s] > 0) {
+        scalar_t* boundary = conv_pool + rows.boundary(s) * line_stride + channel_offset;
+        for (int i = 0; i < history; i++) {
+            boundary[i] = window(page_end_tokens[s] + i);
+        }
+    }
+    for (int i = 0; i < history; i++) {
+        running[i] = window(1 + i);
+    }
+}
+
 // One thread per (sequence, channel).
 template <typename scalar_t>
 __global__ void conv_state_kernel(
@@ -794,6 +844,29 @@ at::Tensor causal_conv_cuda(
     }
     auto stream = at::cuda::getCurrentCUDAStream();
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "causal_conv_cuda", [&] {
+        if (!cu_seqlens_q) {
+            launch_dependent(
+                single_token_conv_kernel<scalar_t>,
+                blocks_for(rows.size(0) * channels),
+                kConvThreads,
+                0,
+                stream,
+                x.const_data_ptr<scalar_t>(),
+                x.stride(0),
+                weight.const_data_ptr<scalar_t>(),
+                conv_pool.mutable_data_ptr<scalar_t>(),
+                conv_pool.stride(0),
+                rows_of(rows),
+                page_end_tokens.const_data_ptr<int32_t>(),
+                static_cast<int>(rows.size(0)),
+                static_cast<int>(channels),
+                static_cast<int>(kernel),
+                static_cast<int>(dilation),
+                out.mutable_data_ptr<scalar_t>()
+            );
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            return;
+        }
         if (total > 0) {
             launch_dependent(
                 causal_conv_kernel<scalar_t>,
