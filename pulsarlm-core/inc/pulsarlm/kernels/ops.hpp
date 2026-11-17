@@ -206,7 +206,8 @@ at::Tensor attn_prefill_cuda(
 // at view index p attends only the keys j <= p of its selected blocks: bit b of selected's row for the query, word
 // b / 32, bit b % 32, selects the keys [b * block_size, (b + 1) * block_size), block_size dividing the page size.
 // selected is int32 [total_q, words] with words * 32 * block_size at least the page tables' keys. A query selects at
-// least one key, and attends only the pages of its selected keys. Returns o [total_q, n_q_heads, head_dim].
+// least one key and at most max_selected_blocks blocks, and attends only the pages of its selected keys. Returns o
+// [total_q, n_q_heads, head_dim].
 at::Tensor attn_indexed_cuda(
     const at::Tensor& q,
     const at::Tensor& k_pool,
@@ -219,6 +220,7 @@ at::Tensor attn_indexed_cuda(
     double scale,
     const at::Tensor& selected,
     int64_t block_size,
+    int64_t max_selected_blocks,
     const std::optional<at::Tensor>& mass_sum,
     const std::optional<at::Tensor>& weight_sum,
     const std::optional<at::Tensor>& cu_view_pages,

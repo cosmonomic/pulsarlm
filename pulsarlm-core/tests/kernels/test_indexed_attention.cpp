@@ -45,9 +45,10 @@ struct view_batch {
     int64_t total_q = 0;
 };
 
-view_batch make_batch(int64_t page_size) {
+// A view of first_ctx keys whose last first_queries are queries, and a view of one query.
+view_batch make_batch(int64_t page_size, int64_t first_ctx, int64_t first_queries) {
     view_batch b{
-        .views = {sequence_view{{0, 3, 5, 1}, 3 * page_size + 5, 24}, sequence_view{{2, 4}, page_size + 3, 1}}
+        .views = {sequence_view{{0, 3, 5, 1}, first_ctx, first_queries}, sequence_view{{2, 4}, page_size + 3, 1}}
     };
     std::vector<int32_t> tables(b.views.size() * kMaxPages, 0), seqlens, cu_q{0}, cu_view;
     for (size_t s = 0; s < b.views.size(); ++s) {
@@ -179,7 +180,9 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
     const pulsarlm::rope_parameters rope{.theta = 1e4, .partial_rotary_factor = 0.25};
     const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
     at::manual_seed(7);
-    view_batch b = make_batch(page_size);
+    // 64 queries of the first view run one split per (query token, KV group), 24 run 2 and 1 runs 16.
+    const int64_t first_queries = GENERATE(64, 24, 1);
+    view_batch b = make_batch(page_size, first_queries == 64 ? 4 * page_size : 3 * page_size + 5, first_queries);
     auto opts = at::device(at::kCUDA).dtype(dtype);
     auto k_pool = at::randn({num_lines, page_size, n_kv, head_dim}, opts);
     auto v_pool = at::randn({num_lines, page_size, n_kv, head_dim}, opts);
@@ -207,6 +210,7 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
         scale,
         selection,
         kBlockSize,
+        kMaxPages * page_size / kBlockSize,
         mass,
         weights,
         b.cu_view_pages,
@@ -254,17 +258,20 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
         scale,
         full_selection(b, words),
         kBlockSize,
+        kMaxPages * page_size / kBlockSize,
         all_mass,
         all_weights,
         b.cu_view_pages,
         b.query_weights
     );
     // The scalar kernel sums each output across threads with atomicAdd, and both ops add the mass with atomicAdd, in no
-    // fixed order.
+    // fixed order. Joined splits round differently from one pass over the keys.
     if (dtype == at::kFloat) {
         CHECK(at::allclose(all, dense, 1e-6, 1e-6));
-    } else {
+    } else if (first_queries == 64) {
         CHECK(at::equal(all, dense));
+    } else {
+        CHECK(at::allclose(all.to(at::kFloat), dense.to(at::kFloat), 2e-2, 2e-2));
     }
     CHECK(at::allclose(all_mass, dense_mass, 1e-5, 1e-6));
     CHECK(at::allclose(all_weights, dense_weights, 1e-5, 1e-6));

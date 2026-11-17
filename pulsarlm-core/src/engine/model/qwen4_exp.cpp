@@ -477,6 +477,7 @@ at::Tensor qwen4_exp_model::attention(
         1.0 / std::sqrt(static_cast<double>(c.head_dim)),
         selected,
         c.indexer_compress_ratio,
+        c.indexer_budget / c.indexer_compress_ratio + 1,
         mass_sum,
         weight_sum,
         cu_view_pages,
