@@ -1,5 +1,7 @@
 #include "pulsarlm/engine/sequence.hpp"
 
+#include "pulsarlm/engine/executor.hpp"
+
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>

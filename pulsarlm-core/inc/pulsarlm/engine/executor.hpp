@@ -21,16 +21,45 @@
 #include "pulsarlm/engine/pending_writes.hpp"
 #include "pulsarlm/engine/request.hpp"
 #include "pulsarlm/engine/request_callbacks.hpp"
+#include "pulsarlm/engine/sequence.hpp"
+#include "pulsarlm/slot_map.hpp"
 
 namespace pulsarlm {
 
-class sequence;
 struct batch_entry;
 
 // Runs sequences on the model: it owns the model shards, the KV cache and the store's side of a request, and does
 // whatever touches them, while the scheduler decides what runs.
 class executor {
+  public:
+    using sequence_id = slot_map<sequence>::key_type;
+
+    // Owns one sequence of an executor, from start. Destroyed without finish, it drops the sequence: its lines and its
+    // lease are released and no state is written.
+    class sequence_handle {
+        executor* owner;
+        sequence_id owned_id;
+
+        sequence_handle(executor& owner, sequence_id owned_id) noexcept;
+
+        friend class executor;
+
+      public:
+        sequence_handle(sequence_handle&& other) noexcept;
+        sequence_handle(const sequence_handle&) = delete;
+        sequence_handle& operator=(const sequence_handle&) = delete;
+        sequence_handle& operator=(sequence_handle&&) = delete;
+        ~sequence_handle();
+
+        sequence_id id() const noexcept;
+    };
+
+  private:
     class batch;
+    struct resolved_entry;
+
+    // Each sequence from start until its handle is finished or destroyed.
+    slot_map<sequence> sequences;
 
     // One model per shard of the cache, each holding its part of every layer.
     std::vector<model*> shards;
@@ -109,8 +138,13 @@ class executor {
     // After seq's views changed: sets its held pages, then drops from each mirroring layer the pages no other layer
     // holds.
     void update_views(sequence& seq);
-    // Whether e's tokens fill a page of its sequence.
-    bool completes_page(const batch_entry& e) const noexcept;
+    // Whether token_count more tokens fill a page of seq.
+    bool completes_page(const sequence& seq, std::size_t token_count) const noexcept;
+    // entries with their sequences found, and for each whether it samples after its tokens and whether they end its
+    // eviction cycle.
+    std::vector<resolved_entry> resolve(std::span<const batch_entry> entries);
+    // Releases the lines of id's sequence, then erases it, which releases its lease.
+    void drop(sequence_id id) noexcept;
     // Moves each entry's tokens to its sequence's tail (sequence::advance), switches the boundary lines of the
     // sequences whose pages it fills, and appends each token the step samples to pending as awaited_token.
     void advance(batch& b);
@@ -163,13 +197,13 @@ class executor {
 
     // The sequence of r, resuming the newest state the store holds for a prefix of its tokens, with lines for its
     // first cycle. Fails with miss when the lookup or a page read fails, and with oom when the free lines do not cover
-    // the state's pages and one cycle's tokens; its lease is then released.
-    task<std::expected<std::unique_ptr<sequence>, request_error>> start(request&& r, result_writer& writer);
+    // the state's pages and one cycle's tokens; its lease is then released. writer outlives the sequence.
+    task<std::expected<sequence_handle, request_error>> start(request&& r, result_writer& writer);
     // Whether a step of entries ends no cycle and, in a model with sliding layers, completes no page, or in an executor
     // whose steps draft, whether every entry verifies drafts: its write-back
     // then changes no view or table that the next step reads, and copies to the store only lines the next step does not
     // write, so the next step can be launched before it.
-    bool allows_overlap(std::span<const batch_entry> entries) const noexcept;
+    bool allows_overlap(std::span<const batch_entry> entries) const;
     // Launches one step of entries, decoding entries first, after the launched steps: advances each sequence by its
     // tokens, then queues the forward and the sampling on every shard without waiting for them. A decoding entry whose token is awaited reads
     // it from the previous launched step's samples on the GPUs, which needs both steps to allow overlap.
@@ -183,13 +217,34 @@ class executor {
     // withdraws that step's token (sequence::withdraw_latest_step); entries of sequences that exited before are
     // skipped.
     task<void> write_back();
-    // Releases seq's lines, writes its end state when it finished, and releases its lease; seq exited.
-    task<std::expected<request_result, request_error>> finish(sequence& seq);
+    // Ends handle's sequence, which exited and is in no launched step: releases its lines, writes its end state when it
+    // finished, and releases its lease.
+    task<std::expected<request_result, request_error>> finish(sequence_handle&& handle);
+
+    // What the scheduler reads of a sequence. Each throws std::out_of_range for the id of a sequence that ended.
+
+    // Whether the sequence has not exited and no launched step forwards its last tokens.
+    bool is_steppable(sequence_id id) const;
+    std::size_t pending_token_count(sequence_id id) const;
+    // The tokens the sequence's eviction cycle can still forward.
+    std::size_t cycle_tokens_left(sequence_id id) const;
+    bool has_exited(sequence_id id) const;
+    bool is_in_launched_batch(sequence_id id) const;
+    // Whether the sequence's callbacks are cancelled.
+    bool is_cancelled(sequence_id id) const;
+    // Makes a sequence that has not exited exit as cancelled.
+    void cancel(sequence_id id);
     // kv_cache::used_bytes of the executor's cache. Safe to call from any thread.
     std::size_t kv_cache_bytes() const noexcept;
     // The drafts the verify steps written back forwarded, and those of them they accepted. Safe to call from any thread.
     std::uint64_t drafted_tokens() const noexcept;
     std::uint64_t accepted_drafts() const noexcept;
+};
+
+// One sequence's part of a step: the tokens it forwards.
+struct batch_entry {
+    executor::sequence_id sequence_id;
+    std::size_t token_count;
 };
 
 }  // namespace pulsarlm

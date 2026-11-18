@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 #include "pulsarlm/engine/event_loop.hpp"
@@ -11,21 +12,20 @@
 
 namespace pulsarlm {
 
-class sequence;
-struct batch_entry;
-
 // Decides what the executor runs: which requests join, which sequences each step forwards and how many tokens, and when
 // a sequence leaves.
 class scheduler {
     executor& exec;
     std::size_t prefill_tokens_per_step;
-    std::vector<sequence*> running_sequences;
+    std::vector<executor::sequence_id> running_sequences;
     // Set when a sequence joins the running set.
     std::optional<event> join_event;
     // The sequences of the launched step not written back yet, none when no step is, and whether that step allows
     // overlap (executor::allows_overlap).
-    std::vector<sequence*> in_flight_sequences;
+    std::vector<executor::sequence_id> in_flight_sequences;
     bool in_flight_allows_overlap = false;
+    // Per running sequence, set once it exited and no launched step holds it; its request's task awaits it.
+    std::unordered_map<executor::sequence_id, event> exit_events;
 
     static event& emplace_event(std::optional<event>& waited);
     static void wake(std::optional<event>& waited) noexcept;

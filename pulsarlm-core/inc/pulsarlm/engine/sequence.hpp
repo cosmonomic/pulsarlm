@@ -12,9 +12,7 @@
 #include <vector>
 
 #include "pulsarlm/digest.hpp"
-#include "pulsarlm/engine/event_loop.hpp"
 #include "pulsarlm/engine/eviction.hpp"
-#include "pulsarlm/engine/executor.hpp"
 #include "pulsarlm/engine/page_store.hpp"
 #include "pulsarlm/engine/pending_writes.hpp"
 #include "pulsarlm/engine/request.hpp"
@@ -23,6 +21,8 @@
 #include "pulsarlm/engine/state.hpp"
 
 namespace pulsarlm {
+
+class executor;
 
 // Holds a lease of a store and releases it once: on release, or when destroyed before it, as with a frame destroyed
 // after a panic, since the lease is the store's.
@@ -112,8 +112,6 @@ class sequence {
     std::vector<at::Tensor> tables;
     std::vector<at::Tensor> position_tables;
     std::optional<exit_reason> end_reason;
-    // Set once the sequence leaves the running set.
-    std::optional<event> exit_event;
     // The launched steps the sequence is in that are not written back yet.
     std::size_t steps_in_flight = 0;
     // Whether a launched step forwards the sequence's last tokens: it samples the last token max_tokens allows, or it
@@ -143,6 +141,7 @@ class sequence {
     std::size_t device_cached_count = 0;
     std::size_t peak_device_memory = 0;
 
+  public:
     // Resumes initial_state, the newest stored state reaching a prefix of r's tokens, leased from store by lease_id.
     // digests are the digests of the full pages of r's tokens, chained from root.
     sequence(
@@ -157,6 +156,7 @@ class sequence {
         std::span<const at::Device> devices
     );
 
+  private:
     // The view index of the next token in KV layer layer's view.
     std::size_t next_index(std::size_t layer) const noexcept;
     // The RoPE position of the next token, the same in every layer.
@@ -214,17 +214,6 @@ class sequence {
     std::vector<std::size_t> missing_lines() const;
 
     friend class executor;
-    friend class executor::batch;
-    friend class scheduler;
-};
-
-// One sequence's part of a step: the tokens it forwards, whether it samples after them, and whether they end its
-// eviction cycle.
-struct batch_entry {
-    sequence* seq;
-    std::size_t token_count;
-    bool samples;
-    bool ends_cycle;
 };
 
 }  // namespace pulsarlm
