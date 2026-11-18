@@ -22,10 +22,10 @@ class scheduler {
     std::vector<sequence*> running_sequences;
     // Set when a sequence joins the running set.
     std::optional<event> join_event;
-    // The sequences of the launched step not written back yet, none when no step is, and whether that step is quiet
-    // (executor::quiet).
+    // The sequences of the launched step not written back yet, none when no step is, and whether that step allows
+    // overlap (executor::allows_overlap).
     std::vector<sequence*> in_flight;
-    bool in_flight_quiet = false;
+    bool in_flight_allows_overlap = false;
 
     static event& emplace_event(std::optional<event>& waited);
     static void wake(std::optional<event>& waited) noexcept;
@@ -46,7 +46,8 @@ class scheduler {
     // cycle's tokens at the start, or the next cycle's tokens while running; the caller resubmits.
     task<void> submit(request r, result_writer writer);
     // Steps the running sequences until the loop stops, launching each step before the previous one is written back
-    // when both are quiet (executor::quiet). A sequence whose callbacks are cancelled leaves after the steps it is in.
+    // when both allow overlap (executor::allows_overlap). A sequence whose callbacks are cancelled leaves after the
+    // steps it is in.
     task<void> run();
 };
 

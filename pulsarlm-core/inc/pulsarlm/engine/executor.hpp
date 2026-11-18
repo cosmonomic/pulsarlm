@@ -169,10 +169,10 @@ class executor {
     // whose steps draft, whether every entry verifies drafts: its write-back
     // then changes no view or table that the next step reads, and copies to the store only lines the next step does not
     // write, so the next step can be launched before it.
-    bool quiet(std::span<const batch_entry> entries) const noexcept;
+    bool allows_overlap(std::span<const batch_entry> entries) const noexcept;
     // Launches one step of entries, decoding entries first, after the launched steps: advances each sequence by its
     // tokens, then queues the forward and the sampling on every shard without waiting for them. A decoding entry whose token is awaited reads
-    // it from the previous launched step's samples on the GPUs, which needs that step to be quiet and this one too.
+    // it from the previous launched step's samples on the GPUs, which needs both steps to allow overlap.
     // A step samples at most max_sampled_rows tokens.
     task<void> launch(std::vector<batch_entry> entries);
     // Writes back the oldest launched step: waits for it, then completes the pages its tokens filled, sets each awaited token it sampled, writes the

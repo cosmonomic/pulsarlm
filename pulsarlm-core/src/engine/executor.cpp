@@ -130,7 +130,6 @@ class executor::batch {
     std::vector<bool> ends_cycle;
     std::vector<std::size_t> sampled_positions;
     std::vector<bool> ends_sequence;
-    bool quiet = false;
     // Per shard, completing once the step's work on its stream has, and an event recorded after that work.
     std::vector<external_task<cudaError_t>> completions;
     std::vector<at::cuda::CUDAEvent> ends;
@@ -1568,7 +1567,7 @@ bool executor::completes_page(const batch_entry& e) const noexcept {
 }
 
 // A drafting sequence's verify step ends neither its cycle nor max_tokens (executor::advance).
-bool executor::quiet(std::span<const batch_entry> entries) const noexcept {
+bool executor::allows_overlap(std::span<const batch_entry> entries) const noexcept {
     if (draft_layer) {
         return std::ranges::all_of(entries, [](const batch_entry& e) { return !e.seq->drafts.empty(); });
     }
@@ -1698,7 +1697,6 @@ void executor::advance(batch& b) {
 // once. Each shard's completion is taken once every shard has queued, before any later step queues.
 task<void> executor::launch(std::vector<batch_entry> entries) {
     std::unique_ptr<batch> b(new batch(entries, page_size, draft_state_slots, graph_pages));
-    b->quiet = quiet(b->entries);
     link_previous(*b);
     advance(*b);
     b->shard_decode_mass.assign(shards.size(), at::Tensor());
