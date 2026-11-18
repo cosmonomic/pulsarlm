@@ -327,6 +327,27 @@ at::Tensor attn_prefill_cuda(
     const std::optional<at::Tensor>& query_weights = std::nullopt
 );
 
+// attn_prefill_cuda measuring each query's mass apart: query i owns the rows [cu_view_pages[i], cu_view_pages[i + 1])
+// of mass_sum and weight_sum, its sequence's view pages; cu_view_pages is int32 [total_q + 1]. A verify group's
+// accepted rows are then added on their own.
+at::Tensor attn_prefill_verify_cuda(
+    const at::Tensor& q,
+    const at::Tensor& k_pool,
+    const at::Tensor& v_pool,
+    const at::Tensor& page_tables,
+    const at::Tensor& cu_seqlens_q,
+    const at::Tensor& seqlens_k,
+    const at::Tensor& page_positions,
+    const rope_parameters& rope,
+    double scale,
+    std::optional<int64_t> sliding_window,
+    const std::optional<at::Tensor>& k_norm_weight,
+    const at::Tensor& mass_sum,
+    const at::Tensor& weight_sum,
+    const at::Tensor& cu_view_pages,
+    const at::Tensor& query_weights
+);
+
 // Indexed attention: attn_prefill_cuda's ragged batch, decode included as one query per sequence, in which the query
 // at view index p attends only the keys j <= p of its selected blocks: bit b of selected's row for the query, word
 // b / 32, bit b % 32, selects the keys [b * block_size, (b + 1) * block_size), block_size dividing the page size.

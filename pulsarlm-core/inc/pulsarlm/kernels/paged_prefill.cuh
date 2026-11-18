@@ -263,7 +263,19 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_prefill_tc_kern
         }
         __syncthreads();
 
-        if (p.mass_sum && tid < KEY_PAGES) {
+        // A query measuring its mass apart adds its own rows; otherwise the tile's queries add to their sequence's.
+        if (p.mass_sum && p.mass_per_query && tid < KEY_PAGES) {
+            for (int m = 0; m < tile_rows; ++m) {
+                const float page_max = page_max_rows[m * KEY_PAGES + tid];
+                if (page_max > -CUDART_INF_F && row_weight[m] > 0.0f) {
+                    const int64_t row = mass_row(p, q_global_base + m, t * KEY_PAGES + tid);
+                    atomicAdd(&p.mass_sum[row * p.n_q_heads + h], row_weight[m] * page_max);
+                    if (h == 0) {
+                        atomicAdd(&p.weight_sum[row], row_weight[m]);
+                    }
+                }
+            }
+        } else if (p.mass_sum && tid < KEY_PAGES) {
             float page_sum = 0.0f;
             float page_weight = 0.0f;
             for (int m = 0; m < tile_rows; ++m) {

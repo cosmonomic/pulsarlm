@@ -189,4 +189,44 @@ at::Tensor attn_prefill_cuda(
     return paged_prefill(batch);
 }
 
+at::Tensor attn_prefill_verify_cuda(
+    const at::Tensor& q,
+    const at::Tensor& k_pool,
+    const at::Tensor& v_pool,
+    const at::Tensor& page_tables,
+    const at::Tensor& cu_seqlens_q,
+    const at::Tensor& seqlens_k,
+    const at::Tensor& page_positions,
+    const rope_parameters& rope,
+    double scale,
+    std::optional<int64_t> sliding_window,
+    const std::optional<at::Tensor>& k_norm_weight,
+    const at::Tensor& mass_sum,
+    const at::Tensor& weight_sum,
+    const at::Tensor& cu_view_pages,
+    const at::Tensor& query_weights
+) {
+    auto batch = attn::make_paged_attn_batch(
+        "attn_prefill_verify",
+        q,
+        k_pool,
+        v_pool,
+        page_tables,
+        cu_seqlens_q,
+        seqlens_k,
+        page_positions,
+        rope,
+        scale,
+        sliding_window,
+        k_norm_weight,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt
+    );
+    attn::attach_mass(batch, "attn_prefill_verify", mass_sum, weight_sum, cu_view_pages, query_weights, batch.total_q);
+    batch.mass_per_query = true;
+    return paged_prefill(batch);
+}
+
 }  // namespace pulsarlm

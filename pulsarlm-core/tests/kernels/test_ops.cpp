@@ -707,6 +707,81 @@ TEST_CASE(
                                 CHECK(at::allclose(mass, reference_pre.mass_sum(), 1e-3, 1e-3));
                                 CHECK(at::allclose(weights, reference_pre.weight_sum(), 1e-5, 1e-5));
 
+                                // Measured per query, each query's views are its sequence's pages: they sum to the
+                                // sequence's mass, and a query's equal the mass of a step weighing only that query.
+                                const int64_t total_q = cu_q.back();
+                                std::vector<int32_t> cu_query_view{0};
+                                for (const windowed_view& view : views) {
+                                    for (int64_t r = 0; r < view.seq_q; ++r) {
+                                        cu_query_view.push_back(cu_query_view.back() + static_cast<int32_t>(max_pages));
+                                    }
+                                }
+                                auto query_mass = at::zeros({total_q * max_pages, n_q}, mass.options());
+                                auto query_weights_sum = at::zeros({total_q * max_pages}, mass.options());
+                                auto verified = pulsarlm::attn_prefill_verify_cuda(
+                                    q_pre,
+                                    k_pool,
+                                    v_pool,
+                                    page_tables,
+                                    cu_seqlens_q,
+                                    seqlens_k,
+                                    page_positions,
+                                    rope,
+                                    scale,
+                                    window,
+                                    k_norm_weight,
+                                    query_mass,
+                                    query_weights_sum,
+                                    int32_cuda(cu_query_view),
+                                    prefill_weights
+                                );
+                                CHECK(at::equal(verified, o));
+                                at::Tensor per_page = query_mass.view({total_q, max_pages, n_q});
+                                at::Tensor per_page_weight = query_weights_sum.view({total_q, max_pages});
+                                std::vector<at::Tensor> sequence_mass;
+                                std::vector<at::Tensor> sequence_weight;
+                                for (size_t s = 0; s < views.size(); ++s) {
+                                    sequence_mass.push_back(per_page.narrow(0, cu_q[s], views[s].seq_q).sum(0));
+                                    sequence_weight.push_back(
+                                        per_page_weight.narrow(0, cu_q[s], views[s].seq_q).sum(0)
+                                    );
+                                }
+                                CHECK(at::allclose(at::cat(sequence_mass), reference_pre.mass_sum(), 1e-3, 1e-3));
+                                CHECK(at::allclose(at::cat(sequence_weight), reference_pre.weight_sum(), 1e-5, 1e-5));
+                                for (int64_t row : {int64_t{0}, int64_t{11}, total_q - 1}) {
+                                    INFO("query " << row);
+                                    auto one_hot = at::zeros_like(prefill_weights);
+                                    one_hot[row] = prefill_weights[row];
+                                    auto alone = new_mass();
+                                    auto alone_weights = new_weights();
+                                    pulsarlm::attn_prefill_cuda(
+                                        q_pre,
+                                        k_pool,
+                                        v_pool,
+                                        page_tables,
+                                        cu_seqlens_q,
+                                        seqlens_k,
+                                        page_positions,
+                                        rope,
+                                        scale,
+                                        window,
+                                        k_norm_weight,
+                                        alone,
+                                        alone_weights,
+                                        cu_view_pages,
+                                        one_hot
+                                    );
+                                    const int64_t s = row < cu_q[1] ? 0 : 1;
+                                    CHECK(
+                                        at::allclose(
+                                            per_page[row],
+                                            alone.narrow(0, s * max_pages, max_pages),
+                                            1e-4,
+                                            1e-4
+                                        )
+                                    );
+                                }
+
                                 for (int64_t num_splits : {0, 1, 2}) {
                                     auto dec_mass = new_mass();
                                     auto dec_weights = new_weights();

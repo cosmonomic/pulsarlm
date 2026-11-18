@@ -113,7 +113,7 @@ template <typename scalar_t, int PAGE_SIZE> __global__ void attn_scalar_kernel(c
             page_max = fmaxf(page_max, sc);
         }
         if (p.mass_sum) {
-            const int64_t row = mass_row(p, s, page);
+            const int64_t row = mass_row(p, mass_view(p, s, qtok), page);
             atomicAdd(&p.mass_sum[row * p.n_q_heads + h], weight * page_max);
             if (h == 0) {
                 atomicAdd(&p.weight_sum[row], weight);
