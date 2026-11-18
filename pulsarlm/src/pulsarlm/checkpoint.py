@@ -307,8 +307,10 @@ def load(
     dtype: torch.dtype | None = None,
     shard: tuple[int, int] = (0, 1),
     expert_parallel: bool = False,
+    drafts: bool = False,
 ) -> PulsarLMModel:
-    """The model directory or archive at path."""
+    """The model directory or archive at path, its multi-token prediction layer
+    (mtp.*) only with drafts."""
     with model_root(path) as root:
         config = load_config(root)
         tokenizer = load_tokenizer(root)
@@ -319,7 +321,8 @@ def load(
             path,
             device=device,
             dtype=dtype,
-            unused_prefixes=UNUSED_PREFIXES.get(config.architecture, ()),
+            unused_prefixes=UNUSED_PREFIXES.get(config.architecture, ())
+            + (() if drafts else ("mtp.",)),
             shard=shard,
             expert_parallel=expert_parallel,
         ),

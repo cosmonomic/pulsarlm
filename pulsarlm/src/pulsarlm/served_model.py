@@ -50,6 +50,11 @@ def load_served_model(
         tokenizer = checkpoint.load_tokenizer(root)
         chat_template = checkpoint.load_chat_template(root)
 
+    draft_tokens = settings.num_draft_tokens
+    if draft_tokens is None:
+        draft_tokens = 1 if checkpoint.drafts(path, cfg) else 0
+
+    # Without drafts the model loads no multi-token prediction layer.
     def load_model_shard(rank: int, size: int) -> dict[str, torch.Tensor]:
         return checkpoint.load(
             path,
@@ -57,12 +62,10 @@ def load_served_model(
             dtype=dtype,
             shard=(rank, size),
             expert_parallel=settings.expert_parallel,
+            drafts=draft_tokens > 0,
         ).weights
 
     max_context = cfg.max_position_embeddings or None
-    draft_tokens = settings.num_draft_tokens
-    if draft_tokens is None:
-        draft_tokens = 1 if checkpoint.drafts(path, cfg) else 0
     stops = stop_ids(tokenizer, cfg.eos_ids)
     store = (
         LocalStore(

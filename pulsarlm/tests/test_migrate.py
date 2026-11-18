@@ -117,6 +117,29 @@ def test_a_qwen4_exp_checkpoint_keeps_its_multi_token_prediction_layer(tmp_path:
     ]
 
 
+def test_a_qwen4_exp_model_loads_its_multi_token_prediction_layer_only_to_draft(
+    tmp_path: Path,
+):
+    src = tmp_path / "src"
+    src.mkdir()
+    write_source(
+        src,
+        "qwen4_exp",
+        {
+            "model.language_model.norm.weight": torch.ones(2),
+            "lm_head.weight": torch.ones(3),
+            "mtp.fc_hidden.weight": torch.zeros(3),
+        },
+        {"chat_template": TEMPLATE},
+    )
+    dst = tmp_path / "model"
+    migrate(src, dst, OVERRIDES)
+
+    device = torch.device("cpu")
+    assert "mtp.fc_hidden.weight" not in load_model(dst, device=device).weights
+    assert "mtp.fc_hidden.weight" in load_model(dst, device=device, drafts=True).weights
+
+
 def test_a_text_only_qwen3_5_checkpoint_loads_under_the_multimodal_names(
     tmp_path: Path,
 ):
