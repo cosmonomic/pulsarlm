@@ -32,17 +32,17 @@
 namespace pulsarlm {
 
 // kv_cache_bytes is the bytes of the KV cache's pool that lines in use take: those of running requests, not those only
-// caching a page. drafted_tokens counts the drafts verify steps forwarded since the engine started, accepted_tokens those
-// of them the steps kept.
+// caching a page. drafted_tokens counts the drafts verify steps forwarded since the engine started, accepted_drafts those
+// of them the steps accepted.
 struct engine_stat {
     std::size_t kv_cache_bytes;
     std::uint64_t drafted_tokens;
-    std::uint64_t accepted_tokens;
+    std::uint64_t accepted_drafts;
 };
 
 // Loads rank's part of a model split over size ranks: its weights, by Hugging Face's names, on the rank's device.
-using model_shard_loader =
-    std::function<std::unordered_map<std::string, at::Tensor>(std::size_t rank, std::size_t size)>;
+using model_shard_loader = std::function<
+    std::unordered_map<std::string, at::Tensor>(std::size_t rank, std::size_t size)>;
 
 // The page shape of each KV layer, one layer each; a recurrent layer keeping a window of inputs keeps
 // config.draft_tokens more of them (recurrent_state).

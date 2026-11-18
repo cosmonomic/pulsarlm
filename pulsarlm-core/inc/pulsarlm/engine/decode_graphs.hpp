@@ -43,23 +43,23 @@ class decode_graphs {
     // The sequences of a draft pass, and whether each has state_slots rows.
     using draft_shape = std::pair<std::int64_t, bool>;
     // A verify step: the forward of a verify group, its sampling, its acceptance of the drafts and the draft head's
-    // passes after it. Its inputs are the verify group's, each row's sampling inputs, each sequence's most tokens kept,
-    // and the draft passes' RoPE positions and key counts before the kept counts are added: per row of the first pass
+    // passes after it. Its inputs are the verify group's, each row's sampling inputs, each sequence's most tokens accepted,
+    // and the draft passes' RoPE positions and key counts before the accepted counts are added: per row of the first pass
     // [rows] and per sequence [sequences], then per later draft [drafts - 1, sequences] each.
     struct captured_step {
         at::cuda::CUDAGraph graph;
         group_batch inputs;
         sampling_inputs sampling;
-        at::Tensor max_kept;
+        at::Tensor max_accepted_token_counts;
         at::Tensor draft_positions;
         at::Tensor draft_key_counts;
         at::Tensor later_positions;
         at::Tensor later_key_counts;
         group_batch first_pass;
         group_batch later_pass;
-        // Each row's sample, each sequence's kept count and its next token then its drafts.
+        // Each row's sample, each sequence's accepted count and its next token then its drafts.
         at::Tensor samples;
-        at::Tensor kept;
+        at::Tensor accepted_token_counts;
         at::Tensor next_tokens;
     };
     // The sequences of a verify step, whether it measures mass, and whether its sampling filters.
@@ -80,7 +80,7 @@ class decode_graphs {
     std::map<shape, std::unique_ptr<captured_forward>> forwards;
     std::map<draft_shape, std::unique_ptr<captured_draft>> drafts;
     std::map<step_shape, std::unique_ptr<captured_step>> steps;
-    // int64, the tokens that end a run of kept drafts.
+    // int64, the tokens that end a run of accepted drafts.
     at::Tensor stop_tokens;
 
     // Inputs of a group of sequences on the lines' device, the mass rows of up to startup_sequences sequences in the
@@ -98,7 +98,7 @@ class decode_graphs {
     // The decoding sequences whose graphs capture_startup records.
     static constexpr std::int64_t startup_sequences = 8;
 
-    // Graphs over page tables width pages wide, of pages page_size tokens long, a verify step's run of kept drafts
+    // Graphs over page tables width pages wide, of pages page_size tokens long, a verify step's run of accepted drafts
     // ending at stop_tokens (int64 on the lines' device), with state_slots slots
     // (group_batch::state_slots). mass_heads holds, per entry of the model's kv_layers(), the query heads
     // whose mass this GPU measures. lines is on the current device, and so is samples, int64, which holds the previous
@@ -131,15 +131,15 @@ class decode_graphs {
     // and g's page tables are page_width() wide.
     draft_output draft(const group_batch& g, const at::Tensor& hidden, bool verify_rows);
     // The verify step of g, a verify group of state_slots tokens per sequence whose sequences all draft: its rows'
-    // samples by sampling, each sequence's kept count, at most max_kept (int64 [sequences]), and its next token then
+    // samples by sampling, each sequence's accepted count, at most max_accepted_token_counts (int64 [sequences]), and its next token then
     // its drafts [sequences, state_slots], valid until the next call, with g's page mass written as model::forward
-    // writes it. A sequence keeps its pending token and its drafts while sample t equals draft t + 1, then the sample
+    // writes it. A sequence accepts its pending token and its drafts while sample t equals draft t + 1, then the sample
     // after them, through a stop token. The draft passes' RoPE positions and key counts are draft_positions and
-    // draft_key_counts, later_positions and later_key_counts (captured_step) before the kept counts are added.
+    // draft_key_counts, later_positions and later_key_counts (captured_step) before the accepted counts are added.
     std::tuple<at::Tensor, at::Tensor, at::Tensor> verify_step(
         const group_batch& g,
         const sampling_inputs& sampling,
-        const at::Tensor& max_kept,
+        const at::Tensor& max_accepted_token_counts,
         const at::Tensor& draft_positions,
         const at::Tensor& draft_key_counts,
         const at::Tensor& later_positions,

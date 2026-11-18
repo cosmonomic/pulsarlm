@@ -125,8 +125,8 @@ routed_experts_counters(int64_t tokens, int64_t top_k, int64_t held_experts, int
 // Where a ragged batch's sequences keep their recurrent state. Per sequence, lines [num_seqs, >= slots + 2] int32 holds
 // slots lines holding states, then the boundary lines of its even and odd pages. history_positions (int64 [num_seqs])
 // is the history position of each sequence's first token in the batch, and rejected_tokens (int32 [num_seqs]) the
-// tokens its previous step forwarded and did not keep. A sequence continues from slot slots - 1 - min(rejected_tokens[s],
-// slots - 1): a layer keeping a state per token has a slot per token a step may not keep and one more, a layer keeping
+// tokens its previous step forwarded and did not accept. A sequence continues from slot slots - 1 - min(rejected_tokens[s],
+// slots - 1): a layer keeping a state per token has a slot per token a step may not accept and one more, a layer keeping
 // a window of inputs one slot whose window it reads rejected_tokens[s] inputs earlier. A token at history position p
 // ends a page when p + 1 is a multiple of page_size, and the state after it goes to the boundary line of page p /
 // page_size, alternating between the two.
@@ -148,7 +148,7 @@ struct state_rows {
 // silu of the causal depthwise convolution of x [tokens, channels], whose rows may lie apart, by weight [channels, 1,
 // kernel] with its taps dilation tokens apart, contiguous in x's dtype. A line of conv_pool [lines, channels, window]
 // holds the last window inputs before a sequence's next token, window at least (kernel - 1) * dilation and the extra
-// ones the inputs of up to slots - 1 tokens a step does not keep: the convolution reads those that end window -
+// ones the inputs of up to slots - 1 tokens a step does not accept: the convolution reads those that end window -
 // rejected_tokens[s] entries in. rows.slots is 1.
 at::Tensor causal_conv_cuda(
     const at::Tensor& x,

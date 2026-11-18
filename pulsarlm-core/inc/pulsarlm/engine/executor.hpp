@@ -52,7 +52,7 @@ class executor {
     // Per shard, stop_ids on its device, int64.
     std::vector<at::Tensor> stop_tokens;
     std::atomic<std::uint64_t> drafted_count{0};
-    std::atomic<std::uint64_t> accepted_count{0};
+    std::atomic<std::uint64_t> accepted_draft_count{0};
     // Per recurrent KV layer, its slots: draft_state_slots for a state, 1 for a window; 0 for a layer with pages.
     std::vector<std::size_t> state_slots;
     std::size_t slots_of(const kv_layer& layer) const noexcept;
@@ -73,7 +73,7 @@ class executor {
     digest root;
     std::vector<std::int64_t> stop_ids;
     // The steps queued on the GPUs and not written back yet, in launch order.
-    std::deque<std::unique_ptr<batch>> launched;
+    std::deque<std::unique_ptr<batch>> launched_batches;
     // The page writes write-backs spawned, at most max_store_writes at once.
     pending_writes store_writes;
     static constexpr std::size_t max_store_writes = 8;
@@ -117,8 +117,8 @@ class executor {
     task<void> enqueue_on_shard(batch& b, std::size_t shard);
     // Points b's verify entries whose sequences' previous step is launched to that step.
     void link_previous(batch& b) const;
-    // Adds the page mass of entry index of b's step, whose sequence kept kept tokens, to its sequence's layers.
-    void add_measured_mass(const batch& b, std::size_t index, std::size_t kept);
+    // Adds the page mass of entry index of b's step, whose sequence accepted accepted_count tokens, to its sequence's layers.
+    void add_measured_mass(const batch& b, std::size_t index, std::size_t accepted_count);
 
     // Syncs the pages of hashes, owners and line_ids (kv_cache::sync) on the copy streams, then ends the write in
     // store_writes and in each of writers.
@@ -187,9 +187,9 @@ class executor {
     task<std::expected<request_result, request_error>> finish(sequence& seq);
     // kv_cache::used_bytes of the executor's cache. Safe to call from any thread.
     std::size_t kv_cache_bytes() const noexcept;
-    // The drafts the verify steps written back forwarded, and those of them they kept. Safe to call from any thread.
+    // The drafts the verify steps written back forwarded, and those of them they accepted. Safe to call from any thread.
     std::uint64_t drafted_tokens() const noexcept;
-    std::uint64_t accepted_tokens() const noexcept;
+    std::uint64_t accepted_drafts() const noexcept;
 };
 
 }  // namespace pulsarlm

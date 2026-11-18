@@ -406,7 +406,7 @@ engine_stat engine::stat() const {
     return engine_stat{
         .kv_cache_bytes = exec.kv_cache_bytes(),
         .drafted_tokens = exec.drafted_tokens(),
-        .accepted_tokens = exec.accepted_tokens(),
+        .accepted_drafts = exec.accepted_drafts(),
     };
 }
 

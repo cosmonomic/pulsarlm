@@ -160,7 +160,7 @@ __device__ void gate_row(
 }
 
 // A convolution line keeps the last window inputs before a sequence's next token, the history (kernel - 1) *
-// dilation the convolution reads and the draft tokens' inputs before it; after a step that did not keep its last
+// dilation the convolution reads and the draft tokens' inputs before it; after a step that did not accept its last
 // rejected tokens, the valid inputs end window - rejected entries in.
 
 // One thread per (token, channel). Reads the lines only: conv_state_kernel writes them afterwards.

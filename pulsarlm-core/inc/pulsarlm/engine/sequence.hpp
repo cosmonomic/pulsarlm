@@ -123,11 +123,11 @@ class sequence {
     std::size_t awaited_row = 0;
     // The tokens the draft head drafted after the pending token, which the next step verifies; empty when it does not.
     std::vector<std::int64_t> drafts;
-    // The tokens the last step forwarded and did not keep (group_batch::rejected_tokens).
+    // The tokens the last step forwarded and did not accept (group_batch::rejected_tokens).
     std::size_t rejected_tokens = 0;
     // The history position before which the draft head's KV layer holds a row for every position.
     std::size_t draft_rows_end = 0;
-    // While a verify step written back has a later step launched: its kept count - 1, which the later step's recorded
+    // While a verify step written back has a later step launched: its accepted count - 1, which the later step's recorded
     // positions lag.
     std::size_t unapplied_shift = 0;
     page_eviction_policy eviction;
@@ -177,10 +177,10 @@ class sequence {
     std::size_t complete_pages(std::size_t end);
     // Recurrent KV layer layer's line holding the state at the end of head's page.
     std::uint32_t& head_state_line(std::size_t layer);
-    // After a verify step that forwarded its pending token at history position start, in tail, and its drafts: keeps
-    // after it the first kept.size() - 1 of its samples kept, the drafts they equal, and sets the next token, awaited
+    // After a verify step that forwarded its pending token at history position start, in tail, and its drafts: inserts
+    // after it the first accepted_tokens.size() - 1 of accepted_tokens, the drafts they equal, and sets the next token, awaited
     // after them in tail or pending, to the last.
-    void keep_verified(std::size_t start, std::span<const std::int64_t> kept);
+    void accept_tokens(std::size_t start, std::span<const std::int64_t> accepted_tokens);
     // Undoes the launch of the latest step, a verify step whose pending token and drafts the GPU took and which is not
     // written back: its pending token, in tail, returns to pending.
     void withdraw_latest_verify_step();

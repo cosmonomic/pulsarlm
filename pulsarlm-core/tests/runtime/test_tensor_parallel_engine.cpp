@@ -773,6 +773,6 @@ TEST_CASE("Qwen3.5 drafting with its MTP layer emits the tokens it emits without
     CHECK(got.tokens == expected.tokens);
     check_same_history(got.end_state, expected.end_state);
     const pulsarlm::engine_stat drafted = drafting->stat();
-    CHECK(drafted.accepted_tokens > 0);
-    CHECK(drafted.accepted_tokens < drafted.drafted_tokens);
+    CHECK(drafted.accepted_drafts > 0);
+    CHECK(drafted.accepted_drafts < drafted.drafted_tokens);
 }

@@ -247,11 +247,11 @@ std::uint32_t& sequence::head_state_line(std::size_t layer) {
     return layers[layer].lines[state_slots[layer] + (history_pages - 1) % 2];
 }
 
-void sequence::keep_verified(std::size_t start, std::span<const std::int64_t> kept) {
-    assert(!kept.empty() && start >= history_pages * page_size);
+void sequence::accept_tokens(std::size_t start, std::span<const std::int64_t> accepted_tokens) {
+    assert(!accepted_tokens.empty() && start >= history_pages * page_size);
     auto after = tail.begin() + static_cast<std::ptrdiff_t>(start - history_pages * page_size) + 1;
-    tail.insert(after, kept.begin(), kept.end() - 1);
-    resolve_token(start + kept.size(), kept.back());
+    tail.insert(after, accepted_tokens.begin(), accepted_tokens.end() - 1);
+    resolve_token(start + accepted_tokens.size(), accepted_tokens.back());
 }
 
 void sequence::withdraw_latest_verify_step() {

@@ -1197,7 +1197,7 @@ TEST_CASE("Qwen4-Exp drafts as a dense MTP layer a position after each row", "[m
     }
 }
 
-// A verify group of the tokens at [first, last), the previous step having forwarded rejected tokens it did not keep, in
+// A verify group of the tokens at [first, last), the previous step having forwarded rejected tokens it did not accept, in
 // an engine drafting draft_tokens tokens.
 pulsarlm::step_batch verify_batch(
     const at::Tensor& tokens,
@@ -1216,7 +1216,7 @@ pulsarlm::step_batch verify_batch(
 // Verify groups after a prefill: one keeping all its tokens, one whose drafts are wrong and keep only its first, then
 // one continuing after that first token and a shorter one ending page 2; each row's logits are the dense forward's,
 // and the layers end with its state.
-TEST_CASE("Qwen4-Exp's verify groups match a dense forward and continue from their kept tokens", "[model][cuda]") {
+TEST_CASE("Qwen4-Exp's verify groups match a dense forward and continue from their accepted tokens", "[model][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }

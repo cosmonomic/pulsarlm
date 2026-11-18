@@ -305,7 +305,7 @@ decode_graphs::capture_step(std::int64_t sequences, bool measures_mass, bool fil
         .draws = at::zeros({2, tokens}, longs),
         .filters = filters,
     };
-    captured->max_kept = at::full({sequences}, rows, longs);
+    captured->max_accepted_token_counts = at::full({sequences}, rows, longs);
     captured->draft_positions = at::zeros({tokens}, longs);
     captured->draft_key_counts = at::full({sequences}, rows + 1, longs);
     captured->later_positions = at::zeros({later, sequences}, longs);
@@ -325,14 +325,14 @@ decode_graphs::capture_step(std::int64_t sequences, bool measures_mass, bool fil
     at::Tensor samples = sample(*logits.verify_logits, captured->sampling);
     at::Tensor verified = samples.view({sequences, rows});
     at::Tensor drafted = inputs.tokens.view({sequences, rows}).narrow(1, 1, rows - 1);
-    at::Tensor kept = verified.narrow(1, 0, rows - 1).eq(drafted).to(at::kLong).cumprod(1).sum(1) + 1;
+    at::Tensor accepted_counts = verified.narrow(1, 0, rows - 1).eq(drafted).to(at::kLong).cumprod(1).sum(1) + 1;
     if (stop_tokens.numel() > 0) {
         at::Tensor stops = at::isin(verified, stop_tokens);
         at::Tensor first_stop = at::where(stops.any(1), stops.to(at::kLong).argmax(1), rows);
-        kept = at::minimum(kept, first_stop + 1);
+        accepted_counts = at::minimum(accepted_counts, first_stop + 1);
     }
-    kept = at::minimum(kept, captured->max_kept);
-    at::Tensor drafting_rows = at::arange(sequences, longs) * rows + kept - 1;
+    accepted_counts = at::minimum(accepted_counts, captured->max_accepted_token_counts);
+    at::Tensor drafting_rows = at::arange(sequences, longs) * rows + accepted_counts - 1;
     group_batch& first = captured->first_pass;
     first.tokens.copy_(samples);
     first.pos.copy_(captured->draft_positions);
@@ -347,17 +347,17 @@ decode_graphs::capture_step(std::int64_t sequences, bool measures_mass, bool fil
     group_batch& one_row = captured->later_pass;
     for (std::int64_t j = 0; j < later; j++) {
         one_row.tokens.copy_(token);
-        one_row.pos.copy_(captured->later_positions[j] + kept);
+        one_row.pos.copy_(captured->later_positions[j] + accepted_counts);
         one_row.page_tables.copy_(inputs.page_tables);
         one_row.page_positions.copy_(inputs.page_positions);
-        one_row.key_counts.copy_(every_layer(captured->later_key_counts[j] + kept));
+        one_row.key_counts.copy_(every_layer(captured->later_key_counts[j] + accepted_counts));
         draft_output following = head.draft(one_row, previous_hidden, lines);
         token = following.logits.argmax(-1);
         previous_hidden = following.hidden;
         next.push_back(token);
     }
     captured->samples = samples;
-    captured->kept = kept;
+    captured->accepted_token_counts = accepted_counts;
     captured->next_tokens = at::stack(next, 1);
     captured->graph.capture_end();
     return captured;
@@ -366,7 +366,7 @@ decode_graphs::capture_step(std::int64_t sequences, bool measures_mass, bool fil
 std::tuple<at::Tensor, at::Tensor, at::Tensor> decode_graphs::verify_step(
     const group_batch& g,
     const sampling_inputs& sampling,
-    const at::Tensor& max_kept,
+    const at::Tensor& max_accepted_token_counts,
     const at::Tensor& draft_positions,
     const at::Tensor& draft_key_counts,
     const at::Tensor& later_positions,
@@ -402,7 +402,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> decode_graphs::verify_step(
     captured->sampling.top_k.copy_(sampling.top_k);
     captured->sampling.top_p.copy_(sampling.top_p);
     captured->sampling.draws.copy_(sampling.draws);
-    captured->max_kept.copy_(max_kept);
+    captured->max_accepted_token_counts.copy_(max_accepted_token_counts);
     captured->draft_positions.copy_(draft_positions);
     captured->draft_key_counts.copy_(draft_key_counts);
     captured->later_positions.copy_(later_positions);
@@ -416,7 +416,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> decode_graphs::verify_step(
             );
         }
     }
-    return {captured->samples, captured->kept, captured->next_tokens};
+    return {captured->samples, captured->accepted_token_counts, captured->next_tokens};
 }
 
 std::pair<at::Tensor, at::Tensor> decode_graphs::decode(const group_batch& g) {

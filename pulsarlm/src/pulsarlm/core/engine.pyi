@@ -149,8 +149,8 @@ class EngineStat:
     def drafted_tokens(self) -> int:
         """The drafts verify steps forwarded since the engine started."""
     @property
-    def accepted_tokens(self) -> int:
-        """The drafts of drafted_tokens the verify steps kept."""
+    def accepted_drafts(self) -> int:
+        """The drafts of drafted_tokens the verify steps accepted."""
 
 class SamplingParams:
     temperature: float

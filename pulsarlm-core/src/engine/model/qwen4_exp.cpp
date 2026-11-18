@@ -660,7 +660,7 @@ at::Tensor qwen4_exp_model::moe(const at::Tensor& h, std::int64_t layer, const a
 // Hugging Face shifts each sequence right by k with EOS in the places before the sequence's start and before a token
 // following an EOS, so a token's k-th previous token is EOS when any of its previous k is EOS.
 // A token line keeps the last window tokens before a sequence's next one, each XOR eos_token_id: the n-gram context, and
-// in an engine that drafts, the tokens a step may not keep; after a step that did not keep its last rejected tokens,
+// in an engine that drafts, the tokens a step may not accept; after a step that did not accept its last rejected tokens,
 // the valid ones end window - rejected entries in.
 at::Tensor
 qwen4_exp_model::ngram_ids(const ple_weights& w, std::size_t token_layer, const group_batch& g, const kv& lines) const {

@@ -723,8 +723,8 @@ TEST_CASE("Qwen4-Exp drafting emits the tokens and reaches the state it does wit
     check_same_state(got.end_state, expected.end_state);
     CHECK(*plain.verify_steps == 0);
     const pulsarlm::engine_stat drafted = drafting.engine->stat();
-    CHECK(drafted.accepted_tokens > 0);
-    CHECK(drafted.accepted_tokens < drafted.drafted_tokens);
+    CHECK(drafted.accepted_drafts > 0);
+    CHECK(drafted.accepted_drafts < drafted.drafted_tokens);
     CHECK(plain.engine->stat().drafted_tokens == 0);
     // Fewer verify steps than tokens accept drafts, and more rows than tokens reject them. A graph replays the forward
     // it captured without calling it, so the counts are a run's without graphs.

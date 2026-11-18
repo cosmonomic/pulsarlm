@@ -24,7 +24,7 @@ class scheduler {
     std::optional<event> join_event;
     // The sequences of the launched step not written back yet, none when no step is, and whether that step allows
     // overlap (executor::allows_overlap).
-    std::vector<sequence*> in_flight;
+    std::vector<sequence*> in_flight_sequences;
     bool in_flight_allows_overlap = false;
 
     static event& emplace_event(std::optional<event>& waited);

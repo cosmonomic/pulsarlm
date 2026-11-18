@@ -68,7 +68,7 @@ struct group_batch {
     at::Tensor page_tables;
     // int64 [num_seqs]: the history position of each sequence's first token in the group.
     at::Tensor history_positions;
-    // int32 [num_seqs]: the tokens each sequence's previous step forwarded and did not keep.
+    // int32 [num_seqs]: the tokens each sequence's previous step forwarded and did not accept.
     at::Tensor rejected_tokens;
     std::int64_t page_size = 0;
     // The slots of a recurrent layer keeping a state; a window layer keeps one.

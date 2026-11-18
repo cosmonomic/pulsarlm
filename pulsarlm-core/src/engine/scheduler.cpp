@@ -54,7 +54,8 @@ task<void> scheduler::submit(request r, result_writer writer) {
 task<void> scheduler::run() {
     for (;;) {
         std::vector<batch_entry> entries = next_entries();
-        if (!in_flight.empty() && (entries.empty() || !in_flight_allows_overlap || !exec.allows_overlap(entries))) {
+        if (!in_flight_sequences.empty() &&
+            (entries.empty() || !in_flight_allows_overlap || !exec.allows_overlap(entries))) {
             co_await retire();
             continue;
         }
@@ -68,17 +69,17 @@ task<void> scheduler::run() {
         }
         const bool allows_overlap = exec.allows_overlap(entries);
         co_await exec.launch(std::move(entries));
-        if (!in_flight.empty()) {
+        if (!in_flight_sequences.empty()) {
             co_await retire();
         }
-        in_flight = std::move(stepped);
+        in_flight_sequences = std::move(stepped);
         in_flight_allows_overlap = allows_overlap;
     }
 }
 
 task<void> scheduler::retire() {
-    std::vector<sequence*> stepped = std::move(in_flight);
-    in_flight.clear();
+    std::vector<sequence*> stepped = std::move(in_flight_sequences);
+    in_flight_sequences.clear();
     co_await exec.write_back();
     for (sequence* seq : stepped) {
         if (!seq->end_reason && seq->writer.cancelled()) {

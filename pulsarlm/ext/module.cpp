@@ -239,7 +239,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
     py::class_<engine_stat>(m, "EngineStat")
         .def_readonly("kv_cache_bytes", &engine_stat::kv_cache_bytes)
         .def_readonly("drafted_tokens", &engine_stat::drafted_tokens)
-        .def_readonly("accepted_tokens", &engine_stat::accepted_tokens);
+        .def_readonly("accepted_drafts", &engine_stat::accepted_drafts);
 
     py::native_enum<request_error>(m, "RequestError", "enum.Enum")
         .value("MISS", request_error::miss)
