@@ -49,6 +49,7 @@ group_batch to_device(const group_batch& host, at::Device device) {
         .history_positions = to_device(host.history_positions, device),
         .rejected_tokens = to_device(host.rejected_tokens, device),
         .page_size = host.page_size,
+        .state_slots = host.state_slots,
         .cu_seqlens_q = to_device(host.cu_seqlens_q, device),
         .key_counts = to_device(host.key_counts, device),
         .cu_view_pages = to_device(host.cu_view_pages, device),
@@ -133,9 +134,15 @@ class executor::batch {
     bool decode_replays = false;
 
     // With graph_pages, a decode group whose tables fit graph_pages pages takes tables that wide and replays a graph.
-    batch(std::span<const batch_entry> step_entries, std::size_t page_size, std::optional<std::size_t> graph_pages);
+    batch(
+        std::span<const batch_entry> step_entries,
+        std::size_t page_size,
+        std::size_t state_slots,
+        std::optional<std::size_t> graph_pages
+    );
 
-    static group_batch make_group(std::span<const batch_entry> group, std::size_t page_size, bool prefill);
+    static group_batch
+    make_group(std::span<const batch_entry> group, std::size_t page_size, std::size_t state_slots, bool prefill);
     // The widest table among the group's sequences.
     static std::size_t table_width(std::span<const batch_entry> group) noexcept;
     static bool measures_mass(std::span<const batch_entry> group) noexcept;
@@ -179,6 +186,13 @@ class executor::batch {
     friend class executor;
 };
 
+std::size_t executor::slots_of(const kv_layer& layer) const noexcept {
+    if (!layer.state) {
+        return 0;
+    }
+    return layer.state->input_window ? 1 : draft_state_slots;
+}
+
 executor::executor(
     std::vector<model*>&& shards,
     kv_cache cache,
@@ -188,7 +202,8 @@ executor::executor(
     std::vector<event_loop*>&& worker_loops,
     digest root,
     std::vector<std::int64_t>&& stop_ids,
-    std::optional<std::size_t> graph_pages
+    std::optional<std::size_t> graph_pages,
+    std::size_t draft_tokens
 )
 : shards(std::move(shards)),
   cache(std::move(cache)),
@@ -199,7 +214,8 @@ executor::executor(
   page_size(0),
   root(root),
   stop_ids(std::move(stop_ids)),
-  graph_pages(graph_pages) {
+  graph_pages(graph_pages),
+  draft_state_slots(draft_tokens + 1) {
     assert(this->shards.size() == this->cache.shard_count() && this->streams.size() == this->shards.size());
     assert(this->worker_loops.size() + 1 == this->shards.size());
     shard_mass_heads.resize(this->shards.size());
@@ -216,7 +232,7 @@ executor::executor(
             if (shard == 0) {
                 sliding_windows.push_back(layers[layer].sliding_window);
                 recurrent.push_back(layer_recurrent);
-                state_slots.push_back(layer_recurrent ? layers[layer].state->slots : 0);
+                state_slots.push_back(slots_of(layers[layer]));
                 mirrors.push_back(layers[layer].mirrors_held_pages);
                 mass_heads.push_back(0);
                 if (page_size == 0 && !layer_recurrent) {
@@ -225,7 +241,7 @@ executor::executor(
             }
             assert(sliding_windows[layer] == layers[layer].sliding_window && recurrent[layer] == layer_recurrent);
             assert(mirrors[layer] == layers[layer].mirrors_held_pages);
-            assert(state_slots[layer] == (layer_recurrent ? layers[layer].state->slots : 0));
+            assert(state_slots[layer] == slots_of(layers[layer]));
             mass_heads[layer] += shard_mass_heads[shard].back();
         }
     }
@@ -243,6 +259,7 @@ executor::executor(
                     lines[shard],
                     *graph_pages,
                     page_size,
+                    draft_state_slots,
                     shard_mass_heads[shard],
                     samples[shard]
                 )
@@ -255,6 +272,7 @@ executor::executor(
 executor::batch::batch(
     std::span<const batch_entry> step_entries,
     std::size_t page_size,
+    std::size_t state_slots,
     std::optional<std::size_t> graph_pages
 )
 : entries(step_entries.begin(), step_entries.end()) {
@@ -264,7 +282,7 @@ executor::batch::batch(
     decode_count = static_cast<std::size_t>(first_prefill - entries.begin());
     std::span<const batch_entry> entry_span(entries);
     if (decode_count > 0) {
-        inputs.decode_group = make_group(entry_span.first(decode_count), page_size, false);
+        inputs.decode_group = make_group(entry_span.first(decode_count), page_size, state_slots, false);
         decode_width = table_width(entry_span.first(decode_count));
         decode_replays = graph_pages && decode_width <= *graph_pages;
         if (decode_replays) {
@@ -272,7 +290,7 @@ executor::batch::batch(
         }
     }
     if (entries.size() > decode_count) {
-        inputs.prefill_group = make_group(entry_span.subspan(decode_count), page_size, true);
+        inputs.prefill_group = make_group(entry_span.subspan(decode_count), page_size, state_slots, true);
     }
     awaits_tokens = std::ranges::any_of(entry_span.first(decode_count), [](const batch_entry& e) {
         return e.seq->pending_tokens.front() == sequence::awaited_token;
@@ -285,7 +303,12 @@ executor::batch::batch(
     }
 }
 
-group_batch executor::batch::make_group(std::span<const batch_entry> group, std::size_t page_size, bool prefill) {
+group_batch executor::batch::make_group(
+    std::span<const batch_entry> group,
+    std::size_t page_size,
+    std::size_t state_slots,
+    bool prefill
+) {
     std::size_t token_count = 0;
     for (const batch_entry& e : group) {
         token_count += e.token_count;
@@ -335,6 +358,7 @@ group_batch executor::batch::make_group(std::span<const batch_entry> group, std:
     g.rejected_tokens = pinned({n_seqs}, at::kInt);
     g.rejected_tokens.zero_();
     g.page_size = static_cast<std::int64_t>(page_size);
+    g.state_slots = static_cast<std::int64_t>(state_slots);
     if (measures_mass(group)) {
         g.cu_view_pages = pinned({n_kv_layers, n_seqs + 1}, at::kInt);
         g.query_weights = pinned({n_tokens}, at::kFloat);
@@ -904,7 +928,7 @@ void executor::advance(batch& b) {
 // Shard 0 queues on the executor's thread while the others queue on their own, so every shard's kernels launch at
 // once. Each shard's completion is taken once every shard has queued, before any later step queues.
 task<void> executor::launch(std::vector<batch_entry> entries) {
-    std::unique_ptr<batch> b(new batch(entries, page_size, graph_pages));
+    std::unique_ptr<batch> b(new batch(entries, page_size, draft_state_slots, graph_pages));
     b->quiet = quiet(b->entries);
     advance(*b);
     b->shard_decode_mass.assign(shards.size(), at::Tensor());

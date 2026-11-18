@@ -141,7 +141,8 @@ struct state_rows {
 // The Gated DeltaNet ops run a ragged batch: sequence s holds tokens [cu_seqlens_q[s], cu_seqlens_q[s + 1]) of x, or
 // token s alone without cu_seqlens_q; a verify op's batch holds tokens_per_sequence tokens of each sequence in turn. The
 // state after the batch's last token of a sequence goes to its last slot, the state after its newest page end to that
-// page's boundary line; a verify op writes the state after each token t of a sequence into slot t instead. A pool's
+// page's boundary line; a verify op of n tokens per sequence also writes the state after each token t into slot slots - n
+// + t. A pool's
 // lines lie any number of elements apart, a state pool's lines 16-byte aligned.
 
 // silu of the causal depthwise convolution of x [tokens, channels], whose rows may lie apart, by weight [channels, 1,
@@ -195,7 +196,7 @@ at::Tensor gated_delta_rule_cuda(
 );
 
 // gated_delta_rule_cuda over tokens_per_sequence tokens of each sequence, at most rows.slots, writing the state after
-// each token t into slot t.
+// each token t into slot rows.slots - tokens_per_sequence + t.
 at::Tensor gated_delta_rule_verify_cuda(
     const at::Tensor& x,
     const at::Tensor& a,

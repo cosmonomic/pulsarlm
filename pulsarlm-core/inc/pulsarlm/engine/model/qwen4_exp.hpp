@@ -135,9 +135,6 @@ class qwen4_exp_model : public model, public draft_head {
     };
 
     qwen4_exp_config config;
-    // The tokens a verify group drafts after each sequence's token; the recurrent layers keep a state per token of a
-    // verify group, and their windows draft_tokens more inputs.
-    std::int64_t draft_tokens;
     communicator comm;
     shard_heads heads;
     std::int64_t n_layers;
@@ -203,12 +200,7 @@ class qwen4_exp_model : public model, public draft_head {
   public:
     // weights are this GPU's parts, on the lines' device, in the attention lines' dtype; the PLE buffers are int64.
     // Throws std::invalid_argument when a split part is not a whole number of heads.
-    qwen4_exp_model(
-        qwen4_exp_config config,
-        const c10::Dict<std::string, at::Tensor>& weights,
-        std::int64_t draft_tokens,
-        communicator comm = {}
-    );
+    qwen4_exp_model(qwen4_exp_config config, const c10::Dict<std::string, at::Tensor>& weights, communicator comm = {});
 
     std::vector<kv_layer> kv_layers() const override;
     std::vector<kv_layer_shard> kv_layer_shards() const override;

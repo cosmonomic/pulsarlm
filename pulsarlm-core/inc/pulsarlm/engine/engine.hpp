@@ -41,7 +41,8 @@ struct engine_stat {
 using model_shard_loader =
     std::function<std::unordered_map<std::string, at::Tensor>(std::size_t rank, std::size_t size)>;
 
-// The page shape of each KV layer, one layer each.
+// The page shape of each KV layer, one layer each; a recurrent layer keeping a window of inputs keeps
+// config.draft_tokens more of them (recurrent_state).
 std::vector<page_shape> page_shapes(const engine_config& config, std::span<const kv_layer> layers);
 
 // Serves requests on a loop thread it owns, with one more loop thread per shard past the first. Once the loops exit,

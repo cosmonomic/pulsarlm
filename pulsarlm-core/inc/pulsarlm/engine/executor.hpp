@@ -44,8 +44,11 @@ class executor {
     std::optional<std::size_t> graph_pages;
     std::vector<std::optional<std::size_t>> sliding_windows;
     std::vector<bool> recurrent;
-    // Per KV layer, its recurrent_state::slots when it is recurrent, 0 otherwise.
+    // The slots of a recurrent layer keeping a state: one per token a step drafts, and one more.
+    std::size_t draft_state_slots;
+    // Per recurrent KV layer, its slots: draft_state_slots for a state, 1 for a window; 0 for a layer with pages.
     std::vector<std::size_t> state_slots;
+    std::size_t slots_of(const kv_layer& layer) const noexcept;
     // Per KV layer, whether it mirrors the pages the other attention layers hold (kv_layer::mirrors_held_pages).
     std::vector<bool> mirrors;
     // Per KV layer, the query heads it measures mass and evicts pages in: those of every attention layer reading a
@@ -129,7 +132,8 @@ class executor {
     // to the store on copy_streams[s], which the caller synchronizes before freeing what the copies read; the cache holds one layer
     // per entry of each model's kv_layers(), and the shards agree on which layers are recurrent or sliding. store is the
     // cache's. root is the engine's root digest (make_root_digest). With graph_pages, a decode group whose sequences'
-    // tables fit graph_pages pages replays a decode_graphs graph over tables that wide.
+    // tables fit graph_pages pages replays a decode_graphs graph over tables that wide. A step drafts at most
+    // draft_tokens tokens per sequence, and the cache's recurrent layers are laid out for them (recurrent_state).
     executor(
         std::vector<model*>&& shards,
         kv_cache cache,
@@ -139,7 +143,8 @@ class executor {
         std::vector<event_loop*>&& worker_loops,
         digest root,
         std::vector<std::int64_t>&& stop_ids,
-        std::optional<std::size_t> graph_pages
+        std::optional<std::size_t> graph_pages,
+        std::size_t draft_tokens
     );
     ~executor();
 

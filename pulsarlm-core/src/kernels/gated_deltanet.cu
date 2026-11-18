@@ -493,7 +493,7 @@ __global__ void __launch_bounds__(kStepThreads) delta_rule_step_kernel(
             }
         }
         if (verify) {
-            store(block.state(p, p.lines.slot(block.s, t)) + block_column, state);
+            store(block.state(p, p.lines.slot(block.s, p.lines.slots - count + t)) + block_column, state);
         }
         if (p.lines.page_end_tokens(block.s, t + 1) == t + 1) {
             store(block.state(p, p.lines.boundary(block.s, t + 1)) + block_column, state);

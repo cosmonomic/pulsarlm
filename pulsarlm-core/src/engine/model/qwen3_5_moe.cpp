@@ -126,6 +126,7 @@ qwen3_5_moe_model::qwen3_5_moe_model(qwen3_5_moe_config config, const c10::Dict<
                     .state = recurrent_state{
                         .sizes = {conv_channels, c.linear_conv_kernel - 1},
                         .dtype = embed_tokens.scalar_type(),
+                        .input_window = true,
                     },
                 }
             );
@@ -197,7 +198,7 @@ at::Tensor qwen3_5_moe_model::deltanet(
         at::linear(h, w.in_proj_qkv),
         w.conv,
         lines[conv_layer].k,
-        recurrent_rows(g, conv_layer, 1),
+        window_layer_rows(g, conv_layer),
         cu_seqlens_q,
         /*dilation=*/1
     );
@@ -208,7 +209,7 @@ at::Tensor qwen3_5_moe_model::deltanet(
         w.dt_bias,
         w.neg_a,
         lines[state_layer].k,
-        recurrent_rows(g, state_layer, 1),
+        state_layer_rows(g, state_layer),
         cu_seqlens_q,
         c.linear_n_key_heads,
         at::linear(h, w.in_proj_z),

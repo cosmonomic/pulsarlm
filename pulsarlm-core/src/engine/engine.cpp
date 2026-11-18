@@ -107,6 +107,13 @@ std::vector<at::Device> checked_devices(const engine_config& config, std::size_t
     return config.devices;
 }
 
+std::size_t checked_draft_tokens(const engine_config& config, const std::vector<std::unique_ptr<model>>& shards) {
+    if (config.draft_tokens > 0 && shards.front()->drafter() == nullptr) {
+        throw std::invalid_argument("the engine drafts tokens, and the model has no drafter");
+    }
+    return config.draft_tokens;
+}
+
 // From the high-priority pool with high_priority, apart from the compute streams of the low-priority one.
 std::vector<cudaStream_t> make_streams(std::span<const at::Device> devices, bool high_priority) {
     std::vector<cudaStream_t> streams;
@@ -200,6 +207,10 @@ std::vector<page_shape> page_shapes(const engine_config& config, std::span<const
     std::vector<page_shape> shapes;
     for (const kv_layer& layer : layers) {
         if (layer.state) {
+            std::vector<std::int64_t> state_sizes = layer.state->sizes;
+            if (layer.state->input_window) {
+                state_sizes.back() += static_cast<std::int64_t>(config.draft_tokens);
+            }
             shapes.push_back(
                 page_shape{
                     .n_layers = 1,
@@ -208,7 +219,7 @@ std::vector<page_shape> page_shapes(const engine_config& config, std::span<const
                     .head_dim = 0,
                     .dtype = layer.state->dtype,
                     .values_only = true,
-                    .state_sizes = layer.state->sizes,
+                    .state_sizes = state_sizes,
                 }
             );
             continue;
@@ -291,7 +302,8 @@ engine::engine(
       loop_pointers(worker_loops),
       make_root_digest(config.model_name, config.model_hash, page_shapes(config, full_layers(*this->shards.front()))),
       std::vector<std::int64_t>(config.stop_ids),
-      graph_pages(config)
+      graph_pages(config),
+      checked_draft_tokens(config, this->shards)
   ),
   sched(exec, config.prefill_tokens_per_step) {
     for (std::size_t shard = 1; shard < devices.size(); shard++) {

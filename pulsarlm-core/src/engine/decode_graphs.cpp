@@ -25,6 +25,7 @@ decode_graphs::decode_graphs(
     std::span<const kv> lines,
     std::size_t width,
     std::size_t page_size,
+    std::size_t state_slots,
     std::vector<std::size_t> mass_heads,
     at::Tensor samples
 )
@@ -33,6 +34,7 @@ decode_graphs::decode_graphs(
   samples(std::move(samples)),
   width(static_cast<std::int64_t>(width)),
   page_size(static_cast<std::int64_t>(page_size)),
+  state_slots(static_cast<std::int64_t>(state_slots)),
   mass_heads(std::move(mass_heads)) {
     auto floats = this->lines.front().k.options().dtype(at::kFloat);
     const std::int64_t rows = startup_sequences * this->width;
@@ -60,6 +62,7 @@ group_batch decode_graphs::make_inputs(std::int64_t sequences, bool measures_mas
         .history_positions = at::zeros({sequences}, longs),
         .rejected_tokens = at::zeros({sequences}, ints),
         .page_size = page_size,
+        .state_slots = state_slots,
         .key_counts = at::ones({layers, sequences}, ints),
         .page_positions = at::zeros({layers, sequences, width}, ints),
         .arrival_counters = at::zeros({shard_model.arrival_counter_count(sequences, sequences)}, ints),
@@ -139,7 +142,10 @@ at::Tensor decode_graphs::forward(const group_batch& g) {
     inputs.tokens.copy_(g.tokens);
     inputs.pos.copy_(g.pos);
     inputs.page_tables.copy_(g.page_tables);
-    TORCH_CHECK(g.page_size == page_size, "decode_graphs: the group's pages are not the graphs' page size");
+    TORCH_CHECK(
+        g.page_size == page_size && g.state_slots == state_slots,
+        "decode_graphs: the group's page size or state slots are not the graphs'"
+    );
     inputs.history_positions.copy_(g.history_positions);
     inputs.rejected_tokens.copy_(g.rejected_tokens);
     inputs.key_counts.copy_(g.key_counts);

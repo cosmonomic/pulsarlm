@@ -237,6 +237,7 @@ void check_against_dense(at::ScalarType dtype, double tolerance, bool graphs) {
         kv,
         view_lines.size(),
         page_size,
+        /*state_slots=*/1,
         std::vector<std::size_t>(n_layers, static_cast<std::size_t>(n_heads)),
         samples
     );

@@ -15,8 +15,9 @@ namespace pulsarlm {
 struct recurrent_state {
     std::vector<std::int64_t> sizes;
     at::ScalarType dtype;
-    // The lines holding states a sequence keeps, besides its two boundary lines (state_rows).
-    std::size_t slots = 1;
+    // Whether a line holds a window of the last sizes.back() inputs before a sequence's next token rather than a
+    // state. The engine drafting k tokens a step widens a window by k inputs and keeps a state in k + 1 slots.
+    bool input_window = false;
 
     bool operator==(const recurrent_state&) const = default;
 };
@@ -70,6 +71,8 @@ struct group_batch {
     // int32 [num_seqs]: the tokens each sequence's previous step forwarded and did not keep.
     at::Tensor rejected_tokens;
     std::int64_t page_size = 0;
+    // The slots of a recurrent layer keeping a state; a window layer keeps one.
+    std::int64_t state_slots = 1;
     // int32 [num_seqs + 1]; prefill groups only.
     at::Tensor cu_seqlens_q;
     // int32 [n_kv_layers, num_seqs]: the keys in sequence s's view in KV layer l, the group's tokens included.

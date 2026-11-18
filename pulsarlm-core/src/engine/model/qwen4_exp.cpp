@@ -66,11 +66,9 @@ std::int64_t split(std::int64_t count, std::int64_t parts, const char* what) {
 qwen4_exp_model::qwen4_exp_model(
     qwen4_exp_config config,
     const c10::Dict<std::string, at::Tensor>& weights,
-    std::int64_t draft_tokens,
     communicator comm
 )
 : config(std::move(config)),
-  draft_tokens(draft_tokens),
   comm(std::move(comm)),
   n_layers(static_cast<std::int64_t>(this->config.layer_types.size())),
   embed_tokens(need(weights, "embed_tokens.weight")) {
@@ -147,23 +145,26 @@ qwen4_exp_model::qwen4_exp_model(
         };
     };
     hyper_connection_mixer = mixer_named(prefix + "hyper_connection_mixer.");
-    auto recurrent = [](std::vector<std::int64_t> sizes, at::ScalarType dtype, std::int64_t slots = 1) {
+    auto state_layer = [](std::vector<std::int64_t> sizes, at::ScalarType dtype) {
         return kv_layer{
             .n_kv_heads = 0,
             .head_dim = 0,
-            .state = recurrent_state{
-                .sizes = std::move(sizes),
-                .dtype = dtype,
-                .slots = static_cast<std::size_t>(slots)
-            }
+            .state = recurrent_state{.sizes = std::move(sizes), .dtype = dtype},
+        };
+    };
+    auto window_layer = [](std::vector<std::int64_t> sizes, at::ScalarType dtype) {
+        return kv_layer{
+            .n_kv_heads = 0,
+            .head_dim = 0,
+            .state = recurrent_state{.sizes = std::move(sizes), .dtype = dtype, .input_window = true},
         };
     };
     auto add_kv_layer = [&](kv_layer layer, kv_layer full, std::vector<std::pair<std::size_t, std::size_t>> held) {
         kv_specs.push_back(std::move(layer));
         kv_shards.push_back(kv_layer_shard{.full = std::move(full), .rows = std::move(held)});
     };
-    auto whole = [&](std::vector<std::int64_t> sizes, at::ScalarType dtype) {
-        kv_layer layer = recurrent(std::move(sizes), dtype);
+    auto whole_window = [&](std::vector<std::int64_t> sizes, at::ScalarType dtype) {
+        kv_layer layer = window_layer(std::move(sizes), dtype);
         std::int64_t first_size = layer.state->sizes.front();
         add_kv_layer(layer, layer, {rows(0, first_size)});
     };
@@ -252,25 +253,14 @@ qwen4_exp_model::qwen4_exp_model(
                 .out_proj = need_named(weights, p + "linear_attn.out_proj.weight"),
             };
             add_kv_layer(
-                recurrent(
-                    {heads.linear_n_value_heads, c.linear_key_head_dim, c.linear_value_head_dim},
-                    at::kFloat,
-                    draft_tokens + 1
-                ),
-                recurrent(
-                    {c.linear_n_value_heads, c.linear_key_head_dim, c.linear_value_head_dim},
-                    at::kFloat,
-                    draft_tokens + 1
-                ),
+                state_layer({heads.linear_n_value_heads, c.linear_key_head_dim, c.linear_value_head_dim}, at::kFloat),
+                state_layer({c.linear_n_value_heads, c.linear_key_head_dim, c.linear_value_head_dim}, at::kFloat),
                 {rows(rank * heads.linear_n_value_heads, heads.linear_n_value_heads)}
             );
             add_kv_layer(
-                recurrent(
-                    {2 * key_channels + value_channels, c.linear_conv_kernel - 1 + draft_tokens},
-                    embed_tokens.scalar_type()
-                ),
-                recurrent(
-                    {2 * full_key_channels + full_value_channels, c.linear_conv_kernel - 1 + draft_tokens},
+                window_layer({2 * key_channels + value_channels, c.linear_conv_kernel - 1}, embed_tokens.scalar_type()),
+                window_layer(
+                    {2 * full_key_channels + full_value_channels, c.linear_conv_kernel - 1},
                     embed_tokens.scalar_type()
                 ),
                 {rows(rank * key_channels, key_channels),
@@ -302,8 +292,8 @@ qwen4_exp_model::qwen4_exp_model(
                 throw std::invalid_argument("qwen4_exp_model: the n-gram buffers must match ngram_size");
             }
             const std::int64_t history = (w.ple->conv.size(2) - 1) * c.ngram_size;
-            whole({c.hc_count * c.hidden_size, history + draft_tokens}, embed_tokens.scalar_type());
-            whole({c.ngram_size - 1 + draft_tokens}, at::kLong);
+            whole_window({c.hc_count * c.hidden_size, history}, embed_tokens.scalar_type());
+            whole_window({c.ngram_size - 1}, at::kLong);
         }
         layers.push_back(std::move(w));
     };
@@ -576,7 +566,7 @@ at::Tensor qwen4_exp_model::deltanet(
         projected.narrow(1, 0, channels),
         w.conv,
         lines[conv_layer].k,
-        recurrent_rows(g, conv_layer, 1),
+        window_layer_rows(g, conv_layer),
         cu_seqlens_q,
         /*dilation=*/1
     );
@@ -587,7 +577,7 @@ at::Tensor qwen4_exp_model::deltanet(
         w.dt_bias,
         w.neg_a,
         lines[state_layer].k,
-        recurrent_rows(g, state_layer, draft_tokens + 1),
+        state_layer_rows(g, state_layer),
         cu_seqlens_q,
         heads.linear_n_key_heads,
         projected.narrow(1, channels + 2 * value_heads, value_heads * c.linear_value_head_dim),
@@ -626,9 +616,9 @@ at::Tensor qwen4_exp_model::moe(const at::Tensor& h, std::int64_t layer, const a
 
 // Hugging Face shifts each sequence right by k with EOS in the places before the sequence's start and before a token
 // following an EOS, so a token's k-th previous token is EOS when any of its previous k is EOS.
-// A token line keeps the last window tokens before a sequence's next one, each XOR eos_token_id, the n-gram context and
-// the tokens of up to draft_tokens tokens a step does not keep; after a step that did not keep its last rejected
-// tokens, the valid ones end window - rejected entries in.
+// A token line keeps the last window tokens before a sequence's next one, each XOR eos_token_id: the n-gram context, and
+// in an engine that drafts, the tokens a step may not keep; after a step that did not keep its last rejected tokens,
+// the valid ones end window - rejected entries in.
 at::Tensor
 qwen4_exp_model::ngram_ids(const ple_weights& w, std::size_t token_layer, const group_batch& g, const kv& lines) const {
     const std::int64_t ntok = g.tokens.size(0);
@@ -725,7 +715,7 @@ qwen4_exp_model::ple(const at::Tensor& x, std::int64_t layer, const group_batch&
         stream_norm(gated, w.norm_conv),
         w.conv,
         lines[conv_layer].k,
-        recurrent_rows(g, conv_layer, 1),
+        window_layer_rows(g, conv_layer),
         cu_seqlens_q,
         c.ngram_size
     );

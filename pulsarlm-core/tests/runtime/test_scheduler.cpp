@@ -150,7 +150,7 @@ const std::vector<pulsarlm::kv_layer> recurrent_and_full{
     pulsarlm::kv_layer{
         .n_kv_heads = 1,
         .head_dim = 2,
-        .state = pulsarlm::recurrent_state{.sizes = {1}, .dtype = at::kFloat, .slots = 2},
+        .state = pulsarlm::recurrent_state{.sizes = {1}, .dtype = at::kFloat},
     },
     pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .n_q_heads = 1},
 };
@@ -379,7 +379,7 @@ class sum_model final : public pulsarlm::model {
         for (std::size_t layer = 0; layer < lines.size(); layer++) {
             tables.push_back(all_tables[static_cast<std::int64_t>(layer)]);
             if (layers[layer].state) {
-                state_sums = run_state(g, lines[layer], tables.back(), layers[layer].state->slots);
+                state_sums = run_state(g, lines[layer], tables.back());
                 continue;
             }
             auto table = tables.back().accessor<std::int32_t, 2>();
@@ -503,7 +503,7 @@ class sum_model final : public pulsarlm::model {
     // the sum after its last token into its last slot, and the sum at its newest page end into that page's boundary
     // line.
     static std::vector<double>
-    run_state(const pulsarlm::group_batch& g, const pulsarlm::kv& lines, const at::Tensor& rows, std::size_t slots) {
+    run_state(const pulsarlm::group_batch& g, const pulsarlm::kv& lines, const at::Tensor& rows) {
         at::Tensor tokens = g.tokens.cpu();
         at::Tensor history_positions = g.history_positions.cpu();
         at::Tensor rejected_tokens = g.rejected_tokens.cpu();
@@ -515,7 +515,7 @@ class sum_model final : public pulsarlm::model {
         auto query_start = query_starts.accessor<std::int32_t, 1>();
         auto table = rows.accessor<std::int32_t, 2>();
         auto state = states.accessor<float, 2>();
-        const auto last_slot = static_cast<std::int64_t>(slots) - 1;
+        const std::int64_t last_slot = g.state_slots - 1;
         std::vector<double> sums;
         for (std::int64_t s = 0; s < rows.size(0); s++) {
             double sum = state[table[s][last_slot - std::min<std::int64_t>(rejected[s], last_slot)]][0];
@@ -594,6 +594,10 @@ struct fixture {
     pulsarlm::executor exec;
     pulsarlm::scheduler sched;
 
+    // The executor is laid out for one drafted token, so a recurrent layer keeps its state in the second of two slots;
+    // no step drafts.
+    static constexpr std::size_t draft_tokens = 1;
+
     // The pool has room for n_lines lines of every KV layer unless pool_bytes sizes it.
     explicit fixture(
         std::size_t n_lines,
@@ -615,7 +619,8 @@ struct fixture {
           {},
           root(),
           std::move(stop_ids),
-          std::nullopt
+          std::nullopt,
+          draft_tokens
       ),
       sched(exec, prefill_tokens_per_step) {}
 

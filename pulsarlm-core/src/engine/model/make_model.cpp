@@ -46,7 +46,7 @@ std::unique_ptr<model> make_model(
         return std::make_unique<qwen3_5_model>(*qwen, weight_dict, comm);
     }
     if (const auto* qwen = std::get_if<qwen4_exp_config>(&any_config)) {
-        return std::make_unique<qwen4_exp_model>(*qwen, weight_dict, /*draft_tokens=*/0, comm);
+        return std::make_unique<qwen4_exp_model>(*qwen, weight_dict, comm);
     }
     if (comm.size() > 1) {
         throw std::invalid_argument("only Qwen3.5 and Qwen4-Exp models split across GPUs");

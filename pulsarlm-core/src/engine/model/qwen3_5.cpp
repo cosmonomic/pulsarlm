@@ -266,6 +266,7 @@ qwen3_5_model::qwen3_5_model(
                                         {2 * full_key_dim + c.linear_n_value_heads * c.linear_value_head_dim,
                                          c.linear_conv_kernel - 1},
                                     .dtype = embed_tokens.scalar_type(),
+                                    .input_window = true,
                                 },
                         },
                     .rows = {
@@ -362,7 +363,7 @@ at::Tensor qwen3_5_model::deltanet(
         w.in_proj_qkv.apply(h),
         w.conv,
         lines[conv_layer].k,
-        recurrent_rows(g, conv_layer, 1),
+        window_layer_rows(g, conv_layer),
         cu_seqlens_q,
         /*dilation=*/1
     );
@@ -373,7 +374,7 @@ at::Tensor qwen3_5_model::deltanet(
         w.dt_bias,
         w.neg_a,
         lines[state_layer].k,
-        recurrent_rows(g, state_layer, 1),
+        state_layer_rows(g, state_layer),
         cu_seqlens_q,
         linear_n_key_heads,
         w.in_proj_z.apply(h),

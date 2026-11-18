@@ -39,8 +39,10 @@ at::Tensor paged_attention(
     const std::optional<at::Tensor>& k_norm_weight = std::nullopt
 );
 
-// KV layer kv_layer's state rows of g, each sequence keeping slots state lines.
-state_rows recurrent_rows(const group_batch& g, std::size_t kv_layer, std::int64_t slots);
+// The state rows of g of KV layer kv_layer, a recurrent layer keeping a state.
+state_rows state_layer_rows(const group_batch& g, std::size_t kv_layer);
+// The state rows of g of KV layer kv_layer, a recurrent layer keeping a window of inputs.
+state_rows window_layer_rows(const group_batch& g, std::size_t kv_layer);
 
 // The rows of x whose logits g asks for.
 at::Tensor logit_inputs(const at::Tensor& x, const group_batch& g);

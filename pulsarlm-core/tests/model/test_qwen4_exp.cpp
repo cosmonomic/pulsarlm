@@ -606,26 +606,29 @@ pulsarlm::qwen4_exp_config model_config(const split_dims& dims, std::int64_t exp
     };
 }
 
-// A step of the single sequence forwarding the tokens at positions [first, last).
+// The slots of a recurrent layer of spec in an engine drafting draft_tokens tokens.
+std::size_t slots_of(const pulsarlm::kv_layer& spec, std::int64_t draft_tokens) {
+    return spec.state->input_window ? 1 : static_cast<std::size_t>(draft_tokens) + 1;
+}
+
+// A step of the single sequence forwarding the tokens at positions [first, last), in an engine drafting draft_tokens
+// tokens.
 pulsarlm::group_batch step(
     const at::Tensor& tokens,
     std::int64_t first,
     std::int64_t last,
     bool prefill,
-    const std::vector<pulsarlm::kv_layer>& specs
+    const std::vector<pulsarlm::kv_layer>& specs,
+    std::int64_t draft_tokens
 ) {
-    std::size_t width = view_lines.size();
-    for (const pulsarlm::kv_layer& spec : specs) {
-        if (spec.state) {
-            width = std::max(width, spec.state->slots + 2);
-        }
-    }
+    std::size_t width = std::max(view_lines.size(), static_cast<std::size_t>(draft_tokens) + 3);
     std::vector<std::int32_t> rows;
     for (const pulsarlm::kv_layer& spec : specs) {
         const std::size_t row_end = rows.size() + width;
         if (spec.state) {
-            REQUIRE(spec.state->slots <= earlier_slot_lines.size() + 1);
-            rows.insert(rows.end(), earlier_slot_lines.begin(), earlier_slot_lines.begin() + spec.state->slots - 1);
+            const std::size_t slots = slots_of(spec, draft_tokens);
+            REQUIRE(slots <= earlier_slot_lines.size() + 1);
+            rows.insert(rows.end(), earlier_slot_lines.begin(), earlier_slot_lines.begin() + slots - 1);
             rows.insert(rows.end(), {running_line, boundary_line, odd_boundary_line});
         } else {
             rows.insert(rows.end(), view_lines.begin(), view_lines.end());
@@ -641,6 +644,7 @@ pulsarlm::group_batch step(
         .history_positions = at::full({1}, first, cuda(at::kLong)),
         .rejected_tokens = int32_cuda({0}),
         .page_size = page_size,
+        .state_slots = draft_tokens + 1,
         .page_positions = (at::arange(static_cast<std::int64_t>(rows.size()) / n_kv_layers, cuda(at::kInt)) * page_size)
                               .expand({n_kv_layers, 1, -1})
                               .contiguous(),
@@ -670,12 +674,17 @@ const std::vector<chunk> chunks{
     chunk{48, 49, false},
 };
 
-std::vector<pulsarlm::kv> make_lines(const std::vector<pulsarlm::kv_layer>& specs, at::ScalarType dtype) {
+// The lines of an engine drafting draft_tokens tokens, whose windows keep draft_tokens more inputs.
+std::vector<pulsarlm::kv>
+make_lines(const std::vector<pulsarlm::kv_layer>& specs, at::ScalarType dtype, std::int64_t draft_tokens) {
     std::vector<pulsarlm::kv> lines;
     for (const pulsarlm::kv_layer& spec : specs) {
         if (spec.state) {
             std::vector<std::int64_t> sizes{n_lines};
             sizes.insert(sizes.end(), spec.state->sizes.begin(), spec.state->sizes.end());
+            if (spec.state->input_window) {
+                sizes.back() += draft_tokens;
+            }
             at::Tensor layer_lines = at::zeros(sizes, cuda(spec.state->dtype));
             lines.push_back(pulsarlm::kv{.k = layer_lines, .v = layer_lines});
         } else {
@@ -708,9 +717,15 @@ std::pair<at::Tensor, std::vector<std::int64_t>> make_tokens() {
     };
 }
 
-pulsarlm::step_batch chunk_batch(const at::Tensor& tokens, chunk c, const std::vector<pulsarlm::kv_layer>& specs) {
+pulsarlm::step_batch chunk_batch(
+    const at::Tensor& tokens,
+    chunk c,
+    const std::vector<pulsarlm::kv_layer>& specs,
+    std::int64_t draft_tokens
+) {
     pulsarlm::step_batch batch;
-    (c.prefill ? batch.prefill_group : batch.decode_group) = step(tokens, c.first, c.last, c.prefill, specs);
+    (c.prefill ? batch.prefill_group
+               : batch.decode_group) = step(tokens, c.first, c.last, c.prefill, specs, draft_tokens);
     return batch;
 }
 
@@ -826,8 +841,8 @@ held_rows(const at::Tensor& full, std::int64_t dim, const std::vector<std::pair<
     return at::cat(parts, dim);
 }
 
-// A model with draft_tokens keeps their states' slots and their windows' inputs too, which ordinary groups leave
-// unread.
+// In an engine drafting draft_tokens tokens, the layers keep their states' slots and their windows' inputs too, which
+// ordinary groups leave unread.
 void check_against_dense(
     at::ScalarType dtype,
     double tolerance,
@@ -836,17 +851,20 @@ void check_against_dense(
     std::int64_t draft_tokens
 ) {
     weights w(dtype, base_dims);
-    pulsarlm::qwen4_exp_model model(model_config(w.dims, experts_per_token, budget), w.named_tensors, draft_tokens);
+    pulsarlm::qwen4_exp_model model(model_config(w.dims, experts_per_token, budget), w.named_tensors);
     std::vector<pulsarlm::kv_layer> specs = model.kv_layers();
     REQUIRE(specs.size() == 9);
-    std::vector<pulsarlm::kv> kv = make_lines(specs, dtype);
+    std::vector<pulsarlm::kv> kv = make_lines(specs, dtype, draft_tokens);
 
     auto [tokens, token_ids] = make_tokens();
     dense_output dense = dense_forward(w, token_ids, experts_per_token, budget);
 
     for (chunk c : chunks) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
-        pulsarlm::step_logits logits = model.forward(with_arrival_counters(chunk_batch(tokens, c, specs), model), kv);
+        pulsarlm::step_logits logits = model.forward(
+            with_arrival_counters(chunk_batch(tokens, c, specs, draft_tokens), model),
+            kv
+        );
         auto expected_logits = dense.logits.narrow(0, c.first, c.last - c.first);
         CHECK(max_relative_error(chunk_logits(logits, c), expected_logits) < tolerance);
     }
@@ -936,9 +954,9 @@ void check_sharded(
 ) {
     weights w(dtype, dims);
     pulsarlm::qwen4_exp_config config = model_config(w.dims, experts_per_token, budget);
-    pulsarlm::qwen4_exp_model single(config, w.named_tensors, /*draft_tokens=*/0);
+    pulsarlm::qwen4_exp_model single(config, w.named_tensors);
     std::vector<pulsarlm::kv_layer> specs = single.kv_layers();
-    std::vector<pulsarlm::kv> single_lines = make_lines(specs, dtype);
+    std::vector<pulsarlm::kv> single_lines = make_lines(specs, dtype, 0);
 
     std::vector<pulsarlm::communicator> ranks = pulsarlm::communicator::make_on_one_device(
         at::Device(at::kCUDA, 0),
@@ -952,13 +970,12 @@ void check_sharded(
             std::make_unique<pulsarlm::qwen4_exp_model>(
                 config,
                 rank_weights(w, rank, gpus, expert_parallel),
-                /*draft_tokens=*/0,
                 ranks[rank]
             )
         );
         std::vector<pulsarlm::kv_layer> rank_specs = shards.back()->kv_layers();
         REQUIRE(rank_specs.size() == specs.size());
-        lines.push_back(make_lines(rank_specs, dtype));
+        lines.push_back(make_lines(rank_specs, dtype, 0));
         streams.push_back(c10::cuda::getStreamFromPool(false, 0));
     }
 
@@ -967,7 +984,7 @@ void check_sharded(
 
     for (chunk c : chunks) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
-        pulsarlm::step_batch batch = chunk_batch(tokens, c, specs);
+        pulsarlm::step_batch batch = chunk_batch(tokens, c, specs, 0);
         single.forward(with_arrival_counters(batch, single), single_lines);
         std::vector<pulsarlm::step_logits> logits = sharded_forward(shards, lines, streams, batch);
         const at::Tensor& rank_0 = chunk_logits(logits.front(), c);
@@ -1020,7 +1037,7 @@ TEST_CASE("Qwen4-Exp kv_layers add a PLE layer's convolution and token lines", "
         SKIP("no CUDA device");
     }
     weights w(at::kFloat, base_dims);
-    pulsarlm::qwen4_exp_model model(model_config(w.dims, 2, 8), w.named_tensors, /*draft_tokens=*/0);
+    pulsarlm::qwen4_exp_model model(model_config(w.dims, 2, 8), w.named_tensors);
     std::vector<pulsarlm::kv_layer> specs = model.kv_layers();
     REQUIRE(specs.size() == 9);
     CHECK(specs[4].state->sizes == std::vector<std::int64_t>{hc * hidden, ple_history});
@@ -1095,7 +1112,7 @@ TEST_CASE("Qwen4-Exp rejects held experts that are neither every expert nor an e
     }
     std::vector<pulsarlm::communicator> ranks = pulsarlm::communicator::make_on_one_device(at::Device(at::kCUDA, 0), 2);
     REQUIRE_THROWS_AS(
-        pulsarlm::qwen4_exp_model(model_config(w.dims, 2, 8), parts, /*draft_tokens=*/0, ranks.front()),
+        pulsarlm::qwen4_exp_model(model_config(w.dims, 2, 8), parts, ranks.front()),
         std::invalid_argument
     );
 }
@@ -1108,7 +1125,7 @@ TEST_CASE("Qwen4-Exp rejects a split that is not whole heads", "[model][cuda]") 
     weights w(at::kFloat, base_dims);
     std::vector<pulsarlm::communicator> ranks = pulsarlm::communicator::make_on_one_device(at::Device(at::kCUDA, 0), 4);
     REQUIRE_THROWS_AS(
-        pulsarlm::qwen4_exp_model(model_config(w.dims, 2, 8), w.named_tensors, /*draft_tokens=*/0, ranks.front()),
+        pulsarlm::qwen4_exp_model(model_config(w.dims, 2, 8), w.named_tensors, ranks.front()),
         std::invalid_argument
     );
 }
@@ -1130,11 +1147,7 @@ TEST_CASE("Qwen4-Exp drafts as a dense MTP layer a position after each row", "[m
     const std::int64_t experts_per_token = 2;
     const std::int64_t budget = 8;
     weights w(at::kFloat, base_dims, /*drafts=*/true);
-    pulsarlm::qwen4_exp_model model(
-        model_config(w.dims, experts_per_token, budget),
-        w.named_tensors,
-        /*draft_tokens=*/0
-    );
+    pulsarlm::qwen4_exp_model model(model_config(w.dims, experts_per_token, budget), w.named_tensors);
     pulsarlm::draft_head* drafter = model.drafter();
     REQUIRE(drafter != nullptr);
     REQUIRE(drafter->hidden_dim() == hc * hidden);
@@ -1143,7 +1156,7 @@ TEST_CASE("Qwen4-Exp drafts as a dense MTP layer a position after each row", "[m
     const std::size_t mtp_layer = specs.size() - 1;
     CHECK(specs[mtp_layer].mirrors_held_pages);
     CHECK(specs[mtp_layer].last_hidden_dim == static_cast<std::size_t>(hc * hidden));
-    std::vector<pulsarlm::kv> kv = make_lines(specs, at::kFloat);
+    std::vector<pulsarlm::kv> kv = make_lines(specs, at::kFloat, 0);
 
     auto [tokens, token_ids] = make_tokens();
     dense_output dense = dense_forward(w, token_ids, experts_per_token, budget);
@@ -1151,7 +1164,10 @@ TEST_CASE("Qwen4-Exp drafts as a dense MTP layer a position after each row", "[m
 
     for (chunk c : chunks) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
-        pulsarlm::step_logits logits = model.forward(with_arrival_counters(chunk_batch(tokens, c, specs), model), kv);
+        pulsarlm::step_logits logits = model.forward(
+            with_arrival_counters(chunk_batch(tokens, c, specs, 0), model),
+            kv
+        );
         const at::Tensor& streams = *(c.prefill ? logits.prefill_hidden : logits.decode_hidden);
         CHECK(max_relative_error(streams, dense.streams.narrow(0, c.first, c.last - c.first)) < 1e-4);
 
@@ -1162,7 +1178,7 @@ TEST_CASE("Qwen4-Exp drafts as a dense MTP layer a position after each row", "[m
             : kv[mtp_layer].last_hidden[view_lines[static_cast<std::size_t>((first - 1) / page_size)]].unsqueeze(0);
         at::Tensor hidden_rows = at::cat({before, streams.narrow(0, 0, last - first - 1)});
         pulsarlm::step_batch drafting;
-        drafting.prefill_group = step(tokens, first, last, true, specs);
+        drafting.prefill_group = step(tokens, first, last, true, specs, 0);
         drafting = with_arrival_counters(drafting, model);
         pulsarlm::draft_output drafted = drafter->draft(*drafting.prefill_group, hidden_rows, kv);
         CHECK(max_relative_error(drafted.logits, expected.logits.narrow(0, first, last - first)) < 1e-4);
@@ -1186,14 +1202,9 @@ void check_sharded_draft(const split_dims& dims, std::size_t gpus) {
     std::vector<c10::cuda::CUDAStream> streams;
     for (std::size_t rank = 0; rank < gpus; rank++) {
         shards.push_back(
-            std::make_unique<pulsarlm::qwen4_exp_model>(
-                config,
-                rank_weights(w, rank, gpus, false),
-                /*draft_tokens=*/0,
-                ranks[rank]
-            )
+            std::make_unique<pulsarlm::qwen4_exp_model>(config, rank_weights(w, rank, gpus, false), ranks[rank])
         );
-        lines.push_back(make_lines(shards.back()->kv_layers(), at::kFloat));
+        lines.push_back(make_lines(shards.back()->kv_layers(), at::kFloat, 0));
         streams.push_back(c10::cuda::getStreamFromPool(false, 0));
     }
     std::vector<pulsarlm::kv_layer> specs = shards.front()->kv_layers();
@@ -1206,7 +1217,7 @@ void check_sharded_draft(const split_dims& dims, std::size_t gpus) {
     for (chunk c : chunks) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
         std::vector<pulsarlm::step_logits>
-            logits = sharded_forward(shards, lines, streams, chunk_batch(tokens, c, specs));
+            logits = sharded_forward(shards, lines, streams, chunk_batch(tokens, c, specs, 0));
         const std::int64_t first = c.first;
         const std::int64_t last = std::min(c.last + 1, n_tokens);
         std::vector<pulsarlm::draft_output> drafted(gpus);
@@ -1221,7 +1232,7 @@ void check_sharded_draft(const split_dims& dims, std::size_t gpus) {
                           .last_hidden[view_lines[static_cast<std::size_t>((first - 1) / page_size)]]
                           .unsqueeze(0);
                 pulsarlm::step_batch drafting;
-                drafting.prefill_group = step(tokens, first, last, true, specs);
+                drafting.prefill_group = step(tokens, first, last, true, specs, 0);
                 drafting = with_arrival_counters(drafting, *shards[rank]);
                 drafted[rank] = shards[rank]->draft(
                     *drafting.prefill_group,

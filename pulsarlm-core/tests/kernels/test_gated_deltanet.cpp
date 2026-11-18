@@ -128,6 +128,16 @@ ragged_case decode_case() {
     };
 }
 
+// A verify group of fewer tokens per sequence than kSlots, as when a step drafts fewer tokens than the layout allows.
+ragged_case short_verify_case() {
+    return {
+        .counts = {2, 2, 2, 2, 2},
+        .history_positions = {14, 30, 0, 31, 46},
+        .rejected = {0, 1, 2, 0, 1},
+        .kind = group_kind::verify,
+    };
+}
+
 // kSlots tokens per sequence.
 ragged_case verify_case() {
     return {
@@ -253,7 +263,7 @@ TEST_CASE("causal_conv continues each sequence's valid inputs and keeps its wind
         SKIP("no CUDA device");
     }
     const auto dtype = GENERATE(at::kFloat, at::kBFloat16);
-    const ragged_case batch = GENERATE(prefill_case(), decode_case(), verify_case());
+    const ragged_case batch = GENERATE(prefill_case(), decode_case(), verify_case(), short_verify_case());
     const int64_t dilation = GENERATE(1, 3);
     const int64_t channels = 24;
     const int64_t kernel = 4;
@@ -306,7 +316,7 @@ TEST_CASE(
     }
     const auto dtype = GENERATE(at::kFloat, at::kBFloat16);
     const int64_t key_dim = GENERATE(32, 128, 256);
-    const ragged_case batch = GENERATE(prefill_case(), decode_case(), verify_case());
+    const ragged_case batch = GENERATE(prefill_case(), decode_case(), verify_case(), short_verify_case());
     const auto activation = GENERATE(pulsarlm::gate_activation::silu, pulsarlm::gate_activation::sigmoid);
     const int64_t key_heads = 2;
     const int64_t value_heads = 4;
@@ -381,11 +391,12 @@ TEST_CASE(
         );
         at::Tensor gated = reference_output_gate(expected.out, z.narrow(0, first, n), norm_weight, eps, activation);
         CHECK(at::allclose(out.narrow(0, first, n), gated, tolerance, tolerance));
+        // A verify group of n tokens writes the state after token t into slot kSlots - n + t.
+        const int64_t first_written = batch.kind == group_kind::verify ? kSlots - n : kSlots - 1;
         for (int64_t slot = 0; slot < kSlots; slot++) {
             const int32_t slot_line = ragged_case::line(s, kSlots, slot);
-            const at::Tensor& written = batch.kind == group_kind::verify ? expected.states[slot]
-                : slot == kSlots - 1                                     ? expected.states.back()
-                                                                         : before.select(0, slot_line);
+            const at::Tensor& written = slot < first_written ? before.select(0, slot_line)
+                                                             : expected.states[n - kSlots + slot];
             CHECK(at::allclose(pool.select(0, slot_line), written, 1e-4, 1e-4));
         }
         const int64_t page_end = batch.page_end(s);

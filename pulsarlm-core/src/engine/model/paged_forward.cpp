@@ -105,6 +105,8 @@ at::Tensor paged_attention(
     return o;
 }
 
+namespace {
+
 state_rows recurrent_rows(const group_batch& g, std::size_t kv_layer, std::int64_t slots) {
     return state_rows{
         .lines = g.page_tables.select(0, static_cast<std::int64_t>(kv_layer)),
@@ -113,6 +115,16 @@ state_rows recurrent_rows(const group_batch& g, std::size_t kv_layer, std::int64
         .rejected_tokens = g.rejected_tokens,
         .page_size = g.page_size,
     };
+}
+
+}  // namespace
+
+state_rows state_layer_rows(const group_batch& g, std::size_t kv_layer) {
+    return recurrent_rows(g, kv_layer, g.state_slots);
+}
+
+state_rows window_layer_rows(const group_batch& g, std::size_t kv_layer) {
+    return recurrent_rows(g, kv_layer, 1);
 }
 
 at::Tensor logit_inputs(const at::Tensor& x, const group_batch& g) {

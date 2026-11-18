@@ -17,7 +17,8 @@ namespace pulsarlm {
 // most prefill_tokens_per_step tokens of the others. With decode_graphs and max_context_window, the decoding sequences'
 // forward is replayed from CUDA graphs (decode_graphs.hpp) over page tables wide enough for a view of
 // max_context_window tokens, the requests' eviction_policy::max_context_window; a step with a wider view runs without a
-// graph.
+// graph. A step drafts up to draft_tokens tokens per sequence with the model's drafter (model::drafter), which it needs
+// when draft_tokens is above 0.
 struct engine_config {
     std::string model_name;
     std::string model_hash;
@@ -29,6 +30,7 @@ struct engine_config {
     std::size_t prefill_tokens_per_step;
     bool decode_graphs = false;
     std::optional<std::size_t> max_context_window;
+    std::size_t draft_tokens = 0;
 };
 
 }  // namespace pulsarlm
