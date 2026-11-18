@@ -141,6 +141,51 @@ c10::Dict<std::string, at::Tensor> full_weights(std::int64_t kv_heads) {
     return named;
 }
 
+// full_weights with the MTP layer's mtp.* weights, and tokens 0 and 1 taking opposite rows of lm_head far longer than
+// the others', so the model and its MTP layer each predict one of them and the drafts are sometimes right.
+c10::Dict<std::string, at::Tensor> drafting_weights(std::int64_t kv_heads) {
+    c10::Dict<std::string, at::Tensor> named = full_weights(kv_heads);
+    at::manual_seed(17);
+    auto add = [&](const std::string& name, const at::Tensor& t) {
+        named.insert_or_assign(name, t.to(at::TensorOptions().device(at::kCUDA).dtype(at::kFloat)));
+    };
+    auto projection = [](std::int64_t out, std::int64_t in) { return at::randn({out, in}) / std::sqrt(in); };
+    auto norm = [](std::int64_t size) { return 0.1 * at::randn({size}); };
+    at::Tensor lm_head = named.at("lm_head.weight").cpu().clone();
+    at::Tensor direction = at::randn({hidden});
+    lm_head[0] = 50.0 * direction / direction.norm();
+    lm_head[1] = -lm_head[0];
+    add("lm_head.weight", lm_head);
+    add("mtp.pre_fc_norm_embedding.weight", norm(hidden));
+    add("mtp.pre_fc_norm_hidden.weight", norm(hidden));
+    add("mtp.fc.weight", projection(hidden, 2 * hidden));
+    add("mtp.norm.weight", norm(hidden));
+    const std::string m = "mtp.layers.0.";
+    add(m + "input_layernorm.weight", norm(hidden));
+    add(m + "post_attention_layernorm.weight", norm(hidden));
+    add(m + "mlp.gate_proj.weight", projection(intermediate, hidden));
+    add(m + "mlp.up_proj.weight", projection(intermediate, hidden));
+    add(m + "mlp.down_proj.weight", projection(hidden, intermediate));
+    add(m + "self_attn.q_proj.weight", projection(2 * n_heads * head_dim, hidden));
+    add(m + "self_attn.k_proj.weight", projection(kv_heads * head_dim, hidden));
+    add(m + "self_attn.v_proj.weight", projection(kv_heads * head_dim, hidden));
+    add(m + "self_attn.o_proj.weight", projection(hidden, n_heads * head_dim));
+    add(m + "self_attn.q_norm.weight", norm(head_dim));
+    add(m + "self_attn.k_norm.weight", norm(head_dim));
+    return named;
+}
+
+// weights without mtp.*, as the loader leaves them out of a model that drafts nothing.
+c10::Dict<std::string, at::Tensor> without_drafts(const c10::Dict<std::string, at::Tensor>& weights) {
+    c10::Dict<std::string, at::Tensor> kept;
+    for (const auto& entry : weights) {
+        if (!entry.key().starts_with("mtp.")) {
+            kept.insert(entry.key(), entry.value());
+        }
+    }
+    return kept;
+}
+
 using cut_ranges = std::vector<std::pair<std::int64_t, std::int64_t>>;
 
 struct weight_cut {
@@ -395,8 +440,10 @@ class recording_callbacks final : public pulsarlm::request_callbacks {
     }
 };
 
-// With decode_graphs, decoding sequences replay graphs over views of up to 1024 tokens.
-pulsarlm::engine_config engine_config(std::size_t shard_count, bool decode_graphs = false) {
+// With decode_graphs, decoding sequences replay graphs over views of up to 1024 tokens. A step drafts draft_tokens
+// tokens.
+pulsarlm::engine_config
+engine_config(std::size_t shard_count, bool decode_graphs = false, std::size_t draft_tokens = 0) {
     return pulsarlm::engine_config{
         .model_name = "qwen3_5-test",
         .model_hash = "1",
@@ -408,6 +455,7 @@ pulsarlm::engine_config engine_config(std::size_t shard_count, bool decode_graph
         .prefill_tokens_per_step = 32,
         .decode_graphs = decode_graphs,
         .max_context_window = decode_graphs ? std::optional<std::size_t>(1024) : std::nullopt,
+        .draft_tokens = draft_tokens,
     };
 }
 
@@ -417,7 +465,8 @@ std::unique_ptr<pulsarlm::engine> make_engine(
     std::int64_t kv_heads,
     std::size_t shard_count,
     const std::shared_ptr<store_contents>& contents,
-    bool decode_graphs = false
+    bool decode_graphs = false,
+    std::size_t draft_tokens = 0
 ) {
     std::vector<std::unique_ptr<pulsarlm::model>> shards;
     if (shard_count == 1) {
@@ -442,7 +491,7 @@ std::unique_ptr<pulsarlm::engine> make_engine(
     return std::make_unique<pulsarlm::engine>(
         std::move(shards),
         vocab,
-        engine_config(shard_count, decode_graphs),
+        engine_config(shard_count, decode_graphs, draft_tokens),
         std::move(store)
     );
 }
@@ -659,4 +708,71 @@ TEST_CASE("decode graphs sample as the eager forward while steps overlap", "[run
     REQUIRE(eager.tokens.size() == decode_tokens);
     CHECK(replayed.tokens == eager.tokens);
     check_same_state(replayed.end_state, eager.end_state);
+}
+
+// The drafting engine's layers are the other's then the MTP layer's, and its root digest differs with its layout, so
+// pages compare by index and mass.
+void check_same_history(const pulsarlm::state& got, const pulsarlm::state& expected) {
+    REQUIRE(got.head.has_value() == expected.head.has_value());
+    REQUIRE(got.tail == expected.tail);
+    REQUIRE(got.layers.size() == expected.layers.size() + 1);
+    for (std::size_t layer = 0; layer < expected.layers.size(); layer++) {
+        INFO("KV layer " << layer);
+        const pulsarlm::layer_sequence& g = got.layers[layer];
+        const pulsarlm::layer_sequence& e = expected.layers[layer];
+        REQUIRE(g.pages.size() == e.pages.size());
+        for (std::size_t i = 0; i < g.pages.size(); i++) {
+            INFO("page " << i);
+            REQUIRE(g.pages[i].index == e.pages[i].index);
+            CHECK(relative_error(g.pages[i].mass_sum, e.pages[i].mass_sum) < tolerance);
+        }
+    }
+}
+
+// Two ranks on one device capture no graphs, as their captures would merge.
+TEST_CASE("Qwen3.5 drafting with its MTP layer emits the tokens it emits without drafts", "[runtime][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const std::size_t shard_count = GENERATE(1, 2);
+    const bool decode_graphs = shard_count == 1 ? GENERATE(false, true) : false;
+    const std::size_t draft_tokens = GENERATE(1, 2);
+    const double temperature = GENERATE(0.0, 0.8);
+    INFO(
+        shard_count << " shards, " << draft_tokens << " drafts at temperature " << temperature
+                    << (decode_graphs ? " with" : " without") << " graphs"
+    );
+    const c10::Dict<std::string, at::Tensor> weights = drafting_weights(n_kv_heads);
+    const auto request = [&] {
+        return pulsarlm::request{
+            .tokens = random_tokens(prompt_tokens, 4),
+            .sampling = pulsarlm::sampling_params{.temperature = temperature, .seed = 7},
+            .max_tokens = decode_tokens,
+            .eviction = eviction,
+        };
+    };
+    std::unique_ptr<pulsarlm::engine> plain = make_engine(
+        without_drafts(weights),
+        n_kv_heads,
+        shard_count,
+        std::make_shared<store_contents>(),
+        decode_graphs
+    );
+    std::unique_ptr<pulsarlm::engine> drafting = make_engine(
+        weights,
+        n_kv_heads,
+        shard_count,
+        std::make_shared<store_contents>(),
+        decode_graphs,
+        draft_tokens
+    );
+    served expected = serve(*plain, request());
+    served got = serve(*drafting, request());
+
+    REQUIRE(expected.tokens.size() == decode_tokens);
+    CHECK(got.tokens == expected.tokens);
+    check_same_history(got.end_state, expected.end_state);
+    const pulsarlm::engine_stat drafted = drafting->stat();
+    CHECK(drafted.accepted_tokens > 0);
+    CHECK(drafted.accepted_tokens < drafted.drafted_tokens);
 }

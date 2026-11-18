@@ -39,8 +39,8 @@ QWEN4_EXP = ("qwen4_exp",)
 # Multimodal checkpoints whose text model's config is their text_config.
 MULTIMODAL = GEMMA4 + QWEN3_5 + QWEN4_EXP
 ARCHITECTURES = DENSE + MULTIMODAL + QWEN3_5_TEXT
-# Weights the text model doesn't read yet: Qwen3.5's vision tower and multi-token prediction layer.
-UNUSED_PREFIXES = dict.fromkeys(QWEN3_5 + QWEN3_5_TEXT, ("model.visual.", "mtp."))
+# Weights the text model doesn't read: Qwen3.5's vision tower.
+UNUSED_PREFIXES = dict.fromkeys(QWEN3_5 + QWEN3_5_TEXT, ("model.visual.",))
 
 
 def config_syntax(raw: dict, key: str, syntaxes: tuple[str, ...]) -> Any:

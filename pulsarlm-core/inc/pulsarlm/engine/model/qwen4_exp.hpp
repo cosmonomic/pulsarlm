@@ -214,10 +214,6 @@ class qwen4_exp_model : public model, public draft_head {
     // The group's logits and the streams after the last layer at every token.
     std::pair<at::Tensor, at::Tensor>
     group_forward(const group_batch& g, group_kind kind, std::span<const kv> lines) const;
-    // Writes the streams x [rows of g, hc_count * hidden] at each sequence's last row of g and at each of its rows
-    // ending a page into the last_hidden of line, the MTP layer's, so a line keeps the streams at the latest position
-    // written into it.
-    void write_last_hidden(const group_batch& g, const at::Tensor& x, const kv& line) const;
 
   public:
     // weights are this GPU's parts, on the lines' device, in the attention lines' dtype; the PLE buffers are int64.

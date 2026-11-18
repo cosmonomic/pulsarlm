@@ -88,7 +88,8 @@ bool full(std::size_t layer) {
 struct weights {
     c10::Dict<std::string, at::Tensor> named_tensors;
 
-    explicit weights(at::ScalarType dtype) {
+    // With drafts, the MTP layer's mtp.* weights too.
+    explicit weights(at::ScalarType dtype, bool drafts = false) {
         at::manual_seed(13);
         auto add = [&](const std::string& name, at::Tensor t) { named_tensors.insert(name, t.to(cuda(dtype))); };
         auto projection = [](std::int64_t out, std::int64_t in) { return at::randn({out, in}) / std::sqrt(in); };
@@ -122,6 +123,24 @@ struct weights {
                 add(l + "linear_attn.norm.weight", 1.0 + 0.1 * at::randn({value_head_dim}));
                 add(l + "linear_attn.out_proj.weight", projection(hidden, value_heads * value_head_dim));
             }
+        }
+        if (drafts) {
+            add("mtp.pre_fc_norm_embedding.weight", norm(hidden));
+            add("mtp.pre_fc_norm_hidden.weight", norm(hidden));
+            add("mtp.fc.weight", projection(hidden, 2 * hidden));
+            add("mtp.norm.weight", norm(hidden));
+            const std::string m = "mtp.layers.0.";
+            add(m + "input_layernorm.weight", norm(hidden));
+            add(m + "post_attention_layernorm.weight", norm(hidden));
+            add(m + "mlp.gate_proj.weight", projection(intermediate, hidden));
+            add(m + "mlp.up_proj.weight", projection(intermediate, hidden));
+            add(m + "mlp.down_proj.weight", projection(hidden, intermediate));
+            add(m + "self_attn.q_proj.weight", projection(2 * n_heads * head_dim, hidden));
+            add(m + "self_attn.k_proj.weight", projection(n_kv_heads * head_dim, hidden));
+            add(m + "self_attn.v_proj.weight", projection(n_kv_heads * head_dim, hidden));
+            add(m + "self_attn.o_proj.weight", projection(hidden, n_heads * head_dim));
+            add(m + "self_attn.q_norm.weight", norm(head_dim));
+            add(m + "self_attn.k_norm.weight", norm(head_dim));
         }
     }
 
@@ -160,6 +179,7 @@ at::Tensor l2_normalized(const at::Tensor& x) {
 
 struct dense_output {
     at::Tensor logits;  // [tokens, vocab]
+    at::Tensor hidden;  // [tokens, hidden], normed
     std::vector<at::Tensor> k;  // per layer, unrotated [tokens, n_kv_heads, head_dim]; undefined for linear layers
     std::vector<at::Tensor>
         states;  // per layer, S after each token [tokens, value_heads, key_head_dim, value_head_dim]
@@ -215,18 +235,18 @@ at::Tensor deltanet(const weights& w, std::size_t layer, const at::Tensor& h, de
     return at::linear(gated, w.layer(layer, "linear_attn.out_proj.weight"));
 }
 
-at::Tensor
-attention(const weights& w, std::size_t layer, const at::Tensor& h, dense_output& out, std::int64_t kv_heads) {
+// The gated attention of the layer whose weights are named after p, its keys unrotated.
+std::pair<at::Tensor, at::Tensor>
+named_attention(const weights& w, const std::string& p, const at::Tensor& h, std::int64_t kv_heads) {
     const std::int64_t n = h.size(0);
-    auto query_gate = at::linear(h, w.layer(layer, "self_attn.q_proj.weight")).view({n, n_heads, 2 * head_dim});
-    auto q = rms_norm(query_gate.narrow(-1, 0, head_dim), w.layer(layer, "self_attn.q_norm.weight"));
+    auto query_gate = at::linear(h, w(p + "self_attn.q_proj.weight")).view({n, n_heads, 2 * head_dim});
+    auto q = rms_norm(query_gate.narrow(-1, 0, head_dim), w(p + "self_attn.q_norm.weight"));
     auto gate = query_gate.narrow(-1, head_dim, head_dim).reshape({n, n_heads * head_dim});
     auto k = rms_norm(
-        at::linear(h, w.layer(layer, "self_attn.k_proj.weight")).view({n, kv_heads, head_dim}),
-        w.layer(layer, "self_attn.k_norm.weight")
+        at::linear(h, w(p + "self_attn.k_proj.weight")).view({n, kv_heads, head_dim}),
+        w(p + "self_attn.k_norm.weight")
     );
-    auto v = at::linear(h, w.layer(layer, "self_attn.v_proj.weight")).view({n, kv_heads, head_dim});
-    out.k[layer] = k;
+    auto v = at::linear(h, w(p + "self_attn.v_proj.weight")).view({n, kv_heads, head_dim});
     auto group = n_heads / kv_heads;
     auto q_heads = rope(q).transpose(0, 1);
     auto k_heads = rope(k).repeat_interleave(group, 1).transpose(0, 1);
@@ -235,7 +255,14 @@ attention(const weights& w, std::size_t layer, const at::Tensor& h, dense_output
     auto scores = at::matmul(q_heads, k_heads.transpose(1, 2)) / std::sqrt(static_cast<double>(head_dim));
     auto probabilities = at::softmax(scores.masked_fill(causal.logical_not(), -INFINITY), -1);
     auto o = at::matmul(probabilities, v_heads).transpose(0, 1).reshape({n, n_heads * head_dim});
-    return at::linear(o * at::sigmoid(gate), w.layer(layer, "self_attn.o_proj.weight"));
+    return {at::linear(o * at::sigmoid(gate), w(p + "self_attn.o_proj.weight")), k};
+}
+
+at::Tensor
+attention(const weights& w, std::size_t layer, const at::Tensor& h, dense_output& out, std::int64_t kv_heads) {
+    auto [attended, k] = named_attention(w, "model.language_model.layers." + std::to_string(layer) + ".", h, kv_heads);
+    out.k[layer] = k;
+    return attended;
 }
 
 dense_output dense_forward(const weights& w, const at::Tensor& tokens, std::int64_t kv_heads = n_kv_heads) {
@@ -253,8 +280,33 @@ dense_output dense_forward(const weights& w, const at::Tensor& tokens, std::int6
             at::linear(h2, w.layer(layer, "mlp.up_proj.weight"));
         x = x + at::linear(mlp, w.layer(layer, "mlp.down_proj.weight"));
     }
-    out.logits = at::linear(rms_norm(x, w("model.language_model.norm.weight")), w("lm_head.weight"));
+    out.hidden = rms_norm(x, w("model.language_model.norm.weight"));
+    out.logits = at::linear(out.hidden, w("lm_head.weight"));
     return out;
+}
+
+// vLLM v0.31.0's Qwen3.5 MTP layer over every position t: the normed embedding of token t and the normed hidden row of
+// t - 1, zeros at 0, through fc, then a full-attention decoder layer at position t, normed; its logits and hidden rows.
+std::pair<at::Tensor, at::Tensor> dense_mtp(const weights& w, const at::Tensor& tokens, const at::Tensor& hidden) {
+    const std::string m = "mtp.layers.0.";
+    auto embedded = rms_norm(
+        w("model.language_model.embed_tokens.weight").index_select(0, tokens),
+        w("mtp.pre_fc_norm_embedding.weight")
+    );
+    auto previous = at::cat(
+        {at::zeros({1, hidden.size(1)}, hidden.options()), hidden.narrow(0, 0, hidden.size(0) - 1)}
+    );
+    auto x = at::linear(
+        at::cat({embedded, rms_norm(previous, w("mtp.pre_fc_norm_hidden.weight"))}, -1),
+        w("mtp.fc.weight")
+    );
+    auto h = rms_norm(x, w(m + "input_layernorm.weight"));
+    x = x + named_attention(w, m, h, n_kv_heads).first;
+    auto h2 = rms_norm(x, w(m + "post_attention_layernorm.weight"));
+    auto mlp = at::silu(at::linear(h2, w(m + "mlp.gate_proj.weight"))) * at::linear(h2, w(m + "mlp.up_proj.weight"));
+    x = x + at::linear(mlp, w(m + "mlp.down_proj.weight"));
+    auto normed = rms_norm(x, w("mtp.norm.weight"));
+    return {at::linear(normed, w("lm_head.weight")), normed};
 }
 
 // Pulsar's head dim i holds Hugging Face's head dim permutation[i].
@@ -389,7 +441,15 @@ std::vector<pulsarlm::kv> make_lines(const std::vector<pulsarlm::kv_layer>& spec
                 static_cast<std::int64_t>(spec.n_kv_heads),
                 static_cast<std::int64_t>(spec.head_dim),
             };
-            kv.push_back(pulsarlm::kv{.k = at::zeros(sizes, cuda(dtype)), .v = at::zeros(sizes, cuda(dtype))});
+            kv.push_back(
+                pulsarlm::kv{
+                    .k = at::zeros(sizes, cuda(dtype)),
+                    .v = at::zeros(sizes, cuda(dtype)),
+                    .last_hidden = spec.last_hidden_dim > 0
+                        ? at::zeros({n_lines, static_cast<std::int64_t>(spec.last_hidden_dim)}, cuda(dtype))
+                        : at::Tensor(),
+                }
+            );
         }
     }
     return kv;
@@ -730,4 +790,48 @@ TEST_CASE("Qwen3.5 with fp8 linears split over ranks matches one GPU", "[model][
     const std::int64_t kv_heads = GENERATE(n_kv_heads, std::int64_t{1});
     INFO(kv_heads << " KV heads over 2 ranks");
     check_split_over_ranks(at::kHalf, 5e-2, 2, kv_heads, pulsarlm::fp8_block{.n = 32, .k = 32});
+}
+
+// After a prefill of every token, a draft pass over every position: row t reads token t and the hidden row of t - 1.
+// The prefill keeps each full page's hidden row at its last position.
+TEST_CASE("Qwen3.5 drafts as vLLM's MTP layer a position after each row", "[model][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    weights w(at::kFloat, /*drafts=*/true);
+    pulsarlm::qwen3_5_model model(model_config(std::nullopt), w.named_tensors);
+    pulsarlm::draft_head* drafter = model.drafter();
+    REQUIRE(drafter != nullptr);
+    REQUIRE(drafter->hidden_dim() == hidden);
+    std::vector<pulsarlm::kv_layer> specs = model.kv_layers();
+    REQUIRE(specs.size() == 8);
+    const std::size_t mtp_layer = specs.size() - 1;
+    CHECK(specs[mtp_layer].mirrors_held_pages);
+    CHECK(specs[mtp_layer].last_hidden_dim == static_cast<std::size_t>(hidden));
+    std::vector<pulsarlm::kv> kv = make_lines(specs, at::kFloat);
+
+    auto tokens = at::randint(vocab, {n_tokens}, cuda(at::kLong));
+    dense_output dense = dense_forward(w, tokens);
+    auto [expected_logits, expected_hidden] = dense_mtp(w, tokens, dense.hidden);
+
+    pulsarlm::step_batch prefill;
+    prefill.prefill_group = step(tokens, 0, n_tokens, true, specs);
+    pulsarlm::step_logits logits = model.forward(with_arrival_counters(prefill, model), kv);
+    REQUIRE(logits.prefill_hidden);
+    CHECK(max_relative_error(*logits.prefill_hidden, dense.hidden) < 1e-4);
+    for (std::int64_t page = 0; page < 3; page++) {
+        INFO("page " << page);
+        const at::Tensor& kept = kv[mtp_layer].last_hidden[view_lines[static_cast<std::size_t>(page)]];
+        CHECK(max_relative_error(kept, dense.hidden[(page + 1) * page_size - 1]) < 1e-4);
+    }
+
+    pulsarlm::step_batch drafting;
+    drafting.prefill_group = step(tokens, 0, n_tokens, true, specs);
+    drafting = with_arrival_counters(drafting, model);
+    at::Tensor hidden_rows = at::cat(
+        {at::zeros({1, hidden}, cuda(at::kFloat)), dense.hidden.narrow(0, 0, n_tokens - 1)}
+    );
+    pulsarlm::draft_output drafted = drafter->draft(*drafting.prefill_group, hidden_rows, kv);
+    CHECK(max_relative_error(drafted.logits, expected_logits) < 1e-4);
+    CHECK(max_relative_error(drafted.hidden, expected_hidden) < 1e-4);
 }

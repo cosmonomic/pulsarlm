@@ -805,7 +805,7 @@ qwen4_exp_model::group_forward(const group_batch& g, group_kind kind, std::span<
     }
     inject_pending();
     if (mtp) {
-        write_last_hidden(g, x, lines[kv_layer_of[n_layers]]);
+        keep_last_hidden(g, x, lines[kv_layer_of[n_layers]], kv_layer_of[n_layers]);
     }
     return {logits(final_mix(logit_inputs(x, g))), x};
 }
@@ -855,34 +855,6 @@ draft_head* qwen4_exp_model::drafter() {
 
 std::int64_t qwen4_exp_model::hidden_dim() const {
     return config.hc_count * config.hidden_size;
-}
-
-// The rows that write nothing write their sequence's last row into its line, as that row does, so the writes need no
-// host sync.
-void qwen4_exp_model::write_last_hidden(const group_batch& g, const at::Tensor& x, const kv& line) const {
-    const auto layer_row = static_cast<std::int64_t>(kv_layer_of[n_layers]);
-    const std::int64_t page_size = line.k.size(1);
-    const std::int64_t ntok = x.size(0);
-    at::Tensor key_counts = g.key_counts.select(0, layer_row).to(at::kLong);
-    at::Tensor page_tables = g.page_tables.select(0, layer_row).to(at::kLong);
-    const std::int64_t num_seqs = key_counts.size(0);
-    if (!g.is_prefill()) {
-        at::Tensor lines = page_tables.gather(1, at::floor_divide(key_counts - 1, page_size).unsqueeze(1)).squeeze(1);
-        line.last_hidden.index_copy_(0, lines, x);
-        return;
-    }
-    at::Tensor starts = g.cu_seqlens_q.to(at::kLong);
-    at::Tensor counts = starts.narrow(0, 1, num_seqs) - starts.narrow(0, 0, num_seqs);
-    at::Tensor sequence_of = at::repeat_interleave(counts, std::optional<std::int64_t>(ntok));
-    at::Tensor local = at::arange(ntok, starts.options()) - starts.index_select(0, sequence_of);
-    at::Tensor row_counts = counts.index_select(0, sequence_of);
-    at::Tensor view_index = key_counts.index_select(0, sequence_of) - row_counts + local;
-    at::Tensor last_row = starts.narrow(0, 1, num_seqs).index_select(0, sequence_of) - 1;
-    at::Tensor writes = (local == row_counts - 1).logical_or(at::remainder(view_index + 1, page_size) == 0);
-    at::Tensor written_row = at::where(writes, at::arange(ntok, starts.options()), last_row);
-    at::Tensor written_index = view_index.index_select(0, written_row);
-    at::Tensor lines = page_tables.index({sequence_of, at::floor_divide(written_index, page_size)});
-    line.last_hidden.index_copy_(0, lines, x.index_select(0, written_row));
 }
 
 draft_output qwen4_exp_model::draft(const group_batch& g, const at::Tensor& hidden, std::span<const kv> lines) {

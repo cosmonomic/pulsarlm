@@ -70,7 +70,9 @@ def test_a_multimodal_checkpoint_keeps_its_text_weights_and_chat_template(
     )
 
 
-def test_a_qwen3_5_checkpoint_keeps_its_text_weights_and_untied_head(tmp_path: Path):
+def test_a_qwen3_5_checkpoint_keeps_its_text_weights_untied_head_and_mtp_layer(
+    tmp_path: Path,
+):
     src = tmp_path / "src"
     src.mkdir()
     write_source(
@@ -90,6 +92,7 @@ def test_a_qwen3_5_checkpoint_keeps_its_text_weights_and_untied_head(tmp_path: P
     assert sorted(built_weights(dst)) == [
         "lm_head.weight",
         "model.language_model.norm.weight",
+        "mtp.fc.weight",
     ]
 
 
@@ -158,7 +161,11 @@ def test_a_text_only_qwen3_5_checkpoint_loads_under_the_multimodal_names(
     dst = tmp_path / "model"
     migrate(src, dst, OVERRIDES)
 
-    assert sorted(built_weights(dst)) == ["lm_head.weight", "model.norm.weight"]
+    assert sorted(built_weights(dst)) == [
+        "lm_head.weight",
+        "model.norm.weight",
+        "mtp.fc.weight",
+    ]
     loaded = load_model(dst, device=torch.device("cpu"))
     assert sorted(loaded.weights) == [
         "lm_head.weight",

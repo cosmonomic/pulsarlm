@@ -21,7 +21,10 @@ at::Tensor rope_q(
     return rope_cuda(by_head, pos, rope).transpose(0, 1).contiguous();
 }
 
-at::Tensor paged_attention(
+namespace {
+
+// paged_attention, with per_query each query measuring its mass in its own view.
+at::Tensor attend_paged(
     const at::Tensor& q,
     const at::Tensor& k,
     const at::Tensor& v,
@@ -32,7 +35,8 @@ at::Tensor paged_attention(
     double scale,
     const rope_parameters& rope,
     std::optional<int64_t> sliding_window,
-    const std::optional<at::Tensor>& k_norm_weight
+    const std::optional<at::Tensor>& k_norm_weight,
+    bool per_query
 ) {
     const at::Tensor& k_pool = lines.k;
     const at::Tensor& v_pool = lines.v;
@@ -63,7 +67,25 @@ at::Tensor paged_attention(
         query_weights = g.query_weights;
     }
     at::Tensor o;
-    if (g.is_prefill()) {
+    if (per_query && mass_sum) {
+        o = attn_prefill_verify_cuda(
+            q,
+            k_pool,
+            v_pool,
+            page_tables,
+            g.cu_seqlens_q,
+            key_counts,
+            page_positions,
+            rope,
+            scale,
+            sliding_window,
+            k_norm_weight,
+            *mass_sum,
+            *weight_sum,
+            *cu_view_pages,
+            *query_weights
+        );
+    } else if (g.is_prefill()) {
         o = attn_prefill_cuda(
             q,
             k_pool,
@@ -103,6 +125,68 @@ at::Tensor paged_attention(
         reader_columns.copy_(*mass_sum);
     }
     return o;
+}
+
+}  // namespace
+
+at::Tensor paged_attention(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const kv& lines,
+    std::size_t kv_layer,
+    std::size_t reader,
+    const group_batch& g,
+    double scale,
+    const rope_parameters& rope,
+    std::optional<int64_t> sliding_window,
+    const std::optional<at::Tensor>& k_norm_weight
+) {
+    return attend_paged(q, k, v, lines, kv_layer, reader, g, scale, rope, sliding_window, k_norm_weight, false);
+}
+
+at::Tensor paged_verify_attention(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const kv& lines,
+    std::size_t kv_layer,
+    std::size_t reader,
+    const group_batch& g,
+    double scale,
+    const rope_parameters& rope,
+    std::optional<int64_t> sliding_window,
+    const std::optional<at::Tensor>& k_norm_weight
+) {
+    return attend_paged(q, k, v, lines, kv_layer, reader, g, scale, rope, sliding_window, k_norm_weight, true);
+}
+
+// The rows that write nothing write their sequence's last row into its line, as that row does, so the writes need no
+// host sync.
+void keep_last_hidden(const group_batch& g, const at::Tensor& hidden, const kv& line, std::size_t kv_layer) {
+    const auto layer_row = static_cast<std::int64_t>(kv_layer);
+    const std::int64_t page_size = line.k.size(1);
+    const std::int64_t ntok = hidden.size(0);
+    at::Tensor key_counts = g.key_counts.select(0, layer_row).to(at::kLong);
+    at::Tensor page_tables = g.page_tables.select(0, layer_row).to(at::kLong);
+    const std::int64_t num_seqs = key_counts.size(0);
+    if (!g.is_prefill()) {
+        at::Tensor lines = page_tables.gather(1, at::floor_divide(key_counts - 1, page_size).unsqueeze(1)).squeeze(1);
+        line.last_hidden.index_copy_(0, lines, hidden);
+        return;
+    }
+    at::Tensor starts = g.cu_seqlens_q.to(at::kLong);
+    at::Tensor counts = starts.narrow(0, 1, num_seqs) - starts.narrow(0, 0, num_seqs);
+    at::Tensor sequence_of = at::repeat_interleave(counts, std::optional<std::int64_t>(ntok));
+    at::Tensor local = at::arange(ntok, starts.options()) - starts.index_select(0, sequence_of);
+    at::Tensor row_counts = counts.index_select(0, sequence_of);
+    at::Tensor view_index = key_counts.index_select(0, sequence_of) - row_counts + local;
+    at::Tensor last_row = starts.narrow(0, 1, num_seqs).index_select(0, sequence_of) - 1;
+    at::Tensor writes = (local == row_counts - 1).logical_or(at::remainder(view_index + 1, page_size) == 0);
+    at::Tensor written_row = at::where(writes, at::arange(ntok, starts.options()), last_row);
+    at::Tensor written_index = view_index.index_select(0, written_row);
+    at::Tensor lines = page_tables.index({sequence_of, at::floor_divide(written_index, page_size)});
+    line.last_hidden.index_copy_(0, lines, hidden.index_select(0, written_row));
 }
 
 namespace {

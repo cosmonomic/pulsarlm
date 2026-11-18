@@ -39,6 +39,25 @@ at::Tensor paged_attention(
     const std::optional<at::Tensor>& k_norm_weight = std::nullopt
 );
 
+// paged_attention of a verify group, each query measuring its mass in a view of its own (attn_prefill_verify_cuda).
+at::Tensor paged_verify_attention(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const kv& lines,
+    std::size_t kv_layer,
+    std::size_t reader,
+    const group_batch& g,
+    double scale,
+    const rope_parameters& rope,
+    std::optional<int64_t> sliding_window = std::nullopt,
+    const std::optional<at::Tensor>& k_norm_weight = std::nullopt
+);
+
+// Writes the hidden rows [rows of g, hidden] at each sequence's last row of g and at each of its rows ending a page into
+// the last_hidden of line, KV layer kv_layer's, so a line keeps the hidden row at the latest position written into it.
+void keep_last_hidden(const group_batch& g, const at::Tensor& hidden, const kv& line, std::size_t kv_layer);
+
 // The state rows of g of KV layer kv_layer, a recurrent layer keeping a state.
 state_rows state_layer_rows(const group_batch& g, std::size_t kv_layer);
 // The state rows of g of KV layer kv_layer, a recurrent layer keeping a window of inputs.
