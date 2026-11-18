@@ -58,6 +58,7 @@ group_batch decode_graphs::make_inputs(std::int64_t sequences, bool measures_mas
         .page_end_tokens = at::zeros({sequences}, ints),
         .key_counts = at::ones({layers, sequences}, ints),
         .page_positions = at::zeros({layers, sequences, width}, ints),
+        .arrival_counters = at::zeros({shard_model.arrival_counter_count(sequences, sequences)}, ints),
     };
     if (measures_mass) {
         // Each view is the one page its key lies on.

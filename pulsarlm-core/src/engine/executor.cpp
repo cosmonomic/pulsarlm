@@ -163,7 +163,8 @@ class executor::batch {
         cudaStream_t stream,
         std::size_t shard,
         decode_graphs* graphs,
-        const at::Tensor& samples
+        const at::Tensor& samples,
+        at::Tensor& counters
     );
     // Joins the shards' page mass, each shard's heads after the previous shards', once their copies completed.
     void join_mass(
@@ -231,6 +232,7 @@ executor::executor(
     for (std::size_t shard = 0; shard < this->shards.size(); shard++) {
         samples.push_back(at::zeros({max_sampled_rows}, lines[shard].front().k.options().dtype(at::kLong)));
     }
+    eager_counters.resize(this->shards.size());
     if (graph_pages) {
         for (std::size_t shard = 0; shard < this->shards.size(); shard++) {
             c10::cuda::CUDAGuard device_guard(lines[shard].front().k.device());
@@ -395,7 +397,8 @@ void executor::batch::enqueue(
     cudaStream_t stream,
     std::size_t shard,
     decode_graphs* graphs,
-    const at::Tensor& samples
+    const at::Tensor& samples,
+    at::Tensor& counters
 ) {
     at::Device device = lines.front().k.device();
     c10::cuda::CUDAStreamGuard guard(c10::cuda::getStreamFromExternal(stream, device.index()));
@@ -428,6 +431,31 @@ void executor::batch::enqueue(
                 inputs.prefill_group->cu_view_pages,
                 mass_heads
             );
+        }
+    }
+    // A replayed group reads its graph's own counters.
+    std::int64_t needed = 0;
+    if (on_device.decode_group && !decode_replays) {
+        needed = shard_model.arrival_counter_count(
+            static_cast<std::int64_t>(decode_count),
+            on_device.decode_group->tokens.size(0)
+        );
+    }
+    if (on_device.prefill_group) {
+        needed = std::max(
+            needed,
+            shard_model.arrival_counter_count(
+                static_cast<std::int64_t>(entries.size() - decode_count),
+                on_device.prefill_group->tokens.size(0)
+            )
+        );
+    }
+    if (!counters.defined() || counters.numel() < needed) {
+        counters = at::zeros({needed}, at::device(device).dtype(at::kInt));
+    }
+    for (std::optional<group_batch>* group : {&on_device.decode_group, &on_device.prefill_group}) {
+        if (*group) {
+            (*group)->arrival_counters = counters;
         }
     }
     step_logits logits;
@@ -910,7 +938,8 @@ task<void> executor::enqueue_on_shard(batch& b, std::size_t shard) {
         streams[shard],
         shard,
         graphs.empty() ? nullptr : graphs[shard].get(),
-        samples[shard]
+        samples[shard],
+        eager_counters[shard]
     );
     co_return;
 }

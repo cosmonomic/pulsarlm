@@ -550,14 +550,15 @@ at::Tensor qwen4_exp_model::deltanet(
         projected.narrow(1, channels + 2 * value_heads, value_heads * c.linear_value_head_dim),
         w.norm,
         c.rms_norm_eps,
-        c.linear_output_gate
+        c.linear_output_gate,
+        g.arrival_counters
     );
     at::Tensor out = small_batch_linear_cuda(gated, w.out_proj);
     comm.all_reduce(out);
     return out;
 }
 
-at::Tensor qwen4_exp_model::moe(const at::Tensor& h, std::int64_t layer) const {
+at::Tensor qwen4_exp_model::moe(const at::Tensor& h, std::int64_t layer, const at::Tensor& counters) const {
     const moe_weights& m = layers[layer].moe;
     at::Tensor logits = small_batch_linear_cuda(h, m.router_and_gate);
     const std::int64_t experts = m.router_and_gate.size(0) - 1;
@@ -568,7 +569,8 @@ at::Tensor qwen4_exp_model::moe(const at::Tensor& h, std::int64_t layer) const {
         m.first_expert,
         m.experts_gate_up_proj,
         m.experts_down_proj,
-        expert_activation::silu
+        expert_activation::silu,
+        counters
     );
     at::Tensor shared = small_batch_linear_cuda(
         small_batch_gated_linear_cuda(h, m.shared_gate_up_proj),
@@ -701,10 +703,24 @@ at::Tensor qwen4_exp_model::group_forward(const group_batch& g, std::span<const 
                                                   : deltanet(mixed.input, layer, g, lines);
         pending.emplace(out, mixed.injection_weights);
         mixed = mix_pending(w.mlp_hyper_connection);
-        pending.emplace(moe(mixed.input, layer), mixed.injection_weights);
+        pending.emplace(moe(mixed.input, layer, g.arrival_counters), mixed.injection_weights);
     }
     inject_pending();
     return logits(final_mix(logit_inputs(x, g)));
+}
+
+std::int64_t qwen4_exp_model::arrival_counter_count(std::int64_t sequences, std::int64_t tokens) const {
+    const moe_weights& m = layers.front().moe;
+    return std::max(
+        gated_delta_rule_counters(sequences, heads.linear_n_value_heads),
+        routed_experts_counters(
+            tokens,
+            config.num_experts_per_tok,
+            m.experts_gate_up_proj.size(0),
+            m.experts_down_proj.size(2),
+            m.experts_down_proj.size(1)
+        )
+    );
 }
 
 step_logits qwen4_exp_model::forward(const step_batch& batch, std::span<const kv> lines) {

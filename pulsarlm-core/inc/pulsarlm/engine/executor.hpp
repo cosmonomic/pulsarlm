@@ -60,6 +60,8 @@ class executor {
     // The page writes write-backs spawned, at most max_store_writes at once.
     pending_writes store_writes;
     static constexpr std::size_t max_store_writes = 8;
+    // Per shard, the arrival counters of the steps that run without a graph, grown to the largest step's.
+    std::vector<at::Tensor> eager_counters;
     // Per shard, int64 [max_sampled_rows] on its device: the tokens the latest launched step sampled, every shard
     // sampling them alike.
     std::vector<at::Tensor> samples;

@@ -81,6 +81,9 @@ struct group_batch {
     at::Tensor query_weights;
     // int64 [n]: the rows whose logits the forward returns, in order. Undefined returns every row's.
     at::Tensor logit_rows;
+    // int32 zeros, at least the model's arrival_counter_count for the group: the arrival counters of its ops (ops.hpp).
+    // The groups of one stream's steps may share them.
+    at::Tensor arrival_counters;
 
     bool is_prefill() const {
         return cu_seqlens_q.defined();
@@ -124,6 +127,10 @@ class model {
     }
     // lines holds one kv per entry of kv_layers().
     virtual step_logits forward(const step_batch& batch, std::span<const kv> lines) = 0;
+    // The arrival counters a group of sequences forwarding tokens tokens needs.
+    virtual std::int64_t arrival_counter_count(std::int64_t sequences, std::int64_t tokens) const {
+        return 0;
+    }
 };
 
 }  // namespace pulsarlm

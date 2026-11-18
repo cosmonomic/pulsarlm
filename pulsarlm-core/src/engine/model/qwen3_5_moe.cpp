@@ -216,12 +216,13 @@ at::Tensor qwen3_5_moe_model::deltanet(
         at::linear(h, w.in_proj_z),
         w.norm,
         c.rms_norm_eps,
-        gate_activation::silu
+        gate_activation::silu,
+        g.arrival_counters
     );
     return at::linear(gated, w.out_proj);
 }
 
-at::Tensor qwen3_5_moe_model::moe(const at::Tensor& h, std::int64_t layer) const {
+at::Tensor qwen3_5_moe_model::moe(const at::Tensor& h, std::int64_t layer, const at::Tensor& counters) const {
     const moe_weights& m = layers[layer].moe;
     at::Tensor shared = at::linear(
         at::silu(at::linear(h, m.shared_gate_proj)) * at::linear(h, m.shared_up_proj),
@@ -234,7 +235,8 @@ at::Tensor qwen3_5_moe_model::moe(const at::Tensor& h, std::int64_t layer) const
         0,
         m.experts_gate_up_proj,
         m.experts_down_proj,
-        expert_activation::silu
+        expert_activation::silu,
+        counters
     );
     return sigmoid_gated_add_cuda(routed, at::linear(h, m.shared_expert_gate), shared);
 }
@@ -246,9 +248,23 @@ at::Tensor qwen3_5_moe_model::group_forward(const group_batch& g, std::span<cons
         const layer_weights& w = layers[layer];
         at::Tensor h = rmsnorm_cuda(x, w.input_layernorm, eps);
         x = x + (full_attention(layer) ? attention(h, layer, g, lines) : deltanet(h, layer, g, lines));
-        x = x + moe(rmsnorm_cuda(x, w.post_attention_layernorm, eps), layer);
+        x = x + moe(rmsnorm_cuda(x, w.post_attention_layernorm, eps), layer, g.arrival_counters);
     }
     return at::matmul(rmsnorm_cuda(logit_inputs(x, g), norm, eps), lm_head.t());
+}
+
+std::int64_t qwen3_5_moe_model::arrival_counter_count(std::int64_t sequences, std::int64_t tokens) const {
+    const moe_weights& m = layers.front().moe;
+    return std::max(
+        gated_delta_rule_counters(sequences, config.linear_n_value_heads),
+        routed_experts_counters(
+            tokens,
+            config.num_experts_per_tok,
+            m.experts_gate_up_proj.size(0),
+            m.experts_down_proj.size(2),
+            m.experts_down_proj.size(1)
+        )
+    );
 }
 
 step_logits qwen3_5_moe_model::forward(const step_batch& batch, std::span<const kv> lines) {

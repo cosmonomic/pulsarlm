@@ -41,7 +41,7 @@ class decode_graphs {
     std::map<shape, std::unique_ptr<captured_forward>> forwards;
 
     // Inputs of a decode group of sequences on the lines' device, the mass rows of up to startup_sequences sequences in
-    // the shared buffers.
+    // the shared buffers, with the group's own arrival counters.
     group_batch make_inputs(std::int64_t sequences, bool measures_mass) const;
     std::unique_ptr<captured_forward> capture(std::int64_t sequences, bool measures_mass);
 

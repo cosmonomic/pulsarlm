@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,21 @@
 // recurrent lines hold at the end and at the newest page end, and the K the attention lines hold.
 
 namespace {
+
+// batch with each group's own arrival counters, as many as model needs for it.
+pulsarlm::step_batch with_arrival_counters(pulsarlm::step_batch batch, const pulsarlm::model& model) {
+    for (std::optional<pulsarlm::group_batch>* group : {&batch.decode_group, &batch.prefill_group}) {
+        if (*group) {
+            const std::int64_t tokens = (*group)->tokens.size(0);
+            const std::int64_t sequences = (*group)->is_prefill() ? (*group)->cu_seqlens_q.size(0) - 1 : tokens;
+            (*group)->arrival_counters = at::zeros(
+                {model.arrival_counter_count(sequences, tokens)},
+                (*group)->tokens.options().dtype(at::kInt)
+            );
+        }
+    }
+    return batch;
+}
 
 using pulsarlm::qwen3_5_layer_type;
 
@@ -377,9 +393,11 @@ void check_against_dense(at::ScalarType dtype, double tolerance, std::int64_t to
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
         pulsarlm::step_batch batch;
         (c.prefill ? batch.prefill_group : batch.decode_group) = step(tokens, c.first, c.last, c.prefill, specs);
-        pulsarlm::step_logits logits = model.forward(batch, kv);
+        pulsarlm::step_logits logits = model.forward(with_arrival_counters(batch, model), kv);
         auto expected_logits = dense.logits.narrow(0, c.first, c.last - c.first);
-        CHECK(max_relative_error(*(c.prefill ? logits.prefill_logits : logits.decode_logits), expected_logits) < tolerance);
+        CHECK(
+            max_relative_error(*(c.prefill ? logits.prefill_logits : logits.decode_logits), expected_logits) < tolerance
+        );
     }
 
     auto permutation = at::tensor(rope_permutation()).to(at::kCUDA);

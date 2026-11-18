@@ -597,6 +597,24 @@ unsigned element_blocks(int64_t elements) {
     return static_cast<unsigned>((elements + kElementThreads - 1) / kElementThreads);
 }
 
+int64_t max_tiles_of(int64_t assignments, int64_t experts) {
+    return std::min(assignments, assignments / kTileRows + std::min(experts, assignments));
+}
+
+int64_t gate_up_column_blocks(int64_t intermediate) {
+    return (intermediate + kTileWeightRows / 2 - 1) / (kTileWeightRows / 2);
+}
+
+// The splits the gated product takes along k, and the chunks of k each covers.
+std::pair<int64_t, int64_t> gate_up_splits(int64_t max_tiles, int64_t intermediate, int64_t hidden) {
+    const int64_t gate_up_blocks = max_tiles * gate_up_column_blocks(intermediate);
+    const int64_t chunks = (hidden + kChunkK - 1) / kChunkK;
+    const int64_t sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    const int64_t splits = std::clamp<int64_t>(kSplitTargetPerSm * sms / gate_up_blocks, 1, chunks);
+    const int64_t chunks_per_split = (chunks + splits - 1) / splits;
+    return {(chunks + chunks_per_split - 1) / chunks_per_split, chunks_per_split};
+}
+
 template <typename scalar_t, bool bf16>
 void launch_tile_gemms(
     const at::Tensor& h,
@@ -607,25 +625,22 @@ void launch_tile_gemms(
     const int32_t* tiles,
     int64_t max_tiles,
     at::Tensor& activations,
-    at::Tensor& expert_out
+    at::Tensor& expert_out,
+    const at::Tensor& counters
 ) {
     const int64_t hidden = h.size(1);
     const int64_t intermediate = down_proj.size(2);
     const int64_t assignments = activations.size(0);
     auto stream = at::cuda::getCurrentCUDAStream();
-    const int64_t gate_up_blocks = max_tiles * ((intermediate + kTileWeightRows / 2 - 1) / (kTileWeightRows / 2));
     const int64_t chunks = (hidden + kChunkK - 1) / kChunkK;
-    const int64_t sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-    const int64_t splits = std::clamp<int64_t>(kSplitTargetPerSm * sms / gate_up_blocks, 1, chunks);
-    const int64_t chunks_per_split = (chunks + splits - 1) / splits;
-    const int64_t used_splits = (chunks + chunks_per_split - 1) / chunks_per_split;
+    const auto [used_splits, chunks_per_split] = gate_up_splits(max_tiles, intermediate, hidden);
     at::Tensor partial;
     if (used_splits > 1) {
         partial = at::empty({used_splits, assignments, 2 * intermediate}, h.options().dtype(at::kFloat));
     }
     const dim3 gate_up_grid(
         static_cast<unsigned>(max_tiles),
-        static_cast<unsigned>((intermediate + kTileWeightRows / 2 - 1) / (kTileWeightRows / 2)),
+        static_cast<unsigned>(gate_up_column_blocks(intermediate)),
         static_cast<unsigned>(used_splits)
     );
     launch_dependent(
@@ -648,7 +663,7 @@ void launch_tile_gemms(
         static_cast<int>(chunks_per_split),
         used_splits > 1 ? partial.mutable_data_ptr<float>() : nullptr,
         assignments,
-        used_splits > 1 ? arrival_counters(gate_up_grid.x * gate_up_grid.y) : nullptr
+        used_splits > 1 ? counters.mutable_data_ptr<int32_t>() : nullptr
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     const dim3 down_grid(
@@ -684,6 +699,14 @@ bool aligned_rows(const at::Tensor& t, int64_t row_stride) {
     return reinterpret_cast<uintptr_t>(t.const_data_ptr()) % 16 == 0 && row_stride * t.element_size() % 16 == 0;
 }
 
+void check_counters(const at::Tensor& counters, const at::Tensor& h, int64_t needed) {
+    TORCH_CHECK(
+        counters.is_cuda() && counters.device() == h.device() && counters.scalar_type() == at::kInt &&
+            counters.is_contiguous() && counters.numel() >= needed,
+        "routed_experts: counters must be contiguous int32 on h's device, at least routed_experts_counters of them"
+    );
+}
+
 void check_experts(const at::Tensor& h, const at::Tensor& gate_up_proj, const at::Tensor& down_proj) {
     TORCH_CHECK(
         h.is_cuda() && h.dim() == 2 && h.stride(1) == 1,
@@ -714,6 +737,7 @@ at::Tensor run_experts(
     const at::Tensor& gate_up_proj,
     const at::Tensor& down_proj,
     expert_activation activation,
+    const at::Tensor& counters,
     Sort&& sort
 ) {
     const int64_t tokens = h.size(0);
@@ -727,7 +751,7 @@ at::Tensor run_experts(
     }
     TORCH_CHECK(assignments <= std::numeric_limits<int32_t>::max() / kTileRows, "routed_experts: too many assignments");
 
-    const int64_t max_tiles = std::min(assignments, assignments / kTileRows + std::min(experts, assignments));
+    const int64_t max_tiles = max_tiles_of(assignments, experts);
     at::Tensor indices = at::empty({3 * assignments + 3 * max_tiles}, h.options().dtype(at::kInt));
     int32_t* position_of = indices.mutable_data_ptr<int32_t>();
     int32_t* sorted_token = position_of + assignments;
@@ -800,7 +824,8 @@ at::Tensor run_experts(
                 tiles,
                 max_tiles,
                 activations,
-                expert_out
+                expert_out,
+                counters
             );
         } else {
             launch_tile_gemms<at::Half, false>(
@@ -812,7 +837,8 @@ at::Tensor run_experts(
                 tiles,
                 max_tiles,
                 activations,
-                expert_out
+                expert_out,
+                counters
             );
         }
     }
@@ -839,13 +865,26 @@ at::Tensor run_experts(
 
 }  // namespace
 
+// The route-and-sort kernel's one counter, then the split gated product's one per block, used by kernels in turn.
+int64_t
+routed_experts_counters(int64_t tokens, int64_t top_k, int64_t held_experts, int64_t intermediate, int64_t hidden) {
+    const int64_t assignments = tokens * top_k;
+    if (assignments == 0) {
+        return 0;
+    }
+    const int64_t max_tiles = max_tiles_of(assignments, held_experts);
+    const bool split = gate_up_splits(max_tiles, intermediate, hidden).first > 1;
+    return std::max<int64_t>(1, split ? max_tiles * gate_up_column_blocks(intermediate) : 0);
+}
+
 at::Tensor routed_experts_cuda(
     const at::Tensor& h,
     const at::Tensor& top_experts,
     const at::Tensor& top_weights,
     const at::Tensor& gate_up_proj,
     const at::Tensor& down_proj,
-    expert_activation activation
+    expert_activation activation,
+    const at::Tensor& counters
 ) {
     check_experts(h, gate_up_proj, down_proj);
     TORCH_CHECK(
@@ -858,6 +897,7 @@ at::Tensor routed_experts_cuda(
     );
     const int64_t experts = gate_up_proj.size(0);
     const int64_t top_k = top_experts.size(1);
+    check_counters(counters, h, routed_experts_counters(h.size(0), top_k, experts, down_proj.size(2), h.size(1)));
     auto sort =
         [&](int32_t* position_of, int32_t* sorted_token, int32_t* sorted_expert, int32_t* tiles, int64_t max_tiles) {
             launch_dependent(
@@ -878,7 +918,7 @@ at::Tensor routed_experts_cuda(
             );
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         };
-    return run_experts(h, top_k, top_weights, gate_up_proj, down_proj, activation, sort);
+    return run_experts(h, top_k, top_weights, gate_up_proj, down_proj, activation, counters, sort);
 }
 
 at::Tensor routed_experts_cuda(
@@ -888,11 +928,13 @@ at::Tensor routed_experts_cuda(
     int64_t first_expert,
     const at::Tensor& gate_up_proj,
     const at::Tensor& down_proj,
-    expert_activation activation
+    expert_activation activation,
+    const at::Tensor& counters
 ) {
     check_experts(h, gate_up_proj, down_proj);
     const int64_t tokens = h.size(0);
     const int64_t held_experts = gate_up_proj.size(0);
+    check_counters(counters, h, routed_experts_counters(tokens, top_k, held_experts, down_proj.size(2), h.size(1)));
     TORCH_CHECK(
         router_logits.is_cuda() && router_logits.dim() == 2 && router_logits.size(0) == tokens &&
             router_logits.stride(1) == 1 && router_logits.device() == h.device(),
@@ -935,7 +977,7 @@ at::Tensor routed_experts_cuda(
                         static_cast<int>(max_tiles),
                         top_weights.mutable_data_ptr<float>(),
                         top_experts.mutable_data_ptr<int64_t>(),
-                        arrival_counters(1),
+                        counters.mutable_data_ptr<int32_t>(),
                         position_of,
                         sorted_token,
                         sorted_expert,
@@ -945,7 +987,7 @@ at::Tensor routed_experts_cuda(
                 }
             );
         };
-    return run_experts(h, top_k, top_weights, gate_up_proj, down_proj, activation, sort);
+    return run_experts(h, top_k, top_weights, gate_up_proj, down_proj, activation, counters, sort);
 }
 
 }  // namespace pulsarlm

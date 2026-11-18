@@ -198,7 +198,7 @@ at::Tensor gemma4_model::attention(
     return at::linear(o.reshape({ntok, config.n_heads * head_dim}), w.o_proj);
 }
 
-at::Tensor gemma4_model::experts(const at::Tensor& x, std::int64_t layer) const {
+at::Tensor gemma4_model::experts(const at::Tensor& x, std::int64_t layer, const at::Tensor& counters) const {
     const layer_weights& w = layers[layer];
     const double eps = config.rms_norm_eps;
 
@@ -215,7 +215,8 @@ at::Tensor gemma4_model::experts(const at::Tensor& x, std::int64_t layer) const 
         top_weights,
         w.experts_gate_up_proj,
         w.experts_down_proj,
-        expert_activation::gelu_tanh
+        expert_activation::gelu_tanh,
+        counters
     );
 }
 
@@ -235,7 +236,7 @@ at::Tensor gemma4_model::block(
     at::Tensor mlp = at::linear(gelu_tanh(at::linear(h, w.gate_proj)) * at::linear(h, w.up_proj), w.down_proj);
     if (config.enable_moe_block) {
         mlp = rmsnorm_cuda(mlp, w.post_feedforward_layernorm_1, eps) +
-            rmsnorm_cuda(experts(x, layer), w.post_feedforward_layernorm_2, eps);
+            rmsnorm_cuda(experts(x, layer, g.arrival_counters), w.post_feedforward_layernorm_2, eps);
     }
     x = x + rmsnorm_cuda(mlp, w.post_feedforward_layernorm, eps);
 
@@ -264,6 +265,20 @@ at::Tensor gemma4_model::group_forward(const group_batch& g, std::span<const kv>
         x = block(x, layer, per_layer.defined() ? per_layer.select(1, layer) : at::Tensor(), g, lines);
     }
     return head(logit_inputs(x, g));
+}
+
+std::int64_t gemma4_model::arrival_counter_count(std::int64_t, std::int64_t tokens) const {
+    if (!config.enable_moe_block) {
+        return 0;
+    }
+    const layer_weights& w = layers.front();
+    return routed_experts_counters(
+        tokens,
+        config.top_k_experts,
+        w.experts_gate_up_proj.size(0),
+        w.experts_down_proj.size(2),
+        config.hidden_size
+    );
 }
 
 step_logits gemma4_model::forward(const step_batch& batch, std::span<const kv> lines) {

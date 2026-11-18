@@ -16,6 +16,21 @@
 
 namespace {
 
+// batch with each group's own arrival counters, as many as model needs for it.
+pulsarlm::step_batch with_arrival_counters(pulsarlm::step_batch batch, const pulsarlm::model& model) {
+    for (std::optional<pulsarlm::group_batch>* group : {&batch.decode_group, &batch.prefill_group}) {
+        if (*group) {
+            const std::int64_t tokens = (*group)->tokens.size(0);
+            const std::int64_t sequences = (*group)->is_prefill() ? (*group)->cu_seqlens_q.size(0) - 1 : tokens;
+            (*group)->arrival_counters = at::zeros(
+                {model.arrival_counter_count(sequences, tokens)},
+                (*group)->tokens.options().dtype(at::kInt)
+            );
+        }
+    }
+    return batch;
+}
+
 using pulsarlm::gemma4_config;
 using pulsarlm::gemma4_layer_type;
 
@@ -378,10 +393,14 @@ void check_against_dense(const gemma4_config& c, at::ScalarType dtype, double to
          {chunk{0, 21, true}, chunk{21, 37, true}, chunk{37, 38, false}, chunk{38, 39, false}, chunk{39, 40, false}}) {
         INFO("tokens [" << ch.first << ", " << ch.last << ")" << (ch.prefill ? " prefill" : " decode"));
         pulsarlm::step_batch batch;
-        (ch.prefill
-             ? batch.prefill_group
-             : batch.decode_group) = step(tokens, static_cast<std::int64_t>(layers.size()), ch.first, ch.last, ch.prefill);
-        pulsarlm::step_logits logits = model.forward(batch, lines);
+        (ch.prefill ? batch.prefill_group : batch.decode_group) = step(
+            tokens,
+            static_cast<std::int64_t>(layers.size()),
+            ch.first,
+            ch.last,
+            ch.prefill
+        );
+        pulsarlm::step_logits logits = model.forward(with_arrival_counters(batch, model), lines);
         auto expected = dense.logits.narrow(0, ch.first, ch.last - ch.first);
         CHECK(max_relative_error(*(ch.prefill ? logits.prefill_logits : logits.decode_logits), expected) < tolerance);
     }

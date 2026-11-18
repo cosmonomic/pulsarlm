@@ -172,7 +172,7 @@ class qwen4_exp_model : public model {
     at::Tensor
     attention(const at::Tensor& h, std::int64_t layer, const group_batch& g, std::span<const kv> lines) const;
     at::Tensor deltanet(const at::Tensor& h, std::int64_t layer, const group_batch& g, std::span<const kv> lines) const;
-    at::Tensor moe(const at::Tensor& h, std::int64_t layer) const;
+    at::Tensor moe(const at::Tensor& h, std::int64_t layer, const at::Tensor& counters) const;
     // Each token's n-gram ids into the layer's table, [ntok, n-gram heads], updating its token lines.
     at::Tensor ngram_ids(const ple_weights& w, std::size_t token_layer, const group_batch& g, const kv& lines) const;
     at::Tensor ple(const at::Tensor& x, std::int64_t layer, const group_batch& g, std::span<const kv> lines) const;
@@ -186,6 +186,7 @@ class qwen4_exp_model : public model {
     std::vector<kv_layer> kv_layers() const override;
     std::vector<kv_layer_shard> kv_layer_shards() const override;
     step_logits forward(const step_batch& batch, std::span<const kv> lines) override;
+    std::int64_t arrival_counter_count(std::int64_t sequences, std::int64_t tokens) const override;
 };
 
 }  // namespace pulsarlm

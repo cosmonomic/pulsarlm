@@ -274,7 +274,11 @@ TEST_CASE(
         z,
         norm_weight,
         eps,
-        activation
+        activation,
+        at::zeros(
+            {pulsarlm::gated_delta_rule_counters(rows.size(0), value_heads)},
+            at::device(at::kCUDA).dtype(at::kInt)
+        )
     );
 
     REQUIRE(out.sizes() == at::IntArrayRef{batch.total(), value_heads * value_dim});
@@ -337,6 +341,42 @@ TEST_CASE("causal_conv reads x's rows wherever they lie", "[ops][cuda]") {
     CHECK(at::equal(strided_pool, packed_pool));
 }
 
+TEST_CASE("gated_delta_rule refuses fewer arrival counters than a step needs", "[ops][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const ragged_case batch = decode_case();
+    const int64_t key_heads = 2;
+    const int64_t key_dim = 32;
+    const int64_t value_heads = 4;
+    const int64_t value_dim = 32;
+    auto opts = at::device(at::kCUDA).dtype(at::kBFloat16);
+    auto fp32 = at::device(at::kCUDA).dtype(at::kFloat);
+    at::Tensor rows = line_rows(kRunning, kBoundary);
+    const int64_t needed = pulsarlm::gated_delta_rule_counters(rows.size(0), value_heads);
+    REQUIRE(needed > 0);
+
+    REQUIRE_THROWS(
+        pulsarlm::gated_delta_rule_cuda(
+            at::randn({batch.total(), 2 * key_heads * key_dim + value_heads * value_dim}, opts),
+            at::randn({batch.total(), value_heads}, opts),
+            at::randn({batch.total(), value_heads}, opts),
+            at::randn({value_heads}, fp32),
+            -at::ones({value_heads}, fp32),
+            spaced_pool({value_heads, key_dim, value_dim}, at::kFloat),
+            rows,
+            batch.cu_seqlens_q(),
+            int32_cuda(batch.page_ends),
+            key_heads,
+            at::randn({batch.total(), value_heads * value_dim}, opts),
+            at::randn({value_dim}, opts),
+            1e-6,
+            pulsarlm::gate_activation::silu,
+            at::zeros({needed - 1}, at::device(at::kCUDA).dtype(at::kInt))
+        )
+    );
+}
+
 TEST_CASE("gated_delta_rule reads a's, b's and z's rows wherever they lie", "[ops][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
@@ -376,7 +416,11 @@ TEST_CASE("gated_delta_rule reads a's, b's and z's rows wherever they lie", "[op
         z,
         norm_weight,
         1e-6,
-        activation
+        activation,
+        at::zeros(
+            {pulsarlm::gated_delta_rule_counters(rows.size(0), value_heads)},
+            at::device(at::kCUDA).dtype(at::kInt)
+        )
     );
     at::Tensor packed = pulsarlm::gated_delta_rule_cuda(
         x,
@@ -392,7 +436,11 @@ TEST_CASE("gated_delta_rule reads a's, b's and z's rows wherever they lie", "[op
         z.contiguous(),
         norm_weight,
         1e-6,
-        activation
+        activation,
+        at::zeros(
+            {pulsarlm::gated_delta_rule_counters(rows.size(0), value_heads)},
+            at::device(at::kCUDA).dtype(at::kInt)
+        )
     );
 
     CHECK(at::equal(strided, packed));

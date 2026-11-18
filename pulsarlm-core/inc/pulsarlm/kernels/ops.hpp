@@ -95,7 +95,8 @@ at::Tensor routed_experts_cuda(
     const at::Tensor& top_weights,
     const at::Tensor& gate_up_proj,
     const at::Tensor& down_proj,
-    expert_activation activation
+    expert_activation activation,
+    const at::Tensor& counters
 );
 
 // routed_experts_cuda with each token's top_k experts by the softmax in fp32 of its router_logits [tokens, experts],
@@ -109,8 +110,17 @@ at::Tensor routed_experts_cuda(
     int64_t first_expert,
     const at::Tensor& gate_up_proj,
     const at::Tensor& down_proj,
-    expert_activation activation
+    expert_activation activation,
+    const at::Tensor& counters
 );
+
+// The arrival counters routed_experts_cuda needs for tokens rows of h, each routed to top_k of the held experts, as
+// both forms use them.
+int64_t
+routed_experts_counters(int64_t tokens, int64_t top_k, int64_t held_experts, int64_t intermediate, int64_t hidden);
+
+// An op taking counters takes int32 zeros on its tensors' device, at least as many as its count function gives, and
+// leaves them zero (arrival_counters.cuh); the ordered calls of one stream may share them.
 
 // The Gated DeltaNet ops run a ragged batch: sequence s holds tokens [cu_seqlens_q[s], cu_seqlens_q[s + 1]) of x, or
 // token s alone without cu_seqlens_q. rows [num_seqs, >= 2] int32 holds each sequence's running line, whose state the
@@ -154,8 +164,12 @@ at::Tensor gated_delta_rule_cuda(
     const at::Tensor& z,
     const at::Tensor& norm_weight,
     double eps,
-    gate_activation activation
+    gate_activation activation,
+    const at::Tensor& counters
 );
+
+// The arrival counters gated_delta_rule_cuda needs for a step of num_seqs sequences.
+int64_t gated_delta_rule_counters(int64_t num_seqs, int64_t value_heads);
 
 // Writes a batch's new keys and values into the lines of paged pools. k_pool and v_pool are [lines, page_size,
 // n_kv_heads, head_dim] of one stride, each line packed and 16-byte aligned, lines any number of elements apart, and

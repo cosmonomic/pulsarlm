@@ -82,7 +82,7 @@ class gemma4_model : public model {
     at::Tensor
     attention(const at::Tensor& h, std::int64_t layer, const group_batch& g, std::span<const kv> lines) const;
     // The experts' output for the hidden states x a layer's MLP block starts from.
-    at::Tensor experts(const at::Tensor& x, std::int64_t layer) const;
+    at::Tensor experts(const at::Tensor& x, std::int64_t layer, const at::Tensor& counters) const;
     at::Tensor head(const at::Tensor& x) const;
     at::Tensor group_forward(const group_batch& g, std::span<const kv> lines) const;
 
@@ -92,6 +92,7 @@ class gemma4_model : public model {
 
     std::vector<kv_layer> kv_layers() const override;
     step_logits forward(const step_batch& batch, std::span<const kv> lines) override;
+    std::int64_t arrival_counter_count(std::int64_t sequences, std::int64_t tokens) const override;
 };
 
 }  // namespace pulsarlm

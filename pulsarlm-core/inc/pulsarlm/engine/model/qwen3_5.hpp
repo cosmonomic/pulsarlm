@@ -92,6 +92,7 @@ class qwen3_5_model : public model {
     std::vector<kv_layer> kv_layers() const override;
     std::vector<kv_layer_shard> kv_layer_shards() const override;
     step_logits forward(const step_batch& batch, std::span<const kv> lines) override;
+    std::int64_t arrival_counter_count(std::int64_t sequences, std::int64_t tokens) const override;
 };
 
 }  // namespace pulsarlm

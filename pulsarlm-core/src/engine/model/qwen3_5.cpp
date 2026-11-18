@@ -381,7 +381,8 @@ at::Tensor qwen3_5_model::deltanet(
         w.in_proj_z.apply(h),
         w.norm,
         c.rms_norm_eps,
-        gate_activation::silu
+        gate_activation::silu,
+        g.arrival_counters
     );
     at::Tensor out = w.out_proj.apply(gated);
     comm.all_reduce(out);
@@ -417,6 +418,10 @@ at::Tensor qwen3_5_model::group_forward(const group_batch& g, std::span<const kv
         .transpose(0, 1)
         .reshape({rows, -1})
         .narrow(1, 0, config.vocab_size);
+}
+
+std::int64_t qwen3_5_model::arrival_counter_count(std::int64_t sequences, std::int64_t) const {
+    return gated_delta_rule_counters(sequences, linear_n_value_heads);
 }
 
 step_logits qwen3_5_model::forward(const step_batch& batch, std::span<const kv> lines) {

@@ -932,6 +932,11 @@ at::Tensor causal_conv_cuda(
     return out;
 }
 
+// One per (sequence, value head) of a step of one token per sequence.
+int64_t gated_delta_rule_counters(int64_t num_seqs, int64_t value_heads) {
+    return num_seqs * value_heads;
+}
+
 at::Tensor gated_delta_rule_cuda(
     const at::Tensor& x,
     const at::Tensor& a,
@@ -946,7 +951,8 @@ at::Tensor gated_delta_rule_cuda(
     const at::Tensor& z,
     const at::Tensor& norm_weight,
     double eps,
-    gate_activation activation
+    gate_activation activation,
+    const at::Tensor& counters
 ) {
     check_ragged("gated_delta_rule", x, rows, cu_seqlens_q, page_end_tokens);
     TORCH_CHECK(x.is_contiguous(), "gated_delta_rule: x must be contiguous");
@@ -998,6 +1004,11 @@ at::Tensor gated_delta_rule_cuda(
     );
     at::Tensor out = at::empty({total, value_heads * value_dim}, x.options());
     const int64_t num_seqs = rows.size(0);
+    TORCH_CHECK(
+        counters.is_cuda() && counters.device() == x.device() && counters.scalar_type() == at::kInt &&
+            counters.is_contiguous() && counters.numel() >= gated_delta_rule_counters(num_seqs, value_heads),
+        "gated_delta_rule: counters must be contiguous int32 on x's device, at least gated_delta_rule_counters of them"
+    );
     if (num_seqs == 0) {
         return out;
     }
@@ -1047,7 +1058,7 @@ at::Tensor gated_delta_rule_cuda(
                     b_data,
                     params,
                     gate,
-                    arrival_counters(num_seqs * value_heads),
+                    counters.mutable_data_ptr<int32_t>(),
                     out_data
                 );
             } else {

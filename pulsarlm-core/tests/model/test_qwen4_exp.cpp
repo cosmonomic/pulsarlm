@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <format>
 #include <memory>
 #include <stdexcept>
@@ -28,6 +29,21 @@
 // the lines of the forward on one GPU.
 
 namespace {
+
+// batch with each group's own arrival counters, as many as model needs for it.
+pulsarlm::step_batch with_arrival_counters(pulsarlm::step_batch batch, const pulsarlm::model& model) {
+    for (std::optional<pulsarlm::group_batch>* group : {&batch.decode_group, &batch.prefill_group}) {
+        if (*group) {
+            const std::int64_t tokens = (*group)->tokens.size(0);
+            const std::int64_t sequences = (*group)->is_prefill() ? (*group)->cu_seqlens_q.size(0) - 1 : tokens;
+            (*group)->arrival_counters = at::zeros(
+                {model.arrival_counter_count(sequences, tokens)},
+                (*group)->tokens.options().dtype(at::kInt)
+            );
+        }
+    }
+    return batch;
+}
 
 using pulsarlm::qwen4_exp_layer_type;
 
@@ -751,7 +767,7 @@ void check_against_dense(at::ScalarType dtype, double tolerance, std::int64_t ex
 
     for (chunk c : chunks) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
-        pulsarlm::step_logits logits = model.forward(chunk_batch(tokens, c, specs), kv);
+        pulsarlm::step_logits logits = model.forward(with_arrival_counters(chunk_batch(tokens, c, specs), model), kv);
         auto expected_logits = dense.logits.narrow(0, c.first, c.last - c.first);
         CHECK(max_relative_error(chunk_logits(logits, c), expected_logits) < tolerance);
     }
@@ -807,7 +823,7 @@ std::vector<pulsarlm::step_logits> sharded_forward(
     for (std::size_t rank = 0; rank < shards.size(); rank++) {
         threads.emplace_back([&, rank] {
             c10::cuda::CUDAStreamGuard guard(streams[rank]);
-            logits[rank] = shards[rank]->forward(batch, lines[rank]);
+            logits[rank] = shards[rank]->forward(with_arrival_counters(batch, *shards[rank]), lines[rank]);
             streams[rank].synchronize();
         });
     }
@@ -859,7 +875,7 @@ void check_sharded(
     for (chunk c : chunks) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
         pulsarlm::step_batch batch = chunk_batch(tokens, c, specs);
-        single.forward(batch, single_lines);
+        single.forward(with_arrival_counters(batch, single), single_lines);
         std::vector<pulsarlm::step_logits> logits = sharded_forward(shards, lines, streams, batch);
         const at::Tensor& rank_0 = chunk_logits(logits.front(), c);
         CHECK(max_relative_error(rank_0, dense.logits.narrow(0, c.first, c.last - c.first)) < tolerance);
