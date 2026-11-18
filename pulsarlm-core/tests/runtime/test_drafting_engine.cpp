@@ -1,4 +1,5 @@
 #include "pulsarlm/digest.hpp"
+#include "pulsarlm/engine/communicator.hpp"
 #include "pulsarlm/engine/engine.hpp"
 #include "pulsarlm/engine/model/qwen4_exp.hpp"
 #include "pulsarlm/engine/request_callbacks.hpp"
@@ -130,12 +131,14 @@ std::vector<std::int64_t> head_offsets() {
 
 struct weights {
     split_dims dims;
+    at::ScalarType dtype;
     c10::Dict<std::string, at::Tensor> named_tensors;
     at::Tensor ngram_embedding;
 
     // With drafts, the MTP layer's mtp.* weights too.
     weights(at::ScalarType dtype, split_dims dims, bool drafts)
-    : dims(dims) {
+    : dims(dims),
+      dtype(dtype) {
         at::manual_seed(13);
         auto add = [&](const std::string& name, at::Tensor t) { named_tensors.insert(name, t.to(cuda(dtype))); };
         auto projection = [](std::int64_t out, std::int64_t in) { return at::randn({out, in}) / std::sqrt(in); };
@@ -501,6 +504,103 @@ void check_same_state(const pulsarlm::state& got, const pulsarlm::state& expecte
     }
 }
 
+at::Tensor part(
+    const at::Tensor& t,
+    std::int64_t dim,
+    std::int64_t first,
+    std::int64_t count,
+    std::size_t rank,
+    std::size_t gpus
+) {
+    const std::int64_t share = count / static_cast<std::int64_t>(gpus);
+    return t.narrow(dim, first + static_cast<std::int64_t>(rank) * share, share);
+}
+
+// The vocabulary padded to a multiple of 64, as vLLM pads it before splitting it.
+constexpr std::int64_t padded_vocab = (vocab + 63) / 64 * 64;
+
+// Of a whole-model weight, the part GPU rank of gpus holds, as vLLM v0.31.0 splits Qwen4-Exp, whole experts with
+// expert_parallel.
+at::Tensor rank_part(
+    const split_dims& dims,
+    const std::string& name,
+    const at::Tensor& t,
+    std::size_t rank,
+    std::size_t gpus,
+    bool expert_parallel
+) {
+    const std::int64_t key_dim = dims.key_channels();
+    const std::int64_t value_dim = dims.value_channels();
+    auto ends = [&](const char* suffix) { return name.ends_with(suffix); };
+    if (ends("embed_tokens.weight") || ends("lm_head.weight")) {
+        at::Tensor padded = at::cat({t, at::zeros({padded_vocab - vocab, t.size(1)}, t.options())});
+        return part(padded, 0, 0, padded_vocab, rank, gpus);
+    }
+    if (ends("self_attn.q_proj.weight")) {
+        return part(t, 0, 0, t.size(0), rank, gpus);
+    }
+    if (ends("self_attn.k_proj.weight") || ends("self_attn.v_proj.weight")) {
+        if (static_cast<std::int64_t>(gpus) <= n_kv_heads) {
+            return part(t, 0, 0, t.size(0), rank, gpus);
+        }
+        const auto head = static_cast<std::int64_t>(rank) / (static_cast<std::int64_t>(gpus) / n_kv_heads);
+        return t.narrow(0, head * head_dim, head_dim);
+    }
+    if (ends("self_attn.o_proj.weight") || ends("linear_attn.out_proj.weight") ||
+        ends("mlp.shared_expert.down_proj.weight")) {
+        return part(t, 1, 0, t.size(1), rank, gpus);
+    }
+    if (ends("linear_attn.in_proj_qkv.weight") || ends("linear_attn.conv1d.weight")) {
+        return at::cat({
+            part(t, 0, 0, key_dim, rank, gpus),
+            part(t, 0, key_dim, key_dim, rank, gpus),
+            part(t, 0, 2 * key_dim, value_dim, rank, gpus),
+        });
+    }
+    if (ends("linear_attn.in_proj_z.weight") || ends("linear_attn.in_proj_b.weight") ||
+        ends("linear_attn.in_proj_a.weight") || ends("linear_attn.dt_bias") || ends("linear_attn.A_log") ||
+        ends("mlp.shared_expert.gate_proj.weight") || ends("mlp.shared_expert.up_proj.weight")) {
+        return part(t, 0, 0, t.size(0), rank, gpus);
+    }
+    if (expert_parallel && (ends("mlp.experts.gate_up_proj") || ends("mlp.experts.down_proj"))) {
+        return part(t, 0, 0, t.size(0), rank, gpus);
+    }
+    if (ends("mlp.experts.gate_up_proj")) {
+        const std::int64_t intermediate = t.size(1) / 2;
+        return at::cat(
+            {part(t, 1, 0, intermediate, rank, gpus), part(t, 1, intermediate, intermediate, rank, gpus)},
+            1
+        );
+    }
+    if (ends("mlp.experts.down_proj")) {
+        return part(t, 2, 0, t.size(2), rank, gpus);
+    }
+    return t;
+}
+
+// GPU rank's weights: each weight's part, and its rows of the n-gram table as two shards.
+c10::Dict<std::string, at::Tensor>
+rank_weights(const weights& w, std::size_t rank, std::size_t gpus, bool expert_parallel) {
+    c10::Dict<std::string, at::Tensor> parts;
+    for (const auto& entry : w.named_tensors) {
+        if (entry.key().find("ngram_embedding.shard_") == std::string::npos) {
+            parts.insert(
+                entry.key(),
+                rank_part(w.dims, entry.key(), entry.value(), rank, gpus, expert_parallel).contiguous()
+            );
+        }
+    }
+    const std::string table = std::format(
+        "model.language_model.layers.{}.ple.ple_embedding.ngram_embedding.",
+        ple_layer
+    );
+    std::vector<at::Tensor> shards = part(w.ngram_embedding, 0, 0, w.dims.ngram_rows, rank, gpus).chunk(ngram_shards);
+    for (std::size_t shard = 0; shard < shards.size(); shard++) {
+        parts.insert(std::format("{}shard_{}.weight", table, shard), shards[shard].contiguous());
+    }
+    return parts;
+}
+
 // Counts the verify groups it forwards and their rows.
 class counting_model final : public pulsarlm::qwen4_exp_model {
   public:
@@ -519,15 +619,20 @@ class counting_model final : public pulsarlm::qwen4_exp_model {
 };
 
 // With decode_graphs, decode and verify groups replay graphs over views of up to 1024 tokens.
-pulsarlm::engine_config
-engine_config(std::size_t draft_tokens, std::vector<std::int64_t> stop_ids, bool decode_graphs) {
+pulsarlm::engine_config engine_config(
+    std::size_t draft_tokens,
+    std::vector<std::int64_t> stop_ids,
+    bool decode_graphs,
+    std::size_t shard_count,
+    at::ScalarType kv_dtype
+) {
     return pulsarlm::engine_config{
         .model_name = "qwen4_exp-test",
         .model_hash = "1",
         .page_size = page_size,
-        .kv_dtype = at::kFloat,
+        .kv_dtype = kv_dtype,
         .kv_cache_pool_bytes = std::size_t{64} << 20,
-        .devices = {at::Device(at::kCUDA, 0)},
+        .devices = std::vector<at::Device>(shard_count, at::Device(at::kCUDA, 0)),
         .stop_ids = std::move(stop_ids),
         .prefill_tokens_per_step = 32,
         .decode_graphs = decode_graphs,
@@ -542,22 +647,46 @@ struct drafting_engine {
     std::shared_ptr<std::size_t> verify_rows;
 };
 
-// Over a store on contents, a fresh one without.
+// Over a store on contents, a fresh one without; split over shard_count ranks on one device, rank 0's counts kept.
 drafting_engine make_engine(
     const weights& w,
     std::size_t draft_tokens,
     std::vector<std::int64_t> stop_ids,
     bool decode_graphs,
-    std::shared_ptr<store_contents> contents = std::make_shared<store_contents>()
+    std::shared_ptr<store_contents> contents = std::make_shared<store_contents>(),
+    std::size_t shard_count = 1
 ) {
-    auto model = std::make_unique<counting_model>(model_config(w.dims, 2, 8), w.named_tensors);
-    drafting_engine made{.verify_steps = model->verify_steps, .verify_rows = model->verify_rows};
+    std::vector<std::unique_ptr<pulsarlm::model>> shards;
+    drafting_engine made;
+    if (shard_count == 1) {
+        auto model = std::make_unique<counting_model>(model_config(w.dims, 2, 8), w.named_tensors);
+        made.verify_steps = model->verify_steps;
+        made.verify_rows = model->verify_rows;
+        shards.push_back(std::move(model));
+    } else {
+        std::vector<pulsarlm::communicator> comms = pulsarlm::communicator::make_on_one_device(
+            at::Device(at::kCUDA, 0),
+            shard_count
+        );
+        for (std::size_t rank = 0; rank < shard_count; rank++) {
+            auto model = std::make_unique<counting_model>(
+                model_config(w.dims, 2, 8),
+                rank_weights(w, rank, shard_count, false),
+                comms[rank]
+            );
+            if (rank == 0) {
+                made.verify_steps = model->verify_steps;
+                made.verify_rows = model->verify_rows;
+            }
+            shards.push_back(std::move(model));
+        }
+    }
     auto store = std::make_unique<memory_store>();
     store->contents = std::move(contents);
     made.engine = std::make_unique<pulsarlm::engine>(
-        std::move(model),
+        std::move(shards),
         vocab,
-        engine_config(draft_tokens, std::move(stop_ids), decode_graphs),
+        engine_config(draft_tokens, std::move(stop_ids), decode_graphs, shard_count, w.dtype),
         std::move(store)
     );
     return made;
@@ -593,9 +722,12 @@ TEST_CASE("Qwen4-Exp drafting emits the tokens and reaches the state it does wit
     CHECK(got.tokens == expected.tokens);
     check_same_state(got.end_state, expected.end_state);
     CHECK(*plain.verify_steps == 0);
-    // Fewer verify steps than tokens accept drafts, and more rows than tokens reject them.
-    CHECK(*drafting.verify_steps < decode_tokens - 1);
-    CHECK(*drafting.verify_rows > decode_tokens - 1);
+    // Fewer verify steps than tokens accept drafts, and more rows than tokens reject them. A graph replays the forward
+    // it captured without calling it, so the counts are a run's without graphs.
+    if (!decode_graphs) {
+        CHECK(*drafting.verify_steps < decode_tokens - 1);
+        CHECK(*drafting.verify_rows > decode_tokens - 1);
+    }
 }
 
 TEST_CASE("Qwen4-Exp drafting stops at the stop token it stops at without drafts", "[runtime][cuda]") {
@@ -656,4 +788,61 @@ TEST_CASE("Qwen4-Exp drafting resumes a stored state as it does without drafts",
     CHECK(got.tokens == expected.tokens);
     check_same_state(got.end_state, expected.end_state);
     CHECK(*drafting.verify_steps > 0);
+}
+
+// Graphs are not captured: two ranks' captures on one device would merge.
+TEST_CASE("Qwen4-Exp split over two ranks drafts the tokens it emits without drafts", "[runtime][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const double temperature = GENERATE(0.0, 0.8);
+    const bool decode_graphs = false;
+    INFO("temperature " << temperature);
+    const weights w(at::kFloat, base_dims, /*drafts=*/true);
+    const auto request = [&] {
+        return pulsarlm::request{
+            .tokens = random_tokens(prompt_tokens, 5),
+            .sampling = pulsarlm::sampling_params{.temperature = temperature, .seed = 7},
+            .max_tokens = decode_tokens,
+            .eviction = eviction,
+        };
+    };
+    served expected = serve(*make_engine(w, 0, {}, decode_graphs).engine, request());
+    drafting_engine drafting = make_engine(w, 1, {}, decode_graphs, std::make_shared<store_contents>(), 2);
+    served got = serve(*drafting.engine, request());
+
+    REQUIRE(expected.tokens.size() == decode_tokens);
+    CHECK(got.tokens == expected.tokens);
+    check_same_state(got.end_state, expected.end_state);
+    CHECK(*drafting.verify_steps < decode_tokens - 1);
+}
+
+// Each token a drafting bf16 engine emits greedily is the one an engine without drafts emits after the same tokens,
+// but at near-ties of bf16's rounding.
+TEST_CASE("Qwen4-Exp drafting in bf16 emits the greedy token after each prefix", "[runtime][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const weights w(at::kBFloat16, base_dims, /*drafts=*/true);
+    const token_list prompt = random_tokens(prompt_tokens, 6);
+    drafting_engine drafting = make_engine(w, 1, {}, true);
+    served got = serve(*drafting.engine, pulsarlm::request{.tokens = prompt, .max_tokens = decode_tokens});
+    drafting_engine plain = make_engine(w, 0, {}, true);
+    std::size_t disagreements = 0;
+    for (std::size_t i = 0; i < got.tokens.size(); i++) {
+        token_list prefix = prompt;
+        prefix.insert(prefix.end(), got.tokens.begin(), got.tokens.begin() + static_cast<std::ptrdiff_t>(i));
+        served next = serve(*plain.engine, pulsarlm::request{.tokens = prefix, .max_tokens = 1});
+        if (next.tokens.front() != got.tokens[i]) {
+            disagreements++;
+            UNSCOPED_INFO("position " << i << ": drafting " << got.tokens[i] << ", plain " << next.tokens.front());
+        }
+    }
+    served whole = serve(*plain.engine, pulsarlm::request{.tokens = prompt, .max_tokens = decode_tokens});
+    std::size_t same_prefix = 0;
+    while (same_prefix < whole.tokens.size() && whole.tokens[same_prefix] == got.tokens[same_prefix]) {
+        same_prefix++;
+    }
+    INFO("a run without drafts agrees for " << same_prefix << " of " << got.tokens.size() << " tokens");
+    CHECK(disagreements == 0);
 }

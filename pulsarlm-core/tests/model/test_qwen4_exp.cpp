@@ -8,6 +8,7 @@
 #include <c10/cuda/CUDAStream.h>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -1219,14 +1220,18 @@ TEST_CASE("Qwen4-Exp's verify groups match a dense forward and continue from the
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
-    const std::int64_t experts_per_token = 2;
-    const std::int64_t budget = 8;
+    // In bf16 every token takes every expert and every block, as their top choices change with bf16's rounding.
+    const auto dtype = GENERATE(at::kFloat, at::kBFloat16);
+    const bool fp32 = dtype == at::kFloat;
+    const std::int64_t experts_per_token = fp32 ? 2 : n_experts;
+    const std::int64_t budget = fp32 ? 8 : n_tokens * compress_ratio;
     const std::int64_t draft_tokens = 2;
-    const double tolerance = 1e-4;
-    weights w(at::kFloat, base_dims, /*drafts=*/true);
+    const double tolerance = fp32 ? 1e-4 : 5e-2;
+    INFO((fp32 ? "fp32" : "bf16"));
+    weights w(dtype, base_dims, /*drafts=*/true);
     pulsarlm::qwen4_exp_model model(model_config(w.dims, experts_per_token, budget), w.named_tensors);
     std::vector<pulsarlm::kv_layer> specs = model.kv_layers();
-    std::vector<pulsarlm::kv> kv = make_lines(specs, at::kFloat, draft_tokens);
+    std::vector<pulsarlm::kv> kv = make_lines(specs, dtype, draft_tokens);
 
     auto [tokens, token_ids] = make_tokens();
     dense_output dense = dense_forward(w, token_ids, experts_per_token, budget);
