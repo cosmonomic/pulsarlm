@@ -518,7 +518,9 @@ class counting_model final : public pulsarlm::qwen4_exp_model {
     }
 };
 
-pulsarlm::engine_config engine_config(std::size_t draft_tokens, std::vector<std::int64_t> stop_ids) {
+// With decode_graphs, decode and verify groups replay graphs over views of up to 1024 tokens.
+pulsarlm::engine_config
+engine_config(std::size_t draft_tokens, std::vector<std::int64_t> stop_ids, bool decode_graphs) {
     return pulsarlm::engine_config{
         .model_name = "qwen4_exp-test",
         .model_hash = "1",
@@ -528,6 +530,8 @@ pulsarlm::engine_config engine_config(std::size_t draft_tokens, std::vector<std:
         .devices = {at::Device(at::kCUDA, 0)},
         .stop_ids = std::move(stop_ids),
         .prefill_tokens_per_step = 32,
+        .decode_graphs = decode_graphs,
+        .max_context_window = decode_graphs ? std::optional<std::size_t>(1024) : std::nullopt,
         .draft_tokens = draft_tokens,
     };
 }
@@ -543,6 +547,7 @@ drafting_engine make_engine(
     const weights& w,
     std::size_t draft_tokens,
     std::vector<std::int64_t> stop_ids,
+    bool decode_graphs,
     std::shared_ptr<store_contents> contents = std::make_shared<store_contents>()
 ) {
     auto model = std::make_unique<counting_model>(model_config(w.dims, 2, 8), w.named_tensors);
@@ -552,7 +557,7 @@ drafting_engine make_engine(
     made.engine = std::make_unique<pulsarlm::engine>(
         std::move(model),
         vocab,
-        engine_config(draft_tokens, std::move(stop_ids)),
+        engine_config(draft_tokens, std::move(stop_ids), decode_graphs),
         std::move(store)
     );
     return made;
@@ -566,7 +571,10 @@ TEST_CASE("Qwen4-Exp drafting emits the tokens and reaches the state it does wit
     }
     const std::size_t draft_tokens = GENERATE(1, 2);
     const double temperature = GENERATE(0.0, 0.8);
-    INFO(draft_tokens << " drafts at temperature " << temperature);
+    const bool decode_graphs = GENERATE(false, true);
+    INFO(
+        draft_tokens << " drafts at temperature " << temperature << (decode_graphs ? " with" : " without") << " graphs"
+    );
     const weights w(at::kFloat, base_dims, /*drafts=*/true);
     const auto request = [&] {
         return pulsarlm::request{
@@ -576,8 +584,8 @@ TEST_CASE("Qwen4-Exp drafting emits the tokens and reaches the state it does wit
             .eviction = eviction,
         };
     };
-    drafting_engine plain = make_engine(w, 0, {});
-    drafting_engine drafting = make_engine(w, draft_tokens, {});
+    drafting_engine plain = make_engine(w, 0, {}, decode_graphs);
+    drafting_engine drafting = make_engine(w, draft_tokens, {}, decode_graphs);
     served expected = serve(*plain.engine, request());
     served got = serve(*drafting.engine, request());
 
@@ -600,8 +608,8 @@ TEST_CASE("Qwen4-Exp drafting stops at the stop token it stops at without drafts
         return pulsarlm::request{.tokens = random_tokens(prompt_tokens, 2), .max_tokens = decode_tokens};
     };
     // The predicted tokens are mostly 0 and 1: 1 stops the request a few tokens in.
-    drafting_engine plain = make_engine(w, 0, {1});
-    drafting_engine drafting = make_engine(w, draft_tokens, {1});
+    drafting_engine plain = make_engine(w, 0, {1}, false);
+    drafting_engine drafting = make_engine(w, draft_tokens, {1}, false);
     served expected = serve(*plain.engine, request());
     served got = serve(*drafting.engine, request());
 
@@ -630,17 +638,17 @@ TEST_CASE("Qwen4-Exp drafting resumes a stored state as it does without drafts",
     auto plain_contents = std::make_shared<store_contents>();
     auto drafting_contents = std::make_shared<store_contents>();
     served plain_first = serve(
-        *make_engine(w, 0, {}, plain_contents).engine,
+        *make_engine(w, 0, {}, false, plain_contents).engine,
         pulsarlm::request{.tokens = prompt, .max_tokens = decode_tokens, .eviction = eviction}
     );
     served drafting_first = serve(
-        *make_engine(w, draft_tokens, {}, drafting_contents).engine,
+        *make_engine(w, draft_tokens, {}, false, drafting_contents).engine,
         pulsarlm::request{.tokens = prompt, .max_tokens = decode_tokens, .eviction = eviction}
     );
     REQUIRE(drafting_first.tokens == plain_first.tokens);
 
-    drafting_engine drafting = make_engine(w, draft_tokens, {}, drafting_contents);
-    served expected = serve(*make_engine(w, 0, {}, plain_contents).engine, resumed_request(plain_first));
+    drafting_engine drafting = make_engine(w, draft_tokens, {}, false, drafting_contents);
+    served expected = serve(*make_engine(w, 0, {}, false, plain_contents).engine, resumed_request(plain_first));
     served got = serve(*drafting.engine, resumed_request(drafting_first));
 
     REQUIRE(plain_contents->fetched_pages > 0);

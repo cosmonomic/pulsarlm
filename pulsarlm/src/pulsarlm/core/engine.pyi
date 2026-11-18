@@ -394,9 +394,9 @@ class Engine:
         """Runs the model of config split over devices: load_model_shard(rank,
         len(devices)) gives rank's weights on devices[rank], each rank loaded
         before the next. Each device's KV cache takes kv_cache_gib. With
-        decode_graphs, decode steps whose views hold at most max_context_window
-        tokens replay from CUDA graphs captured before serving, unless steps
-        draft. A step drafts draft_tokens tokens per sequence with the model's
+        decode_graphs, decode and verify steps whose views hold at most
+        max_context_window tokens replay from CUDA graphs captured before
+        serving. A step drafts draft_tokens tokens per sequence with the model's
         multi-token prediction layer. Raises ValueError for a model the engine
         does not split over devices, or that drafts no tokens with draft_tokens
         above 0."""

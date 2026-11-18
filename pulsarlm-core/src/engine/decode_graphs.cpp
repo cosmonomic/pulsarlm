@@ -50,53 +50,70 @@ std::size_t decode_graphs::page_width() const noexcept {
     return static_cast<std::size_t>(width);
 }
 
-group_batch decode_graphs::make_inputs(std::int64_t sequences, bool measures_mass) const {
+group_batch decode_graphs::make_inputs(std::int64_t sequences, bool measures_mass, bool verifies) const {
     auto device = lines.front().k.options();
     auto ints = device.dtype(at::kInt);
     auto longs = device.dtype(at::kLong);
     const auto layers = static_cast<std::int64_t>(lines.size());
+    const std::int64_t rows = verifies ? state_slots : 1;
+    const std::int64_t tokens = sequences * rows;
     group_batch inputs{
-        .tokens = at::zeros({sequences}, longs),
-        .pos = at::zeros({sequences}, longs),
+        .tokens = at::zeros({tokens}, longs),
+        .pos = at::zeros({tokens}, longs),
         .page_tables = at::zeros({layers, sequences, width}, ints),
         .history_positions = at::zeros({sequences}, longs),
         .rejected_tokens = at::zeros({sequences}, ints),
         .page_size = page_size,
         .state_slots = state_slots,
-        .key_counts = at::ones({layers, sequences}, ints),
+        .key_counts = at::full({layers, sequences}, rows, ints),
         .page_positions = at::zeros({layers, sequences, width}, ints),
-        .arrival_counters = at::zeros({shard_model.arrival_counter_count(sequences, sequences)}, ints),
+        .arrival_counters = at::zeros({shard_model.arrival_counter_count(sequences, tokens)}, ints),
     };
+    if (verifies) {
+        inputs.cu_seqlens_q = at::arange(sequences + 1, ints) * rows;
+    }
     if (measures_mass) {
-        // Each view is the one page its key lies on.
-        inputs.cu_view_pages = at::arange(sequences + 1, ints).unsqueeze(0).repeat({layers, 1});
-        inputs.query_weights = at::zeros({sequences}, device.dtype(at::kFloat));
-        const std::int64_t rows = sequences * width;
+        // Each view is the one page its key lies on; a verify group's views are its rows'.
+        const std::int64_t views = verifies ? tokens : sequences;
+        inputs.cu_view_pages = at::arange(views + 1, ints).unsqueeze(0).repeat({layers, 1});
+        inputs.query_weights = at::zeros({tokens}, device.dtype(at::kFloat));
+        const std::int64_t mass_rows = views * width;
         auto floats = device.dtype(at::kFloat);
         for (std::size_t layer = 0; layer < mass_heads.size(); layer++) {
             if (mass_heads[layer] == 0) {
                 inputs.page_mass_sum.emplace_back();
                 inputs.page_weight_sum.emplace_back();
-            } else if (sequences <= startup_sequences) {
-                inputs.page_mass_sum.push_back(shared_mass_sum[layer].narrow(0, 0, rows));
-                inputs.page_weight_sum.push_back(shared_weight_sum[layer].narrow(0, 0, rows));
+            } else if (sequences <= startup_sequences && !verifies) {
+                inputs.page_mass_sum.push_back(shared_mass_sum[layer].narrow(0, 0, mass_rows));
+                inputs.page_weight_sum.push_back(shared_weight_sum[layer].narrow(0, 0, mass_rows));
             } else {
-                inputs.page_mass_sum.push_back(at::empty({rows, static_cast<std::int64_t>(mass_heads[layer])}, floats));
-                inputs.page_weight_sum.push_back(at::empty({rows}, floats));
+                inputs.page_mass_sum.push_back(
+                    at::empty({mass_rows, static_cast<std::int64_t>(mass_heads[layer])}, floats)
+                );
+                inputs.page_weight_sum.push_back(at::empty({mass_rows}, floats));
             }
         }
     }
     return inputs;
 }
 
-std::unique_ptr<decode_graphs::captured_forward> decode_graphs::capture(std::int64_t sequences, bool measures_mass) {
+std::unique_ptr<decode_graphs::captured_forward>
+decode_graphs::capture(std::int64_t sequences, bool measures_mass, bool verifies) {
     auto captured = std::make_unique<captured_forward>();
-    captured->inputs = make_inputs(sequences, measures_mass);
+    captured->inputs = make_inputs(sequences, measures_mass, verifies);
     const group_batch& inputs = captured->inputs;
     // Thread-local capture leaves the other GPUs' threads free to launch while this one captures.
     captured->graph.capture_begin({0, 0}, cudaStreamCaptureModeThreadLocal);
-    fill_awaited_tokens_cuda(inputs.tokens, samples);
-    captured->logits = *shard_model.forward(step_batch{.decode_group = inputs}, lines).decode_logits;
+    if (verifies) {
+        step_logits logits = shard_model.forward(step_batch{.verify_group = inputs}, lines);
+        captured->logits = *logits.verify_logits;
+        captured->hidden = logits.verify_hidden.value_or(at::Tensor());
+    } else {
+        fill_awaited_tokens_cuda(inputs.tokens, samples);
+        step_logits logits = shard_model.forward(step_batch{.decode_group = inputs}, lines);
+        captured->logits = *logits.decode_logits;
+        captured->hidden = logits.decode_hidden.value_or(at::Tensor());
+    }
     captured->graph.capture_end();
     return captured;
 }
@@ -112,40 +129,53 @@ void decode_graphs::capture_startup() {
             }
         }
     }
-    const bool measures = std::ranges::any_of(mass_heads, [](std::size_t heads) { return heads > 0; });
-    shard_model.forward(step_batch{.decode_group = make_inputs(1, false)}, lines);
-    if (measures) {
-        shard_model.forward(step_batch{.decode_group = make_inputs(1, true)}, lines);
-    }
     const bool any_mass = std::ranges::any_of(mass_heads, [](std::size_t heads) { return heads > 0; });
-    for (std::int64_t sequences = 1; sequences <= startup_sequences; sequences++) {
+    std::vector<bool> kinds{false};
+    if (state_slots > 1) {
+        kinds.push_back(true);
+    }
+    for (bool verifies : kinds) {
         for (bool measures_mass : {false, true}) {
             if (measures_mass && !any_mass) {
                 continue;
             }
-            std::unique_ptr<captured_forward>& captured = forwards[{sequences, measures_mass}];
-            if (!captured) {
-                captured = capture(sequences, measures_mass);
+            group_batch warmup = make_inputs(1, measures_mass, verifies);
+            shard_model.forward(
+                verifies ? step_batch{.verify_group = warmup} : step_batch{.decode_group = warmup},
+                lines
+            );
+        }
+    }
+    for (bool verifies : kinds) {
+        for (std::int64_t sequences = 1; sequences <= startup_sequences; sequences++) {
+            for (bool measures_mass : {false, true}) {
+                if (measures_mass && !any_mass) {
+                    continue;
+                }
+                std::unique_ptr<captured_forward>& captured = forwards[{sequences, measures_mass, verifies}];
+                if (!captured) {
+                    captured = capture(sequences, measures_mass, verifies);
+                }
             }
         }
     }
 }
 
-at::Tensor decode_graphs::forward(const group_batch& g) {
+const decode_graphs::captured_forward& decode_graphs::replay(const group_batch& g, bool verifies) {
     const std::int64_t sequences = g.page_tables.size(1);
     const bool measures_mass = g.cu_view_pages.defined();
-    std::unique_ptr<captured_forward>& captured = forwards[{sequences, measures_mass}];
+    std::unique_ptr<captured_forward>& captured = forwards[{sequences, measures_mass, verifies}];
     if (!captured) {
-        captured = capture(sequences, measures_mass);
+        captured = capture(sequences, measures_mass, verifies);
     }
     group_batch& inputs = captured->inputs;
+    TORCH_CHECK(
+        g.page_size == page_size && g.state_slots == state_slots && g.tokens.sizes() == inputs.tokens.sizes(),
+        "decode_graphs: the group's page size, state slots or tokens are not the graph's"
+    );
     inputs.tokens.copy_(g.tokens);
     inputs.pos.copy_(g.pos);
     inputs.page_tables.copy_(g.page_tables);
-    TORCH_CHECK(
-        g.page_size == page_size && g.state_slots == state_slots,
-        "decode_graphs: the group's page size or state slots are not the graphs'"
-    );
     inputs.history_positions.copy_(g.history_positions);
     inputs.rejected_tokens.copy_(g.rejected_tokens);
     inputs.key_counts.copy_(g.key_counts);
@@ -168,7 +198,17 @@ at::Tensor decode_graphs::forward(const group_batch& g) {
             );
         }
     }
-    return captured->logits;
+    return *captured;
+}
+
+std::pair<at::Tensor, at::Tensor> decode_graphs::decode(const group_batch& g) {
+    const captured_forward& captured = replay(g, false);
+    return {captured.logits, captured.hidden};
+}
+
+std::pair<at::Tensor, at::Tensor> decode_graphs::verify(const group_batch& g) {
+    const captured_forward& captured = replay(g, true);
+    return {captured.logits, captured.hidden};
 }
 
 }  // namespace pulsarlm

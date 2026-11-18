@@ -260,7 +260,7 @@ void check_against_dense(at::ScalarType dtype, double tolerance, bool graphs) {
         if (graphs && !c.prefill) {
             samples[2] = tokens[c.first];
             batch.decode_group->tokens.fill_(-3);
-            logits.decode_logits = decode.forward(*batch.decode_group);
+            logits.decode_logits = decode.decode(*batch.decode_group).first;
         } else {
             logits = model.forward(batch, kv);
         }

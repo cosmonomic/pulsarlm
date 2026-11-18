@@ -187,9 +187,11 @@ class executor::batch {
     at::Tensor kept;
     at::Tensor next_tokens;
 
-    // The decode group's page-table width, and whether its forward replays a graph.
+    // The decode and verify groups' page-table widths, and whether their forwards replay graphs.
     std::size_t decode_width = 0;
     bool decode_replays = false;
+    std::size_t verify_width = 0;
+    bool verify_replays = false;
 
     // With graph_pages, a decode group whose tables fit graph_pages pages takes tables that wide and replays a graph.
     batch(
@@ -352,10 +354,6 @@ executor::executor(
         }
     }
     assert(draft_tokens == 0 || (draft_layer && this->shards.front()->drafter() != nullptr));
-    // The draft head's pass reads the decode group's hidden rows, which a graph does not return.
-    if (draft_layer) {
-        this->graph_pages.reset();
-    }
     assert(page_size > 0);
     for (std::size_t shard = 0; shard < this->shards.size(); shard++) {
         samples.push_back(at::zeros({max_sampled_rows}, lines[shard].front().k.options().dtype(at::kLong)));
@@ -421,6 +419,11 @@ executor::batch::batch(
             state_slots,
             group_kind::verify
         );
+        verify_width = table_width(entry_span.subspan(plain_count, verify_count));
+        verify_replays = graph_pages && verify_width <= *graph_pages;
+        if (verify_replays) {
+            verify_width = *graph_pages;
+        }
     }
     if (entries.size() > decode_count) {
         inputs
@@ -646,9 +649,8 @@ void executor::batch::enqueue(
     if (inputs.verify_group) {
         group_batch& g = on_device.verify_group.emplace(to_device(*inputs.verify_group, device));
         std::span<batch_entry> group = entry_span.subspan(plain_count, verify_count);
-        std::size_t width = table_width(group);
-        g.page_tables = page_tables(group, lines.size(), false, shard, width);
-        g.page_positions = page_tables(group, lines.size(), true, shard, width);
+        g.page_tables = page_tables(group, lines.size(), false, shard, verify_width);
+        g.page_positions = page_tables(group, lines.size(), true, shard, verify_width);
         if (previous) {
             take_previous_tokens(g, shard, device);
         }
@@ -681,7 +683,7 @@ void executor::batch::enqueue(
             on_device.decode_group->tokens.size(0)
         );
     }
-    if (on_device.verify_group) {
+    if (on_device.verify_group && !verify_replays) {
         needed = std::max(
             needed,
             shard_model
@@ -706,14 +708,28 @@ void executor::batch::enqueue(
             (*group)->arrival_counters = counters;
         }
     }
-    step_logits logits;
+    std::optional<group_batch> replayed_decode;
+    std::optional<group_batch> replayed_verify;
     if (decode_replays) {
-        group_batch decode_group = std::move(*on_device.decode_group);
+        replayed_decode = std::move(on_device.decode_group);
         on_device.decode_group.reset();
-        logits = shard_model.forward(on_device, lines);
-        logits.decode_logits = graphs->forward(decode_group);
-    } else {
-        logits = shard_model.forward(on_device, lines);
+    }
+    if (verify_replays) {
+        replayed_verify = std::move(on_device.verify_group);
+        on_device.verify_group.reset();
+    }
+    step_logits logits = shard_model.forward(on_device, lines);
+    if (replayed_decode) {
+        auto [decode_logits, decode_hidden] = graphs->decode(*replayed_decode);
+        logits.decode_logits = decode_logits;
+        if (decode_hidden.defined()) {
+            logits.decode_hidden = decode_hidden;
+        }
+    }
+    if (replayed_verify) {
+        auto [verify_logits, verify_hidden] = graphs->verify(*replayed_verify);
+        logits.verify_logits = verify_logits;
+        logits.verify_hidden = verify_hidden;
     }
     for (auto [by_shard, on_shard] : {
              std::pair{&shard_decode_mass, &decode_on_device},

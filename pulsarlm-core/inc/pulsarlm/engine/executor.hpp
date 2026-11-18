@@ -141,7 +141,7 @@ class executor {
     // to the store on copy_streams[s], which the caller synchronizes before freeing what the copies read; the cache holds one layer
     // per entry of each model's kv_layers(), and the shards agree on which layers are recurrent or sliding. store is the
     // cache's. root is the engine's root digest (make_root_digest). With graph_pages, a decode group whose sequences'
-    // tables fit graph_pages pages replays a decode_graphs graph over tables that wide, unless steps draft. A step drafts
+    // tables fit graph_pages pages replays a decode_graphs graph over tables that wide, and so does a verify group. A step drafts
     // draft_tokens tokens per sequence with the shards' draft heads, which they have when draft_tokens is above 0, and
     // the cache's recurrent layers are laid out for them (recurrent_state).
     executor(

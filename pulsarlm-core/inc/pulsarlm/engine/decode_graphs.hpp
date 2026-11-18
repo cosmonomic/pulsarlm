@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <span>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -16,7 +17,8 @@
 namespace pulsarlm {
 
 // Replays one GPU's decode forward from CUDA graphs over page tables of one fixed width, a graph per number of decoding
-// sequences and whether the step measures mass. The model's decode forward reads nothing back to the host and launches
+// sequences, whether the step measures mass and whether the group is a verify group of state_slots tokens per sequence
+// or a decode group. A verify group's forward reads nothing back to the host either. The model's decode forward reads nothing back to the host and launches
 // the same kernels for every group of one such shape. Each graph first fills the group's awaited tokens from samples
 // (fill_awaited_tokens_cuda).
 class decode_graphs {
@@ -24,9 +26,11 @@ class decode_graphs {
         at::cuda::CUDAGraph graph;
         group_batch inputs;
         at::Tensor logits;
+        // Undefined for a model without a draft head.
+        at::Tensor hidden;
     };
-    // The sequences of a group, and whether it measures mass.
-    using shape = std::pair<std::int64_t, bool>;
+    // The sequences of a group, whether it measures mass, and whether it is a verify group.
+    using shape = std::tuple<std::int64_t, bool, bool>;
 
     model& shard_model;
     std::vector<kv> lines;
@@ -42,10 +46,12 @@ class decode_graphs {
     std::vector<at::Tensor> shared_weight_sum;
     std::map<shape, std::unique_ptr<captured_forward>> forwards;
 
-    // Inputs of a decode group of sequences on the lines' device, the mass rows of up to startup_sequences sequences in
-    // the shared buffers, with the group's own arrival counters.
-    group_batch make_inputs(std::int64_t sequences, bool measures_mass) const;
-    std::unique_ptr<captured_forward> capture(std::int64_t sequences, bool measures_mass);
+    // Inputs of a group of sequences on the lines' device, the mass rows of up to startup_sequences sequences in the
+    // shared buffers, with the group's own arrival counters.
+    group_batch make_inputs(std::int64_t sequences, bool measures_mass, bool verifies) const;
+    std::unique_ptr<captured_forward> capture(std::int64_t sequences, bool measures_mass, bool verifies);
+    // The captured forward of g's shape, captured first if it is not yet, with g's inputs copied into it and replayed.
+    const captured_forward& replay(const group_batch& g, bool verifies);
 
   public:
     // The decoding sequences whose graphs capture_startup records.
@@ -66,14 +72,17 @@ class decode_graphs {
     );
 
     std::size_t page_width() const noexcept;
-    // Captures the graphs of 1 to startup_sequences sequences, with mass when a layer measures it and without, on the
-    // current stream, which is not the default stream, after an eager forward that zeroes line 0 of each layer and
-    // writes into it. Every GPU of the model runs it at once, before any sequence holds a line.
+    // Captures the graphs of 1 to startup_sequences sequences, with mass when a layer measures it and without, decode
+    // groups and with state_slots above 1 verify groups, on the current stream, which is not the default stream, after
+    // an eager forward of each that zeroes line 0 of each layer and writes into it. Every GPU of the model runs it at
+    // once, before any sequence holds a line.
     void capture_startup();
-    // model::forward's decode logits of g, its awaited tokens filled from samples, on the current stream, valid until
-    // the next call, with g's page mass written as model::forward writes it. g's page tables are page_width() wide; a
-    // shape not captured yet is captured first.
-    at::Tensor forward(const group_batch& g);
+    // model::forward's decode logits and hidden rows of g, its awaited tokens filled from samples, on the current
+    // stream, valid until the next call, with g's page mass written as model::forward writes it. g's page tables are
+    // page_width() wide; a shape not captured yet is captured first.
+    std::pair<at::Tensor, at::Tensor> decode(const group_batch& g);
+    // decode's verify logits and hidden rows of g, a verify group of state_slots tokens per sequence.
+    std::pair<at::Tensor, at::Tensor> verify(const group_batch& g);
 };
 
 }  // namespace pulsarlm
