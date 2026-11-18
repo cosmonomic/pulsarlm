@@ -857,7 +857,8 @@ std::int64_t qwen4_exp_model::hidden_dim() const {
     return config.hc_count * config.hidden_size;
 }
 
-// A decode group's rows are each its sequence's last; a group with cu_seqlens_q lists its rows by a host sync.
+// The rows that write nothing write their sequence's last row into its line, as that row does, so the writes need no
+// host sync.
 void qwen4_exp_model::write_last_hidden(const group_batch& g, const at::Tensor& x, const kv& line) const {
     const auto layer_row = static_cast<std::int64_t>(kv_layer_of[n_layers]);
     const std::int64_t page_size = line.k.size(1);
@@ -876,12 +877,12 @@ void qwen4_exp_model::write_last_hidden(const group_batch& g, const at::Tensor& 
     at::Tensor local = at::arange(ntok, starts.options()) - starts.index_select(0, sequence_of);
     at::Tensor row_counts = counts.index_select(0, sequence_of);
     at::Tensor view_index = key_counts.index_select(0, sequence_of) - row_counts + local;
-    at::Tensor kept = (local == row_counts - 1).logical_or(at::remainder(view_index + 1, page_size) == 0);
-    at::Tensor rows = kept.nonzero().squeeze(1);
-    at::Tensor lines = page_tables.index(
-        {sequence_of.index_select(0, rows), at::floor_divide(view_index, page_size).index_select(0, rows)}
-    );
-    line.last_hidden.index_copy_(0, lines, x.index_select(0, rows));
+    at::Tensor last_row = starts.narrow(0, 1, num_seqs).index_select(0, sequence_of) - 1;
+    at::Tensor writes = (local == row_counts - 1).logical_or(at::remainder(view_index + 1, page_size) == 0);
+    at::Tensor written_row = at::where(writes, at::arange(ntok, starts.options()), last_row);
+    at::Tensor written_index = view_index.index_select(0, written_row);
+    at::Tensor lines = page_tables.index({sequence_of, at::floor_divide(written_index, page_size)});
+    line.last_hidden.index_copy_(0, lines, x.index_select(0, written_row));
 }
 
 draft_output qwen4_exp_model::draft(const group_batch& g, const at::Tensor& hidden, std::span<const kv> lines) {
