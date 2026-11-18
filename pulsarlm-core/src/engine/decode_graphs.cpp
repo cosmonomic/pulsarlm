@@ -27,7 +27,8 @@ decode_graphs::decode_graphs(
     std::size_t page_size,
     std::size_t state_slots,
     std::vector<std::size_t> mass_heads,
-    at::Tensor samples
+    at::Tensor samples,
+    at::Tensor stop_tokens
 )
 : shard_model(shard_model),
   lines(lines.begin(), lines.end()),
@@ -35,7 +36,8 @@ decode_graphs::decode_graphs(
   width(static_cast<std::int64_t>(width)),
   page_size(static_cast<std::int64_t>(page_size)),
   state_slots(static_cast<std::int64_t>(state_slots)),
-  mass_heads(std::move(mass_heads)) {
+  mass_heads(std::move(mass_heads)),
+  stop_tokens(std::move(stop_tokens)) {
     auto floats = this->lines.front().k.options().dtype(at::kFloat);
     const std::int64_t rows = startup_sequences * this->width;
     for (std::size_t heads : this->mass_heads) {
@@ -173,6 +175,19 @@ void decode_graphs::capture_startup() {
             }
         }
     }
+    if (state_slots > 1 && shard_model.drafter() != nullptr) {
+        for (std::int64_t sequences = 1; sequences <= startup_sequences; sequences++) {
+            for (bool measures_mass : {false, true}) {
+                if (measures_mass && !any_mass) {
+                    continue;
+                }
+                std::unique_ptr<captured_step>& captured = steps[{sequences, measures_mass, false}];
+                if (!captured) {
+                    captured = capture_step(sequences, measures_mass, false);
+                }
+            }
+        }
+    }
 }
 
 const decode_graphs::captured_forward& decode_graphs::replay(const group_batch& g, bool verifies) {
@@ -272,6 +287,136 @@ draft_output decode_graphs::draft(const group_batch& g, const at::Tensor& hidden
     captured->hidden_rows.copy_(hidden);
     captured->graph.replay();
     return captured->output;
+}
+
+std::unique_ptr<decode_graphs::captured_step>
+decode_graphs::capture_step(std::int64_t sequences, bool measures_mass, bool filters) {
+    auto captured = std::make_unique<captured_step>();
+    captured->inputs = make_inputs(sequences, measures_mass, true);
+    const auto options = lines.front().k.options();
+    const auto longs = options.dtype(at::kLong);
+    const std::int64_t rows = state_slots;
+    const std::int64_t tokens = sequences * rows;
+    const std::int64_t later = state_slots - 2;
+    captured->sampling = sampling_inputs{
+        .temperatures = at::zeros({tokens}, options.dtype(at::kFloat)),
+        .top_k = at::ones({tokens}, longs),
+        .top_p = at::full({tokens}, 2.0f, options.dtype(at::kFloat)),
+        .draws = at::zeros({2, tokens}, longs),
+        .filters = filters,
+    };
+    captured->max_kept = at::full({sequences}, rows, longs);
+    captured->draft_positions = at::zeros({tokens}, longs);
+    captured->draft_key_counts = at::full({sequences}, rows + 1, longs);
+    captured->later_positions = at::zeros({later, sequences}, longs);
+    captured->later_key_counts = at::ones({later, sequences}, longs);
+    auto [first_pass, first_hidden] = make_draft_inputs(sequences, true);
+    auto [later_pass, later_hidden] = make_draft_inputs(sequences, false);
+    captured->first_pass = std::move(first_pass);
+    captured->later_pass = std::move(later_pass);
+    const group_batch& inputs = captured->inputs;
+    const auto layers = static_cast<std::int64_t>(lines.size());
+    auto every_layer = [&](const at::Tensor& counts) {
+        return counts.to(at::kInt).unsqueeze(0).expand({layers, sequences});
+    };
+    draft_head& head = *shard_model.drafter();
+    captured->graph.capture_begin({0, 0}, cudaStreamCaptureModeThreadLocal);
+    step_logits logits = shard_model.forward(step_batch{.verify_group = inputs}, lines);
+    at::Tensor samples = sample(*logits.verify_logits, captured->sampling);
+    at::Tensor verified = samples.view({sequences, rows});
+    at::Tensor drafted = inputs.tokens.view({sequences, rows}).narrow(1, 1, rows - 1);
+    at::Tensor kept = verified.narrow(1, 0, rows - 1).eq(drafted).to(at::kLong).cumprod(1).sum(1) + 1;
+    if (stop_tokens.numel() > 0) {
+        at::Tensor stops = at::isin(verified, stop_tokens);
+        at::Tensor first_stop = at::where(stops.any(1), stops.to(at::kLong).argmax(1), rows);
+        kept = at::minimum(kept, first_stop + 1);
+    }
+    kept = at::minimum(kept, captured->max_kept);
+    at::Tensor drafting_rows = at::arange(sequences, longs) * rows + kept - 1;
+    group_batch& first = captured->first_pass;
+    first.tokens.copy_(samples);
+    first.pos.copy_(captured->draft_positions);
+    first.page_tables.copy_(inputs.page_tables);
+    first.page_positions.copy_(inputs.page_positions);
+    first.key_counts.copy_(every_layer(captured->draft_key_counts));
+    first.logit_rows.copy_(drafting_rows);
+    draft_output drafted_rows = head.draft(first, *logits.verify_hidden, lines);
+    at::Tensor token = drafted_rows.logits.argmax(-1);
+    at::Tensor previous_hidden = drafted_rows.hidden.index_select(0, drafting_rows);
+    std::vector<at::Tensor> next{samples.index_select(0, drafting_rows), token};
+    group_batch& one_row = captured->later_pass;
+    for (std::int64_t j = 0; j < later; j++) {
+        one_row.tokens.copy_(token);
+        one_row.pos.copy_(captured->later_positions[j] + kept);
+        one_row.page_tables.copy_(inputs.page_tables);
+        one_row.page_positions.copy_(inputs.page_positions);
+        one_row.key_counts.copy_(every_layer(captured->later_key_counts[j] + kept));
+        draft_output following = head.draft(one_row, previous_hidden, lines);
+        token = following.logits.argmax(-1);
+        previous_hidden = following.hidden;
+        next.push_back(token);
+    }
+    captured->samples = samples;
+    captured->kept = kept;
+    captured->next_tokens = at::stack(next, 1);
+    captured->graph.capture_end();
+    return captured;
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> decode_graphs::verify_step(
+    const group_batch& g,
+    const sampling_inputs& sampling,
+    const at::Tensor& max_kept,
+    const at::Tensor& draft_positions,
+    const at::Tensor& draft_key_counts,
+    const at::Tensor& later_positions,
+    const at::Tensor& later_key_counts
+) {
+    const std::int64_t sequences = g.page_tables.size(1);
+    const bool measures_mass = g.cu_view_pages.defined();
+    std::unique_ptr<captured_step>& captured = steps[{sequences, measures_mass, sampling.filters}];
+    if (!captured) {
+        captured = capture_step(sequences, measures_mass, sampling.filters);
+    }
+    group_batch& inputs = captured->inputs;
+    TORCH_CHECK(
+        g.page_size == page_size && g.state_slots == state_slots && g.tokens.sizes() == inputs.tokens.sizes(),
+        "decode_graphs: the verify step's group is not the graph's"
+    );
+    inputs.tokens.copy_(g.tokens);
+    inputs.pos.copy_(g.pos);
+    inputs.page_tables.copy_(g.page_tables);
+    inputs.history_positions.copy_(g.history_positions);
+    inputs.rejected_tokens.copy_(g.rejected_tokens);
+    inputs.key_counts.copy_(g.key_counts);
+    inputs.page_positions.copy_(g.page_positions);
+    copy_defined(inputs.cu_view_pages, g.cu_view_pages);
+    copy_defined(inputs.query_weights, g.query_weights);
+    for (std::size_t layer = 0; layer < g.page_mass_sum.size(); layer++) {
+        if (g.page_mass_sum[layer].defined()) {
+            inputs.page_mass_sum[layer].narrow(0, 0, g.page_mass_sum[layer].size(0)).zero_();
+            inputs.page_weight_sum[layer].narrow(0, 0, g.page_weight_sum[layer].size(0)).zero_();
+        }
+    }
+    captured->sampling.temperatures.copy_(sampling.temperatures);
+    captured->sampling.top_k.copy_(sampling.top_k);
+    captured->sampling.top_p.copy_(sampling.top_p);
+    captured->sampling.draws.copy_(sampling.draws);
+    captured->max_kept.copy_(max_kept);
+    captured->draft_positions.copy_(draft_positions);
+    captured->draft_key_counts.copy_(draft_key_counts);
+    captured->later_positions.copy_(later_positions);
+    captured->later_key_counts.copy_(later_key_counts);
+    captured->graph.replay();
+    for (std::size_t layer = 0; layer < g.page_mass_sum.size(); layer++) {
+        if (g.page_mass_sum[layer].defined()) {
+            g.page_mass_sum[layer].copy_(inputs.page_mass_sum[layer].narrow(0, 0, g.page_mass_sum[layer].size(0)));
+            g.page_weight_sum[layer].copy_(
+                inputs.page_weight_sum[layer].narrow(0, 0, g.page_weight_sum[layer].size(0))
+            );
+        }
+    }
+    return {captured->samples, captured->kept, captured->next_tokens};
 }
 
 std::pair<at::Tensor, at::Tensor> decode_graphs::decode(const group_batch& g) {

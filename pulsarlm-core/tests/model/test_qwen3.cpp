@@ -239,7 +239,8 @@ void check_against_dense(at::ScalarType dtype, double tolerance, bool graphs) {
         page_size,
         /*state_slots=*/1,
         std::vector<std::size_t>(n_layers, static_cast<std::size_t>(n_heads)),
-        samples
+        samples,
+        at::empty({0}, cuda(at::kLong))
     );
 
     const std::int64_t n_tokens = 40;

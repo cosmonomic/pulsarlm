@@ -259,6 +259,19 @@ class executor::batch {
         decode_graphs* graphs,
         at::Tensor& counters
     );
+    // Whether the step replays a decode_graphs verify step: every entry verifies and drafts, and the verify group
+    // replays.
+    bool steps_replay() const noexcept;
+    // Queues on device, shard's, the replay of its verify step from graphs, on_device holding the verify group and
+    // verify_mass its page mass, then the copies of its outputs: into samples, and on shard 0 to the host.
+    void enqueue_step(
+        step_batch& on_device,
+        const at::Tensor& verify_mass,
+        std::size_t shard,
+        at::Device device,
+        decode_graphs* graphs,
+        const at::Tensor& samples
+    );
     // Takes into g, the verify group on shard's device, the previous step's next tokens of the entries whose previous
     // step is launched, and moves their positions by its kept count - 1.
     void take_previous_tokens(group_batch& g, std::size_t shard, at::Device device) const;
@@ -375,7 +388,8 @@ executor::executor(
                     page_size,
                     draft_state_slots,
                     shard_mass_heads[shard],
-                    samples[shard]
+                    samples[shard],
+                    stop_tokens[shard]
                 )
             );
         }
@@ -677,6 +691,10 @@ void executor::batch::enqueue(
             );
         }
     }
+    if (steps_replay()) {
+        enqueue_step(on_device, verify_on_device, shard, device, graphs, samples);
+        return;
+    }
     // A replayed group reads its graph's own counters.
     std::int64_t needed = 0;
     if (on_device.decode_group && !decode_replays) {
@@ -810,6 +828,65 @@ at::Tensor executor::batch::previous_draw_shifts(std::size_t shard, at::Device d
         at::tensor(rows, longs).to(device, /*non_blocking=*/true),
         kept_before.index_select(0, at::tensor(verify_entries, longs).to(device, /*non_blocking=*/true))
     );
+}
+
+bool executor::batch::steps_replay() const noexcept {
+    return verify_replays && verify_count == entries.size() && drafting.size() == entries.size();
+}
+
+void executor::batch::enqueue_step(
+    step_batch& on_device,
+    const at::Tensor& verify_mass,
+    std::size_t shard,
+    at::Device device,
+    decode_graphs* graphs,
+    const at::Tensor& samples
+) {
+    const auto longs = at::TensorOptions().dtype(at::kLong);
+    auto on_device_tensor = [&](const auto& values) {
+        return at::tensor(values, longs).to(device, /*non_blocking=*/true);
+    };
+    const auto rows = static_cast<std::int64_t>(verify_rows);
+    const auto sequences = static_cast<std::int64_t>(verify_count);
+    sampling_inputs sampling = sampling_inputs_of(sample_params, sample_draws, device);
+    at::Tensor shift = at::zeros({sequences}, at::device(device).dtype(at::kLong));
+    if (previous) {
+        sampling.draws.select(0, 1).add_(previous_draw_shifts(shard, device));
+        shift = previous_shift(shard, device);
+    }
+    std::vector<std::int64_t> later_positions_flat;
+    std::vector<std::int64_t> later_key_counts_flat;
+    for (std::size_t j = 0; j < later_positions.size(); j++) {
+        later_positions_flat.insert(later_positions_flat.end(), later_positions[j].begin(), later_positions[j].end());
+        later_key_counts_flat
+            .insert(later_key_counts_flat.end(), later_key_counts[j].begin(), later_key_counts[j].end());
+    }
+    const auto later = static_cast<std::int64_t>(later_positions.size());
+    std::vector<std::int64_t> key_counts(draft_key_counts.begin(), draft_key_counts.end());
+    auto [sampled, kept_counts, next] = graphs->verify_step(
+        *on_device.verify_group,
+        sampling,
+        on_device_tensor(max_kept),
+        on_device_tensor(draft_positions) + at::repeat_interleave(shift, rows),
+        on_device_tensor(key_counts) + shift,
+        on_device_tensor(later_positions_flat).view({later, sequences}) + shift,
+        on_device_tensor(later_key_counts_flat).view({later, sequences}) + shift
+    );
+    shard_kept[shard] = kept_counts;
+    shard_next_tokens[shard] = next;
+    samples.narrow(0, 0, sampled.size(0)).copy_(sampled);
+    if (verify_mass.defined()) {
+        shard_verify_mass[shard] = pinned(verify_mass.sizes(), at::kFloat);
+        shard_verify_mass[shard].copy_(verify_mass, /*non_blocking=*/true);
+    }
+    if (shard == 0) {
+        sampled_tokens = pinned(sampled.sizes(), at::kLong);
+        sampled_tokens.copy_(sampled, /*non_blocking=*/true);
+        kept = pinned(kept_counts.sizes(), at::kLong);
+        kept.copy_(kept_counts, /*non_blocking=*/true);
+        next_tokens = pinned(next.sizes(), at::kLong);
+        next_tokens.copy_(next, /*non_blocking=*/true);
+    }
 }
 
 void executor::batch::take_previous_tokens(group_batch& g, std::size_t shard, at::Device device) const {
