@@ -1165,6 +1165,14 @@ TEST_CASE("Qwen4-Exp drafts as a dense MTP layer a position after each row", "[m
 
     for (chunk c : chunks) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
+        const std::int64_t first = c.first;
+        const std::int64_t last = std::min(c.last + 1, n_tokens);
+        // The forward writes the streams of its own rows into the line the position before them is in.
+        at::Tensor before = first == 0 ? at::zeros({1, hc * hidden}, cuda(at::kFloat))
+                                       : kv[mtp_layer]
+                                             .last_hidden[view_lines[static_cast<std::size_t>((first - 1) / page_size)]]
+                                             .unsqueeze(0)
+                                             .clone();
         pulsarlm::step_logits logits = model.forward(
             with_arrival_counters(chunk_batch(tokens, c, specs, 0), model),
             kv
@@ -1172,11 +1180,6 @@ TEST_CASE("Qwen4-Exp drafts as a dense MTP layer a position after each row", "[m
         const at::Tensor& streams = *(c.prefill ? logits.prefill_hidden : logits.decode_hidden);
         CHECK(max_relative_error(streams, dense.streams.narrow(0, c.first, c.last - c.first)) < 1e-4);
 
-        const std::int64_t first = c.first;
-        const std::int64_t last = std::min(c.last + 1, n_tokens);
-        at::Tensor before = first == 0
-            ? at::zeros({1, hc * hidden}, streams.options())
-            : kv[mtp_layer].last_hidden[view_lines[static_cast<std::size_t>((first - 1) / page_size)]].unsqueeze(0);
         at::Tensor hidden_rows = at::cat({before, streams.narrow(0, 0, last - first - 1)});
         pulsarlm::step_batch drafting;
         drafting.prefill_group = step(tokens, first, last, true, specs, 0);
@@ -1184,6 +1187,12 @@ TEST_CASE("Qwen4-Exp drafts as a dense MTP layer a position after each row", "[m
         pulsarlm::draft_output drafted = drafter->draft(*drafting.prefill_group, hidden_rows, kv);
         CHECK(max_relative_error(drafted.logits, expected.logits.narrow(0, first, last - first)) < 1e-4);
         CHECK(max_relative_error(drafted.hidden, expected.streams.narrow(0, first, last - first)) < 1e-4);
+    }
+    // Each full page's line keeps the streams at its last position, whatever rows the steps ended at.
+    for (std::int64_t page = 0; page < 3; page++) {
+        INFO("page " << page);
+        const at::Tensor& kept = kv[mtp_layer].last_hidden[view_lines[static_cast<std::size_t>(page)]];
+        CHECK(max_relative_error(kept, dense.streams[(page + 1) * page_size - 1]) < 1e-4);
     }
 }
 
@@ -1305,27 +1314,31 @@ void check_sharded_draft(const split_dims& dims, std::size_t gpus) {
 
     for (chunk c : chunks) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
-        std::vector<pulsarlm::step_logits>
-            logits = sharded_forward(shards, lines, streams, chunk_batch(tokens, c, specs, 0));
         const std::int64_t first = c.first;
         const std::int64_t last = std::min(c.last + 1, n_tokens);
+        // The forward writes the streams of its own rows into the line the position before them is in.
+        std::vector<at::Tensor> before(gpus);
+        for (std::size_t rank = 0; rank < gpus; rank++) {
+            before[rank] = first == 0 ? at::zeros({1, hc * hidden}, cuda(at::kFloat))
+                                      : lines[rank][mtp_layer]
+                                            .last_hidden[view_lines[static_cast<std::size_t>((first - 1) / page_size)]]
+                                            .unsqueeze(0)
+                                            .clone();
+        }
+        std::vector<pulsarlm::step_logits>
+            logits = sharded_forward(shards, lines, streams, chunk_batch(tokens, c, specs, 0));
         std::vector<pulsarlm::draft_output> drafted(gpus);
         std::vector<std::thread> threads;
         for (std::size_t rank = 0; rank < gpus; rank++) {
             threads.emplace_back([&, rank] {
                 c10::cuda::CUDAStreamGuard guard(streams[rank]);
                 const at::Tensor& streams_out = *(c.prefill ? logits[rank].prefill_hidden : logits[rank].decode_hidden);
-                at::Tensor before = first == 0
-                    ? at::zeros({1, hc * hidden}, streams_out.options())
-                    : lines[rank][mtp_layer]
-                          .last_hidden[view_lines[static_cast<std::size_t>((first - 1) / page_size)]]
-                          .unsqueeze(0);
                 pulsarlm::step_batch drafting;
                 drafting.prefill_group = step(tokens, first, last, true, specs, 0);
                 drafting = with_arrival_counters(drafting, *shards[rank]);
                 drafted[rank] = shards[rank]->draft(
                     *drafting.prefill_group,
-                    at::cat({before, streams_out.narrow(0, 0, last - first - 1)}),
+                    at::cat({before[rank], streams_out.narrow(0, 0, last - first - 1)}),
                     lines[rank]
                 );
                 streams[rank].synchronize();

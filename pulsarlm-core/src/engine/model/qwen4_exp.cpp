@@ -802,6 +802,9 @@ qwen4_exp_model::group_forward(const group_batch& g, group_kind kind, std::span<
         pending.emplace(moe(mixed.input, layer, g.arrival_counters), mixed.injection_weights);
     }
     inject_pending();
+    if (mtp) {
+        write_last_hidden(g, x, lines[kv_layer_of[n_layers]]);
+    }
     return {logits(final_mix(logit_inputs(x, g))), x};
 }
 
@@ -852,25 +855,31 @@ std::int64_t qwen4_exp_model::hidden_dim() const {
     return config.hc_count * config.hidden_size;
 }
 
-// The line of each sequence's view index key_count - 2, the position before its last row; a sequence whose last row is
-// its first position keeps its line's row.
-void qwen4_exp_model::write_last_hidden(const group_batch& g, const at::Tensor& hidden, const kv& line) const {
+// A decode group's rows are each its sequence's last; a group with cu_seqlens_q lists its rows by a host sync.
+void qwen4_exp_model::write_last_hidden(const group_batch& g, const at::Tensor& x, const kv& line) const {
     const auto layer_row = static_cast<std::int64_t>(kv_layer_of[n_layers]);
     const std::int64_t page_size = line.k.size(1);
+    const std::int64_t ntok = x.size(0);
     at::Tensor key_counts = g.key_counts.select(0, layer_row).to(at::kLong);
-    at::Tensor previous = (key_counts - 2).clamp_min(0);
-    at::Tensor line_ids = g.page_tables.select(0, layer_row)
-                              .to(at::kLong)
-                              .gather(1, at::floor_divide(previous, page_size).unsqueeze(1));
-    line_ids = line_ids.squeeze(1);
-    at::Tensor last_rows = g.is_prefill() ? g.cu_seqlens_q.narrow(0, 1, key_counts.size(0)).to(at::kLong) - 1
-                                          : at::arange(key_counts.size(0), key_counts.options());
-    at::Tensor rows = at::where(
-        (key_counts >= 2).unsqueeze(1),
-        hidden.index_select(0, last_rows),
-        line.last_hidden.index_select(0, line_ids)
+    at::Tensor page_tables = g.page_tables.select(0, layer_row).to(at::kLong);
+    const std::int64_t num_seqs = key_counts.size(0);
+    if (!g.is_prefill()) {
+        at::Tensor lines = page_tables.gather(1, at::floor_divide(key_counts - 1, page_size).unsqueeze(1)).squeeze(1);
+        line.last_hidden.index_copy_(0, lines, x);
+        return;
+    }
+    at::Tensor starts = g.cu_seqlens_q.to(at::kLong);
+    at::Tensor counts = starts.narrow(0, 1, num_seqs) - starts.narrow(0, 0, num_seqs);
+    at::Tensor sequence_of = at::repeat_interleave(counts, std::optional<std::int64_t>(ntok));
+    at::Tensor local = at::arange(ntok, starts.options()) - starts.index_select(0, sequence_of);
+    at::Tensor row_counts = counts.index_select(0, sequence_of);
+    at::Tensor view_index = key_counts.index_select(0, sequence_of) - row_counts + local;
+    at::Tensor kept = (local == row_counts - 1).logical_or(at::remainder(view_index + 1, page_size) == 0);
+    at::Tensor rows = kept.nonzero().squeeze(1);
+    at::Tensor lines = page_tables.index(
+        {sequence_of.index_select(0, rows), at::floor_divide(view_index, page_size).index_select(0, rows)}
     );
-    line.last_hidden.index_copy_(0, line_ids, rows);
+    line.last_hidden.index_copy_(0, lines, x.index_select(0, rows));
 }
 
 draft_output qwen4_exp_model::draft(const group_batch& g, const at::Tensor& hidden, std::span<const kv> lines) {
@@ -878,7 +887,6 @@ draft_output qwen4_exp_model::draft(const group_batch& g, const at::Tensor& hidd
     const qwen4_exp_config& c = config;
     const layer_weights& w = layers[n_layers];
     const std::int64_t ntok = g.tokens.size(0);
-    write_last_hidden(g, hidden, lines[kv_layer_of[n_layers]]);
     at::Tensor embedded = at::linear(
         rmsnorm_cuda(lookup(embed_tokens, first_vocab_row, g.tokens), m.pre_fc_norm_embedding, c.rms_norm_eps),
         m.fc_embedding

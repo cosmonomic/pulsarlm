@@ -149,8 +149,8 @@ class draft_head {
     virtual std::int64_t hidden_dim() const = 0;
     // Drafts for the rows of g: row i at position g.pos[i] with token g.tokens[i] and the hidden row hidden[i] of the
     // position before it, zeros before a sequence's first position. Writes the rows' KV into the head's KV layer of
-    // lines, and each sequence's last hidden row into the last_hidden of the line holding the position before its last
-    // row.
+    // lines. The model's forward keeps the hidden row at the latest position written into each of that layer's lines
+    // in its last_hidden, which a row reads when the position before it was forwarded by an earlier step.
     virtual draft_output draft(const group_batch& g, const at::Tensor& hidden, std::span<const kv> lines) = 0;
 };
 
