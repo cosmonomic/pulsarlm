@@ -12,7 +12,7 @@
 namespace pulsarlm {
 namespace {
 
-constexpr int kThreads = 512;
+constexpr int cta_threads = 512;
 
 struct rank_pointers {
     std::byte* buffers[p2p_all_reduce_max_ranks];
@@ -77,7 +77,7 @@ template <> __device__ __forceinline__ __half from_float(float value) {
 // buffer, meets the other ranks' block b, sums every rank's copy in rank order into x, and meets them again so that
 // no rank's next call replaces its buffer while another still reads it.
 template <typename scalar_t>
-__global__ void __launch_bounds__(kThreads) p2p_all_reduce_kernel(
+__global__ void __launch_bounds__(cta_threads) p2p_all_reduce_kernel(
     scalar_t* __restrict__ x,
     int64_t vectors,
     int64_t per_block,
@@ -86,7 +86,7 @@ __global__ void __launch_bounds__(kThreads) p2p_all_reduce_kernel(
     int rank,
     std::uint64_t* __restrict__ counters
 ) {
-    constexpr int kPerVector = 16 / sizeof(scalar_t);
+    constexpr int per_vector = 16 / sizeof(scalar_t);
     __shared__ std::uint64_t epoch;
     if (threadIdx.x == 0) {
         epoch = ++counters[blockIdx.x];
@@ -95,24 +95,24 @@ __global__ void __launch_bounds__(kThreads) p2p_all_reduce_kernel(
     const int64_t last = min(first + per_block, vectors);
     const auto* in = reinterpret_cast<const uint4*>(x);
     auto* own = reinterpret_cast<uint4*>(ranks.buffers[rank]);
-    for (int64_t v = first + threadIdx.x; v < last; v += kThreads) {
+    for (int64_t v = first + threadIdx.x; v < last; v += cta_threads) {
         own[v] = in[v];
     }
     meet(ranks, rank_count, rank, 0, epoch);
-    for (int64_t v = first + threadIdx.x; v < last; v += kThreads) {
-        float sums[kPerVector] = {};
+    for (int64_t v = first + threadIdx.x; v < last; v += cta_threads) {
+        float sums[per_vector] = {};
         for (int p = 0; p < rank_count; p++) {
             const uint4 loaded = __ldcg(reinterpret_cast<const uint4*>(ranks.buffers[p]) + v);
             const auto* values = reinterpret_cast<const scalar_t*>(&loaded);
 #pragma unroll
-            for (int i = 0; i < kPerVector; i++) {
+            for (int i = 0; i < per_vector; i++) {
                 sums[i] += as_float(values[i]);
             }
         }
         uint4 stored;
         auto* out = reinterpret_cast<scalar_t*>(&stored);
 #pragma unroll
-        for (int i = 0; i < kPerVector; i++) {
+        for (int i = 0; i < per_vector; i++) {
             out[i] = from_float<scalar_t>(sums[i]);
         }
         reinterpret_cast<uint4*>(x)[v] = stored;
@@ -151,12 +151,12 @@ void p2p_all_reduce_cuda(
         ranks.buffers[r] = buffers[r];
         ranks.flags[r] = flags[r];
     }
-    const int64_t blocks = std::min<int64_t>(p2p_all_reduce_max_blocks, (vectors + kThreads - 1) / kThreads);
+    const int64_t blocks = std::min<int64_t>(p2p_all_reduce_max_blocks, (vectors + cta_threads - 1) / cta_threads);
     const int64_t per_block = (vectors + blocks - 1) / blocks;
     auto stream = at::cuda::getCurrentCUDAStream(x.device().index());
     auto launch = [&](auto* data) {
         using scalar_t = std::remove_pointer_t<decltype(data)>;
-        p2p_all_reduce_kernel<scalar_t><<<static_cast<unsigned>(blocks), kThreads, 0, stream>>>(
+        p2p_all_reduce_kernel<scalar_t><<<static_cast<unsigned>(blocks), cta_threads, 0, stream>>>(
             data,
             vectors,
             per_block,

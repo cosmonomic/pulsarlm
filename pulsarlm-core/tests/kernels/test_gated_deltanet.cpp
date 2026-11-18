@@ -14,11 +14,11 @@
 
 namespace {
 
-constexpr int64_t kLines = 40;
-constexpr int64_t kPageSize = 16;
+constexpr int64_t line_count = 40;
+constexpr int64_t pool_page_size = 16;
 // The DeltaNet slots of the cases, and the conv windows' inputs past the kernel's history.
-constexpr int64_t kSlots = 3;
-constexpr int64_t kExtraInputs = kSlots - 1;
+constexpr int64_t slot_count = 3;
+constexpr int64_t extra_inputs = slot_count - 1;
 
 at::Tensor int32_cuda(const std::vector<int32_t>& v) {
     return at::tensor(v, at::dtype(at::kInt)).to(at::kCUDA);
@@ -30,9 +30,9 @@ at::Tensor spaced_pool(const std::vector<int64_t>& line_sizes, at::ScalarType dt
     for (int64_t size : line_sizes) {
         line_elements *= size;
     }
-    std::vector<int64_t> sizes{kLines};
+    std::vector<int64_t> sizes{line_count};
     sizes.insert(sizes.end(), line_sizes.begin(), line_sizes.end());
-    return at::randn({kLines, line_elements + 4}, at::device(at::kCUDA).dtype(dtype))
+    return at::randn({line_count, line_elements + 4}, at::device(at::kCUDA).dtype(dtype))
         .narrow(1, 0, line_elements)
         .view(sizes);
 }
@@ -71,23 +71,23 @@ struct ragged_case {
     // The tokens of sequence s up to the newest page end among them, 0 when none ends a page.
     int64_t page_end(size_t s) const {
         const int64_t first = history_positions[s];
-        const int64_t end = (first + counts[s]) / kPageSize * kPageSize;
+        const int64_t end = (first + counts[s]) / pool_page_size * pool_page_size;
         return end > first ? end - first : 0;
     }
 
     // Sequence s's line j: its slots, then the boundary lines of its even and odd pages, scattered over the pool.
     static int32_t line(size_t s, int64_t slots, int64_t j) {
-        return static_cast<int32_t>((static_cast<int64_t>(s) * (slots + 2) + j) * 7 % kLines);
+        return static_cast<int32_t>((static_cast<int64_t>(s) * (slots + 2) + j) * 7 % line_count);
     }
 
     // The boundary line of the newest page sequence s's tokens end.
     int32_t boundary_line(size_t s, int64_t slots) const {
-        const int64_t page = (history_positions[s] + page_end(s)) / kPageSize - 1;
+        const int64_t page = (history_positions[s] + page_end(s)) / pool_page_size - 1;
         return line(s, slots, slots + page % 2);
     }
 
     int32_t other_boundary_line(size_t s, int64_t slots) const {
-        const int64_t page = (history_positions[s] + page_end(s)) / kPageSize - 1;
+        const int64_t page = (history_positions[s] + page_end(s)) / pool_page_size - 1;
         return line(s, slots, slots + (page + 1) % 2);
     }
 
@@ -105,7 +105,7 @@ struct ragged_case {
             .slots = slots,
             .history_positions = at::tensor(history_positions, at::dtype(at::kLong)).to(at::kCUDA),
             .rejected_tokens = int32_cuda(rejected),
-            .page_size = kPageSize,
+            .page_size = pool_page_size,
         };
     }
 };
@@ -128,7 +128,7 @@ ragged_case decode_case() {
     };
 }
 
-// A verify group of fewer tokens per sequence than kSlots, as when a step drafts fewer tokens than the layout allows.
+// A verify group of fewer tokens per sequence than slot_count, as when a step drafts fewer tokens than the layout allows.
 ragged_case short_verify_case() {
     return {
         .counts = {2, 2, 2, 2, 2},
@@ -138,7 +138,7 @@ ragged_case short_verify_case() {
     };
 }
 
-// kSlots tokens per sequence.
+// slot_count tokens per sequence.
 ragged_case verify_case() {
     return {
         .counts = {3, 3, 3, 3, 3},
@@ -270,7 +270,7 @@ TEST_CASE("causal_conv continues each sequence's valid inputs and keeps its wind
     auto opts = at::device(at::kCUDA).dtype(dtype);
     at::Tensor x = at::randn({batch.total(), channels}, opts);
     at::Tensor weight = at::randn({channels, 1, kernel}, opts);
-    at::Tensor pool = spaced_pool({channels, (kernel - 1) * dilation + kExtraInputs}, dtype);
+    at::Tensor pool = spaced_pool({channels, (kernel - 1) * dilation + extra_inputs}, dtype);
     at::Tensor before = pool.clone();
     const pulsarlm::state_rows rows = batch.rows(1);
 
@@ -333,7 +333,7 @@ TEST_CASE(
     at::Tensor neg_a = -(at::randn({value_heads}, fp32) * 0.5).exp();
     at::Tensor pool = spaced_pool({value_heads, key_dim, value_dim}, at::kFloat);
     at::Tensor before = pool.clone();
-    const pulsarlm::state_rows rows = batch.rows(kSlots);
+    const pulsarlm::state_rows rows = batch.rows(slot_count);
     at::Tensor z = at::randn({batch.total(), value_heads * value_dim}, opts);
     at::Tensor norm_weight = at::randn({value_dim}, opts);
     at::Tensor counters = at::zeros(
@@ -379,30 +379,30 @@ TEST_CASE(
     int64_t first = 0;
     for (size_t s = 0; s < batch.counts.size(); s++) {
         const int64_t n = batch.counts[s];
-        const int64_t start = kSlots - 1 - std::min<int64_t>(batch.rejected[s], kSlots - 1);
+        const int64_t start = slot_count - 1 - std::min<int64_t>(batch.rejected[s], slot_count - 1);
         delta_expected expected = reference_delta_rule(
             x.narrow(0, first, n),
             a.narrow(0, first, n),
             b.narrow(0, first, n),
             dt_bias,
             neg_a,
-            before.select(0, ragged_case::line(s, kSlots, start)),
+            before.select(0, ragged_case::line(s, slot_count, start)),
             key_heads
         );
         at::Tensor gated = reference_output_gate(expected.out, z.narrow(0, first, n), norm_weight, eps, activation);
         CHECK(at::allclose(out.narrow(0, first, n), gated, tolerance, tolerance));
-        // A verify group of n tokens writes the state after token t into slot kSlots - n + t.
-        const int64_t first_written = batch.kind == group_kind::verify ? kSlots - n : kSlots - 1;
-        for (int64_t slot = 0; slot < kSlots; slot++) {
-            const int32_t slot_line = ragged_case::line(s, kSlots, slot);
+        // A verify group of n tokens writes the state after token t into slot slot_count - n + t.
+        const int64_t first_written = batch.kind == group_kind::verify ? slot_count - n : slot_count - 1;
+        for (int64_t slot = 0; slot < slot_count; slot++) {
+            const int32_t slot_line = ragged_case::line(s, slot_count, slot);
             const at::Tensor& written = slot < first_written ? before.select(0, slot_line)
-                                                             : expected.states[n - kSlots + slot];
+                                                             : expected.states[n - slot_count + slot];
             CHECK(at::allclose(pool.select(0, slot_line), written, 1e-4, 1e-4));
         }
         const int64_t page_end = batch.page_end(s);
-        for (int64_t j = kSlots; j < kSlots + 2; j++) {
-            const int32_t boundary = ragged_case::line(s, kSlots, j);
-            const bool written = page_end > 0 && boundary == batch.boundary_line(s, kSlots);
+        for (int64_t j = slot_count; j < slot_count + 2; j++) {
+            const int32_t boundary = ragged_case::line(s, slot_count, j);
+            const bool written = page_end > 0 && boundary == batch.boundary_line(s, slot_count);
             CHECK(
                 at::allclose(
                     pool.select(0, boundary),
@@ -426,7 +426,7 @@ TEST_CASE("causal_conv reads x's rows wherever they lie", "[ops][cuda]") {
     auto opts = at::device(at::kCUDA).dtype(at::kBFloat16);
     at::Tensor x = at::randn({batch.total(), channels + 5}, opts).narrow(1, 2, channels);
     at::Tensor weight = at::randn({channels, 1, kernel}, opts);
-    at::Tensor strided_pool = spaced_pool({channels, kernel - 1 + kExtraInputs}, at::kBFloat16);
+    at::Tensor strided_pool = spaced_pool({channels, kernel - 1 + extra_inputs}, at::kBFloat16);
     at::Tensor packed_pool = strided_pool.clone();
     const pulsarlm::state_rows rows = batch.rows(1);
 
@@ -459,7 +459,7 @@ TEST_CASE("gated_delta_rule refuses fewer arrival counters than a step needs", "
             at::randn({value_heads}, fp32),
             -at::ones({value_heads}, fp32),
             spaced_pool({value_heads, key_dim, value_dim}, at::kFloat),
-            batch.rows(kSlots),
+            batch.rows(slot_count),
             batch.cu_seqlens_q(),
             key_heads,
             at::randn({batch.total(), value_heads * value_dim}, opts),
@@ -493,7 +493,7 @@ TEST_CASE("gated_delta_rule reads a's, b's and z's rows wherever they lie", "[op
     at::Tensor neg_a = -(at::randn({value_heads}, fp32) * 0.5).exp();
     at::Tensor strided_pool = spaced_pool({value_heads, key_dim, value_dim}, at::kFloat);
     at::Tensor packed_pool = strided_pool.clone();
-    const pulsarlm::state_rows rows = batch.rows(kSlots);
+    const pulsarlm::state_rows rows = batch.rows(slot_count);
     auto counters = [&] {
         return at::zeros(
             {pulsarlm::gated_delta_rule_counters(batch.num_seqs(), value_heads)},

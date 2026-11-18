@@ -11,8 +11,8 @@
 namespace pulsarlm {
 namespace {
 
-constexpr int kRaceThreads = 256;
-constexpr int64_t kRaceElementsPerCta = 16 * 4 * kRaceThreads;
+constexpr int race_threads = 256;
+constexpr int64_t race_elements_per_cta = 16 * 4 * race_threads;
 
 // A larger key is a larger score, then a smaller index: the score's bits mapped so that they order as the floats do.
 __device__ __forceinline__ unsigned long long race_key(float score, int64_t index) {
@@ -21,7 +21,7 @@ __device__ __forceinline__ unsigned long long race_key(float score, int64_t inde
     return (static_cast<unsigned long long>(ordered) << 32) | (0xffffffffull - index);
 }
 
-// CTA (row, chunk) races the chunk's kRaceElementsPerCta scores and merges its best into best[row] by atomicMax.
+// CTA (row, chunk) races the chunk's race_elements_per_cta scores and merges its best into best[row] by atomicMax.
 // Philox is keyed by the row's seed and counts (element / 4, the row's draw count), so equal seeds and draw counts
 // draw equal noise.
 template <typename scalar_t>
@@ -41,11 +41,11 @@ __global__ void gumbel_race_kernel(
     const auto seed = static_cast<uint64_t>(draws[row]);
     const auto count = static_cast<uint64_t>(draws[rows + row]);
     const uint2 key = make_uint2(static_cast<uint32_t>(seed), static_cast<uint32_t>(seed >> 32));
-    const int64_t first_quad = blockIdx.x * (kRaceElementsPerCta / 4);
-    const int64_t end_quad = min(first_quad + kRaceElementsPerCta / 4, (vocab + 3) / 4);
+    const int64_t first_quad = blockIdx.x * (race_elements_per_cta / 4);
+    const int64_t end_quad = min(first_quad + race_elements_per_cta / 4, (vocab + 3) / 4);
 
     unsigned long long local = 0;
-    for (int64_t quad = first_quad + threadIdx.x; quad < end_quad; quad += kRaceThreads) {
+    for (int64_t quad = first_quad + threadIdx.x; quad < end_quad; quad += race_threads) {
         uint32_t bits[4] = {};
         if (temperature > 0.0f) {
             const uint4 counter = make_uint4(
@@ -107,14 +107,14 @@ at::Tensor gumbel_race_cuda(const at::Tensor& scores, const at::Tensor& temperat
         return best;
     }
     const dim3 grid(
-        static_cast<unsigned>((vocab + kRaceElementsPerCta - 1) / kRaceElementsPerCta),
+        static_cast<unsigned>((vocab + race_elements_per_cta - 1) / race_elements_per_cta),
         static_cast<unsigned>(rows)
     );
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, scores.scalar_type(), "gumbel_race_cuda", [&] {
         launch_dependent(
             gumbel_race_kernel<scalar_t>,
             grid,
-            kRaceThreads,
+            race_threads,
             0,
             at::cuda::getCurrentCUDAStream(),
             scores.data_ptr<scalar_t>(),

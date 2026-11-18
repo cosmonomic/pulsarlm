@@ -19,7 +19,7 @@
 namespace pulsarlm {
 namespace attn {
 
-constexpr size_t kSharedMemoryWithoutOptIn = 48 * 1024;
+constexpr size_t shared_memory_without_opt_in = 48 * 1024;
 
 template <typename scalar_t> struct paged_attn_params {
     const scalar_t* q;  // [total_q, n_q_heads, head_dim], rotated
@@ -99,14 +99,14 @@ sequence_key_positions(const paged_attn_params<scalar_t>& p, int s, int page_siz
 // through the hardware __sincosf, whose absolute error on it is under 2^-21.
 __device__ __forceinline__ void
 rope_sincos_turns(int position, uint64_t turns_per_position, float& cos_out, float& sin_out) {
-    constexpr float kRadiansPerUnit = 1.46291807926715968e-9f;  // 2 pi / 2^32
+    constexpr float radians_per_unit = 1.46291807926715968e-9f;  // 2 pi / 2^32
     const uint64_t turns = static_cast<uint64_t>(static_cast<int64_t>(position)) * turns_per_position;
     const uint32_t top = static_cast<uint32_t>(turns >> 32);
     const uint32_t quadrant = (top + (1u << 29)) >> 30;
     const int32_t remainder = static_cast<int32_t>(top - (quadrant << 30));
 
     float sine, cosine;
-    __sincosf(static_cast<float>(remainder) * kRadiansPerUnit, &sine, &cosine);
+    __sincosf(static_cast<float>(remainder) * radians_per_unit, &sine, &cosine);
     // Quadrants 1 and 3 swap cosine and sine; cos is negative in quadrants 1 and 2, sin in 2 and 3.
     const bool swapped = quadrant & 1;
     const uint32_t cos_sign = ((quadrant + 1) & 2) << 30;

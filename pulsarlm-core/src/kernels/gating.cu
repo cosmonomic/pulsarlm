@@ -8,7 +8,7 @@
 namespace pulsarlm {
 namespace {
 
-constexpr int kThreads = 256;
+constexpr int cta_threads = 256;
 
 template <typename scalar_t> __device__ __forceinline__ float rounded(float value) {
     return static_cast<float>(static_cast<scalar_t>(value));
@@ -84,7 +84,7 @@ __global__ void silu_mul_kernel(const scalar_t* __restrict__ x, scalar_t* __rest
 }
 
 unsigned blocks_for(int64_t elements) {
-    return static_cast<unsigned>((elements + kThreads - 1) / kThreads);
+    return static_cast<unsigned>((elements + cta_threads - 1) / cta_threads);
 }
 
 }  // namespace
@@ -109,7 +109,7 @@ at::Tensor sigmoid_gated_add_cuda(const at::Tensor& x, const at::Tensor& gate_lo
         launch_dependent(
             sigmoid_gated_add_kernel<scalar_t>,
             blocks_for(x.numel()),
-            kThreads,
+            cta_threads,
             0,
             stream,
             x.const_data_ptr<scalar_t>(),
@@ -146,7 +146,7 @@ at::Tensor sigmoid_gated_cuda(const at::Tensor& y, const at::Tensor& gate_logits
         launch_dependent(
             sigmoid_gated_kernel<scalar_t>,
             blocks_for(y.numel()),
-            kThreads,
+            cta_threads,
             0,
             stream,
             y.const_data_ptr<scalar_t>(),
@@ -179,7 +179,7 @@ at::Tensor silu_mul_cuda(const at::Tensor& x) {
         launch_dependent(
             silu_mul_kernel<scalar_t>,
             blocks_for(y.numel()),
-            kThreads,
+            cta_threads,
             0,
             stream,
             x.const_data_ptr<scalar_t>(),

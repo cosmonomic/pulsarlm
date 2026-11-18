@@ -18,9 +18,9 @@
 
 namespace {
 
-constexpr int64_t kExperts = 16;
+constexpr int64_t expert_count = 16;
 // The last experts no token is routed to.
-constexpr int64_t kUnroutedExperts = 4;
+constexpr int64_t unrouted_experts = 4;
 
 at::TensorOptions cuda(at::ScalarType dtype) {
     return at::device(at::kCUDA).dtype(dtype);
@@ -54,7 +54,7 @@ at::Tensor reference(
 }
 
 std::tuple<at::Tensor, at::Tensor> routing(int64_t tokens, int64_t top_k) {
-    at::Tensor scores = at::rand({tokens, kExperts - kUnroutedExperts}, cuda(at::kFloat));
+    at::Tensor scores = at::rand({tokens, expert_count - unrouted_experts}, cuda(at::kFloat));
     at::Tensor top_experts = std::get<1>(at::topk(scores, top_k, -1)).contiguous();
     at::Tensor top_weights = at::rand({tokens, top_k}, cuda(at::kFloat));
     return {top_experts, top_weights};
@@ -91,8 +91,8 @@ TEST_CASE("routed_experts matches a dense reference", "[ops][cuda]") {
     INFO("dtype " << dtype << " tokens " << tokens << " top_k " << top_k << " hidden " << hidden);
     at::manual_seed(3);
     at::Tensor h = at::randn({tokens, hidden}, cuda(dtype));
-    at::Tensor gate_up_proj = at::randn({kExperts, 2 * intermediate, hidden}, cuda(dtype)) / std::sqrt(hidden);
-    at::Tensor down_proj = at::randn({kExperts, hidden, intermediate}, cuda(dtype)) / std::sqrt(intermediate);
+    at::Tensor gate_up_proj = at::randn({expert_count, 2 * intermediate, hidden}, cuda(dtype)) / std::sqrt(hidden);
+    at::Tensor down_proj = at::randn({expert_count, hidden, intermediate}, cuda(dtype)) / std::sqrt(intermediate);
     auto [top_experts, top_weights] = routing(tokens, top_k);
 
     at::Tensor got = pulsarlm::routed_experts_cuda(
@@ -121,10 +121,10 @@ TEST_CASE("routed_experts routes each token to its most probable experts by its 
     INFO("dtype " << dtype << " tokens " << tokens << " top_k " << top_k);
     at::manual_seed(7);
     at::Tensor h = at::randn({tokens, hidden}, cuda(dtype));
-    at::Tensor gate_up_proj = at::randn({kExperts, 2 * intermediate, hidden}, cuda(dtype)) / std::sqrt(hidden);
-    at::Tensor down_proj = at::randn({kExperts, hidden, intermediate}, cuda(dtype)) / std::sqrt(intermediate);
+    at::Tensor gate_up_proj = at::randn({expert_count, 2 * intermediate, hidden}, cuda(dtype)) / std::sqrt(hidden);
+    at::Tensor down_proj = at::randn({expert_count, hidden, intermediate}, cuda(dtype)) / std::sqrt(intermediate);
     // Router logits whose rows lie apart.
-    at::Tensor router_logits = at::randn({tokens, kExperts + 3}, cuda(dtype)).narrow(1, 0, kExperts);
+    at::Tensor router_logits = at::randn({tokens, expert_count + 3}, cuda(dtype)).narrow(1, 0, expert_count);
     const auto activation = pulsarlm::expert_activation::silu;
 
     at::Tensor got = pulsarlm::routed_experts_cuda(
@@ -155,7 +155,7 @@ TEST_CASE("routed_experts takes the lower expert among tied router logits", "[op
     const int64_t tokens = 64;
     const int64_t top_k = GENERATE(1, 3, 8);
     // 2048 experts give each routing thread two of them.
-    const int64_t experts = GENERATE(kExperts, int64_t{2048});
+    const int64_t experts = GENERATE(expert_count, int64_t{2048});
     const int64_t hidden = 96;
     const int64_t intermediate = 40;
     INFO("top_k " << top_k << " experts " << experts);
@@ -204,13 +204,13 @@ TEST_CASE("routed_experts over each GPU's held experts sums to routed_experts ov
     const int64_t hidden = 96;
     const int64_t intermediate = 40;
     const int64_t gpus = 4;
-    const int64_t held = kExperts / gpus;
+    const int64_t held = expert_count / gpus;
     INFO("dtype " << dtype << " tokens " << tokens);
     at::manual_seed(11);
     at::Tensor h = at::randn({tokens, hidden}, cuda(dtype));
-    at::Tensor gate_up_proj = at::randn({kExperts, 2 * intermediate, hidden}, cuda(dtype)) / std::sqrt(hidden);
-    at::Tensor down_proj = at::randn({kExperts, hidden, intermediate}, cuda(dtype)) / std::sqrt(intermediate);
-    at::Tensor router_logits = at::randn({tokens, kExperts}, cuda(dtype));
+    at::Tensor gate_up_proj = at::randn({expert_count, 2 * intermediate, hidden}, cuda(dtype)) / std::sqrt(hidden);
+    at::Tensor down_proj = at::randn({expert_count, hidden, intermediate}, cuda(dtype)) / std::sqrt(intermediate);
+    at::Tensor router_logits = at::randn({tokens, expert_count}, cuda(dtype));
     const auto activation = pulsarlm::expert_activation::silu;
 
     at::Tensor whole = pulsarlm::routed_experts_cuda(
@@ -251,8 +251,8 @@ TEST_CASE("routed_experts replays from a CUDA graph with new inputs", "[ops][cud
     const int64_t intermediate = 128;
     const auto activation = pulsarlm::expert_activation::silu;
     at::manual_seed(5);
-    at::Tensor gate_up_proj = at::randn({kExperts, 2 * intermediate, hidden}, cuda(at::kBFloat16)) / 16.0;
-    at::Tensor down_proj = at::randn({kExperts, hidden, intermediate}, cuda(at::kBFloat16)) / 16.0;
+    at::Tensor gate_up_proj = at::randn({expert_count, 2 * intermediate, hidden}, cuda(at::kBFloat16)) / 16.0;
+    at::Tensor down_proj = at::randn({expert_count, hidden, intermediate}, cuda(at::kBFloat16)) / 16.0;
     at::Tensor h = at::randn({tokens, hidden}, cuda(at::kBFloat16));
     auto [top_experts, top_weights] = routing(tokens, top_k);
 

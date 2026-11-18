@@ -18,9 +18,9 @@
 
 namespace {
 
-constexpr int64_t kBlockSize = 4;
-constexpr int64_t kMaxPages = 4;
-constexpr double kAlpha = 0.25;
+constexpr int64_t block_size = 4;
+constexpr int64_t max_pages = 4;
+constexpr double alpha = 0.25;
 
 at::Tensor int32_cuda(const std::vector<int32_t>& v) {
     return at::tensor(v, at::dtype(at::kInt)).to(at::kCUDA);
@@ -39,7 +39,7 @@ struct view_batch {
     at::Tensor seqlens_k;
     at::Tensor page_positions;
     at::Tensor cu_view_pages;
-    // Query row r of a view of seq_q queries weighs kAlpha * (1 - kAlpha)^(seq_q - 1 - r).
+    // Query row r of a view of seq_q queries weighs alpha * (1 - alpha)^(seq_q - 1 - r).
     std::vector<double> weights;
     at::Tensor query_weights;
     int64_t total_q = 0;
@@ -50,25 +50,25 @@ view_batch make_batch(int64_t page_size, int64_t first_ctx, int64_t first_querie
     view_batch b{
         .views = {sequence_view{{0, 3, 5, 1}, first_ctx, first_queries}, sequence_view{{2, 4}, page_size + 3, 1}}
     };
-    std::vector<int32_t> tables(b.views.size() * kMaxPages, 0), seqlens, cu_q{0}, cu_view;
+    std::vector<int32_t> tables(b.views.size() * max_pages, 0), seqlens, cu_q{0}, cu_view;
     for (size_t s = 0; s < b.views.size(); ++s) {
-        std::copy(b.views[s].lines.begin(), b.views[s].lines.end(), tables.begin() + s * kMaxPages);
+        std::copy(b.views[s].lines.begin(), b.views[s].lines.end(), tables.begin() + s * max_pages);
         seqlens.push_back(static_cast<int32_t>(b.views[s].ctx));
         cu_q.push_back(cu_q.back() + static_cast<int32_t>(b.views[s].seq_q));
-        cu_view.push_back(static_cast<int32_t>(s * kMaxPages));
+        cu_view.push_back(static_cast<int32_t>(s * max_pages));
     }
-    cu_view.push_back(static_cast<int32_t>(b.views.size() * kMaxPages));
+    cu_view.push_back(static_cast<int32_t>(b.views.size() * max_pages));
     const auto num_seqs = static_cast<int64_t>(b.views.size());
-    b.page_tables = int32_cuda(tables).view({num_seqs, kMaxPages});
+    b.page_tables = int32_cuda(tables).view({num_seqs, max_pages});
     b.cu_seqlens_q = int32_cuda(cu_q);
     b.seqlens_k = int32_cuda(seqlens);
-    b.page_positions = (at::arange(kMaxPages, b.page_tables.options()) * page_size)
+    b.page_positions = (at::arange(max_pages, b.page_tables.options()) * page_size)
                            .expand_as(b.page_tables)
                            .contiguous();
     b.cu_view_pages = int32_cuda(cu_view);
     for (const sequence_view& view : b.views) {
         for (int64_t r = 0; r < view.seq_q; ++r) {
-            b.weights.push_back(kAlpha * std::pow(1.0 - kAlpha, static_cast<double>(view.seq_q - 1 - r)));
+            b.weights.push_back(alpha * std::pow(1.0 - alpha, static_cast<double>(view.seq_q - 1 - r)));
         }
     }
     b.query_weights = at::tensor(std::vector<float>(b.weights.begin(), b.weights.end())).to(at::kCUDA);
@@ -83,9 +83,9 @@ at::Tensor random_selection(const view_batch& b, int64_t page_size, int64_t word
     for (const sequence_view& view : b.views) {
         for (int64_t r = 0; r < view.seq_q; ++r, ++row) {
             const int64_t p = view.ctx - view.seq_q + r;
-            const int64_t blocks = p / kBlockSize + 1;
+            const int64_t blocks = p / block_size + 1;
             bits[row].narrow(0, 0, blocks).copy_(at::rand({blocks}) < 0.4);
-            bits[row][p / kBlockSize] = true;
+            bits[row][p / block_size] = true;
         }
     }
     at::Tensor weights = at::pow(2, at::arange(32, at::kLong));
@@ -97,7 +97,7 @@ at::Tensor full_selection(const view_batch& b, int64_t words) {
 }
 
 bool selected(const at::Tensor& host_bits, int64_t row, int64_t key) {
-    const int64_t block = key / kBlockSize;
+    const int64_t block = key / block_size;
     return (static_cast<uint32_t>(host_bits[row][block / 32].item<int32_t>()) >> (block % 32)) & 1u;
 }
 
@@ -105,7 +105,7 @@ bool selected(const at::Tensor& host_bits, int64_t row, int64_t key) {
 // rounded to the pool dtype as the kernels stage them. mass_sum is [view pages, heads]: per page and head, the sum over
 // the queries attending one of the page's keys of their weight times their max scaled score over its keys they attend;
 // weight_sum is [view pages], the sum of those weights. A sequence's queries share its view pages, or with per_query
-// each query has its own, kMaxPages per query row.
+// each query has its own, max_pages per query row.
 void reference(
     const view_batch& b,
     const at::Tensor& q,
@@ -147,16 +147,16 @@ void reference(
                 auto scores = at::mv(k.index_select(0, attended).select(1, g), q[row][h].to(at::kFloat)) * scale;
                 o[row][h] = at::mv(v.index_select(0, attended).select(1, g).t(), at::softmax(scores, 0));
                 at::Tensor host_scores = scores.cpu();
-                std::vector<std::optional<double>> page_max(kMaxPages);
+                std::vector<std::optional<double>> page_max(max_pages);
                 for (size_t i = 0; i < keys.size(); ++i) {
                     std::optional<double>& max = page_max[keys[i] / page_size];
                     auto score = static_cast<double>(host_scores[static_cast<int64_t>(i)].item<float>());
                     max = std::max(max.value_or(score), score);
                 }
-                for (int64_t page = 0; page < kMaxPages; ++page) {
+                for (int64_t page = 0; page < max_pages; ++page) {
                     if (page_max[page]) {
                         const int64_t view = per_query ? row : static_cast<int64_t>(s);
-                        const int64_t view_page = view * kMaxPages + page;
+                        const int64_t view_page = view * max_pages + page;
                         host_mass[view_page][h] += weight * *page_max[page];
                         if (h == 0) {
                             host_weight[view_page] += weight;
@@ -191,13 +191,13 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
     auto k_pool = at::randn({num_lines, page_size, n_kv, head_dim}, opts);
     auto v_pool = at::randn({num_lines, page_size, n_kv, head_dim}, opts);
     auto q = at::randn({b.total_q, n_q, head_dim}, opts);
-    const int64_t words = (kMaxPages * page_size / kBlockSize + 31) / 32;
+    const int64_t words = (max_pages * page_size / block_size + 31) / 32;
     at::Tensor selection = random_selection(b, page_size, words);
     auto mass_of = [&] {
-        return at::zeros({static_cast<int64_t>(b.views.size()) * kMaxPages, n_q}, opts.dtype(at::kFloat));
+        return at::zeros({static_cast<int64_t>(b.views.size()) * max_pages, n_q}, opts.dtype(at::kFloat));
     };
     auto weights_of = [&] {
-        return at::zeros({static_cast<int64_t>(b.views.size()) * kMaxPages}, opts.dtype(at::kFloat));
+        return at::zeros({static_cast<int64_t>(b.views.size()) * max_pages}, opts.dtype(at::kFloat));
     };
 
     at::Tensor mass = mass_of();
@@ -213,8 +213,8 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
         rope,
         scale,
         selection,
-        kBlockSize,
-        kMaxPages * page_size / kBlockSize,
+        block_size,
+        max_pages * page_size / block_size,
         mass,
         weights,
         b.cu_view_pages,
@@ -261,8 +261,8 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
         rope,
         scale,
         full_selection(b, words),
-        kBlockSize,
-        kMaxPages * page_size / kBlockSize,
+        block_size,
+        max_pages * page_size / block_size,
         all_mass,
         all_weights,
         b.cu_view_pages,
@@ -298,11 +298,11 @@ TEST_CASE("verify indexed attention measures each query's mass in its own view",
     auto k_pool = at::randn({num_lines, page_size, n_kv, head_dim}, opts);
     auto v_pool = at::randn({num_lines, page_size, n_kv, head_dim}, opts);
     auto q = at::randn({b.total_q, n_q, head_dim}, opts);
-    const int64_t words = (kMaxPages * page_size / kBlockSize + 31) / 32;
+    const int64_t words = (max_pages * page_size / block_size + 31) / 32;
     at::Tensor selection = random_selection(b, page_size, words);
-    at::Tensor cu_query_pages = at::arange(b.total_q + 1, b.cu_view_pages.options()) * kMaxPages;
-    at::Tensor mass = at::zeros({b.total_q * kMaxPages, n_q}, opts.dtype(at::kFloat));
-    at::Tensor weights = at::zeros({b.total_q * kMaxPages}, opts.dtype(at::kFloat));
+    at::Tensor cu_query_pages = at::arange(b.total_q + 1, b.cu_view_pages.options()) * max_pages;
+    at::Tensor mass = at::zeros({b.total_q * max_pages, n_q}, opts.dtype(at::kFloat));
+    at::Tensor weights = at::zeros({b.total_q * max_pages}, opts.dtype(at::kFloat));
 
     at::Tensor o = pulsarlm::attn_indexed_verify_cuda(
         q,
@@ -315,8 +315,8 @@ TEST_CASE("verify indexed attention measures each query's mass in its own view",
         rope,
         scale,
         selection,
-        kBlockSize,
-        kMaxPages * page_size / kBlockSize,
+        block_size,
+        max_pages * page_size / block_size,
         mass,
         weights,
         cu_query_pages,

@@ -11,11 +11,11 @@
 namespace pulsarlm {
 namespace {
 
-constexpr int kThreads = 256;
-constexpr int kWarps = kThreads / 32;
-constexpr int64_t kMaxTokens = 4;
+constexpr int cta_threads = 256;
+constexpr int warps = cta_threads / 32;
+constexpr int64_t max_tokens = 4;
 // The weight rows a CTA takes; its warps split their columns.
-constexpr int kRows = 4;
+constexpr int rows = 4;
 
 template <typename scalar_t> __device__ __forceinline__ float rounded(float value) {
     return static_cast<float>(static_cast<scalar_t>(value));
@@ -29,13 +29,13 @@ __device__ __forceinline__ float warp_sum(float value) {
 }
 
 // Adds to sums[t] the dot product of 8 consecutive values of row with those of token t's row of x.
-template <typename scalar_t, int TOKENS>
+template <typename scalar_t, int tokens>
 __device__ __forceinline__ void
-add_dots(const scalar_t* __restrict__ row, const scalar_t* __restrict__ x, int64_t x_stride, float (&sums)[TOKENS]) {
+add_dots(const scalar_t* __restrict__ row, const scalar_t* __restrict__ x, int64_t x_stride, float (&sums)[tokens]) {
     const uint4 loaded = *reinterpret_cast<const uint4*>(row);
     const auto* weights = reinterpret_cast<const scalar_t*>(&loaded);
 #pragma unroll
-    for (int t = 0; t < TOKENS; t++) {
+    for (int t = 0; t < tokens; t++) {
         const uint4 x_vector = *reinterpret_cast<const uint4*>(x + t * x_stride);
         const auto* values = reinterpret_cast<const scalar_t*>(&x_vector);
 #pragma unroll
@@ -45,11 +45,11 @@ add_dots(const scalar_t* __restrict__ row, const scalar_t* __restrict__ x, int64
     }
 }
 
-// Each CTA takes kRows output columns. With gated, each column c also takes weight row half + c, and the CTA writes
+// Each CTA takes rows output columns. With gated, each column c also takes weight row half + c, and the CTA writes
 // silu(x . row c) * (x . row half + c), each rounded as at::linear and silu_mul_cuda round; otherwise x . row c. The
 // warps split the columns of x and their sums meet in shared memory.
-template <typename scalar_t, int TOKENS, bool gated>
-__global__ void __launch_bounds__(kThreads) small_batch_linear_kernel(
+template <typename scalar_t, int tokens, bool gated>
+__global__ void __launch_bounds__(cta_threads) small_batch_linear_kernel(
     const scalar_t* __restrict__ x,
     int64_t x_stride,
     const scalar_t* __restrict__ weight,
@@ -61,20 +61,20 @@ __global__ void __launch_bounds__(kThreads) small_batch_linear_kernel(
 ) {
     wait_for_prior_kernels();
     allow_next_kernel();
-    constexpr int kParts = gated ? 2 : 1;
-    __shared__ float warp_sums[kWarps][kParts][kRows][TOKENS];
+    constexpr int parts = gated ? 2 : 1;
+    __shared__ float warp_sums[warps][parts][rows][tokens];
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
-    const int64_t first = static_cast<int64_t>(blockIdx.x) * kRows;
-    float sums[kParts][kRows][TOKENS] = {};
-    for (int column = threadIdx.x * 8; column < k; column += kThreads * 8) {
+    const int64_t first = static_cast<int64_t>(blockIdx.x) * rows;
+    float sums[parts][rows][tokens] = {};
+    for (int column = threadIdx.x * 8; column < k; column += cta_threads * 8) {
 #pragma unroll
-        for (int part = 0; part < kParts; part++) {
+        for (int part = 0; part < parts; part++) {
 #pragma unroll
-            for (int r = 0; r < kRows; r++) {
+            for (int r = 0; r < rows; r++) {
                 if (first + r < columns) {
                     const int64_t row = part * half + first + r;
-                    add_dots<scalar_t, TOKENS>(
+                    add_dots<scalar_t, tokens>(
                         weight + row * weight_stride + column,
                         x + column,
                         x_stride,
@@ -85,11 +85,11 @@ __global__ void __launch_bounds__(kThreads) small_batch_linear_kernel(
         }
     }
 #pragma unroll
-    for (int part = 0; part < kParts; part++) {
+    for (int part = 0; part < parts; part++) {
 #pragma unroll
-        for (int r = 0; r < kRows; r++) {
+        for (int r = 0; r < rows; r++) {
 #pragma unroll
-            for (int t = 0; t < TOKENS; t++) {
+            for (int t = 0; t < tokens; t++) {
                 const float sum = warp_sum(sums[part][r][t]);
                 if (lane == 0) {
                     warp_sums[warp][part][r][t] = sum;
@@ -98,15 +98,15 @@ __global__ void __launch_bounds__(kThreads) small_batch_linear_kernel(
         }
     }
     __syncthreads();
-    if (threadIdx.x < kRows * TOKENS) {
-        const int r = threadIdx.x / TOKENS;
-        const int t = threadIdx.x % TOKENS;
+    if (threadIdx.x < rows * tokens) {
+        const int r = threadIdx.x / tokens;
+        const int t = threadIdx.x % tokens;
         if (first + r < columns) {
-            float dots[kParts];
+            float dots[parts];
 #pragma unroll
-            for (int part = 0; part < kParts; part++) {
+            for (int part = 0; part < parts; part++) {
                 dots[part] = 0.0f;
-                for (int w = 0; w < kWarps; w++) {
+                for (int w = 0; w < warps; w++) {
                     dots[part] += warp_sums[w][part][r][t];
                 }
             }
@@ -144,7 +144,7 @@ bool vector_rows(const at::Tensor& t) {
 
 // Whether x and weight take the matrix-vector kernel.
 bool fits(const at::Tensor& x, const at::Tensor& weight) {
-    return x.is_cuda() && x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= kMaxTokens &&
+    return x.is_cuda() && x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= max_tokens &&
         (x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kHalf) && weight.scalar_type() == x.scalar_type() &&
         weight.dim() == 2 && weight.size(1) == x.size(1) && x.size(1) % 8 == 0 && vector_rows(x) && vector_rows(weight);
 }
@@ -161,8 +161,8 @@ template <bool gated> at::Tensor launch(const at::Tensor& x, const at::Tensor& w
         dispatch_tokens(tokens, [&](auto tokens_tag) {
             launch_dependent(
                 small_batch_linear_kernel<scalar_t, decltype(tokens_tag)::value, gated>,
-                static_cast<unsigned>((columns + kRows - 1) / kRows),
-                kThreads,
+                static_cast<unsigned>((columns + rows - 1) / rows),
+                cta_threads,
                 0,
                 stream,
                 x.const_data_ptr<scalar_t>(),

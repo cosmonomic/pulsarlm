@@ -61,7 +61,7 @@ template <typename scalar_t> __device__ int sequence_of(const attn::paged_attn_p
 }
 
 // One CTA per (query token, query head), as attn_scalar_kernel, its threads striding over pages up to the query's.
-template <typename scalar_t, int PAGE_SIZE>
+template <typename scalar_t, int page_size>
 __global__ void attn_indexed_scalar_kernel(const attn::paged_attn_params<scalar_t> p, const block_selection selection) {
     wait_for_prior_kernels();
     allow_next_kernel();
@@ -78,24 +78,24 @@ __global__ void attn_indexed_scalar_kernel(const attn::paged_attn_params<scalar_
     const int seq_q = p.cu_seqlens_q ? p.cu_seqlens_q[s + 1] - q0 : 1;
     const int ctx_len = p.seqlens_k[s];
     const int query_pos = ctx_len - seq_q + (qtok - q0);
-    const attn::key_positions layout = attn::sequence_key_positions(p, s, PAGE_SIZE);
+    const attn::key_positions layout = attn::sequence_key_positions(p, s, page_size);
     const int32_t* seq_table = p.page_tables + static_cast<int64_t>(s) * p.max_pages;
 
-    // Dynamic shared: [ qsh(head_dim) | out_acc(head_dim) | red(kThreads) ]
+    // Dynamic shared: [ qsh(head_dim) | out_acc(head_dim) | red(cta_threads) ]
     extern __shared__ float smem[];
     float* qsh = smem;
     float* out_acc = qsh + head_dim;
     float* red = out_acc + head_dim;
 
     const scalar_t* qrow = p.q + (static_cast<int64_t>(qtok) * p.n_q_heads + h) * head_dim;
-    for (int d = tid; d < head_dim; d += attn::kThreads) {
+    for (int d = tid; d < head_dim; d += attn::cta_threads) {
         qsh[d] = static_cast<float>(qrow[d]);
     }
     __syncthreads();
 
     auto key_offset = [&](int j) {
-        const int line = seq_table[j / PAGE_SIZE];
-        return static_cast<int64_t>(line) * p.page_stride + (j % PAGE_SIZE) * p.token_stride + g * p.head_stride;
+        const int line = seq_table[j / page_size];
+        return static_cast<int64_t>(line) * p.page_stride + (j % page_size) * p.token_stride + g * p.head_stride;
     };
     auto score = [&](int j, int64_t offset) {
         const scalar_t* krow = p.k_pool + offset;
@@ -114,13 +114,13 @@ __global__ void attn_indexed_scalar_kernel(const attn::paged_attn_params<scalar_
     const float weight = p.mass_sum ? p.query_weights[qtok] : 0.0f;
     float m = -CUDART_INF_F;
     float l = 0.0f;
-    float acc[attn::kMaxHeadDim];
+    float acc[attn::max_head_dim];
     for (int d = 0; d < head_dim; ++d) {
         acc[d] = 0.0f;
     }
-    for (int page = tid; page <= query_pos / PAGE_SIZE; page += attn::kThreads) {
+    for (int page = tid; page <= query_pos / page_size; page += attn::cta_threads) {
         float page_max = -CUDART_INF_F;
-        for (int j = page * PAGE_SIZE; j < min((page + 1) * PAGE_SIZE, query_pos + 1); ++j) {
+        for (int j = page * page_size; j < min((page + 1) * page_size, query_pos + 1); ++j) {
             if (!selection.selects(qtok, j)) {
                 continue;
             }
@@ -146,20 +146,20 @@ __global__ void attn_indexed_scalar_kernel(const attn::paged_attn_params<scalar_
         }
     }
 
-    const float M = attn::block_reduce_max<attn::kThreads>(red, tid, m);
-    const float w = M == -CUDART_INF_F ? 0.0f : __expf(m - M);  // 0 when this thread saw no keys
-    for (int d = tid; d < head_dim; d += attn::kThreads) {
+    const float block_max = attn::block_reduce_max<attn::cta_threads>(red, tid, m);
+    const float w = block_max == -CUDART_INF_F ? 0.0f : __expf(m - block_max);  // 0 when this thread saw no keys
+    for (int d = tid; d < head_dim; d += attn::cta_threads) {
         out_acc[d] = 0.0f;
     }
     __syncthreads();
     for (int d = 0; d < head_dim; ++d) {
         atomicAdd(&out_acc[d], acc[d] * w);
     }
-    const float denom = attn::block_reduce_sum<attn::kThreads>(red, tid, l * w);
+    const float denom = attn::block_reduce_sum<attn::cta_threads>(red, tid, l * w);
 
     scalar_t* orow = p.o + (static_cast<int64_t>(qtok) * p.n_q_heads + h) * head_dim;
     const float inv_denom = 1.0f / denom;
-    for (int d = tid; d < head_dim; d += attn::kThreads) {
+    for (int d = tid; d < head_dim; d += attn::cta_threads) {
         orow[d] = static_cast<scalar_t>(out_acc[d] * inv_denom);
     }
 }
@@ -190,9 +190,9 @@ __global__ void mark_selected_pages_kernel(
     }
 }
 
-constexpr int kSlotThreads = 1024;
+constexpr int slot_threads = 1024;
 
-// The sum of value over threads [0, threadIdx.x) of a kSlotThreads-thread block; sums holds kSlotThreads / 32 entries.
+// The sum of value over threads [0, threadIdx.x) of a slot_threads-thread block; sums holds slot_threads / 32 entries.
 __device__ int exclusive_block_sum(int value, int* sums) {
     const int lane = threadIdx.x % 32;
     const int warp = threadIdx.x / 32;
@@ -225,7 +225,7 @@ __device__ int exclusive_block_sum(int value, int* sums) {
 // page i of the flattened [num_seqs, max_pages] tables, less one, a page being selected when the query of its sequence
 // selects one of its blocks. Each thread takes a run of consecutive pages.
 template <typename scalar_t>
-__global__ void __launch_bounds__(kSlotThreads) single_query_page_slots_kernel(
+__global__ void __launch_bounds__(slot_threads) single_query_page_slots_kernel(
     const attn::paged_attn_params<scalar_t> p,
     const block_selection selection,
     int page_size,
@@ -233,9 +233,9 @@ __global__ void __launch_bounds__(kSlotThreads) single_query_page_slots_kernel(
 ) {
     wait_for_prior_kernels();
     allow_next_kernel();
-    __shared__ int warp_sums[kSlotThreads / 32];
+    __shared__ int warp_sums[slot_threads / 32];
     const int total = p.num_seqs * p.max_pages;
-    const int run = (total + kSlotThreads - 1) / kSlotThreads;
+    const int run = (total + slot_threads - 1) / slot_threads;
     const int first = min(static_cast<int>(threadIdx.x) * run, total);
     const int last = min(first + run, total);
     const int page_blocks = page_size / selection.block_size;
@@ -317,7 +317,7 @@ __global__ void rotate_indexed_keys_kernel(
 }
 
 // The most blocks one query may select.
-constexpr int kMaxListedBlocks = 1024;
+constexpr int max_listed_blocks = 1024;
 
 // A partial row holds the max scaled score, the weight sum and the weighted values [head_dim].
 constexpr int partial_row_floats(int head_dim) {
@@ -327,33 +327,33 @@ constexpr int partial_row_floats(int head_dim) {
 // Runs one CTA per (query token, KV group, split). The MMA rows are the group's query heads, up to 16, and each key
 // tile gathers the token's next selected blocks in view order. The tile, sweep and staging arithmetic is
 // attn_prefill_tc_kernel's. A split takes whole pages of the selection.
-template <typename scalar_t, int PAGE_SIZE, int HEAD_DIM, bool BF16, int NWARPS, int KEY_PAGES, int CTAS_PER_SM>
-__global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kernel(
+template <typename scalar_t, int page_size, int head_dim, bool bf16, int nwarps, int key_pages, int ctas_per_sm>
+__global__ void __launch_bounds__(nwarps * 32, ctas_per_sm) attn_indexed_tc_kernel(
     const attn::paged_attn_params<scalar_t> p,
     const block_selection selection,
     const scalar_t* __restrict__ rotated_k,  // [selected pages, page_size, n_kv_heads, head_dim]
     const int32_t* __restrict__ page_slots,  // [num_seqs * max_pages], each selected view page's row of rotated_k
     int splits,
     float* __restrict__ partial,  // [query tokens * KV groups * splits, 16, partial_row_floats], with splits above 1
-    int32_t* __restrict__ listed_scratch  // [query tokens * KV groups * splits, kMaxListedBlocks]
+    int32_t* __restrict__ listed_scratch  // [query tokens * KV groups * splits, max_listed_blocks]
 ) {
     wait_for_prior_kernels();
     allow_next_kernel();
-    constexpr int KEY_TILE = PAGE_SIZE * KEY_PAGES;
-    constexpr int SCORE_STRIDE = KEY_TILE + 1;
-    constexpr int kSweepLanes = 4;
-    constexpr int kSweepCols = KEY_TILE / kSweepLanes;
-    constexpr int kSweepThreads = 16 * kSweepLanes;
+    constexpr int key_tile = page_size * key_pages;
+    constexpr int score_stride = key_tile + 1;
+    constexpr int sweep_lanes = 4;
+    constexpr int sweep_cols = key_tile / sweep_lanes;
+    constexpr int sweep_threads = 16 * sweep_lanes;
     static_assert(
-        kSweepThreads % 32 == 0 && kSweepThreads <= NWARPS * 32,
+        sweep_threads % 32 == 0 && sweep_threads <= nwarps * 32,
         "the sweep groups must fill whole warps of the CTA"
     );
-    static_assert(KEY_TILE % kSweepLanes == 0, "key tile must split over a group");
+    static_assert(key_tile % sweep_lanes == 0, "key tile must split over a group");
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
-    const int sweep_row = tid / kSweepLanes;
-    const int sweep_lane = tid % kSweepLanes;
+    const int sweep_row = tid / sweep_lanes;
+    const int sweep_lane = tid % sweep_lanes;
     const int split = blockIdx.x % splits;
     const int group_cta = blockIdx.x / splits;
     const int qtok = group_cta / p.n_kv_heads;
@@ -365,33 +365,33 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
     const int seq_q = p.cu_seqlens_q ? p.cu_seqlens_q[s + 1] - q0 : 1;
     const int ctx_len = p.seqlens_k[s];
     const int query_pos = ctx_len - seq_q + (qtok - q0);
-    const int tile_blocks = KEY_TILE / selection.block_size;
-    const int page_blocks = PAGE_SIZE / selection.block_size;
+    const int tile_blocks = key_tile / selection.block_size;
+    const int page_blocks = page_size / selection.block_size;
 
     const int32_t* seq_table = p.page_tables + static_cast<int64_t>(s) * p.max_pages;
     const int32_t* seq_slots = page_slots + static_cast<int64_t>(s) * p.max_pages;
-    const int64_t rotated_token_stride = static_cast<int64_t>(p.n_kv_heads) * HEAD_DIM;
-    const int64_t rotated_page_stride = PAGE_SIZE * rotated_token_stride;
+    const int64_t rotated_token_stride = static_cast<int64_t>(p.n_kv_heads) * head_dim;
+    const int64_t rotated_page_stride = page_size * rotated_token_stride;
 
     static_assert(sizeof(scalar_t) == 2, "the tile staging copies 8 elements at a time");
-    constexpr int kChunkElems = 16 / sizeof(scalar_t);
-    constexpr int kRowChunks = HEAD_DIM / kChunkElems;
-    constexpr int kTileChunks = KEY_TILE * kRowChunks;
+    constexpr int chunk_elems = 16 / sizeof(scalar_t);
+    constexpr int row_chunks = head_dim / chunk_elems;
+    constexpr int tile_chunks = key_tile * row_chunks;
 
     extern __shared__ __align__(16) unsigned char shared_memory[];
     scalar_t* sQ = reinterpret_cast<scalar_t*>(shared_memory);
-    scalar_t* sK = sQ + 16 * HEAD_DIM;
-    scalar_t* sV = sK + KEY_TILE * HEAD_DIM;
-    scalar_t* sP = sV + KEY_TILE * HEAD_DIM;
-    float* sS = reinterpret_cast<float*>(sP + 16 * KEY_TILE);
+    scalar_t* sK = sQ + 16 * head_dim;
+    scalar_t* sV = sK + key_tile * head_dim;
+    scalar_t* sP = sV + key_tile * head_dim;
+    float* sS = reinterpret_cast<float*>(sP + 16 * key_tile);
     __shared__ float Mrow[16], Lrow[16];
     __shared__ float row_rescale[16];
     // The view index of each key of the staged tiles, -1 past the selection or the query: the tile K holds, then the
     // one V holds, as the pipeline stages K a tile ahead of V.
-    __shared__ int key_index[2][KEY_TILE];
+    __shared__ int key_index[2][key_tile];
     // The CTA's selected blocks at or before the query, in view order.
-    int32_t* listed_blocks = listed_scratch + static_cast<int64_t>(blockIdx.x) * kMaxListedBlocks;
-    __shared__ int listed_counts[NWARPS];
+    int32_t* listed_blocks = listed_scratch + static_cast<int64_t>(blockIdx.x) * max_listed_blocks;
+    __shared__ int listed_counts[nwarps];
     // Each row's max scaled score over the page its tiles are in; selected blocks come in view order, so a page's
     // keys are consecutive across tiles.
     __shared__ int run_page[16];
@@ -407,21 +407,21 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
         }
     };
 
-    for (int c = tid; c < 16 * kRowChunks; c += NWARPS * 32) {
-        const int row = c / kRowChunks;
-        const int col = (c % kRowChunks) * kChunkElems;
-        const scalar_t* source = p.q + (static_cast<int64_t>(qtok) * p.n_q_heads + first_head + row) * HEAD_DIM + col;
+    for (int c = tid; c < 16 * row_chunks; c += nwarps * 32) {
+        const int row = c / row_chunks;
+        const int col = (c % row_chunks) * chunk_elems;
+        const scalar_t* source = p.q + (static_cast<int64_t>(qtok) * p.n_q_heads + first_head + row) * head_dim + col;
         attn::cp_async_16(
-            sQ + attn::swizzled_offset<HEAD_DIM>(row, col),
+            sQ + attn::swizzled_offset<head_dim>(row, col),
             row < rows ? source : p.q,
             row < rows ? 16 : 0
         );
     }
     attn::cp_async_commit();
     attn::cp_async_wait<0>();
-    constexpr int kSlabs = attn::pv_slabs_per_warp<HEAD_DIM, NWARPS>();
-    float out_acc[kSlabs * attn::kPvSlabAccums] = {};
-    for (int i = tid; i < 16 * KEY_TILE; i += NWARPS * 32) {
+    constexpr int slabs = attn::pv_slabs_per_warp<head_dim, nwarps>();
+    float out_acc[slabs * attn::pv_slab_accums] = {};
+    for (int i = tid; i < 16 * key_tile; i += nwarps * 32) {
         sP[i] = static_cast<scalar_t>(0);
     }
     if (tid < 16) {
@@ -432,14 +432,14 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
     }
     // The blocks this CTA takes are [first_block, end_block).
     __shared__ int first_block, end_block;
-    __shared__ int chunk_selected[NWARPS * 32];
+    __shared__ int chunk_selected[nwarps * 32];
     if (splits == 1) {
         if (tid == 0) {
             first_block = 0;
             end_block = INT_MAX;
         }
     } else {
-        const int chunk_words = (selection.words + NWARPS * 32 - 1) / (NWARPS * 32);
+        const int chunk_words = (selection.words + nwarps * 32 - 1) / (nwarps * 32);
         int selected = 0;
         for (int w = tid * chunk_words; w < min((tid + 1) * chunk_words, selection.words); ++w) {
             selected += __popc(selection.word(qtok, w));
@@ -448,7 +448,7 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
         __syncthreads();
         if (tid == 0) {
             int total = 0;
-            for (int c = 0; c < NWARPS * 32; ++c) {
+            for (int c = 0; c < nwarps * 32; ++c) {
                 total += chunk_selected[c];
             }
             const int split_blocks = (total + splits - 1) / splits;
@@ -482,7 +482,7 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
     const int last_block = min(end_block - 1, query_pos / selection.block_size);
     const int first_word = first_block / 32;
     const int end_word = last_block >= first_block ? min(selection.words, last_block / 32 + 1) : first_word;
-    const int run_words = max(end_word - first_word, 0) / (NWARPS * 32) + 1;
+    const int run_words = max(end_word - first_word, 0) / (nwarps * 32) + 1;
     auto run_bits = [&](int w) {
         uint32_t bits = selection.word(qtok, w);
         if (w == first_word) {
@@ -512,7 +512,7 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
     listed_before -= run_count;
     __syncthreads();
     int listed = 0;
-    for (int w = 0; w < NWARPS; ++w) {
+    for (int w = 0; w < nwarps; ++w) {
         listed_before += w < warp ? listed_counts[w] : 0;
         listed += listed_counts[w];
     }
@@ -527,7 +527,7 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
     // when none is left. Every thread keeps the same next_listed.
     int next_listed = 0;
     auto next_tile = [&](int slot) {
-        for (int c = tid; c < KEY_TILE; c += NWARPS * 32) {
+        for (int c = tid; c < key_tile; c += nwarps * 32) {
             const int index = next_listed + c / selection.block_size;
             const int key = index < listed ? listed_blocks[index] * selection.block_size + c % selection.block_size
                                            : -1;
@@ -542,17 +542,17 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
     // Stages the keys of key_index[slot], K from rotated_k or V from the pool, zeros past the selection. Always commits
     // a group, as attn_prefill_tc_kernel's stage_tile.
     auto stage_tile = [&](bool keys, scalar_t* dst, int slot) {
-        for (int c = tid; c < kTileChunks; c += NWARPS * 32) {
-            const int row = c / kRowChunks;
-            const int d = (c % kRowChunks) * kChunkElems;
+        for (int c = tid; c < tile_chunks; c += nwarps * 32) {
+            const int row = c / row_chunks;
+            const int d = (c % row_chunks) * chunk_elems;
             const int key = key_index[slot][row];
-            const int view_page = max(key, 0) / PAGE_SIZE;
-            const int offset = max(key, 0) % PAGE_SIZE;
+            const int view_page = max(key, 0) / page_size;
+            const int offset = max(key, 0) % page_size;
             const scalar_t* src = keys ? rotated_k + static_cast<int64_t>(seq_slots[view_page]) * rotated_page_stride +
-                    offset * rotated_token_stride + static_cast<int64_t>(g) * HEAD_DIM + d
+                    offset * rotated_token_stride + static_cast<int64_t>(g) * head_dim + d
                                        : p.v_pool + static_cast<int64_t>(seq_table[view_page]) * p.page_stride +
                     offset * p.token_stride + g * p.head_stride + d;
-            attn::cp_async_16(dst + attn::swizzled_offset<HEAD_DIM>(row, d), src, key >= 0 ? 16 : 0);
+            attn::cp_async_16(dst + attn::swizzled_offset<head_dim>(row, d), src, key >= 0 ? 16 : 0);
         }
         attn::cp_async_commit();
     };
@@ -563,7 +563,7 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
     bool more = next_tile(0);
     if (more) {
         stage_tile(true, sK, 0);
-        for (int i = tid; i < KEY_TILE; i += NWARPS * 32) {
+        for (int i = tid; i < key_tile; i += nwarps * 32) {
             key_index[1][i] = key_index[0][i];
         }
         __syncthreads();
@@ -572,7 +572,7 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
     while (more) {
         attn::cp_async_wait<1>();
         __syncthreads();
-        attn::tile_qkt<scalar_t, KEY_TILE, HEAD_DIM, BF16, SCORE_STRIDE, true>(sQ, sK, sS, warp, NWARPS);
+        attn::tile_qkt<scalar_t, key_tile, head_dim, bf16, score_stride, true>(sQ, sK, sS, warp, nwarps);
         __syncthreads();
         more = next_tile(0);
         if (more) {
@@ -581,17 +581,17 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
             attn::cp_async_commit();
         }
 
-        if (tid < kSweepThreads) {
+        if (tid < sweep_threads) {
             float tmax = -CUDART_INF_F;
 #pragma unroll
-            for (int j = 0; j < kSweepCols; ++j) {
-                const int c = sweep_lane * kSweepCols + j;
+            for (int j = 0; j < sweep_cols; ++j) {
+                const int c = sweep_lane * sweep_cols + j;
                 if (attends(sweep_row, c, 1)) {
-                    tmax = fmaxf(tmax, p.scale * sS[sweep_row * SCORE_STRIDE + c]);
+                    tmax = fmaxf(tmax, p.scale * sS[sweep_row * score_stride + c]);
                 }
             }
 #pragma unroll
-            for (int off = kSweepLanes / 2; off > 0; off >>= 1) {
+            for (int off = sweep_lanes / 2; off > 0; off >>= 1) {
                 tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, off));
             }
             if (sweep_lane == 0 && sweep_row < rows) {
@@ -601,15 +601,15 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
             }
         }
         if (p.mass_sum && tid < rows) {
-            for (int c = 0; c < KEY_TILE; ++c) {
+            for (int c = 0; c < key_tile; ++c) {
                 const int key = key_index[1][c];
                 if (key < 0) {
                     continue;
                 }
-                const float score = p.scale * sS[tid * SCORE_STRIDE + c];
-                if (key / PAGE_SIZE != run_page[tid]) {
+                const float score = p.scale * sS[tid * score_stride + c];
+                if (key / page_size != run_page[tid]) {
                     flush_page(tid);
-                    run_page[tid] = key / PAGE_SIZE;
+                    run_page[tid] = key / page_size;
                     run_max[tid] = score;
                 } else {
                     run_max[tid] = fmaxf(run_max[tid], score);
@@ -618,23 +618,23 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
         }
         __syncthreads();
 
-        for (int i = tid; i < 16 * KEY_TILE; i += NWARPS * 32) {
-            const int m = i / KEY_TILE, c = i % KEY_TILE;
-            float& score = sS[m * SCORE_STRIDE + c];
+        for (int i = tid; i < 16 * key_tile; i += nwarps * 32) {
+            const int m = i / key_tile, c = i % key_tile;
+            float& score = sS[m * score_stride + c];
             const float pw = attends(m, c, 1) ? __expf(p.scale * score - Mrow[m]) : 0.0f;
             score = pw;
             sP[i] = static_cast<scalar_t>(pw);
         }
         __syncthreads();
 
-        if (tid < kSweepThreads) {
+        if (tid < sweep_threads) {
             float lsum = 0.0f;
 #pragma unroll
-            for (int j = 0; j < kSweepCols; ++j) {
-                lsum += sS[sweep_row * SCORE_STRIDE + sweep_lane * kSweepCols + j];
+            for (int j = 0; j < sweep_cols; ++j) {
+                lsum += sS[sweep_row * score_stride + sweep_lane * sweep_cols + j];
             }
 #pragma unroll
-            for (int off = kSweepLanes / 2; off > 0; off >>= 1) {
+            for (int off = sweep_lanes / 2; off > 0; off >>= 1) {
                 lsum += __shfl_xor_sync(0xffffffffu, lsum, off);
             }
             if (sweep_lane == 0 && sweep_row < rows) {
@@ -644,10 +644,10 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
         attn::cp_async_wait<1>();
         __syncthreads();
 
-        attn::tile_pv_registers<scalar_t, KEY_TILE, HEAD_DIM, BF16, NWARPS, true>(sP, sV, row_rescale, out_acc, warp);
+        attn::tile_pv_registers<scalar_t, key_tile, head_dim, bf16, nwarps, true>(sP, sV, row_rescale, out_acc, warp);
         __syncthreads();
         if (more) {
-            for (int i = tid; i < KEY_TILE; i += NWARPS * 32) {
+            for (int i = tid; i < key_tile; i += nwarps * 32) {
                 key_index[1][i] = key_index[0][i];
             }
             __syncthreads();
@@ -659,21 +659,21 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
     if (splits == 1) {
         const int gid = lane >> 2;
         const float inv_low = 1.0f / Lrow[gid], inv_high = 1.0f / Lrow[gid + 8];
-        attn::for_each_pv_register<HEAD_DIM, NWARPS>(out_acc, warp, [&](int row, int col, float value) {
+        attn::for_each_pv_register<head_dim, nwarps>(out_acc, warp, [&](int row, int col, float value) {
             if (row < rows) {
-                p.o[(static_cast<int64_t>(qtok) * p.n_q_heads + first_head + row) * HEAD_DIM +
+                p.o[(static_cast<int64_t>(qtok) * p.n_q_heads + first_head + row) * head_dim +
                     col] = static_cast<scalar_t>(value * (row < 8 ? inv_low : inv_high));
             }
         });
     } else {
-        float* cta_partial = partial + static_cast<int64_t>(blockIdx.x) * 16 * partial_row_floats(HEAD_DIM);
+        float* cta_partial = partial + static_cast<int64_t>(blockIdx.x) * 16 * partial_row_floats(head_dim);
         if (tid < rows) {
-            cta_partial[tid * partial_row_floats(HEAD_DIM)] = Mrow[tid];
-            cta_partial[tid * partial_row_floats(HEAD_DIM) + 1] = Lrow[tid];
+            cta_partial[tid * partial_row_floats(head_dim)] = Mrow[tid];
+            cta_partial[tid * partial_row_floats(head_dim) + 1] = Lrow[tid];
         }
-        attn::for_each_pv_register<HEAD_DIM, NWARPS>(out_acc, warp, [&](int row, int col, float value) {
+        attn::for_each_pv_register<head_dim, nwarps>(out_acc, warp, [&](int row, int col, float value) {
             if (row < rows) {
-                cta_partial[row * partial_row_floats(HEAD_DIM) + 2 + col] = value;
+                cta_partial[row * partial_row_floats(head_dim) + 2 + col] = value;
             }
         });
     }
@@ -722,20 +722,20 @@ __global__ void combine_indexed_splits_kernel(
     }
 }
 
-// The splits of each (query token, KV group) are the largest power of two, at most kMaxSplits, that keeps the grid
+// The splits of each (query token, KV group) are the largest power of two, at most max_splits, that keeps the grid
 // within the device's SMs.
-constexpr int64_t kMaxSplits = 32;
+constexpr int64_t max_splits = 32;
 
 int indexed_splits(int64_t groups) {
     const int64_t sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
     int64_t splits = 1;
-    while (splits < kMaxSplits && groups * splits * 2 <= sms) {
+    while (splits < max_splits && groups * splits * 2 <= sms) {
         splits *= 2;
     }
     return static_cast<int>(splits);
 }
 
-template <typename scalar_t, bool BF16>
+template <typename scalar_t, bool bf16>
 void launch_indexed_tc(
     const attn::paged_attn_batch& b,
     const block_selection& selection,
@@ -751,7 +751,7 @@ void launch_indexed_tc(
         launch_dependent(
             single_query_page_slots_kernel<scalar_t>,
             1,
-            kSlotThreads,
+            slot_threads,
             0,
             stream,
             params,
@@ -793,26 +793,26 @@ void launch_indexed_tc(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     attn::dispatch_page_head("attn_indexed", b.page_size, b.head_dim, [&](auto bs_tag, auto hd_tag) {
-        constexpr int BS = decltype(bs_tag)::value;
-        constexpr int HD = decltype(hd_tag)::value;
+        constexpr int bs = decltype(bs_tag)::value;
+        constexpr int hd = decltype(hd_tag)::value;
         attn::dispatch_attn_tuning([&](auto row_tag) {
-            constexpr attn::attn_tuning kTuning = attn::kAttnTuningTable[decltype(row_tag)::value];
-            constexpr int NWARPS = kTuning.prefill_warps;
-            constexpr int KEY_PAGES = attn::prefill_key_pages<scalar_t, BS, HD, kTuning.prefill_key_pages>();
-            constexpr size_t smem = attn::prefill_tile_bytes<scalar_t, BS, HD, KEY_PAGES>();
+            constexpr attn::attn_tuning tuning = attn::attn_tuning_table[decltype(row_tag)::value];
+            constexpr int nwarps = tuning.prefill_warps;
+            constexpr int key_pages = attn::prefill_key_pages<scalar_t, bs, hd, tuning.prefill_key_pages>();
+            constexpr size_t smem = attn::prefill_tile_bytes<scalar_t, bs, hd, key_pages>();
             const auto
-                kernel = attn_indexed_tc_kernel<scalar_t, BS, HD, BF16, NWARPS, KEY_PAGES, kTuning.prefill_ctas_per_sm>;
+                kernel = attn_indexed_tc_kernel<scalar_t, bs, hd, bf16, nwarps, key_pages, tuning.prefill_ctas_per_sm>;
             attn::allow_shared_memory(kernel, smem);
             const int splits = indexed_splits(grid);
-            at::Tensor listed_scratch = at::empty({grid * splits, kMaxListedBlocks}, b.page_tables.options());
+            at::Tensor listed_scratch = at::empty({grid * splits, max_listed_blocks}, b.page_tables.options());
             at::Tensor partial;
             if (splits > 1) {
-                partial = at::empty({grid * splits, 16, partial_row_floats(HD)}, b.q.options().dtype(at::kFloat));
+                partial = at::empty({grid * splits, 16, partial_row_floats(hd)}, b.q.options().dtype(at::kFloat));
             }
             launch_dependent(
                 kernel,
                 static_cast<int>(grid * splits),
-                NWARPS * 32,
+                nwarps * 32,
                 smem,
                 stream,
                 params,
@@ -843,14 +843,14 @@ void launch_indexed_tc(
 
 void launch_indexed_scalar(const attn::paged_attn_batch& b, const block_selection& selection, cudaStream_t stream) {
     const int64_t blocks = b.total_q * b.n_q_heads;
-    const size_t smem = static_cast<size_t>(2 * b.head_dim + attn::kThreads) * sizeof(float);
+    const size_t smem = static_cast<size_t>(2 * b.head_dim + attn::cta_threads) * sizeof(float);
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, b.q.scalar_type(), "attn_indexed_scalar", [&] {
         attn::dispatch_page_size("attn_indexed", b.page_size, [&](auto page_size_tag) {
-            constexpr int PS = decltype(page_size_tag)::value;
+            constexpr int ps = decltype(page_size_tag)::value;
             launch_dependent(
-                attn_indexed_scalar_kernel<scalar_t, PS>,
+                attn_indexed_scalar_kernel<scalar_t, ps>,
                 static_cast<int>(blocks),
-                attn::kThreads,
+                attn::cta_threads,
                 smem,
                 stream,
                 b.params<scalar_t>(),
@@ -876,9 +876,9 @@ at::Tensor attn_indexed(
         "attn_indexed: block_size must be at least 1 and divide the page size"
     );
     TORCH_CHECK(
-        max_selected_blocks >= 1 && max_selected_blocks <= kMaxListedBlocks,
+        max_selected_blocks >= 1 && max_selected_blocks <= max_listed_blocks,
         "attn_indexed: max_selected_blocks must be between 1 and ",
-        kMaxListedBlocks
+        max_listed_blocks
     );
     TORCH_CHECK(
         selected.is_cuda() && selected.scalar_type() == at::kInt && selected.dim() == 2 &&

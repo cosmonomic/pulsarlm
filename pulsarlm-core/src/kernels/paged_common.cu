@@ -24,7 +24,7 @@ namespace {
 // attends, each running an online softmax over its pages' keys and adding weight times
 // each page's max score into the page's mass_sum; the softmaxes combine with the flash
 // rescale.
-template <typename scalar_t, int PAGE_SIZE> __global__ void attn_scalar_kernel(const paged_attn_params<scalar_t> p) {
+template <typename scalar_t, int page_size> __global__ void attn_scalar_kernel(const paged_attn_params<scalar_t> p) {
     wait_for_prior_kernels();
     allow_next_kernel();
     const int tid = threadIdx.x;
@@ -53,27 +53,27 @@ template <typename scalar_t, int PAGE_SIZE> __global__ void attn_scalar_kernel(c
     const int ctx_len = p.seqlens_k[s];
     const int query_pos = ctx_len - seq_q + (qtok - q0);
     const int first = first_key(p, query_pos);
-    const int first_page = first / PAGE_SIZE;
-    const int last_page = query_pos / PAGE_SIZE;
-    const key_positions layout = sequence_key_positions(p, s, PAGE_SIZE);
+    const int first_page = first / page_size;
+    const int last_page = query_pos / page_size;
+    const key_positions layout = sequence_key_positions(p, s, page_size);
     const int32_t* seq_table = p.page_tables + static_cast<int64_t>(s) * p.max_pages;
     const float weight = p.mass_sum ? p.query_weights[qtok] : 0.0f;
 
-    // Dynamic shared: [ qsh(head_dim) | out_acc(head_dim) | red(kThreads) ]
+    // Dynamic shared: [ qsh(head_dim) | out_acc(head_dim) | red(cta_threads) ]
     extern __shared__ float smem[];
     float* qsh = smem;
     float* out_acc = qsh + head_dim;
     float* red = out_acc + head_dim;
 
     const scalar_t* qrow = p.q + (static_cast<int64_t>(qtok) * p.n_q_heads + h) * head_dim;
-    for (int d = tid; d < head_dim; d += kThreads) {
+    for (int d = tid; d < head_dim; d += cta_threads) {
         qsh[d] = static_cast<float>(qrow[d]);
     }
     __syncthreads();
 
     auto key_offset = [&](int j) {
-        const int line = seq_table[j / PAGE_SIZE];
-        return static_cast<int64_t>(line) * p.page_stride + (j % PAGE_SIZE) * p.token_stride + g * p.head_stride;
+        const int line = seq_table[j / page_size];
+        return static_cast<int64_t>(line) * p.page_stride + (j % page_size) * p.token_stride + g * p.head_stride;
     };
     auto score = [&](int j, int64_t offset) {
         const scalar_t* krow = p.k_pool + offset;
@@ -91,14 +91,14 @@ template <typename scalar_t, int PAGE_SIZE> __global__ void attn_scalar_kernel(c
 
     float m = -CUDART_INF_F;
     float l = 0.0f;
-    float acc[kMaxHeadDim];
+    float acc[max_head_dim];
     for (int d = 0; d < head_dim; ++d) {
         acc[d] = 0.0f;
     }
-    for (int page = first_page + tid; page <= last_page; page += kThreads) {
+    for (int page = first_page + tid; page <= last_page; page += cta_threads) {
         float page_max = -CUDART_INF_F;
-        const int end = min((page + 1) * PAGE_SIZE, query_pos + 1);
-        for (int j = max(page * PAGE_SIZE, first); j < end; ++j) {
+        const int end = min((page + 1) * page_size, query_pos + 1);
+        for (int j = max(page * page_size, first); j < end; ++j) {
             const int64_t offset = key_offset(j);
             const float sc = score(j, offset);
             const float new_m = fmaxf(m, sc);
@@ -121,20 +121,20 @@ template <typename scalar_t, int PAGE_SIZE> __global__ void attn_scalar_kernel(c
         }
     }
 
-    const float M = block_reduce_max<kThreads>(red, tid, m);
-    const float w = __expf(m - M);  // 0 when this thread saw no keys
-    for (int d = tid; d < head_dim; d += kThreads) {
+    const float block_max = block_reduce_max<cta_threads>(red, tid, m);
+    const float w = __expf(m - block_max);  // 0 when this thread saw no keys
+    for (int d = tid; d < head_dim; d += cta_threads) {
         out_acc[d] = 0.0f;
     }
     __syncthreads();
     for (int d = 0; d < head_dim; ++d) {
         atomicAdd(&out_acc[d], acc[d] * w);
     }
-    const float denom = block_reduce_sum<kThreads>(red, tid, l * w);
+    const float denom = block_reduce_sum<cta_threads>(red, tid, l * w);
 
     scalar_t* orow = p.o + (static_cast<int64_t>(qtok) * p.n_q_heads + h) * head_dim;
     const float inv_denom = 1.0f / denom;
-    for (int d = tid; d < head_dim; d += kThreads) {
+    for (int d = tid; d < head_dim; d += cta_threads) {
         orow[d] = static_cast<scalar_t>(out_acc[d] * inv_denom);
     }
 }
@@ -258,7 +258,7 @@ paged_attn_batch make_paged_attn_batch(
     b.sliding_window = sliding_window.value_or(0);
 
     TORCH_CHECK(k_pool.size(3) == b.head_dim, op, ": pool head_dim must match q");
-    TORCH_CHECK(b.head_dim % 2 == 0 && b.head_dim <= kMaxHeadDim, op, ": head_dim must be even and <= ", kMaxHeadDim);
+    TORCH_CHECK(b.head_dim % 2 == 0 && b.head_dim <= max_head_dim, op, ": head_dim must be even and <= ", max_head_dim);
     TORCH_CHECK(
         b.n_kv_heads > 0 && b.n_q_heads % b.n_kv_heads == 0,
         op,
@@ -313,14 +313,14 @@ void launch_attn_scalar(const paged_attn_batch& batch, cudaStream_t stream) {
         return;
     }
     const int64_t blocks = batch.total_q * batch.n_q_heads;
-    const size_t smem = static_cast<size_t>(2 * batch.head_dim + kThreads) * sizeof(float);
+    const size_t smem = static_cast<size_t>(2 * batch.head_dim + cta_threads) * sizeof(float);
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, batch.q.scalar_type(), "attn_scalar", [&] {
         dispatch_page_size("attn_scalar", batch.page_size, [&](auto page_size_tag) {
-            constexpr int PS = decltype(page_size_tag)::value;
+            constexpr int ps = decltype(page_size_tag)::value;
             launch_dependent(
-                attn_scalar_kernel<scalar_t, PS>,
+                attn_scalar_kernel<scalar_t, ps>,
                 static_cast<int>(blocks),
-                kThreads,
+                cta_threads,
                 smem,
                 stream,
                 batch.params<scalar_t>()

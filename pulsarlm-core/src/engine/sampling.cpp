@@ -17,12 +17,12 @@ namespace pulsarlm {
 
 namespace {
 
-template <typename T> at::Tensor rows_on_device(const std::vector<T>& values, at::ScalarType dtype, at::Device device) {
+template <typename value_type> at::Tensor rows_on_device(const std::vector<value_type>& values, at::ScalarType dtype, at::Device device) {
     at::Tensor pinned = at::empty(
         {static_cast<std::int64_t>(values.size())},
         at::TensorOptions().dtype(dtype).pinned_memory(true)
     );
-    std::ranges::copy(values, static_cast<T*>(pinned.data_ptr()));
+    std::ranges::copy(values, static_cast<value_type*>(pinned.data_ptr()));
     return pinned.to(device, /*non_blocking=*/true);
 }
 

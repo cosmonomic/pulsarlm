@@ -10,7 +10,7 @@
 namespace pulsarlm {
 namespace {
 
-constexpr int kCopyThreads = 256;
+constexpr int copy_threads = 256;
 
 struct segment {
     int64_t device_offset;
@@ -28,11 +28,11 @@ __device__ __forceinline__ void copy_bytes(const unsigned char* from, unsigned c
     if (vectors) {
         const auto* from_vectors = reinterpret_cast<const uint4*>(from);
         auto* to_vectors = reinterpret_cast<uint4*>(to);
-        for (int64_t i = threadIdx.x; i < bytes / 16; i += kCopyThreads) {
+        for (int64_t i = threadIdx.x; i < bytes / 16; i += copy_threads) {
             to_vectors[i] = from_vectors[i];
         }
     } else {
-        for (int64_t i = threadIdx.x; i < bytes; i += kCopyThreads) {
+        for (int64_t i = threadIdx.x; i < bytes; i += copy_threads) {
             to[i] = from[i];
         }
     }
@@ -89,7 +89,7 @@ void copy_segments_to_host_cuda(const at::Tensor& device, const at::Tensor& host
     launch_dependent(
         copy_segments_to_host_kernel,
         blocks,
-        kCopyThreads,
+        copy_threads,
         0,
         at::cuda::getCurrentCUDAStream(),
         device.data_ptr<unsigned char>(),
@@ -108,7 +108,7 @@ void copy_segments_from_host_cuda(const at::Tensor& device, const at::Tensor& ho
     launch_dependent(
         copy_segments_from_host_kernel,
         blocks,
-        kCopyThreads,
+        copy_threads,
         0,
         at::cuda::getCurrentCUDAStream(),
         device.data_ptr<unsigned char>(),

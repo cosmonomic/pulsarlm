@@ -30,9 +30,9 @@ __device__ __forceinline__ void ldmatrix_x4_trans(uint32_t r[4], const void* p) 
                  : "r"(a));
 }
 
-// D[16x8] = A[16x16] * B[8x16]^col + C[16x8], fp32 accumulate. BF16 selects the
+// D[16x8] = A[16x16] * B[8x16]^col + C[16x8], fp32 accumulate. bf16 selects the
 // bf16 operand form; false selects fp16. A is 4 regs (.row), B is 2 regs (.col).
-template <bool BF16>
+template <bool bf16>
 __device__ __forceinline__ void mma_m16n8k16(float d[4], const uint32_t a[4], const uint32_t b[2], const float c[4]);
 template <>
 __device__ __forceinline__ void

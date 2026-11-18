@@ -21,19 +21,19 @@
 namespace pulsarlm {
 namespace {
 
-constexpr int kSortThreads = 1024;
-constexpr int kSortWarps = kSortThreads / 32;
-constexpr int64_t kMaxExperts = 4096;
-constexpr int64_t kMaxTopK = 64;
-constexpr int kTileRows = 16;
-constexpr int kTileWeightRows = 64;
-constexpr int kChunkK = 64;
-constexpr int kChunkVectors = kChunkK / 8;
-constexpr int kStages = 3;
-constexpr int kGemmThreads = 128;
-constexpr int kElementThreads = 256;
+constexpr int sort_threads = 1024;
+constexpr int sort_warps = sort_threads / 32;
+constexpr int64_t max_experts = 4096;
+constexpr int64_t max_top_k = 64;
+constexpr int max_tile_rows = 16;
+constexpr int tile_weight_rows = 64;
+constexpr int chunk_k = 64;
+constexpr int chunk_vectors = chunk_k / 8;
+constexpr int stages = 3;
+constexpr int gemm_threads = 128;
+constexpr int element_threads = 256;
 // The gated product splits k until its grid reaches this many CTAs per SM.
-constexpr int64_t kSplitTargetPerSm = 2;
+constexpr int64_t split_target_per_sm = 2;
 
 template <typename scalar_t> __device__ __forceinline__ float rounded(float value) {
     return static_cast<float>(static_cast<scalar_t>(value));
@@ -44,10 +44,10 @@ __device__ __forceinline__ float activated(float x, expert_activation activation
     if (activation == expert_activation::silu) {
         return x / (1.0f + expf(-x));
     }
-    constexpr float kBeta = M_SQRT2 * M_2_SQRTPI * 0.5f;
-    constexpr float kKappa = 0.044715f;
+    constexpr float beta = M_SQRT2 * M_2_SQRTPI * 0.5f;
+    constexpr float kappa = 0.044715f;
     const float cube = x * x * x;
-    return 0.5f * x * (1.0f + tanhf(kBeta * (x + kKappa * cube)));
+    return 0.5f * x * (1.0f + tanhf(beta * (x + kappa * cube)));
 }
 
 __device__ void warp_argmax(float& value, int& index) {
@@ -63,8 +63,8 @@ __device__ void warp_argmax(float& value, int& index) {
 
 // The CTA's maximum of value, the lowest index among equal values; every thread receives it.
 __device__ void block_argmax(float& value, int& index) {
-    __shared__ float values[kSortWarps];
-    __shared__ int indices[kSortWarps];
+    __shared__ float values[sort_warps];
+    __shared__ int indices[sort_warps];
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
     warp_argmax(value, index);
@@ -73,14 +73,14 @@ __device__ void block_argmax(float& value, int& index) {
         indices[warp] = index;
     }
     __syncthreads();
-    value = lane < kSortWarps ? values[lane] : -INFINITY;
-    index = lane < kSortWarps ? indices[lane] : INT_MAX;
+    value = lane < sort_warps ? values[lane] : -INFINITY;
+    index = lane < sort_warps ? indices[lane] : INT_MAX;
     warp_argmax(value, index);
     __syncthreads();
 }
 
 __device__ float block_sum(float value) {
-    __shared__ float values[kSortWarps];
+    __shared__ float values[sort_warps];
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -90,7 +90,7 @@ __device__ float block_sum(float value) {
         values[warp] = value;
     }
     __syncthreads();
-    value = lane < kSortWarps ? values[lane] : 0.0f;
+    value = lane < sort_warps ? values[lane] : 0.0f;
     for (int offset = 16; offset > 0; offset >>= 1) {
         value += __shfl_xor_sync(0xffffffffu, value, offset);
     }
@@ -110,22 +110,22 @@ __device__ void route_token(
     float* __restrict__ weights,
     int64_t* chosen
 ) {
-    __shared__ float top[kMaxTopK];
+    __shared__ float top[max_top_k];
     float max_logit = -INFINITY;
     int unused = 0;
-    for (int e = threadIdx.x; e < experts; e += kSortThreads) {
+    for (int e = threadIdx.x; e < experts; e += sort_threads) {
         max_logit = fmaxf(max_logit, static_cast<float>(row[e]));
     }
     block_argmax(max_logit, unused);
     float local = 0.0f;
-    for (int e = threadIdx.x; e < experts; e += kSortThreads) {
+    for (int e = threadIdx.x; e < experts; e += sort_threads) {
         const float shifted = expf(static_cast<float>(row[e]) - max_logit);
         probabilities[e] = shifted;
         local += shifted;
     }
     const float total = block_sum(local);
     // A NaN probability ranks below every other, as -inf, so that the top k stay among the experts.
-    for (int e = threadIdx.x; e < experts; e += kSortThreads) {
+    for (int e = threadIdx.x; e < experts; e += sort_threads) {
         const float probability = probabilities[e] / total;
         probabilities[e] = isnan(probability) ? -INFINITY : probability;
     }
@@ -134,7 +134,7 @@ __device__ void route_token(
     for (int j = 0; j < k; j++) {
         float best = -INFINITY;
         int best_index = experts;
-        for (int e = threadIdx.x; e < experts; e += kSortThreads) {
+        for (int e = threadIdx.x; e < experts; e += sort_threads) {
             if (probabilities[e] > best || (probabilities[e] == best && e < best_index)) {
                 best = probabilities[e];
                 best_index = e;
@@ -162,7 +162,7 @@ __device__ void route_token(
 // Run by one CTA, over the assignments to the held experts [first_expert, first_expert + experts), numbered from 0
 // here. position_of[a] is the row of assignment a among them sorted by expert, -1 for an assignment to another expert;
 // sorted_token and sorted_expert are the token and held expert of each row, sorted_expert -1 for the rows past them;
-// tiles [3, max_tiles] holds each tile's held expert, first row and rows, at most kTileRows rows of one expert. The
+// tiles [3, max_tiles] holds each tile's held expert, first row and rows, at most max_tile_rows rows of one expert. The
 // tiles past the experts' have no rows. The rows of one expert are in no fixed order. expert_counters holds 2 *
 // experts entries.
 __device__ void sort_assignments(
@@ -183,15 +183,15 @@ __device__ void sort_assignments(
     int32_t* tile_rows = tiles + 2 * max_tiles;
     int32_t* counts = expert_counters;
     int32_t* cursors = expert_counters + experts;
-    __shared__ int32_t segment_rows[kSortThreads];
-    __shared__ int32_t segment_tiles[kSortThreads];
+    __shared__ int32_t segment_rows[sort_threads];
+    __shared__ int32_t segment_tiles[sort_threads];
     const int tid = threadIdx.x;
-    for (int e = tid; e < experts; e += kSortThreads) {
+    for (int e = tid; e < experts; e += sort_threads) {
         counts[e] = 0;
     }
     __syncthreads();
     auto held = [&](int a) { return static_cast<int>(assigned_experts[a] - first_expert); };
-    for (int a = tid; a < assignments; a += kSortThreads) {
+    for (int a = tid; a < assignments; a += sort_threads) {
         const int e = held(a);
         if (e >= 0 && e < experts) {
             atomicAdd(&counts[e], 1);
@@ -199,19 +199,19 @@ __device__ void sort_assignments(
     }
     __syncthreads();
 
-    const int segment = (experts + kSortThreads - 1) / kSortThreads;
+    const int segment = (experts + sort_threads - 1) / sort_threads;
     const int segment_first = min(tid * segment, experts);
     const int segment_end = min(segment_first + segment, experts);
     int rows = 0;
     int tile_count = 0;
     for (int e = segment_first; e < segment_end; e++) {
         rows += counts[e];
-        tile_count += (counts[e] + kTileRows - 1) / kTileRows;
+        tile_count += (counts[e] + max_tile_rows - 1) / max_tile_rows;
     }
     segment_rows[tid] = rows;
     segment_tiles[tid] = tile_count;
     __syncthreads();
-    for (int offset = 1; offset < kSortThreads; offset <<= 1) {
+    for (int offset = 1; offset < sort_threads; offset <<= 1) {
         const int earlier_rows = tid >= offset ? segment_rows[tid - offset] : 0;
         const int earlier_tiles = tid >= offset ? segment_tiles[tid - offset] : 0;
         __syncthreads();
@@ -223,25 +223,25 @@ __device__ void sort_assignments(
     int tile = segment_tiles[tid] - tile_count;
     for (int e = segment_first; e < segment_end; e++) {
         cursors[e] = row;
-        for (int first = 0; first < counts[e]; first += kTileRows) {
+        for (int first = 0; first < counts[e]; first += max_tile_rows) {
             tile_expert[tile] = e;
             tile_first_row[tile] = row + first;
-            tile_rows[tile] = min(kTileRows, counts[e] - first);
+            tile_rows[tile] = min(max_tile_rows, counts[e] - first);
             tile++;
         }
         row += counts[e];
     }
-    for (int t = segment_tiles[kSortThreads - 1] + tid; t < max_tiles; t += kSortThreads) {
+    for (int t = segment_tiles[sort_threads - 1] + tid; t < max_tiles; t += sort_threads) {
         tile_expert[t] = 0;
         tile_first_row[t] = 0;
         tile_rows[t] = 0;
     }
-    for (int r = segment_rows[kSortThreads - 1] + tid; r < assignments; r += kSortThreads) {
+    for (int r = segment_rows[sort_threads - 1] + tid; r < assignments; r += sort_threads) {
         sorted_token[r] = 0;
         sorted_expert[r] = -1;
     }
     __syncthreads();
-    for (int a = tid; a < assignments; a += kSortThreads) {
+    for (int a = tid; a < assignments; a += sort_threads) {
         const int e = held(a);
         if (e < 0 || e >= experts) {
             position_of[a] = -1;
@@ -255,7 +255,7 @@ __device__ void sort_assignments(
 }
 
 // One CTA, sort_assignments of the assignments top_experts [tokens, top_k] holds.
-__global__ void __launch_bounds__(kSortThreads) sort_assignments_kernel(
+__global__ void __launch_bounds__(sort_threads) sort_assignments_kernel(
     const int64_t* __restrict__ top_experts,
     int assignments,
     int top_k,
@@ -288,7 +288,7 @@ __global__ void __launch_bounds__(kSortThreads) sort_assignments_kernel(
 // assignments to the held experts [first_expert, first_expert + held_experts) in the last CTA to finish, found through
 // arrivals.
 template <typename scalar_t>
-__global__ void __launch_bounds__(kSortThreads) route_and_sort_kernel(
+__global__ void __launch_bounds__(sort_threads) route_and_sort_kernel(
     const scalar_t* __restrict__ logits,
     int64_t logits_row_stride,
     int experts,
@@ -332,13 +332,13 @@ __global__ void __launch_bounds__(kSortThreads) route_and_sort_kernel(
     }
 }
 
-// The element offset of 8-element vector index vector of row row in a staged tile of kChunkK columns, permuted so that
+// The element offset of 8-element vector index vector of row row in a staged tile of chunk_k columns, permuted so that
 // the 8 rows an ldmatrix quadrant reads fall in distinct banks.
 __device__ __forceinline__ int staged_offset(int row, int vector) {
-    return row * kChunkK + ((vector ^ (row & 7)) * 8);
+    return row * chunk_k + ((vector ^ (row & 7)) * 8);
 }
 
-// Multiplies the tile's rows of x by kTileWeightRows weight rows of the tile's expert over k, one CTA per (tile of
+// Multiplies the tile's rows of x by tile_weight_rows weight rows of the tile's expert over k, one CTA per (tile of
 // sort_assignments_kernel's tiles, block of weight rows). With gated, the block is the gate rows [n0, n0 + 32) and the
 // up rows [n + n0, n + n0 + 32), x's rows are those of the tile's sorted tokens, and out [rows, n] holds
 // activation(gate) * up. Otherwise the block is the rows [n0, n0 + 64), x's rows are the tile's rows, and out
@@ -347,7 +347,7 @@ __device__ __forceinline__ int staged_offset(int row, int vector) {
 // block to finish, found through block_counters [gridDim.x * gridDim.y], sums the splits in split order and writes
 // out.
 template <typename scalar_t, bool bf16, bool gated>
-__global__ void __launch_bounds__(kGemmThreads) expert_tile_gemm_kernel(
+__global__ void __launch_bounds__(gemm_threads) expert_tile_gemm_kernel(
     const scalar_t* __restrict__ x,
     int64_t x_row_stride,
     const int32_t* __restrict__ sorted_token,
@@ -372,28 +372,28 @@ __global__ void __launch_bounds__(kGemmThreads) expert_tile_gemm_kernel(
     }
     const int first_row = tiles[gridDim.x + blockIdx.x];
     const scalar_t* expert_weights = weights + static_cast<int64_t>(tiles[blockIdx.x]) * expert_stride;
-    constexpr int kBlockColumns = gated ? kTileWeightRows / 2 : kTileWeightRows;
-    const int n0 = static_cast<int>(blockIdx.y) * kBlockColumns;
+    constexpr int block_columns = gated ? tile_weight_rows / 2 : tile_weight_rows;
+    const int n0 = static_cast<int>(blockIdx.y) * block_columns;
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
 
-    __shared__ __align__(16) scalar_t staged_x[kStages][kTileRows * kChunkK];
-    __shared__ __align__(16) scalar_t staged_weights[kStages][kTileWeightRows * kChunkK];
+    __shared__ __align__(16) scalar_t staged_x[stages][max_tile_rows * chunk_k];
+    __shared__ __align__(16) scalar_t staged_weights[stages][tile_weight_rows * chunk_k];
 
-    const int x_row = tid / kChunkVectors;
-    const int x_vector = tid % kChunkVectors;
+    const int x_row = tid / chunk_vectors;
+    const int x_vector = tid % chunk_vectors;
     const scalar_t* x_source = x;
     if (x_row < rows) {
         const int64_t source_row = gated ? sorted_token[first_row + x_row] : first_row + x_row;
         x_source = x + source_row * x_row_stride;
     }
-    constexpr int kWeightVectorsPerThread = kTileWeightRows * kChunkVectors / kGemmThreads;
-    const scalar_t* weight_sources[kWeightVectorsPerThread];
-    bool weight_valid[kWeightVectorsPerThread];
+    constexpr int weight_vectors_per_thread = tile_weight_rows * chunk_vectors / gemm_threads;
+    const scalar_t* weight_sources[weight_vectors_per_thread];
+    bool weight_valid[weight_vectors_per_thread];
 #pragma unroll
-    for (int i = 0; i < kWeightVectorsPerThread; i++) {
-        const int row = (tid + i * kGemmThreads) / kChunkVectors;
+    for (int i = 0; i < weight_vectors_per_thread; i++) {
+        const int row = (tid + i * gemm_threads) / chunk_vectors;
         int column;
         int64_t weight_row;
         if constexpr (gated) {
@@ -408,7 +408,7 @@ __global__ void __launch_bounds__(kGemmThreads) expert_tile_gemm_kernel(
     }
 
     auto stage = [&](int slot, int chunk) {
-        const int k0 = chunk * kChunkK;
+        const int k0 = chunk * chunk_k;
         const int x_column = k0 + x_vector * 8;
         const bool x_valid = x_row < rows && x_column < k;
         __pipeline_memcpy_async(
@@ -418,10 +418,10 @@ __global__ void __launch_bounds__(kGemmThreads) expert_tile_gemm_kernel(
             x_valid ? 0 : 16
         );
 #pragma unroll
-        for (int i = 0; i < kWeightVectorsPerThread; i++) {
-            const int index = tid + i * kGemmThreads;
-            const int row = index / kChunkVectors;
-            const int vector = index % kChunkVectors;
+        for (int i = 0; i < weight_vectors_per_thread; i++) {
+            const int index = tid + i * gemm_threads;
+            const int row = index / chunk_vectors;
+            const int vector = index % chunk_vectors;
             const int column = k0 + vector * 8;
             const bool valid = weight_valid[i] && column < k;
             __pipeline_memcpy_async(
@@ -436,25 +436,25 @@ __global__ void __launch_bounds__(kGemmThreads) expert_tile_gemm_kernel(
     float first_fragment[4] = {};
     float second_fragment[4] = {};
     const int first_chunk = static_cast<int>(blockIdx.z) * chunks_per_split;
-    const int chunks = min((k + kChunkK - 1) / kChunkK - first_chunk, chunks_per_split);
-    for (int chunk = 0; chunk < kStages - 1; chunk++) {
+    const int chunks = min((k + chunk_k - 1) / chunk_k - first_chunk, chunks_per_split);
+    for (int chunk = 0; chunk < stages - 1; chunk++) {
         if (chunk < chunks) {
             stage(chunk, first_chunk + chunk);
         }
         __pipeline_commit();
     }
     for (int chunk = 0; chunk < chunks; chunk++) {
-        __pipeline_wait_prior(kStages - 2);
+        __pipeline_wait_prior(stages - 2);
         __syncthreads();
-        const int next = chunk + kStages - 1;
+        const int next = chunk + stages - 1;
         if (next < chunks) {
-            stage(next % kStages, first_chunk + next);
+            stage(next % stages, first_chunk + next);
         }
         __pipeline_commit();
-        const scalar_t* x_tile = staged_x[chunk % kStages];
-        const scalar_t* weight_tile = staged_weights[chunk % kStages];
+        const scalar_t* x_tile = staged_x[chunk % stages];
+        const scalar_t* weight_tile = staged_weights[chunk % stages];
 #pragma unroll
-        for (int step = 0; step < kChunkK / 16; step++) {
+        for (int step = 0; step < chunk_k / 16; step++) {
             const int vector = 2 * step + lane / 16;
             uint32_t a[4];
             uint32_t b[4];
@@ -501,9 +501,9 @@ __global__ void __launch_bounds__(kGemmThreads) expert_tile_gemm_kernel(
             !last_to_arrive(block_counters + blockIdx.x * gridDim.y + blockIdx.y, static_cast<int>(gridDim.z))) {
             return;
         }
-        for (int index = tid; index < rows * kBlockColumns; index += kGemmThreads) {
-            const int64_t row = first_row + index / kBlockColumns;
-            const int column = n0 + index % kBlockColumns;
+        for (int index = tid; index < rows * block_columns; index += gemm_threads) {
+            const int64_t row = first_row + index / block_columns;
+            const int column = n0 + index % block_columns;
             if (column >= n) {
                 continue;
             }
@@ -594,23 +594,23 @@ __global__ void combine_experts_kernel(
 }
 
 unsigned element_blocks(int64_t elements) {
-    return static_cast<unsigned>((elements + kElementThreads - 1) / kElementThreads);
+    return static_cast<unsigned>((elements + element_threads - 1) / element_threads);
 }
 
 int64_t max_tiles_of(int64_t assignments, int64_t experts) {
-    return std::min(assignments, assignments / kTileRows + std::min(experts, assignments));
+    return std::min(assignments, assignments / max_tile_rows + std::min(experts, assignments));
 }
 
 int64_t gate_up_column_blocks(int64_t intermediate) {
-    return (intermediate + kTileWeightRows / 2 - 1) / (kTileWeightRows / 2);
+    return (intermediate + tile_weight_rows / 2 - 1) / (tile_weight_rows / 2);
 }
 
 // The splits the gated product takes along k, and the chunks of k each covers.
 std::pair<int64_t, int64_t> gate_up_splits(int64_t max_tiles, int64_t intermediate, int64_t hidden) {
     const int64_t gate_up_blocks = max_tiles * gate_up_column_blocks(intermediate);
-    const int64_t chunks = (hidden + kChunkK - 1) / kChunkK;
+    const int64_t chunks = (hidden + chunk_k - 1) / chunk_k;
     const int64_t sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-    const int64_t splits = std::clamp<int64_t>(kSplitTargetPerSm * sms / gate_up_blocks, 1, chunks);
+    const int64_t splits = std::clamp<int64_t>(split_target_per_sm * sms / gate_up_blocks, 1, chunks);
     const int64_t chunks_per_split = (chunks + splits - 1) / splits;
     return {(chunks + chunks_per_split - 1) / chunks_per_split, chunks_per_split};
 }
@@ -632,7 +632,7 @@ void launch_tile_gemms(
     const int64_t intermediate = down_proj.size(2);
     const int64_t assignments = activations.size(0);
     auto stream = at::cuda::getCurrentCUDAStream();
-    const int64_t chunks = (hidden + kChunkK - 1) / kChunkK;
+    const int64_t chunks = (hidden + chunk_k - 1) / chunk_k;
     const auto [used_splits, chunks_per_split] = gate_up_splits(max_tiles, intermediate, hidden);
     at::Tensor partial;
     if (used_splits > 1) {
@@ -646,7 +646,7 @@ void launch_tile_gemms(
     launch_dependent(
         expert_tile_gemm_kernel<scalar_t, bf16, true>,
         gate_up_grid,
-        kGemmThreads,
+        gemm_threads,
         0,
         stream,
         h.const_data_ptr<scalar_t>(),
@@ -668,12 +668,12 @@ void launch_tile_gemms(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     const dim3 down_grid(
         static_cast<unsigned>(max_tiles),
-        static_cast<unsigned>((hidden + kTileWeightRows - 1) / kTileWeightRows)
+        static_cast<unsigned>((hidden + tile_weight_rows - 1) / tile_weight_rows)
     );
     launch_dependent(
         expert_tile_gemm_kernel<scalar_t, bf16, false>,
         down_grid,
-        kGemmThreads,
+        gemm_threads,
         0,
         stream,
         activations.const_data_ptr<scalar_t>(),
@@ -687,7 +687,7 @@ void launch_tile_gemms(
         tiles,
         activation,
         expert_out.mutable_data_ptr<scalar_t>(),
-        static_cast<int>((intermediate + kChunkK - 1) / kChunkK),
+        static_cast<int>((intermediate + chunk_k - 1) / chunk_k),
         nullptr,
         assignments,
         nullptr
@@ -723,7 +723,7 @@ void check_experts(const at::Tensor& h, const at::Tensor& gate_up_proj, const at
         "intermediate], each row contiguous, in h's dtype on h's device"
     );
     const int64_t experts = gate_up_proj.size(0);
-    TORCH_CHECK(experts >= 1 && experts <= kMaxExperts, "routed_experts: experts must be between 1 and ", kMaxExperts);
+    TORCH_CHECK(experts >= 1 && experts <= max_experts, "routed_experts: experts must be between 1 and ", max_experts);
 }
 
 // The routed experts' output for top_k assignments per token of h. sort(position_of, sorted_token, sorted_expert,
@@ -749,7 +749,7 @@ at::Tensor run_experts(
     if (assignments == 0) {
         return out.zero_();
     }
-    TORCH_CHECK(assignments <= std::numeric_limits<int32_t>::max() / kTileRows, "routed_experts: too many assignments");
+    TORCH_CHECK(assignments <= std::numeric_limits<int32_t>::max() / max_tile_rows, "routed_experts: too many assignments");
 
     const int64_t max_tiles = max_tiles_of(assignments, experts);
     at::Tensor indices = at::empty({3 * assignments + 3 * max_tiles}, h.options().dtype(at::kInt));
@@ -766,7 +766,7 @@ at::Tensor run_experts(
         launch_dependent(
             expert_rows_scalar_kernel<true>,
             element_blocks(assignments * intermediate),
-            kElementThreads,
+            element_threads,
             0,
             stream,
             h.const_data_ptr<float>(),
@@ -786,7 +786,7 @@ at::Tensor run_experts(
         launch_dependent(
             expert_rows_scalar_kernel<false>,
             element_blocks(assignments * hidden),
-            kElementThreads,
+            element_threads,
             0,
             stream,
             activations.const_data_ptr<float>(),
@@ -847,7 +847,7 @@ at::Tensor run_experts(
         launch_dependent(
             combine_experts_kernel<scalar_t>,
             element_blocks(tokens * hidden),
-            kElementThreads,
+            element_threads,
             0,
             stream,
             expert_out.const_data_ptr<scalar_t>(),
@@ -903,7 +903,7 @@ at::Tensor routed_experts_cuda(
             launch_dependent(
                 sort_assignments_kernel,
                 1,
-                kSortThreads,
+                sort_threads,
                 2 * experts * sizeof(int32_t),
                 at::cuda::getCurrentCUDAStream(),
                 top_experts.const_data_ptr<int64_t>(),
@@ -942,15 +942,15 @@ at::Tensor routed_experts_cuda(
     );
     const int64_t experts = router_logits.size(1);
     TORCH_CHECK(
-        experts <= kMaxExperts && first_expert >= 0 && first_expert + held_experts <= experts,
+        experts <= max_experts && first_expert >= 0 && first_expert + held_experts <= experts,
         "routed_experts: the held experts [first_expert, first_expert + gate_up_proj.size(0)) must lie within the "
         "router's experts, at most ",
-        kMaxExperts
+        max_experts
     );
     TORCH_CHECK(
-        top_k >= 1 && top_k <= experts && top_k <= kMaxTopK,
+        top_k >= 1 && top_k <= experts && top_k <= max_top_k,
         "routed_experts: top_k must be between 1 and the experts, at most ",
-        kMaxTopK
+        max_top_k
     );
     at::Tensor top_weights = at::empty({tokens, top_k}, h.options().dtype(at::kFloat));
     at::Tensor top_experts = at::empty({tokens, top_k}, h.options().dtype(at::kLong));
@@ -965,7 +965,7 @@ at::Tensor routed_experts_cuda(
                     launch_dependent(
                         route_and_sort_kernel<scalar_t>,
                         static_cast<unsigned>(tokens),
-                        kSortThreads,
+                        sort_threads,
                         std::max(experts, 2 * held_experts) * sizeof(int32_t),
                         at::cuda::getCurrentCUDAStream(),
                         router_logits.const_data_ptr<scalar_t>(),

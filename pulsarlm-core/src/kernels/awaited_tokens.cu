@@ -10,7 +10,7 @@
 namespace pulsarlm {
 namespace {
 
-constexpr int kThreads = 128;
+constexpr int cta_threads = 128;
 
 __global__ void
 fill_awaited_tokens_kernel(int64_t* __restrict__ tokens, int64_t rows, const int64_t* __restrict__ samples) {
@@ -40,8 +40,8 @@ void fill_awaited_tokens_cuda(const at::Tensor& tokens, const at::Tensor& sample
     }
     launch_dependent(
         fill_awaited_tokens_kernel,
-        static_cast<unsigned>((rows + kThreads - 1) / kThreads),
-        kThreads,
+        static_cast<unsigned>((rows + cta_threads - 1) / cta_threads),
+        cta_threads,
         0,
         at::cuda::getCurrentCUDAStream(),
         tokens.mutable_data_ptr<int64_t>(),

@@ -22,11 +22,11 @@
 //     contraction for keys 0-7 is regs {kf0,kf2}, keys 8-15 is {kf1,kf3}.
 //   * PV: A=P (non-trans), B=V loaded ldmatrix.trans (V stored [key][dim]); the
 //     dim N-slice 0-7 is regs {vb0,vb1}, dim 8-15 is {vb2,vb3}.
-//   * All ldmatrix row addresses are 8-element (16-byte) aligned: HEAD_DIM and
-//     KEY_TILE are multiples of 16, the col base is 0 or 8, and the caller's
+//   * All ldmatrix row addresses are 8-element (16-byte) aligned: head_dim and
+//     key_tile are multiples of 16, the col base is 0 or 8, and the caller's
 //     tiles are declared __align__(16).
 //
-// KEY_TILE is the key-tile width in keys. Decode streams one page per tile, so
+// key_tile is the key-tile width in keys. Decode streams one page per tile, so
 // there it equals the page size; prefill may stream several pages per tile.
 
 namespace pulsarlm {
@@ -50,168 +50,168 @@ __device__ __forceinline__ void cp_async_commit() {
     asm volatile("cp.async.commit_group;\n" ::);
 }
 
-template <int N> __device__ __forceinline__ void cp_async_wait() {
-    asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+template <int n> __device__ __forceinline__ void cp_async_wait() {
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(n));
 }
 
-// Bank-conflict-free column permutation for a shared tile of ROW_ELEMS 2-byte
-// elements per row. A row is ROW_ELEMS/8 chunks of 16 bytes and an ldmatrix
+// Bank-conflict-free column permutation for a shared tile of row_elems 2-byte
+// elements per row. A row is row_elems/8 chunks of 16 bytes and an ldmatrix
 // quadrant addresses 8 rows at one chunk index; with a plain row-major layout
 // every row of the tile starts on the same bank and all 8 addresses collide.
 // XOR-ing the chunk index with the row's low 3 bits sends them to 8 different
 // chunk slots of the same 128-byte bank period. Both the staging store and the
-// ldmatrix load must apply it. ROW_ELEMS must be a multiple of 64 so the
+// ldmatrix load must apply it. row_elems must be a multiple of 64 so the
 // permuted chunk stays inside the row.
-template <int ROW_ELEMS> __device__ __forceinline__ int swizzled_offset(int row, int col) {
-    static_assert(ROW_ELEMS % 64 == 0, "the swizzle needs at least 8 chunks per row");
-    constexpr int kChunkElems = 8;
-    return row * ROW_ELEMS + ((col / kChunkElems) ^ (row & 7)) * kChunkElems + col % kChunkElems;
+template <int row_elems> __device__ __forceinline__ int swizzled_offset(int row, int col) {
+    static_assert(row_elems % 64 == 0, "the swizzle needs at least 8 chunks per row");
+    constexpr int chunk_elems = 8;
+    return row * row_elems + ((col / chunk_elems) ^ (row & 7)) * chunk_elems + col % chunk_elems;
 }
 
-// Offset of (row, col) in a tile of ROW_ELEMS-element rows, permuted or not.
-template <int ROW_ELEMS, bool SWIZZLE> __device__ __forceinline__ int tile_offset(int row, int col) {
-    if constexpr (SWIZZLE) {
-        return swizzled_offset<ROW_ELEMS>(row, col);
+// Offset of (row, col) in a tile of row_elems-element rows, permuted or not.
+template <int row_elems, bool swizzle> __device__ __forceinline__ int tile_offset(int row, int col) {
+    if constexpr (swizzle) {
+        return swizzled_offset<row_elems>(row, col);
     }
-    return row * ROW_ELEMS + col;
+    return row * row_elems + col;
 }
 
 // QKᵀ over the loaded tile: sS[m][n] = sum_d sQ[m][d] * sK[n][d] (raw, unscaled).
-// The NSUB 8-key n-subtiles are striped across the CTA's warps. SCORE_STRIDE is
+// The nsub 8-key n-subtiles are striped across the CTA's warps. score_stride is
 // sS's row stride: sS is written and read by scalar accesses only, so its rows may
-// be padded past KEY_TILE to spread a per-row sweep over the shared banks. SWIZZLE
+// be padded past key_tile to spread a per-row sweep over the shared banks. swizzle
 // states that the caller staged sQ and sK through swizzled_offset.
-template <typename scalar_t, int KEY_TILE, int HEAD_DIM, bool BF16, int SCORE_STRIDE = KEY_TILE, bool SWIZZLE = false>
+template <typename scalar_t, int key_tile, int head_dim, bool bf16, int score_stride = key_tile, bool swizzle = false>
 __device__ __forceinline__ void tile_qkt(const scalar_t* sQ, const scalar_t* sK, float* sS, int warp, int nwarps) {
-    constexpr int DC = HEAD_DIM / 16;  // d-chunks
-    constexpr int NSUB = KEY_TILE / 8;  // 8-key n-subtiles
+    constexpr int d_chunks = head_dim / 16;  // d-chunks
+    constexpr int nsub = key_tile / 8;  // 8-key n-subtiles
 
     const int lane = threadIdx.x & 31;
     const int gid = lane >> 2, tg = lane & 3;
     const int quad = lane >> 3, rin = lane & 7;
     const int arow = (quad & 1) * 8 + rin, acol = (quad >> 1) * 8;
 
-    for (int ns = warp; ns < NSUB; ns += nwarps) {
+    for (int ns = warp; ns < nsub; ns += nwarps) {
         const int kc = ns >> 1;  // 16-key chunk
         const int within = ns & 1;  // low/high 8 keys of the chunk
         float acc[4] = {0, 0, 0, 0};
 #pragma unroll
-        for (int dc = 0; dc < DC; ++dc) {
+        for (int dc = 0; dc < d_chunks; ++dc) {
             uint32_t ra[4], kf[4];
-            mma::ldmatrix_x4(ra, &sQ[tile_offset<HEAD_DIM, SWIZZLE>(arow, dc * 16 + acol)]);
-            mma::ldmatrix_x4(kf, &sK[tile_offset<HEAD_DIM, SWIZZLE>(kc * 16 + arow, dc * 16 + acol)]);
+            mma::ldmatrix_x4(ra, &sQ[tile_offset<head_dim, swizzle>(arow, dc * 16 + acol)]);
+            mma::ldmatrix_x4(kf, &sK[tile_offset<head_dim, swizzle>(kc * 16 + arow, dc * 16 + acol)]);
             uint32_t b[2] = {within ? kf[1] : kf[0], within ? kf[3] : kf[2]};
-            mma::mma_m16n8k16<BF16>(acc, ra, b, acc);
+            mma::mma_m16n8k16<bf16>(acc, ra, b, acc);
         }
         const int cb = ns * 8;
-        sS[(gid)*SCORE_STRIDE + cb + tg * 2 + 0] = acc[0];
-        sS[(gid)*SCORE_STRIDE + cb + tg * 2 + 1] = acc[1];
-        sS[(gid + 8) * SCORE_STRIDE + cb + tg * 2 + 0] = acc[2];
-        sS[(gid + 8) * SCORE_STRIDE + cb + tg * 2 + 1] = acc[3];
+        sS[(gid)*score_stride + cb + tg * 2 + 0] = acc[0];
+        sS[(gid)*score_stride + cb + tg * 2 + 1] = acc[1];
+        sS[(gid + 8) * score_stride + cb + tg * 2 + 0] = acc[2];
+        sS[(gid + 8) * score_stride + cb + tg * 2 + 1] = acc[3];
     }
 }
 
 // Head-dim ranges tile_qkt_parts splits QKᵀ into: one when the tile's 8-key subtiles
 // cover every warp, else as many as it takes to give each warp a (subtile, range) pair.
-template <int KEY_TILE, int NWARPS> __host__ __device__ constexpr int qkt_parts() {
-    return KEY_TILE / 8 >= NWARPS ? 1 : NWARPS / (KEY_TILE / 8);
+template <int key_tile, int nwarps> __host__ __device__ constexpr int qkt_parts() {
+    return key_tile / 8 >= nwarps ? 1 : nwarps / (key_tile / 8);
 }
 
 // QKᵀ over the loaded tile with every warp busy: sS[part][m][n] = sum over part's
-// range of d of sQ[m][d] * sK[n][d] (raw, unscaled), each part a [16][KEY_TILE] block;
+// range of d of sQ[m][d] * sK[n][d] (raw, unscaled), each part a [16][key_tile] block;
 // the caller sums the parts. sQ and sK are staged through swizzled_offset.
-template <typename scalar_t, int KEY_TILE, int HEAD_DIM, bool BF16, int NWARPS>
+template <typename scalar_t, int key_tile, int head_dim, bool bf16, int nwarps>
 __device__ __forceinline__ void tile_qkt_parts(const scalar_t* sQ, const scalar_t* sK, float* sS, int warp) {
-    constexpr int NSUB = KEY_TILE / 8;
-    constexpr int PARTS = qkt_parts<KEY_TILE, NWARPS>();
-    constexpr int PART_DC = HEAD_DIM / 16 / PARTS;
-    static_assert(PARTS == 1 || NSUB * PARTS == NWARPS, "warps and subtiles must be powers of two");
-    static_assert(PART_DC * PARTS * 16 == HEAD_DIM, "the head dim must split evenly into the parts");
+    constexpr int nsub = key_tile / 8;
+    constexpr int parts = qkt_parts<key_tile, nwarps>();
+    constexpr int part_dc = head_dim / 16 / parts;
+    static_assert(parts == 1 || nsub * parts == nwarps, "warps and subtiles must be powers of two");
+    static_assert(part_dc * parts * 16 == head_dim, "the head dim must split evenly into the parts");
 
     const int lane = threadIdx.x & 31;
     const int gid = lane >> 2, tg = lane & 3;
     const int quad = lane >> 3, rin = lane & 7;
     const int arow = (quad & 1) * 8 + rin, acol = (quad >> 1) * 8;
-    const int part = PARTS == 1 ? 0 : warp / NSUB;
-    float* part_scores = sS + part * 16 * KEY_TILE;
+    const int part = parts == 1 ? 0 : warp / nsub;
+    float* part_scores = sS + part * 16 * key_tile;
 
-    for (int ns = PARTS == 1 ? warp : warp % NSUB; ns < NSUB; ns += PARTS == 1 ? NWARPS : NSUB) {
+    for (int ns = parts == 1 ? warp : warp % nsub; ns < nsub; ns += parts == 1 ? nwarps : nsub) {
         const int kc = ns >> 1;
         const int within = ns & 1;
         float acc[4] = {0, 0, 0, 0};
 #pragma unroll
-        for (int i = 0; i < PART_DC; ++i) {
-            const int dc = part * PART_DC + i;
+        for (int i = 0; i < part_dc; ++i) {
+            const int dc = part * part_dc + i;
             uint32_t ra[4], kf[4];
-            mma::ldmatrix_x4(ra, &sQ[swizzled_offset<HEAD_DIM>(arow, dc * 16 + acol)]);
-            mma::ldmatrix_x4(kf, &sK[swizzled_offset<HEAD_DIM>(kc * 16 + arow, dc * 16 + acol)]);
+            mma::ldmatrix_x4(ra, &sQ[swizzled_offset<head_dim>(arow, dc * 16 + acol)]);
+            mma::ldmatrix_x4(kf, &sK[swizzled_offset<head_dim>(kc * 16 + arow, dc * 16 + acol)]);
             uint32_t b[2] = {within ? kf[1] : kf[0], within ? kf[3] : kf[2]};
-            mma::mma_m16n8k16<BF16>(acc, ra, b, acc);
+            mma::mma_m16n8k16<bf16>(acc, ra, b, acc);
         }
         const int cb = ns * 8;
-        part_scores[gid * KEY_TILE + cb + tg * 2 + 0] = acc[0];
-        part_scores[gid * KEY_TILE + cb + tg * 2 + 1] = acc[1];
-        part_scores[(gid + 8) * KEY_TILE + cb + tg * 2 + 0] = acc[2];
-        part_scores[(gid + 8) * KEY_TILE + cb + tg * 2 + 1] = acc[3];
+        part_scores[gid * key_tile + cb + tg * 2 + 0] = acc[0];
+        part_scores[gid * key_tile + cb + tg * 2 + 1] = acc[1];
+        part_scores[(gid + 8) * key_tile + cb + tg * 2 + 0] = acc[2];
+        part_scores[(gid + 8) * key_tile + cb + tg * 2 + 1] = acc[3];
     }
 }
 
 // PV over the loaded tile with the running output held in registers:
 // out = out * row_rescale[row] + sum_n sP[m][n] * sV[n][d]. Warp w owns dim slabs
-// w, w + NWARPS, ...; `out` holds kPvSlabAccums entries per slab, slabs in
+// w, w + nwarps, ...; `out` holds pv_slab_accums entries per slab, slabs in
 // ascending ds. Entry i of the slab at column base cb = ds*16 is, for gid = lane>>2
 // and tg = lane&3, the (row, col) of the output tile
 //   0:(gid, cb+tg*2)      1:(gid, cb+tg*2+1)
 //   2:(gid+8, cb+tg*2)    3:(gid+8, cb+tg*2+1)
 //   4:(gid, cb+8+tg*2)    5:(gid, cb+8+tg*2+1)
 //   6:(gid+8, cb+8+tg*2)  7:(gid+8, cb+8+tg*2+1)
-// and the caller reads it back with that same mapping. SWIZZLE states that the
+// and the caller reads it back with that same mapping. swizzle states that the
 // caller staged sV through swizzled_offset; sP is built by this kernel's own
-// scalar stores and is never swizzled. NWARPS must be a compile-time constant so
+// scalar stores and is never swizzled. nwarps must be a compile-time constant so
 // the slab loop unrolls and `out` stays in registers.
-constexpr int kPvSlabAccums = 8;
+constexpr int pv_slab_accums = 8;
 
-// Dim slabs one warp of an NWARPS-warp CTA owns in tile_pv_registers.
-template <int HEAD_DIM, int NWARPS> __device__ constexpr int pv_slabs_per_warp() {
-    return (HEAD_DIM / 16 + NWARPS - 1) / NWARPS;
+// Dim slabs one warp of an nwarps-warp CTA owns in tile_pv_registers.
+template <int head_dim, int nwarps> __device__ constexpr int pv_slabs_per_warp() {
+    return (head_dim / 16 + nwarps - 1) / nwarps;
 }
 
-template <typename scalar_t, int KEY_TILE, int HEAD_DIM, bool BF16, int NWARPS, bool SWIZZLE = false>
+template <typename scalar_t, int key_tile, int head_dim, bool bf16, int nwarps, bool swizzle = false>
 __device__ __forceinline__ void
 tile_pv_registers(const scalar_t* sP, const scalar_t* sV, const float* row_rescale, float* out, int warp) {
-    constexpr int KC = KEY_TILE / 16;
-    constexpr int DSLAB = HEAD_DIM / 16;
+    constexpr int k_chunks = key_tile / 16;
+    constexpr int dslab = head_dim / 16;
 
     const int lane = threadIdx.x & 31;
     const int gid = lane >> 2;
     const int quad = lane >> 3, rin = lane & 7;
     const int arow = (quad & 1) * 8 + rin, acol = (quad >> 1) * 8;
 
-    uint32_t pa[KC][4];
+    uint32_t pa[k_chunks][4];
 #pragma unroll
-    for (int kc = 0; kc < KC; ++kc) {
-        mma::ldmatrix_x4(pa[kc], &sP[arow * KEY_TILE + kc * 16 + acol]);
+    for (int kc = 0; kc < k_chunks; ++kc) {
+        mma::ldmatrix_x4(pa[kc], &sP[arow * key_tile + kc * 16 + acol]);
     }
 
     const float rescale_low = row_rescale[gid], rescale_high = row_rescale[gid + 8];
 
 #pragma unroll
-    for (int slab = 0; slab < pv_slabs_per_warp<HEAD_DIM, NWARPS>(); ++slab) {
-        const int ds = warp + slab * NWARPS;
-        if (ds >= DSLAB) {
+    for (int slab = 0; slab < pv_slabs_per_warp<head_dim, nwarps>(); ++slab) {
+        const int ds = warp + slab * nwarps;
+        if (ds >= dslab) {
             break;
         }
         float of0[4] = {0, 0, 0, 0}, of1[4] = {0, 0, 0, 0};
 #pragma unroll
-        for (int kc = 0; kc < KC; ++kc) {
+        for (int kc = 0; kc < k_chunks; ++kc) {
             uint32_t vb[4];
-            mma::ldmatrix_x4_trans(vb, &sV[tile_offset<HEAD_DIM, SWIZZLE>(kc * 16 + arow, ds * 16 + acol)]);
+            mma::ldmatrix_x4_trans(vb, &sV[tile_offset<head_dim, swizzle>(kc * 16 + arow, ds * 16 + acol)]);
             uint32_t b0[2] = {vb[0], vb[1]};  // dims ds*16+0..7
             uint32_t b1[2] = {vb[2], vb[3]};  // dims ds*16+8..15
-            mma::mma_m16n8k16<BF16>(of0, pa[kc], b0, of0);
-            mma::mma_m16n8k16<BF16>(of1, pa[kc], b1, of1);
+            mma::mma_m16n8k16<bf16>(of0, pa[kc], b0, of0);
+            mma::mma_m16n8k16<bf16>(of1, pa[kc], b1, of1);
         }
-        float* acc = out + slab * kPvSlabAccums;
+        float* acc = out + slab * pv_slab_accums;
         acc[0] = __fadd_rn(__fmul_rn(acc[0], rescale_low), of0[0]);
         acc[1] = __fadd_rn(__fmul_rn(acc[1], rescale_low), of0[1]);
         acc[2] = __fadd_rn(__fmul_rn(acc[2], rescale_high), of0[2]);
@@ -223,18 +223,18 @@ tile_pv_registers(const scalar_t* sP, const scalar_t* sV, const float* row_resca
     }
 }
 
-template <int HEAD_DIM, int NWARPS, typename Fn>
+template <int head_dim, int nwarps, typename Fn>
 __device__ __forceinline__ void for_each_pv_register(const float* out, int warp, Fn&& fn) {
     const int lane = threadIdx.x & 31;
     const int gid = lane >> 2, tg = lane & 3;
 #pragma unroll
-    for (int slab = 0; slab < pv_slabs_per_warp<HEAD_DIM, NWARPS>(); ++slab) {
-        const int ds = warp + slab * NWARPS;
-        if (ds >= HEAD_DIM / 16) {
+    for (int slab = 0; slab < pv_slabs_per_warp<head_dim, nwarps>(); ++slab) {
+        const int ds = warp + slab * nwarps;
+        if (ds >= head_dim / 16) {
             break;
         }
         const int cb = ds * 16;
-        const float* acc = out + slab * kPvSlabAccums;
+        const float* acc = out + slab * pv_slab_accums;
         fn(gid, cb + tg * 2 + 0, acc[0]);
         fn(gid, cb + tg * 2 + 1, acc[1]);
         fn(gid + 8, cb + tg * 2 + 0, acc[2]);

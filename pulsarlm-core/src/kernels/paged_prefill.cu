@@ -62,7 +62,7 @@ rotate_view_keys_kernel(const attn::paged_attn_params<scalar_t> p, int page_size
     }
 }
 
-template <typename scalar_t, bool BF16> void launch_tc_prefill(const attn::paged_attn_batch& b, cudaStream_t stream) {
+template <typename scalar_t, bool bf16> void launch_tc_prefill(const attn::paged_attn_batch& b, cudaStream_t stream) {
     if (b.total_q == 0) {
         return;
     }
@@ -85,20 +85,20 @@ template <typename scalar_t, bool BF16> void launch_tc_prefill(const attn::paged
     );
 
     attn::dispatch_page_head("attn_prefill", b.page_size, b.head_dim, [&](auto bs_tag, auto hd_tag) {
-        constexpr int BS = decltype(bs_tag)::value;
-        constexpr int HD = decltype(hd_tag)::value;
+        constexpr int bs = decltype(bs_tag)::value;
+        constexpr int hd = decltype(hd_tag)::value;
         attn::dispatch_attn_tuning([&](auto row_tag) {
-            constexpr attn::attn_tuning kTuning = attn::kAttnTuningTable[decltype(row_tag)::value];
-            constexpr int NWARPS = kTuning.prefill_warps;
-            constexpr int KEY_PAGES = attn::prefill_key_pages<scalar_t, BS, HD, kTuning.prefill_key_pages>();
-            constexpr size_t smem = attn::prefill_tile_bytes<scalar_t, BS, HD, KEY_PAGES>();
+            constexpr attn::attn_tuning tuning = attn::attn_tuning_table[decltype(row_tag)::value];
+            constexpr int nwarps = tuning.prefill_warps;
+            constexpr int key_pages = attn::prefill_key_pages<scalar_t, bs, hd, tuning.prefill_key_pages>();
+            constexpr size_t smem = attn::prefill_tile_bytes<scalar_t, bs, hd, key_pages>();
             const auto kernel = attn::
-                attn_prefill_tc_kernel<scalar_t, BS, HD, BF16, NWARPS, KEY_PAGES, kTuning.prefill_ctas_per_sm>;
+                attn_prefill_tc_kernel<scalar_t, bs, hd, bf16, nwarps, key_pages, tuning.prefill_ctas_per_sm>;
             attn::allow_shared_memory(kernel, smem);
             launch_dependent(
                 kernel,
                 static_cast<int>(grid),
-                NWARPS * 32,
+                nwarps * 32,
                 smem,
                 stream,
                 params,
@@ -137,15 +137,15 @@ at::Tensor paged_prefill(const attn::paged_attn_batch& b) {
 bool attn::prefill_fits(int64_t page_size, int64_t head_dim) {
     bool fits = false;
     attn::dispatch_page_head("attn_prefill", page_size, head_dim, [&](auto bs_tag, auto hd_tag) {
-        constexpr int BS = decltype(bs_tag)::value;
-        constexpr int HD = decltype(hd_tag)::value;
+        constexpr int bs = decltype(bs_tag)::value;
+        constexpr int hd = decltype(hd_tag)::value;
         attn::dispatch_attn_tuning([&](auto row_tag) {
-            constexpr int KEY_PAGES = attn::prefill_key_pages<
+            constexpr int key_pages = attn::prefill_key_pages<
                 at::Half,
-                BS,
-                HD,
-                attn::kAttnTuningTable[decltype(row_tag)::value].prefill_key_pages>();
-            fits = attn::fits_shared_memory(attn::prefill_smem_bytes<at::Half, BS, HD, KEY_PAGES>());
+                bs,
+                hd,
+                attn::attn_tuning_table[decltype(row_tag)::value].prefill_key_pages>();
+            fits = attn::fits_shared_memory(attn::prefill_smem_bytes<at::Half, bs, hd, key_pages>());
         });
     });
     return fits;

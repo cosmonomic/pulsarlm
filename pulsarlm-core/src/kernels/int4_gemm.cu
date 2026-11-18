@@ -38,18 +38,18 @@
 namespace pulsarlm {
 namespace {
 
-constexpr int BN = 32;  // output N columns per CTA
-constexpr int BK = 64;  // K streamed per chunk (multiple of 16)
-constexpr int STAGES = 2;  // cp.async pipeline depth (chunks in flight per CTA)
-constexpr int NWARPS = 4;  // warps per CTA
-constexpr int NTHREADS = NWARPS * 32;
-constexpr int NSUB = BN / 8;  // 8-wide N subtiles
-constexpr int LSUB = NSUB / NWARPS;  // N subtiles owned per warp
-constexpr int KSUB = BK / 16;  // 16-wide K subchunks per BK chunk
-constexpr int PACK_PER_ROW = BK / 8;  // int32 columns per weight row per chunk
-constexpr int UINT4_PER_ROW = PACK_PER_ROW / 4;  // 128-bit loads per row per chunk
-constexpr int PACK_INT32 = BN * PACK_PER_ROW;  // packed int32 per weight chunk
-constexpr int TU = BN * UINT4_PER_ROW;  // 128-bit weight loads per chunk
+constexpr int bn = 32;  // output N columns per CTA
+constexpr int bk = 64;  // K streamed per chunk (multiple of 16)
+constexpr int stages = 2;  // cp.async pipeline depth (chunks in flight per CTA)
+constexpr int nwarps = 4;  // warps per CTA
+constexpr int nthreads = nwarps * 32;
+constexpr int nsub = bn / 8;  // 8-wide N subtiles
+constexpr int lsub = nsub / nwarps;  // N subtiles owned per warp
+constexpr int ksub = bk / 16;  // 16-wide K subchunks per BK chunk
+constexpr int pack_per_row = bk / 8;  // int32 columns per weight row per chunk
+constexpr int uint4_per_row = pack_per_row / 4;  // 128-bit loads per row per chunk
+constexpr int pack_int32 = bn * pack_per_row;  // packed int32 per weight chunk
+constexpr int tu = bn * uint4_per_row;  // 128-bit weight loads per chunk
 
 // Extract signed int4 nibble j (j in [0,8)) from a packed int32 -> [-8, 7].
 __device__ __forceinline__ int unpack_nibble(int32_t packed, int j) {
@@ -67,19 +67,19 @@ __device__ __forceinline__ void cpasync_pack_chunk(
     const int32_t* __restrict__ weight_packed,
     int n0,
     int k0,
-    int N,
-    int K,
+    int n,
+    int k,
     int pack_stride,
     int tid
 ) {
 #pragma unroll
-    for (int u = tid; u < TU; u += NTHREADS) {
-        const int nl = u / UINT4_PER_ROW;
-        const int uc = u % UINT4_PER_ROW;  // uint4 column within chunk
+    for (int u = tid; u < tu; u += nthreads) {
+        const int nl = u / uint4_per_row;
+        const int uc = u % uint4_per_row;  // uint4 column within chunk
         const int gn = n0 + nl;
         const int gk8 = k0 / 8 + uc * 4;  // int32 column in weight_packed
         void* dst = &sPack[u * 4];
-        const bool ok = (gn < N) && (k0 + uc * 32) < K;
+        const bool ok = (gn < n) && (k0 + uc * 32) < k;
         if (ok) {
             const void* src = &weight_packed[static_cast<int64_t>(gn) * pack_stride + gk8];
             __pipeline_memcpy_async(dst, src, sizeof(uint4));
@@ -90,9 +90,9 @@ __device__ __forceinline__ void cpasync_pack_chunk(
 }
 
 // Pack two fp32 values into a b16x2 register (low half = a, high half = b), in
-// the MMA operand dtype (bf16 if BF16, else fp16).
-template <bool BF16> __device__ __forceinline__ uint32_t pack2(float a, float b) {
-    if constexpr (BF16) {
+// the MMA operand dtype (bf16 if bf16, else fp16).
+template <bool bf16> __device__ __forceinline__ uint32_t pack2(float a, float b) {
+    if constexpr (bf16) {
         return static_cast<uint32_t>(__bfloat16_as_ushort(__float2bfloat16(a))) |
             (static_cast<uint32_t>(__bfloat16_as_ushort(__float2bfloat16(b))) << 16);
     } else {
@@ -108,7 +108,7 @@ template <bool BF16> __device__ __forceinline__ uint32_t pack2(float a, float b)
 // (register b0) and {8+tg*2, 8+tg*2+1} (register b1) with tg = lane&3. The whole
 // 16-wide K subchunk lies in one quant group (group_size % 16 == 0, kc*16 is
 // 16-aligned), so a single scale multiplies all four values.
-template <bool BF16>
+template <bool bf16>
 __device__ __forceinline__ void bfrag(
     uint32_t b[2],
     const int32_t* __restrict__ sPack,
@@ -118,8 +118,8 @@ __device__ __forceinline__ void bfrag(
     int n0,
     int k0,
     int kc,
-    int N,
-    int K,
+    int n,
+    int k,
     int group_size,
     int scale_stride
 ) {
@@ -127,23 +127,23 @@ __device__ __forceinline__ void bfrag(
     const int tg = lane & 3;
     const int gn = n0 + nl;
     const int k16 = k0 + kc * 16;
-    if (gn >= N || k16 >= K) {
+    if (gn >= n || k16 >= k) {
         b[0] = 0;
         b[1] = 0;
         return;
     }
-    const int32_t p0 = sPack[nl * PACK_PER_ROW + kc * 2];  // K rows 0..7
-    const int32_t p1 = sPack[nl * PACK_PER_ROW + kc * 2 + 1];  // K rows 8..15
+    const int32_t p0 = sPack[nl * pack_per_row + kc * 2];  // K rows 0..7
+    const int32_t p1 = sPack[nl * pack_per_row + kc * 2 + 1];  // K rows 8..15
     const float scale = weight_scale[static_cast<int64_t>(gn) * scale_stride + k16 / group_size];
-    b[0] = pack2<BF16>(unpack_nibble(p0, tg * 2) * scale, unpack_nibble(p0, tg * 2 + 1) * scale);
-    b[1] = pack2<BF16>(unpack_nibble(p1, tg * 2) * scale, unpack_nibble(p1, tg * 2 + 1) * scale);
+    b[0] = pack2<bf16>(unpack_nibble(p0, tg * 2) * scale, unpack_nibble(p0, tg * 2 + 1) * scale);
+    b[1] = pack2<bf16>(unpack_nibble(p1, tg * 2) * scale, unpack_nibble(p1, tg * 2 + 1) * scale);
 }
 
-// One CTA computes a BM x BN output tile (BM = MROW MMA row-tiles). Shared memory
+// One CTA computes a BM x BN output tile (BM = mrow MMA row-tiles). Shared memory
 // holds only the packed int4 weight chunk (sPack) and the x tile (sX), both
 // cp.async double-buffered: the next K-chunk is prefetched while the current
 // chunk's MMAs run. Each weight byte is read from global exactly once and reused
-// across all MROW row-tiles.
+// across all mrow row-tiles.
 //
 // Split-K (SPLIT=true): blockIdx.z = kz selects the K-slice. The K chunks are
 // partitioned into contiguous runs of chunks_per_split; split kz owns chunks
@@ -151,133 +151,133 @@ __device__ __forceinline__ void bfrag(
 // partial sum and writes it (fp32) into y_partial[kz]; the combine kernel sums the
 // ksplits partials into y. An empty split (kz*cps >= nchunks) runs no MMAs and
 // writes its zero-initialized accumulator, contributing 0 to the reduction.
-template <int BM, typename scalar_t, bool BF16, bool SPLIT>
-__global__ void __launch_bounds__(NTHREADS) gemm_int4_kernel(
+template <int bm, typename scalar_t, bool bf16, bool split>
+__global__ void __launch_bounds__(nthreads) gemm_int4_kernel(
     const scalar_t* __restrict__ x,
     const int32_t* __restrict__ weight_packed,
     const float* __restrict__ weight_scale,
     scalar_t* __restrict__ y,
     float* __restrict__ y_partial,
-    int M,
-    int N,
-    int K,
+    int m,
+    int n,
+    int k,
     int group_size,
     int chunks_per_split
 ) {
     wait_for_prior_kernels();
     allow_next_kernel();
-    constexpr int MROW = BM / 16;  // MMA row-tiles stacked in the M dimension
+    constexpr int mrow = bm / 16;  // MMA row-tiles stacked in the M dimension
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
-    const int n0 = blockIdx.x * BN;
-    const int m0 = blockIdx.y * BM;
+    const int n0 = blockIdx.x * bn;
+    const int m0 = blockIdx.y * bm;
 
-    const int nchunks = (K + BK - 1) / BK;
+    const int nchunks = (k + bk - 1) / bk;
     // K-chunk range [chunk_begin, chunk_end) this CTA owns. Non-split: the whole
     // range. Split: this CTA's contiguous slice (may be empty for a high kz).
-    const int kz = SPLIT ? static_cast<int>(blockIdx.z) : 0;
-    const int chunk_begin = SPLIT ? kz * chunks_per_split : 0;
-    const int chunk_end = SPLIT ? min((kz + 1) * chunks_per_split, nchunks) : nchunks;
+    const int kz = split ? static_cast<int>(blockIdx.z) : 0;
+    const int chunk_begin = split ? kz * chunks_per_split : 0;
+    const int chunk_end = split ? min((kz + 1) * chunks_per_split, nchunks) : nchunks;
     const int local_nchunks = chunk_end - chunk_begin;  // may be <= 0 (empty)
 
-    __shared__ scalar_t sX[STAGES][BM * BK];
-    __shared__ int32_t sPack[STAGES][PACK_INT32];  // multi-stage cp.async target
+    __shared__ scalar_t sX[stages][bm * bk];
+    __shared__ int32_t sPack[stages][pack_int32];  // multi-stage cp.async target
 
     const int quad = lane >> 3, rin = lane & 7;
     const int arow = (quad & 1) * 8 + rin, acol = (quad >> 1) * 8;
 
-    float acc[LSUB][MROW][4];
+    float acc[lsub][mrow][4];
 #pragma unroll
-    for (int ls = 0; ls < LSUB; ++ls)
+    for (int ls = 0; ls < lsub; ++ls)
 #pragma unroll
-        for (int mr = 0; mr < MROW; ++mr) {
+        for (int mr = 0; mr < mrow; ++mr) {
             acc[ls][mr][0] = acc[ls][mr][1] = acc[ls][mr][2] = acc[ls][mr][3] = 0.0f;
         }
 
-    const int pack_stride = K / 8;
-    const int scale_stride = K / group_size;
+    const int pack_stride = k / 8;
+    const int scale_stride = k / group_size;
 
-    // Prologue: issue the first STAGES-1 chunk loads so several cp.async groups
+    // Prologue: issue the first stages-1 chunk loads so several cp.async groups
     // are in flight at once.
 #pragma unroll
-    for (int s = 0; s < STAGES - 1; ++s) {
+    for (int s = 0; s < stages - 1; ++s) {
         if (s < local_nchunks) {
-            const int k0 = (chunk_begin + s) * BK;
-            cpasync_pack_chunk(sPack[s], weight_packed, n0, k0, N, K, pack_stride, tid);
-            dequant_gemm::load_x_chunk<BM, BK, NTHREADS>(sX[s], x, m0, k0, M, K, tid);
+            const int k0 = (chunk_begin + s) * bk;
+            cpasync_pack_chunk(sPack[s], weight_packed, n0, k0, n, k, pack_stride, tid);
+            dequant_gemm::load_x_chunk<bm, bk, nthreads>(sX[s], x, m0, k0, m, k, tid);
         }
         __pipeline_commit();
     }
 
     // Steady state: wait until the current chunk's group is the oldest still
-    // outstanding, run its MMAs while STAGES-2 later chunks keep loading, and
-    // issue the load for the chunk STAGES-1 ahead. One __syncthreads/iter.
+    // outstanding, run its MMAs while stages-2 later chunks keep loading, and
+    // issue the load for the chunk stages-1 ahead. One __syncthreads/iter.
     for (int lc = 0; lc < local_nchunks; ++lc) {
         const int c = chunk_begin + lc;
-        const int buf = lc % STAGES;
-        const int k0 = c * BK;
-        __pipeline_wait_prior(STAGES - 2);
+        const int buf = lc % stages;
+        const int k0 = c * bk;
+        __pipeline_wait_prior(stages - 2);
         __syncthreads();
-        const int fetch = lc + STAGES - 1;
+        const int fetch = lc + stages - 1;
         if (fetch < local_nchunks) {
-            const int fbuf = fetch % STAGES;
-            const int k_f = (chunk_begin + fetch) * BK;
-            cpasync_pack_chunk(sPack[fbuf], weight_packed, n0, k_f, N, K, pack_stride, tid);
-            dequant_gemm::load_x_chunk<BM, BK, NTHREADS>(sX[fbuf], x, m0, k_f, M, K, tid);
+            const int fbuf = fetch % stages;
+            const int k_f = (chunk_begin + fetch) * bk;
+            cpasync_pack_chunk(sPack[fbuf], weight_packed, n0, k_f, n, k, pack_stride, tid);
+            dequant_gemm::load_x_chunk<bm, bk, nthreads>(sX[fbuf], x, m0, k_f, m, k, tid);
         }
         __pipeline_commit();
 
         // A fragments depend only on (mr, kc), not the N-subtile, so load them
-        // once per kc and reuse across all LSUB N-subtiles.
+        // once per kc and reuse across all lsub N-subtiles.
 #pragma unroll
-        for (int kc = 0; kc < KSUB; ++kc) {
-            uint32_t ra[MROW][4];
+        for (int kc = 0; kc < ksub; ++kc) {
+            uint32_t ra[mrow][4];
 #pragma unroll
-            for (int mr = 0; mr < MROW; ++mr) {
-                mma::ldmatrix_x4(ra[mr], &sX[buf][(mr * 16 + arow) * BK + kc * 16 + acol]);
+            for (int mr = 0; mr < mrow; ++mr) {
+                mma::ldmatrix_x4(ra[mr], &sX[buf][(mr * 16 + arow) * bk + kc * 16 + acol]);
             }
 #pragma unroll
-            for (int ls = 0; ls < LSUB; ++ls) {
+            for (int ls = 0; ls < lsub; ++ls) {
                 uint32_t b[2];
-                bfrag<BF16>(
+                bfrag<bf16>(
                     b,
                     sPack[buf],
                     weight_scale,
-                    (warp + ls * NWARPS) * 8,
+                    (warp + ls * nwarps) * 8,
                     lane,
                     n0,
                     k0,
                     kc,
-                    N,
-                    K,
+                    n,
+                    k,
                     group_size,
                     scale_stride
                 );
 #pragma unroll
-                for (int mr = 0; mr < MROW; ++mr) {
-                    mma::mma_m16n8k16<BF16>(acc[ls][mr], ra[mr], b, acc[ls][mr]);
+                for (int mr = 0; mr < mrow; ++mr) {
+                    mma::mma_m16n8k16<bf16>(acc[ls][mr], ra[mr], b, acc[ls][mr]);
                 }
             }
         }
     }
 
-    const int64_t poff = static_cast<int64_t>(kz) * M * N;
-    dequant_gemm::store_acc_tile<scalar_t, SPLIT, LSUB, MROW, NWARPS>(
+    const int64_t poff = static_cast<int64_t>(kz) * m * n;
+    dequant_gemm::store_acc_tile<scalar_t, split, lsub, mrow, nwarps>(
         y,
         y_partial,
         poff,
         acc,
         m0,
         n0,
-        M,
-        N,
+        m,
+        n,
         warp,
         lane
     );
 }
 
-template <int BM, typename scalar_t, bool BF16, bool SPLIT>
+template <int bm, typename scalar_t, bool bf16, bool split>
 void launch(
     const dim3& grid,
     cudaStream_t stream,
@@ -286,16 +286,16 @@ void launch(
     const float* ws,
     scalar_t* y,
     float* yp,
-    int M,
-    int N,
-    int K,
+    int m,
+    int n,
+    int k,
     int group_size,
     int cps
 ) {
     launch_dependent(
-        gemm_int4_kernel<BM, scalar_t, BF16, SPLIT>,
+        gemm_int4_kernel<bm, scalar_t, bf16, split>,
         grid,
-        NTHREADS,
+        nthreads,
         0,
         stream,
         x,
@@ -303,9 +303,9 @@ void launch(
         ws,
         y,
         yp,
-        M,
-        N,
-        K,
+        m,
+        n,
+        k,
         group_size,
         cps
     );
@@ -313,7 +313,7 @@ void launch(
 
 // Dispatch the split (grid.z = ksplits, fp32 partials) or non-split (grid.z = 1,
 // direct y) kernel for a given (bm, dtype), then, when splitting, the combine.
-template <int BM, typename scalar_t, bool BF16>
+template <int bm, typename scalar_t, bool bf16>
 void dispatch(
     bool split,
     const dim3& grid,
@@ -323,18 +323,18 @@ void dispatch(
     const float* ws,
     scalar_t* y,
     float* yp,
-    int M,
-    int N,
-    int K,
+    int m,
+    int n,
+    int k,
     int group_size,
     int cps,
     int ksplits
 ) {
     if (split) {
-        launch<BM, scalar_t, BF16, true>(grid, stream, x, wp, ws, y, yp, M, N, K, group_size, cps);
-        dequant_gemm::launch_combine(y, yp, M, N, ksplits, stream);
+        launch<bm, scalar_t, bf16, true>(grid, stream, x, wp, ws, y, yp, m, n, k, group_size, cps);
+        dequant_gemm::launch_combine(y, yp, m, n, ksplits, stream);
     } else {
-        launch<BM, scalar_t, BF16, false>(grid, stream, x, wp, ws, y, nullptr, M, N, K, group_size, cps);
+        launch<bm, scalar_t, bf16, false>(grid, stream, x, wp, ws, y, nullptr, m, n, k, group_size, cps);
     }
 }
 
@@ -361,36 +361,36 @@ at::Tensor gemm_int4_run(
     TORCH_CHECK(weight_scale.dim() == 2, "gemm_int4: weight_scale must be 2-D [N, K/group_size]");
     TORCH_CHECK(x.is_contiguous(), "gemm_int4: x must be contiguous");
 
-    const int64_t M = x.size(0);
-    const int64_t K = x.size(1);
-    const int64_t N = weight_packed.size(0);
+    const int64_t m = x.size(0);
+    const int64_t k = x.size(1);
+    const int64_t n = weight_packed.size(0);
 
     TORCH_CHECK(group_size > 0 && group_size % 16 == 0, "gemm_int4: group_size must be a positive multiple of 16");
     TORCH_CHECK(
-        K % 8 == 0 && weight_packed.size(1) == K / 8,
+        k % 8 == 0 && weight_packed.size(1) == k / 8,
         "gemm_int4: weight_packed must be [N, K/8] with K a multiple of 8"
     );
-    TORCH_CHECK(K % group_size == 0, "gemm_int4: K must be a multiple of group_size");
+    TORCH_CHECK(k % group_size == 0, "gemm_int4: K must be a multiple of group_size");
     TORCH_CHECK(
-        weight_scale.size(0) == N && weight_scale.size(1) == K / group_size,
+        weight_scale.size(0) == n && weight_scale.size(1) == k / group_size,
         "gemm_int4: weight_scale must be [N, K/group_size]"
     );
 
     auto xc = x.contiguous();
     auto wp = weight_packed.contiguous();
     auto ws = weight_scale.to(at::kFloat).contiguous();
-    auto y = at::empty({M, N}, xc.options());
+    auto y = at::empty({m, n}, xc.options());
 
-    if (M == 0 || N == 0) {
+    if (m == 0 || n == 0) {
         return y;
     }
 
     // BM = 16 for the decode M (grid.y == 1); BM = 64 stacks four MMA row-tiles
     // so a single CTA covers up to 64 rows without re-reading the weight tile.
-    const int bm = (M <= 16) ? 16 : 64;
-    const int nchunks = static_cast<int>((K + BK - 1) / BK);
-    const unsigned gx = static_cast<unsigned>((N + BN - 1) / BN);
-    const unsigned gy = static_cast<unsigned>((M + bm - 1) / bm);
+    const int bm = (m <= 16) ? 16 : 64;
+    const int nchunks = static_cast<int>((k + bk - 1) / bk);
+    const unsigned gx = static_cast<unsigned>((n + bn - 1) / bn);
+    const unsigned gy = static_cast<unsigned>((m + bm - 1) / bm);
 
     // forced_splits >= 1 forces the split path (even at 1, and may exceed
     // nchunks); otherwise ksplits == 1 uses the direct kernel.
@@ -411,7 +411,7 @@ at::Tensor gemm_int4_run(
     // fp32 partials [ksplits, M, N] for the deterministic combine reduction.
     at::Tensor yp32;
     if (split) {
-        yp32 = at::empty({static_cast<int64_t>(ksplits), M, N}, xc.options().dtype(at::kFloat));
+        yp32 = at::empty({static_cast<int64_t>(ksplits), m, n}, xc.options().dtype(at::kFloat));
     }
     float* ypp = split ? yp32.data_ptr<float>() : nullptr;
 
@@ -428,9 +428,9 @@ at::Tensor gemm_int4_run(
                 ws.data_ptr<float>(),
                 yout,
                 ypp,
-                (int)M,
-                (int)N,
-                (int)K,
+                (int)m,
+                (int)n,
+                (int)k,
                 (int)group_size,
                 cps,
                 ksplits
@@ -445,9 +445,9 @@ at::Tensor gemm_int4_run(
                 ws.data_ptr<float>(),
                 yout,
                 ypp,
-                (int)M,
-                (int)N,
-                (int)K,
+                (int)m,
+                (int)n,
+                (int)k,
                 (int)group_size,
                 cps,
                 ksplits
@@ -466,9 +466,9 @@ at::Tensor gemm_int4_run(
                 ws.data_ptr<float>(),
                 yout,
                 ypp,
-                (int)M,
-                (int)N,
-                (int)K,
+                (int)m,
+                (int)n,
+                (int)k,
                 (int)group_size,
                 cps,
                 ksplits
@@ -483,9 +483,9 @@ at::Tensor gemm_int4_run(
                 ws.data_ptr<float>(),
                 yout,
                 ypp,
-                (int)M,
-                (int)N,
-                (int)K,
+                (int)m,
+                (int)n,
+                (int)k,
                 (int)group_size,
                 cps,
                 ksplits

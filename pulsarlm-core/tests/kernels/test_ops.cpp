@@ -44,10 +44,10 @@ TEST_CASE("rmsnorm matches ATen reference", "[ops][cuda]") {
 // runs the scalar kernels, bf16 the tensor-core ones, so each case covers both.
 namespace {
 
-constexpr int64_t kPageSize = 16;
-constexpr int64_t kHeadDim = 64;
-constexpr double kTheta = 1e6;
-const double kScale = 1.0 / std::sqrt(static_cast<double>(kHeadDim));
+constexpr int64_t pool_page_size = 16;
+constexpr int64_t pool_head_dim = 64;
+constexpr double rope_theta = 1e6;
+const double attention_scale = 1.0 / std::sqrt(static_cast<double>(pool_head_dim));
 
 at::Tensor int32_cuda(const std::vector<int32_t>& v) {
     return at::tensor(v, at::dtype(at::kInt)).to(at::kCUDA);
@@ -59,14 +59,14 @@ at::Tensor fp32_cuda(const std::vector<float>& v) {
 
 // {0, 0, -1} per sequence: every key at its own view index.
 // Each view page's position in a view laid out contiguously: its view index times the page size.
-at::Tensor identity_positions(const at::Tensor& page_tables, int64_t page_size = kPageSize) {
+at::Tensor identity_positions(const at::Tensor& page_tables, int64_t page_size = pool_page_size) {
     return (at::arange(page_tables.size(1), page_tables.options()) * page_size).expand_as(page_tables).contiguous();
 }
 
 // A key pool of num_pages zeroed pages. Every score is q.k == 0 at any rotation, so every
 // mass_sum is 0. One kv head, one query head.
 at::Tensor zero_pool(int64_t num_pages, at::ScalarType dt) {
-    return at::zeros({num_pages, kPageSize, 1, kHeadDim}, at::device(at::kCUDA).dtype(dt));
+    return at::zeros({num_pages, pool_page_size, 1, pool_head_dim}, at::device(at::kCUDA).dtype(dt));
 }
 
 at::Tensor zero_mass(int64_t num_pages) {
@@ -138,8 +138,8 @@ at::Tensor prefill(
         cu_seqlens_q,
         seqlens_k,
         identity_positions(page_tables),
-        pulsarlm::rope_parameters{.theta = kTheta},
-        kScale,
+        pulsarlm::rope_parameters{.theta = rope_theta},
+        attention_scale,
         std::nullopt,
         std::nullopt,
         mass_sum,
@@ -167,8 +167,8 @@ at::Tensor decode(
         page_tables,
         context_lens,
         identity_positions(page_tables),
-        pulsarlm::rope_parameters{.theta = kTheta},
-        kScale,
+        pulsarlm::rope_parameters{.theta = rope_theta},
+        attention_scale,
         std::nullopt,
         std::nullopt,
         mass_sum,
@@ -186,7 +186,7 @@ TEST_CASE("prefill sums the weights of the queries attending each page", "[ops][
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
-    const int64_t ntok = 64, num_pages = ntok / kPageSize;
+    const int64_t ntok = 64, num_pages = ntok / pool_page_size;
     std::vector<float> weights;
     for (int64_t i = 0; i < ntok; ++i) {
         weights.push_back(static_cast<float>(0.05 * std::pow(0.95, static_cast<double>(ntok - 1 - i))));
@@ -195,7 +195,7 @@ TEST_CASE("prefill sums the weights of the queries attending each page", "[ops][
     for (auto dt : {at::kFloat, at::kBFloat16}) {
         auto k_pool = zero_pool(num_pages, dt);
         auto v_pool = zero_pool(num_pages, dt);
-        auto q = at::zeros({ntok, 1, kHeadDim}, at::device(at::kCUDA).dtype(dt));
+        auto q = at::zeros({ntok, 1, pool_head_dim}, at::device(at::kCUDA).dtype(dt));
         auto page_tables = at::arange(num_pages, at::device(at::kCUDA).dtype(at::kInt)).view({1, num_pages});
         auto cu_seqlens_q = int32_cuda({0, static_cast<int32_t>(ntok)});
         auto seqlens_k = int32_cuda({static_cast<int32_t>(ntok)});
@@ -207,7 +207,7 @@ TEST_CASE("prefill sums the weights of the queries attending each page", "[ops][
         auto got = weight_sum.to(at::kCPU);
         for (int64_t b = 0; b < num_pages; ++b) {
             double want = 0.0;
-            for (int64_t i = b * kPageSize; i < ntok; ++i) {
+            for (int64_t i = b * pool_page_size; i < ntok; ++i) {
                 want += weights[i];
             }
             REQUIRE(std::abs(got[b].item<double>() - want) < 1e-5);
@@ -221,7 +221,7 @@ TEST_CASE("decode gives each page its query attends the query's weight", "[ops][
         SKIP("no CUDA device");
     }
     const int64_t short_ctx = 16, long_ctx = 128;
-    const int64_t max_pages = long_ctx / kPageSize;
+    const int64_t max_pages = long_ctx / pool_page_size;
     const int64_t num_pages = 2 * max_pages;
     const std::vector<float> weights{1.0f, 0.25f};
 
@@ -246,7 +246,7 @@ TEST_CASE("decode gives each page its query attends the query's weight", "[ops][
     for (auto dt : {at::kFloat, at::kBFloat16}) {
         auto k_pool = zero_pool(num_pages, dt);
         auto v_pool = zero_pool(num_pages, dt);
-        auto q = at::zeros({2, 1, kHeadDim}, at::device(at::kCUDA).dtype(dt));
+        auto q = at::zeros({2, 1, pool_head_dim}, at::device(at::kCUDA).dtype(dt));
         auto mass_sum = zero_mass(num_pages);
         auto weight_sum = zero_weights(num_pages);
         decode(q, k_pool, v_pool, page_tables, context_lens, mass_sum, weight_sum, fp32_cuda(weights));
@@ -256,7 +256,7 @@ TEST_CASE("decode gives each page its query attends the query's weight", "[ops][
     // The split (flash-decode) path writes each slice's pages from its own CTA.
     auto k_pool = zero_pool(num_pages, at::kBFloat16);
     auto v_pool = zero_pool(num_pages, at::kBFloat16);
-    auto q = at::zeros({2, 1, kHeadDim}, at::device(at::kCUDA).dtype(at::kBFloat16));
+    auto q = at::zeros({2, 1, pool_head_dim}, at::device(at::kCUDA).dtype(at::kBFloat16));
     auto mass_sum = zero_mass(num_pages);
     auto weight_sum = zero_weights(num_pages);
     decode(q, k_pool, v_pool, page_tables, context_lens, mass_sum, weight_sum, fp32_cuda(weights), /*num_splits=*/2);
@@ -273,7 +273,7 @@ struct sequence_view {
     std::vector<int32_t> page_positions;
 
     int64_t position(int64_t j) const {
-        return this->page_positions[j / kPageSize] + j % kPageSize;
+        return this->page_positions[j / pool_page_size] + j % pool_page_size;
     }
 };
 
@@ -304,7 +304,7 @@ void reference_view(
         positions[j] = view.position(j);
     }
     auto pos = at::tensor(positions, at::dtype(at::kLong)).to(at::kCUDA).view({-1, 1});
-    k = pulsarlm::rope_rotate(k, pos, {.theta = kTheta}).to(k_pool.scalar_type()).to(at::kFloat);
+    k = pulsarlm::rope_rotate(k, pos, {.theta = rope_theta}).to(k_pool.scalar_type()).to(at::kFloat);
 
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t p = view.ctx - rows + r;
@@ -313,7 +313,7 @@ void reference_view(
             const int64_t g = h / group;
             auto keys = k.slice(0, 0, p + 1).select(1, g);
             auto values = v.slice(0, 0, p + 1).select(1, g);
-            auto scores = at::mv(keys, q[q_offset + r][h].to(at::kFloat)) * kScale;
+            auto scores = at::mv(keys, q[q_offset + r][h].to(at::kFloat)) * attention_scale;
             o[q_offset + r][h] = at::mv(values.t(), at::softmax(scores, 0));
             mass.add(first_row, 0, scores, h, graded);
         }
@@ -333,8 +333,8 @@ TEST_CASE("views sharing a line rotate and accumulate apart", "[ops][cuda]") {
     }
     const int64_t n_q = 4, n_kv = 2, num_lines = 3;
     const std::vector<sequence_view> views = {
-        sequence_view{{0, 2}, kPageSize + 5, 5, {0, kPageSize, 2 * kPageSize}},
-        sequence_view{{1, 2, 0}, 2 * kPageSize + 7, 20, {0, 3 * kPageSize, 5 * kPageSize}},
+        sequence_view{{0, 2}, pool_page_size + 5, 5, {0, pool_page_size, 2 * pool_page_size}},
+        sequence_view{{1, 2, 0}, 2 * pool_page_size + 7, 20, {0, 3 * pool_page_size, 5 * pool_page_size}},
     };
     const double alpha = 0.5;
     const int64_t max_pages = 3, total_view_pages = 2 * max_pages;
@@ -370,16 +370,16 @@ TEST_CASE("views sharing a line rotate and accumulate apart", "[ops][cuda]") {
     for (auto dt : {at::kFloat, at::kBFloat16}) {  // scalar then tensor-core kernels
         at::manual_seed(7);
         auto opts = at::device(at::kCUDA).dtype(dt);
-        auto k_pool = at::randn({num_lines, kPageSize, n_kv, kHeadDim}, opts);
-        auto v_pool = at::randn({num_lines, kPageSize, n_kv, kHeadDim}, opts);
+        auto k_pool = at::randn({num_lines, pool_page_size, n_kv, pool_head_dim}, opts);
+        auto v_pool = at::randn({num_lines, pool_page_size, n_kv, pool_head_dim}, opts);
         const double o_tol = dt == at::kFloat ? 1e-4 : 2e-2;
 
-        auto q_pre = at::randn({cu_q.back(), n_q, kHeadDim}, opts);
-        auto o_pre = at::zeros({cu_q.back(), n_q, kHeadDim}, at::device(at::kCUDA).dtype(at::kFloat));
-        mass_reference reference_pre(total_view_pages, n_q, kPageSize);
-        auto q_dec = at::randn({2, n_q, kHeadDim}, opts);
-        auto o_dec = at::zeros({2, n_q, kHeadDim}, at::device(at::kCUDA).dtype(at::kFloat));
-        mass_reference reference_dec(total_view_pages, n_q, kPageSize);
+        auto q_pre = at::randn({cu_q.back(), n_q, pool_head_dim}, opts);
+        auto o_pre = at::zeros({cu_q.back(), n_q, pool_head_dim}, at::device(at::kCUDA).dtype(at::kFloat));
+        mass_reference reference_pre(total_view_pages, n_q, pool_page_size);
+        auto q_dec = at::randn({2, n_q, pool_head_dim}, opts);
+        auto o_dec = at::zeros({2, n_q, pool_head_dim}, at::device(at::kCUDA).dtype(at::kFloat));
+        mass_reference reference_dec(total_view_pages, n_q, pool_page_size);
         for (size_t s = 0; s < views.size(); ++s) {
             const int64_t first_row = static_cast<int64_t>(s) * max_pages;
             reference_view(
@@ -406,8 +406,8 @@ TEST_CASE("views sharing a line rotate and accumulate apart", "[ops][cuda]") {
             cu_seqlens_q,
             seqlens_k,
             page_positions,
-            pulsarlm::rope_parameters{.theta = kTheta},
-            kScale,
+            pulsarlm::rope_parameters{.theta = rope_theta},
+            attention_scale,
             std::nullopt,
             std::nullopt,
             mass,
@@ -429,8 +429,8 @@ TEST_CASE("views sharing a line rotate and accumulate apart", "[ops][cuda]") {
                 page_tables,
                 seqlens_k,
                 page_positions,
-                pulsarlm::rope_parameters{.theta = kTheta},
-                kScale,
+                pulsarlm::rope_parameters{.theta = rope_theta},
+                attention_scale,
                 std::nullopt,
                 std::nullopt,
                 dec_mass,
@@ -843,7 +843,7 @@ TEST_CASE("bfloat16 attention of a shape the tensor-core kernels lack fails inst
     REQUIRE(pulsarlm::attention_unsupported_reason(at::kBFloat16, 16, 128, 32, 1).has_value());
 
     auto opts = at::device(at::kCUDA).dtype(at::kBFloat16);
-    auto pool = at::zeros({2, kPageSize, 1, 32}, opts);
+    auto pool = at::zeros({2, pool_page_size, 1, 32}, opts);
     auto q = at::randn({1, 4, 32}, opts);
     REQUIRE_THROWS_WITH(
         pulsarlm::attn_decode_cuda(
@@ -853,8 +853,8 @@ TEST_CASE("bfloat16 attention of a shape the tensor-core kernels lack fails inst
             int32_cuda({0}).view({1, 1}),
             int32_cuda({4}),
             identity_positions(int32_cuda({0}).view({1, 1})),
-            pulsarlm::rope_parameters{.theta = kTheta},
-            kScale,
+            pulsarlm::rope_parameters{.theta = rope_theta},
+            attention_scale,
             std::nullopt,
             std::nullopt
         ),
@@ -875,19 +875,19 @@ TEST_CASE("write_kv places each token at its view index through the page table",
     auto k_new = at::randn({8, n_kv, head_dim}, opts);
     auto v_new = at::randn({8, n_kv, head_dim}, opts);
 
-    auto k_pool = at::zeros({num_lines, kPageSize, n_kv, head_dim}, opts);
-    auto v_pool = at::zeros({num_lines, kPageSize, n_kv, head_dim}, opts);
+    auto k_pool = at::zeros({num_lines, pool_page_size, n_kv, head_dim}, opts);
+    auto v_pool = at::zeros({num_lines, pool_page_size, n_kv, head_dim}, opts);
     pulsarlm::write_kv_cuda(k_pool, v_pool, k_new, v_new, page_tables, cu_seqlens_q, seqlens_k);
     for (int64_t t = 0; t < 6; ++t) {
         const int64_t index = 14 + t;
-        const int64_t line = index < kPageSize ? 3 : 1;
-        CHECK(at::equal(k_pool[line][index % kPageSize], k_new[t]));
-        CHECK(at::equal(v_pool[line][index % kPageSize], v_new[t]));
+        const int64_t line = index < pool_page_size ? 3 : 1;
+        CHECK(at::equal(k_pool[line][index % pool_page_size], k_new[t]));
+        CHECK(at::equal(v_pool[line][index % pool_page_size], v_new[t]));
     }
     CHECK(at::equal(k_pool[4][1], k_new[6]));
     CHECK(at::equal(k_pool[4][2], k_new[7]));
 
-    auto lines = at::zeros({num_lines, 2, kPageSize, n_kv, head_dim}, opts);
+    auto lines = at::zeros({num_lines, 2, pool_page_size, n_kv, head_dim}, opts);
     pulsarlm::write_kv_cuda(lines.select(1, 0), lines.select(1, 1), k_new, v_new, page_tables, cu_seqlens_q, seqlens_k);
     CHECK(at::equal(lines[3][0][14], k_new[0]));
     CHECK(at::equal(lines[3][1][14], v_new[0]));
@@ -895,7 +895,7 @@ TEST_CASE("write_kv places each token at its view index through the page table",
     CHECK(at::equal(lines[4][1][2], v_new[7]));
     CHECK(lines.select(1, 1)[3][13].abs().sum().item<float>() == 0.0f);
 
-    auto head_major = at::zeros({num_lines, n_kv, 2, kPageSize, head_dim}, opts).permute({0, 2, 3, 1, 4});
+    auto head_major = at::zeros({num_lines, n_kv, 2, pool_page_size, head_dim}, opts).permute({0, 2, 3, 1, 4});
     pulsarlm::write_kv_cuda(
         head_major.select(1, 0),
         head_major.select(1, 1),
@@ -908,7 +908,7 @@ TEST_CASE("write_kv places each token at its view index through the page table",
     CHECK(at::equal(head_major.select(1, 0)[3][14], k_new[0]));
     CHECK(at::equal(head_major.select(1, 1)[4][2], v_new[7]));
 
-    auto pool = at::zeros({num_lines, kPageSize, n_kv, head_dim}, opts);
+    auto pool = at::zeros({num_lines, pool_page_size, n_kv, head_dim}, opts);
     auto decode_tokens = at::randn({2, n_kv, head_dim}, opts);
     pulsarlm::write_kv_cuda(pool, pool, decode_tokens, decode_tokens, page_tables, std::nullopt, seqlens_k);
     CHECK(at::equal(pool[1][3], decode_tokens[0]));

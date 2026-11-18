@@ -129,7 +129,7 @@ void launch_attn_scalar(const paged_attn_batch& batch, cudaStream_t stream);
 
 // Upper bound on head_dim; sizes the scalar kernels' per-thread output
 // accumulator, which lives in local memory.
-constexpr int kMaxHeadDim = 512;
+constexpr int max_head_dim = 512;
 
 inline bool fits_shared_memory(size_t bytes) {
     return bytes <= at::cuda::getCurrentDeviceProperties()->sharedMemPerBlockOptin;
@@ -137,7 +137,7 @@ inline bool fits_shared_memory(size_t bytes) {
 
 // bytes must pass fits_shared_memory.
 template <typename Kernel> void allow_shared_memory(Kernel kernel, size_t bytes) {
-    if (bytes > kSharedMemoryWithoutOptIn) {
+    if (bytes > shared_memory_without_opt_in) {
         C10_CUDA_CHECK(
             cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes))
         );
@@ -145,16 +145,16 @@ template <typename Kernel> void allow_shared_memory(Kernel kernel, size_t bytes)
 }
 
 // CTA width of the scalar kernels. Power of two: block_reduce_* requires it.
-constexpr int kThreads = 128;
+constexpr int cta_threads = 128;
 
-// Tree reduction of one value per thread over a CTA of NTHREADS threads.
-// NTHREADS must be a power of two and every thread of the CTA must call this.
-// `scratch` is NTHREADS floats of shared memory, reusable once this returns; the
+// Tree reduction of one value per thread over a CTA of nthreads threads.
+// nthreads must be a power of two and every thread of the CTA must call this.
+// `scratch` is nthreads floats of shared memory, reusable once this returns; the
 // result is returned to every thread.
-template <int NTHREADS> __device__ __forceinline__ float block_reduce_max(float* scratch, int tid, float value) {
+template <int nthreads> __device__ __forceinline__ float block_reduce_max(float* scratch, int tid, float value) {
     scratch[tid] = value;
     __syncthreads();
-    for (int stride = NTHREADS / 2; stride > 0; stride >>= 1) {
+    for (int stride = nthreads / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
             scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
         }
@@ -165,10 +165,10 @@ template <int NTHREADS> __device__ __forceinline__ float block_reduce_max(float*
     return total;
 }
 
-template <int NTHREADS> __device__ __forceinline__ float block_reduce_sum(float* scratch, int tid, float value) {
+template <int nthreads> __device__ __forceinline__ float block_reduce_sum(float* scratch, int tid, float value) {
     scratch[tid] = value;
     __syncthreads();
-    for (int stride = NTHREADS / 2; stride > 0; stride >>= 1) {
+    for (int stride = nthreads / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
             scratch[tid] += scratch[tid + stride];
         }
@@ -179,7 +179,7 @@ template <int NTHREADS> __device__ __forceinline__ float block_reduce_sum(float*
     return total;
 }
 
-// Call fn with the tensor-core kernels' (scalar_t, BF16) for a fp16 or bf16 dtype.
+// Call fn with the tensor-core kernels' (scalar_t, bf16) for a fp16 or bf16 dtype.
 template <typename Fn> void dispatch_tensor_core_dtype(at::ScalarType dtype, Fn&& fn) {
     if (dtype == at::kBFloat16) {
         fn(std::type_identity<at::BFloat16>{}, std::true_type{});
