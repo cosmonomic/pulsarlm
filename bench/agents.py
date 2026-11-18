@@ -171,7 +171,7 @@ SETTINGS = {
     "vllm": Setting("vllm"),
     "full_kv": Setting("pulsarlm"),
     "cap_4k_mass_0.5": Setting(
-        "pulsarlm", max_context_window=4096, eviction_threshold=0.5
+        "pulsarlm", max_context_window=4096, eviction_threshold=0.5, n_working=1024
     ),
     "cap_16k_mass_0.5": Setting(
         "pulsarlm", max_context_window=16384, eviction_threshold=0.5
@@ -187,8 +187,8 @@ SETTINGS = {
     "cap_16k_mass_0.75": Setting(
         "pulsarlm", max_context_window=16384, eviction_threshold=0.75
     ),
-    "cap_16k_mass_0.5_working_8k": Setting(
-        "pulsarlm", max_context_window=16384, eviction_threshold=0.5, n_working=8192
+    "cap_16k_mass_0.5_working_1k": Setting(
+        "pulsarlm", max_context_window=16384, eviction_threshold=0.5, n_working=1024
     ),
     "cap_16k_mass_0.5_mass_tokens_128": Setting(
         "pulsarlm", max_context_window=16384, eviction_threshold=0.5, mass_tokens=128
@@ -366,7 +366,7 @@ def attributes_of(pairs: Iterable[KeyValue]) -> dict[str, Any]:
 
 def otlp_receiver(out: Path) -> Starlette:
     """Takes OTLP/HTTP protobuf exports: appends each span, with its service, to
-    out/spans.jsonl, and each point of pulsarlm.device_memory to out/kv.jsonl."""
+    out/spans.jsonl, and each point of pulsarlm.engine.device_memory to out/kv.jsonl."""
 
     async def traces(request: Request) -> Response:
         export = ExportTraceServiceRequest.FromString(await request.body())
@@ -395,7 +395,7 @@ def otlp_receiver(out: Path) -> Starlette:
             for resource_metrics in export.resource_metrics:
                 for scope_metrics in resource_metrics.scope_metrics:
                     for metric in scope_metrics.metrics:
-                        if metric.name != "pulsarlm.device_memory":
+                        if metric.name != "pulsarlm.engine.device_memory":
                             continue
                         for point in metric.gauge.data_points:
                             sample = {
@@ -548,7 +548,7 @@ def run(
     max_context: int = 262144,
     kv_cache_gib: float = 18.0,
     store_gib: float = 8.0,
-    n_working: int = 1024,
+    n_working: int = 8192,
     prefill_tokens_per_step: int = 512,
     vllm: str = "vllm==0.31.0",
     tensor_parallel_size: int = 4,
@@ -830,10 +830,10 @@ class SpanAttributeNames:
 # deprecated token counts and its own latency attributes.
 SPAN_ATTRIBUTE_NAMES = {
     "pulsarlm": SpanAttributeNames(
-        time_to_first_token="pulsarlm.time_to_first_token",
+        time_to_first_token="pulsarlm.engine.time_to_first_token",
         input_tokens="gen_ai.usage.input_tokens",
         output_tokens="gen_ai.usage.output_tokens",
-        decode_duration="pulsarlm.decode.duration",
+        decode_duration="pulsarlm.engine.decode.duration",
     ),
     "vllm": SpanAttributeNames(
         time_to_first_token="gen_ai.latency.time_to_first_token",
@@ -856,9 +856,11 @@ def served_requests(directories: list[Path], engine: str) -> ServedRequests:
     cached_tokens: int | None = None
     store_tokens: int | None = None
     if engine == "pulsarlm":
-        store_tokens = sum(a["pulsarlm.usage.input_tokens_in_store"] for a in spans)
+        store_tokens = sum(
+            a["pulsarlm.engine.usage.input_tokens_in_store"] for a in spans
+        )
         cached_tokens = store_tokens + sum(
-            a["pulsarlm.usage.input_tokens_on_device"] for a in spans
+            a["pulsarlm.engine.usage.input_tokens_on_device"] for a in spans
         )
     return ServedRequests(
         time_to_first_token_s=[a[names.time_to_first_token] for a in spans],
