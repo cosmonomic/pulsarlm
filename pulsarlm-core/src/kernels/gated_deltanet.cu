@@ -16,27 +16,30 @@ namespace pulsarlm {
 namespace {
 
 constexpr int kConvThreads = 256;
-constexpr int kMaxConvHistory = 9;
+// The most inputs a convolution line keeps: its history and the draft tokens' inputs.
+constexpr int kMaxConvWindow = 16;
 // Value columns per delta rule CTA.
 constexpr int kColumns = 16;
 constexpr size_t kSharedMemoryWithoutOptIn = 48 * 1024;
 
-// Sequence s holds tokens [first(s), first(s) + count(s)); without cu_seqlens_q, the one token s.
+// Sequence s holds tokens [first(s), first(s) + count(s)); without cu_seqlens_q, the per_sequence tokens from
+// s * per_sequence.
 struct ragged_tokens {
     const int32_t* cu_seqlens_q;
     int num_seqs;
+    int per_sequence;
 
     __device__ int first_token(int s) const {
-        return cu_seqlens_q != nullptr ? cu_seqlens_q[s] : s;
+        return cu_seqlens_q != nullptr ? cu_seqlens_q[s] : s * per_sequence;
     }
 
     __device__ int count(int s) const {
-        return cu_seqlens_q != nullptr ? cu_seqlens_q[s + 1] - cu_seqlens_q[s] : 1;
+        return cu_seqlens_q != nullptr ? cu_seqlens_q[s + 1] - cu_seqlens_q[s] : per_sequence;
     }
 
     __device__ int sequence_of(int token) const {
         if (cu_seqlens_q == nullptr) {
-            return token;
+            return token / per_sequence;
         }
         int lo = 0;
         int hi = num_seqs - 1;
@@ -52,17 +55,44 @@ struct ragged_tokens {
     }
 };
 
-// Line ids of the recurrent layers' rows, each sequence's running line then its boundary line.
-struct line_rows {
+// A sequence's lines in a recurrent layer (state_rows): slots lines holding states, then the boundary lines of its even
+// and odd pages.
+struct state_lines {
     const int32_t* ids;
     int64_t row_stride;
+    int slots;
+    const int64_t* history_positions;
+    const int32_t* rejected;
+    int page_size;
 
-    __device__ int64_t running_line(int s) const {
-        return ids[s * row_stride];
+    // The slot holding the state before the group's first token.
+    __device__ int64_t start(int s) const {
+        return ids[s * row_stride + slots - 1 - min(rejected[s], slots - 1)];
     }
 
-    __device__ int64_t boundary(int s) const {
-        return ids[s * row_stride + 1];
+    __device__ int64_t slot(int s, int i) const {
+        return ids[s * row_stride + i];
+    }
+
+    __device__ int64_t last_slot(int s) const {
+        return slot(s, slots - 1);
+    }
+
+    __device__ int rejected_tokens(int s) const {
+        return rejected[s];
+    }
+
+    // The group's tokens up to and including the newest of its count tokens that ends a page, 0 when none does.
+    __device__ int page_end_tokens(int s, int count) const {
+        const int64_t first = history_positions[s];
+        const int64_t end = (first + count) / page_size * page_size;
+        return end > first ? static_cast<int>(end - first) : 0;
+    }
+
+    // The boundary line of the page that the group's first page_end tokens end.
+    __device__ int64_t boundary(int s, int page_end) const {
+        const int64_t page = (history_positions[s] + page_end) / page_size - 1;
+        return ids[s * row_stride + slots + page % 2];
     }
 };
 
@@ -129,7 +159,11 @@ __device__ void gate_row(
     }
 }
 
-// One thread per (token, channel). Reads the running lines only: conv_state_kernel writes them afterwards.
+// A convolution line keeps the last window inputs before a sequence's next token, the history (kernel - 1) *
+// dilation the convolution reads and the draft tokens' inputs before it; after a step that did not keep its last
+// rejected tokens, the valid inputs end window - rejected entries in.
+
+// One thread per (token, channel). Reads the lines only: conv_state_kernel writes them afterwards.
 template <typename scalar_t>
 __global__ void causal_conv_kernel(
     const scalar_t* __restrict__ x,
@@ -137,12 +171,13 @@ __global__ void causal_conv_kernel(
     const scalar_t* __restrict__ weight,
     const scalar_t* __restrict__ conv_pool,
     int64_t line_stride,
-    line_rows rows,
+    state_lines lines,
     ragged_tokens tokens,
     int64_t total,
     int channels,
     int kernel,
     int dilation,
+    int window,
     scalar_t* __restrict__ out
 ) {
     wait_for_prior_kernels();
@@ -156,15 +191,86 @@ __global__ void causal_conv_kernel(
     const int s = tokens.sequence_of(token);
     const int first = tokens.first_token(s);
     const int history = (kernel - 1) * dilation;
-    const scalar_t* old = conv_pool + rows.running_line(s) * line_stride + static_cast<int64_t>(channel) * history;
+    const int valid = window - lines.rejected_tokens(s);
+    const scalar_t* old = conv_pool + lines.start(s) * line_stride + static_cast<int64_t>(channel) * window;
     float sum = 0.0f;
     for (int j = 0; j < kernel; j++) {
         const int input = token - first - history + j * dilation;
         const scalar_t value = input >= 0 ? x[static_cast<int64_t>(first + input) * x_row_stride + channel]
-                                          : old[history + input];
+                                          : old[valid + input];
         sum += static_cast<float>(weight[channel * kernel + j]) * static_cast<float>(value);
     }
     out[index] = static_cast<scalar_t>(silu(rounded<scalar_t>(sum)));
+}
+
+// The window entry j of the inputs up to count tokens into the group: the line's valid inputs, then the group's,
+// zero before the first.
+template <typename scalar_t> struct conv_inputs {
+    const scalar_t* old;
+    int valid;
+    const scalar_t* x;
+    int64_t x_row_stride;
+    int first;
+    int channel;
+    int window;
+
+    __device__ scalar_t entry(int count, int j) const {
+        const int index = valid + count - window + j;
+        if (index < 0) {
+            return scalar_t(0);
+        }
+        return index < valid ? old[index] : x[static_cast<int64_t>(first + index - valid) * x_row_stride + channel];
+    }
+};
+
+// One thread per (sequence, channel). Writes the window after the group's last token, and the one after the token
+// ending the newest page into that page's boundary line.
+template <typename scalar_t>
+__global__ void conv_state_kernel(
+    const scalar_t* __restrict__ x,
+    int64_t x_row_stride,
+    scalar_t* __restrict__ conv_pool,
+    int64_t line_stride,
+    state_lines lines,
+    ragged_tokens tokens,
+    int channels,
+    int window
+) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
+    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= static_cast<int64_t>(tokens.num_seqs) * channels) {
+        return;
+    }
+    const int s = static_cast<int>(index / channels);
+    const int channel = static_cast<int>(index % channels);
+    const int64_t channel_offset = static_cast<int64_t>(channel) * window;
+    scalar_t old[kMaxConvWindow];
+    const scalar_t* start = conv_pool + lines.start(s) * line_stride + channel_offset;
+    for (int i = 0; i < window; i++) {
+        old[i] = start[i];
+    }
+    const conv_inputs<scalar_t> inputs{
+        .old = old,
+        .valid = window - lines.rejected_tokens(s),
+        .x = x,
+        .x_row_stride = x_row_stride,
+        .first = tokens.first_token(s),
+        .channel = channel,
+        .window = window,
+    };
+    const int n = tokens.count(s);
+    const int page_end = lines.page_end_tokens(s, n);
+    if (page_end > 0) {
+        scalar_t* boundary = conv_pool + lines.boundary(s, page_end) * line_stride + channel_offset;
+        for (int j = 0; j < window; j++) {
+            boundary[j] = inputs.entry(page_end, j);
+        }
+    }
+    scalar_t* last = conv_pool + lines.last_slot(s) * line_stride + channel_offset;
+    for (int j = 0; j < window; j++) {
+        last[j] = inputs.entry(n, j);
+    }
 }
 
 // One thread per (sequence, channel) of a batch of one token per sequence: causal_conv_kernel's output for the token,
@@ -176,12 +282,12 @@ __global__ void single_token_conv_kernel(
     const scalar_t* __restrict__ weight,
     scalar_t* __restrict__ conv_pool,
     int64_t line_stride,
-    line_rows rows,
-    const int32_t* __restrict__ page_end_tokens,
+    state_lines lines,
     int num_seqs,
     int channels,
     int kernel,
     int dilation,
+    int window,
     scalar_t* __restrict__ out
 ) {
     wait_for_prior_kernels();
@@ -193,71 +299,36 @@ __global__ void single_token_conv_kernel(
     const int s = static_cast<int>(index / channels);
     const int channel = static_cast<int>(index % channels);
     const int history = (kernel - 1) * dilation;
-    const int64_t channel_offset = static_cast<int64_t>(channel) * history;
-    scalar_t* running = conv_pool + rows.running_line(s) * line_stride + channel_offset;
-    scalar_t old[kMaxConvHistory];
-    for (int i = 0; i < history; i++) {
-        old[i] = running[i];
+    const int64_t channel_offset = static_cast<int64_t>(channel) * window;
+    scalar_t old[kMaxConvWindow];
+    const scalar_t* start = conv_pool + lines.start(s) * line_stride + channel_offset;
+    for (int i = 0; i < window; i++) {
+        old[i] = start[i];
     }
-    const scalar_t token = x[static_cast<int64_t>(s) * x_row_stride + channel];
-    auto window = [&](int i) { return i < history ? old[i] : token; };
+    const conv_inputs<scalar_t> inputs{
+        .old = old,
+        .valid = window - lines.rejected_tokens(s),
+        .x = x,
+        .x_row_stride = x_row_stride,
+        .first = s,
+        .channel = channel,
+        .window = window,
+    };
     float sum = 0.0f;
     for (int j = 0; j < kernel; j++) {
-        sum += static_cast<float>(weight[channel * kernel + j]) * static_cast<float>(window(j * dilation));
+        sum += static_cast<float>(weight[channel * kernel + j]) *
+            static_cast<float>(inputs.entry(1, window - 1 - history + j * dilation));
     }
     out[index] = static_cast<scalar_t>(silu(rounded<scalar_t>(sum)));
-    if (page_end_tokens[s] > 0) {
-        scalar_t* boundary = conv_pool + rows.boundary(s) * line_stride + channel_offset;
-        for (int i = 0; i < history; i++) {
-            boundary[i] = window(page_end_tokens[s] + i);
+    if (lines.page_end_tokens(s, 1) > 0) {
+        scalar_t* boundary = conv_pool + lines.boundary(s, 1) * line_stride + channel_offset;
+        for (int j = 0; j < window; j++) {
+            boundary[j] = inputs.entry(1, j);
         }
     }
-    for (int i = 0; i < history; i++) {
-        running[i] = window(1 + i);
-    }
-}
-
-// One thread per (sequence, channel).
-template <typename scalar_t>
-__global__ void conv_state_kernel(
-    const scalar_t* __restrict__ x,
-    int64_t x_row_stride,
-    scalar_t* __restrict__ conv_pool,
-    int64_t line_stride,
-    line_rows rows,
-    ragged_tokens tokens,
-    const int32_t* __restrict__ page_end_tokens,
-    int channels,
-    int history
-) {
-    wait_for_prior_kernels();
-    allow_next_kernel();
-    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index >= static_cast<int64_t>(tokens.num_seqs) * channels) {
-        return;
-    }
-    const int s = static_cast<int>(index / channels);
-    const int channel = static_cast<int>(index % channels);
-    const int first = tokens.first_token(s);
-    const int64_t channel_offset = static_cast<int64_t>(channel) * history;
-    scalar_t* running = conv_pool + rows.running_line(s) * line_stride + channel_offset;
-    scalar_t old[kMaxConvHistory];
-    for (int i = 0; i < history; i++) {
-        old[i] = running[i];
-    }
-    auto window = [&](int i) {
-        return i < history ? old[i] : x[static_cast<int64_t>(first + i - history) * x_row_stride + channel];
-    };
-    const int page_end = page_end_tokens[s];
-    if (page_end > 0) {
-        scalar_t* boundary = conv_pool + rows.boundary(s) * line_stride + channel_offset;
-        for (int i = 0; i < history; i++) {
-            boundary[i] = window(page_end + i);
-        }
-    }
-    const int n = tokens.count(s);
-    for (int i = 0; i < history; i++) {
-        running[i] = window(n + i);
+    scalar_t* last = conv_pool + lines.last_slot(s) * line_stride + channel_offset;
+    for (int j = 0; j < window; j++) {
+        last[j] = inputs.entry(1, j);
     }
 }
 
@@ -266,9 +337,8 @@ struct delta_rule_params {
     const float* neg_a;
     float* state_pool;
     int64_t line_stride;
-    line_rows rows;
+    state_lines lines;
     ragged_tokens tokens;
-    const int32_t* page_end_tokens;
     int key_heads;
     int value_heads;
     int value_dim;
@@ -297,12 +367,9 @@ struct delta_rule_block {
         state_offset = static_cast<int64_t>(head) * key_head_dim * p.value_dim + first_column;
     }
 
-    __device__ float* running_state(const delta_rule_params& p) const {
-        return p.state_pool + p.rows.running_line(s) * p.line_stride + state_offset;
-    }
-
-    __device__ float* boundary(const delta_rule_params& p) const {
-        return p.state_pool + p.rows.boundary(s) * p.line_stride + state_offset;
+    // The block's part of the state in line.
+    __device__ float* state(const delta_rule_params& p, int64_t line) const {
+        return p.state_pool + line * p.line_stride + state_offset;
     }
 };
 
@@ -330,9 +397,11 @@ template <int COUNT, int THREADS, typename Fn> __device__ __forceinline__ void f
 constexpr int kStepLanes = 8;
 constexpr int kStepThreads = kColumns * kStepLanes;
 
-// One token per sequence. One CTA per (sequence, value head, kColumns value columns); kStepLanes lanes keep a column,
-// lane l of them its rows 32 i + 4 l + e, e < 4.
-template <typename scalar_t, int KEY_DIM>
+// tokens.count(s) tokens per sequence, one after another: one, or with verify the tokens of a verify group, the
+// state after each token written into its slot. One CTA per (sequence, value head, kColumns value columns);
+// kStepLanes lanes keep a column, lane l of them its rows 32 i + 4 l + e, e < 4. The last CTA of a (sequence, value
+// head) to finish gates the head's outputs.
+template <typename scalar_t, int KEY_DIM, bool verify>
 __global__ void __launch_bounds__(kStepThreads) delta_rule_step_kernel(
     const scalar_t* __restrict__ x,
     const scalar_t* __restrict__ a,
@@ -349,74 +418,101 @@ __global__ void __launch_bounds__(kStepThreads) delta_rule_step_kernel(
     const int block_column = threadIdx.x / kStepLanes;
     const int row_lane = threadIdx.x % kStepLanes;
     const int column = block.first_column + block_column;
-    const scalar_t* row = x + static_cast<int64_t>(block.s) * block.channels;
-    float* running = block.running_state(p) + block_column;
+    const int first = p.tokens.first_token(block.s);
+    const int count = p.tokens.count(block.s);
     auto row_of = [&](int quad, int e) { return 32 * quad + 4 * row_lane + e; };
-
-    float q[kQuads][4];
-    float k[kQuads][4];
-    float state[kQuads][4];
-    float qq = 0.0f;
-    float kk = 0.0f;
-    float qk = 0.0f;
+    auto head_out = [&](int t) {
+        return out + (static_cast<int64_t>(first + t) * p.value_heads + block.head) * p.value_dim;
+    };
+    auto store = [&](float* line, const float (&values)[kQuads][4]) {
 #pragma unroll
-    for (int quad = 0; quad < kQuads; quad++) {
+        for (int quad = 0; quad < kQuads; quad++) {
 #pragma unroll
-        for (int e = 0; e < 4; e++) {
-            const int dim = block.key_head * KEY_DIM + row_of(quad, e);
-            q[quad][e] = static_cast<float>(row[dim]);
-            k[quad][e] = static_cast<float>(row[block.key_dim + dim]);
-            state[quad][e] = running[static_cast<int64_t>(row_of(quad, e)) * p.value_dim];
-            qq += q[quad][e] * q[quad][e];
-            kk += k[quad][e] * k[quad][e];
-            qk += q[quad][e] * k[quad][e];
-        }
-    }
-    const float v = static_cast<float>(row[2 * block.key_dim + block.head * p.value_dim + column]);
-    const int64_t gate = static_cast<int64_t>(block.s) * p.gate_row_stride + block.head;
-    const float gain = expf(log_decay_of(static_cast<float>(a[gate]), p, block.head));
-    const float beta = beta_of(b[gate]);
-    const float q_scale = rsqrtf(lane_sum<kStepLanes>(qq) + 1e-6f) / p.key_dim_sqrt;
-    const float k_scale = rsqrtf(lane_sum<kStepLanes>(kk) + 1e-6f);
-    qk = lane_sum<kStepLanes>(qk) * q_scale * k_scale;
-
-    float k_state = 0.0f;
-    float q_state = 0.0f;
-#pragma unroll
-    for (int quad = 0; quad < kQuads; quad++) {
-#pragma unroll
-        for (int e = 0; e < 4; e++) {
-            k[quad][e] *= k_scale;
-            k_state += k[quad][e] * state[quad][e];
-            q_state += q[quad][e] * q_scale * state[quad][e];
-        }
-    }
-    k_state = lane_sum<kStepLanes>(k_state);
-    q_state = lane_sum<kStepLanes>(q_state);
-    const float delta = (v - gain * k_state) * beta;
-    const bool ends_page = p.page_end_tokens[block.s] > 0;
-    float* boundary = block.boundary(p) + block_column;
-#pragma unroll
-    for (int quad = 0; quad < kQuads; quad++) {
-#pragma unroll
-        for (int e = 0; e < 4; e++) {
-            const float updated = state[quad][e] * gain + k[quad][e] * delta;
-            const int64_t index = static_cast<int64_t>(row_of(quad, e)) * p.value_dim;
-            running[index] = updated;
-            if (ends_page) {
-                boundary[index] = updated;
+            for (int e = 0; e < 4; e++) {
+                line[static_cast<int64_t>(row_of(quad, e)) * p.value_dim] = values[quad][e];
             }
         }
+    };
+
+    float state[kQuads][4];
+    const float* start = block.state(p, p.lines.start(block.s)) + block_column;
+#pragma unroll
+    for (int quad = 0; quad < kQuads; quad++) {
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            state[quad][e] = start[static_cast<int64_t>(row_of(quad, e)) * p.value_dim];
+        }
+    }
+    for (int t = 0; t < count; t++) {
+        const int64_t token = first + t;
+        const scalar_t* row = x + token * block.channels;
+        float q[kQuads][4];
+        float k[kQuads][4];
+        float qq = 0.0f;
+        float kk = 0.0f;
+        float qk = 0.0f;
+#pragma unroll
+        for (int quad = 0; quad < kQuads; quad++) {
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int dim = block.key_head * KEY_DIM + row_of(quad, e);
+                q[quad][e] = static_cast<float>(row[dim]);
+                k[quad][e] = static_cast<float>(row[block.key_dim + dim]);
+                qq += q[quad][e] * q[quad][e];
+                kk += k[quad][e] * k[quad][e];
+                qk += q[quad][e] * k[quad][e];
+            }
+        }
+        const float v = static_cast<float>(row[2 * block.key_dim + block.head * p.value_dim + column]);
+        const int64_t gate = token * p.gate_row_stride + block.head;
+        const float gain = expf(log_decay_of(static_cast<float>(a[gate]), p, block.head));
+        const float beta = beta_of(b[gate]);
+        const float q_scale = rsqrtf(lane_sum<kStepLanes>(qq) + 1e-6f) / p.key_dim_sqrt;
+        const float k_scale = rsqrtf(lane_sum<kStepLanes>(kk) + 1e-6f);
+        qk = lane_sum<kStepLanes>(qk) * q_scale * k_scale;
+
+        float k_state = 0.0f;
+        float q_state = 0.0f;
+#pragma unroll
+        for (int quad = 0; quad < kQuads; quad++) {
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                k[quad][e] *= k_scale;
+                k_state += k[quad][e] * state[quad][e];
+                q_state += q[quad][e] * q_scale * state[quad][e];
+            }
+        }
+        k_state = lane_sum<kStepLanes>(k_state);
+        q_state = lane_sum<kStepLanes>(q_state);
+        const float delta = (v - gain * k_state) * beta;
+#pragma unroll
+        for (int quad = 0; quad < kQuads; quad++) {
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                state[quad][e] = state[quad][e] * gain + k[quad][e] * delta;
+            }
+        }
+        if (verify) {
+            store(block.state(p, p.lines.slot(block.s, t)) + block_column, state);
+        }
+        if (p.lines.page_end_tokens(block.s, t + 1) == t + 1) {
+            store(block.state(p, p.lines.boundary(block.s, t + 1)) + block_column, state);
+        }
+        if (row_lane == 0) {
+            head_out(t)[column] = static_cast<scalar_t>(gain * q_state + qk * delta);
+        }
+    }
+    if (!verify) {
+        store(block.state(p, p.lines.last_slot(block.s)) + block_column, state);
     }
     const int64_t head_row = static_cast<int64_t>(block.s) * p.value_heads + block.head;
-    scalar_t* head_out = out + head_row * p.value_dim;
-    if (row_lane == 0) {
-        head_out[column] = static_cast<scalar_t>(gain * q_state + qk * delta);
-    }
     if (last_to_arrive(head_counters + head_row, p.value_dim / kColumns)) {
         __shared__ float sums[kStepThreads];
-        const scalar_t* z = output.z + block.s * output.z_row_stride + block.head * p.value_dim;
-        gate_row(head_out, z, output, head_out, p.value_dim, sums);
+        for (int t = 0; t < count; t++) {
+            const scalar_t* z = output.z + (first + t) * output.z_row_stride + block.head * p.value_dim;
+            gate_row(head_out(t), z, output, head_out(t), p.value_dim, sums);
+            __syncthreads();
+        }
     }
 }
 
@@ -490,7 +586,7 @@ __global__ void __launch_bounds__(kChunkThreads) delta_rule_chunk_kernel(
     const delta_rule_block block(p, KEY_DIM);
     const int first = p.tokens.first_token(block.s);
     const int n = p.tokens.count(block.s);
-    const int page_end = p.page_end_tokens[block.s];
+    const int page_end = p.lines.page_end_tokens(block.s, n);
     auto line_index = [&](int i) {
         return static_cast<int64_t>(i / (kColumns / 4)) * p.value_dim + i % (kColumns / 4) * 4;
     };
@@ -545,9 +641,9 @@ __global__ void __launch_bounds__(kChunkThreads) delta_rule_chunk_kernel(
         }
     };
 
-    const float* running = block.running_state(p);
+    const float* start = block.state(p, p.lines.start(block.s));
     for_each_index<KEY_DIM * kColumns / 4, kChunkThreads>([&](int i) {
-        vector_at(state, 4 * i) = *reinterpret_cast<const float4*>(running + line_index(i));
+        vector_at(state, 4 * i) = *reinterpret_cast<const float4*>(start + line_index(i));
     });
     for (int chunk_first = 0; chunk_first < n;) {
         const int chunk_end = min(min(chunk_first + kChunk, n), chunk_first < page_end ? page_end : n);
@@ -743,11 +839,11 @@ __global__ void __launch_bounds__(kChunkThreads) delta_rule_chunk_kernel(
                 i % kColumns] = static_cast<scalar_t>(outputs[i]);
         }
         if (chunk_end == page_end) {
-            store_state(block.boundary(p));
+            store_state(block.state(p, p.lines.boundary(block.s, page_end)));
         }
         chunk_first = chunk_end;
     }
-    store_state(block.running_state(p));
+    store_state(block.state(p, p.lines.last_slot(block.s)));
 }
 
 // One CTA per (token, value head) of out [tokens, value heads, value dim], gated in place. blockDim.x is a power of
@@ -767,30 +863,46 @@ int blocks_for(int64_t threads) {
     return static_cast<int>((threads + kConvThreads - 1) / kConvThreads);
 }
 
-void check_ragged(
+void check_rows(const char* op, const state_rows& rows) {
+    const at::Tensor& lines = rows.lines;
+    TORCH_CHECK(
+        rows.slots >= 1 && rows.page_size >= 1 && lines.is_cuda() && lines.scalar_type() == at::kInt &&
+            lines.dim() == 2 && lines.size(1) >= rows.slots + 2 && lines.stride(1) == 1,
+        op,
+        ": rows.lines must be CUDA int32 [num_seqs, >= slots + 2] with its columns adjacent, slots and page_size at "
+        "least 1"
+    );
+    const int64_t num_seqs = lines.size(0);
+    TORCH_CHECK(
+        rows.history_positions.is_cuda() && rows.history_positions.scalar_type() == at::kLong &&
+            rows.history_positions.dim() == 1 && rows.history_positions.size(0) == num_seqs &&
+            rows.history_positions.is_contiguous(),
+        op,
+        ": rows.history_positions must be contiguous CUDA int64 [num_seqs]"
+    );
+    TORCH_CHECK(
+        rows.rejected_tokens.is_cuda() && rows.rejected_tokens.scalar_type() == at::kInt &&
+            rows.rejected_tokens.dim() == 1 && rows.rejected_tokens.size(0) == num_seqs &&
+            rows.rejected_tokens.is_contiguous(),
+        op,
+        ": rows.rejected_tokens must be contiguous CUDA int32 [num_seqs]"
+    );
+}
+
+// x's tokens split into rows' sequences by cu_seqlens_q, or per_sequence tokens each without it.
+void check_tokens(
     const char* op,
     const at::Tensor& x,
-    const at::Tensor& rows,
+    const state_rows& rows,
     const std::optional<at::Tensor>& cu_seqlens_q,
-    const at::Tensor& page_end_tokens
+    int64_t per_sequence
 ) {
     TORCH_CHECK(
         x.is_cuda() && x.dim() == 2 && x.stride(1) == 1,
         op,
         ": x must be CUDA [tokens, dim], each row contiguous"
     );
-    TORCH_CHECK(
-        rows.is_cuda() && rows.scalar_type() == at::kInt && rows.dim() == 2 && rows.size(1) >= 2 && rows.stride(1) == 1,
-        op,
-        ": rows must be CUDA int32 [num_seqs, >= 2] with its columns adjacent"
-    );
-    const int64_t num_seqs = rows.size(0);
-    TORCH_CHECK(
-        page_end_tokens.is_cuda() && page_end_tokens.scalar_type() == at::kInt && page_end_tokens.dim() == 1 &&
-            page_end_tokens.size(0) == num_seqs && page_end_tokens.is_contiguous(),
-        op,
-        ": page_end_tokens must be contiguous CUDA int32 [num_seqs]"
-    );
+    const int64_t num_seqs = rows.lines.size(0);
     if (cu_seqlens_q.has_value()) {
         TORCH_CHECK(
             cu_seqlens_q->is_cuda() && cu_seqlens_q->scalar_type() == at::kInt && cu_seqlens_q->dim() == 1 &&
@@ -799,19 +911,27 @@ void check_ragged(
             ": cu_seqlens_q must be contiguous CUDA int32 [num_seqs + 1]"
         );
     } else {
-        TORCH_CHECK(x.size(0) == num_seqs, op, ": without cu_seqlens_q, x holds one token per sequence");
+        TORCH_CHECK(x.size(0) == num_seqs * per_sequence, op, ": x must hold ", per_sequence, " tokens per sequence");
     }
 }
 
-ragged_tokens ragged(const at::Tensor& rows, const std::optional<at::Tensor>& cu_seqlens_q) {
+ragged_tokens ragged(const state_rows& rows, const std::optional<at::Tensor>& cu_seqlens_q, int64_t per_sequence) {
     return ragged_tokens{
         cu_seqlens_q.has_value() ? cu_seqlens_q->const_data_ptr<int32_t>() : nullptr,
-        static_cast<int>(rows.size(0)),
+        static_cast<int>(rows.lines.size(0)),
+        static_cast<int>(per_sequence),
     };
 }
 
-line_rows rows_of(const at::Tensor& rows) {
-    return line_rows{rows.const_data_ptr<int32_t>(), rows.stride(0)};
+state_lines lines_of(const state_rows& rows) {
+    return state_lines{
+        rows.lines.const_data_ptr<int32_t>(),
+        rows.lines.stride(0),
+        static_cast<int>(rows.slots),
+        rows.history_positions.const_data_ptr<int64_t>(),
+        rows.rejected_tokens.const_data_ptr<int32_t>(),
+        static_cast<int>(rows.page_size),
+    };
 }
 
 template <typename Fn> void dispatch_key_dim(int64_t key_dim, Fn&& fn) {
@@ -830,16 +950,21 @@ template <typename Fn> void dispatch_key_dim(int64_t key_dim, Fn&& fn) {
 
 }  // namespace
 
-at::Tensor causal_conv_cuda(
+namespace {
+
+// The convolution of x's tokens, cu_seqlens_q splitting them into sequences, or per_sequence tokens each without it;
+// one token per sequence runs as one kernel.
+at::Tensor causal_conv(
     const at::Tensor& x,
     const at::Tensor& weight,
     const at::Tensor& conv_pool,
-    const at::Tensor& rows,
+    const state_rows& rows,
     const std::optional<at::Tensor>& cu_seqlens_q,
-    const at::Tensor& page_end_tokens,
+    int64_t per_sequence,
     int64_t dilation
 ) {
-    check_ragged("causal_conv", x, rows, cu_seqlens_q, page_end_tokens);
+    check_rows("causal_conv", rows);
+    check_tokens("causal_conv", x, rows, cu_seqlens_q, per_sequence);
     const int64_t channels = x.size(1);
     TORCH_CHECK(
         weight.scalar_type() == x.scalar_type() && weight.dim() == 3 && weight.size(0) == channels &&
@@ -849,27 +974,28 @@ at::Tensor causal_conv_cuda(
     const int64_t kernel = weight.size(2);
     const int64_t history = (kernel - 1) * dilation;
     TORCH_CHECK(
-        dilation >= 1 && history <= kMaxConvHistory,
-        "causal_conv: (kernel - 1) * dilation must be at most ",
-        kMaxConvHistory,
-        " with dilation at least 1"
-    );
-    TORCH_CHECK(
         conv_pool.scalar_type() == x.scalar_type() && conv_pool.dim() == 3 && conv_pool.size(1) == channels &&
-            conv_pool.size(2) == history && conv_pool.stride(2) == 1 && conv_pool.stride(1) == history,
-        "causal_conv: conv_pool must be [lines, channels, (kernel - 1) * dilation] in x's dtype, each line packed"
+            conv_pool.stride(2) == 1 && conv_pool.stride(1) == conv_pool.size(2),
+        "causal_conv: conv_pool must be [lines, channels, window] in x's dtype, each line packed"
+    );
+    const int64_t window = conv_pool.size(2);
+    TORCH_CHECK(
+        dilation >= 1 && history <= window && window <= kMaxConvWindow,
+        "causal_conv: the window must hold (kernel - 1) * dilation inputs, dilation at least 1, and at most ",
+        kMaxConvWindow
     );
     at::Tensor out = at::empty(x.sizes(), x.options());
     const int64_t total = x.size(0);
-    if (rows.size(0) == 0) {
+    const int64_t num_seqs = rows.lines.size(0);
+    if (num_seqs == 0) {
         return out;
     }
     auto stream = at::cuda::getCurrentCUDAStream();
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "causal_conv_cuda", [&] {
-        if (!cu_seqlens_q) {
+        if (!cu_seqlens_q && per_sequence == 1) {
             launch_dependent(
                 single_token_conv_kernel<scalar_t>,
-                blocks_for(rows.size(0) * channels),
+                blocks_for(num_seqs * channels),
                 kConvThreads,
                 0,
                 stream,
@@ -878,12 +1004,12 @@ at::Tensor causal_conv_cuda(
                 weight.const_data_ptr<scalar_t>(),
                 conv_pool.mutable_data_ptr<scalar_t>(),
                 conv_pool.stride(0),
-                rows_of(rows),
-                page_end_tokens.const_data_ptr<int32_t>(),
-                static_cast<int>(rows.size(0)),
+                lines_of(rows),
+                static_cast<int>(num_seqs),
                 static_cast<int>(channels),
                 static_cast<int>(kernel),
                 static_cast<int>(dilation),
+                static_cast<int>(window),
                 out.mutable_data_ptr<scalar_t>()
             );
             C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -901,19 +1027,20 @@ at::Tensor causal_conv_cuda(
                 weight.const_data_ptr<scalar_t>(),
                 conv_pool.const_data_ptr<scalar_t>(),
                 conv_pool.stride(0),
-                rows_of(rows),
-                ragged(rows, cu_seqlens_q),
+                lines_of(rows),
+                ragged(rows, cu_seqlens_q, per_sequence),
                 total,
                 static_cast<int>(channels),
                 static_cast<int>(kernel),
                 static_cast<int>(dilation),
+                static_cast<int>(window),
                 out.mutable_data_ptr<scalar_t>()
             );
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
         launch_dependent(
             conv_state_kernel<scalar_t>,
-            blocks_for(rows.size(0) * channels),
+            blocks_for(num_seqs * channels),
             kConvThreads,
             0,
             stream,
@@ -921,32 +1048,29 @@ at::Tensor causal_conv_cuda(
             x.stride(0),
             conv_pool.mutable_data_ptr<scalar_t>(),
             conv_pool.stride(0),
-            rows_of(rows),
-            ragged(rows, cu_seqlens_q),
-            page_end_tokens.const_data_ptr<int32_t>(),
+            lines_of(rows),
+            ragged(rows, cu_seqlens_q, per_sequence),
             static_cast<int>(channels),
-            static_cast<int>(history)
+            static_cast<int>(window)
         );
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     });
     return out;
 }
 
-// One per (sequence, value head) of a step of one token per sequence.
-int64_t gated_delta_rule_counters(int64_t num_seqs, int64_t value_heads) {
-    return num_seqs * value_heads;
-}
-
-at::Tensor gated_delta_rule_cuda(
+// The gated delta rule over x's tokens: with cu_seqlens_q, chunked; without, per_sequence tokens per sequence one
+// after another, verify writing the state after each into its slot.
+at::Tensor gated_delta_rule(
     const at::Tensor& x,
     const at::Tensor& a,
     const at::Tensor& b,
     const at::Tensor& dt_bias,
     const at::Tensor& neg_a,
     const at::Tensor& state_pool,
-    const at::Tensor& rows,
+    const state_rows& rows,
     const std::optional<at::Tensor>& cu_seqlens_q,
-    const at::Tensor& page_end_tokens,
+    int64_t per_sequence,
+    bool verify,
     int64_t key_heads,
     const at::Tensor& z,
     const at::Tensor& norm_weight,
@@ -954,8 +1078,13 @@ at::Tensor gated_delta_rule_cuda(
     gate_activation activation,
     const at::Tensor& counters
 ) {
-    check_ragged("gated_delta_rule", x, rows, cu_seqlens_q, page_end_tokens);
+    check_rows("gated_delta_rule", rows);
+    check_tokens("gated_delta_rule", x, rows, cu_seqlens_q, per_sequence);
     TORCH_CHECK(x.is_contiguous(), "gated_delta_rule: x must be contiguous");
+    TORCH_CHECK(
+        !verify || per_sequence <= rows.slots,
+        "gated_delta_rule: a verify group holds at most rows.slots tokens per sequence"
+    );
     TORCH_CHECK(
         state_pool.is_cuda() && state_pool.scalar_type() == at::kFloat && state_pool.dim() == 4 &&
             state_pool.stride(3) == 1 && state_pool.stride(2) == state_pool.size(3) &&
@@ -1003,7 +1132,7 @@ at::Tensor gated_delta_rule_cuda(
         "gated_delta_rule: norm_weight must be contiguous [value dim] in x's dtype"
     );
     at::Tensor out = at::empty({total, value_heads * value_dim}, x.options());
-    const int64_t num_seqs = rows.size(0);
+    const int64_t num_seqs = rows.lines.size(0);
     TORCH_CHECK(
         counters.is_cuda() && counters.device() == x.device() && counters.scalar_type() == at::kInt &&
             counters.is_contiguous() && counters.numel() >= gated_delta_rule_counters(num_seqs, value_heads),
@@ -1017,9 +1146,8 @@ at::Tensor gated_delta_rule_cuda(
         neg_a.const_data_ptr<float>(),
         state_pool.mutable_data_ptr<float>(),
         state_pool.stride(0),
-        rows_of(rows),
-        ragged(rows, cu_seqlens_q),
-        page_end_tokens.const_data_ptr<int32_t>(),
+        lines_of(rows),
+        ragged(rows, cu_seqlens_q, per_sequence),
         static_cast<int>(key_heads),
         static_cast<int>(value_heads),
         static_cast<int>(value_dim),
@@ -1048,7 +1176,8 @@ at::Tensor gated_delta_rule_cuda(
             };
             if (!cu_seqlens_q.has_value()) {
                 launch_dependent(
-                    delta_rule_step_kernel<scalar_t, kKeyDim>,
+                    verify ? delta_rule_step_kernel<scalar_t, kKeyDim, true>
+                           : delta_rule_step_kernel<scalar_t, kKeyDim, false>,
                     blocks,
                     kStepThreads,
                     0,
@@ -1102,6 +1231,107 @@ at::Tensor gated_delta_rule_cuda(
         });
     });
     return out;
+}
+
+}  // namespace
+
+at::Tensor causal_conv_cuda(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& conv_pool,
+    const state_rows& rows,
+    const std::optional<at::Tensor>& cu_seqlens_q,
+    int64_t dilation
+) {
+    return causal_conv(x, weight, conv_pool, rows, cu_seqlens_q, 1, dilation);
+}
+
+at::Tensor causal_conv_verify_cuda(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& conv_pool,
+    const state_rows& rows,
+    int64_t tokens_per_sequence,
+    int64_t dilation
+) {
+    return causal_conv(x, weight, conv_pool, rows, std::nullopt, tokens_per_sequence, dilation);
+}
+
+// One per (sequence, value head) of a step that runs without cu_seqlens_q.
+int64_t gated_delta_rule_counters(int64_t num_seqs, int64_t value_heads) {
+    return num_seqs * value_heads;
+}
+
+at::Tensor gated_delta_rule_cuda(
+    const at::Tensor& x,
+    const at::Tensor& a,
+    const at::Tensor& b,
+    const at::Tensor& dt_bias,
+    const at::Tensor& neg_a,
+    const at::Tensor& state_pool,
+    const state_rows& rows,
+    const std::optional<at::Tensor>& cu_seqlens_q,
+    int64_t key_heads,
+    const at::Tensor& z,
+    const at::Tensor& norm_weight,
+    double eps,
+    gate_activation activation,
+    const at::Tensor& counters
+) {
+    return gated_delta_rule(
+        x,
+        a,
+        b,
+        dt_bias,
+        neg_a,
+        state_pool,
+        rows,
+        cu_seqlens_q,
+        1,
+        false,
+        key_heads,
+        z,
+        norm_weight,
+        eps,
+        activation,
+        counters
+    );
+}
+
+at::Tensor gated_delta_rule_verify_cuda(
+    const at::Tensor& x,
+    const at::Tensor& a,
+    const at::Tensor& b,
+    const at::Tensor& dt_bias,
+    const at::Tensor& neg_a,
+    const at::Tensor& state_pool,
+    const state_rows& rows,
+    int64_t tokens_per_sequence,
+    int64_t key_heads,
+    const at::Tensor& z,
+    const at::Tensor& norm_weight,
+    double eps,
+    gate_activation activation,
+    const at::Tensor& counters
+) {
+    return gated_delta_rule(
+        x,
+        a,
+        b,
+        dt_bias,
+        neg_a,
+        state_pool,
+        rows,
+        std::nullopt,
+        tokens_per_sequence,
+        true,
+        key_heads,
+        z,
+        norm_weight,
+        eps,
+        activation,
+        counters
+    );
 }
 
 }  // namespace pulsarlm

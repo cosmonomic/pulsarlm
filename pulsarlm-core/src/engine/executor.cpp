@@ -46,7 +46,9 @@ group_batch to_device(const group_batch& host, at::Device device) {
     return group_batch{
         .tokens = to_device(host.tokens, device),
         .pos = to_device(host.pos, device),
-        .page_end_tokens = to_device(host.page_end_tokens, device),
+        .history_positions = to_device(host.history_positions, device),
+        .rejected_tokens = to_device(host.rejected_tokens, device),
+        .page_size = host.page_size,
         .cu_seqlens_q = to_device(host.cu_seqlens_q, device),
         .key_counts = to_device(host.key_counts, device),
         .cu_view_pages = to_device(host.cu_view_pages, device),
@@ -114,11 +116,6 @@ class executor::batch {
     std::vector<std::size_t> step_ends;
     std::vector<std::size_t> sampled_positions;
     std::vector<bool> ends_sequence;
-    // Per entry, whether its tokens fill a page; for those of a model with recurrent layers, per KV layer, the
-    // recurrent layers' lines the step writes the state at that page's end into (sequence::switch_boundary_lines),
-    // empty for the other entries.
-    std::vector<bool> fills_page;
-    std::vector<std::vector<std::uint32_t>> boundary_lines;
     bool quiet = false;
     // Per shard, completing once the step's work on its stream has, and an event recorded after that work.
     std::vector<external_task<cudaError_t>> completions;
@@ -219,6 +216,7 @@ executor::executor(
             if (shard == 0) {
                 sliding_windows.push_back(layers[layer].sliding_window);
                 recurrent.push_back(layer_recurrent);
+                state_slots.push_back(layer_recurrent ? layers[layer].state->slots : 0);
                 mirrors.push_back(layers[layer].mirrors_held_pages);
                 mass_heads.push_back(0);
                 if (page_size == 0 && !layer_recurrent) {
@@ -227,6 +225,7 @@ executor::executor(
             }
             assert(sliding_windows[layer] == layers[layer].sliding_window && recurrent[layer] == layer_recurrent);
             assert(mirrors[layer] == layers[layer].mirrors_held_pages);
+            assert(state_slots[layer] == (layer_recurrent ? layers[layer].state->slots : 0));
             mass_heads[layer] += shard_mass_heads[shard].back();
         }
     }
@@ -243,6 +242,7 @@ executor::executor(
                     *this->shards[shard],
                     lines[shard],
                     *graph_pages,
+                    page_size,
                     shard_mass_heads[shard],
                     samples[shard]
                 )
@@ -327,13 +327,14 @@ group_batch executor::batch::make_group(std::span<const batch_entry> group, std:
     if (prefill) {
         g.cu_seqlens_q = query_starts;
     }
-    g.page_end_tokens = pinned({n_seqs}, at::kInt);
-    auto* page_end_tokens = g.page_end_tokens.mutable_data_ptr<std::int32_t>();
+    g.history_positions = pinned({n_seqs}, at::kLong);
+    auto* history_position = g.history_positions.mutable_data_ptr<std::int64_t>();
     for (std::size_t s = 0; s < group.size(); s++) {
-        std::size_t start = group[s].seq->tail.size();
-        std::size_t page_end = (start + group[s].token_count) / page_size * page_size;
-        page_end_tokens[s] = static_cast<std::int32_t>(page_end > start ? page_end - start : 0);
+        history_position[s] = static_cast<std::int64_t>(group[s].seq->history_position());
     }
+    g.rejected_tokens = pinned({n_seqs}, at::kInt);
+    g.rejected_tokens.zero_();
+    g.page_size = static_cast<std::int64_t>(page_size);
     if (measures_mass(group)) {
         g.cu_view_pages = pinned({n_kv_layers, n_seqs + 1}, at::kInt);
         g.query_weights = pinned({n_tokens}, at::kFloat);
@@ -754,9 +755,8 @@ task<std::expected<void, page_error>> executor::take_lines(sequence& seq, std::s
     std::vector<std::size_t> counts(cache.layer_count(), line_count);
     for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
         if (recurrent[layer]) {
-            // Without a stored state, the running line too.
-            counts[layer] = (*page_lines)[layer].empty() ? layer_view::recurrent_lines
-                                                         : layer_view::recurrent_lines - 1;
+            // The stored state's copy takes the last slot.
+            counts[layer] = state_slots[layer] + 2 - ((*page_lines)[layer].empty() ? 0 : 1);
         }
     }
     std::expected<std::vector<std::vector<std::uint32_t>>, page_error> allocation = cache.allocate(counts);
@@ -784,20 +784,27 @@ task<std::expected<void, page_error>> executor::take_lines(sequence& seq, std::s
     }
     for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
         layer_view& view = seq.layers[layer];
+        std::span<const std::uint32_t> allocated = (*allocation)[layer];
         if (recurrent[layer]) {
+            const std::size_t first_slots = state_slots[layer] - 1;
+            view.append_lines(allocated.first(first_slots));
+            allocated = allocated.subspan(first_slots);
             if (states[layer].empty()) {
                 for (std::size_t shard = 0; shard < shards.size(); shard++) {
                     c10::cuda::CUDAStreamGuard guard(
                         c10::cuda::getStreamFromExternal(streams[shard], lines[shard][layer].k.device().index())
                     );
-                    lines[shard][layer].k.select(0, (*allocation)[layer].front()).zero_();
+                    lines[shard][layer].k.select(0, allocated.front()).zero_();
                 }
+                view.append_lines(allocated.first(1));
+                allocated = allocated.subspan(1);
+            } else {
+                view.append_lines(states[layer]);
             }
-            view.append_lines(states[layer]);
         } else {
             view.append_lines((*page_lines)[layer]);
         }
-        view.append_lines((*allocation)[layer]);
+        view.append_lines(allocated);
     }
     // The copies of the states at head read the fetched lines.
     co_await synchronize_shards();
@@ -876,13 +883,11 @@ bool executor::quiet(std::span<const batch_entry> entries) const noexcept {
 }
 
 void executor::advance(batch& b) {
-    const bool has_recurrent = std::ranges::contains(recurrent, true);
     std::size_t sampled_row = 0;
     for (const batch_entry& e : b.entries) {
         sequence& seq = *e.seq;
         b.measured.push_back(batch::measures_mass(e));
         b.step_ends.push_back(seq.history_position() + e.token_count);
-        b.fills_page.push_back(has_recurrent && completes_page(e));
         seq.advance(e.token_count);
         b.sampled_positions.push_back(seq.history_position() + seq.pending_tokens.size());
         if (e.samples) {
@@ -923,12 +928,6 @@ task<void> executor::launch(std::vector<batch_entry> entries) {
         c10::cuda::CUDAGuard device_guard(device);
         b->ends.emplace_back().record(c10::cuda::getStreamFromExternal(streams[shard], device.index()));
         b->completions.push_back(completion_of(streams[shard]));
-    }
-    // The step read the boundary lines it writes from the tables; later steps write the other ones.
-    for (std::size_t i = 0; i < b->entries.size(); i++) {
-        b->boundary_lines.push_back(
-            b->fills_page[i] ? b->entries[i].seq->switch_boundary_lines(streams) : std::vector<std::uint32_t>()
-        );
     }
     launched.push_back(std::move(b));
 }
@@ -1033,9 +1032,7 @@ task<void> executor::write_back() {
         }
         std::size_t completed_count = seq.complete_pages(b.step_ends[i]);
         if (completed_count > 0 && has_recurrent) {
-            assert(!b.boundary_lines[i].empty());
             seq.state_pending = true;
-            seq.head_state_lines = b.boundary_lines[i];
         }
         if (b.measured[i]) {
             std::vector<batch::layer_step_mass> step_mass = b.step_mass(i, mass_heads);
@@ -1104,7 +1101,7 @@ task<void> executor::write_back() {
             if (recurrent[layer]) {
                 new_hashes[layer].push_back(*seq->head);
                 new_owners[layer].push_back(seq->lease.id());
-                new_lines[layer].push_back(seq->head_state_lines[layer]);
+                new_lines[layer].push_back(seq->head_state_line(layer));
             }
         }
     }
@@ -1162,10 +1159,9 @@ task<void> executor::write_back() {
             }
             for (std::size_t layer = 0; layer < n_layers; layer++) {
                 if (recurrent[layer]) {
-                    std::vector<std::uint32_t>& state_lines = seq->layers[layer].lines;
-                    auto head_line = std::ranges::find(state_lines, seq->head_state_lines[layer]);
-                    cache.release(layer, std::span(&*head_line, 1));
-                    *head_line = (*replacements)[layer].front();
+                    std::uint32_t& head_line = seq->head_state_line(layer);
+                    cache.release(layer, std::span(&head_line, 1));
+                    head_line = (*replacements)[layer].front();
                 }
             }
         }
@@ -1194,7 +1190,7 @@ task<void> executor::write_back() {
         if (views_changed) {
             first_stale_page = 0;
         } else if (std::ranges::contains(state_writers, &seq)) {
-            first_stale_page = layer_view::next_boundary_line;
+            first_stale_page = 0;
         }
         std::vector<std::size_t> missing_counts = seq.missing_lines();
         if (std::ranges::any_of(missing_counts, [](std::size_t count) { return count > 0; })) {

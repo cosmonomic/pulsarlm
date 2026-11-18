@@ -84,8 +84,12 @@ const std::vector<qwen4_exp_layer_type> layer_types{
     qwen4_exp_layer_type::linear_attention,
 };
 const std::vector<std::int32_t> view_lines{3, 0, 5, 1};
+// A recurrent layer's lines: its slots, the last running_line, then the boundary lines of its even and odd pages; the
+// state after token 47 ends page 2. Slots before the last take earlier_slot_lines.
 constexpr std::int32_t running_line = 2;
 constexpr std::int32_t boundary_line = 4;
+constexpr std::int32_t odd_boundary_line = 0;
+const std::vector<std::int32_t> earlier_slot_lines{1, 3};
 constexpr std::int64_t n_lines = 6;
 constexpr std::int64_t n_tokens = 49;
 const std::vector<std::int64_t> eos_positions{5, 20, 21, 40};
@@ -610,23 +614,33 @@ pulsarlm::group_batch step(
     bool prefill,
     const std::vector<pulsarlm::kv_layer>& specs
 ) {
-    std::vector<std::int32_t> rows;
+    std::size_t width = view_lines.size();
     for (const pulsarlm::kv_layer& spec : specs) {
         if (spec.state) {
-            rows.insert(rows.end(), {running_line, boundary_line});
-            rows.resize(rows.size() + view_lines.size() - 2, 0);
+            width = std::max(width, spec.state->slots + 2);
+        }
+    }
+    std::vector<std::int32_t> rows;
+    for (const pulsarlm::kv_layer& spec : specs) {
+        const std::size_t row_end = rows.size() + width;
+        if (spec.state) {
+            REQUIRE(spec.state->slots <= earlier_slot_lines.size() + 1);
+            rows.insert(rows.end(), earlier_slot_lines.begin(), earlier_slot_lines.begin() + spec.state->slots - 1);
+            rows.insert(rows.end(), {running_line, boundary_line, odd_boundary_line});
         } else {
             rows.insert(rows.end(), view_lines.begin(), view_lines.end());
         }
+        rows.resize(row_end, 0);
     }
-    std::int64_t page_end = last / page_size * page_size;
     auto n_kv_layers = static_cast<std::int64_t>(specs.size());
     auto key_count = int32_cuda({static_cast<std::int32_t>(last)}).expand({n_kv_layers, 1}).contiguous();
     pulsarlm::group_batch g{
         .tokens = tokens.narrow(0, first, last - first),
         .pos = at::arange(first, last, cuda(at::kLong)),
         .page_tables = int32_cuda(rows).view({n_kv_layers, 1, -1}),
-        .page_end_tokens = int32_cuda({static_cast<std::int32_t>(page_end > first ? page_end - first : 0)}),
+        .history_positions = at::full({1}, first, cuda(at::kLong)),
+        .rejected_tokens = int32_cuda({0}),
+        .page_size = page_size,
         .page_positions = (at::arange(static_cast<std::int64_t>(rows.size()) / n_kv_layers, cuda(at::kInt)) * page_size)
                               .expand({n_kv_layers, 1, -1})
                               .contiguous(),
@@ -812,9 +826,17 @@ held_rows(const at::Tensor& full, std::int64_t dim, const std::vector<std::pair<
     return at::cat(parts, dim);
 }
 
-void check_against_dense(at::ScalarType dtype, double tolerance, std::int64_t experts_per_token, std::int64_t budget) {
+// A model with draft_tokens keeps their states' slots and their windows' inputs too, which ordinary groups leave
+// unread.
+void check_against_dense(
+    at::ScalarType dtype,
+    double tolerance,
+    std::int64_t experts_per_token,
+    std::int64_t budget,
+    std::int64_t draft_tokens
+) {
     weights w(dtype, base_dims);
-    pulsarlm::qwen4_exp_model model(model_config(w.dims, experts_per_token, budget), w.named_tensors);
+    pulsarlm::qwen4_exp_model model(model_config(w.dims, experts_per_token, budget), w.named_tensors, draft_tokens);
     std::vector<pulsarlm::kv_layer> specs = model.kv_layers();
     REQUIRE(specs.size() == 9);
     std::vector<pulsarlm::kv> kv = make_lines(specs, dtype);
@@ -841,28 +863,41 @@ void check_against_dense(at::ScalarType dtype, double tolerance, std::int64_t ex
         CHECK(max_relative_error(states[running_line], dense.states[layer][n_tokens - 1]) < tolerance);
         CHECK(max_relative_error(states[boundary_line], dense.states[layer][47]) < tolerance);
         auto inputs = dense.conv_inputs[layer];
-        CHECK(max_relative_error(conv[running_line], inputs.narrow(0, n_tokens - 3, 3).t()) < tolerance);
-        CHECK(max_relative_error(conv[boundary_line], inputs.narrow(0, 45, 3).t()) < tolerance);
+        const std::int64_t window = 3 + draft_tokens;
+        CHECK(max_relative_error(conv[running_line], inputs.narrow(0, n_tokens - window, window).t()) < tolerance);
+        CHECK(max_relative_error(conv[boundary_line], inputs.narrow(0, 48 - window, window).t()) < tolerance);
         kv_index += 2;
         if (static_cast<std::int64_t>(layer) != ple_layer) {
             continue;
         }
         const at::Tensor& ple_conv = kv[kv_index].k;
         const at::Tensor& ple_tokens = kv[kv_index + 1].k;
+        const std::int64_t ple_window = ple_history + draft_tokens;
         CHECK(
             max_relative_error(
                 ple_conv[running_line],
-                dense.ple_conv_inputs.narrow(0, n_tokens - ple_history, ple_history).t()
+                dense.ple_conv_inputs.narrow(0, n_tokens - ple_window, ple_window).t()
             ) < tolerance
         );
         CHECK(
             max_relative_error(
                 ple_conv[boundary_line],
-                dense.ple_conv_inputs.narrow(0, 48 - ple_history, ple_history).t()
+                dense.ple_conv_inputs.narrow(0, 48 - ple_window, ple_window).t()
             ) < tolerance
         );
-        CHECK(at::equal(ple_tokens[running_line], at::bitwise_xor(tokens.narrow(0, n_tokens - 2, 2), eos)));
-        CHECK(at::equal(ple_tokens[boundary_line], at::bitwise_xor(tokens.narrow(0, 46, 2), eos)));
+        const std::int64_t token_window = 2 + draft_tokens;
+        CHECK(
+            at::equal(
+                ple_tokens[running_line],
+                at::bitwise_xor(tokens.narrow(0, n_tokens - token_window, token_window), eos)
+            )
+        );
+        CHECK(
+            at::equal(
+                ple_tokens[boundary_line],
+                at::bitwise_xor(tokens.narrow(0, 48 - token_window, token_window), eos)
+            )
+        );
         kv_index += 2;
     }
 }
@@ -901,7 +936,7 @@ void check_sharded(
 ) {
     weights w(dtype, dims);
     pulsarlm::qwen4_exp_config config = model_config(w.dims, experts_per_token, budget);
-    pulsarlm::qwen4_exp_model single(config, w.named_tensors);
+    pulsarlm::qwen4_exp_model single(config, w.named_tensors, /*draft_tokens=*/0);
     std::vector<pulsarlm::kv_layer> specs = single.kv_layers();
     std::vector<pulsarlm::kv> single_lines = make_lines(specs, dtype);
 
@@ -917,6 +952,7 @@ void check_sharded(
             std::make_unique<pulsarlm::qwen4_exp_model>(
                 config,
                 rank_weights(w, rank, gpus, expert_parallel),
+                /*draft_tokens=*/0,
                 ranks[rank]
             )
         );
@@ -984,7 +1020,7 @@ TEST_CASE("Qwen4-Exp kv_layers add a PLE layer's convolution and token lines", "
         SKIP("no CUDA device");
     }
     weights w(at::kFloat, base_dims);
-    pulsarlm::qwen4_exp_model model(model_config(w.dims, 2, 8), w.named_tensors);
+    pulsarlm::qwen4_exp_model model(model_config(w.dims, 2, 8), w.named_tensors, /*draft_tokens=*/0);
     std::vector<pulsarlm::kv_layer> specs = model.kv_layers();
     REQUIRE(specs.size() == 9);
     CHECK(specs[4].state->sizes == std::vector<std::int64_t>{hc * hidden, ple_history});
@@ -999,7 +1035,14 @@ TEST_CASE("Qwen4-Exp matches a dense forward in fp32", "[model][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
-    check_against_dense(at::kFloat, 1e-4, 2, 8);
+    check_against_dense(at::kFloat, 1e-4, 2, 8, /*draft_tokens=*/0);
+}
+
+TEST_CASE("Qwen4-Exp keeping two drafts' states and inputs matches a dense forward in fp32", "[model][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    check_against_dense(at::kFloat, 1e-4, 2, 8, /*draft_tokens=*/2);
 }
 
 // A token's top experts and top blocks change with bf16's rounding of its router logits and block scores, so in bf16
@@ -1008,7 +1051,7 @@ TEST_CASE("Qwen4-Exp matches a dense forward in bf16", "[model][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
-    check_against_dense(at::kBFloat16, 5e-2, n_experts, n_tokens * compress_ratio);
+    check_against_dense(at::kBFloat16, 5e-2, n_experts, n_tokens * compress_ratio, /*draft_tokens=*/0);
 }
 
 TEST_CASE("Qwen4-Exp split across 2 GPUs matches a dense forward in fp32", "[model][cuda]") {
@@ -1052,7 +1095,7 @@ TEST_CASE("Qwen4-Exp rejects held experts that are neither every expert nor an e
     }
     std::vector<pulsarlm::communicator> ranks = pulsarlm::communicator::make_on_one_device(at::Device(at::kCUDA, 0), 2);
     REQUIRE_THROWS_AS(
-        pulsarlm::qwen4_exp_model(model_config(w.dims, 2, 8), parts, ranks.front()),
+        pulsarlm::qwen4_exp_model(model_config(w.dims, 2, 8), parts, /*draft_tokens=*/0, ranks.front()),
         std::invalid_argument
     );
 }
@@ -1065,7 +1108,7 @@ TEST_CASE("Qwen4-Exp rejects a split that is not whole heads", "[model][cuda]") 
     weights w(at::kFloat, base_dims);
     std::vector<pulsarlm::communicator> ranks = pulsarlm::communicator::make_on_one_device(at::Device(at::kCUDA, 0), 4);
     REQUIRE_THROWS_AS(
-        pulsarlm::qwen4_exp_model(model_config(w.dims, 2, 8), w.named_tensors, ranks.front()),
+        pulsarlm::qwen4_exp_model(model_config(w.dims, 2, 8), w.named_tensors, /*draft_tokens=*/0, ranks.front()),
         std::invalid_argument
     );
 }
@@ -1087,7 +1130,11 @@ TEST_CASE("Qwen4-Exp drafts as a dense MTP layer a position after each row", "[m
     const std::int64_t experts_per_token = 2;
     const std::int64_t budget = 8;
     weights w(at::kFloat, base_dims, /*drafts=*/true);
-    pulsarlm::qwen4_exp_model model(model_config(w.dims, experts_per_token, budget), w.named_tensors);
+    pulsarlm::qwen4_exp_model model(
+        model_config(w.dims, experts_per_token, budget),
+        w.named_tensors,
+        /*draft_tokens=*/0
+    );
     pulsarlm::draft_head* drafter = model.drafter();
     REQUIRE(drafter != nullptr);
     REQUIRE(drafter->hidden_dim() == hc * hidden);
@@ -1139,7 +1186,12 @@ void check_sharded_draft(const split_dims& dims, std::size_t gpus) {
     std::vector<c10::cuda::CUDAStream> streams;
     for (std::size_t rank = 0; rank < gpus; rank++) {
         shards.push_back(
-            std::make_unique<pulsarlm::qwen4_exp_model>(config, rank_weights(w, rank, gpus, false), ranks[rank])
+            std::make_unique<pulsarlm::qwen4_exp_model>(
+                config,
+                rank_weights(w, rank, gpus, false),
+                /*draft_tokens=*/0,
+                ranks[rank]
+            )
         );
         lines.push_back(make_lines(shards.back()->kv_layers(), at::kFloat));
         streams.push_back(c10::cuda::getStreamFromPool(false, 0));

@@ -176,9 +176,9 @@ pulsarlm::group_batch step(const at::Tensor& tokens, std::int64_t first, std::in
         .tokens = tokens.narrow(0, first, last - first),
         .pos = at::arange(first, last, cuda(at::kLong)),
         .page_tables = every_layer(int32_cuda(view_lines).view({1, -1})),
-        .page_end_tokens = int32_cuda(
-            {static_cast<std::int32_t>(last / page_size * page_size > first ? last / page_size * page_size - first : 0)}
-        ),
+        .history_positions = at::full({1}, first, cuda(at::kLong)),
+        .rejected_tokens = int32_cuda({0}),
+        .page_size = page_size,
         .page_positions = every_layer(
             (at::arange(static_cast<std::int64_t>(view_lines.size()), cuda(at::kInt)) * page_size).view({1, -1})
         ),
@@ -236,6 +236,7 @@ void check_against_dense(at::ScalarType dtype, double tolerance, bool graphs) {
         model,
         kv,
         view_lines.size(),
+        page_size,
         std::vector<std::size_t>(n_layers, static_cast<std::size_t>(n_heads)),
         samples
     );

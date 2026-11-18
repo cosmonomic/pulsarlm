@@ -105,6 +105,16 @@ at::Tensor paged_attention(
     return o;
 }
 
+state_rows recurrent_rows(const group_batch& g, std::size_t kv_layer, std::int64_t slots) {
+    return state_rows{
+        .lines = g.page_tables.select(0, static_cast<std::int64_t>(kv_layer)),
+        .slots = slots,
+        .history_positions = g.history_positions,
+        .rejected_tokens = g.rejected_tokens,
+        .page_size = g.page_size,
+    };
+}
+
 at::Tensor logit_inputs(const at::Tensor& x, const group_batch& g) {
     return g.logit_rows.defined() ? x.index_select(0, g.logit_rows) : x;
 }

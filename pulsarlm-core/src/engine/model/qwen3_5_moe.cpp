@@ -197,9 +197,8 @@ at::Tensor qwen3_5_moe_model::deltanet(
         at::linear(h, w.in_proj_qkv),
         w.conv,
         lines[conv_layer].k,
-        g.page_tables.select(0, static_cast<std::int64_t>(conv_layer)),
+        recurrent_rows(g, conv_layer, 1),
         cu_seqlens_q,
-        g.page_end_tokens,
         /*dilation=*/1
     );
     at::Tensor gated = gated_delta_rule_cuda(
@@ -209,9 +208,8 @@ at::Tensor qwen3_5_moe_model::deltanet(
         w.dt_bias,
         w.neg_a,
         lines[state_layer].k,
-        g.page_tables.select(0, static_cast<std::int64_t>(state_layer)),
+        recurrent_rows(g, state_layer, 1),
         cu_seqlens_q,
-        g.page_end_tokens,
         c.linear_n_key_heads,
         at::linear(h, w.in_proj_z),
         w.norm,

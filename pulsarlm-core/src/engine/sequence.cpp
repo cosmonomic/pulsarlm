@@ -103,6 +103,7 @@ sequence::sequence(
   head(last_state->head),
   prompt_digests(std::move(digests)),
   recurrent(owner.recurrent),
+  state_slots(owner.state_slots),
   mirrors(owner.mirrors),
   sliding_windows(owner.sliding_windows),
   page_size(owner.page_size),
@@ -240,17 +241,9 @@ std::size_t sequence::complete_pages(std::size_t end) {
     return full_page_count;
 }
 
-std::vector<std::uint32_t> sequence::switch_boundary_lines(std::span<const cudaStream_t> streams) {
-    std::vector<std::uint32_t> written(layers.size(), 0);
-    for (std::size_t layer = 0; layer < layers.size(); layer++) {
-        if (recurrent[layer]) {
-            std::vector<std::uint32_t>& lines = layers[layer].lines;
-            written[layer] = lines[layer_view::next_boundary_line];
-            std::swap(lines[layer_view::next_boundary_line], lines[layer_view::previous_boundary_line]);
-        }
-    }
-    upload_columns(layer_view::next_boundary_line, layer_view::previous_boundary_line + 1, streams);
-    return written;
+std::uint32_t& sequence::head_state_line(std::size_t layer) {
+    assert(recurrent[layer] && history_pages > 0);
+    return layers[layer].lines[state_slots[layer] + (history_pages - 1) % 2];
 }
 
 void sequence::resolve_token(std::size_t index, std::int64_t token) {
@@ -349,10 +342,6 @@ std::size_t sequence::table_width() const noexcept {
 }
 
 void sequence::upload_table(std::size_t first_page, std::span<const cudaStream_t> streams) {
-    upload_columns(first_page, table_width(), streams);
-}
-
-void sequence::upload_columns(std::size_t first_page, std::size_t end_page, std::span<const cudaStream_t> streams) {
     auto n_layers = static_cast<std::int64_t>(layers.size());
     auto width = static_cast<std::int64_t>(table_width());
     if (tables.front().size(1) < width) {
@@ -362,9 +351,8 @@ void sequence::upload_columns(std::size_t first_page, std::size_t end_page, std:
             position_tables[shard] = at::empty_like(tables[shard]);
         }
         first_page = 0;
-        end_page = table_width();
     }
-    auto page_count = static_cast<std::int64_t>(end_page);
+    auto page_count = width;
     auto first = static_cast<std::int64_t>(first_page);
     if (first == page_count) {
         return;
@@ -402,8 +390,7 @@ std::vector<std::size_t> sequence::missing_lines() const {
     std::vector<std::size_t> counts;
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
         std::size_t held_count = layers[layer].lines.size();
-        std::size_t needed = recurrent[layer] ? layer_view::recurrent_lines
-                                              : ceil_div(next_index(layer) + left, page_size);
+        std::size_t needed = recurrent[layer] ? state_slots[layer] + 2 : ceil_div(next_index(layer) + left, page_size);
         counts.push_back(needed > held_count ? needed - held_count : 0);
     }
     return counts;

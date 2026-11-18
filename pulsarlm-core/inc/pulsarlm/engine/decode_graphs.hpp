@@ -32,6 +32,7 @@ class decode_graphs {
     std::vector<kv> lines;
     at::Tensor samples;
     std::int64_t width;
+    std::int64_t page_size;
     // Per KV layer, the query heads whose mass this GPU measures, 0 for a layer that measures none.
     std::vector<std::size_t> mass_heads;
     // Per KV layer, mass_sum then weight_sum rows for startup_sequences sequences' views, shared by the graphs of up to
@@ -49,13 +50,14 @@ class decode_graphs {
     // The decoding sequences whose graphs capture_startup records.
     static constexpr std::int64_t startup_sequences = 8;
 
-    // Graphs over page tables width pages wide. mass_heads holds, per entry of the model's kv_layers(), the query heads
+    // Graphs over page tables width pages wide, of pages page_size tokens long. mass_heads holds, per entry of the model's kv_layers(), the query heads
     // whose mass this GPU measures. lines is on the current device, and so is samples, int64, which holds the previous
     // step's sampled tokens at each replay.
     decode_graphs(
         model& shard_model,
         std::span<const kv> lines,
         std::size_t width,
+        std::size_t page_size,
         std::vector<std::size_t> mass_heads,
         at::Tensor samples
     );

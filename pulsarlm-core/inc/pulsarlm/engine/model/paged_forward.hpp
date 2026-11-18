@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pulsarlm/engine/model/interface.hpp"
+#include "pulsarlm/kernels/ops.hpp"
 #include "pulsarlm/kernels/rope.hpp"
 
 #include <ATen/core/Tensor.h>
@@ -37,6 +38,9 @@ at::Tensor paged_attention(
     std::optional<int64_t> sliding_window = std::nullopt,
     const std::optional<at::Tensor>& k_norm_weight = std::nullopt
 );
+
+// KV layer kv_layer's state rows of g, each sequence keeping slots state lines.
+state_rows recurrent_rows(const group_batch& g, std::size_t kv_layer, std::int64_t slots);
 
 // The rows of x whose logits g asks for.
 at::Tensor logit_inputs(const at::Tensor& x, const group_batch& g);

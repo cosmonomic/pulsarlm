@@ -122,22 +122,49 @@ routed_experts_counters(int64_t tokens, int64_t top_k, int64_t held_experts, int
 // An op taking counters takes int32 zeros on its tensors' device, at least as many as its count function gives, and
 // leaves them zero (arrival_counters.cuh); the ordered calls of one stream may share them.
 
+// Where a ragged batch's sequences keep their recurrent state. Per sequence, lines [num_seqs, >= slots + 2] int32 holds
+// slots lines holding states, then the boundary lines of its even and odd pages. history_positions (int64 [num_seqs])
+// is the history position of each sequence's first token in the batch, and rejected_tokens (int32 [num_seqs]) the
+// tokens its previous step forwarded and did not keep. A sequence continues from slot slots - 1 - min(rejected_tokens[s],
+// slots - 1): a layer keeping a state per token has a slot per token a step may not keep and one more, a layer keeping
+// a window of inputs one slot whose window it reads rejected_tokens[s] inputs earlier. A token at history position p
+// ends a page when p + 1 is a multiple of page_size, and the state after it goes to the boundary line of page p /
+// page_size, alternating between the two.
+struct state_rows {
+    at::Tensor lines;
+    std::int64_t slots;
+    at::Tensor history_positions;
+    at::Tensor rejected_tokens;
+    std::int64_t page_size;
+};
+
 // The Gated DeltaNet ops run a ragged batch: sequence s holds tokens [cu_seqlens_q[s], cu_seqlens_q[s + 1]) of x, or
-// token s alone without cu_seqlens_q. rows [num_seqs, >= 2] int32 holds each sequence's running line, whose state the
-// sequence continues and which then holds the state after its last token, and its boundary line, which receives the
-// state after its first page_end_tokens[s] tokens when page_end_tokens[s] > 0. A pool's lines lie any number of
-// elements apart, a state pool's lines 16-byte aligned.
+// token s alone without cu_seqlens_q; a verify op's batch holds tokens_per_sequence tokens of each sequence in turn. The
+// state after the batch's last token of a sequence goes to its last slot, the state after its newest page end to that
+// page's boundary line; a verify op writes the state after each token t of a sequence into slot t instead. A pool's
+// lines lie any number of elements apart, a state pool's lines 16-byte aligned.
 
 // silu of the causal depthwise convolution of x [tokens, channels], whose rows may lie apart, by weight [channels, 1,
-// kernel] with its taps dilation tokens apart, contiguous in x's dtype. A line of conv_pool [lines, channels, (kernel - 1) * dilation] holds the
-// (kernel - 1) * dilation inputs before a sequence's next token.
+// kernel] with its taps dilation tokens apart, contiguous in x's dtype. A line of conv_pool [lines, channels, window]
+// holds the last window inputs before a sequence's next token, window at least (kernel - 1) * dilation and the extra
+// ones the inputs of up to slots - 1 tokens a step does not keep: the convolution reads those that end window -
+// rejected_tokens[s] entries in. rows.slots is 1.
 at::Tensor causal_conv_cuda(
     const at::Tensor& x,
     const at::Tensor& weight,
     const at::Tensor& conv_pool,
-    const at::Tensor& rows,
+    const state_rows& rows,
     const std::optional<at::Tensor>& cu_seqlens_q,
-    const at::Tensor& page_end_tokens,
+    std::int64_t dilation
+);
+
+// causal_conv_cuda over tokens_per_sequence tokens of each sequence; the line keeps the inputs after the last.
+at::Tensor causal_conv_verify_cuda(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& conv_pool,
+    const state_rows& rows,
+    std::int64_t tokens_per_sequence,
     std::int64_t dilation
 );
 
@@ -157,9 +184,8 @@ at::Tensor gated_delta_rule_cuda(
     const at::Tensor& dt_bias,
     const at::Tensor& neg_a,
     const at::Tensor& state_pool,
-    const at::Tensor& rows,
+    const state_rows& rows,
     const std::optional<at::Tensor>& cu_seqlens_q,
-    const at::Tensor& page_end_tokens,
     int64_t key_heads,
     const at::Tensor& z,
     const at::Tensor& norm_weight,
@@ -168,7 +194,26 @@ at::Tensor gated_delta_rule_cuda(
     const at::Tensor& counters
 );
 
-// The arrival counters gated_delta_rule_cuda needs for a step of num_seqs sequences.
+// gated_delta_rule_cuda over tokens_per_sequence tokens of each sequence, at most rows.slots, writing the state after
+// each token t into slot t.
+at::Tensor gated_delta_rule_verify_cuda(
+    const at::Tensor& x,
+    const at::Tensor& a,
+    const at::Tensor& b,
+    const at::Tensor& dt_bias,
+    const at::Tensor& neg_a,
+    const at::Tensor& state_pool,
+    const state_rows& rows,
+    int64_t tokens_per_sequence,
+    int64_t key_heads,
+    const at::Tensor& z,
+    const at::Tensor& norm_weight,
+    double eps,
+    gate_activation activation,
+    const at::Tensor& counters
+);
+
+// The arrival counters gated_delta_rule_cuda and gated_delta_rule_verify_cuda need for num_seqs sequences.
 int64_t gated_delta_rule_counters(int64_t num_seqs, int64_t value_heads);
 
 // Writes a batch's new keys and values into the lines of paged pools. k_pool and v_pool are [lines, page_size,

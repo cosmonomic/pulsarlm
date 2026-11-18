@@ -15,6 +15,8 @@ namespace pulsarlm {
 struct recurrent_state {
     std::vector<std::int64_t> sizes;
     at::ScalarType dtype;
+    // The lines holding states a sequence keeps, besides its two boundary lines (state_rows).
+    std::size_t slots = 1;
 
     bool operator==(const recurrent_state&) const = default;
 };
@@ -61,12 +63,13 @@ struct group_batch {
     // int64 [ntok]: each token's RoPE position.
     at::Tensor pos;
     // int32 [n_kv_layers, num_seqs, max_pages]: the lines of sequence s's view pages in KV layer l. A recurrent layer's
-    // row holds the line whose state the forward starts from and updates in place, then the line it writes the state
-    // after page_end_tokens[s] of the sequence's tokens into.
+    // row holds the sequence's state lines, its slots then its boundary lines (state_rows).
     at::Tensor page_tables;
-    // int32 [num_seqs]: the number of sequence s's tokens in the group whose last ends its newest full page, 0 when none
-    // of them ends a page.
-    at::Tensor page_end_tokens;
+    // int64 [num_seqs]: the history position of each sequence's first token in the group.
+    at::Tensor history_positions;
+    // int32 [num_seqs]: the tokens each sequence's previous step forwarded and did not keep.
+    at::Tensor rejected_tokens;
+    std::int64_t page_size = 0;
     // int32 [num_seqs + 1]; prefill groups only.
     at::Tensor cu_seqlens_q;
     // int32 [n_kv_layers, num_seqs]: the keys in sequence s's view in KV layer l, the group's tokens included.

@@ -44,6 +44,8 @@ class executor {
     std::optional<std::size_t> graph_pages;
     std::vector<std::optional<std::size_t>> sliding_windows;
     std::vector<bool> recurrent;
+    // Per KV layer, its recurrent_state::slots when it is recurrent, 0 otherwise.
+    std::vector<std::size_t> state_slots;
     // Per KV layer, whether it mirrors the pages the other attention layers hold (kv_layer::mirrors_held_pages).
     std::vector<bool> mirrors;
     // Per KV layer, the query heads it measures mass and evicts pages in: those of every attention layer reading a

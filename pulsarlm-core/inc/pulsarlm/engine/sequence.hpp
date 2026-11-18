@@ -44,17 +44,10 @@ class lease_guard {
 // One KV layer's view of a sequence. A layer with pages has one line per view page: its full pages, each with its index
 // in the history, then the pages of tail and pending. A layer that measures mass keeps, per line, mass_heads mass_sum
 // values and one weight_sum (add_step_mass), as of the last step that measured them, 0 for a page never measured, and
-// the moments of the pages it sampled (add_sampled_page). A recurrent layer has no pages: its lines are the one its
-// state is updated in, then the one the next step completing a page writes the state at that page's end into, then
-// the other such line, which the step before it wrote.
+// the moments of the pages it sampled (add_sampled_page). A recurrent layer has no pages: its lines are its state
+// slots, then the lines holding the state at the end of its even and of its odd pages (state_rows).
 class layer_view {
   public:
-    // A recurrent layer's lines, by position.
-    static constexpr std::size_t running_line = 0;
-    static constexpr std::size_t next_boundary_line = 1;
-    static constexpr std::size_t previous_boundary_line = 2;
-    static constexpr std::size_t recurrent_lines = 3;
-
     std::vector<digest> pages;
     std::vector<std::size_t> indices;
     std::vector<std::uint32_t> lines;
@@ -101,6 +94,7 @@ class sequence {
     std::size_t next_prompt_digest = 0;
     // Per KV layer, whether it is recurrent and its sliding window; the executor's.
     const std::vector<bool>& recurrent;
+    const std::vector<std::size_t>& state_slots;
     const std::vector<bool>& mirrors;
     const std::vector<std::optional<std::size_t>>& sliding_windows;
     std::size_t page_size;
@@ -109,10 +103,8 @@ class sequence {
     // The ascending history indices of the full pages some layer with pages, other than a mirroring one, holds. A full page's RoPE position is its
     // rank here times the page size, in every layer; the pages of tail and pending follow the last.
     std::vector<std::size_t> held_pages;
-    // Whether head_state_lines hold the state at head, which the store does not have yet.
+    // Whether the recurrent layers' head_state_line hold the state at head, which the store does not have yet.
     bool state_pending = false;
-    // Per KV layer, for a recurrent layer, the line holding the state at head.
-    std::vector<std::uint32_t> head_state_lines;
     // The writes of the sequence's pages to the store not waited for; shared with the tasks writing them.
     std::shared_ptr<pending_writes> page_writes = std::make_shared<pending_writes>();
     // Per shard, int32 [n_kv_layers, capacity] on its device: each view page's line, and the RoPE position of its
@@ -174,10 +166,8 @@ class sequence {
     // Moves the full pages of tail before history position end to every layer with pages, and returns how many. The
     // tokens of those pages are not awaited_token.
     std::size_t complete_pages(std::size_t end);
-    // For a step completing a page, called once the step is queued: returns, per KV layer, the line the step writes
-    // the state at the page's end into (0 for a layer with pages), makes the other boundary line the next such line,
-    // and queues the upload of both into the tables on each shard's stream.
-    std::vector<std::uint32_t> switch_boundary_lines(std::span<const cudaStream_t> streams);
+    // Recurrent KV layer layer's line holding the state at the end of head's page.
+    std::uint32_t& head_state_line(std::size_t layer);
     // Sets the token at history position index, in tail or pending, which was awaited_token.
     void resolve_token(std::size_t index, std::int64_t token);
     // Undoes the advance by one token of the latest launched step, whose pages are not completed yet, and its sample if
@@ -200,8 +190,6 @@ class sequence {
     // Queues on each shard's stream the upload of the lines and positions from column first_page on into its tables,
     // all of them when the tables grow.
     void upload_table(std::size_t first_page, std::span<const cudaStream_t> streams);
-    // upload_table of the columns [first_page, end_page), all of them when the tables grow.
-    void upload_columns(std::size_t first_page, std::size_t end_page, std::span<const cudaStream_t> streams);
     // One line per page the cycle's tokens fill, in each KV layer with pages. Called at the start of a cycle, with an
     // empty tail.
     std::size_t cycle_lines() const noexcept;

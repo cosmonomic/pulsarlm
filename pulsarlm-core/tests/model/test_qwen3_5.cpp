@@ -65,8 +65,11 @@ const std::vector<qwen3_5_layer_type> layer_types{
     qwen3_5_layer_type::linear_attention,
 };
 const std::vector<std::int32_t> view_lines{3, 0, 5, 1};
+// A recurrent layer's lines: its one slot, then the boundary lines of its even and odd pages; the state after token 47
+// ends page 2.
 constexpr std::int32_t running_line = 2;
 constexpr std::int32_t boundary_line = 4;
+constexpr std::int32_t odd_boundary_line = 0;
 constexpr std::int64_t n_lines = 6;
 constexpr std::int64_t n_tokens = 49;
 
@@ -283,20 +286,21 @@ pulsarlm::group_batch step(
     std::vector<std::int32_t> rows;
     for (const pulsarlm::kv_layer& spec : specs) {
         if (spec.state) {
-            rows.insert(rows.end(), {running_line, boundary_line});
-            rows.resize(rows.size() + view_lines.size() - 2, 0);
+            rows.insert(rows.end(), {running_line, boundary_line, odd_boundary_line});
+            rows.resize(rows.size() + view_lines.size() - 3, 0);
         } else {
             rows.insert(rows.end(), view_lines.begin(), view_lines.end());
         }
     }
-    std::int64_t page_end = last / page_size * page_size;
     auto n_kv_layers = static_cast<std::int64_t>(specs.size());
     auto key_count = int32_cuda({static_cast<std::int32_t>(last)}).expand({n_kv_layers, 1}).contiguous();
     pulsarlm::group_batch g{
         .tokens = tokens.narrow(0, first, last - first),
         .pos = at::arange(first, last, cuda(at::kLong)),
         .page_tables = int32_cuda(rows).view({n_kv_layers, 1, -1}),
-        .page_end_tokens = int32_cuda({static_cast<std::int32_t>(page_end > first ? page_end - first : 0)}),
+        .history_positions = at::full({1}, first, cuda(at::kLong)),
+        .rejected_tokens = int32_cuda({0}),
+        .page_size = page_size,
         .page_positions = (at::arange(static_cast<std::int64_t>(rows.size()) / n_kv_layers, cuda(at::kInt)) * page_size)
                               .expand({n_kv_layers, 1, -1})
                               .contiguous(),

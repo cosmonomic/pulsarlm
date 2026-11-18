@@ -66,9 +66,11 @@ std::int64_t split(std::int64_t count, std::int64_t parts, const char* what) {
 qwen4_exp_model::qwen4_exp_model(
     qwen4_exp_config config,
     const c10::Dict<std::string, at::Tensor>& weights,
+    std::int64_t draft_tokens,
     communicator comm
 )
 : config(std::move(config)),
+  draft_tokens(draft_tokens),
   comm(std::move(comm)),
   n_layers(static_cast<std::int64_t>(this->config.layer_types.size())),
   embed_tokens(need(weights, "embed_tokens.weight")) {
@@ -145,11 +147,15 @@ qwen4_exp_model::qwen4_exp_model(
         };
     };
     hyper_connection_mixer = mixer_named(prefix + "hyper_connection_mixer.");
-    auto recurrent = [](std::vector<std::int64_t> sizes, at::ScalarType dtype) {
+    auto recurrent = [](std::vector<std::int64_t> sizes, at::ScalarType dtype, std::int64_t slots = 1) {
         return kv_layer{
             .n_kv_heads = 0,
             .head_dim = 0,
-            .state = recurrent_state{.sizes = std::move(sizes), .dtype = dtype}
+            .state = recurrent_state{
+                .sizes = std::move(sizes),
+                .dtype = dtype,
+                .slots = static_cast<std::size_t>(slots)
+            }
         };
     };
     auto add_kv_layer = [&](kv_layer layer, kv_layer full, std::vector<std::pair<std::size_t, std::size_t>> held) {
@@ -246,14 +252,25 @@ qwen4_exp_model::qwen4_exp_model(
                 .out_proj = need_named(weights, p + "linear_attn.out_proj.weight"),
             };
             add_kv_layer(
-                recurrent({heads.linear_n_value_heads, c.linear_key_head_dim, c.linear_value_head_dim}, at::kFloat),
-                recurrent({c.linear_n_value_heads, c.linear_key_head_dim, c.linear_value_head_dim}, at::kFloat),
+                recurrent(
+                    {heads.linear_n_value_heads, c.linear_key_head_dim, c.linear_value_head_dim},
+                    at::kFloat,
+                    draft_tokens + 1
+                ),
+                recurrent(
+                    {c.linear_n_value_heads, c.linear_key_head_dim, c.linear_value_head_dim},
+                    at::kFloat,
+                    draft_tokens + 1
+                ),
                 {rows(rank * heads.linear_n_value_heads, heads.linear_n_value_heads)}
             );
             add_kv_layer(
-                recurrent({2 * key_channels + value_channels, c.linear_conv_kernel - 1}, embed_tokens.scalar_type()),
                 recurrent(
-                    {2 * full_key_channels + full_value_channels, c.linear_conv_kernel - 1},
+                    {2 * key_channels + value_channels, c.linear_conv_kernel - 1 + draft_tokens},
+                    embed_tokens.scalar_type()
+                ),
+                recurrent(
+                    {2 * full_key_channels + full_value_channels, c.linear_conv_kernel - 1 + draft_tokens},
                     embed_tokens.scalar_type()
                 ),
                 {rows(rank * key_channels, key_channels),
@@ -285,8 +302,8 @@ qwen4_exp_model::qwen4_exp_model(
                 throw std::invalid_argument("qwen4_exp_model: the n-gram buffers must match ngram_size");
             }
             const std::int64_t history = (w.ple->conv.size(2) - 1) * c.ngram_size;
-            whole({c.hc_count * c.hidden_size, history}, embed_tokens.scalar_type());
-            whole({c.ngram_size - 1}, at::kLong);
+            whole({c.hc_count * c.hidden_size, history + draft_tokens}, embed_tokens.scalar_type());
+            whole({c.ngram_size - 1 + draft_tokens}, at::kLong);
         }
         layers.push_back(std::move(w));
     };
@@ -559,9 +576,8 @@ at::Tensor qwen4_exp_model::deltanet(
         projected.narrow(1, 0, channels),
         w.conv,
         lines[conv_layer].k,
-        g.page_tables.select(0, static_cast<std::int64_t>(conv_layer)),
+        recurrent_rows(g, conv_layer, 1),
         cu_seqlens_q,
-        g.page_end_tokens,
         /*dilation=*/1
     );
     at::Tensor gated = gated_delta_rule_cuda(
@@ -571,9 +587,8 @@ at::Tensor qwen4_exp_model::deltanet(
         w.dt_bias,
         w.neg_a,
         lines[state_layer].k,
-        g.page_tables.select(0, static_cast<std::int64_t>(state_layer)),
+        recurrent_rows(g, state_layer, draft_tokens + 1),
         cu_seqlens_q,
-        g.page_end_tokens,
         heads.linear_n_key_heads,
         projected.narrow(1, channels + 2 * value_heads, value_heads * c.linear_value_head_dim),
         w.norm,
@@ -611,35 +626,43 @@ at::Tensor qwen4_exp_model::moe(const at::Tensor& h, std::int64_t layer, const a
 
 // Hugging Face shifts each sequence right by k with EOS in the places before the sequence's start and before a token
 // following an EOS, so a token's k-th previous token is EOS when any of its previous k is EOS.
+// A token line keeps the last window tokens before a sequence's next one, each XOR eos_token_id, the n-gram context and
+// the tokens of up to draft_tokens tokens a step does not keep; after a step that did not keep its last rejected
+// tokens, the valid ones end window - rejected entries in.
 at::Tensor
 qwen4_exp_model::ngram_ids(const ple_weights& w, std::size_t token_layer, const group_batch& g, const kv& lines) const {
     const std::int64_t ntok = g.tokens.size(0);
     const std::int64_t context = config.ngram_size - 1;
     const std::int64_t eos = config.eos_token_id;
+    const std::int64_t window = lines.k.size(1);
     const auto longs = g.tokens.options().dtype(at::kLong);
     at::Tensor rows = g.page_tables.select(0, static_cast<std::int64_t>(token_layer)).to(at::kLong);
-    at::Tensor running = rows.select(1, 0);
-    at::Tensor boundary = rows.select(1, 1);
+    at::Tensor slot = rows.select(1, 0);
     const std::int64_t num_seqs = rows.size(0);
     at::Tensor starts = g.is_prefill() ? g.cu_seqlens_q.to(at::kLong) : at::arange(num_seqs + 1, longs);
     at::Tensor counts = starts.narrow(0, 1, num_seqs) - starts.narrow(0, 0, num_seqs);
+    at::Tensor valid = window - g.rejected_tokens.to(at::kLong);
     at::Tensor sequence_of = at::repeat_interleave(counts, std::optional<std::int64_t>(ntok));
     at::Tensor local = at::arange(ntok, longs) - starts.index_select(0, sequence_of);
 
-    // Each sequence's history is its last context tokens, then its tokens in the group.
+    // Entry c of a sequence's inputs: its line's valid entries, then its tokens in the group, EOS before the first.
     at::Tensor tokens = g.tokens.to(at::kLong);
-    at::Tensor history = at::cat({at::bitwise_xor(lines.k.index_select(0, running), eos).flatten(), tokens});
-    auto history_at = [&](const at::Tensor& sequence, const at::Tensor& index) {
-        at::Tensor before = sequence * context + index;
-        at::Tensor after = num_seqs * context + starts.index_select(0, sequence.flatten()).view(sequence.sizes()) +
-            index - context;
-        return history.index_select(0, at::where(index < context, before, after).flatten()).view(index.sizes());
+    at::Tensor inputs = at::cat({at::bitwise_xor(lines.k.index_select(0, slot), eos).flatten(), tokens});
+    auto input_at = [&](const at::Tensor& sequence, const at::Tensor& c) {
+        at::Tensor flat_sequence = sequence.flatten();
+        at::Tensor flat_c = c.flatten();
+        at::Tensor sequence_valid = valid.index_select(0, flat_sequence);
+        at::Tensor in_line = flat_sequence * window + flat_c.clamp(0, window - 1);
+        at::Tensor in_group = num_seqs * window + starts.index_select(0, flat_sequence) + flat_c - sequence_valid;
+        at::Tensor read = inputs.index_select(0, at::where(flat_c < sequence_valid, in_line, in_group.clamp_min(0)));
+        return at::where(flat_c < 0, eos, read).view(c.sizes());
     };
 
     std::vector<at::Tensor> shifted{tokens};
     at::Tensor after_eos = at::zeros({ntok}, longs.dtype(at::kBool));
+    at::Tensor own = valid.index_select(0, sequence_of) + local;
     for (std::int64_t k = 1; k <= context; k++) {
-        at::Tensor previous = history_at(sequence_of, local + context - k);
+        at::Tensor previous = input_at(sequence_of, own - k);
         after_eos = after_eos.logical_or(previous.eq(eos));
         shifted.push_back(at::where(after_eos, eos, previous));
     }
@@ -655,17 +678,27 @@ qwen4_exp_model::ngram_ids(const ple_weights& w, std::size_t token_layer, const 
         ids.push_back(at::remainder(mixed.unsqueeze(-1), sizes) + offsets);
     }
 
-    at::Tensor sequences = at::arange(num_seqs, longs).unsqueeze(1).expand({num_seqs, context});
-    at::Tensor last = at::arange(context, longs).unsqueeze(0);
-    at::Tensor ends = history_at(sequences, counts.unsqueeze(1) + last);
-    at::Tensor page_ends = g.page_end_tokens.to(at::kLong).unsqueeze(1);
+    // The window after the group's first count tokens of each sequence.
+    at::Tensor sequences = at::arange(num_seqs, longs).unsqueeze(1).expand({num_seqs, window});
+    at::Tensor entries = at::arange(window, longs).unsqueeze(0);
+    auto window_after = [&](const at::Tensor& count) {
+        return at::bitwise_xor(input_at(sequences, valid.unsqueeze(1) + count.unsqueeze(1) - window + entries), eos);
+    };
+    at::Tensor history = g.history_positions;
+    at::Tensor page_ends = at::floor_divide(history + counts, g.page_size) * g.page_size - history;
+    at::Tensor boundary = rows.gather(
+                                  1,
+                                  (1 + at::remainder(at::floor_divide(history + page_ends, g.page_size) - 1, 2))
+                                      .unsqueeze(1)
+    )
+                              .squeeze(1);
     at::Tensor at_page_end = at::where(
-        page_ends > 0,
-        at::bitwise_xor(history_at(sequences, page_ends + last), eos),
+        (page_ends > 0).unsqueeze(1),
+        window_after(page_ends.clamp_min(0)),
         lines.k.index_select(0, boundary)
     );
-    lines.k.index_copy_(0, running, at::bitwise_xor(ends, eos));
     lines.k.index_copy_(0, boundary, at_page_end);
+    lines.k.index_copy_(0, slot, window_after(counts));
     return at::cat(ids, -1);
 }
 
@@ -692,9 +725,8 @@ qwen4_exp_model::ple(const at::Tensor& x, std::int64_t layer, const group_batch&
         stream_norm(gated, w.norm_conv),
         w.conv,
         lines[conv_layer].k,
-        g.page_tables.select(0, static_cast<std::int64_t>(conv_layer)),
+        recurrent_rows(g, conv_layer, 1),
         cu_seqlens_q,
-        g.page_end_tokens,
         c.ngram_size
     );
     return gated + convolved;

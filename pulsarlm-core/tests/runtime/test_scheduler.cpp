@@ -150,7 +150,7 @@ const std::vector<pulsarlm::kv_layer> recurrent_and_full{
     pulsarlm::kv_layer{
         .n_kv_heads = 1,
         .head_dim = 2,
-        .state = pulsarlm::recurrent_state{.sizes = {1}, .dtype = at::kFloat},
+        .state = pulsarlm::recurrent_state{.sizes = {1}, .dtype = at::kFloat, .slots = 2},
     },
     pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .n_q_heads = 1},
 };
@@ -379,7 +379,7 @@ class sum_model final : public pulsarlm::model {
         for (std::size_t layer = 0; layer < lines.size(); layer++) {
             tables.push_back(all_tables[static_cast<std::int64_t>(layer)]);
             if (layers[layer].state) {
-                state_sums = run_state(g, lines[layer], tables.back());
+                state_sums = run_state(g, lines[layer], tables.back(), layers[layer].state->slots);
                 continue;
             }
             auto table = tables.back().accessor<std::int32_t, 2>();
@@ -499,31 +499,39 @@ class sum_model final : public pulsarlm::model {
         return pulsarlm::logit_inputs(logits.to(g.tokens.device()), g);
     }
 
-    // Each row's sum of every token forwarded through it. Starts from each sequence's first line, updates it, and
-    // writes the sum after the sequence's page_end_tokens into its second line.
+    // Each row's sum of every token forwarded through it. Starts from the slot of each sequence's state_rows, writes
+    // the sum after its last token into its last slot, and the sum at its newest page end into that page's boundary
+    // line.
     static std::vector<double>
-    run_state(const pulsarlm::group_batch& g, const pulsarlm::kv& lines, const at::Tensor& rows) {
-        REQUIRE(g.page_end_tokens.defined());
+    run_state(const pulsarlm::group_batch& g, const pulsarlm::kv& lines, const at::Tensor& rows, std::size_t slots) {
         at::Tensor tokens = g.tokens.cpu();
-        at::Tensor page_end_tokens = g.page_end_tokens.cpu();
+        at::Tensor history_positions = g.history_positions.cpu();
+        at::Tensor rejected_tokens = g.rejected_tokens.cpu();
         at::Tensor query_starts = g.is_prefill() ? g.cu_seqlens_q.cpu() : at::arange(rows.size(0) + 1, at::kInt);
         at::Tensor states = lines.k.cpu();
         auto token = tokens.accessor<std::int64_t, 1>();
-        auto page_end = page_end_tokens.accessor<std::int32_t, 1>();
+        auto history_position = history_positions.accessor<std::int64_t, 1>();
+        auto rejected = rejected_tokens.accessor<std::int32_t, 1>();
         auto query_start = query_starts.accessor<std::int32_t, 1>();
         auto table = rows.accessor<std::int32_t, 2>();
         auto state = states.accessor<float, 2>();
+        const auto last_slot = static_cast<std::int64_t>(slots) - 1;
         std::vector<double> sums;
         for (std::int64_t s = 0; s < rows.size(0); s++) {
-            double sum = state[table[s][0]][0];
+            double sum = state[table[s][last_slot - std::min<std::int64_t>(rejected[s], last_slot)]][0];
+            const std::int64_t first = history_position[s];
+            const std::int64_t end = first + query_start[s + 1] - query_start[s];
+            const std::int64_t newest_page_end = end / g.page_size * g.page_size;
             for (std::int32_t row = query_start[s]; row < query_start[s + 1]; row++) {
                 sum += static_cast<double>(token[row]);
                 sums.push_back(sum);
-                if (row - query_start[s] + 1 == page_end[s]) {
-                    state[table[s][1]][0] = static_cast<float>(sum);
+                const std::int64_t position = first + row - query_start[s];
+                if (position + 1 == newest_page_end) {
+                    const std::int64_t page = position / g.page_size;
+                    state[table[s][last_slot + 1 + page % 2]][0] = static_cast<float>(sum);
                 }
             }
-            state[table[s][0]][0] = static_cast<float>(sum);
+            state[table[s][last_slot]][0] = static_cast<float>(sum);
         }
         lines.k.copy_(states);
         return sums;

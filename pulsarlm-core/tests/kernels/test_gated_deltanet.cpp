@@ -6,6 +6,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <optional>
@@ -13,19 +14,14 @@
 
 namespace {
 
-constexpr int64_t kLines = 10;
+constexpr int64_t kLines = 40;
+constexpr int64_t kPageSize = 16;
+// The DeltaNet slots of the cases, and the conv windows' inputs past the kernel's history.
+constexpr int64_t kSlots = 3;
+constexpr int64_t kExtraInputs = kSlots - 1;
 
 at::Tensor int32_cuda(const std::vector<int32_t>& v) {
     return at::tensor(v, at::dtype(at::kInt)).to(at::kCUDA);
-}
-
-// Each sequence's running line, its boundary line, then a column the ops do not read.
-at::Tensor line_rows(const std::vector<int32_t>& running, const std::vector<int32_t>& boundary) {
-    std::vector<int32_t> rows;
-    for (size_t s = 0; s < running.size(); s++) {
-        rows.insert(rows.end(), {running[s], boundary[s], -1});
-    }
-    return int32_cuda(rows).view({static_cast<int64_t>(running.size()), 3});
 }
 
 // A pool of random lines with 4 elements between each line's end and the next line.
@@ -41,10 +37,13 @@ at::Tensor spaced_pool(const std::vector<int64_t>& line_sizes, at::ScalarType dt
         .view(sizes);
 }
 
+enum class group_kind { prefill, decode, verify };
+
 struct ragged_case {
     std::vector<int32_t> counts;
-    std::vector<int32_t> page_ends;
-    bool decode;
+    std::vector<int64_t> history_positions;
+    std::vector<int32_t> rejected;
+    group_kind kind;
 
     int64_t total() const {
         int64_t total = 0;
@@ -54,8 +53,12 @@ struct ragged_case {
         return total;
     }
 
+    int64_t num_seqs() const {
+        return static_cast<int64_t>(counts.size());
+    }
+
     std::optional<at::Tensor> cu_seqlens_q() const {
-        if (decode) {
+        if (kind != group_kind::prefill) {
             return std::nullopt;
         }
         std::vector<int32_t> starts{0};
@@ -64,37 +67,103 @@ struct ragged_case {
         }
         return int32_cuda(starts);
     }
+
+    // The tokens of sequence s up to the newest page end among them, 0 when none ends a page.
+    int64_t page_end(size_t s) const {
+        const int64_t first = history_positions[s];
+        const int64_t end = (first + counts[s]) / kPageSize * kPageSize;
+        return end > first ? end - first : 0;
+    }
+
+    // Sequence s's line j: its slots, then the boundary lines of its even and odd pages, scattered over the pool.
+    static int32_t line(size_t s, int64_t slots, int64_t j) {
+        return static_cast<int32_t>((static_cast<int64_t>(s) * (slots + 2) + j) * 7 % kLines);
+    }
+
+    // The boundary line of the newest page sequence s's tokens end.
+    int32_t boundary_line(size_t s, int64_t slots) const {
+        const int64_t page = (history_positions[s] + page_end(s)) / kPageSize - 1;
+        return line(s, slots, slots + page % 2);
+    }
+
+    int32_t other_boundary_line(size_t s, int64_t slots) const {
+        const int64_t page = (history_positions[s] + page_end(s)) / kPageSize - 1;
+        return line(s, slots, slots + (page + 1) % 2);
+    }
+
+    // Each sequence's lines, then a column the ops do not read.
+    pulsarlm::state_rows rows(int64_t slots) const {
+        std::vector<int32_t> ids;
+        for (size_t s = 0; s < counts.size(); s++) {
+            for (int64_t j = 0; j < slots + 2; j++) {
+                ids.push_back(line(s, slots, j));
+            }
+            ids.push_back(-1);
+        }
+        return pulsarlm::state_rows{
+            .lines = int32_cuda(ids).view({num_seqs(), slots + 3}),
+            .slots = slots,
+            .history_positions = at::tensor(history_positions, at::dtype(at::kLong)).to(at::kCUDA),
+            .rejected_tokens = int32_cuda(rejected),
+            .page_size = kPageSize,
+        };
+    }
 };
 
 ragged_case prefill_case() {
-    return {.counts = {1, 2, 5, 7, 140}, .page_ends = {1, 2, 0, 3, 128}, .decode = false};
+    return {
+        .counts = {1, 2, 5, 7, 140},
+        .history_positions = {15, 30, 0, 13, 0},
+        .rejected = {0, 1, 2, 0, 1},
+        .kind = group_kind::prefill,
+    };
 }
 
 ragged_case decode_case() {
-    return {.counts = {1, 1, 1, 1, 1}, .page_ends = {0, 1, 0, 1, 1}, .decode = true};
+    return {
+        .counts = {1, 1, 1, 1, 1},
+        .history_positions = {3, 15, 4, 31, 47},
+        .rejected = {0, 1, 2, 0, 1},
+        .kind = group_kind::decode,
+    };
 }
 
-const std::vector<int32_t> kRunning{2, 0, 5, 3, 8};
-const std::vector<int32_t> kBoundary{4, 1, 6, 7, 9};
+// kSlots tokens per sequence.
+ragged_case verify_case() {
+    return {
+        .counts = {3, 3, 3, 3, 3},
+        .history_positions = {14, 29, 0, 30, 45},
+        .rejected = {0, 1, 2, 0, 1},
+        .kind = group_kind::verify,
+    };
+}
 
 struct conv_expected {
     at::Tensor out;
-    at::Tensor running_state;
-    at::Tensor boundary;
+    at::Tensor window_after;
+    std::optional<at::Tensor> boundary;
 };
 
+// old is the line's window; its first window - rejected entries are the inputs before the group's tokens, the latest
+// last, and entries before the first input read zero.
 conv_expected reference_conv(
     const at::Tensor& x_seq,
     const at::Tensor& weight,
     const at::Tensor& old,
-    int32_t page_end,
+    int64_t rejected,
+    int64_t page_end,
     int64_t dilation
 ) {
+    const int64_t window = old.size(-1);
     const int64_t history = (weight.size(2) - 1) * dilation;
     const int64_t n = x_seq.size(0);
-    at::Tensor window = at::cat({old.to(at::kFloat), x_seq.to(at::kFloat).t()}, -1);
+    const int64_t valid = window - rejected;
+    at::Tensor inputs = at::cat(
+        {at::zeros_like(old).to(at::kFloat), old.narrow(-1, 0, valid).to(at::kFloat), x_seq.to(at::kFloat).t()},
+        -1
+    );
     at::Tensor convolved = at::conv1d(
-        window.unsqueeze(0),
+        inputs.narrow(-1, window + valid - history, history + n).unsqueeze(0),
         weight.to(at::kFloat),
         std::nullopt,
         at::IntArrayRef{1},
@@ -103,17 +172,18 @@ conv_expected reference_conv(
         weight.size(0)
     );
     at::Tensor out = at::silu(convolved.squeeze(0).t().to(x_seq.scalar_type()).to(at::kFloat)).to(x_seq.scalar_type());
+    auto window_after = [&](int64_t count) { return inputs.narrow(-1, valid + count, window).to(x_seq.scalar_type()); };
     return {
         out,
-        window.narrow(-1, n, history).to(x_seq.scalar_type()),
-        window.narrow(-1, page_end, history).to(x_seq.scalar_type()),
+        window_after(n),
+        page_end > 0 ? std::optional<at::Tensor>(window_after(page_end)) : std::nullopt,
     };
 }
 
 struct delta_expected {
     at::Tensor out;
-    at::Tensor running_state;
-    std::optional<at::Tensor> boundary;
+    // The state after each token.
+    std::vector<at::Tensor> states;
 };
 
 // Hugging Face's recurrent gated delta rule, one token at a time.
@@ -124,8 +194,7 @@ delta_expected reference_delta_rule(
     const at::Tensor& dt_bias,
     const at::Tensor& neg_a,
     at::Tensor state,
-    int64_t key_heads,
-    int32_t page_end
+    int64_t key_heads
 ) {
     const int64_t n = x_seq.size(0);
     const int64_t value_heads = state.size(0);
@@ -145,18 +214,16 @@ delta_expected reference_delta_rule(
     at::Tensor decay = at::softplus(a_seq.to(at::kFloat) + dt_bias) * neg_a;
 
     std::vector<at::Tensor> outputs;
-    std::optional<at::Tensor> boundary;
+    std::vector<at::Tensor> states;
     for (int64_t t = 0; t < n; t++) {
         state = state * decay[t].exp().view({-1, 1, 1});
         at::Tensor remembered = (state * k[t].unsqueeze(-1)).sum(-2);
         at::Tensor delta = (v[t] - remembered) * beta[t].unsqueeze(-1);
         state = state + k[t].unsqueeze(-1) * delta.unsqueeze(-2);
         outputs.push_back((state * q[t].unsqueeze(-1)).sum(-2));
-        if (t + 1 == page_end) {
-            boundary = state.clone();
-        }
+        states.push_back(state.clone());
     }
-    return {at::stack(outputs).to(x_seq.scalar_type()), state, boundary};
+    return {at::stack(outputs).to(x_seq.scalar_type()), states};
 }
 
 // norm_weight * RMSNorm(o) * activation(z) of each value head's output o [tokens, value heads, value dim], flattened
@@ -181,57 +248,57 @@ double output_tolerance(at::ScalarType dtype) {
 
 }  // namespace
 
-TEST_CASE("causal_conv continues each sequence's inputs and keeps its last ones", "[ops][cuda]") {
+TEST_CASE("causal_conv continues each sequence's valid inputs and keeps its window", "[ops][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
     const auto dtype = GENERATE(at::kFloat, at::kBFloat16);
-    const ragged_case batch = GENERATE(prefill_case(), decode_case());
+    const ragged_case batch = GENERATE(prefill_case(), decode_case(), verify_case());
     const int64_t dilation = GENERATE(1, 3);
     const int64_t channels = 24;
     const int64_t kernel = 4;
     auto opts = at::device(at::kCUDA).dtype(dtype);
     at::Tensor x = at::randn({batch.total(), channels}, opts);
     at::Tensor weight = at::randn({channels, 1, kernel}, opts);
-    at::Tensor pool = spaced_pool({channels, (kernel - 1) * dilation}, dtype);
+    at::Tensor pool = spaced_pool({channels, (kernel - 1) * dilation + kExtraInputs}, dtype);
     at::Tensor before = pool.clone();
-    at::Tensor rows = line_rows(kRunning, kBoundary);
+    const pulsarlm::state_rows rows = batch.rows(1);
 
-    at::Tensor out = pulsarlm::causal_conv_cuda(
-        x,
-        weight,
-        pool,
-        rows,
-        batch.cu_seqlens_q(),
-        int32_cuda(batch.page_ends),
-        dilation
-    );
+    at::Tensor out = batch.kind == group_kind::verify
+        ? pulsarlm::causal_conv_verify_cuda(x, weight, pool, rows, batch.counts.front(), dilation)
+        : pulsarlm::causal_conv_cuda(x, weight, pool, rows, batch.cu_seqlens_q(), dilation);
 
     const double tolerance = output_tolerance(dtype);
     int64_t first = 0;
     for (size_t s = 0; s < batch.counts.size(); s++) {
         const int64_t n = batch.counts[s];
+        const int32_t slot = ragged_case::line(s, 1, 0);
         conv_expected expected = reference_conv(
             x.narrow(0, first, n),
             weight,
-            before.select(0, kRunning[s]),
-            batch.page_ends[s],
+            before.select(0, slot),
+            batch.rejected[s],
+            batch.page_end(s),
             dilation
         );
         CHECK(at::allclose(out.narrow(0, first, n), expected.out, tolerance, tolerance));
-        CHECK(at::equal(pool.select(0, kRunning[s]), expected.running_state));
-        CHECK(
-            at::equal(
-                pool.select(0, kBoundary[s]),
-                batch.page_ends[s] > 0 ? expected.boundary : before.select(0, kBoundary[s])
-            )
-        );
+        CHECK(at::equal(pool.select(0, slot), expected.window_after));
+        if (expected.boundary) {
+            CHECK(at::equal(pool.select(0, batch.boundary_line(s, 1)), *expected.boundary));
+            const int32_t other = batch.other_boundary_line(s, 1);
+            CHECK(at::equal(pool.select(0, other), before.select(0, other)));
+        } else {
+            for (int64_t j = 1; j < 3; j++) {
+                const int32_t boundary = ragged_case::line(s, 1, j);
+                CHECK(at::equal(pool.select(0, boundary), before.select(0, boundary)));
+            }
+        }
         first += n;
     }
 }
 
 TEST_CASE(
-    "gated_delta_rule continues each sequence's state, keeps it at its page end and gates its outputs",
+    "gated_delta_rule continues each sequence's state from its slot, keeps it at its page end and gates its outputs",
     "[ops][cuda]"
 ) {
     if (c10::cuda::device_count() == 0) {
@@ -239,7 +306,7 @@ TEST_CASE(
     }
     const auto dtype = GENERATE(at::kFloat, at::kBFloat16);
     const int64_t key_dim = GENERATE(32, 128, 256);
-    const ragged_case batch = GENERATE(prefill_case(), decode_case());
+    const ragged_case batch = GENERATE(prefill_case(), decode_case(), verify_case());
     const auto activation = GENERATE(pulsarlm::gate_activation::silu, pulsarlm::gate_activation::sigmoid);
     const int64_t key_heads = 2;
     const int64_t value_heads = 4;
@@ -256,57 +323,84 @@ TEST_CASE(
     at::Tensor neg_a = -(at::randn({value_heads}, fp32) * 0.5).exp();
     at::Tensor pool = spaced_pool({value_heads, key_dim, value_dim}, at::kFloat);
     at::Tensor before = pool.clone();
-    at::Tensor rows = line_rows(kRunning, kBoundary);
+    const pulsarlm::state_rows rows = batch.rows(kSlots);
     at::Tensor z = at::randn({batch.total(), value_heads * value_dim}, opts);
     at::Tensor norm_weight = at::randn({value_dim}, opts);
-
-    at::Tensor out = pulsarlm::gated_delta_rule_cuda(
-        x,
-        a,
-        b,
-        dt_bias,
-        neg_a,
-        pool,
-        rows,
-        batch.cu_seqlens_q(),
-        int32_cuda(batch.page_ends),
-        key_heads,
-        z,
-        norm_weight,
-        eps,
-        activation,
-        at::zeros(
-            {pulsarlm::gated_delta_rule_counters(rows.size(0), value_heads)},
-            at::device(at::kCUDA).dtype(at::kInt)
-        )
+    at::Tensor counters = at::zeros(
+        {pulsarlm::gated_delta_rule_counters(batch.num_seqs(), value_heads)},
+        at::device(at::kCUDA).dtype(at::kInt)
     );
+
+    at::Tensor out = batch.kind == group_kind::verify ? pulsarlm::gated_delta_rule_verify_cuda(
+                                                            x,
+                                                            a,
+                                                            b,
+                                                            dt_bias,
+                                                            neg_a,
+                                                            pool,
+                                                            rows,
+                                                            batch.counts.front(),
+                                                            key_heads,
+                                                            z,
+                                                            norm_weight,
+                                                            eps,
+                                                            activation,
+                                                            counters
+                                                        )
+                                                      : pulsarlm::gated_delta_rule_cuda(
+                                                            x,
+                                                            a,
+                                                            b,
+                                                            dt_bias,
+                                                            neg_a,
+                                                            pool,
+                                                            rows,
+                                                            batch.cu_seqlens_q(),
+                                                            key_heads,
+                                                            z,
+                                                            norm_weight,
+                                                            eps,
+                                                            activation,
+                                                            counters
+                                                        );
 
     REQUIRE(out.sizes() == at::IntArrayRef{batch.total(), value_heads * value_dim});
     const double tolerance = output_tolerance(dtype);
     int64_t first = 0;
     for (size_t s = 0; s < batch.counts.size(); s++) {
         const int64_t n = batch.counts[s];
+        const int64_t start = kSlots - 1 - std::min<int64_t>(batch.rejected[s], kSlots - 1);
         delta_expected expected = reference_delta_rule(
             x.narrow(0, first, n),
             a.narrow(0, first, n),
             b.narrow(0, first, n),
             dt_bias,
             neg_a,
-            before.select(0, kRunning[s]),
-            key_heads,
-            batch.page_ends[s]
+            before.select(0, ragged_case::line(s, kSlots, start)),
+            key_heads
         );
         at::Tensor gated = reference_output_gate(expected.out, z.narrow(0, first, n), norm_weight, eps, activation);
         CHECK(at::allclose(out.narrow(0, first, n), gated, tolerance, tolerance));
-        CHECK(at::allclose(pool.select(0, kRunning[s]), expected.running_state, 1e-4, 1e-4));
-        CHECK(
-            at::allclose(
-                pool.select(0, kBoundary[s]),
-                expected.boundary.value_or(before.select(0, kBoundary[s])),
-                1e-4,
-                1e-4
-            )
-        );
+        for (int64_t slot = 0; slot < kSlots; slot++) {
+            const int32_t slot_line = ragged_case::line(s, kSlots, slot);
+            const at::Tensor& written = batch.kind == group_kind::verify ? expected.states[slot]
+                : slot == kSlots - 1                                     ? expected.states.back()
+                                                                         : before.select(0, slot_line);
+            CHECK(at::allclose(pool.select(0, slot_line), written, 1e-4, 1e-4));
+        }
+        const int64_t page_end = batch.page_end(s);
+        for (int64_t j = kSlots; j < kSlots + 2; j++) {
+            const int32_t boundary = ragged_case::line(s, kSlots, j);
+            const bool written = page_end > 0 && boundary == batch.boundary_line(s, kSlots);
+            CHECK(
+                at::allclose(
+                    pool.select(0, boundary),
+                    written ? expected.states[page_end - 1] : before.select(0, boundary),
+                    1e-4,
+                    1e-4
+                )
+            );
+        }
         first += n;
     }
 }
@@ -321,21 +415,12 @@ TEST_CASE("causal_conv reads x's rows wherever they lie", "[ops][cuda]") {
     auto opts = at::device(at::kCUDA).dtype(at::kBFloat16);
     at::Tensor x = at::randn({batch.total(), channels + 5}, opts).narrow(1, 2, channels);
     at::Tensor weight = at::randn({channels, 1, kernel}, opts);
-    at::Tensor strided_pool = spaced_pool({channels, kernel - 1}, at::kBFloat16);
+    at::Tensor strided_pool = spaced_pool({channels, kernel - 1 + kExtraInputs}, at::kBFloat16);
     at::Tensor packed_pool = strided_pool.clone();
-    at::Tensor rows = line_rows(kRunning, kBoundary);
-    at::Tensor page_ends = int32_cuda(batch.page_ends);
+    const pulsarlm::state_rows rows = batch.rows(1);
 
-    at::Tensor strided = pulsarlm::causal_conv_cuda(x, weight, strided_pool, rows, batch.cu_seqlens_q(), page_ends, 1);
-    at::Tensor packed = pulsarlm::causal_conv_cuda(
-        x.contiguous(),
-        weight,
-        packed_pool,
-        rows,
-        batch.cu_seqlens_q(),
-        page_ends,
-        1
-    );
+    at::Tensor strided = pulsarlm::causal_conv_cuda(x, weight, strided_pool, rows, batch.cu_seqlens_q(), 1);
+    at::Tensor packed = pulsarlm::causal_conv_cuda(x.contiguous(), weight, packed_pool, rows, batch.cu_seqlens_q(), 1);
 
     CHECK(at::equal(strided, packed));
     CHECK(at::equal(strided_pool, packed_pool));
@@ -352,8 +437,7 @@ TEST_CASE("gated_delta_rule refuses fewer arrival counters than a step needs", "
     const int64_t value_dim = 32;
     auto opts = at::device(at::kCUDA).dtype(at::kBFloat16);
     auto fp32 = at::device(at::kCUDA).dtype(at::kFloat);
-    at::Tensor rows = line_rows(kRunning, kBoundary);
-    const int64_t needed = pulsarlm::gated_delta_rule_counters(rows.size(0), value_heads);
+    const int64_t needed = pulsarlm::gated_delta_rule_counters(batch.num_seqs(), value_heads);
     REQUIRE(needed > 0);
 
     REQUIRE_THROWS(
@@ -364,9 +448,8 @@ TEST_CASE("gated_delta_rule refuses fewer arrival counters than a step needs", "
             at::randn({value_heads}, fp32),
             -at::ones({value_heads}, fp32),
             spaced_pool({value_heads, key_dim, value_dim}, at::kFloat),
-            rows,
+            batch.rows(kSlots),
             batch.cu_seqlens_q(),
-            int32_cuda(batch.page_ends),
             key_heads,
             at::randn({batch.total(), value_heads * value_dim}, opts),
             at::randn({value_dim}, opts),
@@ -399,8 +482,13 @@ TEST_CASE("gated_delta_rule reads a's, b's and z's rows wherever they lie", "[op
     at::Tensor neg_a = -(at::randn({value_heads}, fp32) * 0.5).exp();
     at::Tensor strided_pool = spaced_pool({value_heads, key_dim, value_dim}, at::kFloat);
     at::Tensor packed_pool = strided_pool.clone();
-    at::Tensor rows = line_rows(kRunning, kBoundary);
-    at::Tensor page_ends = int32_cuda(batch.page_ends);
+    const pulsarlm::state_rows rows = batch.rows(kSlots);
+    auto counters = [&] {
+        return at::zeros(
+            {pulsarlm::gated_delta_rule_counters(batch.num_seqs(), value_heads)},
+            at::device(at::kCUDA).dtype(at::kInt)
+        );
+    };
 
     at::Tensor strided = pulsarlm::gated_delta_rule_cuda(
         x,
@@ -411,16 +499,12 @@ TEST_CASE("gated_delta_rule reads a's, b's and z's rows wherever they lie", "[op
         strided_pool,
         rows,
         batch.cu_seqlens_q(),
-        page_ends,
         key_heads,
         z,
         norm_weight,
         1e-6,
         activation,
-        at::zeros(
-            {pulsarlm::gated_delta_rule_counters(rows.size(0), value_heads)},
-            at::device(at::kCUDA).dtype(at::kInt)
-        )
+        counters()
     );
     at::Tensor packed = pulsarlm::gated_delta_rule_cuda(
         x,
@@ -431,16 +515,12 @@ TEST_CASE("gated_delta_rule reads a's, b's and z's rows wherever they lie", "[op
         packed_pool,
         rows,
         batch.cu_seqlens_q(),
-        page_ends,
         key_heads,
         z.contiguous(),
         norm_weight,
         1e-6,
         activation,
-        at::zeros(
-            {pulsarlm::gated_delta_rule_counters(rows.size(0), value_heads)},
-            at::device(at::kCUDA).dtype(at::kInt)
-        )
+        counters()
     );
 
     CHECK(at::equal(strided, packed));
