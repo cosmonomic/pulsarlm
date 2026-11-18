@@ -203,14 +203,6 @@ def weight_files(path: Path) -> list[SafetensorsFile]:
     ]
 
 
-def drafts(path: Path, config: PulsarLMModelConfig) -> bool:
-    """Whether the model at path loads a multi-token prediction layer, which
-    drafts tokens."""
-    if config.architecture not in QWEN4_EXP:
-        return False
-    return any(name.startswith("mtp.") for f in weight_files(path) for name in f.keys())
-
-
 def load_config(path: ModelRoot) -> PulsarLMModelConfig:
     with (path / "config.json").open("r") as f:
         raw = json.load(f)

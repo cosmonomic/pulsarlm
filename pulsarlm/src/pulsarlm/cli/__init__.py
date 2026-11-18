@@ -90,12 +90,11 @@ DecodeGraphs = Annotated[
     ),
 ]
 NumDraftTokens = Annotated[
-    int | None,
+    int,
     typer.Option(
         "--num_draft_tokens",
-        help="Tokens the multi-token prediction layer drafts per step (models with "
-        "one, such as Qwen4-Exp); 0 turns drafting off (default: 1 for a model with "
-        "one, 0 otherwise).",
+        help="Tokens the multi-token prediction layer drafts per step, for a model "
+        "with one, such as Qwen4-Exp; 0 drafts nothing.",
     ),
 ]
 StoreGib = Annotated[
@@ -213,7 +212,7 @@ def serve(
     kv_cache_gib: KvCacheGib = 4.0,
     prefill_tokens_per_step: PrefillTokensPerStep = 512,
     decode_graphs: DecodeGraphs = True,
-    num_draft_tokens: NumDraftTokens = None,
+    num_draft_tokens: NumDraftTokens = 0,
     store_gib: StoreGib = 4.0,
     persist: Persist = False,
     prefix_cache: PrefixCache = True,
@@ -324,7 +323,7 @@ def chat(
     kv_cache_gib: KvCacheGib = 4.0,
     prefill_tokens_per_step: PrefillTokensPerStep = 512,
     decode_graphs: DecodeGraphs = True,
-    num_draft_tokens: NumDraftTokens = None,
+    num_draft_tokens: NumDraftTokens = 0,
     store_gib: StoreGib = 4.0,
     persist: Persist = False,
     prefix_cache: PrefixCache = True,

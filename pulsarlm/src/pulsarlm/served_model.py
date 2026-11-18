@@ -36,8 +36,7 @@ def load_served_model(
     """eviction is the settings' policy, its n_sink left at the default. Above one
     tensor-parallel GPU, the model is split across cuda:0 on, one GPU's part loaded
     and on its GPU before the next is read. The store's reads run on loop. Without
-    the prefix cache, the store keeps nothing. Without num_draft_tokens, a model
-    with a multi-token prediction layer drafts one token a step."""
+    the prefix cache, the store keeps nothing."""
     dtype = getattr(torch, settings.dtype)
     tensor_parallel_size = settings.tensor_parallel_size
     devices = (
@@ -51,8 +50,6 @@ def load_served_model(
         chat_template = checkpoint.load_chat_template(root)
 
     draft_tokens = settings.num_draft_tokens
-    if draft_tokens is None:
-        draft_tokens = 1 if checkpoint.drafts(path, cfg) else 0
 
     # Without drafts the model loads no multi-token prediction layer.
     def load_model_shard(rank: int, size: int) -> dict[str, torch.Tensor]:
