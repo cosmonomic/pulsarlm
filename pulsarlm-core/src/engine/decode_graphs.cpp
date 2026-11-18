@@ -99,7 +99,7 @@ std::unique_ptr<decode_graphs::captured_forward> decode_graphs::capture(std::int
 // reads no uninitialized memory; no sequence holds a line yet.
 void decode_graphs::capture_startup() {
     for (const kv& layer : lines) {
-        for (const at::Tensor& part : {layer.k, layer.v, layer.index_keys}) {
+        for (const at::Tensor& part : {layer.k, layer.v, layer.index_keys, layer.last_hidden}) {
             if (part.defined()) {
                 part.select(0, 0).zero_();
             }

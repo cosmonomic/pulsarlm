@@ -896,6 +896,39 @@ TEST_CASE("an indexed attention line keeps its index keys after K and V, stored 
     release(fixture.kv, *got);
 }
 
+TEST_CASE("a line keeps its last hidden row after its index keys, stored and fetched with them") {
+    pulsarlm::page_shape carrying = shape;
+    carrying.index_head_dim = 6;
+    carrying.last_hidden_dim = 5;
+    pulsarlm::page_shape indexed = carrying;
+    indexed.last_hidden_dim = 0;
+    REQUIRE(pulsarlm::line_bytes(carrying) == pulsarlm::line_bytes(indexed) + 5 * 4);
+    cache_fixture fixture(4, {}, {carrying});
+    const pulsarlm::kv& lines = fixture.kv.tensors(0);
+    REQUIRE((lines.last_hidden.sizes().slice(1) == at::IntArrayRef{5}));
+    REQUIRE(lines.last_hidden.stride(0) == lines.k.stride(0));
+    REQUIRE(
+        lines.last_hidden.data_ptr<float>() - lines.index_keys.data_ptr<float>() ==
+        static_cast<std::int64_t>(shape.page_size * 6)
+    );
+
+    line_ids allocated = allocate(fixture.kv, 1).value();
+    fill_line(fixture.kv, allocated.front(), 1.0f);
+    at::Tensor last_hidden = at::arange(5, at::kFloat) + 0.5;
+    lines.last_hidden.select(0, allocated.front()).copy_(last_hidden);
+    REQUIRE(run_to_completion(sync_one_layer(fixture.kv, {hash_of(1)}, allocated)).has_value());
+    release(fixture.kv, allocated);
+    REQUIRE(stored_tensors(*fixture.store, key_of(1), carrying).last_hidden.select(0, 0).equal(last_hidden));
+
+    line_ids evicting = allocate(fixture.kv, 2).value();
+    lines.last_hidden.zero_();
+    release(fixture.kv, evicting);
+    lines_result got = run_get(fixture.kv, {hash_of(1)});
+    REQUIRE(got.has_value());
+    REQUIRE(lines.last_hidden.select(0, got->front()).equal(last_hidden.cuda()));
+    release(fixture.kv, *got);
+}
+
 TEST_CASE("a recurrent layer's line is one tensor of its state sizes and dtype, stored and fetched as one") {
     pulsarlm::page_shape state{
         .n_layers = 1,
@@ -984,6 +1017,7 @@ const pulsarlm::page_shape indexed_shape{
     .head_dim = 2,
     .dtype = at::kFloat,
     .index_head_dim = 2,
+    .last_hidden_dim = 3,
 };
 const pulsarlm::page_shape state_shape{
     .n_layers = 1,
@@ -1022,7 +1056,8 @@ page full_page(const pulsarlm::page_shape& page_shape, float base) {
 // The bytes of full's rows, then its index keys: one shard's line of it.
 page shard_page(const page& full, const pulsarlm::page_shape& page_shape, const row_ranges& rows) {
     std::size_t index_bytes = page_shape.page_size * page_shape.index_head_dim * sizeof(float);
-    std::size_t row_bytes = (pulsarlm::line_bytes(page_shape) - index_bytes) / first_dim(page_shape);
+    std::size_t hidden_bytes = page_shape.last_hidden_dim * sizeof(float);
+    std::size_t row_bytes = (pulsarlm::line_bytes(page_shape) - index_bytes - hidden_bytes) / first_dim(page_shape);
     std::vector<at::Tensor> parts;
     for (auto [first, last] : rows) {
         parts.push_back(full.bytes.narrow(
@@ -1031,11 +1066,11 @@ page shard_page(const page& full, const pulsarlm::page_shape& page_shape, const 
             static_cast<std::int64_t>((last - first) * row_bytes)
         ));
     }
-    if (index_bytes > 0) {
+    if (index_bytes + hidden_bytes > 0) {
         parts.push_back(full.bytes.narrow(
             0,
             static_cast<std::int64_t>(first_dim(page_shape) * row_bytes),
-            static_cast<std::int64_t>(index_bytes)
+            static_cast<std::int64_t>(index_bytes + hidden_bytes)
         ));
     }
     return page{.bytes = at::cat(parts).contiguous()};
@@ -1055,6 +1090,9 @@ void write_line(
     if (page_shape.index_head_dim > 0) {
         lines.index_keys.select(0, line_id).copy_(source.index_keys.select(0, 0));
     }
+    if (page_shape.last_hidden_dim > 0) {
+        lines.last_hidden.select(0, line_id).copy_(source.last_hidden.select(0, 0));
+    }
 }
 
 bool line_equals(
@@ -1068,6 +1106,9 @@ bool line_equals(
         at::equal(lines.v.select(0, line_id).cpu(), expected.v.select(0, 0));
     if (page_shape.index_head_dim > 0) {
         equal = equal && at::equal(lines.index_keys.select(0, line_id).cpu(), expected.index_keys.select(0, 0));
+    }
+    if (page_shape.last_hidden_dim > 0) {
+        equal = equal && at::equal(lines.last_hidden.select(0, line_id).cpu(), expected.last_hidden.select(0, 0));
     }
     return equal;
 }

@@ -84,6 +84,10 @@ at::Tensor make_pool(std::span<const page_shape> shapes, std::size_t pool_bytes,
             "kv_cache: an indexed attention page keeps K and V apart"
         );
         TORCH_CHECK(
+            shape.last_hidden_dim == 0 || (shape.state_sizes.empty() && !shape.values_only),
+            "kv_cache: a page keeping a last hidden row keeps K and V apart"
+        );
+        TORCH_CHECK(
             pool_bytes / block_bytes(shape) < std::numeric_limits<std::uint32_t>::max(),
             "kv_cache: too many lines in a pool of ",
             pool_bytes,
@@ -106,7 +110,7 @@ std::vector<std::int64_t> line_strides(const page_shape& shape) {
     auto head_elements = static_cast<std::int64_t>(tensor_count(shape)) * tensor_elements;
     return {
         head_elements * static_cast<std::int64_t>(shape.n_kv_heads) +
-            static_cast<std::int64_t>(shape.page_size * shape.index_head_dim),
+            static_cast<std::int64_t>(shape.page_size * shape.index_head_dim + shape.last_hidden_dim),
         static_cast<std::int64_t>(shape.head_dim),
         head_elements,
         1,
@@ -114,8 +118,9 @@ std::vector<std::int64_t> line_strides(const page_shape& shape) {
 }
 
 // count lines from the first element of elements (1-D, in the shape's dtype), each [n_kv_heads, k then v, page_size,
-// head_dim] then [page_size, index_head_dim], as K and V views of [count, page_size, n_kv_heads, head_dim] and index
-// key views of [count, page_size, index_head_dim]; a recurrent shape's lines are contiguous [count, state_sizes...].
+// head_dim] then [page_size, index_head_dim] then [last_hidden_dim], as K and V views of [count, page_size, n_kv_heads,
+// head_dim], index key views of [count, page_size, index_head_dim] and last hidden views of [count, last_hidden_dim];
+// a recurrent shape's lines are contiguous [count, state_sizes...].
 kv line_views(const at::Tensor& elements, const page_shape& shape, std::size_t count) {
     std::vector<std::int64_t> sizes = page_sizes(shape);
     sizes.front() = static_cast<std::int64_t>(count);
@@ -135,6 +140,18 @@ kv line_views(const at::Tensor& elements, const page_shape& shape, std::size_t c
              static_cast<std::int64_t>(shape.index_head_dim)},
             {strides.front(), static_cast<std::int64_t>(shape.index_head_dim), 1},
             index_first
+        );
+    }
+    if (shape.last_hidden_dim > 0) {
+        auto hidden_first = elements.storage_offset() +
+            static_cast<std::int64_t>(
+                                2 * shape.page_size * shape.head_dim * shape.n_kv_heads +
+                                shape.page_size * shape.index_head_dim
+            );
+        lines.last_hidden = elements.as_strided(
+            {static_cast<std::int64_t>(count), static_cast<std::int64_t>(shape.last_hidden_dim)},
+            {strides.front(), 1},
+            hidden_first
         );
     }
     return lines;
@@ -158,6 +175,13 @@ kv pool_views(const at::Tensor& pool, const page_shape& shape, std::size_t line_
             lines.index_keys.sizes(),
             index_strides,
             lines.index_keys.storage_offset()
+        );
+    }
+    if (lines.last_hidden.defined()) {
+        pool_lines.last_hidden = lines.last_hidden.as_strided(
+            lines.last_hidden.sizes(),
+            {block_elements, 1},
+            lines.last_hidden.storage_offset()
         );
     }
     return pool_lines;
@@ -206,6 +230,11 @@ std::size_t index_key_bytes(const page_shape& shape) {
     return shape.page_size * shape.index_head_dim * c10::elementSize(shape.dtype);
 }
 
+// A line's last hidden row, after its index keys.
+std::size_t last_hidden_bytes(const page_shape& shape) {
+    return shape.last_hidden_dim * c10::elementSize(shape.dtype);
+}
+
 void require(bool holds, const std::string& message) {
     if (!holds) {
         throw std::invalid_argument(message);
@@ -248,8 +277,9 @@ std::size_t line_bytes(const page_shape& shape) {
         }
         return elements * c10::elementSize(shape.dtype);
     }
-    return shape.n_layers * shape.page_size *
-        (tensor_count(shape) * shape.n_kv_heads * shape.head_dim + shape.index_head_dim) *
+    return shape.n_layers *
+        (shape.page_size * (tensor_count(shape) * shape.n_kv_heads * shape.head_dim + shape.index_head_dim) +
+         shape.last_hidden_dim) *
         c10::elementSize(shape.dtype);
 }
 
@@ -276,6 +306,7 @@ digest make_root_digest(std::string_view model_name, std::string_view model_hash
         for (std::int64_t size : shape.state_sizes) {
             append_u64(seed, static_cast<std::uint64_t>(size));
         }
+        append_u64(seed, shape.last_hidden_dim);
     }
     return make_digest(seed);
 }
@@ -359,7 +390,8 @@ kv_cache::kv_cache(
             const page_shape& shape = shards[s].shapes[layer];
             require(
                 shape.dtype == full.dtype && shape.state_sizes.empty() == full.state_sizes.empty() &&
-                    shape.index_head_dim == full.index_head_dim && row_bytes(shape) == row_bytes(full),
+                    shape.index_head_dim == full.index_head_dim && shape.last_hidden_dim == full.last_hidden_dim &&
+                    row_bytes(shape) == row_bytes(full),
                 std::format("KV cache shard {}'s line of KV layer {} is rows of the full line", s, layer)
             );
             std::vector<line_piece> pieces;
@@ -388,6 +420,15 @@ kv_cache::kv_cache(
                         .line_offset = row_count(shape) * row_bytes(full),
                         .host_offset = row_count(full) * row_bytes(full),
                         .bytes = index_key_bytes(full),
+                    }
+                );
+            }
+            if (last_hidden_bytes(full) > 0) {
+                pieces.push_back(
+                    line_piece{
+                        .line_offset = row_count(shape) * row_bytes(full) + index_key_bytes(full),
+                        .host_offset = row_count(full) * row_bytes(full) + index_key_bytes(full),
+                        .bytes = last_hidden_bytes(full),
                     }
                 );
             }

@@ -222,6 +222,7 @@ std::vector<page_shape> page_shapes(const engine_config& config, std::span<const
                 .dtype = config.kv_dtype,
                 .values_only = layer.values_only,
                 .index_head_dim = layer.index_head_dim,
+                .last_hidden_dim = layer.last_hidden_dim,
             }
         );
     }

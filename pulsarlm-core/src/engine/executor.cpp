@@ -213,18 +213,20 @@ executor::executor(
         for (std::size_t layer = 0; layer < layers.size(); layer++) {
             lines[shard].push_back(this->cache.tensors(layer, shard));
             bool layer_recurrent = layers[layer].state.has_value();
-            bool evictable = !layers[layer].sliding_window && !layer_recurrent;
+            bool evictable = !layers[layer].sliding_window && !layer_recurrent && !layers[layer].mirrors_held_pages;
             assert(!evictable || layers[layer].n_q_heads > 0);
             shard_mass_heads[shard].push_back(evictable ? layers[layer].n_readers * layers[layer].n_q_heads : 0);
             if (shard == 0) {
                 sliding_windows.push_back(layers[layer].sliding_window);
                 recurrent.push_back(layer_recurrent);
+                mirrors.push_back(layers[layer].mirrors_held_pages);
                 mass_heads.push_back(0);
                 if (page_size == 0 && !layer_recurrent) {
                     page_size = static_cast<std::size_t>(lines[0].back().k.size(1));
                 }
             }
             assert(sliding_windows[layer] == layers[layer].sliding_window && recurrent[layer] == layer_recurrent);
+            assert(mirrors[layer] == layers[layer].mirrors_held_pages);
             mass_heads[layer] += shard_mass_heads[shard].back();
         }
     }
@@ -857,6 +859,25 @@ std::vector<sequence*> executor::launched_step::sequences() const {
     return stepped;
 }
 
+void executor::update_views(sequence& seq) {
+    seq.update_held();
+    for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
+        if (!mirrors[layer]) {
+            continue;
+        }
+        layer_view& view = seq.layers[layer];
+        std::vector<std::size_t> unheld;
+        for (std::size_t page = 0; page < view.pages.size(); page++) {
+            if (!std::ranges::binary_search(seq.held_pages, view.indices[page])) {
+                unheld.push_back(page);
+            }
+        }
+        if (!unheld.empty()) {
+            cache.release(layer, view.remove(unheld));
+        }
+    }
+}
+
 bool executor::completes_page(const batch_entry& e) const noexcept {
     std::size_t start = e.seq->tail.size();
     return (start + e.token_count) / page_size * page_size > start;
@@ -1176,12 +1197,16 @@ task<void> executor::write_back(launched_step& step) {
         if (e.ends_cycle) {
             add_sampled_pages(seq);
             views_changed = evict(seq) || views_changed;
+        }
+        if (views_changed) {
+            update_views(seq);
+        }
+        if (e.ends_cycle) {
             co_await write_cycle_end(seq);
             seq.start_next_cycle();
         }
         std::optional<std::size_t> first_stale_page;
         if (views_changed) {
-            seq.update_held();
             first_stale_page = 0;
         } else if (std::ranges::contains(state_writers, &seq)) {
             first_stale_page = layer_view::next_boundary_line;

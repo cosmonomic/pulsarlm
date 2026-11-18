@@ -103,6 +103,7 @@ sequence::sequence(
   head(last_state->head),
   prompt_digests(std::move(digests)),
   recurrent(owner.recurrent),
+  mirrors(owner.mirrors),
   sliding_windows(owner.sliding_windows),
   page_size(owner.page_size),
   layers(owner.recurrent.size()),
@@ -185,7 +186,7 @@ std::size_t sequence::page_position(std::size_t layer, std::size_t page) const {
 void sequence::update_held() {
     held_pages.clear();
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
-        if (!recurrent[layer]) {
+        if (!recurrent[layer] && !mirrors[layer]) {
             held_pages.insert(held_pages.end(), layers[layer].indices.begin(), layers[layer].indices.end());
         }
     }

@@ -463,7 +463,10 @@ class sum_model final : public pulsarlm::model {
             auto query_weight = query_weights.accessor<float, 1>();
             for (std::size_t layer = 0; layer < lines.size(); layer++) {
                 const at::Tensor& layer_mass_sum = g.page_mass_sum[layer];
-                REQUIRE(layer_mass_sum.defined() == (!layers[layer].state && !layers[layer].sliding_window));
+                REQUIRE(
+                    layer_mass_sum.defined() ==
+                    (!layers[layer].state && !layers[layer].sliding_window && !layers[layer].mirrors_held_pages)
+                );
                 if (!layer_mass_sum.defined()) {
                     continue;
                 }
@@ -1785,6 +1788,46 @@ TEST_CASE("each full-attention layer evicts by its own attention mass") {
     pulsarlm::state end = ended_state(results[0]);
     REQUIRE((hashes_of(end, 0) == std::vector{chain[0], chain[1], chain[4], chain[7]}));
     REQUIRE((hashes_of(end, 1) == std::vector{chain[0], chain[2], chain[5], chain[7]}));
+}
+
+const std::vector<pulsarlm::kv_layer> two_full_and_mirroring{
+    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .n_q_heads = 1},
+    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .n_q_heads = 1},
+    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .n_q_heads = 1, .mirrors_held_pages = true},
+};
+
+// As in the test above, layer 0 keeps pages 0, 1, 4 and 7 and layer 1 pages 0, 2, 5 and 7; the mirroring layer measures
+// no mass and keeps their union, and the tokens and the attention layers' views are those without it.
+TEST_CASE("a mirroring layer holds the pages the other layers hold and changes no position") {
+    fixture f(16, 64, {}, {}, two_full_and_mirroring);
+    f.model.is_important = each_layers_own;
+    pulsarlm::eviction_policy
+        policy{.n_sink = 4, .n_working = 4, .cycle_tokens = 4, .eviction_threshold = 0.5, .eviction_warmup = 0};
+    std::vector<request_results> results = serve_all(
+        f.sched,
+        {request{.tokens = eight_pages, .max_tokens = 3, .eviction = policy}}
+    );
+
+    std::vector<digest> chain = pulsarlm::make_page_digests(request_root(policy), eight_pages, page_size);
+    std::int64_t first = continuation(pages_of(eight_pages, {0, 1, 4, 6, 7}), 1)[0];
+    token_list kept_tokens = pages_of(eight_pages, {0, 1, 4, 7});
+    REQUIRE(results[0].tokens == concat({first}, continuation(concat(kept_tokens, {first}), 2)));
+    pulsarlm::state end = ended_state(results[0]);
+    REQUIRE((hashes_of(end, 0) == std::vector{chain[0], chain[1], chain[4], chain[7]}));
+    REQUIRE((hashes_of(end, 1) == std::vector{chain[0], chain[2], chain[5], chain[7]}));
+    REQUIRE((hashes_of(end, 2) == std::vector{chain[0], chain[1], chain[2], chain[4], chain[5], chain[7]}));
+    for (const pulsarlm::cycle_end& ended : results[0].cycle_ends) {
+        std::vector<digest> held = hashes_of(*ended.state, 0);
+        for (const digest& hash : hashes_of(*ended.state, 1)) {
+            if (!std::ranges::contains(held, hash)) {
+                held.push_back(hash);
+            }
+        }
+        std::vector<digest> mirrored = hashes_of(*ended.state, 2);
+        std::ranges::sort(held, {}, [](const digest& d) { return std::pair(d.hi, d.lo); });
+        std::ranges::sort(mirrored, {}, [](const digest& d) { return std::pair(d.hi, d.lo); });
+        REQUIRE((mirrored == held));
+    }
 }
 
 // Layer 0 keeps pages 1 and 4 and layer 1 pages 2 and 5; both drop pages 3 and 6. Pages 1, 2, 4 and 5 stay in the

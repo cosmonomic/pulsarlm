@@ -33,6 +33,12 @@ struct kv_layer {
     std::optional<std::size_t> sliding_window;
     std::size_t index_head_dim = 0;
     std::optional<recurrent_state> state;
+    // The elements of the row an attention line keeps besides its keys: the model's hidden state at the latest position
+    // written into the line, which the first position of the next page reads.
+    std::size_t last_hidden_dim = 0;
+    // Whether the layer measures no mass and holds exactly the full pages the other attention layers hold, its pages
+    // left out of the ones positions are ranked among.
+    bool mirrors_held_pages = false;
 };
 
 // One KV layer's lines, [n_lines, page_size, n_kv_heads, head_dim] each; k and v are one tensor for a values_only
@@ -42,6 +48,8 @@ struct kv {
     at::Tensor k;
     at::Tensor v;
     at::Tensor index_keys;
+    // [n_lines, last_hidden_dim], for a layer that keeps it.
+    at::Tensor last_hidden;
 };
 
 // The tokens of one group of a step, concatenated across the group's sequences, and where they sit. Every KV layer has

@@ -27,7 +27,7 @@ namespace pulsarlm {
 // With values_only, one tensor per layer serves as both K and V. A recurrent layer's page (state_sizes not empty) is one
 // tensor [n_layers, state_sizes...] with values_only set; page_size, n_kv_heads and head_dim do not apply to it. A line
 // lays a page out head first, [n_kv_heads, k then v, page_size, head_dim], then an indexed attention layer's index keys
-// [page_size, index_head_dim].
+// [page_size, index_head_dim], then the last hidden row [last_hidden_dim] of a layer that keeps one.
 struct page_shape {
     std::size_t n_layers;
     std::size_t page_size;
@@ -37,13 +37,15 @@ struct page_shape {
     bool values_only = false;
     std::size_t index_head_dim = 0;
     std::vector<std::int64_t> state_sizes;
+    std::size_t last_hidden_dim = 0;
 };
 
 // The device bytes of one line: its K and V in every layer, or its one tensor for values_only, and its index keys.
 std::size_t line_bytes(const page_shape& shape);
 
 // The K and V of a page of shape, [n_layers, page_size, n_kv_heads, head_dim] views of its bytes, or its one tensor as
-// both for values_only, and its index keys [n_layers, page_size, index_head_dim].
+// both for values_only, its index keys [n_layers, page_size, index_head_dim] and its last hidden row [n_layers,
+// last_hidden_dim].
 kv page_tensors(const page& p, const page_shape& shape);
 
 // The digest that the page chains of an engine start from. model_name names the model and model_hash its files'
@@ -51,7 +53,8 @@ kv page_tensors(const page& p, const page_shape& shape);
 // changes a page's KV or how tokens split into pages. The seed is digest_function, model_name and model_hash, each as
 // an 8-byte little-endian length then its bytes, then the shape count as 8 little-endian bytes, then per shape the dtype name as a length and
 // its bytes, followed by n_layers, page_size, n_kv_heads, head_dim, values_only and index_head_dim, each as 8
-// little-endian bytes, then the count of state sizes and each size, as 8 little-endian bytes each.
+// little-endian bytes, then the count of state sizes and each size, as 8 little-endian bytes each, then last_hidden_dim
+// as 8 little-endian bytes.
 digest make_root_digest(std::string_view model_name, std::string_view model_hash, std::span<const page_shape> shapes);
 
 // The digest a request's page chain starts from. Under a policy that can evict, a page's KV also depends on when and

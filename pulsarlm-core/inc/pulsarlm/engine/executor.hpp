@@ -43,6 +43,8 @@ class executor {
     std::optional<std::size_t> graph_pages;
     std::vector<std::optional<std::size_t>> sliding_windows;
     std::vector<bool> recurrent;
+    // Per KV layer, whether it mirrors the pages the other attention layers hold (kv_layer::mirrors_held_pages).
+    std::vector<bool> mirrors;
     // Per KV layer, the query heads it measures mass and evicts pages in: those of every attention layer reading a
     // full-attention layer, 0 for other layers.
     std::vector<std::size_t> mass_heads;
@@ -89,6 +91,9 @@ class executor {
     // Drops from each sliding layer's view the pages before the window of the tail's first token, and returns whether
     // any view changed.
     bool release_passed_pages(sequence& seq);
+    // After seq's views changed: sets its held pages, then drops from each mirroring layer the pages no other layer
+    // holds.
+    void update_views(sequence& seq);
     // Whether e's tokens fill a page of its sequence.
     bool completes_page(const batch_entry& e) const noexcept;
     // Moves each entry's tokens to its sequence's tail (sequence::advance), switches the boundary lines of the

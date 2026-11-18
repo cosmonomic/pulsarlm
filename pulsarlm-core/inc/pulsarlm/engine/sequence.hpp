@@ -101,11 +101,12 @@ class sequence {
     std::size_t next_prompt_digest = 0;
     // Per KV layer, whether it is recurrent and its sliding window; the executor's.
     const std::vector<bool>& recurrent;
+    const std::vector<bool>& mirrors;
     const std::vector<std::optional<std::size_t>>& sliding_windows;
     std::size_t page_size;
     // One per KV layer.
     std::vector<layer_view> layers;
-    // The ascending history indices of the full pages some layer with pages holds. A full page's RoPE position is its
+    // The ascending history indices of the full pages some layer with pages, other than a mirroring one, holds. A full page's RoPE position is its
     // rank here times the page size, in every layer; the pages of tail and pending follow the last.
     std::vector<std::size_t> held_pages;
     // Whether head_state_lines hold the state at head, which the store does not have yet.
