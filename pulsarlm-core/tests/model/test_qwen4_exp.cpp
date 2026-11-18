@@ -32,7 +32,8 @@ namespace {
 
 // batch with each group's own arrival counters, as many as model needs for it.
 pulsarlm::step_batch with_arrival_counters(pulsarlm::step_batch batch, const pulsarlm::model& model) {
-    for (std::optional<pulsarlm::group_batch>* group : {&batch.decode_group, &batch.prefill_group}) {
+    for (std::optional<pulsarlm::group_batch>* group :
+         {&batch.decode_group, &batch.prefill_group, &batch.verify_group}) {
         if (*group) {
             const std::int64_t tokens = (*group)->tokens.size(0);
             const std::int64_t sequences = (*group)->is_prefill() ? (*group)->cu_seqlens_q.size(0) - 1 : tokens;
@@ -1183,6 +1184,94 @@ TEST_CASE("Qwen4-Exp drafts as a dense MTP layer a position after each row", "[m
         pulsarlm::draft_output drafted = drafter->draft(*drafting.prefill_group, hidden_rows, kv);
         CHECK(max_relative_error(drafted.logits, expected.logits.narrow(0, first, last - first)) < 1e-4);
         CHECK(max_relative_error(drafted.hidden, expected.streams.narrow(0, first, last - first)) < 1e-4);
+    }
+}
+
+// A verify group of the tokens at [first, last), the previous step having forwarded rejected tokens it did not keep, in
+// an engine drafting draft_tokens tokens.
+pulsarlm::step_batch verify_batch(
+    const at::Tensor& tokens,
+    std::int64_t first,
+    std::int64_t last,
+    std::int64_t rejected,
+    const std::vector<pulsarlm::kv_layer>& specs,
+    std::int64_t draft_tokens
+) {
+    pulsarlm::step_batch batch;
+    batch.verify_group = step(tokens, first, last, true, specs, draft_tokens);
+    batch.verify_group->rejected_tokens = int32_cuda({static_cast<std::int32_t>(rejected)});
+    return batch;
+}
+
+// Verify groups after a prefill: one keeping all its tokens, one whose drafts are wrong and keep only its first, then
+// one continuing after that first token and a shorter one ending page 2; each row's logits are the dense forward's,
+// and the layers end with its state.
+TEST_CASE("Qwen4-Exp's verify groups match a dense forward and continue from their kept tokens", "[model][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const std::int64_t experts_per_token = 2;
+    const std::int64_t budget = 8;
+    const std::int64_t draft_tokens = 2;
+    const double tolerance = 1e-4;
+    weights w(at::kFloat, base_dims, /*drafts=*/true);
+    pulsarlm::qwen4_exp_model model(model_config(w.dims, experts_per_token, budget), w.named_tensors);
+    std::vector<pulsarlm::kv_layer> specs = model.kv_layers();
+    std::vector<pulsarlm::kv> kv = make_lines(specs, at::kFloat, draft_tokens);
+
+    auto [tokens, token_ids] = make_tokens();
+    dense_output dense = dense_forward(w, token_ids, experts_per_token, budget);
+    at::Tensor wrong_drafts = tokens.clone();
+    wrong_drafts.narrow(0, 44, 2).copy_(at::remainder(tokens.narrow(0, 44, 2) + 1, vocab));
+
+    pulsarlm::step_batch prefill;
+    prefill.prefill_group = step(tokens, 0, 40, true, specs, draft_tokens);
+    model.forward(with_arrival_counters(prefill, model), kv);
+
+    struct verify_step {
+        std::int64_t first;
+        std::int64_t last;
+        std::int64_t rejected;
+        const at::Tensor& tokens;
+        std::int64_t matching_rows;
+    };
+    for (const verify_step& v : {
+             verify_step{40, 43, 0, tokens, 3},
+             verify_step{43, 46, 0, wrong_drafts, 1},
+             verify_step{44, 47, 2, tokens, 3},
+             verify_step{47, 49, 0, tokens, 2},
+         }) {
+        INFO("verify [" << v.first << ", " << v.last << ") after " << v.rejected << " rejected");
+        pulsarlm::step_logits logits = model.forward(
+            with_arrival_counters(verify_batch(v.tokens, v.first, v.last, v.rejected, specs, draft_tokens), model),
+            kv
+        );
+        REQUIRE(logits.verify_logits);
+        REQUIRE(logits.verify_hidden);
+        CHECK(
+            max_relative_error(
+                logits.verify_logits->narrow(0, 0, v.matching_rows),
+                dense.logits.narrow(0, v.first, v.matching_rows)
+            ) < tolerance
+        );
+    }
+
+    std::size_t kv_index = 0;
+    for (std::size_t layer = 0; layer < layer_types.size(); layer++) {
+        INFO("layer " << layer);
+        if (indexed(layer)) {
+            kv_index++;
+            continue;
+        }
+        const at::Tensor& states = kv[kv_index].k;
+        const at::Tensor& conv = kv[kv_index + 1].k;
+        CHECK(max_relative_error(states[running_line], dense.states[layer][n_tokens - 1]) < tolerance);
+        CHECK(max_relative_error(states[boundary_line], dense.states[layer][47]) < tolerance);
+        const std::int64_t window = 3 + draft_tokens;
+        auto inputs = dense.conv_inputs[layer];
+        CHECK(max_relative_error(conv[running_line], inputs.narrow(0, n_tokens - window, window).t()) < tolerance);
+        CHECK(max_relative_error(conv[boundary_line], inputs.narrow(0, 48 - window, window).t()) < tolerance);
+        kv_index += static_cast<std::int64_t>(layer) == ple_layer ? 4 : 2;
     }
 }
 

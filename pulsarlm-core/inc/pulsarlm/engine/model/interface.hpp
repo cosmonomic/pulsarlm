@@ -104,10 +104,13 @@ struct group_batch {
     }
 };
 
-// A step's two groups; either may be absent.
+// A step's groups; any may be absent.
 struct step_batch {
     std::optional<group_batch> prefill_group;
     std::optional<group_batch> decode_group;
+    // Each sequence's next token then its drafts, the same count per sequence, with cu_seqlens_q; when it measures
+    // mass, cu_view_pages is [n_kv_layers, tokens + 1], one view per row. Only a model with a drafter receives it.
+    std::optional<group_batch> verify_group;
 };
 
 // Each present group's logits [rows, vocab] in the model's dtype, and for a model that drafts (model::drafter), the
@@ -117,6 +120,9 @@ struct step_logits {
     std::optional<at::Tensor> decode_logits;
     std::optional<at::Tensor> prefill_hidden;
     std::optional<at::Tensor> decode_hidden;
+    // Every row's.
+    std::optional<at::Tensor> verify_logits;
+    std::optional<at::Tensor> verify_hidden;
 };
 
 // A KV layer of the whole model and the ranges [first, last) along its line's first dimension, KV heads or a state's
