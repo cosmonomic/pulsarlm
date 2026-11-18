@@ -139,7 +139,8 @@ struct weights {
     c10::Dict<std::string, at::Tensor> named_tensors;
     at::Tensor ngram_embedding;
 
-    weights(at::ScalarType dtype, split_dims dims)
+    // With drafts, the MTP layer's mtp.* weights too.
+    weights(at::ScalarType dtype, split_dims dims, bool drafts = false)
     : dims(dims) {
         at::manual_seed(13);
         auto add = [&](const std::string& name, at::Tensor t) { named_tensors.insert(name, t.to(cuda(dtype))); };
@@ -153,12 +154,7 @@ struct weights {
                 add(p + "block_inject_weight.weight", projection(hc, hc * hidden));
             }
         };
-        const std::string p = "model.language_model.";
-        add(p + "embed_tokens.weight", at::randn({vocab, hidden}));
-        add("lm_head.weight", projection(vocab, hidden));
-        hyper_connection(p + "hyper_connection_mixer.", false);
-        for (std::size_t layer = 0; layer < layer_types.size(); layer++) {
-            std::string l = p + "layers." + std::to_string(layer) + ".";
+        auto decoder_layer = [&](const std::string& l, bool indexed_layer) {
             hyper_connection(l + "attn_hyper_connection.", true);
             hyper_connection(l + "mlp_hyper_connection.", true);
             add(l + "mlp.gate.weight", projection(n_experts, hidden));
@@ -170,7 +166,7 @@ struct weights {
             add(l + "mlp.shared_expert.up_proj.weight", projection(shared_intermediate, hidden));
             add(l + "mlp.shared_expert.down_proj.weight", projection(hidden, shared_intermediate));
             add(l + "mlp.shared_expert_gate.weight", projection(1, hidden));
-            if (indexed(layer)) {
+            if (indexed_layer) {
                 add(l + "self_attn.indexer.index_qk_proj.weight",
                     projection((indexer_heads + 1) * indexer_dim, hidden));
                 add(l + "self_attn.indexer.q_layernorm.weight", norm(indexer_dim));
@@ -181,7 +177,16 @@ struct weights {
                 add(l + "self_attn.o_proj.weight", projection(hidden, n_heads * head_dim));
                 add(l + "self_attn.q_norm.weight", norm(head_dim));
                 add(l + "self_attn.k_norm.weight", norm(head_dim));
-            } else {
+            }
+        };
+        const std::string p = "model.language_model.";
+        add(p + "embed_tokens.weight", at::randn({vocab, hidden}));
+        add("lm_head.weight", projection(vocab, hidden));
+        hyper_connection(p + "hyper_connection_mixer.", false);
+        for (std::size_t layer = 0; layer < layer_types.size(); layer++) {
+            std::string l = p + "layers." + std::to_string(layer) + ".";
+            decoder_layer(l, indexed(layer));
+            if (!indexed(layer)) {
                 add(l + "linear_attn.in_proj_qkv.weight", projection(dims.channels(), hidden));
                 add(l + "linear_attn.in_proj_z.weight", projection(dims.value_channels(), hidden));
                 add(l + "linear_attn.in_proj_b.weight", projection(dims.value_heads, hidden));
@@ -213,6 +218,14 @@ struct weights {
                     );
                 }
             }
+        }
+        if (drafts) {
+            add("mtp.pre_fc_norm_embedding.weight", norm(hidden));
+            add("mtp.pre_fc_norm_hidden.weight", norm(hc * hidden));
+            add("mtp.fc_embedding.weight", projection(hidden, hidden));
+            add("mtp.fc_hidden.weight", projection(hidden, hidden));
+            hyper_connection("mtp.hyper_connection_mixer.", false);
+            decoder_layer("mtp.layers.0.", true);
         }
     }
 
@@ -257,6 +270,7 @@ at::Tensor l2_normalized(const at::Tensor& x) {
 
 struct dense_output {
     at::Tensor logits;  // [tokens, vocab]
+    at::Tensor streams;  // [tokens, hc * hidden], after the last layer
     std::vector<at::Tensor>
         states;  // per layer, S after each token [tokens, value_heads, key_head_dim, value_head_dim]
     std::vector<at::Tensor> conv_inputs;  // per layer, [tokens, channels]
@@ -351,12 +365,12 @@ at::Tensor index_rope(const at::Tensor& x, const at::Tensor& positions) {
 
 // Hugging Face's QSA indexer, query by query: [n, n] whether query i attends key j. The lower block wins among equal
 // scores, where torch.topk leaves the order unspecified.
-at::Tensor qsa_selection(const weights& w, std::size_t layer, const at::Tensor& h, std::int64_t budget) {
+at::Tensor qsa_selection(const weights& w, const std::string& l, const at::Tensor& h, std::int64_t budget) {
     const std::int64_t n = h.size(0);
-    auto qk = at::linear(h, w.layer(layer, "self_attn.indexer.index_qk_proj.weight"));
+    auto qk = at::linear(h, w(l + "self_attn.indexer.index_qk_proj.weight"));
     auto q = rms_norm(
         qk.narrow(1, 0, indexer_heads * indexer_dim).view({n, indexer_heads, indexer_dim}),
-        w.layer(layer, "self_attn.indexer.q_layernorm.weight")
+        w(l + "self_attn.indexer.q_layernorm.weight")
     );
     q = index_rope(q, at::arange(n, cuda(at::kLong)));
     auto raw_keys = qk.narrow(1, indexer_heads * indexer_dim, indexer_dim);
@@ -367,7 +381,7 @@ at::Tensor qsa_selection(const weights& w, std::size_t layer, const at::Tensor& 
             auto pooled = raw_keys.narrow(0, 0, complete * compress_ratio)
                               .view({complete, compress_ratio, indexer_dim})
                               .mean(1);
-            pooled = rms_norm(pooled, w.layer(layer, "self_attn.indexer.k_layernorm.weight"));
+            pooled = rms_norm(pooled, w(l + "self_attn.indexer.k_layernorm.weight"));
             auto keys = index_rope(pooled, at::arange(complete, cuda(at::kLong)) * compress_ratio);
             auto scores = at::relu(at::matmul(q[i], keys.t())).sum(0) / std::sqrt(static_cast<double>(indexer_dim));
             auto [sorted, order] = at::sort(scores, /*stable=*/true, /*dim=*/0, /*descending=*/true);
@@ -381,34 +395,34 @@ at::Tensor qsa_selection(const weights& w, std::size_t layer, const at::Tensor& 
     return attends;
 }
 
-at::Tensor attention(const weights& w, std::size_t layer, const at::Tensor& h, std::int64_t budget) {
+at::Tensor attention(const weights& w, const std::string& l, const at::Tensor& h, std::int64_t budget) {
     const std::int64_t n = h.size(0);
-    auto query_gate = at::linear(h, w.layer(layer, "self_attn.q_proj.weight")).view({n, n_heads, 2 * head_dim});
-    auto q = rms_norm(query_gate.narrow(-1, 0, head_dim), w.layer(layer, "self_attn.q_norm.weight"));
+    auto query_gate = at::linear(h, w(l + "self_attn.q_proj.weight")).view({n, n_heads, 2 * head_dim});
+    auto q = rms_norm(query_gate.narrow(-1, 0, head_dim), w(l + "self_attn.q_norm.weight"));
     auto gate = query_gate.narrow(-1, head_dim, head_dim).reshape({n, n_heads * head_dim});
     auto k = rms_norm(
-        at::linear(h, w.layer(layer, "self_attn.k_proj.weight")).view({n, n_kv_heads, head_dim}),
-        w.layer(layer, "self_attn.k_norm.weight")
+        at::linear(h, w(l + "self_attn.k_proj.weight")).view({n, n_kv_heads, head_dim}),
+        w(l + "self_attn.k_norm.weight")
     );
-    auto v = at::linear(h, w.layer(layer, "self_attn.v_proj.weight")).view({n, n_kv_heads, head_dim});
+    auto v = at::linear(h, w(l + "self_attn.v_proj.weight")).view({n, n_kv_heads, head_dim});
     auto group = n_heads / n_kv_heads;
     auto q_heads = rope(q).transpose(0, 1);
     auto k_heads = rope(k).repeat_interleave(group, 1).transpose(0, 1);
     auto v_heads = v.repeat_interleave(group, 1).transpose(0, 1);
-    auto attends = qsa_selection(w, layer, h, budget);
+    auto attends = qsa_selection(w, l, h, budget);
     auto scores = at::matmul(q_heads, k_heads.transpose(1, 2)) / std::sqrt(static_cast<double>(head_dim));
     auto probabilities = at::softmax(scores.masked_fill(attends.logical_not(), -INFINITY), -1);
     auto o = at::matmul(probabilities, v_heads).transpose(0, 1).reshape({n, n_heads * head_dim});
-    return at::linear(o * at::sigmoid(gate), w.layer(layer, "self_attn.o_proj.weight"));
+    return at::linear(o * at::sigmoid(gate), w(l + "self_attn.o_proj.weight"));
 }
 
 // Hugging Face's qwen4_exp block, each expert over the tokens that chose it.
-at::Tensor sparse_moe(const weights& w, std::size_t layer, const at::Tensor& h, std::int64_t top_k) {
-    auto probabilities = at::softmax(at::linear(h, w.layer(layer, "mlp.gate.weight")), -1);
+at::Tensor sparse_moe(const weights& w, const std::string& l, const at::Tensor& h, std::int64_t top_k) {
+    auto probabilities = at::softmax(at::linear(h, w(l + "mlp.gate.weight")), -1);
     auto [top_weights, top_experts] = at::topk(probabilities, top_k, -1);
     top_weights = top_weights / top_weights.sum(-1, true);
-    auto gate_up = w.layer(layer, "mlp.experts.gate_up_proj");
-    auto down = w.layer(layer, "mlp.experts.down_proj");
+    auto gate_up = w(l + "mlp.experts.gate_up_proj");
+    auto down = w(l + "mlp.experts.down_proj");
     auto out = at::zeros_like(h);
     for (std::int64_t expert = 0; expert < n_experts; expert++) {
         auto chosen = top_experts.eq(expert);
@@ -421,11 +435,11 @@ at::Tensor sparse_moe(const weights& w, std::size_t layer, const at::Tensor& h, 
         out.index_add_(0, tokens_of, at::linear(at::silu(halves[0]) * halves[1], down[expert]) * weight);
     }
     auto shared = at::linear(
-        at::silu(at::linear(h, w.layer(layer, "mlp.shared_expert.gate_proj.weight"))) *
-            at::linear(h, w.layer(layer, "mlp.shared_expert.up_proj.weight")),
-        w.layer(layer, "mlp.shared_expert.down_proj.weight")
+        at::silu(at::linear(h, w(l + "mlp.shared_expert.gate_proj.weight"))) *
+            at::linear(h, w(l + "mlp.shared_expert.up_proj.weight")),
+        w(l + "mlp.shared_expert.down_proj.weight")
     );
-    return out + at::sigmoid(at::linear(h, w.layer(layer, "mlp.shared_expert_gate.weight"))) * shared;
+    return out + at::sigmoid(at::linear(h, w(l + "mlp.shared_expert_gate.weight"))) * shared;
 }
 
 // Hugging Face's _shift_right_ignore_eos over the history of ngram_size - 1 EOS then the tokens: the token shift
@@ -509,14 +523,54 @@ dense_forward(const weights& w, const std::vector<std::int64_t>& tokens, std::in
         mixed_input mixed = mix(w, l + "attn_hyper_connection.", x);
         x = inject(
             x,
-            indexed(layer) ? attention(w, layer, mixed.input, budget) : deltanet(w, layer, mixed.input, out),
+            indexed(layer) ? attention(w, l, mixed.input, budget) : deltanet(w, layer, mixed.input, out),
             mixed
         );
         mixed = mix(w, l + "mlp_hyper_connection.", x);
-        x = inject(x, sparse_moe(w, layer, mixed.input, top_k), mixed);
+        x = inject(x, sparse_moe(w, l, mixed.input, top_k), mixed);
     }
+    out.streams = x;
     out.logits = at::linear(mix(w, "model.language_model.hyper_connection_mixer.", x).input, w("lm_head.weight"));
     return out;
+}
+
+struct dense_draft {
+    at::Tensor logits;  // [tokens, vocab]: row t predicts the token at t + 1
+    at::Tensor streams;  // [tokens, hc * hidden]
+};
+
+// The MTP layer over every position: row t reads the streams at t - 1, zeros at 0, and the token at t.
+dense_draft dense_mtp(
+    const weights& w,
+    const at::Tensor& streams,
+    const at::Tensor& tokens,
+    std::int64_t top_k,
+    std::int64_t budget
+) {
+    const std::int64_t n = streams.size(0);
+    at::Tensor previous = at::cat({at::zeros({1, hc * hidden}, streams.options()), streams.narrow(0, 0, n - 1)});
+    at::Tensor embedded = at::linear(
+        rms_norm(
+            w("model.language_model.embed_tokens.weight").index_select(0, tokens),
+            w("mtp.pre_fc_norm_embedding.weight")
+        ),
+        w("mtp.fc_embedding.weight")
+    );
+    at::Tensor x = at::linear(
+                       rms_norm(previous, w("mtp.pre_fc_norm_hidden.weight")).view({n, hc, hidden}),
+                       w("mtp.fc_hidden.weight")
+                   )
+                       .flatten(1) +
+        embedded.repeat({1, hc});
+    const std::string l = "mtp.layers.0.";
+    mixed_input mixed = mix(w, l + "attn_hyper_connection.", x);
+    x = inject(x, attention(w, l, mixed.input, budget), mixed);
+    mixed = mix(w, l + "mlp_hyper_connection.", x);
+    x = inject(x, sparse_moe(w, l, mixed.input, top_k), mixed);
+    return dense_draft{
+        .logits = at::linear(mix(w, "mtp.hyper_connection_mixer.", x).input, w("lm_head.weight")),
+        .streams = x,
+    };
 }
 
 pulsarlm::qwen4_exp_config model_config(const split_dims& dims, std::int64_t experts_per_token, std::int64_t budget) {
@@ -617,6 +671,9 @@ std::vector<pulsarlm::kv> make_lines(const std::vector<pulsarlm::kv_layer>& spec
                     .k = at::zeros({n_lines, page_size, kv_heads, head_dim}, cuda(dtype)),
                     .v = at::zeros({n_lines, page_size, kv_heads, head_dim}, cuda(dtype)),
                     .index_keys = at::zeros({n_lines, page_size, indexer_dim}, cuda(dtype)),
+                    .last_hidden = spec.last_hidden_dim > 0
+                        ? at::zeros({n_lines, static_cast<std::int64_t>(spec.last_hidden_dim)}, cuda(dtype))
+                        : at::Tensor(),
                 }
             );
         }
@@ -1019,4 +1076,130 @@ TEST_CASE("Qwen4-Exp split across 4 GPUs, each KV head on 2, matches a dense for
         SKIP("no CUDA device");
     }
     check_sharded(four_way_dims, at::kFloat, 1e-4, 2, 8, 4);
+}
+
+// Each chunk's draft rows run from its first position, whose hidden row the MTP layer's line kept, as after a resume,
+// to the position after its last, the first chunk's from position 0 with zeros.
+TEST_CASE("Qwen4-Exp drafts as a dense MTP layer a position after each row", "[model][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const std::int64_t experts_per_token = 2;
+    const std::int64_t budget = 8;
+    weights w(at::kFloat, base_dims, /*drafts=*/true);
+    pulsarlm::qwen4_exp_model model(model_config(w.dims, experts_per_token, budget), w.named_tensors);
+    pulsarlm::draft_head* drafter = model.drafter();
+    REQUIRE(drafter != nullptr);
+    REQUIRE(drafter->hidden_dim() == hc * hidden);
+    std::vector<pulsarlm::kv_layer> specs = model.kv_layers();
+    REQUIRE(specs.size() == 10);
+    const std::size_t mtp_layer = specs.size() - 1;
+    CHECK(specs[mtp_layer].mirrors_held_pages);
+    CHECK(specs[mtp_layer].last_hidden_dim == static_cast<std::size_t>(hc * hidden));
+    std::vector<pulsarlm::kv> kv = make_lines(specs, at::kFloat);
+
+    auto [tokens, token_ids] = make_tokens();
+    dense_output dense = dense_forward(w, token_ids, experts_per_token, budget);
+    dense_draft expected = dense_mtp(w, dense.streams, tokens, experts_per_token, budget);
+
+    for (chunk c : chunks) {
+        INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
+        pulsarlm::step_logits logits = model.forward(with_arrival_counters(chunk_batch(tokens, c, specs), model), kv);
+        const at::Tensor& streams = *(c.prefill ? logits.prefill_hidden : logits.decode_hidden);
+        CHECK(max_relative_error(streams, dense.streams.narrow(0, c.first, c.last - c.first)) < 1e-4);
+
+        const std::int64_t first = c.first;
+        const std::int64_t last = std::min(c.last + 1, n_tokens);
+        at::Tensor before = first == 0
+            ? at::zeros({1, hc * hidden}, streams.options())
+            : kv[mtp_layer].last_hidden[view_lines[static_cast<std::size_t>((first - 1) / page_size)]].unsqueeze(0);
+        at::Tensor hidden_rows = at::cat({before, streams.narrow(0, 0, last - first - 1)});
+        pulsarlm::step_batch drafting;
+        drafting.prefill_group = step(tokens, first, last, true, specs);
+        drafting = with_arrival_counters(drafting, model);
+        pulsarlm::draft_output drafted = drafter->draft(*drafting.prefill_group, hidden_rows, kv);
+        CHECK(max_relative_error(drafted.logits, expected.logits.narrow(0, first, last - first)) < 1e-4);
+        CHECK(max_relative_error(drafted.hidden, expected.streams.narrow(0, first, last - first)) < 1e-4);
+    }
+}
+
+// Split across gpus, every rank's draft matches the dense MTP layer, each rank holding its part of the MTP layer's
+// weights as of its decoder layers.
+void check_sharded_draft(const split_dims& dims, std::size_t gpus) {
+    const std::int64_t experts_per_token = 2;
+    const std::int64_t budget = 8;
+    weights w(at::kFloat, dims, /*drafts=*/true);
+    pulsarlm::qwen4_exp_config config = model_config(w.dims, experts_per_token, budget);
+    std::vector<pulsarlm::communicator> ranks = pulsarlm::communicator::make_on_one_device(
+        at::Device(at::kCUDA, 0),
+        gpus
+    );
+    std::vector<std::unique_ptr<pulsarlm::qwen4_exp_model>> shards;
+    std::vector<std::vector<pulsarlm::kv>> lines;
+    std::vector<c10::cuda::CUDAStream> streams;
+    for (std::size_t rank = 0; rank < gpus; rank++) {
+        shards.push_back(
+            std::make_unique<pulsarlm::qwen4_exp_model>(config, rank_weights(w, rank, gpus, false), ranks[rank])
+        );
+        lines.push_back(make_lines(shards.back()->kv_layers(), at::kFloat));
+        streams.push_back(c10::cuda::getStreamFromPool(false, 0));
+    }
+    std::vector<pulsarlm::kv_layer> specs = shards.front()->kv_layers();
+    const std::size_t mtp_layer = specs.size() - 1;
+
+    auto [tokens, token_ids] = make_tokens();
+    dense_output dense = dense_forward(w, token_ids, experts_per_token, budget);
+    dense_draft expected = dense_mtp(w, dense.streams, tokens, experts_per_token, budget);
+
+    for (chunk c : chunks) {
+        INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
+        std::vector<pulsarlm::step_logits>
+            logits = sharded_forward(shards, lines, streams, chunk_batch(tokens, c, specs));
+        const std::int64_t first = c.first;
+        const std::int64_t last = std::min(c.last + 1, n_tokens);
+        std::vector<pulsarlm::draft_output> drafted(gpus);
+        std::vector<std::thread> threads;
+        for (std::size_t rank = 0; rank < gpus; rank++) {
+            threads.emplace_back([&, rank] {
+                c10::cuda::CUDAStreamGuard guard(streams[rank]);
+                const at::Tensor& streams_out = *(c.prefill ? logits[rank].prefill_hidden : logits[rank].decode_hidden);
+                at::Tensor before = first == 0
+                    ? at::zeros({1, hc * hidden}, streams_out.options())
+                    : lines[rank][mtp_layer]
+                          .last_hidden[view_lines[static_cast<std::size_t>((first - 1) / page_size)]]
+                          .unsqueeze(0);
+                pulsarlm::step_batch drafting;
+                drafting.prefill_group = step(tokens, first, last, true, specs);
+                drafting = with_arrival_counters(drafting, *shards[rank]);
+                drafted[rank] = shards[rank]->draft(
+                    *drafting.prefill_group,
+                    at::cat({before, streams_out.narrow(0, 0, last - first - 1)}),
+                    lines[rank]
+                );
+                streams[rank].synchronize();
+            });
+        }
+        for (std::thread& thread : threads) {
+            thread.join();
+        }
+        CHECK(max_relative_error(drafted.front().logits, expected.logits.narrow(0, first, last - first)) < 1e-4);
+        CHECK(max_relative_error(drafted.front().hidden, expected.streams.narrow(0, first, last - first)) < 1e-4);
+        for (std::size_t rank = 1; rank < gpus; rank++) {
+            CHECK(at::equal(drafted[rank].logits, drafted.front().logits));
+        }
+    }
+}
+
+TEST_CASE("Qwen4-Exp split across 2 GPUs drafts as the dense MTP layer", "[model][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    check_sharded_draft(base_dims, 2);
+}
+
+TEST_CASE("Qwen4-Exp split across 4 GPUs drafts as the dense MTP layer", "[model][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    check_sharded_draft(four_way_dims, 4);
 }

@@ -104,10 +104,13 @@ struct step_batch {
     std::optional<group_batch> decode_group;
 };
 
-// Each present group's logits [rows, vocab] in the model's dtype.
+// Each present group's logits [rows, vocab] in the model's dtype, and for a model that drafts (model::drafter), the
+// hidden rows [tokens, draft_head::hidden_dim()] of every token of the group, which its draft rows read.
 struct step_logits {
     std::optional<at::Tensor> prefill_logits;
     std::optional<at::Tensor> decode_logits;
+    std::optional<at::Tensor> prefill_hidden;
+    std::optional<at::Tensor> decode_hidden;
 };
 
 // A KV layer of the whole model and the ranges [first, last) along its line's first dimension, KV heads or a state's
@@ -115,6 +118,28 @@ struct step_logits {
 struct kv_layer_shard {
     kv_layer full;
     std::vector<std::pair<std::size_t, std::size_t>> rows;
+};
+
+// The draft logits of a draft group's logit rows, and the hidden rows of every row, which the next draft step reads.
+struct draft_output {
+    at::Tensor logits;
+    at::Tensor hidden;
+};
+
+// A model's multi-token prediction head, one decoder layer with its own KV layer (kv_layer::mirrors_held_pages and
+// last_hidden_dim set) that drafts the token after the next. Its row at position t reads the hidden row of position
+// t - 1 and the token at t, and predicts the token at t + 1.
+class draft_head {
+  public:
+    virtual ~draft_head() = default;
+
+    // The elements of a hidden row.
+    virtual std::int64_t hidden_dim() const = 0;
+    // Drafts for the rows of g: row i at position g.pos[i] with token g.tokens[i] and the hidden row hidden[i] of the
+    // position before it, zeros before a sequence's first position. Writes the rows' KV into the head's KV layer of
+    // lines, and each sequence's last hidden row into the last_hidden of the line holding the position before its last
+    // row.
+    virtual draft_output draft(const group_batch& g, const at::Tensor& hidden, std::span<const kv> lines) = 0;
 };
 
 class model {
@@ -135,6 +160,10 @@ class model {
     }
     // lines holds one kv per entry of kv_layers().
     virtual step_logits forward(const step_batch& batch, std::span<const kv> lines) = 0;
+    // The model's draft head, null for a model without one.
+    virtual draft_head* drafter() {
+        return nullptr;
+    }
     // The arrival counters a group of sequences forwarding tokens tokens needs.
     virtual std::int64_t arrival_counter_count(std::int64_t sequences, std::int64_t tokens) const {
         return 0;

@@ -23,11 +23,16 @@ namespace {
 
 const std::string prefix = "model.language_model.";
 
-at::Tensor need(const c10::Dict<std::string, at::Tensor>& weights, const std::string& name) {
-    if (!weights.contains(prefix + name)) {
-        throw std::invalid_argument(std::format("qwen4_exp_model: missing weight {:?}", prefix + name));
+// The weight of the checkpoint's full name.
+at::Tensor need_named(const c10::Dict<std::string, at::Tensor>& weights, const std::string& name) {
+    if (!weights.contains(name)) {
+        throw std::invalid_argument(std::format("qwen4_exp_model: missing weight {:?}", name));
     }
-    return weights.at(prefix + name);
+    return weights.at(name);
+}
+
+at::Tensor need(const c10::Dict<std::string, at::Tensor>& weights, const std::string& name) {
+    return need_named(weights, prefix + name);
 }
 
 // Hugging Face's Qwen4-Exp RMSNorm scales by 1 + weight, in fp32.
@@ -35,14 +40,14 @@ at::Tensor zero_centered(const at::Tensor& weight) {
     return weight.to(at::kFloat) + 1.0;
 }
 
-// The table's shards, concatenated in order.
+// The shards of the table whose weights' full names start with p, concatenated in order.
 at::Tensor ngram_table(const c10::Dict<std::string, at::Tensor>& weights, const std::string& p) {
     std::vector<at::Tensor> shards;
-    while (weights.contains(std::format("{}{}shard_{}.weight", prefix, p, shards.size()))) {
-        shards.push_back(weights.at(std::format("{}{}shard_{}.weight", prefix, p, shards.size())));
+    while (weights.contains(std::format("{}shard_{}.weight", p, shards.size()))) {
+        shards.push_back(weights.at(std::format("{}shard_{}.weight", p, shards.size())));
     }
     if (shards.empty()) {
-        throw std::invalid_argument(std::format("qwen4_exp_model: missing weight {:?}", prefix + p + "shard_0.weight"));
+        throw std::invalid_argument(std::format("qwen4_exp_model: missing weight {:?}", p + "shard_0.weight"));
     }
     return at::cat(shards);
 }
@@ -122,23 +127,24 @@ qwen4_exp_model::qwen4_exp_model(
     auto rows = [](std::int64_t first, std::int64_t count) {
         return std::pair{static_cast<std::size_t>(first), static_cast<std::size_t>(first + count)};
     };
-    auto mixer = [&](const std::string& p) {
-        return mixer_weights{
-            .hc_norm = zero_centered(need(weights, p + "hc_norm.weight")),
-            .input_mix_weight_down = need(weights, p + "input_mix_weight_down.weight"),
-            .input_mix_weight_up = need(weights, p + "input_mix_weight_up.weight"),
-        };
-    };
     auto hyper_connection = [&](const std::string& p) {
         return hyper_connection_weights{
-            .hc_norm = zero_centered(need(weights, p + "hc_norm.weight")),
+            .hc_norm = zero_centered(need_named(weights, p + "hc_norm.weight")),
             .down_and_inject = at::cat(
-                {need(weights, p + "input_mix_weight_down.weight"), need(weights, p + "block_inject_weight.weight")}
+                {need_named(weights, p + "input_mix_weight_down.weight"),
+                 need_named(weights, p + "block_inject_weight.weight")}
             ),
-            .input_mix_weight_up = need(weights, p + "input_mix_weight_up.weight"),
+            .input_mix_weight_up = need_named(weights, p + "input_mix_weight_up.weight"),
         };
     };
-    hyper_connection_mixer = mixer("hyper_connection_mixer.");
+    auto mixer_named = [&](const std::string& p) {
+        return mixer_weights{
+            .hc_norm = zero_centered(need_named(weights, p + "hc_norm.weight")),
+            .input_mix_weight_down = need_named(weights, p + "input_mix_weight_down.weight"),
+            .input_mix_weight_up = need_named(weights, p + "input_mix_weight_up.weight"),
+        };
+    };
+    hyper_connection_mixer = mixer_named(prefix + "hyper_connection_mixer.");
     auto recurrent = [](std::vector<std::int64_t> sizes, at::ScalarType dtype) {
         return kv_layer{
             .n_kv_heads = 0,
@@ -156,22 +162,23 @@ qwen4_exp_model::qwen4_exp_model(
         add_kv_layer(layer, layer, {rows(0, first_size)});
     };
 
-    for (std::int64_t layer = 0; layer < n_layers; layer++) {
-        const std::string p = "layers." + std::to_string(layer) + ".";
+    // p is the layer's weight prefix; layer n_layers is the MTP layer, an indexed attention layer without PLE.
+    auto load_layer = [&](const std::string& p, std::int64_t layer) {
         layer_weights w{
             .attn_hyper_connection = hyper_connection(p + "attn_hyper_connection."),
             .mlp_hyper_connection = hyper_connection(p + "mlp_hyper_connection."),
             .moe = moe_weights{
                 .router_and_gate = at::cat(
-                    {need(weights, p + "mlp.gate.weight"), need(weights, p + "mlp.shared_expert_gate.weight")}
+                    {need_named(weights, p + "mlp.gate.weight"),
+                     need_named(weights, p + "mlp.shared_expert_gate.weight")}
                 ),
-                .experts_gate_up_proj = need(weights, p + "mlp.experts.gate_up_proj"),
-                .experts_down_proj = need(weights, p + "mlp.experts.down_proj"),
+                .experts_gate_up_proj = need_named(weights, p + "mlp.experts.gate_up_proj"),
+                .experts_down_proj = need_named(weights, p + "mlp.experts.down_proj"),
                 .shared_gate_up_proj = at::cat(
-                    {need(weights, p + "mlp.shared_expert.gate_proj.weight"),
-                     need(weights, p + "mlp.shared_expert.up_proj.weight")}
+                    {need_named(weights, p + "mlp.shared_expert.gate_proj.weight"),
+                     need_named(weights, p + "mlp.shared_expert.up_proj.weight")}
                 ),
-                .shared_down_proj = need(weights, p + "mlp.shared_expert.down_proj.weight"),
+                .shared_down_proj = need_named(weights, p + "mlp.shared_expert.down_proj.weight"),
             },
         };
         const std::int64_t experts = w.moe.router_and_gate.size(0) - 1;
@@ -192,16 +199,18 @@ qwen4_exp_model::qwen4_exp_model(
         if (indexed_attention(layer)) {
             w.attention = attention_weights{
                 .projections = at::cat(
-                    {permute_queries(need(weights, p + "self_attn.q_proj.weight"), heads.n_heads, permutation),
-                     permute_heads(need(weights, p + "self_attn.k_proj.weight"), heads.n_kv_heads, permutation),
-                     need(weights, p + "self_attn.v_proj.weight"),
-                     need(weights, p + "self_attn.indexer.index_qk_proj.weight")}
+                    {permute_queries(need_named(weights, p + "self_attn.q_proj.weight"), heads.n_heads, permutation),
+                     permute_heads(need_named(weights, p + "self_attn.k_proj.weight"), heads.n_kv_heads, permutation),
+                     need_named(weights, p + "self_attn.v_proj.weight"),
+                     need_named(weights, p + "self_attn.indexer.index_qk_proj.weight")}
                 ),
-                .o_proj = need(weights, p + "self_attn.o_proj.weight"),
-                .q_norm = zero_centered(need(weights, p + "self_attn.q_norm.weight")).index_select(0, permutation),
-                .k_norm = zero_centered(need(weights, p + "self_attn.k_norm.weight")).index_select(0, permutation),
-                .index_q_norm = zero_centered(need(weights, p + "self_attn.indexer.q_layernorm.weight")),
-                .index_k_norm = zero_centered(need(weights, p + "self_attn.indexer.k_layernorm.weight")),
+                .o_proj = need_named(weights, p + "self_attn.o_proj.weight"),
+                .q_norm = zero_centered(need_named(weights, p + "self_attn.q_norm.weight"))
+                              .index_select(0, permutation),
+                .k_norm = zero_centered(need_named(weights, p + "self_attn.k_norm.weight"))
+                              .index_select(0, permutation),
+                .index_q_norm = zero_centered(need_named(weights, p + "self_attn.indexer.q_layernorm.weight")),
+                .index_k_norm = zero_centered(need_named(weights, p + "self_attn.indexer.k_layernorm.weight")),
             };
             auto attention_layer = [&](std::int64_t n_kv_heads, std::int64_t n_q_heads) {
                 return kv_layer{
@@ -216,19 +225,25 @@ qwen4_exp_model::qwen4_exp_model(
                 attention_layer(c.n_kv_heads, c.n_heads),
                 {rows(first_kv_head, heads.n_kv_heads)}
             );
+            if (layer == n_layers) {
+                for (kv_layer* drafting : {&kv_specs.back(), &kv_shards.back().full}) {
+                    drafting->mirrors_held_pages = true;
+                    drafting->last_hidden_dim = static_cast<std::size_t>(c.hc_count * c.hidden_size);
+                }
+            }
         } else {
             w.deltanet = deltanet_weights{
                 .in_proj = at::cat(
-                    {need(weights, p + "linear_attn.in_proj_qkv.weight"),
-                     need(weights, p + "linear_attn.in_proj_a.weight"),
-                     need(weights, p + "linear_attn.in_proj_b.weight"),
-                     need(weights, p + "linear_attn.in_proj_z.weight")}
+                    {need_named(weights, p + "linear_attn.in_proj_qkv.weight"),
+                     need_named(weights, p + "linear_attn.in_proj_a.weight"),
+                     need_named(weights, p + "linear_attn.in_proj_b.weight"),
+                     need_named(weights, p + "linear_attn.in_proj_z.weight")}
                 ),
-                .conv = need(weights, p + "linear_attn.conv1d.weight"),
-                .dt_bias = need(weights, p + "linear_attn.dt_bias").to(at::kFloat),
-                .neg_a = -need(weights, p + "linear_attn.A_log").to(at::kFloat).exp(),
-                .norm = need(weights, p + "linear_attn.norm.weight"),
-                .out_proj = need(weights, p + "linear_attn.out_proj.weight"),
+                .conv = need_named(weights, p + "linear_attn.conv1d.weight"),
+                .dt_bias = need_named(weights, p + "linear_attn.dt_bias").to(at::kFloat),
+                .neg_a = -need_named(weights, p + "linear_attn.A_log").to(at::kFloat).exp(),
+                .norm = need_named(weights, p + "linear_attn.norm.weight"),
+                .out_proj = need_named(weights, p + "linear_attn.out_proj.weight"),
             };
             add_kv_layer(
                 recurrent({heads.linear_n_value_heads, c.linear_key_head_dim, c.linear_value_head_dim}, at::kFloat),
@@ -250,15 +265,15 @@ qwen4_exp_model::qwen4_exp_model(
             const std::string e = p + "ple.ple_embedding.";
             at::Tensor table = ngram_table(weights, e + "ngram_embedding.");
             w.ple = ple_weights{
-                .key_proj = need(weights, p + "ple.key_proj.weight"),
-                .value_proj = need(weights, p + "ple.value_proj.weight"),
-                .norm_key = zero_centered(need(weights, p + "ple.norm_key.weight")),
-                .norm_query = zero_centered(need(weights, p + "ple.norm_query.weight")),
-                .norm_conv = zero_centered(need(weights, p + "ple.norm_conv.weight")),
-                .conv = need(weights, p + "ple.conv1d.weight"),
-                .layer_multipliers = need(weights, e + "layer_multipliers").to(at::kLong),
-                .head_vocab_sizes = need(weights, e + "ngram_heads_vocab_sizes").to(at::kLong),
-                .head_offsets = need(weights, e + "ngram_heads_offsets").to(at::kLong),
+                .key_proj = need_named(weights, p + "ple.key_proj.weight"),
+                .value_proj = need_named(weights, p + "ple.value_proj.weight"),
+                .norm_key = zero_centered(need_named(weights, p + "ple.norm_key.weight")),
+                .norm_query = zero_centered(need_named(weights, p + "ple.norm_query.weight")),
+                .norm_conv = zero_centered(need_named(weights, p + "ple.norm_conv.weight")),
+                .conv = need_named(weights, p + "ple.conv1d.weight"),
+                .layer_multipliers = need_named(weights, e + "layer_multipliers").to(at::kLong),
+                .head_vocab_sizes = need_named(weights, e + "ngram_heads_vocab_sizes").to(at::kLong),
+                .head_offsets = need_named(weights, e + "ngram_heads_offsets").to(at::kLong),
                 .ngram_embedding = table,
                 .first_row = rank * table.size(0),
             };
@@ -274,6 +289,19 @@ qwen4_exp_model::qwen4_exp_model(
             whole({c.ngram_size - 1}, at::kLong);
         }
         layers.push_back(std::move(w));
+    };
+    for (std::int64_t layer = 0; layer < n_layers; layer++) {
+        load_layer(prefix + "layers." + std::to_string(layer) + ".", layer);
+    }
+    if (weights.contains("mtp.fc_embedding.weight")) {
+        load_layer("mtp.layers.0.", n_layers);
+        mtp = mtp_weights{
+            .pre_fc_norm_embedding = zero_centered(need_named(weights, "mtp.pre_fc_norm_embedding.weight")),
+            .pre_fc_norm_hidden = zero_centered(need_named(weights, "mtp.pre_fc_norm_hidden.weight")),
+            .fc_embedding = need_named(weights, "mtp.fc_embedding.weight"),
+            .fc_hidden = need_named(weights, "mtp.fc_hidden.weight"),
+            .mixer = mixer_named("mtp.hyper_connection_mixer."),
+        };
     }
 }
 
@@ -307,7 +335,7 @@ at::Tensor qwen4_exp_model::logits(const at::Tensor& x) const {
 }
 
 bool qwen4_exp_model::indexed_attention(std::int64_t layer) const {
-    return config.layer_types[layer] == qwen4_exp_layer_type::indexed_attention;
+    return layer == n_layers || config.layer_types[layer] == qwen4_exp_layer_type::indexed_attention;
 }
 
 // Hugging Face takes a query's top blocks with torch.topk, whose order among equal scores is unspecified; here the lower
@@ -673,7 +701,8 @@ qwen4_exp_model::ple(const at::Tensor& x, std::int64_t layer, const group_batch&
 }
 
 // A block's output joins the streams in the next mix's kernel, so x lags it until then.
-at::Tensor qwen4_exp_model::group_forward(const group_batch& g, std::span<const kv> lines) const {
+std::pair<at::Tensor, at::Tensor>
+qwen4_exp_model::group_forward(const group_batch& g, std::span<const kv> lines) const {
     at::Tensor x = lookup(embed_tokens, first_vocab_row, g.tokens).repeat({1, config.hc_count});
     // The last block's output and its injection weights, not yet added to x.
     std::optional<std::pair<at::Tensor, at::Tensor>> pending;
@@ -706,7 +735,7 @@ at::Tensor qwen4_exp_model::group_forward(const group_batch& g, std::span<const 
         pending.emplace(moe(mixed.input, layer, g.arrival_counters), mixed.injection_weights);
     }
     inject_pending();
-    return logits(final_mix(logit_inputs(x, g)));
+    return {logits(final_mix(logit_inputs(x, g))), x};
 }
 
 std::int64_t qwen4_exp_model::arrival_counter_count(std::int64_t sequences, std::int64_t tokens) const {
@@ -724,7 +753,83 @@ std::int64_t qwen4_exp_model::arrival_counter_count(std::int64_t sequences, std:
 }
 
 step_logits qwen4_exp_model::forward(const step_batch& batch, std::span<const kv> lines) {
-    return paged_forward(batch, [&](const group_batch& g) { return group_forward(g, lines); });
+    step_logits out;
+    if (batch.prefill_group) {
+        auto [logits, hidden] = group_forward(*batch.prefill_group, lines);
+        out.prefill_logits = logits;
+        if (mtp) {
+            out.prefill_hidden = hidden;
+        }
+    }
+    if (batch.decode_group) {
+        auto [logits, hidden] = group_forward(*batch.decode_group, lines);
+        out.decode_logits = logits;
+        if (mtp) {
+            out.decode_hidden = hidden;
+        }
+    }
+    return out;
+}
+
+draft_head* qwen4_exp_model::drafter() {
+    return mtp ? this : nullptr;
+}
+
+std::int64_t qwen4_exp_model::hidden_dim() const {
+    return config.hc_count * config.hidden_size;
+}
+
+// The line of each sequence's view index key_count - 2, the position before its last row; a sequence whose last row is
+// its first position keeps its line's row.
+void qwen4_exp_model::write_last_hidden(const group_batch& g, const at::Tensor& hidden, const kv& line) const {
+    const auto layer_row = static_cast<std::int64_t>(kv_layer_of[n_layers]);
+    const std::int64_t page_size = line.k.size(1);
+    at::Tensor key_counts = g.key_counts.select(0, layer_row).to(at::kLong);
+    at::Tensor previous = (key_counts - 2).clamp_min(0);
+    at::Tensor line_ids = g.page_tables.select(0, layer_row)
+                              .to(at::kLong)
+                              .gather(1, at::floor_divide(previous, page_size).unsqueeze(1));
+    line_ids = line_ids.squeeze(1);
+    at::Tensor last_rows = g.is_prefill() ? g.cu_seqlens_q.narrow(0, 1, key_counts.size(0)).to(at::kLong) - 1
+                                          : at::arange(key_counts.size(0), key_counts.options());
+    at::Tensor rows = at::where(
+        (key_counts >= 2).unsqueeze(1),
+        hidden.index_select(0, last_rows),
+        line.last_hidden.index_select(0, line_ids)
+    );
+    line.last_hidden.index_copy_(0, line_ids, rows);
+}
+
+draft_output qwen4_exp_model::draft(const group_batch& g, const at::Tensor& hidden, std::span<const kv> lines) {
+    const mtp_weights& m = *mtp;
+    const qwen4_exp_config& c = config;
+    const layer_weights& w = layers[n_layers];
+    const std::int64_t ntok = g.tokens.size(0);
+    write_last_hidden(g, hidden, lines[kv_layer_of[n_layers]]);
+    at::Tensor embedded = at::linear(
+        rmsnorm_cuda(lookup(embed_tokens, first_vocab_row, g.tokens), m.pre_fc_norm_embedding, c.rms_norm_eps),
+        m.fc_embedding
+    );
+    at::Tensor streams = at::linear(
+                             rmsnorm_cuda(hidden.contiguous(), m.pre_fc_norm_hidden, c.rms_norm_eps)
+                                 .view({ntok, c.hc_count, c.hidden_size}),
+                             m.fc_hidden
+    )
+                             .view({ntok, c.hc_count * c.hidden_size});
+    at::Tensor whole = at::ones({ntok, c.hc_count}, embedded.options());
+    auto [x, mixed] = injected_mix(streams, embedded, whole, w.attn_hyper_connection);
+    at::Tensor attended = attention(mixed.input, n_layers, g, lines);
+    auto [summed, mlp_mixed] = injected_mix(x, attended, mixed.injection_weights, w.mlp_hyper_connection);
+    x = hyper_connection_inject_cuda(
+        summed,
+        moe(mlp_mixed.input, n_layers, g.arrival_counters),
+        mlp_mixed.injection_weights
+    );
+    at::Tensor rows = logit_inputs(x, g);
+    return draft_output{
+        .logits = logits(mixed_streams(stream_norm(rows, m.mixer.hc_norm), m.mixer)),
+        .hidden = x,
+    };
 }
 
 }  // namespace pulsarlm

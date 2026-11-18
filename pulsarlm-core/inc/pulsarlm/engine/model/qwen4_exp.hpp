@@ -39,7 +39,12 @@ namespace pulsarlm {
 // recurrent KV layers. A PLE layer then keeps two more: its convolution's
 // last (kernel - 1) * ngram_size inputs, [hc_count * hidden, (kernel - 1) * ngram_size] in the weights' dtype, and the
 // last ngram_size - 1 tokens, int64, each XOR eos_token_id so that a zeroed line holds EOS.
-class qwen4_exp_model : public model {
+// With the checkpoint's mtp.* weights, the model drafts with its MTP layer, vLLM v0.31.0's Qwen4ExpMultiTokenPredictor
+// with each MTP row a position later: the row at position t reads the streams after the last layer at t - 1, normed
+// over all streams and projected by fc_hidden on each, and the token at t, normed and projected by fc_embedding and
+// injected into every stream at weight 1; then one indexed attention layer with its MoE block and hyper connections,
+// without PLE, and hyper_connection_mixer before lm_head.
+class qwen4_exp_model : public model, public draft_head {
     // Query and key heads are stored with their dims permuted as qwen3_5_model stores them.
     struct attention_weights {
         // The rows of q_proj [n_heads * 2 * head_dim, hidden], each head's query then gate, of k_proj, of v_proj, then
@@ -99,6 +104,14 @@ class qwen4_exp_model : public model {
         std::int64_t first_row;  // of the whole table, the row ngram_embedding starts at
     };
 
+    struct mtp_weights {
+        at::Tensor pre_fc_norm_embedding;  // fp32 1 + weight
+        at::Tensor pre_fc_norm_hidden;  // fp32 1 + weight, [hc_count * hidden], one RMSNorm over every stream
+        at::Tensor fc_embedding;
+        at::Tensor fc_hidden;  // [hidden, hidden], each stream's
+        mixer_weights mixer;
+    };
+
     struct layer_weights {
         hyper_connection_weights attn_hyper_connection;
         hyper_connection_weights mlp_hyper_connection;
@@ -137,7 +150,9 @@ class qwen4_exp_model : public model {
     std::int64_t first_vocab_row;
     at::Tensor lm_head;
     mixer_weights hyper_connection_mixer;
+    // The decoder layers, then the MTP layer when the model drafts.
     std::vector<layer_weights> layers;
+    std::optional<mtp_weights> mtp;
 
     bool indexed_attention(std::int64_t layer) const;
     // The rows of a table split across the GPUs at ids, [ids..., table columns], summed across the GPUs; this GPU's
@@ -176,7 +191,11 @@ class qwen4_exp_model : public model {
     // Each token's n-gram ids into the layer's table, [ntok, n-gram heads], updating its token lines.
     at::Tensor ngram_ids(const ple_weights& w, std::size_t token_layer, const group_batch& g, const kv& lines) const;
     at::Tensor ple(const at::Tensor& x, std::int64_t layer, const group_batch& g, std::span<const kv> lines) const;
-    at::Tensor group_forward(const group_batch& g, std::span<const kv> lines) const;
+    // The group's logits and the streams after the last layer at every token.
+    std::pair<at::Tensor, at::Tensor> group_forward(const group_batch& g, std::span<const kv> lines) const;
+    // Writes each sequence's hidden row of the position before its last row of g into the last_hidden of line, the MTP
+    // layer's.
+    void write_last_hidden(const group_batch& g, const at::Tensor& hidden, const kv& line) const;
 
   public:
     // weights are this GPU's parts, on the lines' device, in the attention lines' dtype; the PLE buffers are int64.
@@ -187,6 +206,9 @@ class qwen4_exp_model : public model {
     std::vector<kv_layer_shard> kv_layer_shards() const override;
     step_logits forward(const step_batch& batch, std::span<const kv> lines) override;
     std::int64_t arrival_counter_count(std::int64_t sequences, std::int64_t tokens) const override;
+    draft_head* drafter() override;
+    std::int64_t hidden_dim() const override;
+    draft_output draft(const group_batch& g, const at::Tensor& hidden, std::span<const kv> lines) override;
 };
 
 }  // namespace pulsarlm
