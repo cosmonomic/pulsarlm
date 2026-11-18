@@ -1,5 +1,6 @@
 #include "pulsarlm/kernels/arrival_counters.cuh"
 #include "pulsarlm/kernels/dependent_launch.cuh"
+#include "pulsarlm/kernels/device_check.hpp"
 #include "pulsarlm/kernels/mma.cuh"
 #include "pulsarlm/kernels/ops.hpp"
 
@@ -724,6 +725,7 @@ void check_experts(const at::Tensor& h, const at::Tensor& gate_up_proj, const at
     );
     const int64_t experts = gate_up_proj.size(0);
     TORCH_CHECK(experts >= 1 && experts <= max_experts, "routed_experts: experts must be between 1 and ", max_experts);
+    TORCH_CHECK(hidden >= 1 && down_proj.size(2) >= 1, "routed_experts: hidden and intermediate must be at least 1");
 }
 
 // The routed experts' output for top_k assignments per token of h. sort(position_of, sorted_token, sorted_expert,
@@ -749,7 +751,10 @@ at::Tensor run_experts(
     if (assignments == 0) {
         return out.zero_();
     }
-    TORCH_CHECK(assignments <= std::numeric_limits<int32_t>::max() / max_tile_rows, "routed_experts: too many assignments");
+    TORCH_CHECK(
+        assignments <= std::numeric_limits<int32_t>::max() / max_tile_rows,
+        "routed_experts: too many assignments"
+    );
 
     const int64_t max_tiles = max_tiles_of(assignments, experts);
     at::Tensor indices = at::empty({3 * assignments + 3 * max_tiles}, h.options().dtype(at::kInt));
@@ -868,6 +873,10 @@ at::Tensor run_experts(
 // The route-and-sort kernel's one counter, then the split gated product's one per block, used by kernels in turn.
 int64_t
 routed_experts_counters(int64_t tokens, int64_t top_k, int64_t held_experts, int64_t intermediate, int64_t hidden) {
+    TORCH_CHECK(
+        held_experts >= 1 && intermediate >= 1 && hidden >= 1,
+        "routed_experts_counters: held_experts, intermediate and hidden must be at least 1"
+    );
     const int64_t assignments = tokens * top_k;
     if (assignments == 0) {
         return 0;
@@ -886,6 +895,7 @@ at::Tensor routed_experts_cuda(
     expert_activation activation,
     const at::Tensor& counters
 ) {
+    check_on_current_device("routed_experts", {h, top_experts, top_weights, gate_up_proj, down_proj, counters});
     check_experts(h, gate_up_proj, down_proj);
     TORCH_CHECK(
         top_experts.scalar_type() == at::kLong && top_weights.scalar_type() == at::kFloat && top_experts.dim() == 2 &&
@@ -931,6 +941,7 @@ at::Tensor routed_experts_cuda(
     expert_activation activation,
     const at::Tensor& counters
 ) {
+    check_on_current_device("routed_experts", {h, router_logits, gate_up_proj, down_proj, counters});
     check_experts(h, gate_up_proj, down_proj);
     const int64_t tokens = h.size(0);
     const int64_t held_experts = gate_up_proj.size(0);

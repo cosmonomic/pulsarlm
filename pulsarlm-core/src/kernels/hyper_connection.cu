@@ -1,4 +1,5 @@
 #include "pulsarlm/kernels/dependent_launch.cuh"
+#include "pulsarlm/kernels/device_check.hpp"
 #include "pulsarlm/kernels/ops.hpp"
 
 #include <ATen/ATen.h>
@@ -411,9 +412,11 @@ template <typename Body> void dispatch_tokens(int64_t tokens, Body body) {
     case 3:
         body(std::integral_constant<int, 3>{});
         break;
-    default:
+    case 4:
         body(std::integral_constant<int, 4>{});
         break;
+    default:
+        TORCH_CHECK(false, "hyper_connection: the kernel takes 1 to 4 tokens, got ", tokens);
     }
 }
 
@@ -457,6 +460,7 @@ mix_streams(const at::Tensor& normed, const at::Tensor& gate_logits, const at::T
 }  // namespace
 
 at::Tensor stream_rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, int64_t n_streams, double eps) {
+    check_on_current_device("stream_rmsnorm", {x, weight});
     TORCH_CHECK(
         x.is_cuda() && x.dim() == 2 && x.is_contiguous() && n_streams >= 1 && x.size(1) % n_streams == 0,
         "stream_rmsnorm: x must be contiguous CUDA [tokens, n_streams * hidden]"
@@ -502,8 +506,9 @@ bool fused_norm_linear(
     int64_t n_streams,
     const at::Tensor& weight
 ) {
-    return x.size(0) >= 1 && x.size(0) <= vector_tokens && x.scalar_type() != at::kFloat && x.is_contiguous() &&
-        n_streams == 4 && x.size(1) % n_streams == 0 && (x.size(1) / n_streams) % 8 == 0 && vector_rows(x, x.size(1)) &&
+    return x.size(0) >= 1 && x.size(0) <= vector_tokens &&
+        (x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kHalf) && x.is_contiguous() && n_streams == 4 &&
+        x.size(1) % n_streams == 0 && (x.size(1) / n_streams) % 8 == 0 && vector_rows(x, x.size(1)) &&
         vector_rows(weight, weight.stride(0)) && reinterpret_cast<uintptr_t>(norm_weight.const_data_ptr()) % 16 == 0 &&
         (!block_out || (block_out->is_contiguous() && vector_rows(*block_out, block_out->size(1))));
 }
@@ -578,6 +583,7 @@ std::tuple<at::Tensor, at::Tensor> stream_rmsnorm_linear_cuda(
     double eps,
     const at::Tensor& weight
 ) {
+    check_on_current_device("stream_rmsnorm_linear", {x, norm_weight, weight});
     check_norm_linear(x, norm_weight, n_streams, weight);
     if (!fused_norm_linear(x, std::nullopt, norm_weight, n_streams, weight)) {
         at::Tensor normed = stream_rmsnorm_cuda(x, norm_weight, n_streams, eps);
@@ -599,6 +605,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> injected_stream_rmsnorm_linear_cu
     double eps,
     const at::Tensor& weight
 ) {
+    check_on_current_device("injected_stream_rmsnorm_linear", {x, out, injection_weights, norm_weight, weight});
     check_norm_linear(x, norm_weight, n_streams, weight);
     if (!fused_norm_linear(x, out, norm_weight, n_streams, weight) || !injection_weights.is_contiguous() ||
         out.dim() != 2 || out.size(1) * n_streams != x.size(1)) {
@@ -626,6 +633,7 @@ std::tuple<at::Tensor, at::Tensor> hyper_connection_mix_cuda(
     const at::Tensor& up_weight,
     const at::Tensor& inject_logits
 ) {
+    check_on_current_device("hyper_connection_mix", {normed, mix_logits, up_weight, inject_logits});
     TORCH_CHECK(
         normed.is_cuda() && normed.dim() == 2 && normed.is_contiguous(),
         "hyper_connection_mix: normed must be contiguous CUDA [tokens, hc * hidden]"
@@ -652,8 +660,9 @@ std::tuple<at::Tensor, at::Tensor> hyper_connection_mix_cuda(
     const int64_t hidden = normed.size(1) / streams;
     const int64_t rank = mix_logits.size(1);
     // The fused kernel is compiled for Qwen3.8-Flash-Next's 4 streams.
-    const bool vectors = tokens >= 1 && tokens <= vector_tokens && streams == 4 && normed.scalar_type() != at::kFloat &&
-        rank % 8 == 0 && vector_rows(up_weight, up_weight.stride(0));
+    const bool vectors = tokens >= 1 && tokens <= vector_tokens && streams == 4 &&
+        (normed.scalar_type() == at::kBFloat16 || normed.scalar_type() == at::kHalf) && rank % 8 == 0 &&
+        vector_rows(up_weight, up_weight.stride(0));
     if (!vectors) {
         at::Tensor gate_logits = at::linear(at::silu(mix_logits / static_cast<double>(streams)), up_weight);
         return mix_streams(normed, gate_logits, inject_logits);
@@ -694,6 +703,7 @@ std::tuple<at::Tensor, at::Tensor> hyper_connection_mix_cuda(
 
 at::Tensor
 hyper_connection_inject_cuda(const at::Tensor& x, const at::Tensor& out, const at::Tensor& injection_weights) {
+    check_on_current_device("hyper_connection_inject", {x, out, injection_weights});
     TORCH_CHECK(
         x.is_cuda() && x.dim() == 2 && x.is_contiguous(),
         "hyper_connection_inject: x must be contiguous CUDA [tokens, hc * hidden]"

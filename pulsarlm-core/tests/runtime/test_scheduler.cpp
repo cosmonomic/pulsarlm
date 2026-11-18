@@ -1098,21 +1098,27 @@ TEST_CASE("a request cancelled while decoding ends with cancelled at the next wr
     REQUIRE(f.store->releases == f.store->leases);
 }
 
-TEST_CASE("a request's lease is releases once when the loop stops while it runs") {
-    fixture f(16);
-    f.model.on_forward = [] { event_loop::current()->stop(); };
+// The executor owns a sequence that was not stopped until its own destruction, and the sequence holds the lease.
+TEST_CASE("a request's lease is released once, with the executor, when the loop stops while it runs") {
+    std::shared_ptr<store_contents> store;
     auto recorded_results = std::make_shared<request_results>();
     {
-        event_loop loop;
-        loop.spawn(f.sched.run());
-        loop.spawn(f.sched.submit(request{.tokens = {1, 2, 3}, .max_tokens = 10}, make_writer(recorded_results)));
-        REQUIRE(loop.run() == nullptr);
-        c10::cuda::getCurrentCUDAStream().synchronize();
-        REQUIRE(f.store->leases.size() == 1);
-        REQUIRE(f.store->releases.empty());
+        fixture f(16);
+        store = f.store;
+        f.model.on_forward = [] { event_loop::current()->stop(); };
+        {
+            event_loop loop;
+            loop.spawn(f.sched.run());
+            loop.spawn(f.sched.submit(request{.tokens = {1, 2, 3}, .max_tokens = 10}, make_writer(recorded_results)));
+            REQUIRE(loop.run() == nullptr);
+            c10::cuda::getCurrentCUDAStream().synchronize();
+            REQUIRE(store->leases.size() == 1);
+            REQUIRE(store->releases.empty());
+        }
+        REQUIRE(ended_error(*recorded_results) == request_error::loop_exited);
+        REQUIRE(store->releases.empty());
     }
-    REQUIRE(f.store->releases == f.store->leases);
-    REQUIRE(ended_error(*recorded_results) == request_error::loop_exited);
+    REQUIRE(store->releases == store->leases);
 }
 
 TEST_CASE("a request that finds too few free lines ends with oom without waiting") {

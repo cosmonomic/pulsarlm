@@ -1,4 +1,5 @@
 #include "pulsarlm/kernels/dependent_launch.cuh"
+#include "pulsarlm/kernels/device_check.hpp"
 #include "pulsarlm/kernels/ops.hpp"
 
 #include <ATen/ATen.h>
@@ -90,6 +91,7 @@ unsigned blocks_for(int64_t elements) {
 }  // namespace
 
 at::Tensor sigmoid_gated_add_cuda(const at::Tensor& x, const at::Tensor& gate_logits, const at::Tensor& y) {
+    check_on_current_device("sigmoid_gated_add", {x, gate_logits, y});
     TORCH_CHECK(
         x.is_cuda() && x.dim() == 2 && x.is_contiguous() && y.sizes() == x.sizes() && y.is_contiguous() &&
             y.scalar_type() == x.scalar_type(),
@@ -126,6 +128,7 @@ at::Tensor sigmoid_gated_add_cuda(const at::Tensor& x, const at::Tensor& gate_lo
 }
 
 at::Tensor sigmoid_gated_cuda(const at::Tensor& y, const at::Tensor& gate_logits) {
+    check_on_current_device("sigmoid_gated", {y, gate_logits});
     TORCH_CHECK(
         y.is_cuda() && (y.dim() == 2 || y.dim() == 3) && y.is_contiguous(),
         "sigmoid_gated: y must be contiguous CUDA [rows, columns] or [rows, middle, columns]"
@@ -164,6 +167,7 @@ at::Tensor sigmoid_gated_cuda(const at::Tensor& y, const at::Tensor& gate_logits
 }
 
 at::Tensor silu_mul_cuda(const at::Tensor& x) {
+    check_on_current_device("silu_mul", {x});
     TORCH_CHECK(
         x.is_cuda() && x.dim() == 2 && x.is_contiguous() && x.size(1) % 2 == 0,
         "silu_mul: x must be contiguous CUDA [tokens, 2 * n]"

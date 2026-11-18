@@ -1,5 +1,7 @@
 #include "pulsarlm/kernels/p2p_all_reduce.hpp"
 
+#include "pulsarlm/kernels/device_check.hpp"
+
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
@@ -31,13 +33,7 @@ __device__ __forceinline__ std::uint64_t load_acquire(const std::uint64_t* addre
 
 // Thread p below ranks sets flag (phase, block, rank) of rank p to epoch and waits for its own flag (phase, block,
 // p) to reach it, so every rank's block has passed the point.
-__device__ void meet(
-    const rank_pointers& ranks,
-    int rank_count,
-    int rank,
-    int phase,
-    std::uint64_t epoch
-) {
+__device__ void meet(const rank_pointers& ranks, int rank_count, int rank, int phase, std::uint64_t epoch) {
     __syncthreads();
     const int peer = static_cast<int>(threadIdx.x);
     if (peer < rank_count) {
@@ -91,6 +87,7 @@ __global__ void __launch_bounds__(cta_threads) p2p_all_reduce_kernel(
     if (threadIdx.x == 0) {
         epoch = ++counters[blockIdx.x];
     }
+    __syncthreads();
     const int64_t first = blockIdx.x * per_block;
     const int64_t last = min(first + per_block, vectors);
     const auto* in = reinterpret_cast<const uint4*>(x);
@@ -129,6 +126,7 @@ void p2p_all_reduce_cuda(
     std::span<std::uint64_t* const> flags,
     std::span<std::uint64_t* const> counters
 ) {
+    check_on_current_device("p2p_all_reduce", {x});
     const std::size_t rank_count = buffers.size();
     TORCH_CHECK(
         rank_count >= 1 && rank_count <= p2p_all_reduce_max_ranks && flags.size() == rank_count &&

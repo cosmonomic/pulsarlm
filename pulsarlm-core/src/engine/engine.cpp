@@ -352,11 +352,15 @@ void engine::run_loop(std::latch& started) {
         for (std::thread& worker : worker_threads) {
             worker.join();
         }
-        for (cudaStream_t stream : streams) {
-            cudaStreamSynchronize(stream);
-        }
-        for (cudaStream_t stream : copy_streams) {
-            cudaStreamSynchronize(stream);
+        for (const std::vector<cudaStream_t>* shard_streams : {&streams, &copy_streams}) {
+            for (cudaStream_t stream : *shard_streams) {
+                const cudaError_t status = cudaStreamSynchronize(stream);
+                if (status != cudaSuccess && !thrown) {
+                    thrown = std::make_exception_ptr(
+                        std::runtime_error(std::string("engine: ") + cudaGetErrorString(status))
+                    );
+                }
+            }
         }
         {
             std::lock_guard lock(mutex);

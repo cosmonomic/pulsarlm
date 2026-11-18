@@ -48,11 +48,12 @@ TEST_CASE("an erased key stops matching, also after its slot holds another value
     slot_map<pinned_value>::key_type erased = values.emplace(1);
     slot_map<pinned_value>::key_type other = values.emplace(2);
 
-    values.erase(erased);
+    CHECK(values.erase(erased));
     CHECK(values.size() == 1);
     CHECK_FALSE(values.contains(erased));
     CHECK_THROWS_AS(values.at(erased), std::out_of_range);
-    CHECK_THROWS_AS(values.erase(erased), std::out_of_range);
+    CHECK_FALSE(values.erase(erased));
+    CHECK(values.find(erased) == nullptr);
 
     slot_map<pinned_value>::key_type reusing = values.emplace(3);
     CHECK(reusing != erased);

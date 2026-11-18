@@ -6,11 +6,18 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <stdexcept>
 #include <utility>
 
 namespace pulsarlm {
 
 namespace {
+
+void require_draft_head(model& shard_model) {
+    if (shard_model.drafter() == nullptr) {
+        throw std::logic_error("decode_graphs: the model has no draft head");
+    }
+}
 
 void copy_defined(const at::Tensor& to, const at::Tensor& from) {
     if (from.defined()) {
@@ -268,6 +275,7 @@ std::unique_ptr<decode_graphs::captured_draft> decode_graphs::capture_draft(std:
 }
 
 draft_output decode_graphs::draft(const group_batch& g, const at::Tensor& hidden, bool verify_rows) {
+    require_draft_head(shard_model);
     const std::int64_t sequences = g.page_tables.size(1);
     std::unique_ptr<captured_draft>& captured = drafts[{sequences, verify_rows}];
     if (!captured) {
@@ -372,6 +380,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> decode_graphs::verify_step(
     const at::Tensor& later_positions,
     const at::Tensor& later_key_counts
 ) {
+    require_draft_head(shard_model);
     const std::int64_t sequences = g.page_tables.size(1);
     const bool measures_mass = g.cu_view_pages.defined();
     std::unique_ptr<captured_step>& captured = steps[{sequences, measures_mass, sampling.filters}];

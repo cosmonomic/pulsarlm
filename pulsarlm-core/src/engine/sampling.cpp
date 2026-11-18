@@ -4,20 +4,21 @@
 
 #include <ATen/ATen.h>
 
-#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <optional>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace pulsarlm {
 
 namespace {
 
-template <typename value_type> at::Tensor rows_on_device(const std::vector<value_type>& values, at::ScalarType dtype, at::Device device) {
+template <typename value_type>
+at::Tensor rows_on_device(const std::vector<value_type>& values, at::ScalarType dtype, at::Device device) {
     at::Tensor pinned = at::empty(
         {static_cast<std::int64_t>(values.size())},
         at::TensorOptions().dtype(dtype).pinned_memory(true)
@@ -38,7 +39,9 @@ std::uint64_t sampling_seed(std::optional<std::uint64_t> seed) {
 
 sampling_inputs
 sampling_inputs_of(std::span<const sampling_params> params, std::span<const sampling_draw> draws, at::Device device) {
-    assert(draws.size() == params.size());
+    if (draws.size() != params.size()) {
+        throw std::invalid_argument("sampling_inputs_of takes one draw per row of params");
+    }
     std::vector<float> temperature;
     std::vector<std::int64_t> top_k;
     std::vector<float> top_p;
@@ -89,7 +92,9 @@ at::Tensor sample(
     std::span<const sampling_draw> draws,
     const at::Tensor& draw_shifts
 ) {
-    assert(params.size() == static_cast<std::size_t>(logits.size(0)));
+    if (params.size() != static_cast<std::size_t>(logits.size(0))) {
+        throw std::invalid_argument("sample takes one sampling_params per row of logits");
+    }
     sampling_inputs inputs = sampling_inputs_of(params, draws, logits.device());
     if (draw_shifts.defined()) {
         inputs.draws.select(0, 1).add_(draw_shifts);

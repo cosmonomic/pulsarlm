@@ -30,8 +30,10 @@ namespace pulsarlm {
 
 namespace {
 
-std::size_t ceil_div(std::size_t n, std::size_t d) {
-    return (n + d - 1) / d;
+void require(bool condition, const char* message) {
+    if (!condition) {
+        throw std::invalid_argument(message);
+    }
 }
 
 at::Tensor pinned(at::IntArrayRef sizes, at::ScalarType dtype) {
@@ -95,10 +97,8 @@ at::Tensor zero_page_mass(
 
 }  // namespace
 
-// A batch holds its sequences by address between its launch and its write-back; executor::finish refuses a sequence that
-// a launched batch holds.
 struct executor::resolved_entry {
-    sequence* seq;
+    sequence_ref seq;
     std::size_t token_count;
     bool samples;
     bool ends_cycle;
@@ -254,16 +254,14 @@ class executor::batch {
     void
     plan_draft_rows(std::size_t index, bool next_row, bool drafts, std::size_t draft_layer, std::size_t draft_count);
     // Queues on stream shard, after the step's sampling into samples, the verify entries' acceptance of their samples,
-    // stop_tokens ending a run (int64), and the draft head's pass, replayed from graphs when every entry verifies and
-    // drafts and its verify group replays; shard 0 also queues the copies of the accepted counts and next tokens to the
-    // host.
+    // stop_tokens ending a run (int64), and the draft head's pass; shard 0 also queues the copies of the accepted
+    // counts and next tokens to the host.
     void enqueue_drafts(
         model& shard_model,
         std::span<const kv> lines,
         const at::Tensor& samples,
         const at::Tensor& stop_tokens,
         std::size_t shard,
-        decode_graphs* graphs,
         at::Tensor& counters
     );
     // Whether the step replays a decode_graphs verify step: every entry verifies and drafts, and the verify group
@@ -343,18 +341,25 @@ executor::executor(
   stop_ids(std::move(stop_ids)),
   graph_pages(graph_pages),
   draft_state_slots(draft_tokens + 1) {
-    assert(this->shards.size() == this->cache.shard_count() && this->streams.size() == this->shards.size());
-    assert(this->worker_loops.size() + 1 == this->shards.size());
+    require(
+        !this->shards.empty() && this->shards.size() == this->cache.shard_count() &&
+            this->streams.size() == this->shards.size() && this->copy_streams.size() == this->shards.size() &&
+            this->worker_loops.size() + 1 == this->shards.size(),
+        "executor: the cache, the streams, the copy streams and the worker loops must match the model shards"
+    );
     shard_mass_heads.resize(this->shards.size());
     lines.resize(this->shards.size());
     for (std::size_t shard = 0; shard < this->shards.size(); shard++) {
         std::vector<kv_layer> layers = this->shards[shard]->kv_layers();
-        assert(layers.size() == this->cache.layer_count());
+        require(layers.size() == this->cache.layer_count(), "executor: the cache must hold one layer per KV layer");
         for (std::size_t layer = 0; layer < layers.size(); layer++) {
             lines[shard].push_back(this->cache.tensors(layer, shard));
             bool layer_recurrent = layers[layer].state.has_value();
             bool evictable = !layers[layer].sliding_window && !layer_recurrent && !layers[layer].mirrors_held_pages;
-            assert(!evictable || layers[layer].n_q_heads > 0);
+            require(
+                !evictable || layers[layer].n_q_heads > 0,
+                "executor: a full-attention KV layer must state its query heads"
+            );
             shard_mass_heads[shard].push_back(evictable ? layers[layer].n_readers * layers[layer].n_q_heads : 0);
             if (shard == 0) {
                 sliding_windows.push_back(layers[layer].sliding_window);
@@ -366,17 +371,18 @@ executor::executor(
                     page_size = static_cast<std::size_t>(lines[0].back().k.size(1));
                 }
             }
-            assert(sliding_windows[layer] == layers[layer].sliding_window && recurrent[layer] == layer_recurrent);
-            assert(mirrors[layer] == layers[layer].mirrors_held_pages);
-            assert(state_slots[layer] == slots_of(layers[layer]));
+            require(
+                sliding_windows[layer] == layers[layer].sliding_window && recurrent[layer] == layer_recurrent &&
+                    mirrors[layer] == layers[layer].mirrors_held_pages && state_slots[layer] == slots_of(layers[layer]),
+                "executor: the model shards must agree on the kind of each KV layer"
+            );
             mass_heads[layer] += shard_mass_heads[shard].back();
             if (shard == 0 && draft_tokens > 0 && layers[layer].last_hidden_dim > 0) {
                 draft_layer = layer;
             }
         }
     }
-    assert(draft_tokens == 0 || (draft_layer && this->shards.front()->drafter() != nullptr));
-    assert(page_size > 0);
+    require(page_size > 0, "executor: the model must have a KV layer with pages");
     for (std::size_t shard = 0; shard < this->shards.size(); shard++) {
         samples.push_back(at::zeros({max_sampled_rows}, lines[shard].front().k.options().dtype(at::kLong)));
         stop_tokens.push_back(
@@ -805,7 +811,7 @@ void executor::batch::enqueue(
         }
     }
     if (draft_layer && !draft_entries.empty()) {
-        enqueue_drafts(shard_model, lines, samples, stop_tokens, shard, graphs, counters);
+        enqueue_drafts(shard_model, lines, samples, stop_tokens, shard, counters);
     }
 }
 
@@ -1047,7 +1053,7 @@ void executor::batch::plan_draft_rows(
             later_key_counts[j - 1].push_back(static_cast<std::int32_t>(next_index + drafted_after + j + 1));
         }
     }
-    draft_entries.push_back(resolved_entry{.seq = &seq, .token_count = rows, .samples = drafts});
+    draft_entries.push_back(resolved_entry{.seq = e.seq, .token_count = rows, .samples = drafts});
 }
 
 at::Tensor executor::batch::previous_shift(std::size_t shard, at::Device device) const {
@@ -1078,11 +1084,8 @@ void executor::batch::enqueue_drafts(
     const at::Tensor& samples,
     const at::Tensor& stop_tokens,
     std::size_t shard,
-    decode_graphs* graphs,
     at::Tensor& counters
 ) {
-    const bool replays = verify_replays && decode_count == entries.size() && verify_count == entries.size() &&
-        drafting_indices.size() == entries.size();
     at::Device device = lines.front().k.device();
     draft_head& head = *shard_model.drafter();
     const auto n_layers = lines.size();
@@ -1096,7 +1099,7 @@ void executor::batch::enqueue_drafts(
         return counts.to(at::kInt).unsqueeze(0).expand({static_cast<std::int64_t>(n_layers), -1}).contiguous();
     };
     auto tables = [&](std::span<const resolved_entry> group, group_batch& g) {
-        const std::size_t width = replays ? verify_width : table_width(group);
+        const std::size_t width = table_width(group);
         g.page_tables = page_tables(group, n_layers, false, shard, width);
         g.page_positions = page_tables(group, n_layers, true, shard, width);
     };
@@ -1176,13 +1179,8 @@ void executor::batch::enqueue_drafts(
     fill_awaited_tokens_cuda(rows.tokens, samples);
     tables(draft_entries, rows);
     at::Tensor hidden = at::cat(sources).index_select(0, on_device(draft_sources, longs));
-    draft_output drafted_rows;
-    if (replays) {
-        drafted_rows = graphs->draft(rows, hidden, /*verify_rows=*/true);
-    } else {
-        with_counters(rows, draft_count);
-        drafted_rows = head.draft(rows, hidden, lines);
-    }
+    with_counters(rows, draft_count);
+    draft_output drafted_rows = head.draft(rows, hidden, lines);
     if (!drafting_indices.empty()) {
         at::Tensor drafting_entries_index = on_device(drafting_indices, longs);
         std::vector<resolved_entry> drafting_entries;
@@ -1202,13 +1200,8 @@ void executor::batch::enqueue_drafts(
                 .key_counts = key_counts(on_device(later_key_counts[j], longs) + later_shift),
             };
             tables(drafting_entries, one_row);
-            draft_output next;
-            if (replays) {
-                next = graphs->draft(one_row, previous_hidden, /*verify_rows=*/false);
-            } else {
-                with_counters(one_row, static_cast<std::int64_t>(drafting_entries.size()));
-                next = head.draft(one_row, previous_hidden, lines);
-            }
+            with_counters(one_row, static_cast<std::int64_t>(drafting_entries.size()));
+            draft_output next = head.draft(one_row, previous_hidden, lines);
             token = next.logits.argmax(-1);
             previous_hidden = next.hidden;
             tokens.push_back(token);
@@ -1272,11 +1265,13 @@ void executor::batch::join_mass(
     prefill_mass = join(shard_prefill_mass, inputs.prefill_group);
 }
 
-task<std::expected<executor::sequence_handle, request_error>> executor::start(request&& r, result_writer& writer) {
-    assert(!r.tokens.empty());
-    assert(r.eviction.n_working >= 1 && r.eviction.cycle_tokens >= 1);
-    assert(r.eviction.attention_mass_decay > 0.0 && r.eviction.attention_mass_decay <= 1.0);
-    assert(r.eviction.eviction_threshold >= 0.0 && r.eviction.eviction_threshold <= 1.0);
+task<std::expected<executor::sequence_id, request_error>> executor::start(request&& r, result_writer& writer) {
+    require(
+        !r.tokens.empty() && r.eviction.n_working >= 1 && r.eviction.cycle_tokens >= 1 &&
+            r.eviction.attention_mass_decay > 0.0 && r.eviction.attention_mass_decay <= 1.0 &&
+            r.eviction.eviction_threshold >= 0.0 && r.eviction.eviction_threshold <= 1.0,
+        "executor::start: the request has no token or an eviction policy out of range"
+    );
     digest chain_root = r.initial_digest.value_or(make_request_root_digest(root, to_pages(r.eviction, page_size)));
     std::vector<digest> digests = make_page_digests(chain_root, r.tokens, page_size);
     std::expected<std::pair<std::shared_ptr<const state>, state::lease_id_type>, page_error>
@@ -1285,65 +1280,72 @@ task<std::expected<executor::sequence_handle, request_error>> executor::start(re
         co_return std::unexpected(request_error::miss);
     }
     auto& [stored_state, lease_id] = *lookup;
-    std::size_t stored_pages = stored_state->head
-        ? static_cast<std::size_t>(std::ranges::find(digests, *stored_state->head) - digests.begin()) + 1
-        : 0;
+    std::size_t stored_pages = 0;
+    if (stored_state->head) {
+        auto head_digest = std::ranges::find(digests, *stored_state->head);
+        if (head_digest == digests.end()) {
+            store.release(lease_id);
+            co_return std::unexpected(request_error::miss);
+        }
+        stored_pages = static_cast<std::size_t>(head_digest - digests.begin()) + 1;
+    }
+    std::span<const std::int64_t> unstored_tokens = std::span(r.tokens).subspan(stored_pages * page_size);
+    if (stored_state->tail.size() >= unstored_tokens.size() ||
+        !std::ranges::equal(stored_state->tail, unstored_tokens.first(stored_state->tail.size()))) {
+        store.release(lease_id);
+        co_return std::unexpected(request_error::miss);
+    }
     std::shared_ptr<const state> initial_state = extend_with_hot_pages(std::move(stored_state), r, digests);
     std::vector<at::Device> devices;
     for (const std::vector<kv>& shard_lines : lines) {
         devices.push_back(shard_lines.front().k.device());
     }
-    sequence_handle handle(
+    const sequence_id id = sequences.emplace(
+        std::move(r),
+        std::move(initial_state),
+        store,
+        lease_id,
+        std::move(digests),
+        chain_root,
         *this,
-        sequences.emplace(
-            std::move(r),
-            std::move(initial_state),
-            store,
-            lease_id,
-            std::move(digests),
-            chain_root,
-            *this,
-            writer,
-            std::span<const at::Device>(devices)
-        )
+        writer,
+        std::span<const at::Device>(devices)
     );
-    sequence& seq = sequences.at(handle.id());
+    sequence& seq = sequences.at(id);
     // take_lines holds the resident pages before it first suspends, so they are the ones counted here.
     seq.device_cached_count = device_cached_tokens(seq);
     std::expected<void, page_error> line_allocation = co_await take_lines(seq, seq.cycle_lines());
     if (!line_allocation) {
+        drop(id);
         co_return std::unexpected(
             line_allocation.error() == page_error::miss ? request_error::miss : request_error::oom
         );
     }
     if (seq.history_pages > stored_pages && !co_await own_pages_from(seq, stored_pages)) {
+        drop(id);
         co_return std::unexpected(request_error::oom);
     }
     seq.upload_table(0, streams);
-    co_return std::move(handle);
+    co_return id;
 }
 
-executor::sequence_handle::sequence_handle(executor& owner, sequence_id owned_id) noexcept
+executor::sequence_ref::sequence_ref(executor& owner, sequence_id id) noexcept
 : owner(&owner),
-  owned_id(owned_id) {}
+  id(id) {}
 
-executor::sequence_handle::sequence_handle(sequence_handle&& other) noexcept
-: owner(std::exchange(other.owner, nullptr)),
-  owned_id(other.owned_id) {}
-
-executor::sequence_handle::~sequence_handle() {
-    if (owner != nullptr) {
-        owner->drop(owned_id);
-    }
+sequence& executor::sequence_ref::operator*() const {
+    return owner->sequences.at(id);
 }
 
-executor::sequence_id executor::sequence_handle::id() const noexcept {
-    return owned_id;
+sequence* executor::sequence_ref::operator->() const {
+    return &**this;
 }
 
 void executor::drop(sequence_id id) noexcept {
-    release_lines(sequences.at(id));
-    sequences.erase(id);
+    if (sequence* dropped = sequences.find(id)) {
+        release_lines(*dropped);
+        sequences.erase(id);
+    }
 }
 
 std::vector<executor::resolved_entry> executor::resolve(std::span<const batch_entry> entries) {
@@ -1352,7 +1354,7 @@ std::vector<executor::resolved_entry> executor::resolve(std::span<const batch_en
         sequence& seq = sequences.at(e.sequence_id);
         resolved.push_back(
             resolved_entry{
-                .seq = &seq,
+                .seq = sequence_ref(*this, e.sequence_id),
                 .token_count = e.token_count,
                 .samples = e.token_count == seq.pending_tokens.size() && seq.may_sample(),
                 .ends_cycle = seq.ends_cycle(e.token_count),
@@ -1462,11 +1464,10 @@ task<std::expected<void, page_error>> executor::own_pages_from(sequence& seq, st
     co_return co_await cache.sync(hashes, owners, line_ids, streams);
 }
 
-task<std::expected<request_result, request_error>> executor::finish(sequence_handle&& handle) {
-    sequence_handle finished = std::move(handle);
-    sequence& seq = sequences.at(finished.id());
-    if (seq.steps_in_flight > 0) {
-        throw std::logic_error("executor::finish: a launched step holds the sequence");
+task<std::expected<request_result, request_error>> executor::stop(sequence_id id) {
+    sequence& seq = sequences.at(id);
+    if (!seq.end_reason || seq.steps_in_flight > 0) {
+        throw std::logic_error("executor::stop: the sequence has not exited or a launched step holds it");
     }
     release_lines(seq);
     std::expected<request_result, request_error> result = std::unexpected(request_error::cancelled);
@@ -1490,7 +1491,7 @@ task<std::expected<request_result, request_error>> executor::finish(sequence_han
         result = std::unexpected(request_error::oom);
         break;
     }
-    seq.lease.release();
+    drop(id);
     co_return result;
 }
 
@@ -1787,6 +1788,12 @@ void executor::advance(batch& b) {
 // once. Each shard's completion is taken once every shard has queued, before any later step queues.
 task<void> executor::launch(std::vector<batch_entry> entries) {
     std::unique_ptr<batch> b(new batch(resolve(entries), page_size, draft_state_slots, graph_pages));
+    TORCH_CHECK(
+        static_cast<std::int64_t>(b->sample_params.size()) <= max_sampled_rows,
+        "executor: a step samples at most ",
+        max_sampled_rows,
+        " tokens"
+    );
     link_previous(*b);
     advance(*b);
     b->shard_decode_mass.assign(shards.size(), at::Tensor());
@@ -1797,12 +1804,6 @@ task<void> executor::launch(std::vector<batch_entry> entries) {
     b->verify_tokens.assign(shards.size(), at::Tensor());
     b->accepted_token_counts_by_shard.assign(shards.size(), at::Tensor());
     b->shard_next_tokens.assign(shards.size(), at::Tensor());
-    TORCH_CHECK(
-        static_cast<std::int64_t>(b->sample_params.size()) <= max_sampled_rows,
-        "executor: a step samples at most ",
-        max_sampled_rows,
-        " tokens"
-    );
     std::vector<external_task<>> other_shards;
     for (std::size_t shard = 1; shard < shards.size(); shard++) {
         other_shards.push_back(run_on(*worker_loops[shard - 1], enqueue_on_shard(*b, shard)));
@@ -1829,7 +1830,7 @@ void executor::link_previous(batch& b) const {
     const std::size_t plain_count = b.decode_count - b.verify_count;
     const std::size_t previous_plain = previous.decode_count - previous.verify_count;
     for (std::size_t v = 0; v < b.verify_count; v++) {
-        const sequence* seq = b.entries[plain_count + v].seq;
+        const sequence_ref& seq = b.entries[plain_count + v].seq;
         std::int64_t verify_row = -1;
         std::int64_t drafting_row = -1;
         if (seq->steps_in_flight > 0) {
@@ -1941,7 +1942,7 @@ task<void> executor::write_back() {
     for (std::size_t d = 0; d < b.drafting_indices.size(); d++) {
         const auto row = static_cast<std::size_t>(b.next_tokens.size(1));
         drafted.emplace(
-            b.draft_entries[static_cast<std::size_t>(b.drafting_indices[d])].seq,
+            &*b.draft_entries[static_cast<std::size_t>(b.drafting_indices[d])].seq,
             std::span(b.next_tokens.const_data_ptr<std::int64_t>() + d * row, row)
         );
     }
@@ -2078,10 +2079,9 @@ task<void> executor::write_back() {
         for (const std::shared_ptr<pending_writes>& writer : spawned_writers) {
             writer->start();
         }
+        // kv_cache::sync holds the lines before the write-back below releases the ones that left a view.
         event_loop::current()->spawn(async_write_back(
-            std::move(spawned_hashes),
-            std::move(spawned_owners),
-            std::move(spawned_lines),
+            cache.sync(spawned_hashes, spawned_owners, spawned_lines, copy_streams),
             std::move(spawned_writers)
         ));
     }
@@ -2176,12 +2176,10 @@ task<void> executor::write_back() {
 }
 
 task<void> executor::async_write_back(
-    std::vector<std::vector<digest>> hashes,
-    std::vector<std::vector<state::lease_id_type>> owners,
-    std::vector<std::vector<std::uint32_t>> line_ids,
+    task<std::expected<void, page_error>> syncing,
     std::vector<std::shared_ptr<pending_writes>> writers
 ) {
-    std::expected<void, page_error> written = co_await cache.sync(hashes, owners, line_ids, copy_streams);
+    std::expected<void, page_error> written = co_await std::move(syncing);
     for (const std::shared_ptr<pending_writes>& writer : writers) {
         writer->finish(written.has_value());
     }

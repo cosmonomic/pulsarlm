@@ -34,31 +34,24 @@ class executor {
   public:
     using sequence_id = slot_map<sequence>::key_type;
 
-    // Owns one sequence of an executor, from start. Destroyed without finish, it drops the sequence: its lines and its
-    // lease are released and no state is written.
-    class sequence_handle {
-        executor* owner;
-        sequence_id owned_id;
-
-        sequence_handle(executor& owner, sequence_id owned_id) noexcept;
-
-        friend class executor;
-
-      public:
-        sequence_handle(sequence_handle&& other) noexcept;
-        sequence_handle(const sequence_handle&) = delete;
-        sequence_handle& operator=(const sequence_handle&) = delete;
-        sequence_handle& operator=(sequence_handle&&) = delete;
-        ~sequence_handle();
-
-        sequence_id id() const noexcept;
-    };
-
   private:
     class batch;
     struct resolved_entry;
 
-    // Each sequence from start until its handle is finished or destroyed.
+    // Names a sequence of an executor without owning it. Each access throws std::out_of_range once the sequence was
+    // stopped.
+    class sequence_ref {
+        executor* owner;
+        sequence_id id;
+
+      public:
+        sequence_ref(executor& owner, sequence_id id) noexcept;
+        sequence& operator*() const;
+        sequence* operator->() const;
+        bool operator==(const sequence_ref& other) const noexcept = default;
+    };
+
+    // Each sequence from start until stop.
     slot_map<sequence> sequences;
 
     // One model per shard of the cache, each holding its part of every layer.
@@ -154,12 +147,10 @@ class executor {
     // Adds the page mass of entry index of b's step, whose sequence accepted accepted_count tokens, to its sequence's layers.
     void add_measured_mass(const batch& b, std::size_t index, std::size_t accepted_count);
 
-    // Syncs the pages of hashes, owners and line_ids (kv_cache::sync) on the copy streams, then ends the write in
-    // store_writes and in each of writers.
+    // Awaits syncing, the task of a kv_cache::sync on the copy streams, then ends the write in store_writes and in each
+    // of writers.
     task<void> async_write_back(
-        std::vector<std::vector<digest>> hashes,
-        std::vector<std::vector<state::lease_id_type>> owners,
-        std::vector<std::vector<std::uint32_t>> line_ids,
+        task<std::expected<void, page_error>> syncing,
         std::vector<std::shared_ptr<pending_writes>> writers
     );
     task<void> synchronize_shards();
@@ -198,7 +189,7 @@ class executor {
     // The sequence of r, resuming the newest state the store holds for a prefix of its tokens, with lines for its
     // first cycle. Fails with miss when the lookup or a page read fails, and with oom when the free lines do not cover
     // the state's pages and one cycle's tokens; its lease is then released. writer outlives the sequence.
-    task<std::expected<sequence_handle, request_error>> start(request&& r, result_writer& writer);
+    task<std::expected<sequence_id, request_error>> start(request&& r, result_writer& writer);
     // Whether a step of entries ends no cycle and, in a model with sliding layers, completes no page, or in an executor
     // whose steps draft, whether every entry verifies drafts: its write-back
     // then changes no view or table that the next step reads, and copies to the store only lines the next step does not
@@ -217,12 +208,10 @@ class executor {
     // withdraws that step's token (sequence::withdraw_latest_step); entries of sequences that exited before are
     // skipped.
     task<void> write_back();
-    // Ends handle's sequence, which exited and is in no launched step: releases its lines, writes its end state when it
-    // finished, and releases its lease.
-    task<std::expected<request_result, request_error>> finish(sequence_handle&& handle);
-
-    // What the scheduler reads of a sequence. Each throws std::out_of_range for the id of a sequence that ended.
-
+    // Ends the sequence of id, which exited and is in no launched step: releases its lines, writes its end state when it
+    // finished, releases its lease and erases it. Throws std::logic_error for a sequence that has not exited or that a
+    // launched step holds.
+    task<std::expected<request_result, request_error>> stop(sequence_id id);
     // Whether the sequence has not exited and no launched step forwards its last tokens.
     bool is_steppable(sequence_id id) const;
     std::size_t pending_token_count(sequence_id id) const;

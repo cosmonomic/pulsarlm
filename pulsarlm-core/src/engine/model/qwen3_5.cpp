@@ -374,7 +374,16 @@ at::Tensor qwen3_5_model::deltanet(
     const state_rows state_rows = state_layer_rows(g, state_layer);
     at::Tensor gated;
     if (kind == group_kind::verify) {
-        const std::int64_t per_sequence = ntok / window_rows.lines.size(0);
+        const std::int64_t sequences = window_rows.lines.size(0);
+        TORCH_CHECK(
+            sequences > 0 && ntok > 0 && ntok % sequences == 0,
+            "qwen3_5_model: a verify group of ",
+            ntok,
+            " tokens does not hold the same count for each of its ",
+            sequences,
+            " sequences"
+        );
+        const std::int64_t per_sequence = ntok / sequences;
         at::Tensor convolved = causal_conv_verify_cuda(
             w.in_proj_qkv.apply(h),
             w.conv,

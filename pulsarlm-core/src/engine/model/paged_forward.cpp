@@ -216,6 +216,7 @@ at::Tensor logit_inputs(const at::Tensor& x, const group_batch& g) {
 }
 
 step_logits paged_forward(const step_batch& batch, const std::function<at::Tensor(const group_batch&)>& group_forward) {
+    TORCH_CHECK(!batch.verify_group, "paged_forward: a model without a draft head forwards no verify group");
     step_logits logits;
     if (batch.prefill_group) {
         logits.prefill_logits = group_forward(*batch.prefill_group);

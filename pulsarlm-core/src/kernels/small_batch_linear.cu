@@ -1,4 +1,5 @@
 #include "pulsarlm/kernels/dependent_launch.cuh"
+#include "pulsarlm/kernels/device_check.hpp"
 #include "pulsarlm/kernels/ops.hpp"
 
 #include <ATen/ATen.h>
@@ -132,9 +133,11 @@ template <typename Body> void dispatch_tokens(int64_t tokens, Body body) {
     case 3:
         body(std::integral_constant<int, 3>{});
         break;
-    default:
+    case 4:
         body(std::integral_constant<int, 4>{});
         break;
+    default:
+        TORCH_CHECK(false, "small_batch_linear: the kernel takes 1 to 4 tokens, got ", tokens);
     }
 }
 
@@ -182,6 +185,7 @@ template <bool gated> at::Tensor launch(const at::Tensor& x, const at::Tensor& w
 }  // namespace
 
 at::Tensor small_batch_linear_cuda(const at::Tensor& x, const at::Tensor& weight) {
+    check_on_current_device("small_batch_linear", {x, weight});
     if (!fits(x, weight)) {
         return at::linear(x, weight);
     }
@@ -189,6 +193,7 @@ at::Tensor small_batch_linear_cuda(const at::Tensor& x, const at::Tensor& weight
 }
 
 at::Tensor small_batch_gated_linear_cuda(const at::Tensor& x, const at::Tensor& gate_up) {
+    check_on_current_device("small_batch_gated_linear", {x, gate_up});
     TORCH_CHECK(
         gate_up.dim() == 2 && gate_up.size(0) % 2 == 0,
         "small_batch_gated_linear: gate_up must be [2 * out, in], the gate rows first"

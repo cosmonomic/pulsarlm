@@ -3,6 +3,7 @@
 
 #include "pulsarlm/kernels/attn_tiles.cuh"
 #include "pulsarlm/kernels/attn_tuning.hpp"
+#include "pulsarlm/kernels/device_check.hpp"
 #include "pulsarlm/kernels/ops.hpp"
 
 #include <ATen/ATen.h>
@@ -44,8 +45,8 @@
 namespace pulsarlm {
 namespace {
 
-using attn::key_positions;
 using attn::cta_threads;
+using attn::key_positions;
 using attn::paged_attn_params;
 
 // One block per token; the n_kv_heads*head_dim elements are strided across the
@@ -316,8 +317,10 @@ __device__ __forceinline__ void tc_attend_tiles(
     int run_page = -1;
     float run_max = -CUDART_INF_F;
     const float weight = group_mass ? p.query_weights[s] : 0.0f;
+    const int mass_pages = group_mass ? min(p.cu_view_pages[s + 1], p.total_view_pages) - p.cu_view_pages[s] : 0;
     auto flush_page = [&]() {
         if (run_page >= 0 && row_lane == 0 && row < p.group) {
+            CUDA_KERNEL_ASSERT(run_page < mass_pages);
             group_mass[static_cast<int64_t>(run_page) * p.n_q_heads + row] = weight * run_max;
             if (page_weight && row == 0) {
                 page_weight[run_page] = weight;
@@ -544,7 +547,6 @@ __global__ void __launch_bounds__(nwarps * 32) paged_decode_split_kernel(
 template <typename scalar_t>
 __global__ void paged_decode_combine_kernel(
     const paged_attn_params<scalar_t> p,
-    float* __restrict__ lse_out,
     const float* __restrict__ o_partial,
     const float* __restrict__ m_partial,
     const float* __restrict__ l_partial,
@@ -590,9 +592,6 @@ __global__ void paged_decode_combine_kernel(
             }
         }
         orow[d] = static_cast<scalar_t>(acc * invl);
-    }
-    if (tid == 0) {
-        lse_out[static_cast<int64_t>(s) * p.n_q_heads + h] = bad ? -CUDART_INF_F : (block_max + logf(l));
     }
 }
 
@@ -670,10 +669,13 @@ void launch_tc_decode(const attn::paged_attn_batch& b, int64_t forced_splits, cu
         return;
     }
 
+    TORCH_CHECK(
+        base_ctas * nsplits <= std::numeric_limits<int>::max(),
+        "attn_decode: the split grid must fit a 32-bit index"
+    );
     auto o_partial = at::empty({b.num_seqs, b.n_kv_heads, nsplits, group, b.head_dim}, fopts);
     auto m_partial = at::empty({b.num_seqs, b.n_kv_heads, nsplits, group}, fopts);
     auto l_partial = at::empty({b.num_seqs, b.n_kv_heads, nsplits, group}, fopts);
-    auto lse_out = at::empty({b.num_seqs, b.n_kv_heads, group}, fopts);
 
     attn::dispatch_page_head("attn_decode", b.page_size, b.head_dim, [&](auto bs_tag, auto hd_tag) {
         constexpr int bs = decltype(bs_tag)::value;
@@ -705,7 +707,6 @@ void launch_tc_decode(const attn::paged_attn_batch& b, int64_t forced_splits, cu
         combine_smem,
         stream,
         p,
-        lse_out.data_ptr<float>(),
         o_partial.data_ptr<float>(),
         m_partial.data_ptr<float>(),
         l_partial.data_ptr<float>(),
@@ -730,6 +731,7 @@ namespace {
 
 at::Tensor paged_decode(const attn::paged_attn_batch& b, int64_t num_splits) {
     TORCH_CHECK(num_splits >= 0, "attn_decode: num_splits must be >= 0");
+    TORCH_CHECK(num_splits <= std::numeric_limits<int>::max(), "attn_decode: num_splits must fit a 32-bit index");
     if (b.num_seqs == 0) {
         return b.o;
     }
@@ -769,6 +771,10 @@ void write_kv_cuda(
             seqlens_k.is_cuda() && (!cu_seqlens_q || cu_seqlens_q->is_cuda()),
         "write_kv: all inputs must be CUDA tensors"
     );
+    check_on_current_device(
+        "write_kv",
+        {k_pool, v_pool, k_new, v_new, page_tables, seqlens_k, cu_seqlens_q.value_or(at::Tensor())}
+    );
     TORCH_CHECK(
         k_pool.scalar_type() == v_pool.scalar_type() && k_pool.scalar_type() == k_new.scalar_type() &&
             k_new.scalar_type() == v_new.scalar_type(),
@@ -801,6 +807,11 @@ void write_kv_cuda(
     } else {
         TORCH_CHECK(num_new_tokens == num_seqs, "write_kv: one new token per sequence without cu_seqlens_q");
     }
+    TORCH_CHECK(
+        num_new_tokens <= std::numeric_limits<int>::max() && num_seqs <= std::numeric_limits<int>::max() &&
+            page_tables.size(1) * page_size <= std::numeric_limits<int>::max(),
+        "write_kv: the new tokens, sequences and keys of a view must each fit a 32-bit index"
+    );
     if (num_new_tokens == 0) {
         return;
     }

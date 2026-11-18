@@ -27,6 +27,12 @@ at::Tensor need(const c10::Dict<std::string, at::Tensor>& weights, const std::st
     return weights.at(prefix + name);
 }
 
+void check_size(const at::Tensor& tensor, std::int64_t dim, std::int64_t size, const std::string& name) {
+    if (tensor.dim() <= dim || tensor.size(dim) != size) {
+        throw std::invalid_argument(std::format("gemma4_model: {:?} must have {} in dim {}", prefix + name, size, dim));
+    }
+}
+
 at::Tensor gelu_tanh(const at::Tensor& x) {
     return at::gelu(x, "tanh");
 }
@@ -122,6 +128,44 @@ gemma4_model::gemma4_model(gemma4_config config, const c10::Dict<std::string, at
             w.pre_feedforward_layernorm_2 = need(weights, p + "pre_feedforward_layernorm_2.weight");
             w.post_feedforward_layernorm_1 = need(weights, p + "post_feedforward_layernorm_1.weight");
             w.post_feedforward_layernorm_2 = need(weights, p + "post_feedforward_layernorm_2.weight");
+            check_size(w.router_proj, 1, c.hidden_size, p + "router.proj.weight");
+            const std::int64_t experts = w.router_proj.size(0);
+            if (c.top_k_experts < 1 || c.top_k_experts > experts) {
+                throw std::invalid_argument("gemma4_model: top_k_experts must be between 1 and the experts");
+            }
+            check_size(w.router_per_expert_scale, 0, experts, p + "router.per_expert_scale");
+            check_size(w.experts_gate_up_proj, 0, experts, p + "experts.gate_up_proj");
+            check_size(w.experts_gate_up_proj, 2, c.hidden_size, p + "experts.gate_up_proj");
+            check_size(w.experts_down_proj, 0, experts, p + "experts.down_proj");
+            check_size(w.experts_down_proj, 1, c.hidden_size, p + "experts.down_proj");
+            check_size(w.experts_down_proj, 2, w.experts_gate_up_proj.size(1) / 2, p + "experts.down_proj");
+            check_size(w.experts_gate_up_proj, 1, 2 * w.experts_down_proj.size(2), p + "experts.gate_up_proj");
+            if (!layers.empty()) {
+                check_size(
+                    w.experts_gate_up_proj,
+                    0,
+                    layers.front().experts_gate_up_proj.size(0),
+                    p + "experts.gate_up_proj"
+                );
+                check_size(w.experts_down_proj, 2, layers.front().experts_down_proj.size(2), p + "experts.down_proj");
+            }
+        }
+        const kv_layer& spec = kv_specs[kv_layer_of[layer]];
+        const auto layer_head_dim = static_cast<std::int64_t>(spec.head_dim);
+        const auto layer_kv_heads = static_cast<std::int64_t>(spec.n_kv_heads);
+        check_size(w.q_proj, 0, c.n_heads * layer_head_dim, p + "self_attn.q_proj.weight");
+        check_size(w.q_proj, 1, c.hidden_size, p + "self_attn.q_proj.weight");
+        check_size(w.q_norm, 0, layer_head_dim, p + "self_attn.q_norm.weight");
+        check_size(w.o_proj, 0, c.hidden_size, p + "self_attn.o_proj.weight");
+        check_size(w.o_proj, 1, c.n_heads * layer_head_dim, p + "self_attn.o_proj.weight");
+        if (w.k_proj.defined()) {
+            check_size(w.k_proj, 0, layer_kv_heads * layer_head_dim, p + "self_attn.k_proj.weight");
+            check_size(w.k_proj, 1, c.hidden_size, p + "self_attn.k_proj.weight");
+            check_size(w.k_norm, 0, layer_head_dim, p + "self_attn.k_norm.weight");
+        }
+        if (w.v_proj.defined()) {
+            check_size(w.v_proj, 0, layer_kv_heads * layer_head_dim, p + "self_attn.v_proj.weight");
+            check_size(w.v_proj, 1, c.hidden_size, p + "self_attn.v_proj.weight");
         }
         layers.push_back(std::move(w));
     }

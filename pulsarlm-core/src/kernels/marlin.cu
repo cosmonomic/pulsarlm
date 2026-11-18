@@ -1,4 +1,5 @@
 #include "pulsarlm/kernels/dependent_launch.cuh"
+#include "pulsarlm/kernels/device_check.hpp"
 #include "pulsarlm/kernels/dequant_gemm_common.cuh"
 
 #include "pulsarlm/kernels/ops.hpp"
@@ -16,6 +17,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <tuple>
 #include <type_traits>
 
@@ -410,6 +412,12 @@ std::tuple<at::Tensor, at::Tensor> repack(
     int64_t group_size
 ) {
     TORCH_CHECK(weight.is_cuda() && weight_scale.is_cuda(), op, ": inputs must be CUDA tensors");
+    check_on_current_device(op, {weight, weight_scale});
+    TORCH_CHECK(
+        n <= std::numeric_limits<int32_t>::max() && k <= std::numeric_limits<int32_t>::max(),
+        op,
+        ": N and K must fit 32 bits"
+    );
     TORCH_CHECK(block_n > 0, op, ": block_n must be positive");
     TORCH_CHECK(group_size > 0 && group_size % 16 == 0, op, ": group_size must be a positive multiple of 16");
     TORCH_CHECK(k % group_size == 0, op, ": K must be a multiple of group_size");
@@ -570,6 +578,7 @@ at::Tensor gemm(
         op,
         ": all inputs must be CUDA tensors"
     );
+    check_on_current_device(op, {x, weight_marlin, scale_marlin});
     TORCH_CHECK(x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16, op, ": x must be fp16 or bf16");
     TORCH_CHECK(x.dim() == 2 && x.is_contiguous(), op, ": x must be a contiguous [M, K]");
     TORCH_CHECK(weight_marlin.scalar_type() == at::kInt, op, ": weight_marlin must be int32");
@@ -578,6 +587,12 @@ at::Tensor gemm(
     TORCH_CHECK(group_size > 0 && group_size % 16 == 0, op, ": group_size must be a positive multiple of 16");
     const int64_t k = x.size(1);
     TORCH_CHECK(k % group_size == 0, op, ": K must be a multiple of group_size");
+    constexpr int64_t int32_max = std::numeric_limits<int32_t>::max();
+    TORCH_CHECK(
+        x.size(0) <= int32_max && k <= int32_max && n <= int32_max && block_n <= int32_max && group_size <= int32_max,
+        op,
+        ": M, K, N, block_n and group_size must fit 32 bits"
+    );
     TORCH_CHECK(
         scale_marlin.dim() == 2 && scale_marlin.size(0) == k / group_size &&
             scale_marlin.size(1) == ceil_div(n, block_n),

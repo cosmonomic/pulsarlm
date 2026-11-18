@@ -2,6 +2,8 @@
 
 #include <ATen/ATen.h>
 
+#include <format>
+#include <stdexcept>
 #include <vector>
 
 namespace pulsarlm {
@@ -19,11 +21,31 @@ at::Tensor rope_permutation(std::int64_t head_dim, std::int64_t rotary_dim, at::
 
 at::Tensor permute_heads(const at::Tensor& weight, std::int64_t heads, const at::Tensor& permutation) {
     std::int64_t head_dim = permutation.size(0);
+    if (weight.dim() < 1 || weight.size(0) != heads * head_dim) {
+        throw std::invalid_argument(
+            std::format(
+                "permute_heads: the weight must have {} rows, {} heads of {} dims",
+                heads * head_dim,
+                heads,
+                head_dim
+            )
+        );
+    }
     return weight.view({heads, head_dim, -1}).index_select(1, permutation).reshape(weight.sizes()).contiguous();
 }
 
 at::Tensor permute_queries(const at::Tensor& weight, std::int64_t heads, const at::Tensor& permutation) {
     std::int64_t head_dim = permutation.size(0);
+    if (weight.dim() < 1 || weight.size(0) != heads * 2 * head_dim) {
+        throw std::invalid_argument(
+            std::format(
+                "permute_queries: the weight must have {} rows, {} heads of 2 * {} dims",
+                heads * 2 * head_dim,
+                heads,
+                head_dim
+            )
+        );
+    }
     at::Tensor halves = weight.view({heads, 2, head_dim, -1});
     at::Tensor queries = halves.select(1, 0).index_select(1, permutation);
     return at::stack({queries, halves.select(1, 1)}, 1).reshape(weight.sizes()).contiguous();

@@ -8,6 +8,7 @@
 #include <numbers>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -200,7 +201,11 @@ std::vector<std::size_t> pages_to_evict(
     std::size_t page_size,
     const page_eviction_policy& policy
 ) {
-    assert(policy.n_working >= 1 && n_q_heads >= 1 && mass_sum.size() == weight_sum.size() * n_q_heads);
+    if (policy.n_working < 1 || n_q_heads < 1 || mass_sum.size() != weight_sum.size() * n_q_heads) {
+        throw std::invalid_argument(
+            "pages_to_evict takes a working set of at least one page and n_q_heads masses per page weight"
+        );
+    }
     std::size_t page_count = weight_sum.size();
     if (page_count <= policy.n_sink + policy.n_working) {
         return {};

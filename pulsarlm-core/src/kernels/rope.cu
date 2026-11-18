@@ -1,4 +1,5 @@
 #include "pulsarlm/kernels/dependent_launch.cuh"
+#include "pulsarlm/kernels/device_check.hpp"
 #include "pulsarlm/kernels/ops.hpp"
 #include "pulsarlm/kernels/rope_tables.hpp"
 
@@ -7,6 +8,7 @@
 #include <c10/cuda/CUDAStream.h>
 
 #include <algorithm>
+#include <limits>
 
 // Rotary position embedding (RoPE), HF/Qwen2 "rotate_half" convention.
 //
@@ -90,6 +92,7 @@ __global__ void rope_kernel(
 
 at::Tensor rope_cuda(const at::Tensor& x, const at::Tensor& pos, const rope_parameters& rope) {
     TORCH_CHECK(x.is_cuda() && pos.is_cuda(), "rope: inputs must be CUDA tensors");
+    check_on_current_device("rope", {x, pos});
     TORCH_CHECK(x.dim() == 3, "rope: x must be 3-D [n_heads, seq, head_dim]");
     TORCH_CHECK(pos.dim() == 1, "rope: pos must be 1-D [seq]");
     TORCH_CHECK(pos.scalar_type() == at::kLong, "rope: pos must be int64");
@@ -100,10 +103,14 @@ at::Tensor rope_cuda(const at::Tensor& x, const at::Tensor& pos, const rope_para
 
     TORCH_CHECK(head_dim % 2 == 0, "rope: head_dim must be even");
     TORCH_CHECK(pos.size(0) == seq, "rope: pos length must match x seq dim");
+    TORCH_CHECK(n_heads * seq <= std::numeric_limits<int>::max(), "rope: n_heads * seq must fit a 32-bit index");
 
     auto xc = x.contiguous();
     auto pc = pos.contiguous();
     auto out = at::empty_like(xc);
+    if (out.numel() == 0) {
+        return out;
+    }
     const auto& quadrants_per_position = rope_quadrants_per_position(rope, head_dim, xc.device());
 
     const int64_t blocks = n_heads * seq;

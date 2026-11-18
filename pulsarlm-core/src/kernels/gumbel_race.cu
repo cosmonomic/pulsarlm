@@ -1,4 +1,5 @@
 #include "pulsarlm/kernels/dependent_launch.cuh"
+#include "pulsarlm/kernels/device_check.hpp"
 #include "pulsarlm/kernels/ops.hpp"
 
 #include <ATen/ATen.h>
@@ -85,6 +86,7 @@ __global__ void gumbel_race_kernel(
 }  // namespace
 
 at::Tensor gumbel_race_cuda(const at::Tensor& scores, const at::Tensor& temperatures, const at::Tensor& draws) {
+    check_on_current_device("gumbel_race", {scores, temperatures, draws});
     TORCH_CHECK(
         scores.is_cuda() && scores.dim() == 2 && scores.is_contiguous(),
         "gumbel_race: scores must be contiguous CUDA [rows, vocab]"

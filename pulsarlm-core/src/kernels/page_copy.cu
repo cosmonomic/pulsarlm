@@ -1,4 +1,5 @@
 #include "pulsarlm/kernels/dependent_launch.cuh"
+#include "pulsarlm/kernels/device_check.hpp"
 #include "pulsarlm/kernels/page_copy.hpp"
 
 #include <ATen/ATen.h>
@@ -6,6 +7,7 @@
 #include <c10/cuda/CUDAException.h>
 
 #include <cstdint>
+#include <limits>
 
 namespace pulsarlm {
 namespace {
@@ -76,6 +78,22 @@ void check_segments(const at::Tensor& device, const at::Tensor& host, const at::
             segments.is_contiguous(),
         "copy_segments: segments must be pinned contiguous int64 [n, 3]"
     );
+    check_on_current_device("copy_segments", {device});
+    TORCH_CHECK(
+        segments.size(0) <= std::numeric_limits<int>::max(),
+        "copy_segments: the segments must fit a 32-bit index"
+    );
+    const int64_t* rows = segments.const_data_ptr<int64_t>();
+    for (int64_t i = 0; i < segments.size(0); i++) {
+        const segment s{rows[3 * i], rows[3 * i + 1], rows[3 * i + 2]};
+        TORCH_CHECK(
+            s.bytes >= 0 && s.device_offset >= 0 && s.host_offset >= 0 && s.bytes <= device.numel() - s.device_offset &&
+                s.bytes <= host.numel() - s.host_offset,
+            "copy_segments: segment ",
+            i,
+            " must lie within the device and host tensors"
+        );
+    }
 }
 
 }  // namespace

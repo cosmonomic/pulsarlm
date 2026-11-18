@@ -2,6 +2,7 @@
 #include "pulsarlm/kernels/attn_common.cuh"
 
 #include "pulsarlm/kernels/attn_tiles.cuh"
+#include "pulsarlm/kernels/device_check.hpp"
 #include "pulsarlm/kernels/ops.hpp"
 
 #include <ATen/ATen.h>
@@ -13,6 +14,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 
 namespace pulsarlm {
 namespace {
@@ -487,6 +489,12 @@ query_rows rows_of(
         ": cu_seqlens_q must be contiguous int32 CUDA [sequences + 1]"
     );
     TORCH_CHECK(ratio >= 1 && first_row >= 0, op, ": ratio must be positive and first_row not negative");
+    check_on_current_device(op, {key_counts, cu_seqlens_q.value_or(at::Tensor())});
+    TORCH_CHECK(
+        key_counts.size(0) <= std::numeric_limits<int>::max() && ratio <= std::numeric_limits<int>::max(),
+        op,
+        ": the sequences and ratio must each fit a 32-bit index"
+    );
     return query_rows{
         .key_counts = key_counts.const_data_ptr<int32_t>(),
         .cu_seqlens_q = cu_seqlens_q ? cu_seqlens_q->const_data_ptr<int32_t>() : nullptr,
@@ -518,6 +526,19 @@ at::Tensor index_scores_cuda(
     );
     const int64_t rows = queries.size(0);
     const query_rows layout = rows_of("index_scores", key_counts, cu_seqlens_q, first_row, ratio);
+    check_on_current_device("index_scores", {queries, blocks});
+    TORCH_CHECK(
+        blocks.size(0) == key_counts.size(0),
+        "index_scores: blocks and key_counts must hold the same sequences"
+    );
+    TORCH_CHECK(
+        cu_seqlens_q || first_row + rows <= key_counts.size(0),
+        "index_scores: without cu_seqlens_q, first_row + rows must be at most the sequences"
+    );
+    TORCH_CHECK(
+        rows <= std::numeric_limits<int>::max() && queries.size(1) * queries.size(2) <= std::numeric_limits<int>::max(),
+        "index_scores: the rows and a row's elements must each fit a 32-bit index"
+    );
     const int64_t max_blocks = blocks.size(1);
     at::Tensor scores = at::empty({rows, max_blocks}, queries.options().dtype(at::kFloat));
     if (rows == 0 || max_blocks == 0) {
@@ -528,6 +549,10 @@ at::Tensor index_scores_cuda(
     const bool tensor_cores = queries.scalar_type() != at::kFloat && heads <= 16 && 16 % heads == 0 &&
         (dim == 64 || dim == 128 || dim == 256);
     if (tensor_cores) {
+        TORCH_CHECK(
+            reinterpret_cast<std::uintptr_t>(blocks.data_ptr()) % 16 == 0,
+            "index_scores: blocks must start at a multiple of 16 bytes"
+        );
         const int tile_rows = 16 / heads;
         const dim3 tc_grid(
             static_cast<unsigned>((rows + tile_rows - 1) / tile_rows),
@@ -622,6 +647,11 @@ at::Tensor index_queries_cuda(
             positions.size(0) == index_qk.size(0) && positions.is_contiguous(),
         "index_queries: positions must be contiguous int64 CUDA [tokens]"
     );
+    check_on_current_device("index_queries", {index_qk, norm_weight, inv_freq, positions});
+    TORCH_CHECK(
+        n_heads <= std::numeric_limits<int>::max() && index_qk.size(0) * n_heads <= std::numeric_limits<int>::max(),
+        "index_queries: the tokens times n_heads must fit a 32-bit index"
+    );
     at::Tensor queries = at::empty({index_qk.size(0), n_heads, dim}, index_qk.options());
     if (queries.numel() == 0) {
         return queries;
@@ -693,6 +723,15 @@ at::Tensor index_blocks_cuda(
             key_counts.size(0) == sequences && key_counts.is_contiguous(),
         "index_blocks: key_counts must be contiguous int32 CUDA [sequences]"
     );
+    check_on_current_device(
+        "index_blocks",
+        {index_keys, page_tables, page_positions, key_counts, norm_weight, inv_freq}
+    );
+    TORCH_CHECK(
+        sequences <= std::numeric_limits<int>::max() &&
+            page_tables.size(1) * page_size <= std::numeric_limits<int>::max(),
+        "index_blocks: the sequences and the keys of a view must each fit a 32-bit index"
+    );
     const int64_t max_blocks = page_tables.size(1) * page_size / ratio;
     at::Tensor blocks = at::empty({sequences, max_blocks, dim}, index_keys.options());
     if (blocks.numel() == 0) {
@@ -744,6 +783,11 @@ at::Tensor select_blocks_cuda(
     TORCH_CHECK(
         top >= 1 && words * 32 > scores.size(1),
         "select_blocks: top must be positive and words cover a block past the scores"
+    );
+    check_on_current_device("select_blocks", {scores});
+    TORCH_CHECK(
+        rows <= std::numeric_limits<int>::max() && words <= std::numeric_limits<int>::max(),
+        "select_blocks: the rows and words must each fit a 32-bit index"
     );
     at::Tensor selected = at::empty({rows, words}, scores.options().dtype(at::kInt));
     if (rows == 0) {

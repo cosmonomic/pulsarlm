@@ -8,6 +8,7 @@
 #include <numeric>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -19,7 +20,19 @@ std::size_t ceil_div(std::size_t n, std::size_t d) {
     return (n + d - 1) / d;
 }
 
+void require_block_class(std::span<const std::size_t> sizes) {
+    if (sizes.empty()) {
+        throw std::invalid_argument("a line allocator has at least one block class");
+    }
+}
+
+std::size_t smallest(std::span<const std::size_t> sizes) {
+    require_block_class(sizes);
+    return *std::ranges::min_element(sizes);
+}
+
 std::size_t largest(std::span<const std::size_t> sizes) {
+    require_block_class(sizes);
     return *std::ranges::max_element(sizes);
 }
 
@@ -46,7 +59,7 @@ std::uint64_t free_block_starts(std::uint64_t word, std::size_t order) {
 }  // namespace
 
 line_allocator::line_allocator(std::span<const std::size_t> block_bytes, std::size_t pool_bytes)
-: unit_bytes(*std::ranges::min_element(block_bytes)),
+: unit_bytes(smallest(block_bytes)),
   region_units(largest(block_bytes) / unit_bytes),
   region_words(ceil_div(region_units, 64)),
   regions(pool_bytes / largest(block_bytes)),
@@ -102,9 +115,11 @@ std::optional<std::size_t> line_allocator::free_block(std::uint32_t r, std::size
     if (order >= word_order) {
         std::size_t block_words = std::size_t{1} << (order - word_order);
         for (std::size_t first = 0; first < units.size(); first += block_words) {
-            if (std::all_of(units.begin() + static_cast<std::ptrdiff_t>(first),
-                            units.begin() + static_cast<std::ptrdiff_t>(first + block_words),
-                            [](std::uint64_t word) { return word == 0; })) {
+            if (std::all_of(
+                    units.begin() + static_cast<std::ptrdiff_t>(first),
+                    units.begin() + static_cast<std::ptrdiff_t>(first + block_words),
+                    [](std::uint64_t word) { return word == 0; }
+                )) {
                 return first * 64;
             }
         }
@@ -129,9 +144,7 @@ std::optional<std::size_t> line_allocator::largest_free_order(std::uint32_t r) c
         for (std::size_t w = 0; w < units.size(); w++) {
             run = units[w] == 0 ? run + 1 : 0;
             if (run > 0) {
-                auto order = static_cast<std::size_t>(
-                    std::min(std::countr_zero(w + 1), std::bit_width(run) - 1)
-                );
+                auto order = static_cast<std::size_t>(std::min(std::countr_zero(w + 1), std::bit_width(run) - 1));
                 largest_words_order = std::max(largest_words_order.value_or(0), order);
             }
         }
@@ -139,7 +152,10 @@ std::optional<std::size_t> line_allocator::largest_free_order(std::uint32_t r) c
             return word_order + *largest_words_order;
         }
     }
-    std::size_t orders = std::min<std::size_t>(word_order, static_cast<std::size_t>(std::countr_zero(region_units)) + 1);
+    std::size_t orders = std::min<std::size_t>(
+        word_order,
+        static_cast<std::size_t>(std::countr_zero(region_units)) + 1
+    );
     for (std::size_t order = orders; order > 0; order--) {
         if (free_block(r, order - 1)) {
             return order - 1;

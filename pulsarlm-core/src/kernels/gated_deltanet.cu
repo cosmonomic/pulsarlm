@@ -1,5 +1,6 @@
 #include "pulsarlm/kernels/arrival_counters.cuh"
 #include "pulsarlm/kernels/dependent_launch.cuh"
+#include "pulsarlm/kernels/device_check.hpp"
 #include "pulsarlm/kernels/ops.hpp"
 
 #include <ATen/ATen.h>
@@ -9,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <type_traits>
 
@@ -21,6 +23,7 @@ constexpr int max_conv_window = 16;
 // Value columns per delta rule CTA.
 constexpr int columns = 16;
 constexpr size_t shared_memory_without_opt_in = 48 * 1024;
+constexpr int64_t int32_max = std::numeric_limits<int32_t>::max();
 
 // Sequence s holds tokens [first(s), first(s) + count(s)); without cu_seqlens_q, the per_sequence tokens from
 // s * per_sequence.
@@ -874,6 +877,11 @@ void check_rows(const char* op, const state_rows& rows) {
     );
     const int64_t num_seqs = lines.size(0);
     TORCH_CHECK(
+        rows.slots <= int32_max && rows.page_size <= int32_max && num_seqs <= int32_max,
+        op,
+        ": rows.slots, rows.page_size and the sequences must fit 32 bits"
+    );
+    TORCH_CHECK(
         rows.history_positions.is_cuda() && rows.history_positions.scalar_type() == at::kLong &&
             rows.history_positions.dim() == 1 && rows.history_positions.size(0) == num_seqs &&
             rows.history_positions.is_contiguous(),
@@ -963,7 +971,18 @@ at::Tensor causal_conv(
     int64_t per_sequence,
     int64_t dilation
 ) {
+    check_on_current_device(
+        "causal_conv",
+        {x,
+         weight,
+         conv_pool,
+         rows.lines,
+         rows.history_positions,
+         rows.rejected_tokens,
+         cu_seqlens_q.value_or(at::Tensor())}
+    );
     check_rows("causal_conv", rows);
+    TORCH_CHECK(rows.slots == 1, "causal_conv: rows.slots must be 1");
     check_tokens("causal_conv", x, rows, cu_seqlens_q, per_sequence);
     const int64_t channels = x.size(1);
     TORCH_CHECK(
@@ -984,9 +1003,14 @@ at::Tensor causal_conv(
         "causal_conv: the window must hold (kernel - 1) * dilation inputs, dilation at least 1, and at most ",
         max_conv_window
     );
-    at::Tensor out = at::empty(x.sizes(), x.options());
     const int64_t total = x.size(0);
     const int64_t num_seqs = rows.lines.size(0);
+    TORCH_CHECK(
+        total <= int32_max && channels * kernel <= int32_max && dilation <= int32_max &&
+            (std::max(total, num_seqs) * channels + conv_threads - 1) / conv_threads <= int32_max,
+        "causal_conv: too many tokens, sequences or channels"
+    );
+    at::Tensor out = at::empty(x.sizes(), x.options());
     if (num_seqs == 0) {
         return out;
     }
@@ -1078,6 +1102,22 @@ at::Tensor gated_delta_rule(
     gate_activation activation,
     const at::Tensor& counters
 ) {
+    check_on_current_device(
+        "gated_delta_rule",
+        {x,
+         a,
+         b,
+         dt_bias,
+         neg_a,
+         state_pool,
+         rows.lines,
+         rows.history_positions,
+         rows.rejected_tokens,
+         cu_seqlens_q.value_or(at::Tensor()),
+         z,
+         norm_weight,
+         counters}
+    );
     check_rows("gated_delta_rule", rows);
     check_tokens("gated_delta_rule", x, rows, cu_seqlens_q, per_sequence);
     TORCH_CHECK(x.is_contiguous(), "gated_delta_rule: x must be contiguous");
@@ -1131,8 +1171,13 @@ at::Tensor gated_delta_rule(
             norm_weight.is_contiguous(),
         "gated_delta_rule: norm_weight must be contiguous [value dim] in x's dtype"
     );
-    at::Tensor out = at::empty({total, value_heads * value_dim}, x.options());
     const int64_t num_seqs = rows.lines.size(0);
+    TORCH_CHECK(
+        total <= int32_max && x.size(1) <= int32_max && total * value_heads <= int32_max &&
+            num_seqs * value_heads * (value_dim / columns) <= int32_max,
+        "gated_delta_rule: too many tokens, sequences, heads or channels"
+    );
+    at::Tensor out = at::empty({total, value_heads * value_dim}, x.options());
     TORCH_CHECK(
         counters.is_cuda() && counters.device() == x.device() && counters.scalar_type() == at::kInt &&
             counters.is_contiguous() && counters.numel() >= gated_delta_rule_counters(num_seqs, value_heads),

@@ -22,15 +22,35 @@ at::Tensor need(const c10::Dict<std::string, at::Tensor>& weights, const std::st
     return weights.at(name);
 }
 
+void check_size(const at::Tensor& tensor, std::int64_t dim, std::int64_t size, const std::string& name) {
+    if (tensor.dim() <= dim || tensor.size(dim) != size) {
+        throw std::invalid_argument(std::format("llama_model: {:?} must have {} in dim {}", name, size, dim));
+    }
+}
+
 }  // namespace
 
 llama_model::llama_model(dense_config config, const c10::Dict<std::string, at::Tensor>& weights)
 : config(std::move(config)),
   embed_tokens(need(weights, "model.embed_tokens.weight")),
   norm(need(weights, "model.norm.weight")) {
+    if (embed_tokens.dim() != 2) {
+        throw std::invalid_argument("llama_model: \"model.embed_tokens.weight\" must have 2 dims");
+    }
     lm_head = weights.contains("lm_head.weight") ? weights.at("lm_head.weight") : embed_tokens;
     for (std::int64_t layer = 0; layer < this->config.n_layers; layer++) {
         const std::string p = "model.layers." + std::to_string(layer) + ".";
+        const std::string a = p + "self_attn.";
+        const dense_config& c = this->config;
+        const std::int64_t hidden = embed_tokens.size(1);
+        check_size(need(weights, a + "q_proj.weight"), 0, c.n_heads * c.head_dim, a + "q_proj.weight");
+        check_size(need(weights, a + "q_proj.weight"), 1, hidden, a + "q_proj.weight");
+        check_size(need(weights, a + "k_proj.weight"), 0, c.n_kv_heads * c.head_dim, a + "k_proj.weight");
+        check_size(need(weights, a + "k_proj.weight"), 1, hidden, a + "k_proj.weight");
+        check_size(need(weights, a + "v_proj.weight"), 0, c.n_kv_heads * c.head_dim, a + "v_proj.weight");
+        check_size(need(weights, a + "v_proj.weight"), 1, hidden, a + "v_proj.weight");
+        check_size(need(weights, a + "o_proj.weight"), 0, hidden, a + "o_proj.weight");
+        check_size(need(weights, a + "o_proj.weight"), 1, c.n_heads * c.head_dim, a + "o_proj.weight");
         layers.push_back(
             layer_weights{
                 .input_layernorm = need(weights, p + "input_layernorm.weight"),

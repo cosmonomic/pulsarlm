@@ -27,6 +27,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -243,6 +244,7 @@ void require(bool holds, const std::string& message) {
 
 std::span<const page_shape> first_shard_shapes(std::span<const kv_cache_shard> shards) {
     require(!shards.empty(), "a KV cache has at least one shard");
+    require(!shards.front().shapes.empty(), "a KV cache has at least one KV layer");
     return shards.front().shapes;
 }
 
@@ -617,7 +619,15 @@ void kv_cache::release_all(std::span<const std::vector<std::uint32_t>> line_ids)
 // Every layer's resident pages are held before any line is taken, so taking one never drops a page this call needs.
 task<std::expected<std::vector<std::vector<std::uint32_t>>, page_error>>
 kv_cache::get(std::span<const std::span<const digest>> hashes, std::span<const cudaStream_t> streams) {
-    assert(hashes.size() == layers.size());
+    if (hashes.size() != layers.size()) {
+        throw std::invalid_argument("kv_cache::get takes the hashes of every KV layer");
+    }
+    for (std::size_t layer = 0; layer < layers.size(); layer++) {
+        std::unordered_set<digest, digest_hash> layer_hashes(hashes[layer].begin(), hashes[layer].end());
+        if (layer_hashes.size() != hashes[layer].size()) {
+            throw std::invalid_argument(std::format("kv_cache::get takes distinct hashes of KV layer {}", layer));
+        }
+    }
     std::vector<std::vector<std::uint32_t>> line_ids(layers.size());
     std::vector<std::vector<std::size_t>> joined(layers.size());
     std::vector<std::vector<std::size_t>> to_fetch(layers.size());
@@ -712,7 +722,9 @@ kv_cache::get(std::span<const std::span<const digest>> hashes, std::span<const c
 
 std::expected<std::vector<std::vector<std::uint32_t>>, page_error>
 kv_cache::allocate(std::span<const std::size_t> counts) {
-    assert(counts.size() == layers.size());
+    if (counts.size() != layers.size()) {
+        throw std::invalid_argument("kv_cache::allocate takes a count for every KV layer");
+    }
     line_allocator::transaction taking(allocator);
     std::optional<std::vector<std::vector<std::uint32_t>>> taken = take_lines(taking, counts);
     if (!taken) {
@@ -749,18 +761,45 @@ task<std::expected<void, page_error>> kv_cache::sync(
     const std::vector<std::vector<std::uint32_t>>& line_ids,
     std::span<const cudaStream_t> streams
 ) {
-    assert(hashes.size() == layers.size() && owners.size() == layers.size() && line_ids.size() == layers.size());
+    if (hashes.size() != layers.size() || owners.size() != layers.size() || line_ids.size() != layers.size()) {
+        throw std::invalid_argument("kv_cache::sync takes hashes, owners and line ids for every KV layer");
+    }
+    for (std::size_t layer = 0; layer < layers.size(); layer++) {
+        if (line_ids[layer].size() != hashes[layer].size() || owners[layer].size() != hashes[layer].size()) {
+            throw std::invalid_argument(
+                std::format("kv_cache::sync takes one owner and one line id per hash of KV layer {}", layer)
+            );
+        }
+        for (std::size_t i = 0; i < hashes[layer].size(); i++) {
+            const cache_line& synced = line(layer, line_ids[layer][i]);
+            if (synced.ref == 0) {
+                throw std::invalid_argument(
+                    std::format(
+                        "kv_cache::sync takes held lines; line {} of KV layer {} is not",
+                        line_ids[layer][i],
+                        layer
+                    )
+                );
+            }
+            if (synced.hash && *synced.hash != hashes[layer][i]) {
+                throw std::invalid_argument(
+                    std::format(
+                        "kv_cache::sync cannot rename line {} of KV layer {}, which another hash names",
+                        line_ids[layer][i],
+                        layer
+                    )
+                );
+            }
+        }
+    }
     std::vector<layer_line> sources;
     std::vector<digest> keys;
     std::vector<std::pair<state::lease_id_type, page_store::page_index_type>> page_owners;
     std::vector<std::pair<layer_line, digest>> named;
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
-        assert(line_ids[layer].size() == hashes[layer].size() && owners[layer].size() == hashes[layer].size());
         std::unordered_map<digest, std::size_t, digest_hash> put_index;
         for (std::size_t i = 0; i < hashes[layer].size(); i++) {
             std::uint32_t line_id = line_ids[layer][i];
-            const cache_line& synced = line(layer, line_id);
-            assert(synced.ref > 0 && (!synced.hash || *synced.hash == hashes[layer][i]));
             auto [found, inserted] = put_index.try_emplace(hashes[layer][i], sources.size());
             if (inserted) {
                 sources.push_back(layer_line{.layer = layer, .line_id = line_id});
@@ -770,10 +809,6 @@ task<std::expected<void, page_error>> kv_cache::sync(
             page_owners.emplace_back(owners[layer][i], found->second);
         }
     }
-    if (sources.empty()) {
-        co_return {};
-    }
-
     std::vector<sharded_page> pages;
     pages.reserve(sources.size());
     for (const layer_line& source : sources) {
@@ -782,12 +817,23 @@ task<std::expected<void, page_error>> kv_cache::sync(
     for (const auto& [target, hash] : named) {
         assign_hash(target.layer, target.line_id, hash);
     }
-    // Held until the copies read them, whatever the caller releases meanwhile.
     for (const layer_line& source : sources) {
         line(source.layer, source.line_id).ref++;
     }
-    std::expected<void, page_error>
+    return write_synced(std::move(keys), std::move(pages), std::move(page_owners), std::move(sources), streams);
+}
+
+task<std::expected<void, page_error>> kv_cache::write_synced(
+    std::vector<digest> keys,
+    std::vector<sharded_page> pages,
+    std::vector<std::pair<state::lease_id_type, page_store::page_index_type>> page_owners,
+    std::vector<layer_line> sources,
+    std::span<const cudaStream_t> streams
+) {
+    std::expected<void, page_error> written;
+    if (!sources.empty()) {
         written = co_await store->write_pages(std::move(keys), std::move(pages), std::move(page_owners), streams);
+    }
     for (const layer_line& source : sources) {
         release(source.layer, std::span(&source.line_id, 1));
     }

@@ -1,4 +1,5 @@
 #include "pulsarlm/kernels/dependent_launch.cuh"
+#include "pulsarlm/kernels/device_check.hpp"
 #include "pulsarlm/kernels/ops.hpp"
 
 #include <ATen/ATen.h>
@@ -7,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 
 namespace pulsarlm {
@@ -46,6 +48,12 @@ at::Tensor gather_page_tables_cuda(
     TORCH_CHECK(page_counts.size() == tables.size(), "gather_page_tables: one page count per table");
     const auto device = tables.front().device();
     const auto num_seqs = static_cast<int64_t>(tables.size());
+    TORCH_CHECK(
+        n_layers >= 0 && width >= 0 && width <= std::numeric_limits<int>::max() &&
+            n_layers * num_seqs <= std::numeric_limits<int>::max(),
+        "gather_page_tables: n_layers and width must not be negative, and the rows and width must each fit a 32-bit "
+        "index"
+    );
     at::Tensor addresses = at::empty({num_seqs}, at::TensorOptions().dtype(at::kLong).pinned_memory(true));
     at::Tensor capacities = at::empty({num_seqs}, at::TensorOptions().dtype(at::kInt).pinned_memory(true));
     auto* address = addresses.mutable_data_ptr<int64_t>();
@@ -58,6 +66,15 @@ at::Tensor gather_page_tables_cuda(
             table.device() == device && table.scalar_type() == at::kInt && table.dim() == 2 &&
                 table.size(0) == n_layers && table.is_contiguous(),
             "gather_page_tables: each table must be a contiguous int32 [n_layers, capacity] tensor on one device"
+        );
+        check_on_current_device("gather_page_tables", {table});
+        TORCH_CHECK(
+            table.size(1) <= std::numeric_limits<int32_t>::max(),
+            "gather_page_tables: a table's capacity must fit a 32-bit index"
+        );
+        TORCH_CHECK(
+            page_counts[s] <= static_cast<std::size_t>(width),
+            "gather_page_tables: a page count must be at most width"
         );
         address[s] = reinterpret_cast<int64_t>(table.const_data_ptr<int32_t>());
         TORCH_CHECK(

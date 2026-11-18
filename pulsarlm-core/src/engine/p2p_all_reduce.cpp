@@ -41,20 +41,34 @@ bool reach(const at::Device& device, const at::Device& peer) {
 p2p_all_reduce::p2p_all_reduce(std::span<const at::Device> devices, std::size_t max_bytes)
 : devices(devices.begin(), devices.end()),
   max_bytes(max_bytes) {
-    for (const at::Device& device : this->devices) {
-        c10::cuda::CUDAGuard guard(device);
-        void* buffer = nullptr;
-        void* rank_flags = nullptr;
-        void* rank_counters = nullptr;
-        C10_CUDA_CHECK(cudaMalloc(&buffer, max_bytes));
-        buffers.push_back(static_cast<std::byte*>(buffer));
-        C10_CUDA_CHECK(cudaMalloc(&rank_flags, flag_count(devices.size()) * sizeof(std::uint64_t)));
-        flags.push_back(static_cast<std::uint64_t*>(rank_flags));
-        C10_CUDA_CHECK(cudaMalloc(&rank_counters, p2p_all_reduce_max_blocks * sizeof(std::uint64_t)));
-        counters.push_back(static_cast<std::uint64_t*>(rank_counters));
-        C10_CUDA_CHECK(cudaMemset(rank_flags, 0, flag_count(devices.size()) * sizeof(std::uint64_t)));
-        C10_CUDA_CHECK(cudaMemset(rank_counters, 0, p2p_all_reduce_max_blocks * sizeof(std::uint64_t)));
-        C10_CUDA_CHECK(cudaDeviceSynchronize());
+    try {
+        for (const at::Device& device : this->devices) {
+            c10::cuda::CUDAGuard guard(device);
+            void* buffer = nullptr;
+            void* rank_flags = nullptr;
+            void* rank_counters = nullptr;
+            C10_CUDA_CHECK(cudaMalloc(&buffer, max_bytes));
+            buffers.push_back(static_cast<std::byte*>(buffer));
+            C10_CUDA_CHECK(cudaMalloc(&rank_flags, flag_count(devices.size()) * sizeof(std::uint64_t)));
+            flags.push_back(static_cast<std::uint64_t*>(rank_flags));
+            C10_CUDA_CHECK(cudaMalloc(&rank_counters, p2p_all_reduce_max_blocks * sizeof(std::uint64_t)));
+            counters.push_back(static_cast<std::uint64_t*>(rank_counters));
+            C10_CUDA_CHECK(cudaMemset(rank_flags, 0, flag_count(devices.size()) * sizeof(std::uint64_t)));
+            C10_CUDA_CHECK(cudaMemset(rank_counters, 0, p2p_all_reduce_max_blocks * sizeof(std::uint64_t)));
+            C10_CUDA_CHECK(cudaDeviceSynchronize());
+        }
+    } catch (...) {
+        for (std::size_t rank = 0; rank < buffers.size(); rank++) {
+            c10::cuda::CUDAGuard guard(this->devices[rank]);
+            cudaFree(buffers[rank]);
+            if (rank < flags.size()) {
+                cudaFree(flags[rank]);
+            }
+            if (rank < counters.size()) {
+                cudaFree(counters[rank]);
+            }
+        }
+        throw;
     }
 }
 

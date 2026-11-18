@@ -1,6 +1,7 @@
 #include "pulsarlm/kernels/dependent_launch.cuh"
 #include "pulsarlm/kernels/attn_common.cuh"
 
+#include "pulsarlm/kernels/device_check.hpp"
 #include "pulsarlm/kernels/ops.hpp"
 #include "pulsarlm/kernels/rope_tables.hpp"
 
@@ -9,6 +10,8 @@
 
 #include <math_constants.h>
 
+#include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 
@@ -181,11 +184,19 @@ void attach_mass(
             op,
             ": all inputs must be CUDA tensors"
         );
+        check_on_current_device(op, {*mass_sum, *weight_sum, *cu_view_pages, *query_weights});
         TORCH_CHECK(
             mass_sum->scalar_type() == at::kFloat && mass_sum->dim() == 2 && mass_sum->size(1) == b.n_q_heads &&
                 mass_sum->is_contiguous(),
             op,
             ": mass_sum must be contiguous fp32 [total_view_pages, n_q_heads]"
+        );
+        TORCH_CHECK(
+            mass_sum->size(0) <= std::numeric_limits<int>::max(),
+            op,
+            ": mass_sum must have at most ",
+            std::numeric_limits<int>::max(),
+            " rows"
         );
         TORCH_CHECK(
             weight_sum->scalar_type() == at::kFloat && weight_sum->dim() == 1 &&
@@ -238,6 +249,17 @@ paged_attn_batch make_paged_attn_batch(
         op,
         ": all inputs must be CUDA tensors"
     );
+    check_on_current_device(
+        op,
+        {q,
+         k_pool,
+         v_pool,
+         page_tables,
+         seqlens_k,
+         page_positions,
+         cu_seqlens_q.value_or(at::Tensor()),
+         k_norm_weight.value_or(at::Tensor())}
+    );
     TORCH_CHECK(
         q.scalar_type() == k_pool.scalar_type() && k_pool.scalar_type() == v_pool.scalar_type(),
         op,
@@ -286,6 +308,14 @@ paged_attn_batch make_paged_attn_batch(
         TORCH_CHECK(b.total_q == b.num_seqs, op, ": one query row per sequence");
     }
     b.max_pages = page_tables.size(1);
+    const int64_t int_max = std::numeric_limits<int>::max();
+    TORCH_CHECK(
+        b.total_q <= int_max && b.num_seqs <= int_max && b.total_q * b.n_q_heads <= int_max &&
+            (b.total_q / 16 + b.num_seqs) * b.n_q_heads <= int_max && b.num_seqs * b.max_pages <= int_max &&
+            b.max_pages * b.page_size <= int_max && b.sliding_window <= int_max,
+        op,
+        ": the batch's query rows, view pages, keys and sliding_window must each fit a 32-bit index"
+    );
 
     attach_mass(b, op, mass_sum, weight_sum, cu_view_pages, query_weights, b.num_seqs);
     if (k_norm_weight.has_value()) {

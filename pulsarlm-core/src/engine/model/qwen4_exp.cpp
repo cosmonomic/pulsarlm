@@ -61,6 +61,12 @@ std::int64_t split(std::int64_t count, std::int64_t parts, const char* what) {
     return count / parts;
 }
 
+void check_size(const at::Tensor& tensor, std::int64_t dim, std::int64_t size, const std::string& name) {
+    if (tensor.dim() <= dim || tensor.size(dim) != size) {
+        throw std::invalid_argument(std::format("qwen4_exp_model: {:?} must have {} in dim {}", name, size, dim));
+    }
+}
+
 }  // namespace
 
 qwen4_exp_model::qwen4_exp_model(
@@ -75,6 +81,9 @@ qwen4_exp_model::qwen4_exp_model(
     const qwen4_exp_config& c = this->config;
     const auto gpus = static_cast<std::int64_t>(this->comm.size());
     const auto rank = static_cast<std::int64_t>(this->comm.rank());
+    if (c.layer_types.empty()) {
+        throw std::invalid_argument("qwen4_exp_model: layer_types must hold a layer");
+    }
     if (c.n_kv_heads % gpus != 0 && gpus % c.n_kv_heads != 0) {
         throw std::invalid_argument(
             std::format("qwen4_exp_model: {} KV heads do not split across or repeat over {} GPUs", c.n_kv_heads, gpus)
@@ -118,6 +127,7 @@ qwen4_exp_model::qwen4_exp_model(
         at::pow(c.rope_theta, at::arange(0, rotary_dim, 2, at::kLong).to(at::kFloat) / static_cast<double>(rotary_dim))
             .to(embed_tokens.device());
     lm_head = weights.contains("lm_head.weight") ? weights.at("lm_head.weight") : embed_tokens;
+    check_size(lm_head, 0, embed_tokens.size(0), "lm_head.weight");
     at::Tensor permutation = rope_permutation(c.head_dim, rotary_dim, embed_tokens.device());
     const std::int64_t key_channels = heads.linear_n_key_heads * c.linear_key_head_dim;
     const std::int64_t value_channels = heads.linear_n_value_heads * c.linear_value_head_dim;
@@ -171,6 +181,22 @@ qwen4_exp_model::qwen4_exp_model(
 
     // p is the layer's weight prefix; layer n_layers is the MTP layer, an indexed attention layer without PLE.
     auto load_layer = [&](const std::string& p, std::int64_t layer) {
+        const std::string m = p + "mlp.";
+        const std::string shared = m + "shared_expert.";
+        check_size(need_named(weights, m + "gate.weight"), 1, c.hidden_size, m + "gate.weight");
+        check_size(need_named(weights, m + "shared_expert_gate.weight"), 0, 1, m + "shared_expert_gate.weight");
+        check_size(
+            need_named(weights, m + "shared_expert_gate.weight"),
+            1,
+            c.hidden_size,
+            m + "shared_expert_gate.weight"
+        );
+        check_size(need_named(weights, shared + "gate_proj.weight"), 1, c.hidden_size, shared + "gate_proj.weight");
+        const std::int64_t shared_rows = need_named(weights, shared + "gate_proj.weight").size(0);
+        check_size(need_named(weights, shared + "up_proj.weight"), 0, shared_rows, shared + "up_proj.weight");
+        check_size(need_named(weights, shared + "up_proj.weight"), 1, c.hidden_size, shared + "up_proj.weight");
+        check_size(need_named(weights, shared + "down_proj.weight"), 0, c.hidden_size, shared + "down_proj.weight");
+        check_size(need_named(weights, shared + "down_proj.weight"), 1, shared_rows, shared + "down_proj.weight");
         layer_weights w{
             .attn_hyper_connection = hyper_connection(p + "attn_hyper_connection."),
             .mlp_hyper_connection = hyper_connection(p + "mlp_hyper_connection."),
@@ -192,6 +218,16 @@ qwen4_exp_model::qwen4_exp_model(
         if (experts < c.num_experts_per_tok || c.num_experts_per_tok < 1) {
             throw std::invalid_argument("qwen4_exp_model: num_experts_per_tok must be between 1 and the experts");
         }
+        check_size(w.moe.experts_gate_up_proj, 2, c.hidden_size, m + "experts.gate_up_proj");
+        check_size(w.moe.experts_down_proj, 1, c.hidden_size, m + "experts.down_proj");
+        check_size(w.moe.experts_down_proj, 0, w.moe.experts_gate_up_proj.size(0), m + "experts.down_proj");
+        check_size(w.moe.experts_down_proj, 2, w.moe.experts_gate_up_proj.size(1) / 2, m + "experts.down_proj");
+        check_size(w.moe.experts_gate_up_proj, 1, 2 * w.moe.experts_down_proj.size(2), m + "experts.gate_up_proj");
+        if (!layers.empty()) {
+            const moe_weights& first = layers.front().moe;
+            check_size(w.moe.experts_gate_up_proj, 0, first.experts_gate_up_proj.size(0), m + "experts.gate_up_proj");
+            check_size(w.moe.experts_down_proj, 2, first.experts_down_proj.size(2), m + "experts.down_proj");
+        }
         const std::int64_t held_experts = w.moe.experts_gate_up_proj.size(0);
         if (held_experts == experts) {
             w.moe.first_expert = 0;
@@ -204,6 +240,26 @@ qwen4_exp_model::qwen4_exp_model(
         }
         kv_layer_of.push_back(kv_specs.size());
         if (indexed_attention(layer)) {
+            const std::string a = p + "self_attn.";
+            const std::string index_qk = a + "indexer.index_qk_proj.weight";
+            const std::int64_t index_rows = (c.indexer_n_heads + 1) * c.indexer_head_dim;
+            check_size(
+                need_named(weights, a + "q_proj.weight"),
+                0,
+                heads.n_heads * 2 * c.head_dim,
+                a + "q_proj.weight"
+            );
+            check_size(need_named(weights, a + "q_proj.weight"), 1, c.hidden_size, a + "q_proj.weight");
+            check_size(need_named(weights, a + "k_proj.weight"), 0, heads.n_kv_heads * c.head_dim, a + "k_proj.weight");
+            check_size(need_named(weights, a + "k_proj.weight"), 1, c.hidden_size, a + "k_proj.weight");
+            check_size(need_named(weights, a + "v_proj.weight"), 0, heads.n_kv_heads * c.head_dim, a + "v_proj.weight");
+            check_size(need_named(weights, a + "v_proj.weight"), 1, c.hidden_size, a + "v_proj.weight");
+            check_size(need_named(weights, index_qk), 0, index_rows, index_qk);
+            check_size(need_named(weights, index_qk), 1, c.hidden_size, index_qk);
+            check_size(need_named(weights, a + "o_proj.weight"), 0, c.hidden_size, a + "o_proj.weight");
+            check_size(need_named(weights, a + "o_proj.weight"), 1, heads.n_heads * c.head_dim, a + "o_proj.weight");
+            check_size(need_named(weights, a + "q_norm.weight"), 0, c.head_dim, a + "q_norm.weight");
+            check_size(need_named(weights, a + "k_norm.weight"), 0, c.head_dim, a + "k_norm.weight");
             w.attention = attention_weights{
                 .projections = at::cat(
                     {permute_queries(need_named(weights, p + "self_attn.q_proj.weight"), heads.n_heads, permutation),
@@ -239,6 +295,24 @@ qwen4_exp_model::qwen4_exp_model(
                 }
             }
         } else {
+            const std::string l = p + "linear_attn.";
+            const std::int64_t value_heads = heads.linear_n_value_heads;
+            const std::int64_t channels = 2 * key_channels + value_channels;
+            check_size(need_named(weights, l + "in_proj_qkv.weight"), 0, channels, l + "in_proj_qkv.weight");
+            check_size(need_named(weights, l + "in_proj_qkv.weight"), 1, c.hidden_size, l + "in_proj_qkv.weight");
+            check_size(need_named(weights, l + "in_proj_a.weight"), 0, value_heads, l + "in_proj_a.weight");
+            check_size(need_named(weights, l + "in_proj_a.weight"), 1, c.hidden_size, l + "in_proj_a.weight");
+            check_size(need_named(weights, l + "in_proj_b.weight"), 0, value_heads, l + "in_proj_b.weight");
+            check_size(need_named(weights, l + "in_proj_b.weight"), 1, c.hidden_size, l + "in_proj_b.weight");
+            check_size(need_named(weights, l + "in_proj_z.weight"), 0, value_channels, l + "in_proj_z.weight");
+            check_size(need_named(weights, l + "in_proj_z.weight"), 1, c.hidden_size, l + "in_proj_z.weight");
+            check_size(need_named(weights, l + "conv1d.weight"), 0, channels, l + "conv1d.weight");
+            check_size(need_named(weights, l + "conv1d.weight"), 2, c.linear_conv_kernel, l + "conv1d.weight");
+            check_size(need_named(weights, l + "dt_bias"), 0, value_heads, l + "dt_bias");
+            check_size(need_named(weights, l + "A_log"), 0, value_heads, l + "A_log");
+            check_size(need_named(weights, l + "norm.weight"), 0, c.linear_value_head_dim, l + "norm.weight");
+            check_size(need_named(weights, l + "out_proj.weight"), 0, c.hidden_size, l + "out_proj.weight");
+            check_size(need_named(weights, l + "out_proj.weight"), 1, value_channels, l + "out_proj.weight");
             w.deltanet = deltanet_weights{
                 .in_proj = at::cat(
                     {need_named(weights, p + "linear_attn.in_proj_qkv.weight"),
@@ -592,7 +666,16 @@ at::Tensor qwen4_exp_model::deltanet(
     at::Tensor z = projected.narrow(1, channels + 2 * value_heads, value_heads * c.linear_value_head_dim);
     at::Tensor gated;
     if (kind == group_kind::verify) {
-        const std::int64_t per_sequence = ntok / window_rows.lines.size(0);
+        const std::int64_t sequences = window_rows.lines.size(0);
+        TORCH_CHECK(
+            sequences > 0 && ntok > 0 && ntok % sequences == 0,
+            "qwen4_exp_model: a verify group of ",
+            ntok,
+            " tokens does not hold the same count for each of its ",
+            sequences,
+            " sequences"
+        );
+        const std::int64_t per_sequence = ntok / sequences;
         at::Tensor convolved = causal_conv_verify_cuda(qkv, w.conv, lines[conv_layer].k, window_rows, per_sequence, 1);
         gated = gated_delta_rule_verify_cuda(
             convolved,
@@ -763,8 +846,17 @@ at::Tensor qwen4_exp_model::ple(
     at::Tensor gated = (at::sigmoid(gate) * at::linear(embeddings, w.value_proj).unsqueeze(1)).flatten(1);
     at::Tensor normed = stream_norm(gated, w.norm_conv);
     const state_rows rows = window_layer_rows(g, conv_layer);
+    const std::int64_t sequences = rows.lines.size(0);
+    TORCH_CHECK(
+        kind != group_kind::verify || (sequences > 0 && ntok > 0 && ntok % sequences == 0),
+        "qwen4_exp_model: a verify group of ",
+        ntok,
+        " tokens does not hold the same count for each of its ",
+        sequences,
+        " sequences"
+    );
     at::Tensor convolved = kind == group_kind::verify
-        ? causal_conv_verify_cuda(normed, w.conv, lines[conv_layer].k, rows, ntok / rows.lines.size(0), c.ngram_size)
+        ? causal_conv_verify_cuda(normed, w.conv, lines[conv_layer].k, rows, ntok / sequences, c.ngram_size)
         : causal_conv_cuda(normed, w.conv, lines[conv_layer].k, rows, cu_seqlens_q, c.ngram_size);
     return gated + convolved;
 }

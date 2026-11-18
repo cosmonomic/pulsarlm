@@ -2,6 +2,7 @@
 
 #include "pulsarlm/kernels/dependent_launch.cuh"
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
 
 #include <cuda_runtime.h>
 
@@ -122,6 +123,7 @@ void launch_combine(scalar_type* y, const float* y_partial, int m, int n, int sp
     const int64_t blocks = (total + combine_threads - 1) / combine_threads;
     combine_partials_kernel<scalar_type>
         <<<static_cast<unsigned>(blocks), combine_threads, 0, stream>>>(y, y_partial, total, splits);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 // Past ctas_per_sm CTAs per SM, more K splits only add combine work.

@@ -3,6 +3,7 @@
 
 #include "pulsarlm/kernels/attn_tiles.cuh"
 #include "pulsarlm/kernels/attn_tuning.hpp"
+#include "pulsarlm/kernels/device_check.hpp"
 #include "pulsarlm/kernels/paged_prefill.cuh"
 #include "pulsarlm/kernels/ops.hpp"
 
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 
@@ -518,6 +520,7 @@ __global__ void __launch_bounds__(nwarps * 32, ctas_per_sm) attn_indexed_tc_kern
     }
     for (int w = run_first; w < run_end; ++w) {
         for (uint32_t bits = run_bits(w); bits != 0; bits &= bits - 1) {
+            CUDA_KERNEL_ASSERT(listed_before < max_listed_blocks);
             listed_blocks[listed_before++] = w * 32 + __ffs(bits) - 1;
         }
     }
@@ -768,7 +771,11 @@ __global__ void __launch_bounds__(decode_warps * 32) attn_indexed_decode_kernel(
         const int row = c / row_chunks;
         const int col = (c % row_chunks) * chunk_elems;
         const scalar_t* source = p.q + (static_cast<int64_t>(qtok) * p.n_q_heads + first_head + row) * head_dim + col;
-        attn::cp_async_16(sQ + attn::swizzled_offset<head_dim>(row, col), row < rows ? source : p.q, row < rows ? 16 : 0);
+        attn::cp_async_16(
+            sQ + attn::swizzled_offset<head_dim>(row, col),
+            row < rows ? source : p.q,
+            row < rows ? 16 : 0
+        );
     }
     attn::cp_async_commit();
     if (tid < 16) {
@@ -814,6 +821,7 @@ __global__ void __launch_bounds__(decode_warps * 32) attn_indexed_decode_kernel(
     }
     for (int w = run_first; w < run_end; ++w) {
         for (uint32_t bits = run_bits(w); bits != 0; bits &= bits - 1) {
+            CUDA_KERNEL_ASSERT(listed_before < max_listed_blocks);
             listed_blocks[listed_before++] = w * 32 + __ffs(bits) - 1;
         }
     }
@@ -940,8 +948,8 @@ __global__ void __launch_bounds__(decode_warps * 32) attn_indexed_decode_kernel(
         const float inv_low = 1.0f / Lrow[gid], inv_high = 1.0f / Lrow[gid + 8];
         attn::for_each_pv_register<head_dim, decode_warps>(out_acc, warp, [&](int row, int col, float value) {
             if (row < rows) {
-                p.o[(static_cast<int64_t>(qtok) * p.n_q_heads + first_head + row) * head_dim + col] =
-                    static_cast<scalar_t>(value * (row < 8 ? inv_low : inv_high));
+                p.o[(static_cast<int64_t>(qtok) * p.n_q_heads + first_head + row) * head_dim +
+                    col] = static_cast<scalar_t>(value * (row < 8 ? inv_low : inv_high));
             }
         });
     } else {
@@ -1154,7 +1162,9 @@ void launch_indexed_decode(const attn::paged_attn_batch& b, const block_selectio
         constexpr size_t smem = decode_tile_bytes<scalar_t, hd>();
         const auto kernel = attn_indexed_decode_kernel<scalar_t, bs, hd, bf16>;
         // The kernel's static shared memory counts against the default limit too.
-        C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
+        C10_CUDA_CHECK(
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem))
+        );
         at::Tensor partial;
         if (splits > 1) {
             partial = at::empty({grid * splits, 16, partial_row_floats(hd)}, b.q.options().dtype(at::kFloat));
@@ -1233,6 +1243,12 @@ at::Tensor attn_indexed(
         "attn_indexed: selected must be contiguous int32 [total_q, words] on CUDA, a bit for each block of block_size "
         "keys of the page tables"
     );
+    check_on_current_device("attn_indexed", {selected});
+    TORCH_CHECK(
+        selected.size(1) <= std::numeric_limits<int>::max() &&
+            b.total_q * selected.size(1) / 256 < std::numeric_limits<int>::max(),
+        "attn_indexed: the selection's words must fit a 32-bit index"
+    );
     if (b.total_q == 0 || b.num_seqs == 0) {
         return b.o;
     }
@@ -1254,6 +1270,10 @@ at::Tensor attn_indexed(
         b.n_kv_heads
     );
     TORCH_CHECK(!unsupported, "attn_indexed: ", *unsupported);
+    TORCH_CHECK(
+        reinterpret_cast<std::uintptr_t>(b.q.data_ptr()) % 16 == 0,
+        "attn_indexed: q must start at a multiple of 16 bytes"
+    );
     attn::dispatch_tensor_core_dtype(b.q.scalar_type(), [&](auto type_tag, auto bf16_tag) {
         using scalar_t = typename decltype(type_tag)::type;
         const int64_t sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;

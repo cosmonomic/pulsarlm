@@ -1,4 +1,5 @@
 #include "pulsarlm/kernels/dependent_launch.cuh"
+#include "pulsarlm/kernels/device_check.hpp"
 #include "pulsarlm/kernels/ops.hpp"
 
 #include <ATen/ATen.h>
@@ -25,6 +26,7 @@ fill_awaited_tokens_kernel(int64_t* __restrict__ tokens, int64_t rows, const int
 }  // namespace
 
 void fill_awaited_tokens_cuda(const at::Tensor& tokens, const at::Tensor& samples) {
+    check_on_current_device("fill_awaited_tokens", {tokens, samples});
     TORCH_CHECK(
         tokens.is_cuda() && tokens.scalar_type() == at::kLong && tokens.dim() == 1 && tokens.is_contiguous(),
         "fill_awaited_tokens: tokens must be contiguous int64 CUDA [rows]"

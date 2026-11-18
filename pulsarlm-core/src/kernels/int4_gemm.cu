@@ -1,4 +1,5 @@
 #include "pulsarlm/kernels/dependent_launch.cuh"
+#include "pulsarlm/kernels/device_check.hpp"
 #include "pulsarlm/kernels/dequant_gemm_common.cuh"
 
 #include "pulsarlm/kernels/ops.hpp"
@@ -354,6 +355,7 @@ at::Tensor gemm_int4_run(
         x.is_cuda() && weight_packed.is_cuda() && weight_scale.is_cuda(),
         "gemm_int4: all inputs must be CUDA tensors"
     );
+    check_on_current_device("gemm_int4", {x, weight_packed, weight_scale});
     TORCH_CHECK(x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16, "gemm_int4: x must be fp16 or bf16");
     TORCH_CHECK(weight_packed.scalar_type() == at::kInt, "gemm_int4: weight_packed must be int32");
     TORCH_CHECK(x.dim() == 2, "gemm_int4: x must be 2-D [M, K]");

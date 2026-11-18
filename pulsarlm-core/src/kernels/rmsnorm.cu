@@ -1,4 +1,5 @@
 #include "pulsarlm/kernels/dependent_launch.cuh"
+#include "pulsarlm/kernels/device_check.hpp"
 #include "pulsarlm/kernels/ops.hpp"
 
 #include <ATen/ATen.h>
@@ -57,6 +58,7 @@ __global__ void rmsnorm_kernel(
 
 at::Tensor rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, double eps) {
     TORCH_CHECK(x.is_cuda() && weight.is_cuda(), "rmsnorm: inputs must be CUDA tensors");
+    check_on_current_device("rmsnorm", {x, weight});
     TORCH_CHECK(
         weight.scalar_type() == x.scalar_type() || weight.scalar_type() == at::kFloat,
         "rmsnorm: the weight's dtype must be x's or float32"
@@ -65,6 +67,9 @@ at::Tensor rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, double ep
         weight.dim() == 1 && weight.size(0) == x.size(-1),
         "rmsnorm: weight must be [dim] matching the last axis of x"
     );
+    if (x.numel() == 0) {
+        return at::empty_like(x);
+    }
 
     auto xc = x.contiguous();
     auto wc = weight.contiguous();

@@ -38,6 +38,14 @@ at::Tensor zero_centered(const at::Tensor& weight) {
     return weight.to(at::kFloat) + 1.0;
 }
 
+void check_size(const at::Tensor& tensor, std::int64_t dim, std::int64_t size, const std::string& name) {
+    if (tensor.dim() <= dim || tensor.size(dim) != size) {
+        throw std::invalid_argument(
+            std::format("qwen3_5_moe_model: {:?} must have {} in dim {}", prefix + name, size, dim)
+        );
+    }
+}
+
 }  // namespace
 
 qwen3_5_moe_model::qwen3_5_moe_model(qwen3_5_moe_config config, const c10::Dict<std::string, at::Tensor>& weights)
@@ -46,6 +54,9 @@ qwen3_5_moe_model::qwen3_5_moe_model(qwen3_5_moe_config config, const c10::Dict<
   embed_tokens(need_text(weights, "embed_tokens.weight")),
   norm(zero_centered(need_text(weights, "norm.weight"))) {
     const qwen3_5_moe_config& c = this->config;
+    if (c.layer_types.empty()) {
+        throw std::invalid_argument("qwen3_5_moe_model: layer_types must hold a layer");
+    }
     const auto rotary_dim = static_cast<std::int64_t>(std::llround(c.partial_rotary_factor * c.head_dim));
     if (rotary_dim % 2 != 0 || rotary_dim > c.head_dim || c.head_dim % 2 != 0) {
         throw std::invalid_argument("qwen3_5_moe_model: the rotated dims must be an even part of an even head dim");
@@ -80,8 +91,44 @@ qwen3_5_moe_model::qwen3_5_moe_model(qwen3_5_moe_config config, const c10::Dict<
         if (c.num_experts_per_tok < 1 || w.moe.router.size(0) < c.num_experts_per_tok) {
             throw std::invalid_argument("qwen3_5_moe_model: num_experts_per_tok must be between 1 and the experts");
         }
+        const std::int64_t experts = w.moe.router.size(0);
+        check_size(w.moe.router, 1, c.hidden_size, p + "mlp.gate.weight");
+        check_size(w.moe.experts_gate_up_proj, 0, experts, p + "mlp.experts.gate_up_proj");
+        check_size(w.moe.experts_gate_up_proj, 2, c.hidden_size, p + "mlp.experts.gate_up_proj");
+        check_size(w.moe.experts_down_proj, 0, experts, p + "mlp.experts.down_proj");
+        check_size(w.moe.experts_down_proj, 1, c.hidden_size, p + "mlp.experts.down_proj");
+        check_size(w.moe.experts_down_proj, 2, w.moe.experts_gate_up_proj.size(1) / 2, p + "mlp.experts.down_proj");
+        check_size(w.moe.experts_gate_up_proj, 1, 2 * w.moe.experts_down_proj.size(2), p + "mlp.experts.gate_up_proj");
+        check_size(w.moe.shared_gate_proj, 1, c.hidden_size, p + "mlp.shared_expert.gate_proj.weight");
+        check_size(w.moe.shared_up_proj, 0, w.moe.shared_gate_proj.size(0), p + "mlp.shared_expert.up_proj.weight");
+        check_size(w.moe.shared_up_proj, 1, c.hidden_size, p + "mlp.shared_expert.up_proj.weight");
+        check_size(w.moe.shared_down_proj, 0, c.hidden_size, p + "mlp.shared_expert.down_proj.weight");
+        check_size(w.moe.shared_down_proj, 1, w.moe.shared_gate_proj.size(0), p + "mlp.shared_expert.down_proj.weight");
+        check_size(w.moe.shared_expert_gate, 0, 1, p + "mlp.shared_expert_gate.weight");
+        check_size(w.moe.shared_expert_gate, 1, c.hidden_size, p + "mlp.shared_expert_gate.weight");
+        if (!layers.empty()) {
+            const moe_weights& first = layers.front().moe;
+            check_size(
+                w.moe.experts_gate_up_proj,
+                0,
+                first.experts_gate_up_proj.size(0),
+                p + "mlp.experts.gate_up_proj"
+            );
+            check_size(w.moe.experts_down_proj, 2, first.experts_down_proj.size(2), p + "mlp.experts.down_proj");
+        }
         kv_layer_of.push_back(kv_specs.size());
         if (full_attention(layer)) {
+            const std::string a = p + "self_attn.";
+            check_size(need_text(weights, a + "q_proj.weight"), 0, c.n_heads * 2 * c.head_dim, a + "q_proj.weight");
+            check_size(need_text(weights, a + "q_proj.weight"), 1, c.hidden_size, a + "q_proj.weight");
+            check_size(need_text(weights, a + "k_proj.weight"), 0, c.n_kv_heads * c.head_dim, a + "k_proj.weight");
+            check_size(need_text(weights, a + "k_proj.weight"), 1, c.hidden_size, a + "k_proj.weight");
+            check_size(need_text(weights, a + "v_proj.weight"), 0, c.n_kv_heads * c.head_dim, a + "v_proj.weight");
+            check_size(need_text(weights, a + "v_proj.weight"), 1, c.hidden_size, a + "v_proj.weight");
+            check_size(need_text(weights, a + "o_proj.weight"), 0, c.hidden_size, a + "o_proj.weight");
+            check_size(need_text(weights, a + "o_proj.weight"), 1, c.n_heads * c.head_dim, a + "o_proj.weight");
+            check_size(need_text(weights, a + "q_norm.weight"), 0, c.head_dim, a + "q_norm.weight");
+            check_size(need_text(weights, a + "k_norm.weight"), 0, c.head_dim, a + "k_norm.weight");
             w.attention = attention_weights{
                 .q_proj = permute_queries(need_text(weights, p + "self_attn.q_proj.weight"), c.n_heads, permutation),
                 .k_proj = permute_heads(need_text(weights, p + "self_attn.k_proj.weight"), c.n_kv_heads, permutation),
@@ -98,6 +145,20 @@ qwen3_5_moe_model::qwen3_5_moe_model(qwen3_5_moe_config config, const c10::Dict<
                 }
             );
         } else {
+            const std::string l = p + "linear_attn.";
+            const std::int64_t value_dim = c.linear_n_value_heads * c.linear_value_head_dim;
+            check_size(need_text(weights, l + "in_proj_qkv.weight"), 0, conv_channels, l + "in_proj_qkv.weight");
+            check_size(need_text(weights, l + "in_proj_qkv.weight"), 1, c.hidden_size, l + "in_proj_qkv.weight");
+            check_size(need_text(weights, l + "in_proj_z.weight"), 0, value_dim, l + "in_proj_z.weight");
+            check_size(need_text(weights, l + "in_proj_b.weight"), 0, c.linear_n_value_heads, l + "in_proj_b.weight");
+            check_size(need_text(weights, l + "in_proj_a.weight"), 0, c.linear_n_value_heads, l + "in_proj_a.weight");
+            check_size(need_text(weights, l + "conv1d.weight"), 0, conv_channels, l + "conv1d.weight");
+            check_size(need_text(weights, l + "conv1d.weight"), 2, c.linear_conv_kernel, l + "conv1d.weight");
+            check_size(need_text(weights, l + "dt_bias"), 0, c.linear_n_value_heads, l + "dt_bias");
+            check_size(need_text(weights, l + "A_log"), 0, c.linear_n_value_heads, l + "A_log");
+            check_size(need_text(weights, l + "norm.weight"), 0, c.linear_value_head_dim, l + "norm.weight");
+            check_size(need_text(weights, l + "out_proj.weight"), 0, c.hidden_size, l + "out_proj.weight");
+            check_size(need_text(weights, l + "out_proj.weight"), 1, value_dim, l + "out_proj.weight");
             w.deltanet = deltanet_weights{
                 .in_proj_qkv = need_text(weights, p + "linear_attn.in_proj_qkv.weight"),
                 .in_proj_z = need_text(weights, p + "linear_attn.in_proj_z.weight"),
