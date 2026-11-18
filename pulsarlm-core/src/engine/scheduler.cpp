@@ -52,29 +52,34 @@ task<void> scheduler::submit(request r, result_writer writer) {
 }
 
 task<void> scheduler::run() {
-    std::optional<executor::launched_step> in_flight;
     for (;;) {
         std::vector<batch_entry> entries = next_entries();
-        if (in_flight && (entries.empty() || !in_flight->quiet() || !exec.quiet(entries))) {
-            co_await retire(*in_flight);
-            in_flight.reset();
+        if (!in_flight.empty() && (entries.empty() || !in_flight_quiet || !exec.quiet(entries))) {
+            co_await retire();
             continue;
         }
         if (entries.empty()) {
             co_await emplace_event(join_event);
             continue;
         }
-        executor::launched_step launched = co_await exec.launch(std::move(entries));
-        if (in_flight) {
-            co_await retire(*in_flight);
+        std::vector<sequence*> stepped;
+        for (const batch_entry& e : entries) {
+            stepped.push_back(e.seq);
         }
-        in_flight = std::move(launched);
+        const bool quiet = exec.quiet(entries);
+        co_await exec.launch(std::move(entries));
+        if (!in_flight.empty()) {
+            co_await retire();
+        }
+        in_flight = std::move(stepped);
+        in_flight_quiet = quiet;
     }
 }
 
-task<void> scheduler::retire(executor::launched_step& step) {
-    std::vector<sequence*> stepped = step.sequences();
-    co_await exec.write_back(step);
+task<void> scheduler::retire() {
+    std::vector<sequence*> stepped = std::move(in_flight);
+    in_flight.clear();
+    co_await exec.write_back();
     for (sequence* seq : stepped) {
         if (!seq->end_reason && seq->writer.cancelled()) {
             seq->end_reason = sequence::exit_reason::cancelled;

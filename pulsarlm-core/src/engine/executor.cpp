@@ -840,24 +840,7 @@ bool executor::release_passed_pages(sequence& seq) {
     return changed;
 }
 
-executor::launched_step::launched_step(std::unique_ptr<batch> queued) noexcept
-: queued(std::move(queued)) {}
-
-executor::launched_step::launched_step(launched_step&&) noexcept = default;
-executor::launched_step& executor::launched_step::operator=(launched_step&&) noexcept = default;
-executor::launched_step::~launched_step() = default;
-
-bool executor::launched_step::quiet() const noexcept {
-    return queued->quiet;
-}
-
-std::vector<sequence*> executor::launched_step::sequences() const {
-    std::vector<sequence*> stepped;
-    for (const batch_entry& e : queued->entries) {
-        stepped.push_back(e.seq);
-    }
-    return stepped;
-}
+executor::~executor() = default;
 
 void executor::update_views(sequence& seq) {
     seq.update_held();
@@ -915,7 +898,7 @@ void executor::advance(batch& b) {
 
 // Shard 0 queues on the executor's thread while the others queue on their own, so every shard's kernels launch at
 // once. Each shard's completion is taken once every shard has queued, before any later step queues.
-task<executor::launched_step> executor::launch(std::vector<batch_entry> entries) {
+task<void> executor::launch(std::vector<batch_entry> entries) {
     std::unique_ptr<batch> b(new batch(entries, page_size, graph_pages));
     b->quiet = quiet(b->entries);
     advance(*b);
@@ -947,7 +930,7 @@ task<executor::launched_step> executor::launch(std::vector<batch_entry> entries)
             b->fills_page[i] ? b->entries[i].seq->switch_boundary_lines(streams) : std::vector<std::uint32_t>()
         );
     }
-    co_return launched_step(std::move(b));
+    launched.push_back(std::move(b));
 }
 
 task<void> executor::enqueue_on_shard(batch& b, std::size_t shard) {
@@ -1003,8 +986,10 @@ task<void> executor::synchronize_shards() {
 // A sequence ends with oom when the sync of its new pages fails, as a state names only pages the store has. The step
 // that last read the lines of pages that left a view has completed, so they are released right after the sync. A
 // recurrent layer's state at head reaches the store at the resume points, cycle ends and the end, that find it pending.
-task<void> executor::write_back(launched_step& step) {
-    batch& b = *step.queued;
+task<void> executor::write_back() {
+    std::unique_ptr<batch> written = std::move(launched.front());
+    launched.pop_front();
+    batch& b = *written;
     for (external_task<cudaError_t>& completion : b.completions) {
         cudaError_t status = co_await std::move(completion);
         if (status != cudaSuccess) {

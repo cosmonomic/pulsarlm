@@ -22,15 +22,19 @@ class scheduler {
     std::vector<sequence*> running_sequences;
     // Set when a sequence joins the running set.
     std::optional<event> join_event;
+    // The sequences of the launched step not written back yet, none when no step is, and whether that step is quiet
+    // (executor::quiet).
+    std::vector<sequence*> in_flight;
+    bool in_flight_quiet = false;
 
     static event& emplace_event(std::optional<event>& waited);
     static void wake(std::optional<event>& waited) noexcept;
     // The next step's entries: every decoding sequence, then the others' tokens up to prefill_tokens_per_step, never
     // past the end of a sequence's cycle. Leaves out the sequences whose last step is launched.
     std::vector<batch_entry> next_entries() const;
-    // Writes step back, ends the sequences in it whose callbacks are cancelled, and lets each sequence that exited
-    // leave once no launched step holds it.
-    task<void> retire(executor::launched_step& step);
+    // Writes the step in flight back, ends the sequences in it whose callbacks are cancelled, and lets each sequence
+    // that exited leave once no launched step holds it.
+    task<void> retire();
 
   public:
     scheduler(executor& exec, std::size_t prefill_tokens_per_step);

@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <expected>
 #include <memory>
 #include <optional>
@@ -59,6 +60,8 @@ class executor {
     std::size_t page_size;
     digest root;
     std::vector<std::int64_t> stop_ids;
+    // The steps queued on the GPUs and not written back yet, in launch order.
+    std::deque<std::unique_ptr<batch>> launched;
     // The page writes write-backs spawned, at most max_store_writes at once.
     pending_writes store_writes;
     static constexpr std::size_t max_store_writes = 8;
@@ -120,25 +123,6 @@ class executor {
     friend class sequence;
 
   public:
-    // A step queued on every shard and not written back yet.
-    class launched_step {
-        std::unique_ptr<batch> queued;
-
-        explicit launched_step(std::unique_ptr<batch> queued) noexcept;
-
-        friend class executor;
-
-      public:
-        launched_step(launched_step&&) noexcept;
-        launched_step& operator=(launched_step&&) noexcept;
-        ~launched_step();
-
-        // Whether the step lets the next one launch before its write-back (executor::quiet).
-        bool quiet() const noexcept;
-        // The sequences of the step's entries, in entry order.
-        std::vector<sequence*> sequences() const;
-    };
-
     // shards[s] runs on cache shard s with streams[s], shards 1 on on worker_loops[s - 1], and its write-backs' copies
     // to the store on copy_streams[s], which the caller synchronizes before freeing what the copies read; the cache holds one layer
     // per entry of each model's kv_layers(), and the shards agree on which layers are recurrent or sliding. store is the
@@ -155,6 +139,7 @@ class executor {
         std::vector<std::int64_t>&& stop_ids,
         std::optional<std::size_t> graph_pages
     );
+    ~executor();
 
     // The sequence of r, resuming the newest state the store holds for a prefix of its tokens, with lines for its
     // first cycle. Fails with miss when the lookup or a page read fails, and with oom when the free lines do not cover
@@ -164,19 +149,19 @@ class executor {
     // then changes no view or table that the next step reads, and copies to the store only lines the next step does not
     // write, so the next step can be launched before it.
     bool quiet(std::span<const batch_entry> entries) const noexcept;
-    // Launches one step of entries, decoding entries first: advances each sequence by its tokens, then queues the
-    // forward and the sampling on every shard without waiting for them. A decoding entry whose token is awaited reads
+    // Launches one step of entries, decoding entries first, after the launched steps: advances each sequence by its
+    // tokens, then queues the forward and the sampling on every shard without waiting for them. A decoding entry whose token is awaited reads
     // it from the previous launched step's samples on the GPUs, which needs that step to be quiet and this one too.
     // A step samples at most max_sampled_rows tokens.
-    task<launched_step> launch(std::vector<batch_entry> entries);
-    // Waits for step, then completes the pages its tokens filled, sets each awaited token it sampled, writes the
+    task<void> launch(std::vector<batch_entry> entries);
+    // Writes back the oldest launched step: waits for it, then completes the pages its tokens filled, sets each awaited token it sampled, writes the
     // completed pages, evicts and writes the state at a cycle end, and takes lines for the next tokens. The pages of a
     // sequence writing no state are written by a spawned task; a sequence writing its state waits for its pages' writes
     // first, and a failed write ends its sequence with oom at a later write-back. Sets the exit reason of each sequence that finished,
     // by a stop token or max_tokens, or ran out of lines. A sequence stopped by a token while in a later launched step
     // withdraws that step's token (sequence::withdraw_latest_step); entries of sequences that exited before are
-    // skipped. Steps are written back in launch order.
-    task<void> write_back(launched_step& step);
+    // skipped.
+    task<void> write_back();
     // Releases seq's lines, writes its end state when it finished, and releases its lease; seq exited.
     task<std::expected<request_result, request_error>> finish(sequence& seq);
     // kv_cache::used_bytes of the executor's cache. Safe to call from any thread.
