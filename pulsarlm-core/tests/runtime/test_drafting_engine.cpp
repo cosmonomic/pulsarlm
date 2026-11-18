@@ -438,8 +438,14 @@ served serve(pulsarlm::engine& e, pulsarlm::request&& r) {
     REQUIRE(recorded_results->end_condition.wait_for(lock, end_timeout, [&] {
         return recorded_results->end.has_value();
     }));
+    if (e.exception()) {
+        try {
+            std::rethrow_exception(e.exception());
+        } catch (const std::exception& error) {
+            FAIL("the engine's loop exited: " << error.what());
+        }
+    }
     REQUIRE(recorded_results->end->has_value());
-    REQUIRE(e.exception() == nullptr);
     return served{.tokens = recorded_results->tokens, .end_state = std::move(**recorded_results->end)};
 }
 

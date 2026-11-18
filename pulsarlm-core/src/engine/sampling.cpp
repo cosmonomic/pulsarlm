@@ -37,8 +37,12 @@ std::uint64_t sampling_seed(std::optional<std::uint64_t> seed) {
 
 // A row keeping every token gets top_k vocab and top_p 2. With top_k or top_p the race runs over the log of the kept
 // probabilities in rank order, at temperature 1 for a drawing row and 0 for an argmax row.
-at::Tensor
-sample(const at::Tensor& logits, std::span<const sampling_params> params, std::span<const sampling_draw> draws) {
+at::Tensor sample(
+    const at::Tensor& logits,
+    std::span<const sampling_params> params,
+    std::span<const sampling_draw> draws,
+    const at::Tensor& draw_shifts
+) {
     assert(params.size() == static_cast<std::size_t>(logits.size(0)) && draws.size() == params.size());
     const std::int64_t vocab = logits.size(1);
     const auto rows = static_cast<std::int64_t>(params.size());
@@ -61,6 +65,9 @@ sample(const at::Tensor& logits, std::span<const sampling_params> params, std::s
     }
     const at::Device device = logits.device();
     at::Tensor draw_rows = rows_on_device(seeds_then_counts, at::kLong, device).view({2, rows});
+    if (draw_shifts.defined()) {
+        draw_rows.select(0, 1).add_(draw_shifts);
+    }
     at::Tensor temperatures = rows_on_device(temperature, at::kFloat, device);
     if (!any_filter) {
         return gumbel_race_cuda(logits.contiguous(), temperatures, draw_rows);
@@ -73,6 +80,11 @@ sample(const at::Tensor& logits, std::span<const sampling_params> params, std::s
     kept &= at::cumsum(sorted, -1) - sorted <= rows_on_device(top_p, at::kFloat, device).unsqueeze(1);
     at::Tensor rank = gumbel_race_cuda(at::log(sorted * kept).contiguous(), drawing.to(at::kFloat), draw_rows);
     return order.gather(1, rank.unsqueeze(1)).squeeze(1);
+}
+
+at::Tensor
+sample(const at::Tensor& logits, std::span<const sampling_params> params, std::span<const sampling_draw> draws) {
+    return sample(logits, params, draws, at::Tensor());
 }
 
 }  // namespace pulsarlm

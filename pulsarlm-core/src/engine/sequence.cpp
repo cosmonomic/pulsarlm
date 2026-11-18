@@ -247,12 +247,20 @@ std::uint32_t& sequence::head_state_line(std::size_t layer) {
     return layers[layer].lines[state_slots[layer] + (history_pages - 1) % 2];
 }
 
-void sequence::keep_drafts(std::size_t kept, std::int64_t next) {
-    assert(kept <= drafts.size() && pending_tokens.empty());
-    tail.insert(tail.end(), drafts.begin(), drafts.begin() + static_cast<std::ptrdiff_t>(kept));
-    rejected_tokens = drafts.size() - kept;
+void sequence::keep_verified(std::size_t start, std::span<const std::int64_t> kept) {
+    assert(!kept.empty() && start >= history_pages * page_size);
+    auto after = tail.begin() + static_cast<std::ptrdiff_t>(start - history_pages * page_size) + 1;
+    tail.insert(after, kept.begin(), kept.end() - 1);
+    resolve_token(start + kept.size(), kept.back());
+}
+
+void sequence::withdraw_latest_verify_step() {
+    assert(!tail.empty());
+    pending_tokens.assign(1, tail.back());
+    tail.pop_back();
     drafts.clear();
-    pending_tokens.push_back(next);
+    unapplied_shift = 0;
+    last_step_launched = false;
 }
 
 void sequence::resolve_token(std::size_t index, std::int64_t token) {

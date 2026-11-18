@@ -48,6 +48,8 @@ class executor {
     std::size_t draft_state_slots;
     // When steps draft, the draft head's KV layer (kv_layer::last_hidden_dim above 0).
     std::optional<std::size_t> draft_layer;
+    // Per shard, stop_ids on its device, int64.
+    std::vector<at::Tensor> stop_tokens;
     // Per recurrent KV layer, its slots: draft_state_slots for a state, 1 for a window; 0 for a layer with pages.
     std::vector<std::size_t> state_slots;
     std::size_t slots_of(const kv_layer& layer) const noexcept;
@@ -110,15 +112,11 @@ class executor {
     // sequences whose pages it fills, and appends each token the step samples to pending as awaited_token.
     void advance(batch& b);
     task<void> enqueue_on_shard(batch& b, std::size_t shard);
-    // The samples a verify step of seq emits: while sample t equals draft t + 1, then the sample after, cut after a
-    // stop token or at max_tokens.
-    std::size_t accepted_count(const sequence& seq, std::span<const std::int64_t> samples) const;
+    // Points b's verify entries whose sequences' previous step is launched to that step.
+    void link_previous(batch& b) const;
     // Adds the page mass of entry index of b's step, whose sequence kept kept tokens, to its sequence's layers.
     void add_measured_mass(const batch& b, std::size_t index, std::size_t kept);
-    // Queues b's draft head's pass on every shard, as launch queues a step, waits for it, and gives each drafting
-    // sequence its drafts; b's events then mark the pass's end.
-    task<void> run_draft_pass(batch& b);
-    task<void> enqueue_drafts_on_shard(batch& b, std::size_t shard);
+
     // Syncs the pages of hashes, owners and line_ids (kv_cache::sync) on the copy streams, then ends the write in
     // store_writes and in each of writers.
     task<void> async_write_back(
@@ -164,8 +162,8 @@ class executor {
     // first cycle. Fails with miss when the lookup or a page read fails, and with oom when the free lines do not cover
     // the state's pages and one cycle's tokens; its lease is then released.
     task<std::expected<std::unique_ptr<sequence>, request_error>> start(request&& r, result_writer& writer);
-    // Whether a step of entries ends no cycle and, in a model with sliding layers, completes no page, in an executor
-    // whose steps do not draft: its write-back
+    // Whether a step of entries ends no cycle and, in a model with sliding layers, completes no page, or in an executor
+    // whose steps draft, whether every entry verifies drafts: its write-back
     // then changes no view or table that the next step reads, and copies to the store only lines the next step does not
     // write, so the next step can be launched before it.
     bool quiet(std::span<const batch_entry> entries) const noexcept;

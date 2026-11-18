@@ -25,5 +25,12 @@ std::uint64_t sampling_seed(std::optional<std::uint64_t> seed);
 // device. Queues its work on the current stream and does not wait for it.
 at::Tensor
 sample(const at::Tensor& logits, std::span<const sampling_params> params, std::span<const sampling_draw> draws);
+// sample, each row's draw count moved by draw_shifts[row], int64 [rows] on the logits' device.
+at::Tensor sample(
+    const at::Tensor& logits,
+    std::span<const sampling_params> params,
+    std::span<const sampling_draw> draws,
+    const at::Tensor& draw_shifts
+);
 
 }  // namespace pulsarlm
