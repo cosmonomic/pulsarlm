@@ -1793,6 +1793,8 @@ task<void> executor::write_back() {
             emitted = samples.first(kept);
             const std::size_t start = b.step_starts[i] + seq.unapplied_shift;
             seq.keep_verified(start, emitted);
+            drafted_count.fetch_add(b.verify_rows - 1, std::memory_order_relaxed);
+            accepted_count.fetch_add(kept - 1, std::memory_order_relaxed);
             seq.draw_count += kept;
             seq.generated_count += kept;
             b.step_starts[i] = start;
@@ -2074,6 +2076,14 @@ task<void> executor::write_cycle_end(sequence& seq) {
 
 std::size_t executor::kv_cache_bytes() const noexcept {
     return cache.used_bytes();
+}
+
+std::uint64_t executor::drafted_tokens() const noexcept {
+    return drafted_count.load(std::memory_order_relaxed);
+}
+
+std::uint64_t executor::accepted_tokens() const noexcept {
+    return accepted_count.load(std::memory_order_relaxed);
 }
 
 }  // namespace pulsarlm

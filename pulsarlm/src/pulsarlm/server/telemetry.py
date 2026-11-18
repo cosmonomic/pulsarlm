@@ -165,6 +165,27 @@ def start_telemetry(
         description="Bytes of the KV cache that running requests use.",
     )
 
+    def draft_observation(
+        value: Callable[[EngineStat], int],
+    ) -> Callable[[CallbackOptions], Iterable[Observation]]:
+        def observe(_: CallbackOptions) -> Iterable[Observation]:
+            yield Observation(value(stat()), attributes)
+
+        return observe
+
+    meter.create_observable_counter(
+        "pulsarlm.engine.draft.drafted_tokens",
+        callbacks=[draft_observation(lambda s: s.drafted_tokens)],
+        unit="{token}",
+        description="Drafts the verify steps forwarded.",
+    )
+    meter.create_observable_counter(
+        "pulsarlm.engine.draft.accepted_tokens",
+        callbacks=[draft_observation(lambda s: s.accepted_tokens)],
+        unit="{token}",
+        description="Drafts the verify steps kept.",
+    )
+
     def store_observation(
         value: Callable[[StoreStat], float],
     ) -> Callable[[CallbackOptions], Iterable[Observation]]:

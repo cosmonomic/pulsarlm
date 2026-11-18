@@ -236,7 +236,10 @@ PYBIND11_MODULE(pulsarlm_core, m) {
         .def_readonly("device_cached_tokens", &request_result::device_cached_tokens)
         .def_readonly("peak_device_memory", &request_result::peak_device_memory);
 
-    py::class_<engine_stat>(m, "EngineStat").def_readonly("kv_cache_bytes", &engine_stat::kv_cache_bytes);
+    py::class_<engine_stat>(m, "EngineStat")
+        .def_readonly("kv_cache_bytes", &engine_stat::kv_cache_bytes)
+        .def_readonly("drafted_tokens", &engine_stat::drafted_tokens)
+        .def_readonly("accepted_tokens", &engine_stat::accepted_tokens);
 
     py::native_enum<request_error>(m, "RequestError", "enum.Enum")
         .value("MISS", request_error::miss)

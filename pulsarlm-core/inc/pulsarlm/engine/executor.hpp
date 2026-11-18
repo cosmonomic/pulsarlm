@@ -2,6 +2,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -50,6 +51,8 @@ class executor {
     std::optional<std::size_t> draft_layer;
     // Per shard, stop_ids on its device, int64.
     std::vector<at::Tensor> stop_tokens;
+    std::atomic<std::uint64_t> drafted_count{0};
+    std::atomic<std::uint64_t> accepted_count{0};
     // Per recurrent KV layer, its slots: draft_state_slots for a state, 1 for a window; 0 for a layer with pages.
     std::vector<std::size_t> state_slots;
     std::size_t slots_of(const kv_layer& layer) const noexcept;
@@ -184,6 +187,9 @@ class executor {
     task<std::expected<request_result, request_error>> finish(sequence& seq);
     // kv_cache::used_bytes of the executor's cache. Safe to call from any thread.
     std::size_t kv_cache_bytes() const noexcept;
+    // The drafts the verify steps written back forwarded, and those of them they kept. Safe to call from any thread.
+    std::uint64_t drafted_tokens() const noexcept;
+    std::uint64_t accepted_tokens() const noexcept;
 };
 
 }  // namespace pulsarlm

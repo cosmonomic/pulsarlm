@@ -403,7 +403,11 @@ std::size_t engine::largest_page_bytes() const noexcept {
 }
 
 engine_stat engine::stat() const {
-    return engine_stat{.kv_cache_bytes = exec.kv_cache_bytes()};
+    return engine_stat{
+        .kv_cache_bytes = exec.kv_cache_bytes(),
+        .drafted_tokens = exec.drafted_tokens(),
+        .accepted_tokens = exec.accepted_tokens(),
+    };
 }
 
 eviction_report engine::eviction_report_of(const state& s, const eviction_policy& policy) const {
