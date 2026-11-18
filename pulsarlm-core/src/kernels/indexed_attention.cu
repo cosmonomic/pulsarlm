@@ -683,7 +683,289 @@ __global__ void __launch_bounds__(nwarps * 32, ctas_per_sm) attn_indexed_tc_kern
     }
 }
 
-// Joins each query head's splits into o, one CTA per (query token, query head).
+constexpr int decode_warps = 4;
+constexpr int decode_key_tile = 32;
+
+// The dynamic shared memory of attn_indexed_decode_kernel: Q, K and V tiles, P, the scores and the listed blocks.
+template <typename scalar_t, int head_dim> constexpr size_t decode_tile_bytes() {
+    return (16 * head_dim + 2 * decode_key_tile * head_dim + 16 * decode_key_tile) * sizeof(scalar_t) +
+        16 * (decode_key_tile + 1) * sizeof(float) + max_listed_blocks * sizeof(int32_t);
+}
+
+// Runs one CTA per (query token, KV group, split) for batches of few query tokens. Every CTA lists its token's selected
+// blocks at or before the query in shared memory and takes an equal share of them, its bounds moved forward to the
+// first block of a page so that a page's keys stay in one CTA. It gathers each tile's keys and values straight from
+// the pool and rotates the keys in shared memory, as rotate_indexed_keys_kernel does. Splits write partial rows as
+// attn_indexed_tc_kernel's.
+template <typename scalar_t, int page_size, int head_dim, bool bf16>
+__global__ void __launch_bounds__(decode_warps * 32) attn_indexed_decode_kernel(
+    const attn::paged_attn_params<scalar_t> p,
+    const block_selection selection,
+    int splits,
+    float* __restrict__ partial  // [query tokens * KV groups * splits, 16, partial_row_floats], with splits above 1
+) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
+    constexpr int key_tile = decode_key_tile;
+    constexpr int score_stride = key_tile + 1;
+    constexpr int cta_threads = decode_warps * 32;
+    constexpr int chunk_elems = 16 / sizeof(scalar_t);
+    constexpr int row_chunks = head_dim / chunk_elems;
+    constexpr int half = head_dim / 2;
+    static_assert(sizeof(scalar_t) == 2, "the tile staging copies 8 elements at a time");
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int split = blockIdx.x % splits;
+    const int group_cta = blockIdx.x / splits;
+    const int qtok = group_cta / p.n_kv_heads;
+    const int g = group_cta % p.n_kv_heads;
+    const int rows = p.group;
+    const int first_head = g * p.group;
+    const int s = sequence_of(p, qtok);
+    const int q0 = p.cu_seqlens_q ? p.cu_seqlens_q[s] : s;
+    const int seq_q = p.cu_seqlens_q ? p.cu_seqlens_q[s + 1] - q0 : 1;
+    const int query_pos = p.seqlens_k[s] - seq_q + (qtok - q0);
+    const int block_size = selection.block_size;
+    const int tile_blocks = key_tile / block_size;
+    const int32_t* seq_table = p.page_tables + static_cast<int64_t>(s) * p.max_pages;
+    const attn::key_positions layout = attn::sequence_key_positions(p, s, page_size);
+
+    extern __shared__ __align__(16) unsigned char shared_memory[];
+    scalar_t* sQ = reinterpret_cast<scalar_t*>(shared_memory);
+    scalar_t* sK = sQ + 16 * head_dim;
+    scalar_t* sV = sK + key_tile * head_dim;
+    scalar_t* sP = sV + key_tile * head_dim;
+    float* sS = reinterpret_cast<float*>(sP + 16 * key_tile);
+    int32_t* listed_blocks = reinterpret_cast<int32_t*>(sS + 16 * score_stride);
+    __shared__ float Mrow[16], Lrow[16], row_rescale[16];
+    __shared__ int key_index[key_tile];
+    __shared__ int key_position[key_tile];
+    // Each key's elements from the start of the pool, K and V alike.
+    __shared__ int64_t key_offset[key_tile];
+    __shared__ int listed_counts[decode_warps];
+    __shared__ int run_page[16];
+    __shared__ float run_max[16];
+    // The frequency pairs whose rotation is not the identity.
+    __shared__ int rotating_pairs[half];
+    __shared__ int rotating;
+    static_assert(key_tile == 32, "a lane per key of a tile");
+
+    if (tid == 0) {
+        rotating = 0;
+    }
+    for (int i = tid; i < 16 * key_tile; i += cta_threads) {
+        sP[i] = static_cast<scalar_t>(0);
+    }
+    __syncthreads();
+    for (int pair = tid; pair < half; pair += cta_threads) {
+        if (p.rope_turns[pair] != 0) {
+            rotating_pairs[atomicAdd(&rotating, 1)] = pair;
+        }
+    }
+
+    for (int c = tid; c < 16 * row_chunks; c += cta_threads) {
+        const int row = c / row_chunks;
+        const int col = (c % row_chunks) * chunk_elems;
+        const scalar_t* source = p.q + (static_cast<int64_t>(qtok) * p.n_q_heads + first_head + row) * head_dim + col;
+        attn::cp_async_16(sQ + attn::swizzled_offset<head_dim>(row, col), row < rows ? source : p.q, row < rows ? 16 : 0);
+    }
+    attn::cp_async_commit();
+    if (tid < 16) {
+        Mrow[tid] = -CUDART_INF_F;
+        Lrow[tid] = 0.0f;
+        row_rescale[tid] = 1.0f;
+        run_page[tid] = -1;
+    }
+
+    // Each thread lists the blocks of a run of consecutive words, after the runs of the threads before it.
+    const int last_block = query_pos / block_size;
+    const int end_word = min(selection.words, last_block / 32 + 1);
+    const int run_words = (end_word + cta_threads - 1) / cta_threads;
+    auto run_bits = [&](int w) {
+        uint32_t bits = selection.word(qtok, w);
+        if (w == last_block / 32 && last_block % 32 != 31) {
+            bits &= (2u << (last_block % 32)) - 1u;
+        }
+        return bits;
+    };
+    const int run_first = min(tid * run_words, end_word);
+    const int run_end = min(run_first + run_words, end_word);
+    int run_count = 0;
+    for (int w = run_first; w < run_end; ++w) {
+        run_count += __popc(run_bits(w));
+    }
+    int listed_before = run_count;
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        const int other = __shfl_up_sync(0xffffffffu, listed_before, offset);
+        if (lane >= offset) {
+            listed_before += other;
+        }
+    }
+    if (lane == 31) {
+        listed_counts[warp] = listed_before;
+    }
+    listed_before -= run_count;
+    __syncthreads();
+    int listed = 0;
+    for (int w = 0; w < decode_warps; ++w) {
+        listed_before += w < warp ? listed_counts[w] : 0;
+        listed += listed_counts[w];
+    }
+    for (int w = run_first; w < run_end; ++w) {
+        for (uint32_t bits = run_bits(w); bits != 0; bits &= bits - 1) {
+            listed_blocks[listed_before++] = w * 32 + __ffs(bits) - 1;
+        }
+    }
+    __syncthreads();
+
+    // The listed block a split starting at index i begins at: the first at or after i that starts a page's run.
+    auto page_aligned = [&](int i) {
+        while (i > 0 && i < listed &&
+               listed_blocks[i] * block_size / page_size == listed_blocks[i - 1] * block_size / page_size) {
+            ++i;
+        }
+        return min(i, listed);
+    };
+    const int split_blocks = (listed + splits - 1) / splits;
+    const int first = page_aligned(split * split_blocks);
+    const int end = split + 1 == splits ? listed : page_aligned((split + 1) * split_blocks);
+
+    const float weight = p.mass_sum ? p.query_weights[qtok] : 0.0f;
+    auto flush_page = [&](int m) {
+        if (run_page[m] >= 0) {
+            const int64_t row = attn::mass_row(p, attn::mass_view(p, s, qtok), run_page[m]);
+            atomicAdd(&p.mass_sum[row * p.n_q_heads + first_head + m], weight * run_max[m]);
+            if (g == 0 && m == 0) {
+                atomicAdd(&p.weight_sum[row], weight);
+            }
+        }
+    };
+
+    constexpr int slabs = attn::pv_slabs_per_warp<head_dim, decode_warps>();
+    float out_acc[slabs * attn::pv_slab_accums] = {};
+    for (int tile_first = first; tile_first < end; tile_first += tile_blocks) {
+        for (int c = tid; c < key_tile; c += cta_threads) {
+            const int index = tile_first + c / block_size;
+            const int key = index < end ? listed_blocks[index] * block_size + c % block_size : -1;
+            const bool attended = key <= query_pos;
+            key_index[c] = attended ? key : -1;
+            key_position[c] = attended ? layout.position(key) : 0;
+            key_offset[c] = attended ? static_cast<int64_t>(seq_table[key / page_size]) * p.page_stride +
+                    key % page_size * p.token_stride + g * p.head_stride
+                                     : 0;
+        }
+        __syncthreads();
+        for (int c = tid; c < key_tile * row_chunks; c += cta_threads) {
+            const int row = c / row_chunks;
+            const int d = (c % row_chunks) * chunk_elems;
+            const int64_t offset = key_offset[row] + d;
+            const int bytes = key_index[row] >= 0 ? 16 : 0;
+            attn::cp_async_16(sK + attn::swizzled_offset<head_dim>(row, d), p.k_pool + offset, bytes);
+            attn::cp_async_16(sV + attn::swizzled_offset<head_dim>(row, d), p.v_pool + offset, bytes);
+        }
+        attn::cp_async_commit();
+        attn::cp_async_wait<0>();
+        __syncthreads();
+        for (int i = tid; i < key_tile * rotating; i += cta_threads) {
+            const int row = i / rotating;
+            const int pair = rotating_pairs[i % rotating];
+            if (key_index[row] < 0) {
+                continue;
+            }
+            scalar_t& low = sK[attn::swizzled_offset<head_dim>(row, pair)];
+            scalar_t& high = sK[attn::swizzled_offset<head_dim>(row, pair + half)];
+            float cos_a, sin_a;
+            attn::rope_sincos_turns(key_position[row], p.rope_turns[pair], cos_a, sin_a);
+            const auto k = attn::rope_rotate<scalar_t>(static_cast<float>(low), static_cast<float>(high), cos_a, sin_a);
+            low = k.lo;
+            high = k.hi;
+        }
+        __syncthreads();
+        attn::tile_qkt<scalar_t, key_tile, head_dim, bf16, score_stride, true>(sQ, sK, sS, warp, decode_warps);
+        __syncthreads();
+
+        // A warp per query head, a lane per key of the tile.
+        const int key = key_index[lane];
+        for (int m = warp; m < rows; m += decode_warps) {
+            const float score = key >= 0 ? p.scale * sS[m * score_stride + lane] : -CUDART_INF_F;
+            if (p.mass_sum) {
+                for (int c = 0; c < key_tile; ++c) {
+                    const float key_score = __shfl_sync(0xffffffffu, score, c);
+                    const int page = key_index[c] / page_size;
+                    if (lane == 0 && key_index[c] >= 0) {
+                        if (page != run_page[m]) {
+                            flush_page(m);
+                            run_page[m] = page;
+                            run_max[m] = key_score;
+                        } else {
+                            run_max[m] = fmaxf(run_max[m], key_score);
+                        }
+                    }
+                }
+            }
+            float tile_max = score;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffffu, tile_max, offset));
+            }
+            const float new_max = fmaxf(Mrow[m], tile_max);
+            const float rescale = new_max == -CUDART_INF_F ? 1.0f : __expf(Mrow[m] - new_max);
+            const float pw = key >= 0 ? __expf(score - new_max) : 0.0f;
+            sP[m * key_tile + lane] = static_cast<scalar_t>(pw);
+            float sum = pw;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+            }
+            __syncwarp();
+            if (lane == 0) {
+                Lrow[m] = Lrow[m] * rescale + sum;
+                Mrow[m] = new_max;
+                row_rescale[m] = rescale;
+            }
+        }
+        __syncthreads();
+        attn::tile_pv_registers<scalar_t, key_tile, head_dim, bf16, decode_warps, true>(
+            sP,
+            sV,
+            row_rescale,
+            out_acc,
+            warp
+        );
+        __syncthreads();
+    }
+    attn::cp_async_wait<0>();
+
+    if (splits == 1) {
+        const int gid = lane >> 2;
+        const float inv_low = 1.0f / Lrow[gid], inv_high = 1.0f / Lrow[gid + 8];
+        attn::for_each_pv_register<head_dim, decode_warps>(out_acc, warp, [&](int row, int col, float value) {
+            if (row < rows) {
+                p.o[(static_cast<int64_t>(qtok) * p.n_q_heads + first_head + row) * head_dim + col] =
+                    static_cast<scalar_t>(value * (row < 8 ? inv_low : inv_high));
+            }
+        });
+    } else {
+        float* cta_partial = partial + static_cast<int64_t>(blockIdx.x) * 16 * partial_row_floats(head_dim);
+        if (tid < rows) {
+            cta_partial[tid * partial_row_floats(head_dim)] = Mrow[tid];
+            cta_partial[tid * partial_row_floats(head_dim) + 1] = Lrow[tid];
+        }
+        attn::for_each_pv_register<head_dim, decode_warps>(out_acc, warp, [&](int row, int col, float value) {
+            if (row < rows) {
+                cta_partial[row * partial_row_floats(head_dim) + 2 + col] = value;
+            }
+        });
+    }
+    if (p.mass_sum && tid < rows) {
+        flush_page(tid);
+    }
+}
+
+// The most splits combine_indexed_splits_kernel joins.
+constexpr int max_combined_splits = 64;
+
+// Joins each query head's splits into o, one CTA per (query token, query head): the first warp weighs the splits, then
+// each thread sums its dims' weighted partial rows.
 template <typename scalar_t>
 __global__ void combine_indexed_splits_kernel(
     const attn::paged_attn_params<scalar_t> p,
@@ -692,33 +974,46 @@ __global__ void combine_indexed_splits_kernel(
 ) {
     wait_for_prior_kernels();
     allow_next_kernel();
+    __shared__ float split_weight[max_combined_splits];
     const int qtok = blockIdx.x / p.n_q_heads;
     const int head = blockIdx.x % p.n_q_heads;
     const int row_floats = partial_row_floats(p.head_dim);
     const float* rows = partial +
         ((static_cast<int64_t>(qtok) * p.n_kv_heads + head / p.group) * splits * 16 + head % p.group) * row_floats;
     const int64_t split_stride = static_cast<int64_t>(16) * row_floats;
-    float max_score = -CUDART_INF_F;
-    for (int j = 0; j < splits; ++j) {
-        max_score = fmaxf(max_score, rows[j * split_stride]);
-    }
-    float sum = 0.0f;
-    for (int j = 0; j < splits; ++j) {
-        const float split_max = rows[j * split_stride];
-        if (split_max > -CUDART_INF_F) {
-            sum += rows[j * split_stride + 1] * __expf(split_max - max_score);
+    if (threadIdx.x < 32) {
+        const int lane = threadIdx.x;
+        float max_score = -CUDART_INF_F;
+        for (int j = lane; j < splits; j += 32) {
+            max_score = fmaxf(max_score, rows[j * split_stride]);
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            max_score = fmaxf(max_score, __shfl_xor_sync(0xffffffffu, max_score, offset));
+        }
+        float sum = 0.0f;
+        for (int j = lane; j < splits; j += 32) {
+            const float split_max = rows[j * split_stride];
+            const float scale = split_max > -CUDART_INF_F ? __expf(split_max - max_score) : 0.0f;
+            split_weight[j] = scale;
+            sum += rows[j * split_stride + 1] * scale;
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+        }
+        __syncwarp();
+        for (int j = lane; j < splits; j += 32) {
+            split_weight[j] /= sum;
         }
     }
+    __syncthreads();
     scalar_t* out = p.o + (static_cast<int64_t>(qtok) * p.n_q_heads + head) * p.head_dim;
     for (int d = threadIdx.x; d < p.head_dim; d += blockDim.x) {
         float value = 0.0f;
+#pragma unroll 8
         for (int j = 0; j < splits; ++j) {
-            const float split_max = rows[j * split_stride];
-            if (split_max > -CUDART_INF_F) {
-                value += rows[j * split_stride + 2 + d] * __expf(split_max - max_score);
-            }
+            value += rows[j * split_stride + 2 + d] * split_weight[j];
         }
-        out[d] = static_cast<scalar_t>(value / sum);
+        out[d] = static_cast<scalar_t>(value);
     }
 }
 
@@ -841,6 +1136,57 @@ void launch_indexed_tc(
     });
 }
 
+// The splits of each (query token, KV group) of attn_indexed_decode_kernel: the largest power of two, at most
+// max_decode_splits, that keeps the grid within two CTAs per SM.
+constexpr int64_t max_decode_splits = max_combined_splits;
+
+template <typename scalar_t, bool bf16>
+void launch_indexed_decode(const attn::paged_attn_batch& b, const block_selection& selection, cudaStream_t stream) {
+    const int64_t grid = b.total_q * b.n_kv_heads;
+    const int64_t sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    int64_t splits = 1;
+    while (splits < max_decode_splits && grid * (splits * 2) <= 2 * sms) {
+        splits *= 2;
+    }
+    attn::dispatch_page_head("attn_indexed", b.page_size, b.head_dim, [&](auto bs_tag, auto hd_tag) {
+        constexpr int bs = decltype(bs_tag)::value;
+        constexpr int hd = decltype(hd_tag)::value;
+        constexpr size_t smem = decode_tile_bytes<scalar_t, hd>();
+        const auto kernel = attn_indexed_decode_kernel<scalar_t, bs, hd, bf16>;
+        // The kernel's static shared memory counts against the default limit too.
+        C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
+        at::Tensor partial;
+        if (splits > 1) {
+            partial = at::empty({grid * splits, 16, partial_row_floats(hd)}, b.q.options().dtype(at::kFloat));
+        }
+        launch_dependent(
+            kernel,
+            static_cast<int>(grid * splits),
+            decode_warps * 32,
+            smem,
+            stream,
+            b.params<scalar_t>(),
+            selection,
+            static_cast<int>(splits),
+            splits > 1 ? partial.data_ptr<float>() : nullptr
+        );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        if (splits > 1) {
+            launch_dependent(
+                combine_indexed_splits_kernel<scalar_t>,
+                static_cast<int>(b.total_q * b.n_q_heads),
+                128,
+                0,
+                stream,
+                b.params<scalar_t>(),
+                static_cast<int>(splits),
+                partial.const_data_ptr<float>()
+            );
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+    });
+}
+
 void launch_indexed_scalar(const attn::paged_attn_batch& b, const block_selection& selection, cudaStream_t stream) {
     const int64_t blocks = b.total_q * b.n_q_heads;
     const size_t smem = static_cast<size_t>(2 * b.head_dim + attn::cta_threads) * sizeof(float);
@@ -910,7 +1256,12 @@ at::Tensor attn_indexed(
     TORCH_CHECK(!unsupported, "attn_indexed: ", *unsupported);
     attn::dispatch_tensor_core_dtype(b.q.scalar_type(), [&](auto type_tag, auto bf16_tag) {
         using scalar_t = typename decltype(type_tag)::type;
-        launch_indexed_tc<scalar_t, decltype(bf16_tag)::value>(b, selection, max_selected_blocks, stream);
+        const int64_t sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+        if (b.total_q * b.n_kv_heads * 2 <= sms && decode_key_tile % block_size == 0) {
+            launch_indexed_decode<scalar_t, decltype(bf16_tag)::value>(b, selection, stream);
+        } else {
+            launch_indexed_tc<scalar_t, decltype(bf16_tag)::value>(b, selection, max_selected_blocks, stream);
+        }
     });
     return b.o;
 }
