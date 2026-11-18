@@ -293,7 +293,7 @@ qwen4_exp_model::qwen4_exp_model(
             }
             const std::int64_t history = (w.ple->conv.size(2) - 1) * c.ngram_size;
             whole_window({c.hc_count * c.hidden_size, history}, embed_tokens.scalar_type());
-            whole_window({c.ngram_size - 1}, at::kLong);
+            whole_window({1, c.ngram_size - 1}, at::kLong);
         }
         layers.push_back(std::move(w));
     };
@@ -667,7 +667,9 @@ qwen4_exp_model::ngram_ids(const ple_weights& w, std::size_t token_layer, const 
     const std::int64_t ntok = g.tokens.size(0);
     const std::int64_t context = config.ngram_size - 1;
     const std::int64_t eos = config.eos_token_id;
-    const std::int64_t window = lines.k.size(1);
+    // [lines, window]: each token line's one row.
+    at::Tensor token_lines = lines.k.select(1, 0);
+    const std::int64_t window = token_lines.size(1);
     const auto longs = g.tokens.options().dtype(at::kLong);
     at::Tensor rows = g.page_tables.select(0, static_cast<std::int64_t>(token_layer)).to(at::kLong);
     at::Tensor slot = rows.select(1, 0);
@@ -680,7 +682,7 @@ qwen4_exp_model::ngram_ids(const ple_weights& w, std::size_t token_layer, const 
 
     // Entry c of a sequence's inputs: its line's valid entries, then its tokens in the group, EOS before the first.
     at::Tensor tokens = g.tokens.to(at::kLong);
-    at::Tensor inputs = at::cat({at::bitwise_xor(lines.k.index_select(0, slot), eos).flatten(), tokens});
+    at::Tensor inputs = at::cat({at::bitwise_xor(token_lines.index_select(0, slot), eos).flatten(), tokens});
     auto input_at = [&](const at::Tensor& sequence, const at::Tensor& c) {
         at::Tensor flat_sequence = sequence.flatten();
         at::Tensor flat_c = c.flatten();
@@ -728,10 +730,10 @@ qwen4_exp_model::ngram_ids(const ple_weights& w, std::size_t token_layer, const 
     at::Tensor at_page_end = at::where(
         (page_ends > 0).unsqueeze(1),
         window_after(page_ends.clamp_min(0)),
-        lines.k.index_select(0, boundary)
+        token_lines.index_select(0, boundary)
     );
-    lines.k.index_copy_(0, boundary, at_page_end);
-    lines.k.index_copy_(0, slot, window_after(counts));
+    token_lines.index_copy_(0, boundary, at_page_end);
+    token_lines.index_copy_(0, slot, window_after(counts));
     return at::cat(ids, -1);
 }
 

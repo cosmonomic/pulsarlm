@@ -36,7 +36,8 @@ def load_served_model(
     """eviction is the settings' policy, its n_sink left at the default. Above one
     tensor-parallel GPU, the model is split across cuda:0 on, one GPU's part loaded
     and on its GPU before the next is read. The store's reads run on loop. Without
-    the prefix cache, the store keeps nothing."""
+    the prefix cache, the store keeps nothing. Without num_draft_tokens, a model
+    with a multi-token prediction layer drafts one token a step."""
     dtype = getattr(torch, settings.dtype)
     tensor_parallel_size = settings.tensor_parallel_size
     devices = (
@@ -59,6 +60,9 @@ def load_served_model(
         ).weights
 
     max_context = cfg.max_position_embeddings or None
+    draft_tokens = settings.num_draft_tokens
+    if draft_tokens is None:
+        draft_tokens = 1 if checkpoint.drafts(path, cfg) else 0
     stops = stop_ids(tokenizer, cfg.eos_ids)
     store = (
         LocalStore(
@@ -86,6 +90,7 @@ def load_served_model(
             prefill_tokens_per_step=settings.prefill_tokens_per_step,
             decode_graphs=settings.decode_graphs,
             max_context_window=settings.max_context_window or max_context,
+            draft_tokens=draft_tokens,
         )
     except ValueError as error:
         raise checkpoint.PulsarLMModelLoadingError(str(error)) from error

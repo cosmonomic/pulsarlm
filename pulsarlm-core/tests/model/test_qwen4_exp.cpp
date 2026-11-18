@@ -907,13 +907,13 @@ void check_against_dense(
         const std::int64_t token_window = 2 + draft_tokens;
         CHECK(
             at::equal(
-                ple_tokens[running_line],
+                ple_tokens[running_line][0],
                 at::bitwise_xor(tokens.narrow(0, n_tokens - token_window, token_window), eos)
             )
         );
         CHECK(
             at::equal(
-                ple_tokens[boundary_line],
+                ple_tokens[boundary_line][0],
                 at::bitwise_xor(tokens.narrow(0, 48 - token_window, token_window), eos)
             )
         );
@@ -1042,7 +1042,7 @@ TEST_CASE("Qwen4-Exp kv_layers add a PLE layer's convolution and token lines", "
     std::vector<pulsarlm::kv_layer> specs = model.kv_layers();
     REQUIRE(specs.size() == 9);
     CHECK(specs[4].state->sizes == std::vector<std::int64_t>{hc * hidden, ple_history});
-    CHECK(specs[5].state->sizes == std::vector<std::int64_t>{ngram_size - 1});
+    CHECK(specs[5].state->sizes == std::vector<std::int64_t>{1, ngram_size - 1});
     CHECK(specs[5].state->dtype == at::kLong);
     CHECK(!specs[6].state);
     CHECK(specs[6].index_head_dim == indexer_dim);

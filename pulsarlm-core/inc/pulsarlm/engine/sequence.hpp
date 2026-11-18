@@ -121,6 +121,12 @@ class sequence {
     bool last_step_launched = false;
     // While a pending token is awaited_token: the row of its step's sampled tokens that holds it.
     std::size_t awaited_row = 0;
+    // The tokens the draft head drafted after the pending token, which the next step verifies; empty when it does not.
+    std::vector<std::int64_t> drafts;
+    // The tokens the last step forwarded and did not keep (group_batch::rejected_tokens).
+    std::size_t rejected_tokens = 0;
+    // The history position before which the draft head's KV layer holds a row for every position.
+    std::size_t draft_rows_end = 0;
     page_eviction_policy eviction;
     // The history position, in tokens, at which the eviction cycle ends: a multiple of cycle_tokens, and past the end of
     // the resumed state, so that forwarding its tail again never reaches a cycle end that state already passed.
@@ -168,6 +174,9 @@ class sequence {
     std::size_t complete_pages(std::size_t end);
     // Recurrent KV layer layer's line holding the state at the end of head's page.
     std::uint32_t& head_state_line(std::size_t layer);
+    // After a step that forwarded the pending token and the drafts: keeps the first kept drafts in tail, the others
+    // rejected, and makes next the pending token.
+    void keep_drafts(std::size_t kept, std::int64_t next);
     // Sets the token at history position index, in tail or pending, which was awaited_token.
     void resolve_token(std::size_t index, std::int64_t token);
     // Undoes the advance by one token of the latest launched step, whose pages are not completed yet, and its sample if
@@ -179,8 +188,9 @@ class sequence {
     // The history position from which the cycle's queries add mass: the cycle's last mass_tokens tokens, less those
     // the masses already hold.
     std::size_t measured_start() const noexcept;
-    // The weight of each of the next token_count tokens' queries (query_weights), 0 for those before measured_start.
-    void fill_query_weights(std::span<float> weights) const noexcept;
+    // The weight of the queries of weights.size() tokens from history position first (query_weights), 0 for those
+    // before measured_start.
+    void fill_query_weights(std::size_t first, std::span<float> weights) const noexcept;
     // Whether forwarding token_count more tokens ends the eviction cycle.
     bool ends_cycle(std::size_t token_count) const noexcept;
     // The tokens the cycle can still forward: no more than its length allows, nor than the request will forward.

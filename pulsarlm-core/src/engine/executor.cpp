@@ -98,23 +98,33 @@ at::Tensor zero_page_mass(
 // The tokens each running sequence forwards in one step, the model inputs for them, and the tokens sampled from the
 // step's logits.
 class executor::batch {
-    // decode_count decode entries first, each forwarding its sequence's only pending token.
+    enum class group_kind { decode, verify, prefill };
+
+    // decode_count decode entries first, each forwarding its sequence's only pending token, the last verify_count of
+    // them with their drafts after it.
     std::vector<batch_entry> entries;
     std::size_t decode_count = 0;
+    std::size_t verify_count = 0;
+    // The tokens a verify entry forwards and samples after: its pending token and its drafts.
+    std::size_t verify_rows = 0;
     // Pinned host tensors.
     step_batch inputs;
     // Whether a decode entry's token is awaited, -(r + 1) in the decode group's tokens for row r of the previous
     // launched step's samples.
     bool awaits_tokens = false;
-    // Per entry that samples, in entry order: its params and draw.
+    // Per row sampled, in entry order: a row of each entry that samples but a verify entry's verify_rows, the params
+    // and draw.
     std::vector<sampling_params> sample_params;
     std::vector<sampling_draw> sample_draws;
-    // Pinned host int64, one token per entry that samples, in entry order.
+    // Pinned host int64, one token per row sampled.
     at::Tensor sampled_tokens;
     // Per entry, as of its launch: whether it measures mass, the history position its tokens end at, the history
     // position of the token it samples, and whether it forwards its sequence's last tokens.
     std::vector<bool> measured;
+    std::vector<std::size_t> step_starts;
     std::vector<std::size_t> step_ends;
+    // Per entry, whether its tokens end its sequence's eviction cycle; a verify entry's is set at its write-back.
+    std::vector<bool> ends_cycle;
     std::vector<std::size_t> sampled_positions;
     std::vector<bool> ends_sequence;
     bool quiet = false;
@@ -125,9 +135,34 @@ class executor::batch {
     // turn, laid out as the layer's row of the group's cu_view_pages, its heads innermost; per shard, its heads, then
     // joined over the shards.
     std::vector<at::Tensor> shard_decode_mass;
+    std::vector<at::Tensor> shard_verify_mass;
     std::vector<at::Tensor> shard_prefill_mass;
     at::Tensor decode_mass;
+    at::Tensor verify_mass;
     at::Tensor prefill_mass;
+    // Per entry whose draft rows start at its first token after an earlier step forwarded the position before it,
+    // the line of the draft head's KV layer holding that position, and per shard, those lines' last_hidden as of the
+    // step's launch; prior_rows gives each entry's row, if it has one.
+    std::vector<std::int64_t> prior_lines;
+    std::vector<std::optional<std::size_t>> prior_rows;
+    std::vector<at::Tensor> shard_prior_hidden;
+    // Per shard, the step's hidden rows, which the draft head's pass reads.
+    std::vector<step_logits> shard_hidden;
+    // The draft head's pass, planned at the write-back once the step's tokens are kept: per sequence writing draft
+    // rows, its entry, its rows' tokens and RoPE positions, and its key count after them in the draft head's KV layer;
+    // per row, its hidden row (draft_head::draft) as an index into a zeros row, then the prior hidden rows, then the
+    // step's prefill, decode and verify hidden rows.
+    std::vector<batch_entry> draft_entries;
+    std::vector<std::int64_t> draft_tokens;
+    std::vector<std::int64_t> draft_positions;
+    std::vector<std::int32_t> draft_key_counts;
+    std::vector<std::int64_t> draft_sources;
+    // The sequences that draft: their indices among draft_entries, and per draft after the first, each one's RoPE
+    // position and key count; drafted holds shard 0's drafts, int64 [drafting sequences, drafts].
+    std::vector<std::size_t> drafting;
+    std::vector<std::vector<std::int64_t>> later_positions;
+    std::vector<std::vector<std::int32_t>> later_key_counts;
+    at::Tensor drafted;
 
     // The decode group's page-table width, and whether its forward replays a graph.
     std::size_t decode_width = 0;
@@ -141,8 +176,18 @@ class executor::batch {
         std::optional<std::size_t> graph_pages
     );
 
+    // A verify group measures each row's mass apart (group_batch::cu_view_pages), its queries weighing 1 from
+    // measured_start on: the rows its write-back keeps are then weighed as one step's.
     static group_batch
-    make_group(std::span<const batch_entry> group, std::size_t page_size, std::size_t state_slots, bool prefill);
+    make_group(std::span<const batch_entry> group, std::size_t page_size, std::size_t state_slots, group_kind kind);
+    // The tokens e forwards: its pending tokens', and its drafts.
+    static std::size_t forwarded(const batch_entry& e) noexcept;
+    // The tokens entry index forwards, as its group's inputs hold them.
+    std::vector<std::int64_t> forwarded_tokens(std::size_t index) const;
+    // Whether entry index is a plain decode, a verify or a prefill entry.
+    group_kind kind_of(std::size_t index) const noexcept;
+    // The first row of entry index in its group.
+    std::size_t first_row(std::size_t index) const noexcept;
     // The widest table among the group's sequences.
     static std::size_t table_width(std::span<const batch_entry> group) noexcept;
     static bool measures_mass(std::span<const batch_entry> group) noexcept;
@@ -156,18 +201,39 @@ class executor::batch {
         std::size_t shard,
         std::size_t width
     );
-    // Queues on stream shard's copies of the inputs, the filling of the awaited tokens from samples, its forward, the
-    // copies of its page mass to the host and the sampling into samples; shard 0 also queues the copy of the sampled
-    // tokens to the host. mass_heads is the shard's part of the executor's. graphs is the shard's when decode_replays.
-    // Every shard's call may run at once, each on its own thread.
+    // Queues on stream shard's copies of the inputs, the filling of the awaited tokens from samples, the copy of the
+    // prior hidden rows from draft_layer's lines, its forward, the copies of its page mass to the host and the
+    // sampling into samples; shard 0 also queues the copy of the sampled tokens to the host. mass_heads is the shard's
+    // part of the executor's. graphs is the shard's when decode_replays. Every shard's call may run at once, each on
+    // its own thread.
     void enqueue(
         model& shard_model,
         std::span<const kv> lines,
         const std::vector<std::size_t>& mass_heads,
+        std::optional<std::size_t> draft_layer,
         cudaStream_t stream,
         std::size_t shard,
         decode_graphs* graphs,
         const at::Tensor& samples,
+        at::Tensor& counters
+    );
+    // Adds to the draft head's pass the rows of entry index's sequence from its first position without one, through its
+    // kept tokens tokens and, with next_row, its next token, the sequence drafting draft_count tokens after them with
+    // drafts. The sequence's tokens are kept, and the entry's group holds them from first_row(index) on.
+    void plan_draft_rows(
+        std::size_t index,
+        std::span<const std::int64_t> tokens,
+        bool next_row,
+        bool drafts,
+        std::size_t draft_layer,
+        std::size_t draft_count
+    );
+    // Queues on stream shard's draft head's pass, and shard 0 the copy of the drafts to drafted.
+    void enqueue_drafts(
+        model& shard_model,
+        std::span<const kv> lines,
+        cudaStream_t stream,
+        std::size_t shard,
         at::Tensor& counters
     );
     // Joins the shards' page mass, each shard's heads after the previous shards', once their copies completed.
@@ -182,6 +248,16 @@ class executor::batch {
         std::span<const float> weight_sum;
     };
     std::vector<layer_step_mass> step_mass(std::size_t index, const std::vector<std::size_t>& mass_heads) const;
+    // step_mass of row row of verify entry index, its query weighing 1.
+    std::vector<layer_step_mass>
+    verify_row_mass(std::size_t index, std::size_t row, const std::vector<std::size_t>& mass_heads) const;
+    // The page mass of the view view of group from mass, laid out as join_mass leaves it.
+    static std::vector<layer_step_mass> view_mass(
+        const group_batch& group,
+        const at::Tensor& mass,
+        std::size_t view,
+        const std::vector<std::size_t>& mass_heads
+    );
 
     friend class executor;
 };
@@ -243,21 +319,29 @@ executor::executor(
             assert(mirrors[layer] == layers[layer].mirrors_held_pages);
             assert(state_slots[layer] == slots_of(layers[layer]));
             mass_heads[layer] += shard_mass_heads[shard].back();
+            if (shard == 0 && draft_tokens > 0 && layers[layer].last_hidden_dim > 0) {
+                draft_layer = layer;
+            }
         }
+    }
+    assert(draft_tokens == 0 || (draft_layer && this->shards.front()->drafter() != nullptr));
+    // The draft head's pass reads the decode group's hidden rows, which a graph does not return.
+    if (draft_layer) {
+        this->graph_pages.reset();
     }
     assert(page_size > 0);
     for (std::size_t shard = 0; shard < this->shards.size(); shard++) {
         samples.push_back(at::zeros({max_sampled_rows}, lines[shard].front().k.options().dtype(at::kLong)));
     }
     eager_counters.resize(this->shards.size());
-    if (graph_pages) {
+    if (this->graph_pages) {
         for (std::size_t shard = 0; shard < this->shards.size(); shard++) {
             c10::cuda::CUDAGuard device_guard(lines[shard].front().k.device());
             graphs.push_back(
                 std::make_unique<decode_graphs>(
                     *this->shards[shard],
                     lines[shard],
-                    *graph_pages,
+                    *this->graph_pages,
                     page_size,
                     draft_state_slots,
                     shard_mass_heads[shard],
@@ -280,38 +364,103 @@ executor::batch::batch(
         return e.seq->pending_tokens.size() > 1;
     });
     decode_count = static_cast<std::size_t>(first_prefill - entries.begin());
+    auto first_verify = std::stable_partition(entries.begin(), first_prefill, [](const batch_entry& e) {
+        return e.seq->drafts.empty();
+    });
+    verify_count = static_cast<std::size_t>(first_prefill - first_verify);
+    const std::size_t plain_count = decode_count - verify_count;
     std::span<const batch_entry> entry_span(entries);
-    if (decode_count > 0) {
-        inputs.decode_group = make_group(entry_span.first(decode_count), page_size, state_slots, false);
-        decode_width = table_width(entry_span.first(decode_count));
+    if (verify_count > 0) {
+        verify_rows = forwarded(entries[plain_count]);
+        assert(std::ranges::all_of(entry_span.subspan(plain_count, verify_count), [&](const batch_entry& e) {
+            return e.samples && forwarded(e) == verify_rows;
+        }));
+    }
+    if (plain_count > 0) {
+        inputs.decode_group = make_group(entry_span.first(plain_count), page_size, state_slots, group_kind::decode);
+        decode_width = table_width(entry_span.first(plain_count));
         decode_replays = graph_pages && decode_width <= *graph_pages;
         if (decode_replays) {
             decode_width = *graph_pages;
         }
     }
-    if (entries.size() > decode_count) {
-        inputs.prefill_group = make_group(entry_span.subspan(decode_count), page_size, state_slots, true);
+    if (verify_count > 0) {
+        inputs.verify_group = make_group(
+            entry_span.subspan(plain_count, verify_count),
+            page_size,
+            state_slots,
+            group_kind::verify
+        );
     }
-    awaits_tokens = std::ranges::any_of(entry_span.first(decode_count), [](const batch_entry& e) {
+    if (entries.size() > decode_count) {
+        inputs.prefill_group = make_group(entry_span.subspan(decode_count), page_size, state_slots, group_kind::prefill);
+    }
+    awaits_tokens = std::ranges::any_of(entry_span.first(plain_count), [](const batch_entry& e) {
         return e.seq->pending_tokens.front() == sequence::awaited_token;
     });
-    for (const batch_entry& e : entries) {
-        if (e.samples) {
+    // A verify entry's draws advance by the tokens its write-back keeps.
+    for (std::size_t i = 0; i < entries.size(); i++) {
+        const batch_entry& e = entries[i];
+        if (!e.samples) {
+            continue;
+        }
+        if (kind_of(i) == group_kind::verify) {
+            for (std::size_t row = 0; row < verify_rows; row++) {
+                sample_params.push_back(e.seq->sampling);
+                sample_draws.push_back(sampling_draw{.seed = e.seq->seed, .count = e.seq->draw_count + row});
+            }
+        } else {
             sample_params.push_back(e.seq->sampling);
             sample_draws.push_back(sampling_draw{.seed = e.seq->seed, .count = e.seq->draw_count++});
         }
     }
 }
 
+std::size_t executor::batch::forwarded(const batch_entry& e) noexcept {
+    return e.token_count + e.seq->drafts.size();
+}
+
+executor::batch::group_kind executor::batch::kind_of(std::size_t index) const noexcept {
+    if (index >= decode_count) {
+        return group_kind::prefill;
+    }
+    return index >= decode_count - verify_count ? group_kind::verify : group_kind::decode;
+}
+
+std::vector<std::int64_t> executor::batch::forwarded_tokens(std::size_t index) const {
+    const group_kind kind = kind_of(index);
+    const group_batch& group = kind == group_kind::decode ? *inputs.decode_group
+        : kind == group_kind::verify                       ? *inputs.verify_group
+                                                           : *inputs.prefill_group;
+    const std::int64_t* first = group.tokens.const_data_ptr<std::int64_t>() + first_row(index);
+    std::vector<std::int64_t> tokens(first, first + forwarded(entries[index]));
+    assert(std::ranges::none_of(tokens, [](std::int64_t token) { return token < 0; }));
+    return tokens;
+}
+
+std::size_t executor::batch::first_row(std::size_t index) const noexcept {
+    switch (kind_of(index)) {
+    case group_kind::decode:
+        return index;
+    case group_kind::verify:
+        return (index - (decode_count - verify_count)) * verify_rows;
+    case group_kind::prefill:
+        return static_cast<std::size_t>(
+            inputs.prefill_group->cu_seqlens_q.const_data_ptr<std::int32_t>()[index - decode_count]
+        );
+    }
+    return 0;
+}
+
 group_batch executor::batch::make_group(
     std::span<const batch_entry> group,
     std::size_t page_size,
     std::size_t state_slots,
-    bool prefill
+    group_kind kind
 ) {
     std::size_t token_count = 0;
     for (const batch_entry& e : group) {
-        token_count += e.token_count;
+        token_count += forwarded(e);
     }
     std::size_t n_layers = group.front().seq->layers.size();
     auto n_tokens = static_cast<std::int64_t>(token_count);
@@ -333,21 +482,23 @@ group_batch executor::batch::make_group(
     for (std::size_t s = 0; s < group.size(); s++) {
         const sequence& seq = *group[s].seq;
         std::size_t first_position = seq.next_position();
-        for (std::size_t i = 0; i < group[s].token_count; i++) {
-            const std::int64_t token = seq.pending_tokens[i];
+        const std::size_t count = forwarded(group[s]);
+        for (std::size_t i = 0; i < count; i++) {
+            const std::int64_t token = i < group[s].token_count ? seq.pending_tokens[i]
+                                                                : seq.drafts[i - group[s].token_count];
             tokens[first_row + i] = token == sequence::awaited_token ? -static_cast<std::int64_t>(seq.awaited_row) - 1
                                                                      : token;
             positions[first_row + i] = static_cast<std::int64_t>(first_position + i);
         }
         for (std::size_t layer = 0; layer < n_layers; layer++) {
             std::size_t start = seq.next_index(layer);
-            key_count[layer * group.size() + s] = static_cast<std::int32_t>(start + group[s].token_count);
+            key_count[layer * group.size() + s] = static_cast<std::int32_t>(start + count);
         }
-        first_row += group[s].token_count;
+        first_row += count;
         query_start[s + 1] = static_cast<std::int32_t>(first_row);
     }
     g.key_counts = key_counts;
-    if (prefill) {
+    if (kind != group_kind::decode) {
         g.cu_seqlens_q = query_starts;
     }
     g.history_positions = pinned({n_seqs}, at::kLong);
@@ -356,25 +507,43 @@ group_batch executor::batch::make_group(
         history_position[s] = static_cast<std::int64_t>(group[s].seq->history_position());
     }
     g.rejected_tokens = pinned({n_seqs}, at::kInt);
-    g.rejected_tokens.zero_();
+    auto* rejected = g.rejected_tokens.mutable_data_ptr<std::int32_t>();
+    for (std::size_t s = 0; s < group.size(); s++) {
+        rejected[s] = static_cast<std::int32_t>(group[s].seq->rejected_tokens);
+    }
     g.page_size = static_cast<std::int64_t>(page_size);
     g.state_slots = static_cast<std::int64_t>(state_slots);
     if (measures_mass(group)) {
-        g.cu_view_pages = pinned({n_kv_layers, n_seqs + 1}, at::kInt);
+        // A verify group's views are its rows'.
+        const bool per_row = kind == group_kind::verify;
+        const std::int64_t views = per_row ? n_tokens : n_seqs;
+        g.cu_view_pages = pinned({n_kv_layers, views + 1}, at::kInt);
         g.query_weights = pinned({n_tokens}, at::kFloat);
         auto* cu_view_pages = g.cu_view_pages.mutable_data_ptr<std::int32_t>();
         for (std::size_t layer = 0; layer < n_layers; layer++) {
-            std::int32_t* row = cu_view_pages + layer * (group.size() + 1);
+            std::int32_t* row = cu_view_pages + layer * static_cast<std::size_t>(views + 1);
             row[0] = 0;
-            for (std::size_t s = 0; s < group.size(); s++) {
-                row[s + 1] = row[s] + static_cast<std::int32_t>(group[s].seq->layers[layer].lines.size());
+            std::size_t view = 0;
+            for (const batch_entry& e : group) {
+                const auto pages = static_cast<std::int32_t>(e.seq->layers[layer].lines.size());
+                for (std::size_t i = 0; i < (per_row ? forwarded(e) : 1); i++, view++) {
+                    row[view + 1] = row[view] + pages;
+                }
             }
         }
         std::span<float> weights(g.query_weights.mutable_data_ptr<float>(), token_count);
         std::size_t first = 0;
         for (const batch_entry& e : group) {
-            e.seq->fill_query_weights(weights.subspan(first, e.token_count));
-            first += e.token_count;
+            const std::size_t count = forwarded(e);
+            const std::size_t start = e.seq->history_position();
+            if (per_row) {
+                for (std::size_t i = 0; i < count; i++) {
+                    weights[first + i] = start + i >= e.seq->measured_start() ? 1.0f : 0.0f;
+                }
+            } else {
+                e.seq->fill_query_weights(start, weights.subspan(first, count));
+            }
+            first += count;
         }
     }
     return g;
@@ -393,7 +562,7 @@ bool executor::batch::measures_mass(std::span<const batch_entry> group) noexcept
 }
 
 bool executor::batch::measures_mass(const batch_entry& e) noexcept {
-    return e.seq->eviction.can_evict() && e.seq->history_position() + e.token_count > e.seq->measured_start();
+    return e.seq->eviction.can_evict() && e.seq->history_position() + forwarded(e) > e.seq->measured_start();
 }
 
 at::Tensor executor::batch::page_tables(
@@ -421,6 +590,7 @@ void executor::batch::enqueue(
     model& shard_model,
     std::span<const kv> lines,
     const std::vector<std::size_t>& mass_heads,
+    std::optional<std::size_t> draft_layer,
     cudaStream_t stream,
     std::size_t shard,
     decode_graphs* graphs,
@@ -431,17 +601,32 @@ void executor::batch::enqueue(
     c10::cuda::CUDAStreamGuard guard(c10::cuda::getStreamFromExternal(stream, device.index()));
     step_batch on_device;
     std::span<batch_entry> entry_span(entries);
-    at::Tensor decode_on_device, prefill_on_device;
+    const std::size_t plain_count = decode_count - verify_count;
+    if (draft_layer && !prior_lines.empty()) {
+        at::Tensor line_ids = at::tensor(prior_lines, at::TensorOptions().dtype(at::kLong)).to(device, true);
+        shard_prior_hidden[shard] = lines[*draft_layer].last_hidden.index_select(0, line_ids);
+    }
+    at::Tensor decode_on_device, verify_on_device, prefill_on_device;
     if (inputs.decode_group) {
         on_device.decode_group = to_device(*inputs.decode_group, device);
         if (awaits_tokens && !decode_replays) {
             fill_awaited_tokens_cuda(on_device.decode_group->tokens, samples);
         }
-        std::span<batch_entry> group = entry_span.first(decode_count);
+        std::span<batch_entry> group = entry_span.first(plain_count);
         on_device.decode_group->page_tables = page_tables(group, lines.size(), false, shard, decode_width);
         on_device.decode_group->page_positions = page_tables(group, lines.size(), true, shard, decode_width);
         if (inputs.decode_group->cu_view_pages.defined()) {
             decode_on_device = zero_page_mass(*on_device.decode_group, inputs.decode_group->cu_view_pages, mass_heads);
+        }
+    }
+    if (inputs.verify_group) {
+        on_device.verify_group = to_device(*inputs.verify_group, device);
+        std::span<batch_entry> group = entry_span.subspan(plain_count, verify_count);
+        std::size_t width = table_width(group);
+        on_device.verify_group->page_tables = page_tables(group, lines.size(), false, shard, width);
+        on_device.verify_group->page_positions = page_tables(group, lines.size(), true, shard, width);
+        if (inputs.verify_group->cu_view_pages.defined()) {
+            verify_on_device = zero_page_mass(*on_device.verify_group, inputs.verify_group->cu_view_pages, mass_heads);
         }
     }
     if (inputs.prefill_group) {
@@ -464,8 +649,17 @@ void executor::batch::enqueue(
     std::int64_t needed = 0;
     if (on_device.decode_group && !decode_replays) {
         needed = shard_model.arrival_counter_count(
-            static_cast<std::int64_t>(decode_count),
+            static_cast<std::int64_t>(plain_count),
             on_device.decode_group->tokens.size(0)
+        );
+    }
+    if (on_device.verify_group) {
+        needed = std::max(
+            needed,
+            shard_model.arrival_counter_count(
+                static_cast<std::int64_t>(verify_count),
+                on_device.verify_group->tokens.size(0)
+            )
         );
     }
     if (on_device.prefill_group) {
@@ -480,7 +674,8 @@ void executor::batch::enqueue(
     if (!counters.defined() || counters.numel() < needed) {
         counters = at::zeros({needed}, at::device(device).dtype(at::kInt));
     }
-    for (std::optional<group_batch>* group : {&on_device.decode_group, &on_device.prefill_group}) {
+    for (std::optional<group_batch>* group :
+         {&on_device.decode_group, &on_device.verify_group, &on_device.prefill_group}) {
         if (*group) {
             (*group)->arrival_counters = counters;
         }
@@ -494,39 +689,76 @@ void executor::batch::enqueue(
     } else {
         logits = shard_model.forward(on_device, lines);
     }
-    if (decode_on_device.defined()) {
-        shard_decode_mass[shard] = pinned(decode_on_device.sizes(), at::kFloat);
-        shard_decode_mass[shard].copy_(decode_on_device, /*non_blocking=*/true);
-    }
-    if (prefill_on_device.defined()) {
-        shard_prefill_mass[shard] = pinned(prefill_on_device.sizes(), at::kFloat);
-        shard_prefill_mass[shard].copy_(prefill_on_device, /*non_blocking=*/true);
+    for (auto [by_shard, on_shard] : {
+             std::pair{&shard_decode_mass, &decode_on_device},
+             std::pair{&shard_verify_mass, &verify_on_device},
+             std::pair{&shard_prefill_mass, &prefill_on_device},
+         }) {
+        if (on_shard->defined()) {
+            (*by_shard)[shard] = pinned(on_shard->sizes(), at::kFloat);
+            (*by_shard)[shard].copy_(*on_shard, /*non_blocking=*/true);
+        }
     }
     std::vector<at::Tensor> rows;
     for (std::size_t i = 0; i < entries.size(); i++) {
-        if (entries[i].samples) {
-            const bool decodes = i < decode_count;
-            const auto row = static_cast<std::int64_t>(decodes ? i : i - decode_count);
-            rows.push_back((decodes ? *logits.decode_logits : *logits.prefill_logits).select(0, row));
+        if (!entries[i].samples) {
+            continue;
+        }
+        switch (kind_of(i)) {
+        case group_kind::decode:
+            rows.push_back(logits.decode_logits->narrow(0, static_cast<std::int64_t>(i), 1));
+            break;
+        case group_kind::verify:
+            rows.push_back(
+                logits.verify_logits->narrow(
+                    0,
+                    static_cast<std::int64_t>(first_row(i)),
+                    static_cast<std::int64_t>(verify_rows)
+                )
+            );
+            break;
+        case group_kind::prefill:
+            rows.push_back(logits.prefill_logits->narrow(0, static_cast<std::int64_t>(i - decode_count), 1));
+            break;
         }
     }
+    shard_hidden[shard] = step_logits{
+        .prefill_hidden = logits.prefill_hidden,
+        .decode_hidden = logits.decode_hidden,
+        .verify_hidden = logits.verify_hidden,
+    };
     if (rows.empty()) {
         return;
     }
-    at::Tensor tokens = sample(at::stack(rows), sample_params, sample_draws);
+    at::Tensor tokens = sample(at::cat(rows), sample_params, sample_draws);
     samples.narrow(0, 0, tokens.size(0)).copy_(tokens);
     if (shard == 0) {
-        sampled_tokens = pinned({static_cast<std::int64_t>(rows.size())}, at::kLong);
+        sampled_tokens = pinned({tokens.size(0)}, at::kLong);
         sampled_tokens.copy_(tokens, /*non_blocking=*/true);
     }
 }
 
 std::vector<executor::batch::layer_step_mass>
 executor::batch::step_mass(std::size_t index, const std::vector<std::size_t>& mass_heads) const {
-    const bool decodes = index < decode_count;
-    const group_batch& group = decodes ? *inputs.decode_group : *inputs.prefill_group;
-    const float* mass = (decodes ? decode_mass : prefill_mass).const_data_ptr<float>();
-    std::size_t s = decodes ? index : index - decode_count;
+    if (kind_of(index) == group_kind::decode) {
+        return view_mass(*inputs.decode_group, decode_mass, index, mass_heads);
+    }
+    assert(kind_of(index) == group_kind::prefill);
+    return view_mass(*inputs.prefill_group, prefill_mass, index - decode_count, mass_heads);
+}
+
+std::vector<executor::batch::layer_step_mass>
+executor::batch::verify_row_mass(std::size_t index, std::size_t row, const std::vector<std::size_t>& mass_heads) const {
+    return view_mass(*inputs.verify_group, verify_mass, first_row(index) + row, mass_heads);
+}
+
+std::vector<executor::batch::layer_step_mass> executor::batch::view_mass(
+    const group_batch& group,
+    const at::Tensor& mass,
+    std::size_t view,
+    const std::vector<std::size_t>& mass_heads
+) {
+    const float* values = mass.const_data_ptr<float>();
     auto row_size = static_cast<std::size_t>(group.cu_view_pages.size(1));
     const auto* cu_view_pages = group.cu_view_pages.const_data_ptr<std::int32_t>();
     std::vector<layer_step_mass> by_layer(mass_heads.size());
@@ -537,16 +769,167 @@ executor::batch::step_mass(std::size_t index, const std::vector<std::size_t>& ma
             continue;
         }
         const std::int32_t* row = cu_view_pages + layer * row_size;
-        auto first_page = static_cast<std::size_t>(row[s]);
-        auto pages = static_cast<std::size_t>(row[s + 1] - row[s]);
+        auto first_page = static_cast<std::size_t>(row[view]);
+        auto pages = static_cast<std::size_t>(row[view + 1] - row[view]);
         auto layer_pages = static_cast<std::size_t>(row[row_size - 1]);
         by_layer[layer] = layer_step_mass{
-            .mass_sum = std::span(mass + first + first_page * heads, pages * heads),
-            .weight_sum = std::span(mass + first + layer_pages * heads + first_page, pages),
+            .mass_sum = std::span(values + first + first_page * heads, pages * heads),
+            .weight_sum = std::span(values + first + layer_pages * heads + first_page, pages),
         };
         first += layer_pages * (heads + 1);
     }
     return by_layer;
+}
+
+void executor::batch::plan_draft_rows(
+    std::size_t index,
+    std::span<const std::int64_t> tokens,
+    bool next_row,
+    bool drafts,
+    std::size_t draft_layer,
+    std::size_t draft_count
+) {
+    sequence& seq = *entries[index].seq;
+    const std::size_t start = step_starts[index];
+    const std::size_t next = seq.history_position();
+    const std::size_t first = seq.draft_rows_end;
+    const std::size_t end = next_row ? next + 1 : next;
+    assert(next == start + tokens.size() && (first == start || first == start + 1) && (next_row || !drafts));
+    if (end == first) {
+        return;
+    }
+    auto rows_of = [](const std::optional<group_batch>& group) {
+        return group ? static_cast<std::size_t>(group->tokens.size(0)) : 0;
+    };
+    std::size_t step_source = 1 + prior_lines.size() + first_row(index);
+    if (kind_of(index) != group_kind::prefill) {
+        step_source += rows_of(inputs.prefill_group);
+    }
+    if (kind_of(index) == group_kind::verify) {
+        step_source += rows_of(inputs.decode_group);
+    }
+    const std::size_t next_index = seq.next_index(draft_layer);
+    const std::size_t next_position = seq.next_position();
+    for (std::size_t t = first; t < end; t++) {
+        draft_tokens.push_back(t < next ? tokens[t - start] : seq.pending_tokens.front());
+        draft_positions.push_back(static_cast<std::int64_t>(next_position + t - next));
+        if (t == 0) {
+            draft_sources.push_back(0);
+        } else if (t == start) {
+            assert(prior_rows[index]);
+            draft_sources.push_back(static_cast<std::int64_t>(1 + *prior_rows[index]));
+        } else {
+            draft_sources.push_back(static_cast<std::int64_t>(step_source + t - 1 - start));
+        }
+    }
+    draft_key_counts.push_back(static_cast<std::int32_t>(next_index + end - next));
+    seq.draft_rows_end = end;
+    if (drafts) {
+        drafting.push_back(draft_entries.size());
+        later_positions.resize(draft_count - 1);
+        later_key_counts.resize(draft_count - 1);
+        for (std::size_t j = 1; j < draft_count; j++) {
+            later_positions[j - 1].push_back(static_cast<std::int64_t>(next_position + j));
+            later_key_counts[j - 1].push_back(static_cast<std::int32_t>(next_index + j + 1));
+        }
+    }
+    draft_entries.push_back(batch_entry{.seq = &seq, .token_count = end - first, .samples = drafts});
+}
+
+void executor::batch::enqueue_drafts(
+    model& shard_model,
+    std::span<const kv> lines,
+    cudaStream_t stream,
+    std::size_t shard,
+    at::Tensor& counters
+) {
+    at::Device device = lines.front().k.device();
+    c10::cuda::CUDAStreamGuard guard(c10::cuda::getStreamFromExternal(stream, device.index()));
+    draft_head& head = *shard_model.drafter();
+    const auto n_layers = lines.size();
+    const auto longs = at::TensorOptions().dtype(at::kLong);
+    const auto ints = at::TensorOptions().dtype(at::kInt);
+    auto on_device = [&](const auto& values, at::TensorOptions options) {
+        return at::tensor(values, options).to(device, /*non_blocking=*/true);
+    };
+    // Every KV layer's row of a group's key counts, as the draft head reads only its own.
+    auto key_counts = [&](const std::vector<std::int32_t>& counts) {
+        return on_device(counts, ints).unsqueeze(0).expand({static_cast<std::int64_t>(n_layers), -1}).contiguous();
+    };
+    auto tables = [&](std::span<const batch_entry> group, group_batch& g) {
+        const std::size_t width = table_width(group);
+        g.page_tables = page_tables(group, n_layers, false, shard, width);
+        g.page_positions = page_tables(group, n_layers, true, shard, width);
+    };
+    auto with_counters = [&](group_batch& g, std::int64_t sequences) {
+        const std::int64_t needed = shard_model.arrival_counter_count(sequences, g.tokens.size(0));
+        if (!counters.defined() || counters.numel() < needed) {
+            counters = at::zeros({needed}, at::device(device).dtype(at::kInt));
+        }
+        g.arrival_counters = counters;
+    };
+
+    const step_logits& step = shard_hidden[shard];
+    std::vector<at::Tensor> step_rows;
+    for (const std::optional<at::Tensor>& hidden : {step.prefill_hidden, step.decode_hidden, step.verify_hidden}) {
+        if (hidden) {
+            step_rows.push_back(*hidden);
+        }
+    }
+    std::vector<at::Tensor> sources{at::zeros({1, head.hidden_dim()}, step_rows.front().options())};
+    if (shard_prior_hidden[shard].defined()) {
+        sources.push_back(shard_prior_hidden[shard]);
+    }
+    sources.insert(sources.end(), step_rows.begin(), step_rows.end());
+    std::vector<std::int32_t> starts{0};
+    std::vector<std::int64_t> last_rows;
+    for (const batch_entry& e : draft_entries) {
+        starts.push_back(starts.back() + static_cast<std::int32_t>(e.token_count));
+        last_rows.push_back(starts.back() - 1);
+    }
+    group_batch rows{
+        .tokens = on_device(draft_tokens, longs),
+        .pos = on_device(draft_positions, longs),
+        .cu_seqlens_q = on_device(starts, ints),
+        .key_counts = key_counts(draft_key_counts),
+        .logit_rows = on_device(last_rows, longs),
+    };
+    tables(draft_entries, rows);
+    with_counters(rows, static_cast<std::int64_t>(draft_entries.size()));
+    at::Tensor hidden = at::cat(sources).index_select(0, on_device(draft_sources, longs));
+    draft_output drafted_rows = head.draft(rows, hidden, lines);
+    if (drafting.empty()) {
+        return;
+    }
+
+    std::vector<std::int64_t> drafting_sequences(drafting.begin(), drafting.end());
+    std::vector<std::int64_t> drafting_rows;
+    std::vector<batch_entry> drafting_entries;
+    for (std::size_t s : drafting) {
+        drafting_rows.push_back(last_rows[s]);
+        drafting_entries.push_back(draft_entries[s]);
+    }
+    at::Tensor token = drafted_rows.logits.index_select(0, on_device(drafting_sequences, longs)).argmax(-1);
+    at::Tensor previous = drafted_rows.hidden.index_select(0, on_device(drafting_rows, longs));
+    std::vector<at::Tensor> tokens{token};
+    for (std::size_t j = 0; j < later_positions.size(); j++) {
+        group_batch one_row{
+            .tokens = token,
+            .pos = on_device(later_positions[j], longs),
+            .key_counts = key_counts(later_key_counts[j]),
+        };
+        tables(drafting_entries, one_row);
+        with_counters(one_row, static_cast<std::int64_t>(drafting_entries.size()));
+        draft_output next = head.draft(one_row, previous, lines);
+        token = next.logits.argmax(-1);
+        previous = next.hidden;
+        tokens.push_back(token);
+    }
+    if (shard == 0) {
+        at::Tensor stacked = at::stack(tokens, 1);
+        drafted = pinned(stacked.sizes(), at::kLong);
+        drafted.copy_(stacked, /*non_blocking=*/true);
+    }
 }
 
 void executor::batch::join_mass(
@@ -592,6 +975,7 @@ void executor::batch::join_mass(
         return joined;
     };
     decode_mass = join(shard_decode_mass, inputs.decode_group);
+    verify_mass = join(shard_verify_mass, inputs.verify_group);
     prefill_mass = join(shard_prefill_mass, inputs.prefill_group);
 }
 
@@ -898,6 +1282,9 @@ bool executor::completes_page(const batch_entry& e) const noexcept {
 }
 
 bool executor::quiet(std::span<const batch_entry> entries) const noexcept {
+    if (draft_layer) {
+        return false;
+    }
     const bool sliding = std::ranges::any_of(sliding_windows, [](const std::optional<std::size_t>& window) {
         return window.has_value();
     });
@@ -906,11 +1293,94 @@ bool executor::quiet(std::span<const batch_entry> entries) const noexcept {
     });
 }
 
+std::size_t executor::accepted_count(const sequence& seq, std::span<const std::int64_t> samples) const {
+    std::size_t count = 1;
+    while (count < samples.size() && samples[count - 1] == seq.drafts[count - 1]) {
+        count++;
+    }
+    auto stop = std::ranges::find_if(samples.first(count), [&](std::int64_t token) {
+        return std::ranges::contains(stop_ids, token);
+    });
+    count = std::min(count, static_cast<std::size_t>(stop - samples.begin()) + 1);
+    if (seq.max_tokens) {
+        count = std::min(count, *seq.max_tokens - seq.generated_count);
+    }
+    return count;
+}
+
+// A verify entry measured each row's mass with weight 1; its kept rows are weighed as one step of kept tokens.
+void executor::add_measured_mass(const batch& b, std::size_t index, std::size_t kept) {
+    sequence& seq = *b.entries[index].seq;
+    std::vector<batch::layer_step_mass> step_mass;
+    std::vector<std::vector<float>> verified_mass(mass_heads.size());
+    std::vector<std::vector<float>> verified_weight(mass_heads.size());
+    if (b.kind_of(index) == batch::group_kind::verify) {
+        std::vector<float> weights(kept);
+        seq.fill_query_weights(b.step_starts[index], weights);
+        step_mass.resize(mass_heads.size());
+        for (std::size_t row = 0; row < kept; row++) {
+            std::vector<batch::layer_step_mass> row_mass = b.verify_row_mass(index, row, mass_heads);
+            for (std::size_t layer = 0; layer < mass_heads.size(); layer++) {
+                if (mass_heads[layer] == 0) {
+                    continue;
+                }
+                verified_mass[layer].resize(row_mass[layer].mass_sum.size());
+                verified_weight[layer].resize(row_mass[layer].weight_sum.size());
+                for (std::size_t j = 0; j < verified_mass[layer].size(); j++) {
+                    verified_mass[layer][j] += weights[row] * row_mass[layer].mass_sum[j];
+                }
+                for (std::size_t j = 0; j < verified_weight[layer].size(); j++) {
+                    verified_weight[layer][j] += weights[row] * row_mass[layer].weight_sum[j];
+                }
+                step_mass[layer] = batch::layer_step_mass{
+                    .mass_sum = verified_mass[layer],
+                    .weight_sum = verified_weight[layer],
+                };
+            }
+        }
+    } else {
+        step_mass = b.step_mass(index, mass_heads);
+    }
+    for (std::size_t layer = 0; layer < mass_heads.size(); layer++) {
+        if (mass_heads[layer] > 0) {
+            layer_view& view = seq.layers[layer];
+            add_step_mass(
+                view.mass_sum,
+                view.weight_sum,
+                step_mass[layer].mass_sum.first(view.mass_sum.size()),
+                step_mass[layer].weight_sum.first(view.weight_sum.size()),
+                b.step_ends[index] - seq.measured_end,
+                seq.eviction.attention_mass_decay
+            );
+        }
+    }
+}
+
+// A verify entry's tokens are kept, and its samples taken, at its write-back.
 void executor::advance(batch& b) {
     std::size_t sampled_row = 0;
-    for (const batch_entry& e : b.entries) {
+    for (std::size_t i = 0; i < b.entries.size(); i++) {
+        const batch_entry& e = b.entries[i];
         sequence& seq = *e.seq;
         b.measured.push_back(batch::measures_mass(e));
+        b.step_starts.push_back(seq.history_position());
+        b.ends_cycle.push_back(e.ends_cycle);
+        if (draft_layer && seq.draft_rows_end == seq.history_position() && seq.history_position() > 0) {
+            const layer_view& view = seq.layers[*draft_layer];
+            b.prior_rows.push_back(b.prior_lines.size());
+            b.prior_lines.push_back(view.lines[(seq.next_index(*draft_layer) - 1) / page_size]);
+        } else {
+            b.prior_rows.emplace_back();
+        }
+        if (b.kind_of(i) == batch::group_kind::verify) {
+            b.step_ends.push_back(seq.history_position());
+            seq.advance(e.token_count);
+            b.sampled_positions.push_back(seq.history_position());
+            b.ends_sequence.push_back(false);
+            seq.steps_in_flight++;
+            continue;
+        }
+        seq.rejected_tokens = 0;
         b.step_ends.push_back(seq.history_position() + e.token_count);
         seq.advance(e.token_count);
         b.sampled_positions.push_back(seq.history_position() + seq.pending_tokens.size());
@@ -932,7 +1402,10 @@ task<void> executor::launch(std::vector<batch_entry> entries) {
     b->quiet = quiet(b->entries);
     advance(*b);
     b->shard_decode_mass.assign(shards.size(), at::Tensor());
+    b->shard_verify_mass.assign(shards.size(), at::Tensor());
     b->shard_prefill_mass.assign(shards.size(), at::Tensor());
+    b->shard_prior_hidden.assign(shards.size(), at::Tensor());
+    b->shard_hidden.assign(shards.size(), step_logits());
     TORCH_CHECK(
         static_cast<std::int64_t>(b->sample_params.size()) <= max_sampled_rows,
         "executor: a step samples at most ",
@@ -956,12 +1429,54 @@ task<void> executor::launch(std::vector<batch_entry> entries) {
     launched.push_back(std::move(b));
 }
 
+task<void> executor::run_draft_pass(batch& b) {
+    if (b.draft_entries.empty()) {
+        co_return;
+    }
+    std::vector<external_task<>> other_shards;
+    for (std::size_t shard = 1; shard < shards.size(); shard++) {
+        other_shards.push_back(run_on(*worker_loops[shard - 1], enqueue_drafts_on_shard(b, shard)));
+    }
+    co_await enqueue_drafts_on_shard(b, 0);
+    for (external_task<>& other : other_shards) {
+        co_await std::move(other);
+    }
+    std::vector<external_task<cudaError_t>> completions;
+    for (std::size_t shard = 0; shard < shards.size(); shard++) {
+        at::Device device = lines[shard].front().k.device();
+        c10::cuda::CUDAGuard device_guard(device);
+        b.ends[shard].record(c10::cuda::getStreamFromExternal(streams[shard], device.index()));
+        completions.push_back(completion_of(streams[shard]));
+    }
+    for (external_task<cudaError_t>& completion : completions) {
+        cudaError_t status = co_await std::move(completion);
+        if (status != cudaSuccess) {
+            throw std::runtime_error(std::string("run_draft_pass: ") + cudaGetErrorString(status));
+        }
+    }
+    if (b.drafting.empty()) {
+        co_return;
+    }
+    const auto* drafted = b.drafted.const_data_ptr<std::int64_t>();
+    const auto count = static_cast<std::size_t>(b.drafted.size(1));
+    for (std::size_t d = 0; d < b.drafting.size(); d++) {
+        b.draft_entries[b.drafting[d]].seq->drafts.assign(drafted + d * count, drafted + (d + 1) * count);
+    }
+}
+
+task<void> executor::enqueue_drafts_on_shard(batch& b, std::size_t shard) {
+    c10::cuda::CUDAGuard device_guard(lines[shard].front().k.device());
+    b.enqueue_drafts(*shards[shard], lines[shard], streams[shard], shard, eager_counters[shard]);
+    co_return;
+}
+
 task<void> executor::enqueue_on_shard(batch& b, std::size_t shard) {
     c10::cuda::CUDAGuard device_guard(lines[shard].front().k.device());
     b.enqueue(
         *shards[shard],
         lines[shard],
         shard_mass_heads[shard],
+        draft_layer,
         streams[shard],
         shard,
         graphs.empty() ? nullptr : graphs[shard].get(),
@@ -1043,9 +1558,11 @@ task<void> executor::write_back() {
     for (std::size_t i = 0; i < b.entries.size(); i++) {
         const batch_entry& e = b.entries[i];
         sequence& seq = *e.seq;
-        std::optional<std::int64_t> token;
+        const bool verifies = b.kind_of(i) == batch::group_kind::verify;
+        std::span<const std::int64_t> samples;
         if (e.samples) {
-            token = *next_sampled++;
+            samples = std::span(next_sampled, verifies ? b.verify_rows : 1);
+            next_sampled += samples.size();
         }
         if (exited[i]) {
             continue;
@@ -1054,31 +1571,39 @@ task<void> executor::write_back() {
             seq.end_reason = sequence::exit_reason::oom;
             continue;
         }
+        // The tokens the step keeps, and of its samples those it emits.
+        std::vector<std::int64_t> kept_tokens = b.forwarded_tokens(i);
+        std::span<const std::int64_t> emitted = samples;
+        if (verifies) {
+            const std::size_t kept = accepted_count(seq, samples);
+            kept_tokens.resize(kept);
+            emitted = samples.first(kept);
+            seq.keep_drafts(kept - 1, samples[kept - 1]);
+            seq.draw_count += kept;
+            seq.generated_count += kept;
+            b.step_ends[i] = seq.history_position();
+            b.ends_cycle[i] = seq.ends_cycle(0);
+        }
         std::size_t completed_count = seq.complete_pages(b.step_ends[i]);
         if (completed_count > 0 && has_recurrent) {
             seq.state_pending = true;
         }
         if (b.measured[i]) {
-            std::vector<batch::layer_step_mass> step_mass = b.step_mass(i, mass_heads);
-            for (std::size_t layer = 0; layer < n_layers; layer++) {
-                if (mass_heads[layer] > 0) {
-                    layer_view& view = seq.layers[layer];
-                    add_step_mass(
-                        view.mass_sum,
-                        view.weight_sum,
-                        step_mass[layer].mass_sum.first(view.mass_sum.size()),
-                        step_mass[layer].weight_sum.first(view.weight_sum.size()),
-                        b.step_ends[i] - seq.measured_end,
-                        seq.eviction.attention_mass_decay
-                    );
-                }
-            }
+            add_measured_mass(b, i, kept_tokens.size());
             seq.measured_end = b.step_ends[i];
         }
-        if (token) {
-            seq.resolve_token(b.sampled_positions[i], *token);
-            seq.writer.append(*token);
-            if (std::ranges::contains(stop_ids, *token)) {
+        if (verifies) {
+            for (std::int64_t token : emitted) {
+                seq.writer.append(token);
+            }
+            if (std::ranges::contains(stop_ids, emitted.back()) || !seq.may_sample()) {
+                seq.end_reason = sequence::exit_reason::finished;
+            }
+        } else if (!samples.empty()) {
+            const std::int64_t token = samples.front();
+            seq.resolve_token(b.sampled_positions[i], token);
+            seq.writer.append(token);
+            if (std::ranges::contains(stop_ids, token)) {
                 seq.end_reason = sequence::exit_reason::finished;
                 if (seq.steps_in_flight > 1) {
                     seq.withdraw_latest_step();
@@ -1088,7 +1613,14 @@ task<void> executor::write_back() {
         if (b.ends_sequence[i]) {
             seq.end_reason = sequence::exit_reason::finished;
         }
-        const bool reaches_state = e.ends_cycle || seq.end_reason == sequence::exit_reason::finished;
+        if (draft_layer) {
+            // A cycle's end changes the views the next token's row reads, so its row waits for the next step.
+            const bool next_row = !seq.end_reason && !b.ends_cycle[i];
+            const bool drafts = next_row && seq.pending_tokens.size() == 1 && seq.may_sample() &&
+                seq.cycle_tokens_left() >= draft_state_slots;
+            b.plan_draft_rows(i, kept_tokens, next_row, drafts, *draft_layer, draft_state_slots - 1);
+        }
+        const bool reaches_state = b.ends_cycle[i] || seq.end_reason == sequence::exit_reason::finished;
         if (reaches_state) {
             state_reachers.push_back(&seq);
             if (seq.state_pending) {
@@ -1130,7 +1662,11 @@ task<void> executor::write_back() {
         }
     }
 
-    // The copies wait for this step only, not for the step launched after it, which writes none of the copied lines.
+    if (draft_layer) {
+        co_await run_draft_pass(b);
+    }
+    // The copies wait for this step only, and its draft pass, not for the step launched after it, which writes none of
+    // the copied lines.
     for (std::size_t shard = 0; shard < shards.size(); shard++) {
         at::Device device = lines[shard].front().k.device();
         b.ends[shard].block(c10::cuda::getStreamFromExternal(copy_streams[shard], device.index()));
@@ -1199,14 +1735,14 @@ task<void> executor::write_back() {
             continue;
         }
         bool views_changed = release_passed_pages(seq);
-        if (e.ends_cycle) {
+        if (b.ends_cycle[i]) {
             add_sampled_pages(seq);
             views_changed = evict(seq) || views_changed;
         }
         if (views_changed) {
             update_views(seq);
         }
-        if (e.ends_cycle) {
+        if (b.ends_cycle[i]) {
             co_await write_cycle_end(seq);
             seq.start_next_cycle();
         }

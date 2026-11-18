@@ -164,6 +164,7 @@ sequence::sequence(
     std::size_t window_start = next_cycle_end - eviction.mass_tokens;
     measured_end = resumed_end > window_start ? resumed_end : next_cycle_end - eviction.cycle_tokens;
     prompt_count = r.tokens.size();
+    draft_rows_end = cached_count;
     update_held();
 }
 
@@ -246,6 +247,14 @@ std::uint32_t& sequence::head_state_line(std::size_t layer) {
     return layers[layer].lines[state_slots[layer] + (history_pages - 1) % 2];
 }
 
+void sequence::keep_drafts(std::size_t kept, std::int64_t next) {
+    assert(kept <= drafts.size() && pending_tokens.empty());
+    tail.insert(tail.end(), drafts.begin(), drafts.begin() + static_cast<std::ptrdiff_t>(kept));
+    rejected_tokens = drafts.size() - kept;
+    drafts.clear();
+    pending_tokens.push_back(next);
+}
+
 void sequence::resolve_token(std::size_t index, std::int64_t token) {
     std::size_t offset = index - history_pages * page_size;
     std::int64_t& awaited = offset < tail.size() ? tail[offset] : pending_tokens[offset - tail.size()];
@@ -312,9 +321,8 @@ std::size_t sequence::measured_start() const noexcept {
     return std::max(next_cycle_end - eviction.mass_tokens, measured_end);
 }
 
-void sequence::fill_query_weights(std::span<float> weights) const noexcept {
-    std::size_t start = history_position();
-    std::size_t unmeasured = std::min(weights.size(), std::max(measured_start(), start) - start);
+void sequence::fill_query_weights(std::size_t first, std::span<float> weights) const noexcept {
+    std::size_t unmeasured = std::min(weights.size(), std::max(measured_start(), first) - first);
     std::fill_n(weights.begin(), unmeasured, 0.0f);
     query_weights(weights.subspan(unmeasured), eviction.attention_mass_decay);
 }

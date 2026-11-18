@@ -159,6 +159,7 @@ def load(
         prefill_tokens_per_step=64,
         decode_graphs=True,
         max_context_window=4096,
+        draft_tokens=0,
     )
     return ServerState(
         engine=AsyncEngine(engine),

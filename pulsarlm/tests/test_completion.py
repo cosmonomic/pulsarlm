@@ -117,6 +117,7 @@ def make_engine(store: LocalStore | EmptyStore) -> AsyncEngine:
             prefill_tokens_per_step=64,
             decode_graphs=True,
             max_context_window=4096,
+            draft_tokens=0,
         )
     )
 
