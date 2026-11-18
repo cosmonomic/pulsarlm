@@ -49,6 +49,12 @@ class lease_guard {
 // the other such line, which the step before it wrote.
 class layer_view {
   public:
+    // A recurrent layer's lines, by position.
+    static constexpr std::size_t running_line = 0;
+    static constexpr std::size_t next_boundary_line = 1;
+    static constexpr std::size_t previous_boundary_line = 2;
+    static constexpr std::size_t recurrent_lines = 3;
+
     std::vector<digest> pages;
     std::vector<std::size_t> indices;
     std::vector<std::uint32_t> lines;
@@ -167,9 +173,10 @@ class sequence {
     // Moves the full pages of tail before history position end to every layer with pages, and returns how many. The
     // tokens of those pages are not awaited_token.
     std::size_t complete_pages(std::size_t end);
-    // For a step completing a page: returns, per KV layer, the line that step writes the state at the page's end into
-    // (0 for a layer with pages), and makes the other boundary line the next such line.
-    std::vector<std::uint32_t> switch_boundary_lines();
+    // For a step completing a page, called once the step is queued: returns, per KV layer, the line the step writes
+    // the state at the page's end into (0 for a layer with pages), makes the other boundary line the next such line,
+    // and queues the upload of both into the tables on each shard's stream.
+    std::vector<std::uint32_t> switch_boundary_lines(std::span<const cudaStream_t> streams);
     // Sets the token at history position index, in tail or pending, which was awaited_token.
     void resolve_token(std::size_t index, std::int64_t token);
     // Undoes the advance by one token of the latest launched step, whose pages are not completed yet, and its sample if
@@ -189,13 +196,11 @@ class sequence {
     std::size_t cycle_tokens_left() const noexcept;
     // The columns of table the lines take.
     std::size_t table_width() const noexcept;
-    // Queues on each shard's stream the upload of the lines and positions of columns [first_page, end_page) into its
-    // tables, end_page the table width without it, all of them when the tables grow.
-    void upload_table(
-        std::size_t first_page,
-        std::span<const cudaStream_t> streams,
-        std::optional<std::size_t> end_page = std::nullopt
-    );
+    // Queues on each shard's stream the upload of the lines and positions from column first_page on into its tables,
+    // all of them when the tables grow.
+    void upload_table(std::size_t first_page, std::span<const cudaStream_t> streams);
+    // upload_table of the columns [first_page, end_page), all of them when the tables grow.
+    void upload_columns(std::size_t first_page, std::size_t end_page, std::span<const cudaStream_t> streams);
     // One line per page the cycle's tokens fill, in each KV layer with pages. Called at the start of a cycle, with an
     // empty tail.
     std::size_t cycle_lines() const noexcept;

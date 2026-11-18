@@ -114,8 +114,10 @@ class executor::batch {
     std::vector<std::size_t> step_ends;
     std::vector<std::size_t> sampled_positions;
     std::vector<bool> ends_sequence;
-    // Per entry that completes a page, per KV layer, the recurrent layers' lines the step writes the state at that
-    // page's end into (sequence::switch_boundary_lines); empty for the other entries.
+    // Per entry, whether its tokens fill a page; for those of a model with recurrent layers, per KV layer, the
+    // recurrent layers' lines the step writes the state at that page's end into (sequence::switch_boundary_lines),
+    // empty for the other entries.
+    std::vector<bool> fills_page;
     std::vector<std::vector<std::uint32_t>> boundary_lines;
     bool quiet = false;
     // Per shard, completing once the step's work on its stream has, and an event recorded after that work.
@@ -722,7 +724,9 @@ task<std::expected<void, page_error>> executor::take_lines(sequence& seq, std::s
     std::vector<std::size_t> counts(cache.layer_count(), line_count);
     for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
         if (recurrent[layer]) {
-            counts[layer] = (*page_lines)[layer].empty() ? 3 : 2;
+            // Without a stored state, the running line too.
+            counts[layer] = (*page_lines)[layer].empty() ? layer_view::recurrent_lines
+                                                         : layer_view::recurrent_lines - 1;
         }
     }
     std::expected<std::vector<std::vector<std::uint32_t>>, page_error> allocation = cache.allocate(counts);
@@ -846,9 +850,7 @@ void executor::advance(batch& b) {
         sequence& seq = *e.seq;
         b.measured.push_back(batch::measures_mass(e));
         b.step_ends.push_back(seq.history_position() + e.token_count);
-        b.boundary_lines.push_back(
-            has_recurrent && completes_page(e) ? seq.switch_boundary_lines() : std::vector<std::uint32_t>()
-        );
+        b.fills_page.push_back(has_recurrent && completes_page(e));
         seq.advance(e.token_count);
         b.sampled_positions.push_back(seq.history_position() + seq.pending_tokens.size());
         if (e.samples) {
@@ -892,9 +894,9 @@ task<executor::launched_step> executor::launch(std::vector<batch_entry> entries)
     }
     // The step read the boundary lines it writes from the tables; later steps write the other ones.
     for (std::size_t i = 0; i < b->entries.size(); i++) {
-        if (!b->boundary_lines[i].empty()) {
-            b->entries[i].seq->upload_table(1, streams, 3);
-        }
+        b->boundary_lines.push_back(
+            b->fills_page[i] ? b->entries[i].seq->switch_boundary_lines(streams) : std::vector<std::uint32_t>()
+        );
     }
     co_return launched_step(std::move(b));
 }
@@ -1113,12 +1115,22 @@ task<void> executor::write_back(launched_step& step) {
                 continue;
             }
             seq->state_pending = false;
+            // The synced line keeps the stored state as a cached page; a new line takes its place.
+            std::vector<std::size_t> counts(n_layers, 0);
+            for (std::size_t layer = 0; layer < n_layers; layer++) {
+                counts[layer] = recurrent[layer] ? 1 : 0;
+            }
+            std::expected<std::vector<std::vector<std::uint32_t>>, page_error> replacements = cache.allocate(counts);
+            if (!replacements) {
+                seq->end_reason = sequence::exit_reason::oom;
+                continue;
+            }
             for (std::size_t layer = 0; layer < n_layers; layer++) {
                 if (recurrent[layer]) {
                     std::vector<std::uint32_t>& state_lines = seq->layers[layer].lines;
                     auto head_line = std::ranges::find(state_lines, seq->head_state_lines[layer]);
                     cache.release(layer, std::span(&*head_line, 1));
-                    state_lines.erase(head_line);
+                    *head_line = (*replacements)[layer].front();
                 }
             }
         }
@@ -1143,7 +1155,7 @@ task<void> executor::write_back(launched_step& step) {
             seq.update_held();
             first_stale_page = 0;
         } else if (std::ranges::contains(state_writers, &seq)) {
-            first_stale_page = 1;
+            first_stale_page = layer_view::next_boundary_line;
         }
         std::vector<std::size_t> missing_counts = seq.missing_lines();
         if (std::ranges::any_of(missing_counts, [](std::size_t count) { return count > 0; })) {
