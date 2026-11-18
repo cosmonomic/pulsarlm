@@ -26,7 +26,7 @@ def write_source(
     text = {"vocab_size": 8, "num_hidden_layers": 1}
     if model_type.endswith("_text"):
         config |= text
-    elif model_type.startswith(("gemma4", "qwen3_5")):
+    elif model_type.startswith(("gemma4", "qwen3_5", "qwen4_exp")):
         config["text_config"] = text
     (src / "config.json").write_text(json.dumps(config))
     (src / "tokenizer.json").write_text(
@@ -90,6 +90,30 @@ def test_a_qwen3_5_checkpoint_keeps_its_text_weights_and_untied_head(tmp_path: P
     assert sorted(built_weights(dst)) == [
         "lm_head.weight",
         "model.language_model.norm.weight",
+    ]
+
+
+def test_a_qwen4_exp_checkpoint_keeps_its_multi_token_prediction_layer(tmp_path: Path):
+    src = tmp_path / "src"
+    src.mkdir()
+    write_source(
+        src,
+        "qwen4_exp",
+        {
+            "model.language_model.norm.weight": torch.ones(2),
+            "lm_head.weight": torch.ones(3),
+            "model.visual.weight": torch.zeros(3),
+            "mtp.fc_hidden.weight": torch.zeros(3),
+        },
+        {"chat_template": TEMPLATE},
+    )
+    dst = tmp_path / "model"
+    migrate(src, dst, OVERRIDES)
+
+    assert sorted(built_weights(dst)) == [
+        "lm_head.weight",
+        "model.language_model.norm.weight",
+        "mtp.fc_hidden.weight",
     ]
 
 

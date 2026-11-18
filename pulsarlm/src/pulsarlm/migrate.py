@@ -106,8 +106,14 @@ def chat_template(src: Path, tokenizer_config: dict) -> str:
 def is_text_weight(architecture: str, name: str) -> bool:
     if architecture in GEMMA4:
         return name.startswith("model.language_model.")
-    if architecture in QWEN3_5 + QWEN4_EXP:
+    if architecture in QWEN3_5:
         return name.startswith("model.language_model.") or name == "lm_head.weight"
+    if architecture in QWEN4_EXP:
+        # Its multi-token prediction layer drafts tokens.
+        return (
+            name.startswith(("model.language_model.", "mtp."))
+            or name == "lm_head.weight"
+        )
     if architecture in QWEN3_5_TEXT:
         return name.startswith("model.") or name == "lm_head.weight"
     return True
