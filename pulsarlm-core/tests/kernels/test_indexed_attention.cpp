@@ -104,7 +104,8 @@ bool selected(const at::Tensor& host_bits, int64_t row, int64_t key) {
 // The dense reference: each query's keys j <= p of its selected blocks, the keys rotated to their view index and
 // rounded to the pool dtype as the kernels stage them. mass_sum is [view pages, heads]: per page and head, the sum over
 // the queries attending one of the page's keys of their weight times their max scaled score over its keys they attend;
-// weight_sum is [view pages], the sum of those weights.
+// weight_sum is [view pages], the sum of those weights. A sequence's queries share its view pages, or with per_query
+// each query has its own, kMaxPages per query row.
 void reference(
     const view_batch& b,
     const at::Tensor& q,
@@ -115,7 +116,8 @@ void reference(
     double scale,
     at::Tensor& o,
     at::Tensor& mass_sum,
-    at::Tensor& weight_sum
+    at::Tensor& weight_sum,
+    bool per_query
 ) {
     const int64_t n_kv = k_pool.size(2), head_dim = k_pool.size(3), group = q.size(1) / n_kv;
     at::Tensor host_bits = selection.cpu();
@@ -153,7 +155,8 @@ void reference(
                 }
                 for (int64_t page = 0; page < kMaxPages; ++page) {
                     if (page_max[page]) {
-                        const int64_t view_page = static_cast<int64_t>(s) * kMaxPages + page;
+                        const int64_t view = per_query ? row : static_cast<int64_t>(s);
+                        const int64_t view_page = view * kMaxPages + page;
                         host_mass[view_page][h] += weight * *page_max[page];
                         if (h == 0) {
                             host_weight[view_page] += weight;
@@ -220,7 +223,7 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
     at::Tensor expected_o = at::zeros({b.total_q, n_q, head_dim}, opts.dtype(at::kFloat));
     at::Tensor expected_mass = mass_of();
     at::Tensor expected_weights = weights_of();
-    reference(b, q, k_pool, v_pool, selection, rope, scale, expected_o, expected_mass, expected_weights);
+    reference(b, q, k_pool, v_pool, selection, rope, scale, expected_o, expected_mass, expected_weights, false);
     const double tolerance = dtype == at::kFloat ? 1e-4 : 2e-2;
     CHECK(at::allclose(o.to(at::kFloat), expected_o, tolerance, tolerance));
     CHECK(at::allclose(mass, expected_mass, tolerance, tolerance));
@@ -276,4 +279,56 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
     }
     CHECK(at::allclose(all_mass, dense_mass, 1e-5, 1e-6));
     CHECK(at::allclose(all_weights, dense_weights, 1e-5, 1e-6));
+}
+
+TEST_CASE("verify indexed attention measures each query's mass in its own view", "[ops][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const auto dtype = GENERATE(at::kFloat, at::kBFloat16);
+    const int64_t first_queries = GENERATE(3, 24);
+    const int64_t head_dim = 64;
+    const int64_t page_size = 16;
+    const int64_t n_q = 4, n_kv = 2, num_lines = 6;
+    const pulsarlm::rope_parameters rope{.theta = 1e4, .partial_rotary_factor = 0.25};
+    const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
+    at::manual_seed(11);
+    view_batch b = make_batch(page_size, 3 * page_size + 5, first_queries);
+    auto opts = at::device(at::kCUDA).dtype(dtype);
+    auto k_pool = at::randn({num_lines, page_size, n_kv, head_dim}, opts);
+    auto v_pool = at::randn({num_lines, page_size, n_kv, head_dim}, opts);
+    auto q = at::randn({b.total_q, n_q, head_dim}, opts);
+    const int64_t words = (kMaxPages * page_size / kBlockSize + 31) / 32;
+    at::Tensor selection = random_selection(b, page_size, words);
+    at::Tensor cu_query_pages = at::arange(b.total_q + 1, b.cu_view_pages.options()) * kMaxPages;
+    at::Tensor mass = at::zeros({b.total_q * kMaxPages, n_q}, opts.dtype(at::kFloat));
+    at::Tensor weights = at::zeros({b.total_q * kMaxPages}, opts.dtype(at::kFloat));
+
+    at::Tensor o = pulsarlm::attn_indexed_verify_cuda(
+        q,
+        k_pool,
+        v_pool,
+        b.page_tables,
+        b.cu_seqlens_q,
+        b.seqlens_k,
+        b.page_positions,
+        rope,
+        scale,
+        selection,
+        kBlockSize,
+        kMaxPages * page_size / kBlockSize,
+        mass,
+        weights,
+        cu_query_pages,
+        b.query_weights
+    );
+
+    at::Tensor expected_o = at::zeros({b.total_q, n_q, head_dim}, opts.dtype(at::kFloat));
+    at::Tensor expected_mass = at::zeros_like(mass);
+    at::Tensor expected_weights = at::zeros_like(weights);
+    reference(b, q, k_pool, v_pool, selection, rope, scale, expected_o, expected_mass, expected_weights, true);
+    const double tolerance = dtype == at::kFloat ? 1e-4 : 2e-2;
+    CHECK(at::allclose(o.to(at::kFloat), expected_o, tolerance, tolerance));
+    CHECK(at::allclose(mass, expected_mass, tolerance, tolerance));
+    CHECK(at::allclose(weights, expected_weights, 1e-5, 1e-6));
 }

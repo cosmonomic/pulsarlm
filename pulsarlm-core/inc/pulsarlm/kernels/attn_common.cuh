@@ -37,6 +37,7 @@ struct paged_attn_batch {
     at::Tensor cu_view_pages;
     at::Tensor query_weights;
     at::Tensor o;
+    bool mass_per_query = false;
     double scale;
     int64_t sliding_window;
     int64_t num_seqs;
@@ -66,6 +67,7 @@ struct paged_attn_batch {
             static_cast<float*>(data(this->weight_sum)),
             static_cast<const int32_t*>(data(this->cu_view_pages)),
             static_cast<const float*>(data(this->query_weights)),
+            this->mass_per_query,
             static_cast<scalar_t*>(data(this->o)),
             static_cast<int>(this->num_seqs),
             static_cast<int>(this->n_q_heads),
@@ -88,8 +90,20 @@ bool prefill_fits(int64_t page_size, int64_t head_dim);
 // page, token and head starting 16-byte aligned.
 void check_pools(const char* op, const at::Tensor& k_pool, const at::Tensor& v_pool);
 
-// Checks the argument contract the attention ops share (pulsarlm/ops.hpp) and allocates o. op names the caller in
-// every error.
+// Checks the mass arguments of b's op, passed together or not at all, with views mass views (cu_view_pages [views + 1]),
+// and sets them on b.
+void attach_mass(
+    paged_attn_batch& b,
+    const char* op,
+    const std::optional<at::Tensor>& mass_sum,
+    const std::optional<at::Tensor>& weight_sum,
+    const std::optional<at::Tensor>& cu_view_pages,
+    const std::optional<at::Tensor>& query_weights,
+    int64_t views
+);
+
+// Checks the argument contract the attention ops share (pulsarlm/ops.hpp) and allocates o, one mass view per sequence.
+// op names the caller in every error.
 paged_attn_batch make_paged_attn_batch(
     const char* op,
     const at::Tensor& q,

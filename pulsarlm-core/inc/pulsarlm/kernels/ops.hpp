@@ -352,6 +352,28 @@ at::Tensor attn_indexed_cuda(
     const std::optional<at::Tensor>& query_weights
 );
 
+// attn_indexed_cuda measuring each query's mass apart: query i owns the rows [cu_view_pages[i], cu_view_pages[i + 1])
+// of mass_sum and weight_sum, its sequence's view pages; cu_view_pages is int32 [total_q + 1]. A verify group's
+// accepted rows are then added on their own.
+at::Tensor attn_indexed_verify_cuda(
+    const at::Tensor& q,
+    const at::Tensor& k_pool,
+    const at::Tensor& v_pool,
+    const at::Tensor& page_tables,
+    const at::Tensor& cu_seqlens_q,
+    const at::Tensor& seqlens_k,
+    const at::Tensor& page_positions,
+    const rope_parameters& rope,
+    double scale,
+    const at::Tensor& selected,
+    int64_t block_size,
+    int64_t max_selected_blocks,
+    const at::Tensor& mass_sum,
+    const at::Tensor& weight_sum,
+    const at::Tensor& cu_view_pages,
+    const at::Tensor& query_weights
+);
+
 // QSA's index queries [tokens, n_heads, dim] from the first n_heads * dim columns of index_qk [tokens, >= n_heads *
 // dim], each row contiguous: each head's RMSNorm by norm_weight (fp32, 1 + weight) as rmsnorm_cuda computes it, then
 // Hugging Face's partial RoPE of its first 2 * inv_freq.size(0) dims at the token's position (int64 [tokens]), as

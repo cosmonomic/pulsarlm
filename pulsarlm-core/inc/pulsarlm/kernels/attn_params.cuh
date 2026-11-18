@@ -39,8 +39,10 @@ template <typename scalar_t> struct paged_attn_params {
     // query_weights times the query's max score over the page's keys.
     float* mass_sum;
     float* weight_sum;  // [total_view_pages]: each page's sum of query_weights over its queries
-    const int32_t* cu_view_pages;  // [num_seqs + 1]
+    // [num_seqs + 1], or [total_q + 1] with mass_per_query: the mass rows of each sequence's view, or of each query's.
+    const int32_t* cu_view_pages;
     const float* query_weights;  // [total_q]
+    bool mass_per_query;
 
     scalar_t* o;  // [total_q, n_q_heads, head_dim]
     int num_seqs;
@@ -129,7 +131,13 @@ __device__ __forceinline__ rotated_pair<scalar_t> rope_rotate(float lo, float hi
     };
 }
 
-// The row of sequence s's view page b in mass_sum and weight_sum, so two views sharing a line accumulate apart.
+// The mass view of query row qtok of sequence s: the sequence's, or the query's own with mass_per_query.
+template <typename scalar_t>
+__device__ __forceinline__ int mass_view(const paged_attn_params<scalar_t>& p, int s, int qtok) {
+    return p.mass_per_query ? qtok : s;
+}
+
+// The row of mass view s's view page b in mass_sum and weight_sum, so two views sharing a line accumulate apart.
 template <typename scalar_t>
 __device__ __forceinline__ int64_t mass_row(const paged_attn_params<scalar_t>& p, int s, int view_page) {
     const int row = p.cu_view_pages[s] + view_page;

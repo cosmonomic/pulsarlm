@@ -138,7 +138,7 @@ __global__ void attn_indexed_scalar_kernel(const attn::paged_attn_params<scalar_
             page_max = fmaxf(page_max, sc);
         }
         if (p.mass_sum && page_max > -CUDART_INF_F) {
-            const int64_t row = attn::mass_row(p, s, page);
+            const int64_t row = attn::mass_row(p, attn::mass_view(p, s, qtok), page);
             atomicAdd(&p.mass_sum[row * p.n_q_heads + h], weight * page_max);
             if (h == 0) {
                 atomicAdd(&p.weight_sum[row], weight);
@@ -399,7 +399,7 @@ __global__ void __launch_bounds__(NWARPS * 32, CTAS_PER_SM) attn_indexed_tc_kern
     const float weight = p.mass_sum ? p.query_weights[qtok] : 0.0f;
     auto flush_page = [&](int m) {
         if (run_page[m] >= 0) {
-            const int64_t row = attn::mass_row(p, s, run_page[m]);
+            const int64_t row = attn::mass_row(p, attn::mass_view(p, s, qtok), run_page[m]);
             atomicAdd(&p.mass_sum[row * p.n_q_heads + first_head + m], weight * run_max[m]);
             if (g == 0 && m == 0) {
                 atomicAdd(&p.weight_sum[row], weight);
@@ -863,42 +863,14 @@ void launch_indexed_scalar(const attn::paged_attn_batch& b, const block_selectio
 
 }  // namespace
 
-at::Tensor attn_indexed_cuda(
-    const at::Tensor& q,
-    const at::Tensor& k_pool,
-    const at::Tensor& v_pool,
-    const at::Tensor& page_tables,
-    const std::optional<at::Tensor>& cu_seqlens_q,
-    const at::Tensor& seqlens_k,
-    const at::Tensor& page_positions,
-    const rope_parameters& rope,
-    double scale,
+namespace {
+
+at::Tensor attn_indexed(
+    const attn::paged_attn_batch& b,
     const at::Tensor& selected,
     int64_t block_size,
-    int64_t max_selected_blocks,
-    const std::optional<at::Tensor>& mass_sum,
-    const std::optional<at::Tensor>& weight_sum,
-    const std::optional<at::Tensor>& cu_view_pages,
-    const std::optional<at::Tensor>& query_weights
+    int64_t max_selected_blocks
 ) {
-    const auto b = attn::make_paged_attn_batch(
-        "attn_indexed",
-        q,
-        k_pool,
-        v_pool,
-        page_tables,
-        cu_seqlens_q,
-        seqlens_k,
-        page_positions,
-        rope,
-        scale,
-        std::nullopt,
-        std::nullopt,
-        mass_sum,
-        weight_sum,
-        cu_view_pages,
-        query_weights
-    );
     TORCH_CHECK(
         block_size >= 1 && b.page_size % block_size == 0,
         "attn_indexed: block_size must be at least 1 and divide the page size"
@@ -941,6 +913,88 @@ at::Tensor attn_indexed_cuda(
         launch_indexed_tc<scalar_t, decltype(bf16_tag)::value>(b, selection, max_selected_blocks, stream);
     });
     return b.o;
+}
+
+}  // namespace
+
+at::Tensor attn_indexed_cuda(
+    const at::Tensor& q,
+    const at::Tensor& k_pool,
+    const at::Tensor& v_pool,
+    const at::Tensor& page_tables,
+    const std::optional<at::Tensor>& cu_seqlens_q,
+    const at::Tensor& seqlens_k,
+    const at::Tensor& page_positions,
+    const rope_parameters& rope,
+    double scale,
+    const at::Tensor& selected,
+    int64_t block_size,
+    int64_t max_selected_blocks,
+    const std::optional<at::Tensor>& mass_sum,
+    const std::optional<at::Tensor>& weight_sum,
+    const std::optional<at::Tensor>& cu_view_pages,
+    const std::optional<at::Tensor>& query_weights
+) {
+    const auto b = attn::make_paged_attn_batch(
+        "attn_indexed",
+        q,
+        k_pool,
+        v_pool,
+        page_tables,
+        cu_seqlens_q,
+        seqlens_k,
+        page_positions,
+        rope,
+        scale,
+        std::nullopt,
+        std::nullopt,
+        mass_sum,
+        weight_sum,
+        cu_view_pages,
+        query_weights
+    );
+    return attn_indexed(b, selected, block_size, max_selected_blocks);
+}
+
+at::Tensor attn_indexed_verify_cuda(
+    const at::Tensor& q,
+    const at::Tensor& k_pool,
+    const at::Tensor& v_pool,
+    const at::Tensor& page_tables,
+    const at::Tensor& cu_seqlens_q,
+    const at::Tensor& seqlens_k,
+    const at::Tensor& page_positions,
+    const rope_parameters& rope,
+    double scale,
+    const at::Tensor& selected,
+    int64_t block_size,
+    int64_t max_selected_blocks,
+    const at::Tensor& mass_sum,
+    const at::Tensor& weight_sum,
+    const at::Tensor& cu_view_pages,
+    const at::Tensor& query_weights
+) {
+    auto b = attn::make_paged_attn_batch(
+        "attn_indexed_verify",
+        q,
+        k_pool,
+        v_pool,
+        page_tables,
+        cu_seqlens_q,
+        seqlens_k,
+        page_positions,
+        rope,
+        scale,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt
+    );
+    attn::attach_mass(b, "attn_indexed_verify", mass_sum, weight_sum, cu_view_pages, query_weights, b.total_q);
+    b.mass_per_query = true;
+    return attn_indexed(b, selected, block_size, max_selected_blocks);
 }
 
 }  // namespace pulsarlm

@@ -157,6 +157,60 @@ void check_pools(const char* op, const at::Tensor& k_pool, const at::Tensor& v_p
     );
 }
 
+void attach_mass(
+    paged_attn_batch& b,
+    const char* op,
+    const std::optional<at::Tensor>& mass_sum,
+    const std::optional<at::Tensor>& weight_sum,
+    const std::optional<at::Tensor>& cu_view_pages,
+    const std::optional<at::Tensor>& query_weights,
+    int64_t views
+) {
+    auto on_cuda = [](const at::Tensor& t) { return t.is_cuda(); };
+    auto int32_dims = [](const at::Tensor& t, int64_t dims) { return t.scalar_type() == at::kInt && t.dim() == dims; };
+    const bool measures = mass_sum.has_value();
+    TORCH_CHECK(
+        weight_sum.has_value() == measures && cu_view_pages.has_value() == measures &&
+            query_weights.has_value() == measures,
+        op,
+        ": mass_sum, weight_sum, cu_view_pages and query_weights are passed together or not at all"
+    );
+    if (measures) {
+        TORCH_CHECK(
+            on_cuda(*mass_sum) && on_cuda(*weight_sum) && on_cuda(*cu_view_pages) && on_cuda(*query_weights),
+            op,
+            ": all inputs must be CUDA tensors"
+        );
+        TORCH_CHECK(
+            mass_sum->scalar_type() == at::kFloat && mass_sum->dim() == 2 && mass_sum->size(1) == b.n_q_heads &&
+                mass_sum->is_contiguous(),
+            op,
+            ": mass_sum must be contiguous fp32 [total_view_pages, n_q_heads]"
+        );
+        TORCH_CHECK(
+            weight_sum->scalar_type() == at::kFloat && weight_sum->dim() == 1 &&
+                weight_sum->size(0) == mass_sum->size(0) && weight_sum->is_contiguous(),
+            op,
+            ": weight_sum must be contiguous fp32 [total_view_pages]"
+        );
+        TORCH_CHECK(
+            int32_dims(*cu_view_pages, 1) && cu_view_pages->size(0) == views + 1,
+            op,
+            ": cu_view_pages must be int32 [views + 1], one per mass view"
+        );
+        TORCH_CHECK(
+            query_weights->scalar_type() == at::kFloat && query_weights->dim() == 1 &&
+                query_weights->size(0) == b.total_q,
+            op,
+            ": query_weights must be fp32 [total_q]"
+        );
+        b.mass_sum = *mass_sum;
+        b.weight_sum = *weight_sum;
+        b.cu_view_pages = cu_view_pages->contiguous();
+        b.query_weights = query_weights->contiguous();
+    }
+}
+
 paged_attn_batch make_paged_attn_batch(
     const char* op,
     const at::Tensor& q,
@@ -233,47 +287,7 @@ paged_attn_batch make_paged_attn_batch(
     }
     b.max_pages = page_tables.size(1);
 
-    const bool measures = mass_sum.has_value();
-    TORCH_CHECK(
-        weight_sum.has_value() == measures && cu_view_pages.has_value() == measures &&
-            query_weights.has_value() == measures,
-        op,
-        ": mass_sum, weight_sum, cu_view_pages and query_weights are passed together or not at all"
-    );
-    if (measures) {
-        TORCH_CHECK(
-            on_cuda(*mass_sum) && on_cuda(*weight_sum) && on_cuda(*cu_view_pages) && on_cuda(*query_weights),
-            op,
-            ": all inputs must be CUDA tensors"
-        );
-        TORCH_CHECK(
-            mass_sum->scalar_type() == at::kFloat && mass_sum->dim() == 2 && mass_sum->size(1) == b.n_q_heads &&
-                mass_sum->is_contiguous(),
-            op,
-            ": mass_sum must be contiguous fp32 [total_view_pages, n_q_heads]"
-        );
-        TORCH_CHECK(
-            weight_sum->scalar_type() == at::kFloat && weight_sum->dim() == 1 &&
-                weight_sum->size(0) == mass_sum->size(0) && weight_sum->is_contiguous(),
-            op,
-            ": weight_sum must be contiguous fp32 [total_view_pages]"
-        );
-        TORCH_CHECK(
-            int32_dims(*cu_view_pages, 1) && cu_view_pages->size(0) == b.num_seqs + 1,
-            op,
-            ": cu_view_pages must be int32 [num_seqs + 1]"
-        );
-        TORCH_CHECK(
-            query_weights->scalar_type() == at::kFloat && query_weights->dim() == 1 &&
-                query_weights->size(0) == b.total_q,
-            op,
-            ": query_weights must be fp32 [total_q]"
-        );
-        b.mass_sum = *mass_sum;
-        b.weight_sum = *weight_sum;
-        b.cu_view_pages = cu_view_pages->contiguous();
-        b.query_weights = query_weights->contiguous();
-    }
+    attach_mass(b, op, mass_sum, weight_sum, cu_view_pages, query_weights, b.num_seqs);
     if (k_norm_weight.has_value()) {
         TORCH_CHECK(
             on_cuda(*k_norm_weight) && k_norm_weight->dim() == 1 && k_norm_weight->size(0) == b.head_dim,
