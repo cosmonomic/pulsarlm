@@ -146,6 +146,20 @@ void decode_graphs::capture_startup() {
             );
         }
     }
+    if (state_slots > 1 && shard_model.drafter() != nullptr) {
+        for (bool verify_rows : {true, false}) {
+            auto [inputs, hidden] = make_draft_inputs(1, verify_rows);
+            shard_model.drafter()->draft(inputs, hidden, lines);
+        }
+        for (std::int64_t sequences = 1; sequences <= startup_sequences; sequences++) {
+            for (bool verify_rows : {true, false}) {
+                std::unique_ptr<captured_draft>& captured = drafts[{sequences, verify_rows}];
+                if (!captured) {
+                    captured = capture_draft(sequences, verify_rows);
+                }
+            }
+        }
+    }
     for (bool verifies : kinds) {
         for (std::int64_t sequences = 1; sequences <= startup_sequences; sequences++) {
             for (bool measures_mass : {false, true}) {
@@ -199,6 +213,65 @@ const decode_graphs::captured_forward& decode_graphs::replay(const group_batch& 
         }
     }
     return *captured;
+}
+
+std::pair<group_batch, at::Tensor> decode_graphs::make_draft_inputs(std::int64_t sequences, bool verify_rows) const {
+    auto device = lines.front().k.options();
+    auto ints = device.dtype(at::kInt);
+    auto longs = device.dtype(at::kLong);
+    const auto layers = static_cast<std::int64_t>(lines.size());
+    const std::int64_t rows = verify_rows ? state_slots : 1;
+    const std::int64_t tokens = sequences * rows;
+    group_batch inputs{
+        .tokens = at::zeros({tokens}, longs),
+        .pos = at::zeros({tokens}, longs),
+        .page_tables = at::zeros({layers, sequences, width}, ints),
+        .page_size = page_size,
+        .state_slots = state_slots,
+        .key_counts = at::full({layers, sequences}, rows, ints),
+        .page_positions = at::zeros({layers, sequences, width}, ints),
+        .arrival_counters = at::zeros({shard_model.arrival_counter_count(sequences, tokens)}, ints),
+    };
+    if (verify_rows) {
+        inputs.cu_seqlens_q = at::arange(sequences + 1, ints) * rows;
+        inputs.logit_rows = at::arange(sequences, longs) * rows;
+    }
+    // The draft head's KV layer keeps hidden rows in the model's dtype.
+    auto with_hidden = std::ranges::find_if(lines, [](const kv& line) { return line.last_hidden.defined(); });
+    TORCH_CHECK(with_hidden != lines.end(), "decode_graphs: no KV layer keeps the draft head's hidden rows");
+    at::Tensor hidden = at::zeros({tokens, shard_model.drafter()->hidden_dim()}, with_hidden->last_hidden.options());
+    return {std::move(inputs), std::move(hidden)};
+}
+
+std::unique_ptr<decode_graphs::captured_draft> decode_graphs::capture_draft(std::int64_t sequences, bool verify_rows) {
+    auto captured = std::make_unique<captured_draft>();
+    std::tie(captured->inputs, captured->hidden_rows) = make_draft_inputs(sequences, verify_rows);
+    captured->graph.capture_begin({0, 0}, cudaStreamCaptureModeThreadLocal);
+    captured->output = shard_model.drafter()->draft(captured->inputs, captured->hidden_rows, lines);
+    captured->graph.capture_end();
+    return captured;
+}
+
+draft_output decode_graphs::draft(const group_batch& g, const at::Tensor& hidden, bool verify_rows) {
+    const std::int64_t sequences = g.page_tables.size(1);
+    std::unique_ptr<captured_draft>& captured = drafts[{sequences, verify_rows}];
+    if (!captured) {
+        captured = capture_draft(sequences, verify_rows);
+    }
+    group_batch& inputs = captured->inputs;
+    TORCH_CHECK(
+        g.tokens.sizes() == inputs.tokens.sizes() && hidden.sizes() == captured->hidden_rows.sizes(),
+        "decode_graphs: the draft pass's rows are not the graph's"
+    );
+    inputs.tokens.copy_(g.tokens);
+    inputs.pos.copy_(g.pos);
+    inputs.page_tables.copy_(g.page_tables);
+    inputs.key_counts.copy_(g.key_counts);
+    inputs.page_positions.copy_(g.page_positions);
+    copy_defined(inputs.logit_rows, g.logit_rows);
+    captured->hidden_rows.copy_(hidden);
+    captured->graph.replay();
+    return captured->output;
 }
 
 std::pair<at::Tensor, at::Tensor> decode_graphs::decode(const group_batch& g) {

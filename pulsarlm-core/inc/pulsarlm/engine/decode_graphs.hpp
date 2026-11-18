@@ -31,6 +31,16 @@ class decode_graphs {
     };
     // The sequences of a group, whether it measures mass, and whether it is a verify group.
     using shape = std::tuple<std::int64_t, bool, bool>;
+    // A draft pass of the model's draft head over a group of state_slots rows per sequence, the first pass after a
+    // verify group, or of one row per sequence.
+    struct captured_draft {
+        at::cuda::CUDAGraph graph;
+        group_batch inputs;
+        at::Tensor hidden_rows;
+        draft_output output;
+    };
+    // The sequences of a draft pass, and whether each has state_slots rows.
+    using draft_shape = std::pair<std::int64_t, bool>;
 
     model& shard_model;
     std::vector<kv> lines;
@@ -45,6 +55,7 @@ class decode_graphs {
     std::vector<at::Tensor> shared_mass_sum;
     std::vector<at::Tensor> shared_weight_sum;
     std::map<shape, std::unique_ptr<captured_forward>> forwards;
+    std::map<draft_shape, std::unique_ptr<captured_draft>> drafts;
 
     // Inputs of a group of sequences on the lines' device, the mass rows of up to startup_sequences sequences in the
     // shared buffers, with the group's own arrival counters.
@@ -52,6 +63,9 @@ class decode_graphs {
     std::unique_ptr<captured_forward> capture(std::int64_t sequences, bool measures_mass, bool verifies);
     // The captured forward of g's shape, captured first if it is not yet, with g's inputs copied into it and replayed.
     const captured_forward& replay(const group_batch& g, bool verifies);
+    // Inputs of a draft pass of sequences, with state_slots rows each or one, and its hidden rows.
+    std::pair<group_batch, at::Tensor> make_draft_inputs(std::int64_t sequences, bool verify_rows) const;
+    std::unique_ptr<captured_draft> capture_draft(std::int64_t sequences, bool verify_rows);
 
   public:
     // The decoding sequences whose graphs capture_startup records.
@@ -83,6 +97,10 @@ class decode_graphs {
     std::pair<at::Tensor, at::Tensor> decode(const group_batch& g);
     // decode's verify logits and hidden rows of g, a verify group of state_slots tokens per sequence.
     std::pair<at::Tensor, at::Tensor> verify(const group_batch& g);
+    // draft_head::draft of g and hidden, g holding state_slots rows per sequence with cu_seqlens_q and a logit row per
+    // sequence, or with verify_rows false one row per sequence; valid until the next call. The model has a draft head,
+    // and g's page tables are page_width() wide.
+    draft_output draft(const group_batch& g, const at::Tensor& hidden, bool verify_rows);
 };
 
 }  // namespace pulsarlm

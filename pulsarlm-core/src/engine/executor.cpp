@@ -247,14 +247,16 @@ class executor::batch {
     void
     plan_draft_rows(std::size_t index, bool next_row, bool drafts, std::size_t draft_layer, std::size_t draft_count);
     // Queues on stream shard, after the step's sampling into samples, the verify entries' acceptance of their samples,
-    // stop_tokens ending a run (int64), and the draft head's pass; shard 0 also queues the copies of the kept counts and
-    // next tokens to the host.
+    // stop_tokens ending a run (int64), and the draft head's pass, replayed from graphs when every entry verifies and
+    // drafts and its verify group replays; shard 0 also queues the copies of the kept counts and next tokens to the
+    // host.
     void enqueue_drafts(
         model& shard_model,
         std::span<const kv> lines,
         const at::Tensor& samples,
         const at::Tensor& stop_tokens,
         std::size_t shard,
+        decode_graphs* graphs,
         at::Tensor& counters
     );
     // Takes into g, the verify group on shard's device, the previous step's next tokens of the entries whose previous
@@ -778,7 +780,7 @@ void executor::batch::enqueue(
         }
     }
     if (draft_layer && !draft_entries.empty()) {
-        enqueue_drafts(shard_model, lines, samples, stop_tokens, shard, counters);
+        enqueue_drafts(shard_model, lines, samples, stop_tokens, shard, graphs, counters);
     }
 }
 
@@ -992,8 +994,11 @@ void executor::batch::enqueue_drafts(
     const at::Tensor& samples,
     const at::Tensor& stop_tokens,
     std::size_t shard,
+    decode_graphs* graphs,
     at::Tensor& counters
 ) {
+    const bool replays = verify_replays && decode_count == entries.size() && verify_count == entries.size() &&
+        drafting.size() == entries.size();
     at::Device device = lines.front().k.device();
     draft_head& head = *shard_model.drafter();
     const auto n_layers = lines.size();
@@ -1007,7 +1012,7 @@ void executor::batch::enqueue_drafts(
         return counts.to(at::kInt).unsqueeze(0).expand({static_cast<std::int64_t>(n_layers), -1}).contiguous();
     };
     auto tables = [&](std::span<const batch_entry> group, group_batch& g) {
-        const std::size_t width = table_width(group);
+        const std::size_t width = replays ? verify_width : table_width(group);
         g.page_tables = page_tables(group, n_layers, false, shard, width);
         g.page_positions = page_tables(group, n_layers, true, shard, width);
     };
@@ -1086,9 +1091,14 @@ void executor::batch::enqueue_drafts(
     };
     fill_awaited_tokens_cuda(rows.tokens, samples);
     tables(draft_entries, rows);
-    with_counters(rows, draft_count);
     at::Tensor hidden = at::cat(sources).index_select(0, on_device(draft_sources, longs));
-    draft_output drafted_rows = head.draft(rows, hidden, lines);
+    draft_output drafted_rows;
+    if (replays) {
+        drafted_rows = graphs->draft(rows, hidden, /*verify_rows=*/true);
+    } else {
+        with_counters(rows, draft_count);
+        drafted_rows = head.draft(rows, hidden, lines);
+    }
     if (!drafting.empty()) {
         at::Tensor drafting_entries_index = on_device(drafting, longs);
         std::vector<batch_entry> drafting_entries;
@@ -1108,8 +1118,13 @@ void executor::batch::enqueue_drafts(
                 .key_counts = key_counts(on_device(later_key_counts[j], longs) + later_shift),
             };
             tables(drafting_entries, one_row);
-            with_counters(one_row, static_cast<std::int64_t>(drafting_entries.size()));
-            draft_output next = head.draft(one_row, previous_hidden, lines);
+            draft_output next;
+            if (replays) {
+                next = graphs->draft(one_row, previous_hidden, /*verify_rows=*/false);
+            } else {
+                with_counters(one_row, static_cast<std::int64_t>(drafting_entries.size()));
+                next = head.draft(one_row, previous_hidden, lines);
+            }
             token = next.logits.argmax(-1);
             previous_hidden = next.hidden;
             tokens.push_back(token);
