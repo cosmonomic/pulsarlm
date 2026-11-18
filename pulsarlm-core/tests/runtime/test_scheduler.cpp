@@ -1048,8 +1048,9 @@ TEST_CASE("max_tokens 0 forwards the tokens and ends with their state") {
     REQUIRE(f.store->pages.size() == 4);
 }
 
-// The prefill's page goes to the store in a write the write-back does not wait for; its failure ends the request with
-// oom at the next write-back.
+// The prefill's page goes to the store in a write the write-back does not wait for. The write-back seeing its failure
+// is the first after the write ran, which depends on when the loop runs it, and at the latest the one reaching the end
+// state, which waits for the sequence's page writes; either ends the request with oom and writes no state.
 TEST_CASE("a page write that fails after its write-back ends the request with oom") {
     fixture f(16);
     f.store->failing_put = 1;
@@ -1057,7 +1058,6 @@ TEST_CASE("a page write that fails after its write-back ends the request with oo
     std::vector<request_results> results = serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 10}});
 
     REQUIRE(ended_error(results[0]) == request_error::oom);
-    REQUIRE(results[0].tokens.size() < 10);
     REQUIRE(f.store->releases == f.store->leases);
     REQUIRE(f.store->written_states.empty());
 }
