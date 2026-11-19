@@ -15,13 +15,18 @@
 #include <optional>
 #include <ranges>
 #include <span>
-#include <stdexcept>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 namespace pulsarlm {
 
 namespace {
+
+bool lists_page_twice(const layer_sequence& layer) {
+    std::unordered_set<digest, digest_hash> hashes;
+    return !std::ranges::all_of(layer.pages, [&](const active_page& page) { return hashes.insert(page.hash).second; });
+}
 
 request_statistics statistics_of(const sequence& seq) {
     return request_statistics{
@@ -40,7 +45,7 @@ request_statistics statistics_of(const sequence& seq) {
 task<std::optional<executor::sequence_id>>
 executor::start(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
     const sequence_id id = requests.emplace(std::move(callbacks));
-    served_request& served = requests.at(id);
+    served_request& served = requests[id];
     if (served.callbacks->cancelled()) {
         end_request(id, std::unexpected(request_error::cancelled), request_statistics{});
         co_return std::nullopt;
@@ -57,7 +62,7 @@ executor::start(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
     std::expected<std::pair<std::shared_ptr<const state>, state::lease_id_type>, page_error>
         lookup = co_await store.read_state(r.tokens, digests);
     if (!lookup) {
-        end_request(id, std::unexpected(request_error::miss), request_statistics{});
+        end_request(id, std::unexpected(request_error::missing_state), request_statistics{});
         co_return std::nullopt;
     }
     auto& [stored_state, lease_id] = *lookup;
@@ -66,16 +71,17 @@ executor::start(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
         auto head_digest = std::ranges::find(digests, *stored_state->head);
         if (head_digest == digests.end()) {
             store.release(lease_id);
-            end_request(id, std::unexpected(request_error::miss), request_statistics{});
+            end_request(id, std::unexpected(request_error::invalid_state), request_statistics{});
             co_return std::nullopt;
         }
         stored_pages = static_cast<std::size_t>(head_digest - digests.begin()) + 1;
     }
     std::span<const std::int64_t> unstored_tokens = std::span(r.tokens).subspan(stored_pages * layout.page_size);
     if (stored_state->tail.size() >= unstored_tokens.size() ||
-        !std::ranges::equal(stored_state->tail, unstored_tokens.first(stored_state->tail.size()))) {
+        !std::ranges::equal(stored_state->tail, unstored_tokens.first(stored_state->tail.size())) ||
+        std::ranges::any_of(stored_state->layers, lists_page_twice)) {
         store.release(lease_id);
-        end_request(id, std::unexpected(request_error::miss), request_statistics{});
+        end_request(id, std::unexpected(request_error::invalid_state), request_statistics{});
         co_return std::nullopt;
     }
     std::shared_ptr<const state> initial_state = extend_with_hot_pages(std::move(stored_state), r, digests);
@@ -100,7 +106,9 @@ executor::start(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
         store.release(seq.lease_id());
         end_request(
             id,
-            std::unexpected(line_allocation.error() == page_error::miss ? request_error::miss : request_error::oom),
+            std::unexpected(
+                line_allocation.error() == page_error::miss ? request_error::missing_state : request_error::oom
+            ),
             request_statistics{}
         );
         co_return std::nullopt;
@@ -216,9 +224,7 @@ task<std::expected<void, page_error>> executor::own_pages_from(sequence& seq, st
 
 task<void> executor::stop(sequence_id id) {
     sequence& seq = sequence_of(id);
-    if (!seq.has_exited() || seq.launched_step_count() > 0) {
-        throw std::logic_error("executor::stop: the sequence has not exited or a launched step holds it");
-    }
+    assert(seq.has_exited() && seq.launched_step_count() == 0);
     release_lines(seq);
     std::expected<std::shared_ptr<const state>, request_error> result = std::unexpected(request_error::cancelled);
     switch (*seq.reason_of_exit()) {

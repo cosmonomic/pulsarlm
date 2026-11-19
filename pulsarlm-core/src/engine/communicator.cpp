@@ -10,6 +10,7 @@
 #include <nccl.h>
 
 #include <barrier>
+#include <cassert>
 #include <cstddef>
 #include <format>
 #include <memory>
@@ -51,16 +52,17 @@ ncclDataType_t nccl_type(at::ScalarType dtype) {
     case at::kByte:
         return ncclUint8;
     default:
-        throw std::invalid_argument(std::format("communicator: no NCCL type for {}", c10::toString(dtype)));
+        assert(false);
+        std::unreachable();
     }
 }
 
 void check_contiguous(const at::Tensor& x) {
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous(), "communicator: a collective takes a contiguous CUDA tensor");
+    assert(x.is_cuda() && x.is_contiguous());
 }
 
 std::vector<std::int64_t> gathered_sizes(const at::Tensor& x, std::size_t size) {
-    TORCH_CHECK(x.dim() >= 1, "communicator: all_gather takes a tensor of at least one dimension");
+    assert(x.dim() >= 1);
     std::vector<std::int64_t> sizes = x.sizes().vec();
     sizes.front() *= static_cast<std::int64_t>(size);
     return sizes;

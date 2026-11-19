@@ -87,7 +87,7 @@ class engine {
     // The model of model_config, split over config.devices: shard r runs on config.devices[r] with the weights
     // load_model_shard(r, config.devices.size()) gives, loaded one shard after another. Shards on distinct devices reduce
     // over NCCL; several on one device, for tests, without it. Throws std::invalid_argument for a model the engine does
-    // not split over config.devices.
+    // not split over config.devices, and for a Qwen4-Exp model whose index blocks do not divide config.page_size.
     engine(
         const any_model_config& model_config,
         const model_shard_loader& load_model_shard,

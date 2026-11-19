@@ -165,7 +165,7 @@ class draft_head {
     virtual model::output draft(const model::batch& b, const at::Tensor& hidden, std::span<const kv> lines) = 0;
 };
 
-// Throws c10::Error unless b.cu_seqlens_q is defined exactly when b.kind is not decode.
+// b.cu_seqlens_q is defined exactly when b.kind is not decode.
 void check_batch(const model::batch& b);
 
 }  // namespace pulsarlm

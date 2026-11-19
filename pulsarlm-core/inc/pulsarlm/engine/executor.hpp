@@ -46,8 +46,7 @@ class executor {
     class batch;
     struct batch_writes;
 
-    // Names a sequence of an executor without owning it. Each access throws std::out_of_range once the sequence's
-    // request was erased.
+    // Names a sequence of an executor without owning it. The sequence's request is not erased at an access.
     class sequence_ref {
         executor* owner;
         sequence_id id;
@@ -139,8 +138,7 @@ class executor {
     void update_views(sequence& seq);
     // Whether token_count more tokens fill a page of seq.
     bool completes_page(const sequence& seq, std::size_t token_count) const noexcept;
-    // The sequence of id's request. Throws std::out_of_range once the request was erased, and
-    // std::bad_optional_access before start read the stored state.
+    // The sequence of id's request, which is not erased and whose stored state start has read.
     sequence& sequence_of(sequence_id id);
     const sequence& sequence_of(sequence_id id) const;
     // Calls on_end of served's callbacks with result and statistics and destroys the callbacks.
@@ -160,15 +158,17 @@ class executor {
     // awaited_token.
     void advance(batch& b);
     task<void> enqueue_on_shard(batch& b, std::size_t shard);
-    // Points b's verify entries whose sequences' previous step is launched to that step. Throws std::logic_error for
-    // such a sequence that is not a verify entry and a drafting entry of that step.
+    // Points b's verify entries whose sequences' previous step is launched to that step, of which each such sequence
+    // is a verify entry and a drafting entry.
     void link_previous(batch& b) const;
     // Whether a step of entries ends no cycle and, in a model with sliding layers, completes no page, or in an executor
     // whose steps draft, whether every entry verifies drafts: its write-back then changes no view or table that the
     // next step reads, and copies to the store only lines the next step does not write.
     bool entries_allow_overlap(std::span<const batch_tokens> entries) const;
-    // Throws std::logic_error unless launch can launch a step of entries now, the limit sampled_row_limit() aside.
-    void check_launch(std::span<const batch_tokens> entries) const;
+    // Whether launch can launch a step of entries now, the limit sampled_row_limit() aside: entries is not empty and
+    // names no sequence twice, each token count is above 0 and at most the sequence's pending tokens, each sequence is
+    // steppable (is_steppable), fewer than two steps are launched, and no step is launched or allows_overlap(entries).
+    bool is_launchable(std::span<const batch_tokens> entries) const;
 
     task<void> join(batch& b);
     // step_duration is the time from b's launch to its write-back.
@@ -214,9 +214,10 @@ class executor {
     // Serves r with callbacks, which it takes before it first suspends. Returns the sequence of r, resuming the newest
     // state the store holds for a prefix of its tokens, with lines for its first cycle. Returns std::nullopt after it
     // ended the request through on_end, with value-initialized statistics: with cancelled when the callbacks are
-    // cancelled at the start, before the store is read, with miss when the lookup or a page read fails, and with oom
-    // when the free lines do not cover the state's pages and one cycle's tokens. The lease of a request that fails is
-    // released before on_end.
+    // cancelled at the start, before the store is read, with missing_state when the lookup or a page read fails, with
+    // invalid_state when the stored state's head is not a digest of r's full pages, its tail is not a proper prefix
+    // of r's tokens after its head, or one of its layers lists a page hash twice, and with oom when the free lines do
+    // not cover the state's pages and one cycle's tokens. The lease of a request that fails is released before on_end.
     task<std::optional<sequence_id>> start(request&& r, std::unique_ptr<request_callbacks>&& callbacks);
     // Whether a step of entries can be launched now, before any write-back: no step is launched or the last launched
     // step allows overlap, and so does a step of entries. A step allows overlap when it ends no cycle and, in a model
@@ -231,10 +232,9 @@ class executor {
     // Launches one step of entries, decoding entries first, after the launched steps: advances each sequence by its
     // tokens, then queues the forward and the sampling on every shard without waiting for them. A decoding entry whose token is awaited reads
     // it from the previous launched step's samples on the GPUs, which needs both steps to allow overlap.
-    // Throws std::logic_error, which panics the loop, before it changes a sequence or queues work, when entries is
-    // empty or names a sequence twice, a token count is 0 or above the sequence's pending tokens, a sequence is not
-    // steppable (is_steppable), two steps are launched, a step is launched and allows_overlap(entries) is false, or
-    // the step samples more than sampled_row_limit() rows.
+    // entries is not empty and names no sequence twice, each token count is above 0 and at most the sequence's pending
+    // tokens, each sequence is steppable (is_steppable), fewer than two steps are launched, no step is launched or
+    // allows_overlap(entries), and the step samples at most sampled_row_limit() rows.
     task<void> launch(std::span<const batch_tokens> entries);
     // Writes back the oldest launched step: waits for it, then completes the pages its tokens filled, sets each awaited token it sampled, writes the
     // completed pages, evicts and writes the state at a cycle end, and takes lines for the next tokens. The pages of a
@@ -242,12 +242,11 @@ class executor {
     // first, and a failed write ends its sequence with oom at a later write-back. Sets the exit reason of each sequence that finished,
     // by a stop token or max_tokens, or ran out of lines. A sequence stopped by a token while in a later launched step
     // withdraws that step's token (sequence::withdraw_latest_step); entries of sequences that exited before are
-    // skipped. Returns the sequences of the step's entries, in entry order. Throws std::logic_error, which panics the
-    // loop, when no step is launched.
+    // skipped. Returns the sequences of the step's entries, in entry order. A step is launched.
     task<std::vector<sequence_id>> write_back();
     // Ends the request of id, whose sequence exited and is in no launched step: releases its lines, writes its end state
     // when it finished, releases its lease, delivers the state or the error and the statistics through on_end, and
-    // erases it. Throws std::logic_error for a sequence that has not exited or that a launched step holds.
+    // erases it.
     task<void> stop(sequence_id id);
     // Releases the lines and the lease of every request's sequence, delivers error and the request's statistics so far
     // through on_end, and erases the request. Called when the loop has exited.

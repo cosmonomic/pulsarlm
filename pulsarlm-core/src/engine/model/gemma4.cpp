@@ -6,6 +6,7 @@
 
 #include <ATen/ATen.h>
 
+#include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -300,10 +301,7 @@ at::Tensor gemma4_model::head(const at::Tensor& x) const {
 
 model::output gemma4_model::forward(const batch& b, std::span<const kv> lines) {
     check_batch(b);
-    TORCH_CHECK(
-        b.kind != batch_kind::verify,
-        "gemma4_model::forward: a model without a draft head computes no verify batch"
-    );
+    assert(b.kind != batch_kind::verify);
     at::Tensor x = scaled(embed_tokens.index_select(0, b.tokens), std::sqrt(static_cast<double>(config.hidden_size)));
     at::Tensor per_layer;
     if (config.hidden_size_per_layer_input > 0) {

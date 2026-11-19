@@ -60,7 +60,15 @@ struct request_statistics {
     std::chrono::steady_clock::duration step_duration;
 };
 
-enum class request_error { miss, oom, cancelled, loop_exited };
+enum class request_error {
+    // The store holds no state for the request's digest, or lacks a page of it.
+    missing_state,
+    // The stored state breaks a rule of a state.
+    invalid_state,
+    oom,
+    cancelled,
+    loop_exited,
+};
 
 // One request's prefill statistics, sampled tokens and cycle ends, then its end: its final state or an error. Calls come
 // one at a time and must not block; all but an on_end with loop_exited come from the loop thread.

@@ -21,8 +21,10 @@ class PageStore(Protocol):
     it their host copies with those pages' owners. write_state makes a state the
     lease's request reached findable, page_keys being its pages. A read_pages that
     raises or yields a malformed result misses every page it asked for; a
-    read_state that does ends its request with MISS, holding no lease, so the
-    store cleans up what it took. An exception raised by claim,
+    read_state that does ends its request with MISSING_STATE, holding no lease, so
+    the store cleans up what it took. A read_state yielding a state that does not
+    reach a proper prefix of tokens, or that lists a page hash twice in a layer,
+    ends its request with INVALID_STATE. An exception raised by claim,
     which then claims nothing, or by write_pages, write_state or release goes to
     sys.unraisablehook.
     """
@@ -178,7 +180,8 @@ class RequestStatistics:
         """Launch to write-back of every step of the request, summed."""
 
 class RequestError(enum.Enum):
-    MISS = ...
+    MISSING_STATE = ...
+    INVALID_STATE = ...
     OOM = ...
     CANCELLED = ...
     LOOP_EXITED = ...

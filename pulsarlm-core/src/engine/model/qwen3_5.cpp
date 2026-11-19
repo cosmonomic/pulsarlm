@@ -7,6 +7,7 @@
 
 #include <ATen/ATen.h>
 
+#include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -479,10 +480,7 @@ at::Tensor qwen3_5_model::logits(const at::Tensor& rows) const {
 // Normed row by row, the logit rows' hidden rows equal the normed hidden rows' logit rows.
 model::output qwen3_5_model::forward(const batch& b, std::span<const kv> lines) {
     check_batch(b);
-    TORCH_CHECK(
-        mtp || b.kind != batch_kind::verify,
-        "qwen3_5_model: a model without its MTP layer forwards no verify batch"
-    );
+    assert(mtp || b.kind != batch_kind::verify);
     at::Tensor x = embed(b.tokens);
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
         x = decoder_layer(x, layers[layer], b, lines);

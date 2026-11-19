@@ -76,10 +76,10 @@ std::size_t block_bytes(const page_shape& shape) {
 }
 
 at::Tensor make_pool(std::span<const page_shape> shapes, std::size_t pool_bytes, at::Device device) {
-    TORCH_CHECK(!shapes.empty(), "kv_cache: no KV layer");
+    assert(!shapes.empty());
     for (const page_shape& shape : shapes) {
-        TORCH_CHECK(shape.n_layers == 1, "kv_cache: a KV layer's page shape has n_layers 1");
-        TORCH_CHECK(shape.state_sizes.empty() || shape.values_only, "kv_cache: a recurrent page is values_only");
+        assert(shape.n_layers == 1);
+        assert(shape.state_sizes.empty() || shape.values_only);
         TORCH_CHECK(
             shape.index_head_dim == 0 || (shape.state_sizes.empty() && !shape.values_only),
             "kv_cache: an indexed attention page keeps K and V apart"
@@ -243,7 +243,7 @@ void require(bool holds, const std::string& message) {
 }
 
 std::span<const page_shape> first_shard_shapes(std::span<const kv_cache_shard> shards) {
-    require(!shards.empty(), "a KV cache has at least one shard");
+    assert(!shards.empty());
     require(!shards.front().shapes.empty(), "a KV cache has at least one KV layer");
     return shards.front().shapes;
 }
@@ -619,15 +619,11 @@ void kv_cache::release_all(std::span<const std::vector<std::uint32_t>> line_ids)
 // Every layer's resident pages are held before any line is taken, so taking one never drops a page this call needs.
 task<std::expected<std::vector<std::vector<std::uint32_t>>, page_error>>
 kv_cache::get(std::span<const std::span<const digest>> hashes, std::span<const cudaStream_t> streams) {
-    if (hashes.size() != layers.size()) {
-        throw std::invalid_argument("kv_cache::get takes the hashes of every KV layer");
-    }
-    for (std::size_t layer = 0; layer < layers.size(); layer++) {
-        std::unordered_set<digest, digest_hash> layer_hashes(hashes[layer].begin(), hashes[layer].end());
-        if (layer_hashes.size() != hashes[layer].size()) {
-            throw std::invalid_argument(std::format("kv_cache::get takes distinct hashes of KV layer {}", layer));
-        }
-    }
+    assert(hashes.size() == layers.size());
+    assert(std::ranges::all_of(hashes, [](std::span<const digest> layer_hashes) {
+        return std::unordered_set<digest, digest_hash>(layer_hashes.begin(), layer_hashes.end()).size() ==
+            layer_hashes.size();
+    }));
     std::vector<std::vector<std::uint32_t>> line_ids(layers.size());
     std::vector<std::vector<std::size_t>> joined(layers.size());
     std::vector<std::vector<std::size_t>> to_fetch(layers.size());
@@ -722,9 +718,7 @@ kv_cache::get(std::span<const std::span<const digest>> hashes, std::span<const c
 
 std::expected<std::vector<std::vector<std::uint32_t>>, page_error>
 kv_cache::allocate(std::span<const std::size_t> counts) {
-    if (counts.size() != layers.size()) {
-        throw std::invalid_argument("kv_cache::allocate takes a count for every KV layer");
-    }
+    assert(counts.size() == layers.size());
     line_allocator::transaction taking(allocator);
     std::optional<std::vector<std::vector<std::uint32_t>>> taken = take_lines(taking, counts);
     if (!taken) {
@@ -761,35 +755,12 @@ task<std::expected<void, page_error>> kv_cache::sync(
     const std::vector<std::vector<std::uint32_t>>& line_ids,
     std::span<const cudaStream_t> streams
 ) {
-    if (hashes.size() != layers.size() || owners.size() != layers.size() || line_ids.size() != layers.size()) {
-        throw std::invalid_argument("kv_cache::sync takes hashes, owners and line ids for every KV layer");
-    }
+    assert(hashes.size() == layers.size() && owners.size() == layers.size() && line_ids.size() == layers.size());
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
-        if (line_ids[layer].size() != hashes[layer].size() || owners[layer].size() != hashes[layer].size()) {
-            throw std::invalid_argument(
-                std::format("kv_cache::sync takes one owner and one line id per hash of KV layer {}", layer)
-            );
-        }
+        assert(line_ids[layer].size() == hashes[layer].size() && owners[layer].size() == hashes[layer].size());
         for (std::size_t i = 0; i < hashes[layer].size(); i++) {
-            const cache_line& synced = line(layer, line_ids[layer][i]);
-            if (synced.ref == 0) {
-                throw std::invalid_argument(
-                    std::format(
-                        "kv_cache::sync takes held lines; line {} of KV layer {} is not",
-                        line_ids[layer][i],
-                        layer
-                    )
-                );
-            }
-            if (synced.hash && *synced.hash != hashes[layer][i]) {
-                throw std::invalid_argument(
-                    std::format(
-                        "kv_cache::sync cannot rename line {} of KV layer {}, which another hash names",
-                        line_ids[layer][i],
-                        layer
-                    )
-                );
-            }
+            assert(line(layer, line_ids[layer][i]).ref > 0);
+            assert(!line(layer, line_ids[layer][i]).hash || *line(layer, line_ids[layer][i]).hash == hashes[layer][i]);
         }
     }
     std::vector<layer_line> sources;

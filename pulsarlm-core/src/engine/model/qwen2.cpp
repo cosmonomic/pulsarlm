@@ -6,6 +6,7 @@
 
 #include <ATen/ATen.h>
 
+#include <cassert>
 #include <cmath>
 #include <format>
 #include <stdexcept>
@@ -140,10 +141,7 @@ qwen2_model::attention(const at::Tensor& h, std::int64_t layer, const batch& g, 
 
 model::output qwen2_model::forward(const batch& b, std::span<const kv> lines) {
     check_batch(b);
-    TORCH_CHECK(
-        b.kind != batch_kind::verify,
-        "qwen2_model::forward: a model without a draft head computes no verify batch"
-    );
+    assert(b.kind != batch_kind::verify);
     const double eps = config.rms_norm_eps;
     at::Tensor x = embed_tokens.index_select(0, b.tokens);
     for (std::int64_t layer = 0; layer < config.n_layers; layer++) {

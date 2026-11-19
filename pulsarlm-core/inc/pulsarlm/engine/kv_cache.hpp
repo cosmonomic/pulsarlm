@@ -202,7 +202,7 @@ class kv_cache {
     // the lease of every owners[layer][i] of its hash, to the store in one write_pages, also when another line caches
     // its hash, since the store may have dropped that page; it releases its holds once the write completes and fails as
     // the write does. A hash already cached at another line leaves its line unmapped. The caller may release the lines
-    // once sync has returned. Throws std::invalid_argument for a line that is not held or that another hash names.
+    // once sync has returned.
     task<std::expected<void, page_error>> sync(
         const std::vector<std::vector<digest>>& hashes,
         const std::vector<std::vector<state::lease_id_type>>& owners,

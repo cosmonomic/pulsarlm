@@ -113,7 +113,39 @@ std::size_t checked_draft_tokens(const engine_config& config, const std::vector<
     if (config.draft_tokens > 0 && shards.front()->drafter() == nullptr) {
         throw std::invalid_argument("the engine drafts tokens, and the model has no drafter");
     }
+    if (config.draft_tokens + 1 > sampled_row_limit) {
+        throw std::invalid_argument(
+            std::format(
+                "the engine drafts {} tokens a step; a step samples at most {} rows, draft_tokens + 1 of one sequence",
+                config.draft_tokens,
+                sampled_row_limit
+            )
+        );
+    }
     return config.draft_tokens;
+}
+
+std::size_t checked_prefill_tokens_per_step(const engine_config& config) {
+    if (config.prefill_tokens_per_step < 1) {
+        throw std::invalid_argument("prefill_tokens_per_step must be at least 1");
+    }
+    return config.prefill_tokens_per_step;
+}
+
+const any_model_config& checked_model_config(const any_model_config& model_config, const engine_config& config) {
+    if (const qwen4_exp_config* qwen4_exp = std::get_if<qwen4_exp_config>(&model_config)) {
+        const auto ratio = static_cast<std::size_t>(qwen4_exp->indexer_compress_ratio);
+        if (qwen4_exp->indexer_compress_ratio > 0 && config.page_size % ratio != 0) {
+            throw std::invalid_argument(
+                std::format(
+                    "a page of {} tokens does not hold whole index blocks of {} tokens",
+                    config.page_size,
+                    ratio
+                )
+            );
+        }
+    }
+    return model_config;
 }
 
 // From the high-priority pool with high_priority, apart from the compute streams of the low-priority one.
@@ -276,7 +308,11 @@ engine::engine(
     const engine_config& config,
     std::unique_ptr<page_store>&& store
 )
-: engine(load_model(model_config, load_model_shard, config.devices), config, std::move(store)) {}
+: engine(
+      load_model(checked_model_config(model_config, config), load_model_shard, config.devices),
+      config,
+      std::move(store)
+  ) {}
 
 engine::engine(loaded_model&& loaded, const engine_config& config, std::unique_ptr<page_store>&& store)
 : engine(std::move(loaded.shards), loaded.vocab_size, config, std::move(store)) {}
@@ -309,7 +345,7 @@ engine::engine(
       checked_draft_tokens(config, this->shards),
       sampled_row_limit
   ),
-  sched(exec, config.prefill_tokens_per_step) {
+  sched(exec, checked_prefill_tokens_per_step(config)) {
     for (std::size_t shard = 1; shard < devices.size(); shard++) {
         worker_threads.emplace_back([this, shard] { run_worker_loop(shard); });
     }

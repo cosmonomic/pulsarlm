@@ -4,6 +4,7 @@
 
 #include <ATen/ATen.h>
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -193,14 +194,7 @@ at::Tensor gated_deltanet(
     if (b.kind == model::batch_kind::verify) {
         const std::int64_t ntok = projected.qkv.size(0);
         const std::int64_t sequences = window_rows.lines.size(0);
-        TORCH_CHECK(
-            sequences > 0 && ntok > 0 && ntok % sequences == 0,
-            "gated_deltanet: a verify batch of ",
-            ntok,
-            " tokens does not hold the same count for each of its ",
-            sequences,
-            " sequences"
-        );
+        assert(sequences > 0 && ntok > 0 && ntok % sequences == 0);
         const std::int64_t per_sequence = ntok / sequences;
         at::Tensor convolved = causal_conv_verify_cuda(
             projected.qkv,
@@ -255,10 +249,7 @@ at::Tensor logit_inputs(const at::Tensor& x, const model::batch& g) {
 }
 
 void check_batch(const model::batch& b) {
-    TORCH_CHECK(
-        b.cu_seqlens_q.defined() == (b.kind != model::batch_kind::decode),
-        "check_batch: cu_seqlens_q is defined exactly when the batch is not a decode batch"
-    );
+    assert(b.cu_seqlens_q.defined() == (b.kind != model::batch_kind::decode));
 }
 
 }  // namespace pulsarlm

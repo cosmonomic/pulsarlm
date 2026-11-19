@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -27,9 +28,7 @@ namespace pulsarlm {
 // that last read the lines of pages that left a view has completed, so they are released right after the sync. A
 // recurrent layer's state at head reaches the store at the resume points, cycle ends and the end, that find it pending.
 task<std::vector<executor::sequence_id>> executor::write_back() {
-    if (launched_batches.empty()) {
-        throw std::logic_error("executor::write_back: no step is launched");
-    }
+    assert(!launched_batches.empty());
     std::unique_ptr<batch> written = std::move(launched_batches.front());
     launched_batches.pop_front();
     batch& b = *written;
@@ -83,7 +82,7 @@ executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clo
         for (std::size_t position = 0; position < g->entries.size(); position++) {
             batch::entry& e = g->entries[position];
             sequence& seq = *e.seq;
-            request_callbacks& callbacks = *requests.at(e.seq.key()).callbacks;
+            request_callbacks& callbacks = *requests[e.seq.key()].callbacks;
             std::span<const std::int64_t> samples;
             if (e.is_sampling) {
                 samples = std::span(next_sampled, verifies ? b.verify_rows : 1);
@@ -303,7 +302,7 @@ task<void> executor::refresh_views(batch& b) {
                 update_views(seq);
             }
             if (e.ends_cycle) {
-                co_await write_cycle_end(seq, *requests.at(e.seq.key()).callbacks);
+                co_await write_cycle_end(seq, *requests[e.seq.key()].callbacks);
                 seq.start_next_cycle();
             }
             std::optional<std::size_t> first_stale_page;

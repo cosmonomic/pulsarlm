@@ -35,6 +35,18 @@ TEST_CASE("a slot_map constructs a value that cannot move and finds it by its ke
     CHECK(values.contains(first));
 }
 
+TEST_CASE("a slot_map's subscript gives the value of a live key, the one at gives") {
+    slot_map<pinned_value> values;
+    slot_map<pinned_value>::key_type first = values.emplace(1);
+    slot_map<pinned_value>::key_type second = values.emplace(2);
+    const slot_map<pinned_value>& read_only = values;
+
+    CHECK(values[first].number == 1);
+    CHECK(values[second].number == 2);
+    CHECK(&values[second] == &values.at(second));
+    CHECK(&read_only[first] == &read_only.at(first));
+}
+
 TEST_CASE("a slot_map's values keep their address while others are added") {
     slot_map<pinned_value> values;
     slot_map<pinned_value>::key_type first = values.emplace(1);

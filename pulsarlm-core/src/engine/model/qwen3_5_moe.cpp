@@ -7,6 +7,7 @@
 
 #include <ATen/ATen.h>
 
+#include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -282,10 +283,7 @@ at::Tensor qwen3_5_moe_model::moe(const at::Tensor& h, std::int64_t layer, const
 
 model::output qwen3_5_moe_model::forward(const batch& b, std::span<const kv> lines) {
     check_batch(b);
-    TORCH_CHECK(
-        b.kind != batch_kind::verify,
-        "qwen3_5_moe_model::forward: a model without a draft head computes no verify batch"
-    );
+    assert(b.kind != batch_kind::verify);
     const double eps = config.rms_norm_eps;
     at::Tensor x = embed_tokens.index_select(0, b.tokens);
     for (std::int64_t layer = 0; layer < n_layers; layer++) {

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -15,7 +16,6 @@
 #include <memory>
 #include <optional>
 #include <span>
-#include <stdexcept>
 #include <thread>
 #include <unordered_set>
 #include <utility>
@@ -55,23 +55,18 @@ executor::executor(
   graph_pages(graph_pages),
   draft_state_slots(draft_tokens + 1),
   sampled_row_capacity(sampled_row_limit) {
-    if (sampled_row_limit == 0) {
-        throw std::invalid_argument("executor: sampled_row_limit must be at least 1");
-    }
-    if (sampled_row_limit < draft_tokens + 1) {
-        throw std::invalid_argument("executor: sampled_row_limit must cover one verify entry, draft_tokens + 1 rows");
-    }
-    require(
+    assert(sampled_row_limit >= 1);
+    assert(sampled_row_limit >= draft_tokens + 1);
+    assert(
         !this->shards.empty() && this->shards.size() == this->cache.shard_count() &&
-            this->streams.size() == this->shards.size() && this->copy_streams.size() == this->shards.size() &&
-            this->worker_loops.size() + 1 == this->shards.size(),
-        "executor: the cache, the streams, the copy streams and the worker loops must match the model shards"
+        this->streams.size() == this->shards.size() && this->copy_streams.size() == this->shards.size() &&
+        this->worker_loops.size() + 1 == this->shards.size()
     );
     shard_mass_heads.resize(this->shards.size());
     lines.resize(this->shards.size());
     for (std::size_t shard = 0; shard < this->shards.size(); shard++) {
         std::vector<kv_layer> layers = this->shards[shard]->kv_layers();
-        require(layers.size() == this->cache.layer_count(), "executor: the cache must hold one layer per KV layer");
+        assert(layers.size() == this->cache.layer_count());
         for (std::size_t layer = 0; layer < layers.size(); layer++) {
             lines[shard].push_back(this->cache.tensors(layer, shard));
             bool layer_recurrent = layers[layer].state.has_value();
@@ -163,11 +158,15 @@ executor::sequence_id executor::sequence_ref::key() const noexcept {
 }
 
 sequence& executor::sequence_of(sequence_id id) {
-    return requests.at(id).state.value();
+    std::optional<sequence>& state = requests[id].state;
+    assert(state);
+    return *state;
 }
 
 const sequence& executor::sequence_of(sequence_id id) const {
-    return requests.at(id).state.value();
+    const std::optional<sequence>& state = requests[id].state;
+    assert(state);
+    return *state;
 }
 
 bool executor::is_steppable(sequence_id id) const {
@@ -192,7 +191,7 @@ bool executor::is_in_launched_batch(sequence_id id) const {
 }
 
 bool executor::is_cancelled(sequence_id id) const {
-    return requests.at(id).callbacks->cancelled();
+    return requests[id].callbacks->cancelled();
 }
 
 void executor::cancel(sequence_id id) {
@@ -256,28 +255,18 @@ std::size_t executor::sampled_row_count(sequence_id id, std::size_t token_count)
     return seq.draft_tokens().empty() ? 1 : token_count + seq.draft_tokens().size();
 }
 
-void executor::check_launch(std::span<const batch_tokens> entries) const {
-    if (entries.empty()) {
-        throw std::logic_error("executor::launch: a step has at least one entry");
-    }
-    if (launched_batches.size() >= 2) {
-        throw std::logic_error("executor::launch: two steps are launched already");
+bool executor::is_launchable(std::span<const batch_tokens> entries) const {
+    if (entries.empty() || launched_batches.size() >= 2) {
+        return false;
     }
     std::unordered_set<sequence_id> entered;
     for (const auto& [id, token_count] : entries) {
-        if (!entered.insert(id).second) {
-            throw std::logic_error("executor::launch: a sequence has two entries");
-        }
-        if (token_count == 0 || token_count > pending_token_count(id)) {
-            throw std::logic_error("executor::launch: an entry computes no token or more than its sequence's pending");
-        }
-        if (!is_steppable(id)) {
-            throw std::logic_error("executor::launch: a sequence is not steppable");
+        if (!entered.insert(id).second || token_count == 0 || token_count > pending_token_count(id) ||
+            !is_steppable(id)) {
+            return false;
         }
     }
-    if (!launched_batches.empty() && !allows_overlap(entries)) {
-        throw std::logic_error("executor::launch: the launched step and the entries do not allow overlap");
-    }
+    return launched_batches.empty() || allows_overlap(entries);
 }
 
 // A verify entry's tokens are accepted, and its samples taken, at its write-back. Its pending token and drafts are
@@ -344,12 +333,10 @@ void executor::advance(batch& b) {
 // once. Each shard's completion is taken once every shard has queued, before any later step queues.
 task<void> executor::launch(std::span<const batch_tokens> entries) {
     const std::chrono::steady_clock::time_point launch_time = std::chrono::steady_clock::now();
-    check_launch(entries);
+    assert(is_launchable(entries));
     std::unique_ptr<batch> b(new batch(*this, entries));
     b->launch_time = launch_time;
-    if (b->sample_params.size() > sampled_row_capacity) {
-        throw std::logic_error("executor::launch: the step samples more than sampled_row_limit rows");
-    }
+    assert(b->sample_params.size() <= sampled_row_capacity);
     b->allows_overlap = entries_allow_overlap(entries);
     link_previous(*b);
     advance(*b);
@@ -399,11 +386,7 @@ void executor::link_previous(batch& b) const {
                 e.previous_drafting_row = d;
             }
         }
-        if (!e.previous_verify_row || !e.previous_drafting_row) {
-            throw std::logic_error(
-                "executor::launch: a sequence with a launched step is not a verify and drafting entry of that step"
-            );
-        }
+        assert(e.previous_verify_row && e.previous_drafting_row);
     }
 }
 

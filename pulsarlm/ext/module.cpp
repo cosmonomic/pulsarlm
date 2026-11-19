@@ -256,7 +256,8 @@ PYBIND11_MODULE(pulsarlm_core, m) {
         .def_readonly("accepted_draft_count", &engine_stat::accepted_draft_count);
 
     py::native_enum<request_error>(m, "RequestError", "enum.Enum")
-        .value("MISS", request_error::miss)
+        .value("MISSING_STATE", request_error::missing_state)
+        .value("INVALID_STATE", request_error::invalid_state)
         .value("OOM", request_error::oom)
         .value("CANCELLED", request_error::cancelled)
         .value("LOOP_EXITED", request_error::loop_exited)

@@ -43,8 +43,7 @@ struct layer_sequence {
 
 // head is the hash of the newest full page of the history, which new pages chain from and every non-empty sequence
 // ends with; absent before the first full page. layers holds one sequence per KV layer, and may be empty when head is
-// absent. tail holds the tokens after head. A sequence's hashes are distinct: they come from one digest chain. A state
-// that breaks this is undefined behaviour.
+// absent. tail holds the tokens after head. A sequence's hashes are distinct: they come from one digest chain.
 struct state {
     using lease_id_type = std::uint64_t;
 

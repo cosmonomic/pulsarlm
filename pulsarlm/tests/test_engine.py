@@ -383,7 +383,7 @@ def test_a_store_pool_with_room_gives_pinned_pages():
     asyncio.run(main())
 
 
-def test_a_page_missing_from_the_store_ends_with_miss():
+def test_a_page_missing_from_the_store_ends_with_missing_state():
     async def main():
         store = MemoryStore(asyncio.get_running_loop())
         first = make_engine(store)
@@ -393,7 +393,7 @@ def test_a_page_missing_from_the_store_ends_with_miss():
         second = make_engine(store)
         _, _, end = await run(second, *submit(second, PROMPT + sampled, max_tokens=1))
 
-        assert end == RequestError.MISS
+        assert end == RequestError.MISSING_STATE
         del first, second
         assert store.releases == [1, 2]
 
@@ -412,7 +412,7 @@ def test_a_failing_read_misses():
         second = make_engine(failing_store)
         _, _, end = await run(second, *submit(second, PROMPT + sampled, max_tokens=1))
 
-        assert end == RequestError.MISS
+        assert end == RequestError.MISSING_STATE
         assert second.exception() is None
 
     asyncio.run(main())
@@ -425,10 +425,21 @@ def test_a_failing_state_lookup_misses():
         sampled, _, end = await run(engine, *submit(engine, PROMPT, max_tokens=8))
 
         assert sampled == []
-        assert end == RequestError.MISS
+        assert end == RequestError.MISSING_STATE
         assert engine.exception() is None
 
     asyncio.run(main())
+
+
+def test_request_error_names_a_missing_and_an_invalid_state():
+    assert RequestError.MISSING_STATE != RequestError.INVALID_STATE
+    assert [error.name for error in RequestError] == [
+        "MISSING_STATE",
+        "INVALID_STATE",
+        "OOM",
+        "CANCELLED",
+        "LOOP_EXITED",
+    ]
 
 
 def test_cancel_ends_the_request_with_cancelled():

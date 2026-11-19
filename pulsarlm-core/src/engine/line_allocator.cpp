@@ -8,7 +8,6 @@
 #include <numeric>
 #include <optional>
 #include <span>
-#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -20,19 +19,13 @@ std::size_t ceil_div(std::size_t n, std::size_t d) {
     return (n + d - 1) / d;
 }
 
-void require_block_class(std::span<const std::size_t> sizes) {
-    if (sizes.empty()) {
-        throw std::invalid_argument("a line allocator has at least one block class");
-    }
-}
-
 std::size_t smallest(std::span<const std::size_t> sizes) {
-    require_block_class(sizes);
+    assert(!sizes.empty());
     return *std::ranges::min_element(sizes);
 }
 
 std::size_t largest(std::span<const std::size_t> sizes) {
-    require_block_class(sizes);
+    assert(!sizes.empty());
     return *std::ranges::max_element(sizes);
 }
 

@@ -1021,7 +1021,7 @@ TEST_CASE("pages fetched from the store count as cached but not device cached") 
     REQUIRE(second.statistics.device_cached_token_count == 0);
 }
 
-TEST_CASE("a state page missing from the store ends the request with miss") {
+TEST_CASE("a state page missing from the store ends the request with missing_state") {
     fixture f(16);
     token_list prompt{1, 2, 3, 4, 5};
     f.backing.keep_state(
@@ -1032,18 +1032,36 @@ TEST_CASE("a state page missing from the store ends the request with miss") {
     std::vector<request_results> results = serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 1}});
 
     REQUIRE(results[0].tokens.empty());
-    REQUIRE(ended_error(results[0]) == request_error::miss);
+    REQUIRE(ended_error(results[0]) == request_error::missing_state);
     REQUIRE(f.model.forward_count == 0);
     REQUIRE(f.store->releases == f.store->leases);
 }
 
-TEST_CASE("a failed state lookup ends the request with miss and leases nothing") {
+TEST_CASE("a stored state listing a page twice in a layer ends the request with invalid_state") {
+    fixture f(16);
+    token_list prompt{1, 2, 3, 4, 5, 6, 7, 8, 9};
+    std::vector<digest> hashes = pulsarlm::make_page_digests(root(), prompt, page_size);
+    f.backing.keep_state(std::make_shared<const pulsarlm::state>(full_layers_state({hashes[1], hashes[1]}, 2)));
+    token_list other_prompt{20, 21, 22};
+    std::vector<request_results> results = serve_in_turn(
+        f.sched,
+        request{.tokens = prompt, .max_tokens = 1},
+        [&](const request_results&) { return request{.tokens = other_prompt, .max_tokens = 2}; }
+    );
+
+    REQUIRE(results[0].tokens.empty());
+    REQUIRE(ended_error(results[0]) == request_error::invalid_state);
+    REQUIRE(results[1].tokens == continuation(other_prompt, 2));
+    REQUIRE(f.store->releases == f.store->leases);
+}
+
+TEST_CASE("a failed state lookup ends the request with missing_state and leases nothing") {
     fixture f(16);
     f.store->lookup_fails = true;
     std::vector<request_results> results = serve_all(f.sched, {request{.tokens = {1, 2, 3}, .max_tokens = 1}});
 
     REQUIRE(results[0].tokens.empty());
-    REQUIRE(ended_error(results[0]) == request_error::miss);
+    REQUIRE(ended_error(results[0]) == request_error::missing_state);
     REQUIRE(f.model.forward_count == 0);
     REQUIRE(f.store->state_reads.size() == 1);
     REQUIRE(f.store->leases.empty());
@@ -2212,34 +2230,6 @@ TEST_CASE("each state a recurrent request reaches has the state at its head in t
     }
 }
 
-task<void> write_back_once(pulsarlm::executor& exec) {
-    co_await exec.write_back();
-}
-
-TEST_CASE("a write-back with no launched step panics the loop with a logic error") {
-    fixture f(16);
-    event_loop loop;
-    loop.spawn(write_back_once(f.exec));
-    std::exception_ptr thrown = loop.run();
-
-    REQUIRE(thrown != nullptr);
-    REQUIRE_THROWS_AS(std::rethrow_exception(thrown), std::logic_error);
-}
-
-task<void> launch_no_entries(pulsarlm::executor& exec) {
-    co_await exec.launch({});
-}
-
-TEST_CASE("a launch of no entries panics the loop with a logic error") {
-    fixture f(16);
-    event_loop loop;
-    loop.spawn(launch_no_entries(f.exec));
-    std::exception_ptr thrown = loop.run();
-
-    REQUIRE(thrown != nullptr);
-    REQUIRE_THROWS_AS(std::rethrow_exception(thrown), std::logic_error);
-}
-
 task<void> start_then_stop_loop(
     pulsarlm::executor& exec,
     request r,
@@ -2405,27 +2395,6 @@ TEST_CASE("a prefilling request left out by the row limit leaves its prefill tok
     }
     REQUIRE(!f.model.prefill_chunks.empty());
     REQUIRE(f.model.prefill_chunks.front() == token_list{2, 2, 2});
-}
-
-TEST_CASE("an executor with a row limit of 0 is not constructed") {
-    memory_store backing;
-    sum_model model;
-    REQUIRE_THROWS_AS(
-        pulsarlm::executor(
-            {&model},
-            make_cache(model.layers, 16, std::nullopt, backing),
-            backing,
-            compute_streams(),
-            copy_streams(),
-            {},
-            root(),
-            {},
-            std::nullopt,
-            0,
-            0
-        ),
-        std::invalid_argument
-    );
 }
 
 }  // namespace

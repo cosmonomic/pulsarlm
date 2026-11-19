@@ -7,18 +7,11 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
-#include <stdexcept>
 #include <utility>
 
 namespace pulsarlm {
 
 namespace {
-
-void require_draft_head(model& shard_model) {
-    if (shard_model.drafter() == nullptr) {
-        throw std::logic_error("step_graphs: the model has no draft head");
-    }
-}
 
 void copy_input(const at::Tensor& buffer, const at::Tensor& source) {
     assert(buffer.sizes() == source.sizes());
@@ -380,7 +373,7 @@ step_graphs::verify_step_outputs step_graphs::verify_step(
     const at::Tensor& later_positions,
     const at::Tensor& later_key_counts
 ) {
-    require_draft_head(shard_model);
+    assert(shard_model.drafter() != nullptr);
     const group_shape shape = shape_of(g);
     captured_step* captured = nullptr;
     if (sampling.filters) {

@@ -1,10 +1,10 @@
 #include "pulsarlm/engine/scheduler.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <memory>
 #include <optional>
-#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -13,9 +13,7 @@ namespace pulsarlm {
 scheduler::scheduler(executor& exec, std::size_t prefill_tokens_per_step)
 : exec(exec),
   prefill_tokens_per_step(prefill_tokens_per_step) {
-    if (prefill_tokens_per_step == 0) {
-        throw std::invalid_argument("scheduler: prefill_tokens_per_step must be at least 1");
-    }
+    assert(prefill_tokens_per_step >= 1);
 }
 
 event& scheduler::emplace_event(std::optional<event>& waited) {

@@ -54,7 +54,7 @@ class scheduler {
     // them with the request's result or an error. The callbacks are ended with loop_exited when the returned task is
     // destroyed before the executor has taken them. The executor writes the state reached at the end of each eviction
     // cycle to the store, then passes it to the callbacks, and likewise the end state, and releases the state's lease
-    // before it ends them. Ends with miss when the store's lookup fails. Ends with oom, never waiting, when the free
+    // before it ends them. Ends with missing_state when the store's lookup fails. Ends with oom, never waiting, when the free
     // lines do not cover the state's pages and one cycle's tokens at the start, or the next cycle's tokens while
     // running; the caller resubmits.
     task<void> submit(request&& r, std::unique_ptr<request_callbacks>&& callbacks);

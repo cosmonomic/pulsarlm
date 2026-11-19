@@ -8,6 +8,7 @@
 #include <ATen/ATen.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -934,14 +935,7 @@ qwen4_exp_model::ple(const at::Tensor& x, const layer_weights& layer, const batc
     at::Tensor normed = stream_norm(gated, w.norm_conv);
     const state_rows rows = window_layer_rows(g, conv_layer);
     const std::int64_t sequences = rows.lines.size(0);
-    TORCH_CHECK(
-        g.kind != batch_kind::verify || (sequences > 0 && ntok > 0 && ntok % sequences == 0),
-        "qwen4_exp_model: a verify batch of ",
-        ntok,
-        " tokens does not hold the same count for each of its ",
-        sequences,
-        " sequences"
-    );
+    assert(g.kind != batch_kind::verify || (sequences > 0 && ntok > 0 && ntok % sequences == 0));
     at::Tensor convolved = g.kind == batch_kind::verify
         ? causal_conv_verify_cuda(normed, w.conv, lines[conv_layer].k, rows, ntok / sequences, c.ngram_size)
         : causal_conv_cuda(normed, w.conv, lines[conv_layer].k, rows, cu_seqlens_q, c.ngram_size);
@@ -951,10 +945,7 @@ qwen4_exp_model::ple(const at::Tensor& x, const layer_weights& layer, const batc
 // A block's output joins the streams in the next mix's kernel, so x lags it until then.
 model::output qwen4_exp_model::forward(const batch& b, std::span<const kv> lines) {
     check_batch(b);
-    TORCH_CHECK(
-        mtp || b.kind != batch_kind::verify,
-        "qwen4_exp_model: a model without its MTP layer forwards no verify batch"
-    );
+    assert(mtp || b.kind != batch_kind::verify);
     at::Tensor x = lookup(embed_tokens, first_vocab_row, b.tokens).repeat({1, config.hc_count});
     // The last block's output and its injection weights, not yet added to x.
     std::optional<std::pair<at::Tensor, at::Tensor>> pending;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -136,6 +137,17 @@ template <typename value_type> class slot_map {
             throw std::out_of_range("slot_map: the key's value was erased");
         }
         return *value;
+    }
+
+    // key's value. The value was not erased.
+    value_type& operator[](key_type key) noexcept {
+        return const_cast<value_type&>(std::as_const(*this)[key]);
+    }
+
+    const value_type& operator[](key_type key) const noexcept {
+        const slot_type* slot = slot_of(key);
+        assert(slot != nullptr);
+        return *slot->second;
     }
 
     // key's value, or null when the value was erased.

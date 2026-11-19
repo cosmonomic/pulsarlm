@@ -24,6 +24,8 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -107,6 +109,35 @@ class successor_model final : public pulsarlm::model {
                 b
             ),
         };
+    }
+};
+
+class unused_draft_head final : public pulsarlm::draft_head {
+  public:
+    std::int64_t hidden_dim() const override {
+        return 1;
+    }
+
+    pulsarlm::model::output
+    draft(const pulsarlm::model::batch&, const at::Tensor&, std::span<const pulsarlm::kv>) override {
+        return {};
+    }
+};
+
+class drafting_model final : public pulsarlm::model {
+    unused_draft_head head;
+
+  public:
+    std::vector<pulsarlm::kv_layer> kv_layers() const override {
+        return one_layer;
+    }
+
+    output forward(const batch&, std::span<const pulsarlm::kv>) override {
+        return {};
+    }
+
+    pulsarlm::draft_head* drafter() override {
+        return &head;
     }
 };
 
@@ -220,6 +251,71 @@ TEST_CASE("an engine whose bfloat16 attention the kernels cannot run is rejected
         pulsarlm::engine(std::make_unique<successor_model>(), vocab, bfloat16, std::make_unique<stalling_store>()),
         std::invalid_argument
     );
+}
+
+TEST_CASE("an engine that prefills no token per step is rejected") {
+    pulsarlm::engine_config idle = config(16);
+    idle.prefill_tokens_per_step = 0;
+    REQUIRE_THROWS_AS(
+        pulsarlm::engine(std::make_unique<successor_model>(), vocab, idle, std::make_unique<stalling_store>()),
+        std::invalid_argument
+    );
+}
+
+TEST_CASE("an engine whose drafts of one sequence exceed a step's sampled rows is rejected") {
+    pulsarlm::engine_config drafting = config(16);
+    drafting.draft_tokens = 4096;
+    REQUIRE_THROWS_AS(
+        pulsarlm::engine(std::make_unique<drafting_model>(), vocab, drafting, std::make_unique<stalling_store>()),
+        std::invalid_argument
+    );
+}
+
+TEST_CASE("an engine whose page does not hold whole Qwen4-Exp index blocks is rejected before the model loads") {
+    bool loaded = false;
+    pulsarlm::model_shard_loader loader = [&](std::size_t, std::size_t) {
+        loaded = true;
+        return std::unordered_map<std::string, at::Tensor>{};
+    };
+    REQUIRE_THROWS_AS(
+        pulsarlm::engine(
+            pulsarlm::qwen4_exp_config{.indexer_compress_ratio = 3},
+            loader,
+            config(16),
+            std::make_unique<stalling_store>()
+        ),
+        std::invalid_argument
+    );
+    REQUIRE(!loaded);
+}
+
+TEST_CASE("a stored state whose head is no digest of the request ends the request with invalid_state") {
+    auto store = std::make_unique<stalling_store>();
+    store->stored_state = std::make_shared<const pulsarlm::state>(
+        one_page_state(pulsarlm::make_page_digests(root(), token_list{9, 9, 9, 9}, page_size)[0], 0.0f)
+    );
+    std::shared_ptr<lease_record> lease_records = store->lease_records;
+    pulsarlm::engine e(std::make_unique<successor_model>(), vocab, config(16), std::move(store));
+    auto recorded_results = std::make_shared<request_results>();
+    e.submit(request{.tokens = {1, 2, 3, 4, 5}, .max_tokens = 1}, record_into(recorded_results));
+    wait_for_end(*recorded_results);
+
+    REQUIRE(ended_with(*recorded_results, request_error::invalid_state));
+    REQUIRE(e.exception() == nullptr);
+    std::lock_guard lock(lease_records->mutex);
+    REQUIRE(lease_records->releases == lease_records->leases);
+}
+
+TEST_CASE("a stored state whose tail is no proper prefix of the request's tokens ends the request with invalid_state") {
+    auto store = std::make_unique<stalling_store>();
+    store->stored_state = std::make_shared<const pulsarlm::state>(pulsarlm::state{.tail = {1, 7}});
+    pulsarlm::engine e(std::make_unique<successor_model>(), vocab, config(16), std::move(store));
+    auto recorded_results = std::make_shared<request_results>();
+    e.submit(request{.tokens = {1, 2, 3}, .max_tokens = 1}, record_into(recorded_results));
+    wait_for_end(*recorded_results);
+
+    REQUIRE(ended_with(*recorded_results, request_error::invalid_state));
+    REQUIRE(e.exception() == nullptr);
 }
 
 TEST_CASE("a submitted request passes its tokens and its end state to its callbacks") {
