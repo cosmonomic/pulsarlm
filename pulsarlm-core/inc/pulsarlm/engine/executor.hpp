@@ -31,14 +31,14 @@ namespace pulsarlm {
 // Runs sequences on the model: it owns the model shards, the KV cache and the store's side of a request, and does
 // whatever touches them, while the scheduler decides what runs.
 class executor {
-    // A request being served: its callbacks, and its sequence once the stored state was read.
-    struct served_request {
+    // A request the executor runs: its callbacks, and its sequence once the stored state was read.
+    struct running_request {
         std::unique_ptr<request_callbacks> callbacks;
         std::optional<sequence> state;
     };
 
   public:
-    using sequence_id = slot_map<served_request>::key_type;
+    using sequence_id = slot_map<running_request>::key_type;
     // A sequence and the tokens it computes in a batch.
     using batch_tokens = std::pair<sequence_id, std::size_t>;
 
@@ -60,7 +60,7 @@ class executor {
     };
 
     // Each request from start until its end.
-    slot_map<served_request> requests;
+    slot_map<running_request> requests;
 
     // One model per shard of the cache, each holding its part of every layer.
     std::vector<model*> shards;
@@ -141,9 +141,9 @@ class executor {
     // The sequence of id's request, which is not erased and whose stored state start has read.
     sequence& sequence_of(sequence_id id);
     const sequence& sequence_of(sequence_id id) const;
-    // Calls on_end of served's callbacks with result and statistics and destroys the callbacks.
+    // Calls on_end of running's callbacks with result and statistics and destroys the callbacks.
     void deliver_end(
-        served_request& served,
+        running_request& running,
         std::expected<std::shared_ptr<const state>, request_error>&& result,
         const request_statistics& statistics
     ) noexcept;

@@ -45,8 +45,8 @@ request_statistics statistics_of(const sequence& seq) {
 task<std::optional<executor::sequence_id>>
 executor::start(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
     const sequence_id id = requests.emplace(std::move(callbacks));
-    served_request& served = requests[id];
-    if (served.callbacks->cancelled()) {
+    running_request& running = requests[id];
+    if (running.callbacks->cancelled()) {
         end_request(id, std::unexpected(request_error::cancelled), request_statistics{});
         co_return std::nullopt;
     }
@@ -89,7 +89,7 @@ executor::start(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
     for (const std::vector<kv>& shard_lines : lines) {
         devices.push_back(shard_lines.front().k.device());
     }
-    sequence& seq = served.state.emplace(
+    sequence& seq = running.state.emplace(
         std::move(r),
         std::move(initial_state),
         lease_id,
@@ -124,11 +124,11 @@ executor::start(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
 }
 
 void executor::deliver_end(
-    served_request& served,
+    running_request& running,
     std::expected<std::shared_ptr<const state>, request_error>&& result,
     const request_statistics& statistics
 ) noexcept {
-    std::unique_ptr<request_callbacks> ended = std::move(served.callbacks);
+    std::unique_ptr<request_callbacks> ended = std::move(running.callbacks);
     ended->on_end(std::move(result), statistics);
 }
 
@@ -137,19 +137,23 @@ void executor::end_request(
     std::expected<std::shared_ptr<const state>, request_error>&& result,
     const request_statistics& statistics
 ) noexcept {
-    if (served_request* served = requests.find(id)) {
-        deliver_end(*served, std::move(result), statistics);
+    if (running_request* running = requests.find(id)) {
+        deliver_end(*running, std::move(result), statistics);
         requests.erase(id);
     }
 }
 
 void executor::end_requests(request_error error) noexcept {
-    for (served_request& served : requests) {
-        if (served.state) {
-            release_lines(*served.state);
-            store.release(served.state->lease_id());
+    for (running_request& running : requests) {
+        if (running.state) {
+            release_lines(*running.state);
+            store.release(running.state->lease_id());
         }
-        deliver_end(served, std::unexpected(error), served.state ? statistics_of(*served.state) : request_statistics{});
+        deliver_end(
+            running,
+            std::unexpected(error),
+            running.state ? statistics_of(*running.state) : request_statistics{}
+        );
     }
     requests.clear();
 }
