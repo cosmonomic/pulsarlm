@@ -1,4 +1,6 @@
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/normalization.hpp"
+#include "pulsarlm/kernels/page_tables.hpp"
+#include "pulsarlm/kernels/paged_attention.hpp"
 #include "pulsarlm/kernels/rope.hpp"
 
 #include <ATen/ATen.h>
@@ -125,27 +127,26 @@ at::Tensor prefill(
     const at::Tensor& v_pool,
     const at::Tensor& page_tables,
     const at::Tensor& cu_seqlens_q,
-    const at::Tensor& seqlens_k,
+    const at::Tensor& key_counts,
     const at::Tensor& mass_sum,
     const at::Tensor& weight_sum,
     const at::Tensor& query_weights
 ) {
     return pulsarlm::attn_prefill_cuda(
         q,
-        k_pool,
-        v_pool,
-        page_tables,
+        {.keys = k_pool, .values = v_pool},
+        {.page_tables = page_tables, .page_positions = identity_positions(page_tables), .key_counts = key_counts},
         cu_seqlens_q,
-        seqlens_k,
-        identity_positions(page_tables),
-        pulsarlm::rope_parameters{.theta = rope_theta},
-        attention_scale,
-        std::nullopt,
-        std::nullopt,
-        mass_sum,
-        weight_sum,
-        row_view_pages(page_tables),
-        query_weights
+        {.rope = pulsarlm::rope_parameters{.theta = rope_theta},
+         .scale = attention_scale,
+         .sliding_window = std::nullopt,
+         .k_norm_weight = std::nullopt},
+        pulsarlm::page_mass{
+            .mass_sum = mass_sum,
+            .weight_sum = weight_sum,
+            .cu_view_pages = row_view_pages(page_tables),
+            .query_weights = query_weights
+        }
     );
 }
 
@@ -154,7 +155,7 @@ at::Tensor decode(
     const at::Tensor& k_pool,
     const at::Tensor& v_pool,
     const at::Tensor& page_tables,
-    const at::Tensor& context_lens,
+    const at::Tensor& key_counts,
     const at::Tensor& mass_sum,
     const at::Tensor& weight_sum,
     const at::Tensor& query_weights,
@@ -162,19 +163,18 @@ at::Tensor decode(
 ) {
     return pulsarlm::attn_decode_cuda(
         q,
-        k_pool,
-        v_pool,
-        page_tables,
-        context_lens,
-        identity_positions(page_tables),
-        pulsarlm::rope_parameters{.theta = rope_theta},
-        attention_scale,
-        std::nullopt,
-        std::nullopt,
-        mass_sum,
-        weight_sum,
-        row_view_pages(page_tables),
-        query_weights,
+        {.keys = k_pool, .values = v_pool},
+        {.page_tables = page_tables, .page_positions = identity_positions(page_tables), .key_counts = key_counts},
+        {.rope = pulsarlm::rope_parameters{.theta = rope_theta},
+         .scale = attention_scale,
+         .sliding_window = std::nullopt,
+         .k_norm_weight = std::nullopt},
+        pulsarlm::page_mass{
+            .mass_sum = mass_sum,
+            .weight_sum = weight_sum,
+            .cu_view_pages = row_view_pages(page_tables),
+            .query_weights = query_weights
+        },
         num_splits
     );
 }
@@ -198,11 +198,11 @@ TEST_CASE("prefill sums the weights of the queries attending each page", "[ops][
         auto q = at::zeros({ntok, 1, pool_head_dim}, at::device(at::kCUDA).dtype(dt));
         auto page_tables = at::arange(num_pages, at::device(at::kCUDA).dtype(at::kInt)).view({1, num_pages});
         auto cu_seqlens_q = int32_cuda({0, static_cast<int32_t>(ntok)});
-        auto seqlens_k = int32_cuda({static_cast<int32_t>(ntok)});
+        auto key_counts = int32_cuda({static_cast<int32_t>(ntok)});
 
         auto mass_sum = zero_mass(num_pages);
         auto weight_sum = zero_weights(num_pages);
-        prefill(q, k_pool, v_pool, page_tables, cu_seqlens_q, seqlens_k, mass_sum, weight_sum, fp32_cuda(weights));
+        prefill(q, k_pool, v_pool, page_tables, cu_seqlens_q, key_counts, mass_sum, weight_sum, fp32_cuda(weights));
         REQUIRE(at::equal(mass_sum, zero_mass(num_pages)));
         auto got = weight_sum.to(at::kCPU);
         for (int64_t b = 0; b < num_pages; ++b) {
@@ -230,7 +230,7 @@ TEST_CASE("decode gives each page its query attends the query's weight", "[ops][
         tables.push_back(p);
     }
     auto page_tables = int32_cuda(tables).view({2, max_pages});
-    auto context_lens = int32_cuda({static_cast<int32_t>(short_ctx), static_cast<int32_t>(long_ctx)});
+    auto key_counts = int32_cuda({static_cast<int32_t>(short_ctx), static_cast<int32_t>(long_ctx)});
     auto check = [&](const at::Tensor& mass_sum, const at::Tensor& weight_sum) {
         REQUIRE(at::equal(mass_sum, zero_mass(num_pages)));
         auto got = weight_sum.view({2, max_pages}).to(at::kCPU);
@@ -249,7 +249,7 @@ TEST_CASE("decode gives each page its query attends the query's weight", "[ops][
         auto q = at::zeros({2, 1, pool_head_dim}, at::device(at::kCUDA).dtype(dt));
         auto mass_sum = zero_mass(num_pages);
         auto weight_sum = zero_weights(num_pages);
-        decode(q, k_pool, v_pool, page_tables, context_lens, mass_sum, weight_sum, fp32_cuda(weights));
+        decode(q, k_pool, v_pool, page_tables, key_counts, mass_sum, weight_sum, fp32_cuda(weights));
         check(mass_sum, weight_sum);
     }
 
@@ -259,7 +259,7 @@ TEST_CASE("decode gives each page its query attends the query's weight", "[ops][
     auto q = at::zeros({2, 1, pool_head_dim}, at::device(at::kCUDA).dtype(at::kBFloat16));
     auto mass_sum = zero_mass(num_pages);
     auto weight_sum = zero_weights(num_pages);
-    decode(q, k_pool, v_pool, page_tables, context_lens, mass_sum, weight_sum, fp32_cuda(weights), /*num_splits=*/2);
+    decode(q, k_pool, v_pool, page_tables, key_counts, mass_sum, weight_sum, fp32_cuda(weights), /*num_splits=*/2);
     check(mass_sum, weight_sum);
 }
 
@@ -351,7 +351,7 @@ TEST_CASE("views sharing a line rotate and accumulate apart", "[ops][cuda]") {
     cu_view.push_back(static_cast<int32_t>(total_view_pages));
     auto page_tables = int32_cuda(tables).view({2, max_pages});
     auto page_positions = int32_cuda(positions).view({2, max_pages});
-    auto seqlens_k = int32_cuda(seqlens);
+    auto key_counts = int32_cuda(seqlens);
     auto cu_seqlens_q = int32_cuda(cu_q);
     auto cu_view_pages = int32_cuda(cu_view);
     std::vector<float> pre_weights;
@@ -400,20 +400,19 @@ TEST_CASE("views sharing a line rotate and accumulate apart", "[ops][cuda]") {
         auto weights = new_weights();
         auto o = pulsarlm::attn_prefill_cuda(
             q_pre,
-            k_pool,
-            v_pool,
-            page_tables,
+            {.keys = k_pool, .values = v_pool},
+            {.page_tables = page_tables, .page_positions = page_positions, .key_counts = key_counts},
             cu_seqlens_q,
-            seqlens_k,
-            page_positions,
-            pulsarlm::rope_parameters{.theta = rope_theta},
-            attention_scale,
-            std::nullopt,
-            std::nullopt,
-            mass,
-            weights,
-            cu_view_pages,
-            prefill_weights
+            {.rope = pulsarlm::rope_parameters{.theta = rope_theta},
+             .scale = attention_scale,
+             .sliding_window = std::nullopt,
+             .k_norm_weight = std::nullopt},
+            pulsarlm::page_mass{
+                .mass_sum = mass,
+                .weight_sum = weights,
+                .cu_view_pages = cu_view_pages,
+                .query_weights = prefill_weights
+            }
         );
         CHECK(at::allclose(o.to(at::kFloat), o_pre, o_tol, o_tol));
         CHECK(at::allclose(mass, reference_pre.mass_sum(), 1e-3, 1e-3));
@@ -424,19 +423,18 @@ TEST_CASE("views sharing a line rotate and accumulate apart", "[ops][cuda]") {
             auto dec_weights = new_weights();
             auto dec_o = pulsarlm::attn_decode_cuda(
                 q_dec,
-                k_pool,
-                v_pool,
-                page_tables,
-                seqlens_k,
-                page_positions,
-                pulsarlm::rope_parameters{.theta = rope_theta},
-                attention_scale,
-                std::nullopt,
-                std::nullopt,
-                dec_mass,
-                dec_weights,
-                cu_view_pages,
-                decode_weights,
+                {.keys = k_pool, .values = v_pool},
+                {.page_tables = page_tables, .page_positions = page_positions, .key_counts = key_counts},
+                {.rope = pulsarlm::rope_parameters{.theta = rope_theta},
+                 .scale = attention_scale,
+                 .sliding_window = std::nullopt,
+                 .k_norm_weight = std::nullopt},
+                pulsarlm::page_mass{
+                    .mass_sum = dec_mass,
+                    .weight_sum = dec_weights,
+                    .cu_view_pages = cu_view_pages,
+                    .query_weights = decode_weights
+                },
                 num_splits
             );
             CHECK(at::allclose(dec_o.to(at::kFloat), o_dec, o_tol, o_tol));
@@ -602,7 +600,7 @@ TEST_CASE(
                         cu_view.push_back(static_cast<int32_t>(views.size() * max_pages));
                         auto page_tables = int32_cuda(tables).view({static_cast<int64_t>(views.size()), max_pages});
                         auto page_positions = identity_positions(page_tables, page_size);
-                        auto seqlens_k = int32_cuda(seqlens);
+                        auto key_counts = int32_cuda(seqlens);
                         auto cu_seqlens_q = int32_cuda(cu_q);
                         auto cu_view_pages = int32_cuda(cu_view);
                         const int64_t total_view_pages = static_cast<int64_t>(views.size()) * max_pages;
@@ -688,20 +686,21 @@ TEST_CASE(
                                 auto weights = new_weights();
                                 auto o = pulsarlm::attn_prefill_cuda(
                                     q_pre,
-                                    k_pool,
-                                    v_pool,
-                                    page_tables,
+                                    {.keys = k_pool, .values = v_pool},
+                                    {.page_tables = page_tables,
+                                     .page_positions = page_positions,
+                                     .key_counts = key_counts},
                                     cu_seqlens_q,
-                                    seqlens_k,
-                                    page_positions,
-                                    rope,
-                                    scale,
-                                    window,
-                                    k_norm_weight,
-                                    mass,
-                                    weights,
-                                    cu_view_pages,
-                                    prefill_weights
+                                    {.rope = rope,
+                                     .scale = scale,
+                                     .sliding_window = window,
+                                     .k_norm_weight = k_norm_weight},
+                                    pulsarlm::page_mass{
+                                        .mass_sum = mass,
+                                        .weight_sum = weights,
+                                        .cu_view_pages = cu_view_pages,
+                                        .query_weights = prefill_weights
+                                    }
                                 );
                                 CHECK(at::allclose(o.to(at::kFloat), o_pre, o_tol, o_tol));
                                 CHECK(at::allclose(mass, reference_pre.mass_sum(), 1e-3, 1e-3));
@@ -720,20 +719,21 @@ TEST_CASE(
                                 auto query_weights_sum = at::zeros({total_q * max_pages}, mass.options());
                                 auto verified = pulsarlm::attn_prefill_verify_cuda(
                                     q_pre,
-                                    k_pool,
-                                    v_pool,
-                                    page_tables,
+                                    {.keys = k_pool, .values = v_pool},
+                                    {.page_tables = page_tables,
+                                     .page_positions = page_positions,
+                                     .key_counts = key_counts},
                                     cu_seqlens_q,
-                                    seqlens_k,
-                                    page_positions,
-                                    rope,
-                                    scale,
-                                    window,
-                                    k_norm_weight,
-                                    query_mass,
-                                    query_weights_sum,
-                                    int32_cuda(cu_query_view),
-                                    prefill_weights
+                                    {.rope = rope,
+                                     .scale = scale,
+                                     .sliding_window = window,
+                                     .k_norm_weight = k_norm_weight},
+                                    pulsarlm::page_mass{
+                                        .mass_sum = query_mass,
+                                        .weight_sum = query_weights_sum,
+                                        .cu_view_pages = int32_cuda(cu_query_view),
+                                        .query_weights = prefill_weights
+                                    }
                                 );
                                 CHECK(at::equal(verified, o));
                                 at::Tensor per_page = query_mass.view({total_q, max_pages, n_q});
@@ -756,20 +756,21 @@ TEST_CASE(
                                     auto alone_weights = new_weights();
                                     pulsarlm::attn_prefill_cuda(
                                         q_pre,
-                                        k_pool,
-                                        v_pool,
-                                        page_tables,
+                                        {.keys = k_pool, .values = v_pool},
+                                        {.page_tables = page_tables,
+                                         .page_positions = page_positions,
+                                         .key_counts = key_counts},
                                         cu_seqlens_q,
-                                        seqlens_k,
-                                        page_positions,
-                                        rope,
-                                        scale,
-                                        window,
-                                        k_norm_weight,
-                                        alone,
-                                        alone_weights,
-                                        cu_view_pages,
-                                        one_hot
+                                        {.rope = rope,
+                                         .scale = scale,
+                                         .sliding_window = window,
+                                         .k_norm_weight = k_norm_weight},
+                                        pulsarlm::page_mass{
+                                            .mass_sum = alone,
+                                            .weight_sum = alone_weights,
+                                            .cu_view_pages = cu_view_pages,
+                                            .query_weights = one_hot
+                                        }
                                     );
                                     const int64_t s = row < cu_q[1] ? 0 : 1;
                                     CHECK(
@@ -787,19 +788,20 @@ TEST_CASE(
                                     auto dec_weights = new_weights();
                                     auto dec_o = pulsarlm::attn_decode_cuda(
                                         q_dec,
-                                        k_pool,
-                                        v_pool,
-                                        page_tables,
-                                        seqlens_k,
-                                        page_positions,
-                                        rope,
-                                        scale,
-                                        window,
-                                        k_norm_weight,
-                                        dec_mass,
-                                        dec_weights,
-                                        cu_view_pages,
-                                        decode_weights,
+                                        {.keys = k_pool, .values = v_pool},
+                                        {.page_tables = page_tables,
+                                         .page_positions = page_positions,
+                                         .key_counts = key_counts},
+                                        {.rope = rope,
+                                         .scale = scale,
+                                         .sliding_window = window,
+                                         .k_norm_weight = k_norm_weight},
+                                        pulsarlm::page_mass{
+                                            .mass_sum = dec_mass,
+                                            .weight_sum = dec_weights,
+                                            .cu_view_pages = cu_view_pages,
+                                            .query_weights = decode_weights
+                                        },
                                         num_splits
                                     );
                                     CHECK(at::allclose(dec_o.to(at::kFloat), o_dec, o_tol, o_tol));
@@ -848,15 +850,14 @@ TEST_CASE("bfloat16 attention of a shape the tensor-core kernels lack fails inst
     REQUIRE_THROWS_WITH(
         pulsarlm::attn_decode_cuda(
             q,
-            pool,
-            pool,
-            int32_cuda({0}).view({1, 1}),
-            int32_cuda({4}),
-            identity_positions(int32_cuda({0}).view({1, 1})),
-            pulsarlm::rope_parameters{.theta = rope_theta},
-            attention_scale,
-            std::nullopt,
-            std::nullopt
+            {.keys = pool, .values = pool},
+            {.page_tables = int32_cuda({0}).view({1, 1}),
+             .page_positions = identity_positions(int32_cuda({0}).view({1, 1})),
+             .key_counts = int32_cuda({4})},
+            {.rope = pulsarlm::rope_parameters{.theta = rope_theta},
+             .scale = attention_scale,
+             .sliding_window = std::nullopt,
+             .k_norm_weight = std::nullopt}
         ),
         Catch::Matchers::ContainsSubstring("head dim 32")
     );
@@ -870,14 +871,20 @@ TEST_CASE("write_kv places each token at its view index through the page table",
     auto opts = at::device(at::kCUDA).dtype(at::kFloat);
     auto page_tables = int32_cuda({3, 1, 0, 4, 2, 0}).view({2, 3});
     // Sequence 0 forwards view indices [14, 20), sequence 1 [1, 3).
-    auto seqlens_k = int32_cuda({20, 3});
+    auto key_counts = int32_cuda({20, 3});
     auto cu_seqlens_q = int32_cuda({0, 6, 8});
     auto k_new = at::randn({8, n_kv, head_dim}, opts);
     auto v_new = at::randn({8, n_kv, head_dim}, opts);
 
     auto k_pool = at::zeros({num_lines, pool_page_size, n_kv, head_dim}, opts);
     auto v_pool = at::zeros({num_lines, pool_page_size, n_kv, head_dim}, opts);
-    pulsarlm::write_kv_cuda(k_pool, v_pool, k_new, v_new, page_tables, cu_seqlens_q, seqlens_k);
+    pulsarlm::write_kv_cuda(
+        {.keys = k_pool, .values = v_pool},
+        k_new,
+        v_new,
+        {.page_tables = page_tables, .key_counts = key_counts},
+        cu_seqlens_q
+    );
     for (int64_t t = 0; t < 6; ++t) {
         const int64_t index = 14 + t;
         const int64_t line = index < pool_page_size ? 3 : 1;
@@ -888,7 +895,13 @@ TEST_CASE("write_kv places each token at its view index through the page table",
     CHECK(at::equal(k_pool[4][2], k_new[7]));
 
     auto lines = at::zeros({num_lines, 2, pool_page_size, n_kv, head_dim}, opts);
-    pulsarlm::write_kv_cuda(lines.select(1, 0), lines.select(1, 1), k_new, v_new, page_tables, cu_seqlens_q, seqlens_k);
+    pulsarlm::write_kv_cuda(
+        {.keys = lines.select(1, 0), .values = lines.select(1, 1)},
+        k_new,
+        v_new,
+        {.page_tables = page_tables, .key_counts = key_counts},
+        cu_seqlens_q
+    );
     CHECK(at::equal(lines[3][0][14], k_new[0]));
     CHECK(at::equal(lines[3][1][14], v_new[0]));
     CHECK(at::equal(lines[4][0][2], k_new[7]));
@@ -897,20 +910,24 @@ TEST_CASE("write_kv places each token at its view index through the page table",
 
     auto head_major = at::zeros({num_lines, n_kv, 2, pool_page_size, head_dim}, opts).permute({0, 2, 3, 1, 4});
     pulsarlm::write_kv_cuda(
-        head_major.select(1, 0),
-        head_major.select(1, 1),
+        {.keys = head_major.select(1, 0), .values = head_major.select(1, 1)},
         k_new,
         v_new,
-        page_tables,
-        cu_seqlens_q,
-        seqlens_k
+        {.page_tables = page_tables, .key_counts = key_counts},
+        cu_seqlens_q
     );
     CHECK(at::equal(head_major.select(1, 0)[3][14], k_new[0]));
     CHECK(at::equal(head_major.select(1, 1)[4][2], v_new[7]));
 
     auto pool = at::zeros({num_lines, pool_page_size, n_kv, head_dim}, opts);
     auto decode_tokens = at::randn({2, n_kv, head_dim}, opts);
-    pulsarlm::write_kv_cuda(pool, pool, decode_tokens, decode_tokens, page_tables, std::nullopt, seqlens_k);
+    pulsarlm::write_kv_cuda(
+        {.keys = pool, .values = pool},
+        decode_tokens,
+        decode_tokens,
+        {.page_tables = page_tables, .key_counts = key_counts},
+        std::nullopt
+    );
     CHECK(at::equal(pool[1][3], decode_tokens[0]));
     CHECK(at::equal(pool[4][2], decode_tokens[1]));
 }

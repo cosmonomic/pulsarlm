@@ -3,7 +3,7 @@
 #include "pulsarlm/engine/communicator.hpp"
 #include "pulsarlm/engine/model/interface.hpp"
 #include "pulsarlm/engine/model/qwen4_exp_config.hpp"
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/paged_attention.hpp"
 #include "pulsarlm/kernels/rope.hpp"
 
 #include <ATen/core/Dict.h>
@@ -171,10 +171,8 @@ class qwen4_exp_model : public model, public draft_head {
         const attention_weights& w,
         const at::Tensor& queries,
         const kv& lines,
-        const at::Tensor& page_tables,
-        const std::optional<at::Tensor>& cu_seqlens_q,
-        const at::Tensor& key_counts,
-        const at::Tensor& page_positions
+        const page_views& views,
+        const std::optional<at::Tensor>& cu_seqlens_q
     ) const;
     at::Tensor stream_norm(const at::Tensor& x, const at::Tensor& weight) const;
     // The mix of the normed streams [ntok, hc_count * hidden] the head reads.

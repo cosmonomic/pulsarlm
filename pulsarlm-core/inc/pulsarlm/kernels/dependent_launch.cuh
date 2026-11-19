@@ -1,5 +1,7 @@
 #pragma once
 
+#include "pulsarlm/kernels/device.hpp"
+
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 
@@ -27,8 +29,6 @@ __device__ __forceinline__ void allow_next_kernel() {
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 #endif
 }
-
-bool supports_dependent_launch(int device);
 
 template <typename... Params, typename... Args>
 void launch_dependent(

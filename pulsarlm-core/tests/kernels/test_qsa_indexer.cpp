@@ -1,4 +1,5 @@
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/indexed_attention.hpp"
+#include "pulsarlm/kernels/normalization.hpp"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAFunctions.h>
@@ -30,7 +31,8 @@ at::Tensor int32_cuda(const std::vector<int32_t>& v) {
 }
 
 at::Tensor inv_freq() {
-    return (1.0 / at::pow(rope_theta, at::arange(0, rotary_dim, 2, at::kLong).to(at::kFloat) / rotary_dim)).to(at::kCUDA);
+    return (1.0 / at::pow(rope_theta, at::arange(0, rotary_dim, 2, at::kLong).to(at::kFloat) / rotary_dim))
+        .to(at::kCUDA);
 }
 
 at::Tensor reference_rope(const at::Tensor& x, const at::Tensor& positions) {
@@ -90,9 +92,7 @@ TEST_CASE("index_blocks_cuda pools, norms and ropes each view block", "[ops][cud
 
     at::Tensor blocks = pulsarlm::index_blocks_cuda(
         index_keys,
-        page_tables,
-        page_positions,
-        key_counts,
+        {.page_tables = page_tables, .page_positions = page_positions, .key_counts = key_counts},
         norm_weight,
         inv_freq(),
         ratio,
@@ -128,9 +128,7 @@ TEST_CASE("index_blocks_cuda zeros the blocks ending past a view's keys without 
 
     at::Tensor blocks = pulsarlm::index_blocks_cuda(
         index_keys,
-        page_tables,
-        page_positions,
-        key_counts,
+        {.page_tables = page_tables, .page_positions = page_positions, .key_counts = key_counts},
         norm_weight,
         inv_freq(),
         ratio,

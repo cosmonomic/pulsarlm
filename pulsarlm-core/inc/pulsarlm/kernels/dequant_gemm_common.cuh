@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pulsarlm/kernels/dependent_launch.cuh"
+#include "pulsarlm/kernels/device.hpp"
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 
@@ -131,8 +132,7 @@ constexpr int ctas_per_sm = 4;
 
 // The K splits that fill the SMs when the non-split grid has base_ctas CTAs over n_chunks K chunks.
 inline int split_k_count(int64_t base_ctas, int n_chunks) {
-    const int sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-    int64_t splits = (ctas_per_sm * static_cast<int64_t>(sm_count) + base_ctas - 1) / base_ctas;
+    int64_t splits = (ctas_per_sm * static_cast<int64_t>(sm_count()) + base_ctas - 1) / base_ctas;
     splits = std::min<int64_t>(std::max<int64_t>(splits, 1), n_chunks);
     return static_cast<int>(splits);
 }

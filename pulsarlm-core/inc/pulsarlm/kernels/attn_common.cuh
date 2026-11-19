@@ -1,7 +1,8 @@
 #pragma once
 
 #include "pulsarlm/kernels/attn_params.cuh"
-#include "pulsarlm/kernels/rope.hpp"
+#include "pulsarlm/kernels/device.hpp"
+#include "pulsarlm/kernels/paged_attention.hpp"
 
 #include <ATen/core/Tensor.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -21,14 +22,14 @@ namespace attn {
 
 // One validated call of a paged attention op. cu_seqlens_q is undefined for decode,
 // where sequence s has the one query row s. mass_sum, weight_sum, cu_view_pages and
-// query_weights are all defined or all undefined.
+// query_weights are all defined, with a page_mass, or all undefined.
 struct paged_attn_batch {
     at::Tensor q;
     at::Tensor k_pool;
     at::Tensor v_pool;
     at::Tensor page_tables;
     at::Tensor cu_seqlens_q;
-    at::Tensor seqlens_k;
+    at::Tensor key_counts;
     at::Tensor page_positions;
     at::Tensor rope_turns;
     at::Tensor k_norm_weight;
@@ -59,7 +60,7 @@ struct paged_attn_batch {
             this->k_pool.stride(2),
             static_cast<const int32_t*>(data(this->page_tables)),
             static_cast<const int32_t*>(data(this->cu_seqlens_q)),
-            static_cast<const int32_t*>(data(this->seqlens_k)),
+            static_cast<const int32_t*>(data(this->key_counts)),
             static_cast<const int32_t*>(data(this->page_positions)),
             static_cast<const uint64_t*>(data(this->rope_turns)),
             static_cast<const float*>(data(this->k_norm_weight)),
@@ -90,37 +91,19 @@ bool prefill_fits(int64_t page_size, int64_t head_dim);
 // page, token and head starting 16-byte aligned.
 void check_pools(const char* op, const at::Tensor& k_pool, const at::Tensor& v_pool);
 
-// Checks the mass arguments of b's op, passed together or not at all, with views mass views (cu_view_pages [views + 1]),
-// and sets them on b.
-void attach_mass(
-    paged_attn_batch& b,
-    const char* op,
-    const std::optional<at::Tensor>& mass_sum,
-    const std::optional<at::Tensor>& weight_sum,
-    const std::optional<at::Tensor>& cu_view_pages,
-    const std::optional<at::Tensor>& query_weights,
-    int64_t views
-);
+// Checks the mass of b's op, with views mass views (cu_view_pages [views + 1]), and sets it on b.
+void attach_mass(paged_attn_batch& b, const char* op, const page_mass& mass, int64_t views);
 
-// Checks the argument contract the attention ops share (pulsarlm/ops.hpp) and allocates o, one mass view per sequence.
-// op names the caller in every error.
+// Checks the argument contract the attention ops share (pulsarlm/kernels/paged_attention.hpp) and allocates o, one mass
+// view per sequence. op names the caller in every error.
 paged_attn_batch make_paged_attn_batch(
     const char* op,
     const at::Tensor& q,
-    const at::Tensor& k_pool,
-    const at::Tensor& v_pool,
-    const at::Tensor& page_tables,
+    const kv_pools& pools,
+    const page_views& views,
     const std::optional<at::Tensor>& cu_seqlens_q,
-    const at::Tensor& seqlens_k,
-    const at::Tensor& page_positions,
-    const rope_parameters& rope,
-    double scale,
-    std::optional<int64_t> sliding_window,
-    const std::optional<at::Tensor>& k_norm_weight,
-    const std::optional<at::Tensor>& mass_sum,
-    const std::optional<at::Tensor>& weight_sum,
-    const std::optional<at::Tensor>& cu_view_pages,
-    const std::optional<at::Tensor>& query_weights
+    const attention_layer& layer,
+    const std::optional<page_mass>& mass
 );
 
 // The scalar kernel over the whole batch: the fallback for shapes the tensor-core
@@ -130,19 +113,6 @@ void launch_attn_scalar(const paged_attn_batch& batch, cudaStream_t stream);
 // Upper bound on head_dim; sizes the scalar kernels' per-thread output
 // accumulator, which lives in local memory.
 constexpr int max_head_dim = 512;
-
-inline bool fits_shared_memory(size_t bytes) {
-    return bytes <= at::cuda::getCurrentDeviceProperties()->sharedMemPerBlockOptin;
-}
-
-// bytes must pass fits_shared_memory.
-template <typename Kernel> void allow_shared_memory(Kernel kernel, size_t bytes) {
-    if (bytes > shared_memory_without_opt_in) {
-        C10_CUDA_CHECK(
-            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes))
-        );
-    }
-}
 
 // CTA width of the scalar kernels. Power of two: block_reduce_* requires it.
 constexpr int cta_threads = 128;

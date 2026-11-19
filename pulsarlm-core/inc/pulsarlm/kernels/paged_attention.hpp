@@ -1,0 +1,130 @@
+#pragma once
+
+#include "pulsarlm/kernels/rope_parameters.hpp"
+
+#include <ATen/core/Tensor.h>
+
+#include <cstdint>
+#include <optional>
+#include <string>
+
+namespace pulsarlm {
+
+// The paged attention ops attend a batch of sequences, each a view: an ordered list of lines (pages of page_size keys)
+// of the pools, laid out as write_kv_cuda's. Key j of sequence s lives at slot j % page_size of line
+// page_tables[s][j / page_size], and a line may appear in several views.
+//
+// The pools hold unrotated keys. The ops rotate key j of sequence s to the RoPE position
+// page_positions[s][j / page_size] + j % page_size, in the rotate_half convention with the frequencies rope states.
+// Queries arrive rotated to their own positions, which the caller gives under the same page positions.
+
+// The key and value pools of one KV layer. They may be the same tensor.
+struct kv_pools {
+    // [lines, page_size, n_kv_heads, head_dim], each line packed and 16-byte aligned, lines any number of elements
+    // apart.
+    at::Tensor keys;
+    // Shaped as keys, of one stride with them.
+    at::Tensor values;
+};
+
+// One KV layer's rows of a batch's page tables.
+struct page_views {
+    // int32 [num_seqs, max_pages].
+    at::Tensor page_tables;
+    // int32 [num_seqs, max_pages], laid out as page_tables.
+    at::Tensor page_positions;
+    // int32 [num_seqs], the keys in each view.
+    at::Tensor key_counts;
+};
+
+// The constants of one attention layer.
+struct attention_layer {
+    rope_parameters rope;
+    double scale;
+    // When given, limits the query at view index p to the keys [max(0, p - sliding_window + 1), p]. The ops read no
+    // page table entry whose page lies wholly before the window of the sequence's first query, so those entries may
+    // hold any value.
+    std::optional<std::int64_t> sliding_window;
+    // When given, fp32 [head_dim], and multiplies each stored key before rotation.
+    std::optional<at::Tensor> k_norm_weight;
+};
+
+// The page mass a step measures; the ops add to mass_sum and weight_sum, which the caller zeroed. Without it the ops
+// measure no mass. Query token i attends view page b of its sequence when it attends one of b's key tokens; its mass on
+// b in query head h is the max over b's key tokens it attends of the scaled score. Views never share mass, whatever
+// lines they share.
+struct page_mass {
+    // fp32 [total_view_pages, n_q_heads], zeroed by the caller. Over the query tokens attending b,
+    // mass_sum[cu_view_pages[s] + b, h] is set to the sum of query_weights[i] times the mass; it stays 0 for a page no
+    // query token attends.
+    at::Tensor mass_sum;
+    // fp32 [total_view_pages], zeroed by the caller. weight_sum[cu_view_pages[s] + b] is set to the sum of
+    // query_weights[i] over the query tokens attending b; it stays 0 for a page no query token attends.
+    at::Tensor weight_sum;
+    // int32 [num_seqs + 1]; sequence s owns view pages [cu_view_pages[s], cu_view_pages[s + 1]), at least its keys'.
+    at::Tensor cu_view_pages;
+    // fp32 [total_q], non-negative.
+    at::Tensor query_weights;
+};
+
+// Why the attention ops cannot run layers of this shape in dtype, or nullopt when they can: float16 and bfloat16 run
+// on the tensor-core kernels only, float32 on the scalar kernel.
+std::optional<std::string> attention_unsupported_reason(
+    at::ScalarType dtype,
+    int64_t page_size,
+    int64_t head_dim,
+    int64_t n_q_heads,
+    int64_t n_kv_heads
+);
+
+// Writes a batch's new keys and values into the lines of paged pools. k_new and v_new are [new tokens, n_kv_heads,
+// head_dim]. The tokens sit at the view indices of attn_prefill_cuda's queries (with cu_seqlens_q) or
+// attn_decode_cuda's (without): the token at view index j of sequence s goes to line
+// views.page_tables[s][j / page_size], slot j % page_size. Keys are stored as given; the attention ops read them
+// unrotated. views.page_positions is not read.
+void write_kv_cuda(
+    const kv_pools& pools,
+    const at::Tensor& k_new,
+    const at::Tensor& v_new,
+    const page_views& views,
+    const std::optional<at::Tensor>& cu_seqlens_q
+);
+
+// Decode: one query per sequence, q [num_seqs, n_q_heads, head_dim], at view index key_counts[s] - 1, attending the
+// keys [0, key_counts[s]) or its window of them. num_splits above 0 forces the split (flash-decode) path with that
+// many splits, 1 included; 0 picks the split count from occupancy. Returns o [num_seqs, n_q_heads, head_dim].
+at::Tensor attn_decode_cuda(
+    const at::Tensor& q,
+    const kv_pools& pools,
+    const page_views& views,
+    const attention_layer& layer,
+    const std::optional<page_mass>& mass = std::nullopt,
+    int64_t num_splits = 0
+);
+
+// Prefill: a ragged batch of query chunks, causal over each view. Sequence i's queries are
+// q[cu_seqlens_q[i] : cu_seqlens_q[i + 1]] (q [total_q, n_q_heads, head_dim]) at view indices
+// [key_counts[i] - seq_q_i, key_counts[i]), and the query at view index p attends the keys [0, p] or its window of
+// them. Returns o [total_q, n_q_heads, head_dim].
+at::Tensor attn_prefill_cuda(
+    const at::Tensor& q,
+    const kv_pools& pools,
+    const page_views& views,
+    const at::Tensor& cu_seqlens_q,
+    const attention_layer& layer,
+    const std::optional<page_mass>& mass = std::nullopt
+);
+
+// attn_prefill_cuda measuring each query's mass apart: query i owns the rows [cu_view_pages[i], cu_view_pages[i + 1])
+// of mass_sum and weight_sum, its sequence's view pages; cu_view_pages is int32 [total_q + 1]. A verify group's
+// accepted rows are then added on their own.
+at::Tensor attn_prefill_verify_cuda(
+    const at::Tensor& q,
+    const kv_pools& pools,
+    const page_views& views,
+    const at::Tensor& cu_seqlens_q,
+    const attention_layer& layer,
+    const page_mass& mass
+);
+
+}  // namespace pulsarlm

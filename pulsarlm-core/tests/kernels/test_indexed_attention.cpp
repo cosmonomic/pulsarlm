@@ -1,4 +1,5 @@
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/indexed_attention.hpp"
+#include "pulsarlm/kernels/paged_attention.hpp"
 #include "pulsarlm/kernels/rope.hpp"
 
 #include <ATen/ATen.h>
@@ -36,7 +37,7 @@ struct view_batch {
     std::vector<sequence_view> views;
     at::Tensor page_tables;
     at::Tensor cu_seqlens_q;
-    at::Tensor seqlens_k;
+    at::Tensor key_counts;
     at::Tensor page_positions;
     at::Tensor cu_view_pages;
     // Query row r of a view of seq_q queries weighs alpha * (1 - alpha)^(seq_q - 1 - r).
@@ -61,7 +62,7 @@ view_batch make_batch(int64_t page_size, int64_t first_ctx, int64_t first_querie
     const auto num_seqs = static_cast<int64_t>(b.views.size());
     b.page_tables = int32_cuda(tables).view({num_seqs, max_pages});
     b.cu_seqlens_q = int32_cuda(cu_q);
-    b.seqlens_k = int32_cuda(seqlens);
+    b.key_counts = int32_cuda(seqlens);
     b.page_positions = (at::arange(max_pages, b.page_tables.options()) * page_size)
                            .expand_as(b.page_tables)
                            .contiguous();
@@ -204,21 +205,18 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
     at::Tensor weights = weights_of();
     at::Tensor o = pulsarlm::attn_indexed_cuda(
         q,
-        k_pool,
-        v_pool,
-        b.page_tables,
+        {.keys = k_pool, .values = v_pool},
+        {.page_tables = b.page_tables, .page_positions = b.page_positions, .key_counts = b.key_counts},
         b.cu_seqlens_q,
-        b.seqlens_k,
-        b.page_positions,
         rope,
         scale,
-        selection,
-        block_size,
-        max_pages * page_size / block_size,
-        mass,
-        weights,
-        b.cu_view_pages,
-        b.query_weights
+        {.selected = selection, .block_size = block_size, .max_selected_blocks = max_pages * page_size / block_size},
+        pulsarlm::page_mass{
+            .mass_sum = mass,
+            .weight_sum = weights,
+            .cu_view_pages = b.cu_view_pages,
+            .query_weights = b.query_weights
+        }
     );
     at::Tensor expected_o = at::zeros({b.total_q, n_q, head_dim}, opts.dtype(at::kFloat));
     at::Tensor expected_mass = mass_of();
@@ -233,40 +231,35 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
     at::Tensor dense_weights = weights_of();
     at::Tensor dense = pulsarlm::attn_prefill_cuda(
         q,
-        k_pool,
-        v_pool,
-        b.page_tables,
+        {.keys = k_pool, .values = v_pool},
+        {.page_tables = b.page_tables, .page_positions = b.page_positions, .key_counts = b.key_counts},
         b.cu_seqlens_q,
-        b.seqlens_k,
-        b.page_positions,
-        rope,
-        scale,
-        std::nullopt,
-        std::nullopt,
-        dense_mass,
-        dense_weights,
-        b.cu_view_pages,
-        b.query_weights
+        {.rope = rope, .scale = scale, .sliding_window = std::nullopt, .k_norm_weight = std::nullopt},
+        pulsarlm::page_mass{
+            .mass_sum = dense_mass,
+            .weight_sum = dense_weights,
+            .cu_view_pages = b.cu_view_pages,
+            .query_weights = b.query_weights
+        }
     );
     at::Tensor all_mass = mass_of();
     at::Tensor all_weights = weights_of();
     at::Tensor all = pulsarlm::attn_indexed_cuda(
         q,
-        k_pool,
-        v_pool,
-        b.page_tables,
+        {.keys = k_pool, .values = v_pool},
+        {.page_tables = b.page_tables, .page_positions = b.page_positions, .key_counts = b.key_counts},
         b.cu_seqlens_q,
-        b.seqlens_k,
-        b.page_positions,
         rope,
         scale,
-        full_selection(b, words),
-        block_size,
-        max_pages * page_size / block_size,
-        all_mass,
-        all_weights,
-        b.cu_view_pages,
-        b.query_weights
+        {.selected = full_selection(b, words),
+         .block_size = block_size,
+         .max_selected_blocks = max_pages * page_size / block_size},
+        pulsarlm::page_mass{
+            .mass_sum = all_mass,
+            .weight_sum = all_weights,
+            .cu_view_pages = b.cu_view_pages,
+            .query_weights = b.query_weights
+        }
     );
     // The scalar kernel sums each output across threads with atomicAdd, and both ops add the mass with atomicAdd, in no
     // fixed order. Joined splits round differently from one pass over the keys.
@@ -306,21 +299,18 @@ TEST_CASE("verify indexed attention measures each query's mass in its own view",
 
     at::Tensor o = pulsarlm::attn_indexed_verify_cuda(
         q,
-        k_pool,
-        v_pool,
-        b.page_tables,
+        {.keys = k_pool, .values = v_pool},
+        {.page_tables = b.page_tables, .page_positions = b.page_positions, .key_counts = b.key_counts},
         b.cu_seqlens_q,
-        b.seqlens_k,
-        b.page_positions,
         rope,
         scale,
-        selection,
-        block_size,
-        max_pages * page_size / block_size,
-        mass,
-        weights,
-        cu_query_pages,
-        b.query_weights
+        {.selected = selection, .block_size = block_size, .max_selected_blocks = max_pages * page_size / block_size},
+        pulsarlm::page_mass{
+            .mass_sum = mass,
+            .weight_sum = weights,
+            .cu_view_pages = cu_query_pages,
+            .query_weights = b.query_weights
+        }
     );
 
     at::Tensor expected_o = at::zeros({b.total_q, n_q, head_dim}, opts.dtype(at::kFloat));

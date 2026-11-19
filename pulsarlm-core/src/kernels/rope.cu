@@ -1,6 +1,6 @@
 #include "pulsarlm/kernels/dependent_launch.cuh"
-#include "pulsarlm/kernels/device_check.hpp"
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/device.hpp"
+#include "pulsarlm/kernels/rope.hpp"
 #include "pulsarlm/kernels/rope_tables.hpp"
 
 #include <ATen/ATen.h>

@@ -93,8 +93,8 @@ __global__ void __launch_bounds__(nwarps * 32, ctas_per_sm) attn_prefill_tc_kern
     }
     const int q0 = p.cu_seqlens_q[s];
     const int seq_q = p.cu_seqlens_q[s + 1] - q0;
-    const int ctx_len = p.seqlens_k[s];
-    const int ctx_start = ctx_len - seq_q;
+    const int key_count = p.key_counts[s];
+    const int ctx_start = key_count - seq_q;
     const int tile_rows = min(16, seq_q - qbase);
     const int q_global_base = q0 + qbase;
     // Context pos of MMA row m is ctx_start + qbase + m; the tile's highest.
@@ -168,7 +168,7 @@ __global__ void __launch_bounds__(nwarps * 32, ctas_per_sm) attn_prefill_tc_kern
 #pragma unroll
         for (int kp = 0; kp < key_pages; ++kp) {
             const int page_base = t * key_tile + kp * page_size;
-            const bool in_view = t < n_key_tiles && page_base < ctx_len && page_base + page_size > tile_first_key;
+            const bool in_view = t < n_key_tiles && page_base < key_count && page_base + page_size > tile_first_key;
             lines[kp] = in_view ? seq_table[t * key_pages + kp] : 0;
             key_indices[kp] = in_view ? s * p.max_pages + t * key_pages + kp : 0;
         }
@@ -189,7 +189,7 @@ __global__ void __launch_bounds__(nwarps * 32, ctas_per_sm) attn_prefill_tc_kern
 #pragma unroll
             for (int kp = 0; kp < key_pages; ++kp) {
                 const int page_base = t * key_tile + kp * page_size;
-                const int valid = page_base + page_size > tile_first_key ? min(page_size, ctx_len - page_base) : 0;
+                const int valid = page_base + page_size > tile_first_key ? min(page_size, key_count - page_base) : 0;
                 const int64_t page_first = static_cast<int64_t>(pages[kp]) * page_stride + g * head_stride;
                 for (int c = tid; c < page_chunks; c += nwarps * 32) {
                     const int off = c / row_chunks;
@@ -350,7 +350,8 @@ template <typename scalar_t, int page_size, int head_dim, int key_pages> constex
 
 // key_pages, unless the CTA would then need to opt in to more shared memory.
 template <typename scalar_t, int page_size, int head_dim, int key_pages> constexpr int prefill_key_pages() {
-    return prefill_smem_bytes<scalar_t, page_size, head_dim, key_pages>() <= shared_memory_without_opt_in ? key_pages : 1;
+    return prefill_smem_bytes<scalar_t, page_size, head_dim, key_pages>() <= shared_memory_without_opt_in ? key_pages
+                                                                                                          : 1;
 }
 
 }  // namespace attn

@@ -1,7 +1,8 @@
 #include "pulsarlm/engine/model/gemma4.hpp"
 
 #include "pulsarlm/engine/model/paged_forward.hpp"
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/normalization.hpp"
+#include "pulsarlm/kernels/routed_experts.hpp"
 #include "weights.hpp"
 
 #include <ATen/ATen.h>

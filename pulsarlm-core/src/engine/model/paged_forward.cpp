@@ -1,6 +1,8 @@
 #include "pulsarlm/engine/model/paged_forward.hpp"
 
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/gated_deltanet.hpp"
+#include "pulsarlm/kernels/paged_attention.hpp"
+#include "pulsarlm/kernels/rope.hpp"
 
 #include <ATen/ATen.h>
 
@@ -38,91 +40,51 @@ at::Tensor paged_attention(
     std::optional<int64_t> sliding_window,
     const std::optional<at::Tensor>& k_norm_weight
 ) {
-    const at::Tensor& k_pool = lines.k;
-    const at::Tensor& v_pool = lines.v;
-    const auto layer = static_cast<int64_t>(kv_layer);
-    at::Tensor page_tables = g.page_tables.select(0, layer);
-    at::Tensor page_positions = g.page_positions.select(0, layer);
-    at::Tensor key_counts = g.key_counts.select(0, layer);
+    const kv_pools pools{.keys = lines.k, .values = lines.v};
+    const auto layer_row = static_cast<int64_t>(kv_layer);
+    const page_views views{
+        .page_tables = g.page_tables.select(0, layer_row),
+        .page_positions = g.page_positions.select(0, layer_row),
+        .key_counts = g.key_counts.select(0, layer_row),
+    };
     if (k.defined()) {
         write_kv_cuda(
-            k_pool,
-            v_pool,
+            pools,
             k,
             v,
-            page_tables,
-            g.kind != model::batch_kind::decode ? std::optional<at::Tensor>(g.cu_seqlens_q) : std::nullopt,
-            key_counts
+            views,
+            g.kind != model::batch_kind::decode ? std::optional<at::Tensor>(g.cu_seqlens_q) : std::nullopt
         );
     }
-    std::optional<at::Tensor> mass_sum, weight_sum, cu_view_pages, query_weights;
+    const attention_layer layer{
+        .rope = rope,
+        .scale = scale,
+        .sliding_window = sliding_window,
+        .k_norm_weight = k_norm_weight,
+    };
+    std::optional<page_mass> mass;
     at::Tensor reader_columns;
     if (!g.page_mass_sum.empty() && g.page_mass_sum[kv_layer].defined()) {
         const int64_t heads = q.size(1);
         reader_columns = g.page_mass_sum[kv_layer].narrow(1, static_cast<int64_t>(reader) * heads, heads);
-        mass_sum = reader_columns.is_contiguous() ? reader_columns : at::zeros_like(reader_columns);
         const at::Tensor& page_weight_sum = g.page_weight_sum[kv_layer];
-        weight_sum = reader == 0 ? page_weight_sum : at::zeros_like(page_weight_sum);
-        cu_view_pages = g.cu_view_pages.select(0, layer);
-        query_weights = g.query_weights;
+        mass = page_mass{
+            .mass_sum = reader_columns.is_contiguous() ? reader_columns : at::zeros_like(reader_columns),
+            .weight_sum = reader == 0 ? page_weight_sum : at::zeros_like(page_weight_sum),
+            .cu_view_pages = g.cu_view_pages.select(0, layer_row),
+            .query_weights = g.query_weights,
+        };
     }
     at::Tensor o;
-    if (g.kind == model::batch_kind::verify && mass_sum) {
-        o = attn_prefill_verify_cuda(
-            q,
-            k_pool,
-            v_pool,
-            page_tables,
-            g.cu_seqlens_q,
-            key_counts,
-            page_positions,
-            rope,
-            scale,
-            sliding_window,
-            k_norm_weight,
-            *mass_sum,
-            *weight_sum,
-            *cu_view_pages,
-            *query_weights
-        );
+    if (g.kind == model::batch_kind::verify && mass) {
+        o = attn_prefill_verify_cuda(q, pools, views, g.cu_seqlens_q, layer, *mass);
     } else if (g.kind != model::batch_kind::decode) {
-        o = attn_prefill_cuda(
-            q,
-            k_pool,
-            v_pool,
-            page_tables,
-            g.cu_seqlens_q,
-            key_counts,
-            page_positions,
-            rope,
-            scale,
-            sliding_window,
-            k_norm_weight,
-            mass_sum,
-            weight_sum,
-            cu_view_pages,
-            query_weights
-        );
+        o = attn_prefill_cuda(q, pools, views, g.cu_seqlens_q, layer, mass);
     } else {
-        o = attn_decode_cuda(
-            q,
-            k_pool,
-            v_pool,
-            page_tables,
-            key_counts,
-            page_positions,
-            rope,
-            scale,
-            sliding_window,
-            k_norm_weight,
-            mass_sum,
-            weight_sum,
-            cu_view_pages,
-            query_weights
-        );
+        o = attn_decode_cuda(q, pools, views, layer, mass);
     }
-    if (mass_sum && !mass_sum->is_same(reader_columns)) {
-        reader_columns.copy_(*mass_sum);
+    if (mass && !mass->mass_sum.is_same(reader_columns)) {
+        reader_columns.copy_(mass->mass_sum);
     }
     return o;
 }

@@ -2,8 +2,8 @@
 #include "pulsarlm/kernels/attn_common.cuh"
 
 #include "pulsarlm/kernels/attn_tiles.cuh"
-#include "pulsarlm/kernels/device_check.hpp"
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/device.hpp"
+#include "pulsarlm/kernels/indexed_attention.hpp"
 
 #include <ATen/ATen.h>
 #include <ATen/Dispatch.h>
@@ -681,14 +681,15 @@ at::Tensor index_queries_cuda(
 
 at::Tensor index_blocks_cuda(
     const at::Tensor& index_keys,
-    const at::Tensor& page_tables,
-    const at::Tensor& page_positions,
-    const at::Tensor& key_counts,
+    const page_views& views,
     const at::Tensor& norm_weight,
     const at::Tensor& inv_freq,
     int64_t ratio,
     double eps
 ) {
+    const at::Tensor& page_tables = views.page_tables;
+    const at::Tensor& page_positions = views.page_positions;
+    const at::Tensor& key_counts = views.key_counts;
     TORCH_CHECK(
         index_keys.is_cuda() && index_keys.dim() == 3 && index_keys.stride(2) == 1 &&
             index_keys.stride(1) == index_keys.size(2),

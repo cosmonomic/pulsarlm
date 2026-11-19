@@ -1,8 +1,8 @@
 #include "pulsarlm/kernels/dependent_launch.cuh"
-#include "pulsarlm/kernels/device_check.hpp"
+#include "pulsarlm/kernels/device.hpp"
 #include "pulsarlm/kernels/dequant_gemm_common.cuh"
 
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/dequant_gemm.hpp"
 
 #include "pulsarlm/kernels/mma.cuh"
 

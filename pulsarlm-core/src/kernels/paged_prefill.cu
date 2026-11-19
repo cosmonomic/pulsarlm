@@ -3,7 +3,7 @@
 
 #include "pulsarlm/kernels/attn_tuning.hpp"
 #include "pulsarlm/kernels/paged_prefill.cuh"
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/paged_attention.hpp"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -14,7 +14,7 @@
 // Paged-KV prefill attention: many query tokens per sequence, causal over the
 // sequence's view, for a ragged (varlen) batch. Sequence i's queries
 // q[cu_seqlens_q[i] : cu_seqlens_q[i+1]] sit at view indices [ctx_start_i,
-// seqlens_k[i]) with ctx_start_i = seqlens_k[i] - seq_q_i, and the query at view
+// key_counts[i]) with ctx_start_i = key_counts[i] - seq_q_i, and the query at view
 // index p attends keys [0, p], or the window of them sliding_window leaves. The
 // tensor-core kernel is in paged_prefill.cuh.
 
@@ -34,9 +34,9 @@ rotate_view_keys_kernel(const attn::paged_attn_params<scalar_t> p, int page_size
     allow_next_kernel();
     const int s = blockIdx.x / p.max_pages;
     const int view_page = blockIdx.x % p.max_pages;
-    const int ctx_len = p.seqlens_k[s];
-    const int keys = min(page_size, ctx_len - view_page * page_size);
-    const int first_query = ctx_len - (p.cu_seqlens_q[s + 1] - p.cu_seqlens_q[s]);
+    const int key_count = p.key_counts[s];
+    const int keys = min(page_size, key_count - view_page * page_size);
+    const int first_query = key_count - (p.cu_seqlens_q[s + 1] - p.cu_seqlens_q[s]);
     if (keys <= 0 || (view_page + 1) * page_size <= attn::first_key(p, first_query)) {
         return;
     }
@@ -94,7 +94,7 @@ template <typename scalar_t, bool bf16> void launch_tc_prefill(const attn::paged
             constexpr size_t smem = attn::prefill_tile_bytes<scalar_t, bs, hd, key_pages>();
             const auto kernel = attn::
                 attn_prefill_tc_kernel<scalar_t, bs, hd, bf16, nwarps, key_pages, tuning.prefill_ctas_per_sm>;
-            attn::allow_shared_memory(kernel, smem);
+            allow_shared_memory(kernel, smem);
             launch_dependent(
                 kernel,
                 static_cast<int>(grid),
@@ -145,7 +145,7 @@ bool attn::prefill_fits(int64_t page_size, int64_t head_dim) {
                 bs,
                 hd,
                 attn::attn_tuning_table[decltype(row_tag)::value].prefill_key_pages>();
-            fits = attn::fits_shared_memory(attn::prefill_smem_bytes<at::Half, bs, hd, key_pages>());
+            fits = fits_shared_memory(attn::prefill_smem_bytes<at::Half, bs, hd, key_pages>());
         });
     });
     return fits;
@@ -153,78 +153,26 @@ bool attn::prefill_fits(int64_t page_size, int64_t head_dim) {
 
 at::Tensor attn_prefill_cuda(
     const at::Tensor& q,
-    const at::Tensor& k_pool,
-    const at::Tensor& v_pool,
-    const at::Tensor& page_tables,
+    const kv_pools& pools,
+    const page_views& views,
     const at::Tensor& cu_seqlens_q,
-    const at::Tensor& seqlens_k,
-    const at::Tensor& page_positions,
-    const rope_parameters& rope,
-    double scale,
-    std::optional<int64_t> sliding_window,
-    const std::optional<at::Tensor>& k_norm_weight,
-    const std::optional<at::Tensor>& mass_sum,
-    const std::optional<at::Tensor>& weight_sum,
-    const std::optional<at::Tensor>& cu_view_pages,
-    const std::optional<at::Tensor>& query_weights
+    const attention_layer& layer,
+    const std::optional<page_mass>& mass
 ) {
-    const auto batch = attn::make_paged_attn_batch(
-        "attn_prefill",
-        q,
-        k_pool,
-        v_pool,
-        page_tables,
-        cu_seqlens_q,
-        seqlens_k,
-        page_positions,
-        rope,
-        scale,
-        sliding_window,
-        k_norm_weight,
-        mass_sum,
-        weight_sum,
-        cu_view_pages,
-        query_weights
-    );
+    const auto batch = attn::make_paged_attn_batch("attn_prefill", q, pools, views, cu_seqlens_q, layer, mass);
     return paged_prefill(batch);
 }
 
 at::Tensor attn_prefill_verify_cuda(
     const at::Tensor& q,
-    const at::Tensor& k_pool,
-    const at::Tensor& v_pool,
-    const at::Tensor& page_tables,
+    const kv_pools& pools,
+    const page_views& views,
     const at::Tensor& cu_seqlens_q,
-    const at::Tensor& seqlens_k,
-    const at::Tensor& page_positions,
-    const rope_parameters& rope,
-    double scale,
-    std::optional<int64_t> sliding_window,
-    const std::optional<at::Tensor>& k_norm_weight,
-    const at::Tensor& mass_sum,
-    const at::Tensor& weight_sum,
-    const at::Tensor& cu_view_pages,
-    const at::Tensor& query_weights
+    const attention_layer& layer,
+    const page_mass& mass
 ) {
-    auto batch = attn::make_paged_attn_batch(
-        "attn_prefill_verify",
-        q,
-        k_pool,
-        v_pool,
-        page_tables,
-        cu_seqlens_q,
-        seqlens_k,
-        page_positions,
-        rope,
-        scale,
-        sliding_window,
-        k_norm_weight,
-        std::nullopt,
-        std::nullopt,
-        std::nullopt,
-        std::nullopt
-    );
-    attn::attach_mass(batch, "attn_prefill_verify", mass_sum, weight_sum, cu_view_pages, query_weights, batch.total_q);
+    auto batch = attn::make_paged_attn_batch("attn_prefill_verify", q, pools, views, cu_seqlens_q, layer, std::nullopt);
+    attn::attach_mass(batch, "attn_prefill_verify", mass, batch.total_q);
     batch.mass_per_query = true;
     return paged_prefill(batch);
 }

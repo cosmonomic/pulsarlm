@@ -1,6 +1,6 @@
 #include "pulsarlm/engine/model/linear.hpp"
 
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/dequant_gemm.hpp"
 
 #include <ATen/ATen.h>
 

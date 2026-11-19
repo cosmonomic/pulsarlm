@@ -1,6 +1,6 @@
 #include "pulsarlm/kernels/dependent_launch.cuh"
-#include "pulsarlm/kernels/device_check.hpp"
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/device.hpp"
+#include "pulsarlm/kernels/gating.hpp"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -84,10 +84,6 @@ __global__ void silu_mul_kernel(const scalar_t* __restrict__ x, scalar_t* __rest
     y[index] = static_cast<scalar_t>(__fmul_rn(activated, static_cast<float>(x[token * 2 * n + n + i])));
 }
 
-unsigned blocks_for(int64_t elements) {
-    return static_cast<unsigned>((elements + cta_threads - 1) / cta_threads);
-}
-
 }  // namespace
 
 at::Tensor sigmoid_gated_add_cuda(const at::Tensor& x, const at::Tensor& gate_logits, const at::Tensor& y) {
@@ -110,7 +106,7 @@ at::Tensor sigmoid_gated_add_cuda(const at::Tensor& x, const at::Tensor& gate_lo
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "sigmoid_gated_add_cuda", [&] {
         launch_dependent(
             sigmoid_gated_add_kernel<scalar_t>,
-            blocks_for(x.numel()),
+            cta_count(x.numel(), cta_threads),
             cta_threads,
             0,
             stream,
@@ -148,7 +144,7 @@ at::Tensor sigmoid_gated_cuda(const at::Tensor& y, const at::Tensor& gate_logits
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, y.scalar_type(), "sigmoid_gated_cuda", [&] {
         launch_dependent(
             sigmoid_gated_kernel<scalar_t>,
-            blocks_for(y.numel()),
+            cta_count(y.numel(), cta_threads),
             cta_threads,
             0,
             stream,
@@ -182,7 +178,7 @@ at::Tensor silu_mul_cuda(const at::Tensor& x) {
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "silu_mul_cuda", [&] {
         launch_dependent(
             silu_mul_kernel<scalar_t>,
-            blocks_for(y.numel()),
+            cta_count(y.numel(), cta_threads),
             cta_threads,
             0,
             stream,

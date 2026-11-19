@@ -3,9 +3,9 @@
 
 #include "pulsarlm/kernels/attn_tiles.cuh"
 #include "pulsarlm/kernels/attn_tuning.hpp"
-#include "pulsarlm/kernels/device_check.hpp"
+#include "pulsarlm/kernels/device.hpp"
 #include "pulsarlm/kernels/paged_prefill.cuh"
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/indexed_attention.hpp"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -30,7 +30,7 @@ namespace {
 
 // The selection of one batch: bit b of query q's row, word b / 32, bit b % 32, selects view keys
 // [b * block_size, (b + 1) * block_size).
-struct block_selection {
+struct selection_words {
     const uint32_t* bits;
     int words;
     int block_size;
@@ -64,7 +64,7 @@ template <typename scalar_t> __device__ int sequence_of(const attn::paged_attn_p
 
 // One CTA per (query token, query head), as attn_scalar_kernel, its threads striding over pages up to the query's.
 template <typename scalar_t, int page_size>
-__global__ void attn_indexed_scalar_kernel(const attn::paged_attn_params<scalar_t> p, const block_selection selection) {
+__global__ void attn_indexed_scalar_kernel(const attn::paged_attn_params<scalar_t> p, const selection_words selection) {
     wait_for_prior_kernels();
     allow_next_kernel();
     const int tid = threadIdx.x;
@@ -78,8 +78,8 @@ __global__ void attn_indexed_scalar_kernel(const attn::paged_attn_params<scalar_
     const int s = sequence_of(p, qtok);
     const int q0 = p.cu_seqlens_q ? p.cu_seqlens_q[s] : s;
     const int seq_q = p.cu_seqlens_q ? p.cu_seqlens_q[s + 1] - q0 : 1;
-    const int ctx_len = p.seqlens_k[s];
-    const int query_pos = ctx_len - seq_q + (qtok - q0);
+    const int key_count = p.key_counts[s];
+    const int query_pos = key_count - seq_q + (qtok - q0);
     const attn::key_positions layout = attn::sequence_key_positions(p, s, page_size);
     const int32_t* seq_table = p.page_tables + static_cast<int64_t>(s) * p.max_pages;
 
@@ -170,7 +170,7 @@ __global__ void attn_indexed_scalar_kernel(const attn::paged_attn_params<scalar_
 template <typename scalar_t>
 __global__ void mark_selected_pages_kernel(
     const attn::paged_attn_params<scalar_t> p,
-    const block_selection selection,
+    const selection_words selection,
     int total_q,
     int page_size,
     int32_t* __restrict__ selected_pages
@@ -229,7 +229,7 @@ __device__ int exclusive_block_sum(int value, int* sums) {
 template <typename scalar_t>
 __global__ void __launch_bounds__(slot_threads) single_query_page_slots_kernel(
     const attn::paged_attn_params<scalar_t> p,
-    const block_selection selection,
+    const selection_words selection,
     int page_size,
     int32_t* __restrict__ page_slots
 ) {
@@ -292,7 +292,7 @@ __global__ void rotate_indexed_keys_kernel(
     }
     const int s = first / p.max_pages;
     const int view_page = first % p.max_pages;
-    const int keys = min(page_size, p.seqlens_k[s] - view_page * page_size);
+    const int keys = min(page_size, p.key_counts[s] - view_page * page_size);
     if (keys <= 0) {
         return;
     }
@@ -332,7 +332,7 @@ constexpr int partial_row_floats(int head_dim) {
 template <typename scalar_t, int page_size, int head_dim, bool bf16, int nwarps, int key_pages, int ctas_per_sm>
 __global__ void __launch_bounds__(nwarps * 32, ctas_per_sm) attn_indexed_tc_kernel(
     const attn::paged_attn_params<scalar_t> p,
-    const block_selection selection,
+    const selection_words selection,
     const scalar_t* __restrict__ rotated_k,  // [selected pages, page_size, n_kv_heads, head_dim]
     const int32_t* __restrict__ page_slots,  // [num_seqs * max_pages], each selected view page's row of rotated_k
     int splits,
@@ -365,8 +365,8 @@ __global__ void __launch_bounds__(nwarps * 32, ctas_per_sm) attn_indexed_tc_kern
     const int s = sequence_of(p, qtok);
     const int q0 = p.cu_seqlens_q ? p.cu_seqlens_q[s] : s;
     const int seq_q = p.cu_seqlens_q ? p.cu_seqlens_q[s + 1] - q0 : 1;
-    const int ctx_len = p.seqlens_k[s];
-    const int query_pos = ctx_len - seq_q + (qtok - q0);
+    const int key_count = p.key_counts[s];
+    const int query_pos = key_count - seq_q + (qtok - q0);
     const int tile_blocks = key_tile / selection.block_size;
     const int page_blocks = page_size / selection.block_size;
 
@@ -703,7 +703,7 @@ template <typename scalar_t, int head_dim> constexpr size_t decode_tile_bytes() 
 template <typename scalar_t, int page_size, int head_dim, bool bf16>
 __global__ void __launch_bounds__(decode_warps * 32) attn_indexed_decode_kernel(
     const attn::paged_attn_params<scalar_t> p,
-    const block_selection selection,
+    const selection_words selection,
     int splits,
     float* __restrict__ partial  // [query tokens * KV groups * splits, 16, partial_row_floats], with splits above 1
 ) {
@@ -728,7 +728,7 @@ __global__ void __launch_bounds__(decode_warps * 32) attn_indexed_decode_kernel(
     const int s = sequence_of(p, qtok);
     const int q0 = p.cu_seqlens_q ? p.cu_seqlens_q[s] : s;
     const int seq_q = p.cu_seqlens_q ? p.cu_seqlens_q[s + 1] - q0 : 1;
-    const int query_pos = p.seqlens_k[s] - seq_q + (qtok - q0);
+    const int query_pos = p.key_counts[s] - seq_q + (qtok - q0);
     const int block_size = selection.block_size;
     const int tile_blocks = key_tile / block_size;
     const int32_t* seq_table = p.page_tables + static_cast<int64_t>(s) * p.max_pages;
@@ -1030,7 +1030,7 @@ __global__ void combine_indexed_splits_kernel(
 constexpr int64_t max_splits = 32;
 
 int indexed_splits(int64_t groups) {
-    const int64_t sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    const int64_t sms = sm_count();
     int64_t splits = 1;
     while (splits < max_splits && groups * splits * 2 <= sms) {
         splits *= 2;
@@ -1041,7 +1041,7 @@ int indexed_splits(int64_t groups) {
 template <typename scalar_t, bool bf16>
 void launch_indexed_tc(
     const attn::paged_attn_batch& b,
-    const block_selection& selection,
+    const selection_words& selection,
     int64_t max_selected_blocks,
     cudaStream_t stream
 ) {
@@ -1105,7 +1105,7 @@ void launch_indexed_tc(
             constexpr size_t smem = attn::prefill_tile_bytes<scalar_t, bs, hd, key_pages>();
             const auto
                 kernel = attn_indexed_tc_kernel<scalar_t, bs, hd, bf16, nwarps, key_pages, tuning.prefill_ctas_per_sm>;
-            attn::allow_shared_memory(kernel, smem);
+            allow_shared_memory(kernel, smem);
             const int splits = indexed_splits(grid);
             at::Tensor listed_scratch = at::empty({grid * splits, max_listed_blocks}, b.page_tables.options());
             at::Tensor partial;
@@ -1149,9 +1149,9 @@ void launch_indexed_tc(
 constexpr int64_t max_decode_splits = max_combined_splits;
 
 template <typename scalar_t, bool bf16>
-void launch_indexed_decode(const attn::paged_attn_batch& b, const block_selection& selection, cudaStream_t stream) {
+void launch_indexed_decode(const attn::paged_attn_batch& b, const selection_words& selection, cudaStream_t stream) {
     const int64_t grid = b.total_q * b.n_kv_heads;
-    const int64_t sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    const int64_t sms = sm_count();
     int64_t splits = 1;
     while (splits < max_decode_splits && grid * (splits * 2) <= 2 * sms) {
         splits *= 2;
@@ -1161,10 +1161,7 @@ void launch_indexed_decode(const attn::paged_attn_batch& b, const block_selectio
         constexpr int hd = decltype(hd_tag)::value;
         constexpr size_t smem = decode_tile_bytes<scalar_t, hd>();
         const auto kernel = attn_indexed_decode_kernel<scalar_t, bs, hd, bf16>;
-        // The kernel's static shared memory counts against the default limit too.
-        C10_CUDA_CHECK(
-            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem))
-        );
+        allow_shared_memory(kernel, smem);
         at::Tensor partial;
         if (splits > 1) {
             partial = at::empty({grid * splits, 16, partial_row_floats(hd)}, b.q.options().dtype(at::kFloat));
@@ -1197,7 +1194,7 @@ void launch_indexed_decode(const attn::paged_attn_batch& b, const block_selectio
     });
 }
 
-void launch_indexed_scalar(const attn::paged_attn_batch& b, const block_selection& selection, cudaStream_t stream) {
+void launch_indexed_scalar(const attn::paged_attn_batch& b, const selection_words& selection, cudaStream_t stream) {
     const int64_t blocks = b.total_q * b.n_q_heads;
     const size_t smem = static_cast<size_t>(2 * b.head_dim + attn::cta_threads) * sizeof(float);
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, b.q.scalar_type(), "attn_indexed_scalar", [&] {
@@ -1221,12 +1218,10 @@ void launch_indexed_scalar(const attn::paged_attn_batch& b, const block_selectio
 
 namespace {
 
-at::Tensor attn_indexed(
-    const attn::paged_attn_batch& b,
-    const at::Tensor& selected,
-    int64_t block_size,
-    int64_t max_selected_blocks
-) {
+at::Tensor attn_indexed(const attn::paged_attn_batch& b, const block_selection& selection) {
+    const at::Tensor& selected = selection.selected;
+    const int64_t block_size = selection.block_size;
+    const int64_t max_selected_blocks = selection.max_selected_blocks;
     TORCH_CHECK(
         block_size >= 1 && b.page_size % block_size == 0,
         "attn_indexed: block_size must be at least 1 and divide the page size"
@@ -1252,14 +1247,14 @@ at::Tensor attn_indexed(
     if (b.total_q == 0 || b.num_seqs == 0) {
         return b.o;
     }
-    const block_selection selection{
+    const selection_words words{
         .bits = reinterpret_cast<const uint32_t*>(selected.const_data_ptr<int32_t>()),
         .words = static_cast<int>(selected.size(1)),
         .block_size = static_cast<int>(block_size),
     };
     auto stream = at::cuda::getCurrentCUDAStream();
     if (b.q.scalar_type() == at::kFloat) {
-        launch_indexed_scalar(b, selection, stream);
+        launch_indexed_scalar(b, words, stream);
         return b.o;
     }
     std::optional<std::string> unsupported = attention_unsupported_reason(
@@ -1276,11 +1271,11 @@ at::Tensor attn_indexed(
     );
     attn::dispatch_tensor_core_dtype(b.q.scalar_type(), [&](auto type_tag, auto bf16_tag) {
         using scalar_t = typename decltype(type_tag)::type;
-        const int64_t sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+        const int64_t sms = sm_count();
         if (b.total_q * b.n_kv_heads * 2 <= sms && decode_key_tile % block_size == 0) {
-            launch_indexed_decode<scalar_t, decltype(bf16_tag)::value>(b, selection, stream);
+            launch_indexed_decode<scalar_t, decltype(bf16_tag)::value>(b, words, stream);
         } else {
-            launch_indexed_tc<scalar_t, decltype(bf16_tag)::value>(b, selection, max_selected_blocks, stream);
+            launch_indexed_tc<scalar_t, decltype(bf16_tag)::value>(b, words, max_selected_blocks, stream);
         }
     });
     return b.o;
@@ -1290,82 +1285,44 @@ at::Tensor attn_indexed(
 
 at::Tensor attn_indexed_cuda(
     const at::Tensor& q,
-    const at::Tensor& k_pool,
-    const at::Tensor& v_pool,
-    const at::Tensor& page_tables,
+    const kv_pools& pools,
+    const page_views& views,
     const std::optional<at::Tensor>& cu_seqlens_q,
-    const at::Tensor& seqlens_k,
-    const at::Tensor& page_positions,
     const rope_parameters& rope,
     double scale,
-    const at::Tensor& selected,
-    int64_t block_size,
-    int64_t max_selected_blocks,
-    const std::optional<at::Tensor>& mass_sum,
-    const std::optional<at::Tensor>& weight_sum,
-    const std::optional<at::Tensor>& cu_view_pages,
-    const std::optional<at::Tensor>& query_weights
+    const block_selection& selection,
+    const std::optional<page_mass>& mass
 ) {
-    const auto b = attn::make_paged_attn_batch(
-        "attn_indexed",
-        q,
-        k_pool,
-        v_pool,
-        page_tables,
-        cu_seqlens_q,
-        seqlens_k,
-        page_positions,
-        rope,
-        scale,
-        std::nullopt,
-        std::nullopt,
-        mass_sum,
-        weight_sum,
-        cu_view_pages,
-        query_weights
-    );
-    return attn_indexed(b, selected, block_size, max_selected_blocks);
+    const attention_layer layer{
+        .rope = rope,
+        .scale = scale,
+        .sliding_window = std::nullopt,
+        .k_norm_weight = std::nullopt,
+    };
+    const auto b = attn::make_paged_attn_batch("attn_indexed", q, pools, views, cu_seqlens_q, layer, mass);
+    return attn_indexed(b, selection);
 }
 
 at::Tensor attn_indexed_verify_cuda(
     const at::Tensor& q,
-    const at::Tensor& k_pool,
-    const at::Tensor& v_pool,
-    const at::Tensor& page_tables,
+    const kv_pools& pools,
+    const page_views& views,
     const at::Tensor& cu_seqlens_q,
-    const at::Tensor& seqlens_k,
-    const at::Tensor& page_positions,
     const rope_parameters& rope,
     double scale,
-    const at::Tensor& selected,
-    int64_t block_size,
-    int64_t max_selected_blocks,
-    const at::Tensor& mass_sum,
-    const at::Tensor& weight_sum,
-    const at::Tensor& cu_view_pages,
-    const at::Tensor& query_weights
+    const block_selection& selection,
+    const page_mass& mass
 ) {
-    auto b = attn::make_paged_attn_batch(
-        "attn_indexed_verify",
-        q,
-        k_pool,
-        v_pool,
-        page_tables,
-        cu_seqlens_q,
-        seqlens_k,
-        page_positions,
-        rope,
-        scale,
-        std::nullopt,
-        std::nullopt,
-        std::nullopt,
-        std::nullopt,
-        std::nullopt,
-        std::nullopt
-    );
-    attn::attach_mass(b, "attn_indexed_verify", mass_sum, weight_sum, cu_view_pages, query_weights, b.total_q);
+    const attention_layer layer{
+        .rope = rope,
+        .scale = scale,
+        .sliding_window = std::nullopt,
+        .k_norm_weight = std::nullopt,
+    };
+    auto b = attn::make_paged_attn_batch("attn_indexed_verify", q, pools, views, cu_seqlens_q, layer, std::nullopt);
+    attn::attach_mass(b, "attn_indexed_verify", mass, b.total_q);
     b.mass_per_query = true;
-    return attn_indexed(b, selected, block_size, max_selected_blocks);
+    return attn_indexed(b, selection);
 }
 
 }  // namespace pulsarlm

@@ -1,7 +1,7 @@
 #include "batch.hpp"
 
 #include "pulsarlm/engine/executor.hpp"
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/page_tables.hpp"
 
 #include <ATen/ATen.h>
 

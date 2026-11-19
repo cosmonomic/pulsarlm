@@ -2,7 +2,7 @@
 
 #include "pulsarlm/engine/executor.hpp"
 #include "pulsarlm/engine/sampling.hpp"
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/sampling.hpp"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>

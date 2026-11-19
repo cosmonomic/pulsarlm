@@ -2,7 +2,14 @@
 
 #include "pulsarlm/engine/model/paged_forward.hpp"
 #include "pulsarlm/engine/model/partial_rope.hpp"
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/gated_deltanet.hpp"
+#include "pulsarlm/kernels/gating.hpp"
+#include "pulsarlm/kernels/hyper_connection.hpp"
+#include "pulsarlm/kernels/indexed_attention.hpp"
+#include "pulsarlm/kernels/normalization.hpp"
+#include "pulsarlm/kernels/paged_attention.hpp"
+#include "pulsarlm/kernels/routed_experts.hpp"
+#include "pulsarlm/kernels/small_batch_linear.hpp"
 #include "weights.hpp"
 
 #include <ATen/ATen.h>
@@ -566,29 +573,19 @@ at::Tensor qwen4_exp_model::selected_blocks(
     const attention_weights& w,
     const at::Tensor& queries,
     const kv& lines,
-    const at::Tensor& page_tables,
-    const std::optional<at::Tensor>& cu_seqlens_q,
-    const at::Tensor& key_counts,
-    const at::Tensor& page_positions
+    const page_views& views,
+    const std::optional<at::Tensor>& cu_seqlens_q
 ) const {
     const qwen4_exp_config& c = config;
     const std::int64_t ratio = c.indexer_compress_ratio;
     const std::int64_t ntok = queries.size(0);
     const std::int64_t page_size = lines.index_keys.size(1);
     TORCH_CHECK(page_size % ratio == 0, "qwen4_exp_model: a page must hold whole index blocks");
-    const std::int64_t max_blocks = page_tables.size(1) * page_size / ratio;
+    const std::int64_t max_blocks = views.page_tables.size(1) * page_size / ratio;
     const std::int64_t words = max_blocks / 32 + 1;
 
-    at::Tensor blocks = index_blocks_cuda(
-        lines.index_keys,
-        page_tables,
-        page_positions,
-        key_counts,
-        w.index_k_norm,
-        index_inv_freq,
-        ratio,
-        c.rms_norm_eps
-    );
+    at::Tensor
+        blocks = index_blocks_cuda(lines.index_keys, views, w.index_k_norm, index_inv_freq, ratio, c.rms_norm_eps);
 
     const std::int64_t chunk_rows = std::max<std::int64_t>(1, (std::int64_t{1} << 26) / max_blocks);
     std::vector<at::Tensor> selected;
@@ -597,14 +594,14 @@ at::Tensor qwen4_exp_model::selected_blocks(
         at::Tensor scores = index_scores_cuda(
             queries.narrow(0, first, rows).contiguous(),
             blocks,
-            key_counts,
+            views.key_counts,
             cu_seqlens_q,
             first,
             ratio,
             1.0 / std::sqrt(static_cast<double>(c.indexer_head_dim))
         );
         selected.push_back(
-            select_blocks_cuda(scores, key_counts, cu_seqlens_q, first, c.indexer_budget / ratio, ratio, words)
+            select_blocks_cuda(scores, views.key_counts, cu_seqlens_q, first, c.indexer_budget / ratio, ratio, words)
         );
     }
     return selected.size() == 1 ? selected.front() : at::cat(selected);
@@ -699,14 +696,17 @@ at::Tensor qwen4_exp_model::attention(
 
     const kv& line = lines[kv_index];
     const auto layer_row = static_cast<std::int64_t>(kv_index);
-    at::Tensor page_tables = g.page_tables.select(0, layer_row);
-    at::Tensor page_positions = g.page_positions.select(0, layer_row);
-    at::Tensor key_counts = g.key_counts.select(0, layer_row);
+    const page_views views{
+        .page_tables = g.page_tables.select(0, layer_row),
+        .page_positions = g.page_positions.select(0, layer_row),
+        .key_counts = g.key_counts.select(0, layer_row),
+    };
     std::optional<at::Tensor> cu_seqlens_q;
     if (g.kind != batch_kind::decode) {
         cu_seqlens_q = g.cu_seqlens_q;
     }
-    write_kv_cuda(line.k, line.v, k, v, page_tables, cu_seqlens_q, key_counts);
+    const kv_pools pools{.keys = line.k, .values = line.v};
+    write_kv_cuda(pools, k, v, views, cu_seqlens_q);
 
     at::Tensor index_qk = projected.narrow(1, query_rows + 2 * key_rows, projected.size(1) - query_rows - 2 * key_rows);
     at::Tensor index_queries = index_queries_cuda(
@@ -721,55 +721,27 @@ at::Tensor qwen4_exp_model::attention(
                                 .contiguous()
                                 .view({ntok, 1, -1});
     at::Tensor index_pool = line.index_keys.unsqueeze(2);
-    write_kv_cuda(index_pool, index_pool, index_keys, index_keys, page_tables, cu_seqlens_q, key_counts);
-    at::Tensor
-        selected = selected_blocks(w, index_queries, line, page_tables, cu_seqlens_q, key_counts, page_positions);
+    write_kv_cuda({.keys = index_pool, .values = index_pool}, index_keys, index_keys, views, cu_seqlens_q);
+    const std::int64_t block_size = c.indexer_compress_ratio;
+    const block_selection selection{
+        .selected = selected_blocks(w, index_queries, line, views, cu_seqlens_q),
+        .block_size = block_size,
+        .max_selected_blocks = c.indexer_budget / block_size + 1,
+    };
 
-    std::optional<at::Tensor> mass_sum, weight_sum, cu_view_pages, query_weights;
+    std::optional<page_mass> mass;
     if (!g.page_mass_sum.empty() && g.page_mass_sum[kv_index].defined()) {
-        mass_sum = g.page_mass_sum[kv_index];
-        weight_sum = g.page_weight_sum[kv_index];
-        cu_view_pages = g.cu_view_pages.select(0, layer_row);
-        query_weights = g.query_weights;
+        mass = page_mass{
+            .mass_sum = g.page_mass_sum[kv_index],
+            .weight_sum = g.page_weight_sum[kv_index],
+            .cu_view_pages = g.cu_view_pages.select(0, layer_row),
+            .query_weights = g.query_weights,
+        };
     }
     const double scale = 1.0 / std::sqrt(static_cast<double>(c.head_dim));
-    const std::int64_t max_selected_blocks = c.indexer_budget / c.indexer_compress_ratio + 1;
-    at::Tensor o = g.kind == batch_kind::verify && mass_sum ? attn_indexed_verify_cuda(
-                                                                  q,
-                                                                  line.k,
-                                                                  line.v,
-                                                                  page_tables,
-                                                                  g.cu_seqlens_q,
-                                                                  key_counts,
-                                                                  page_positions,
-                                                                  rope,
-                                                                  scale,
-                                                                  selected,
-                                                                  c.indexer_compress_ratio,
-                                                                  max_selected_blocks,
-                                                                  *mass_sum,
-                                                                  *weight_sum,
-                                                                  *cu_view_pages,
-                                                                  *query_weights
-                                                              )
-                                                            : attn_indexed_cuda(
-                                                                  q,
-                                                                  line.k,
-                                                                  line.v,
-                                                                  page_tables,
-                                                                  cu_seqlens_q,
-                                                                  key_counts,
-                                                                  page_positions,
-                                                                  rope,
-                                                                  scale,
-                                                                  selected,
-                                                                  c.indexer_compress_ratio,
-                                                                  max_selected_blocks,
-                                                                  mass_sum,
-                                                                  weight_sum,
-                                                                  cu_view_pages,
-                                                                  query_weights
-                                                              );
+    at::Tensor o = g.kind == batch_kind::verify && mass
+        ? attn_indexed_verify_cuda(q, pools, views, g.cu_seqlens_q, rope, scale, selection, *mass)
+        : attn_indexed_cuda(q, pools, views, cu_seqlens_q, rope, scale, selection, mass);
     at::Tensor out = small_batch_linear_cuda(
         sigmoid_gated_cuda(o.view({ntok, heads.n_heads, c.head_dim}), gate).view({ntok, heads.n_heads * c.head_dim}),
         w.o_proj

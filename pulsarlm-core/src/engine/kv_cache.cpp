@@ -1,7 +1,5 @@
 #include "pulsarlm/engine/kv_cache.hpp"
 
-#include "pulsarlm/kernels/ops.hpp"
-
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>

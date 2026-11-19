@@ -2,7 +2,10 @@
 
 #include "pulsarlm/engine/model/paged_forward.hpp"
 #include "pulsarlm/engine/model/partial_rope.hpp"
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/gated_deltanet.hpp"
+#include "pulsarlm/kernels/gating.hpp"
+#include "pulsarlm/kernels/normalization.hpp"
+#include "pulsarlm/kernels/routed_experts.hpp"
 #include "weights.hpp"
 
 #include <ATen/ATen.h>

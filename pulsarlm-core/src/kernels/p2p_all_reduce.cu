@@ -1,6 +1,6 @@
 #include "pulsarlm/kernels/p2p_all_reduce.hpp"
 
-#include "pulsarlm/kernels/device_check.hpp"
+#include "pulsarlm/kernels/device.hpp"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>

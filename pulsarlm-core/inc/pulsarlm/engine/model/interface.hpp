@@ -112,7 +112,7 @@ class model {
         // int64 [n]: the rows whose logits the forward returns, in order. Undefined returns every row's.
         at::Tensor logit_rows;
         // int32 zeros, at least the model's arrival_counter_count for the batch: the arrival counters of its ops
-        // (ops.hpp). The batches of one stream's steps may share them.
+        // (kernels/arrival_counters.cuh). The batches of one stream's steps may share them.
         at::Tensor arrival_counters;
     };
 

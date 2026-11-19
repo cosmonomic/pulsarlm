@@ -3,8 +3,8 @@
 
 #include "pulsarlm/kernels/attn_tiles.cuh"
 #include "pulsarlm/kernels/attn_tuning.hpp"
-#include "pulsarlm/kernels/device_check.hpp"
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/device.hpp"
+#include "pulsarlm/kernels/paged_attention.hpp"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <mutex>
+#include <unordered_map>
 
 // Paged-KV decode attention, and the scatter that writes new K/V into the pool. One
 // query per sequence attends its whole view, or the window of it sliding_window
@@ -59,7 +61,7 @@ __global__ void write_kv_kernel(
     const scalar_t* __restrict__ v_new,
     const int32_t* __restrict__ page_tables,
     const int32_t* __restrict__ cu_seqlens_q,
-    const int32_t* __restrict__ seqlens_k,
+    const int32_t* __restrict__ key_counts,
     int num_seqs,
     int max_pages,
     int n_kv_heads,
@@ -74,7 +76,7 @@ __global__ void write_kv_kernel(
     int s = t;
     int index = 0;
     if (!cu_seqlens_q) {
-        index = seqlens_k[t] - 1;
+        index = key_counts[t] - 1;
     } else {
         int lo = 0, hi = num_seqs;
         while (hi - lo > 1) {
@@ -86,7 +88,7 @@ __global__ void write_kv_kernel(
             }
         }
         s = lo;
-        index = seqlens_k[s] - (cu_seqlens_q[s + 1] - t);
+        index = key_counts[s] - (cu_seqlens_q[s + 1] - t);
     }
     const int line = page_tables[static_cast<int64_t>(s) * max_pages + index / page_size];
 
@@ -201,7 +203,7 @@ __device__ __forceinline__ void tc_attend_tiles(
     const paged_attn_params<scalar_t>& p,
     int s,
     int g,
-    int ctx_len,
+    int key_count,
     int first,
     const key_positions& layout,
     float* __restrict__ group_mass,
@@ -236,9 +238,9 @@ __device__ __forceinline__ void tc_attend_tiles(
     const int32_t* seq_table = p.page_tables + static_cast<int64_t>(s) * p.max_pages;
     const bool keys_are_values = p.k_pool == p.v_pool;
     const int t_first = max(t_start, first / key_tile);
-    const int t_last = min(t_end, (ctx_len + key_tile - 1) / key_tile);
+    const int t_last = min(t_end, (key_count + key_tile - 1) / key_tile);
 
-    auto attended = [&](int key) { return key >= first && key < ctx_len; };
+    auto attended = [&](int key) { return key >= first && key < key_count; };
     // Chunk c is the 16-byte chunks at elements d and d + HALF of one key, so the thread that copies a key's
     // halves is the one that rotates them. Always commits a group, so a wait count means the same tiles throughout.
     auto stage = [&](const scalar_t* pool, scalar_t* dst, int t) {
@@ -442,8 +444,8 @@ __global__ void __launch_bounds__(nwarps * 32) attn_decode_tc_kernel(const paged
     const int tid = threadIdx.x;
     const int s = blockIdx.x / p.n_kv_heads;
     const int g = blockIdx.x % p.n_kv_heads;
-    const int ctx_len = p.seqlens_k[s];
-    const int first = attn::first_key(p, ctx_len - 1);
+    const int key_count = p.key_counts[s];
+    const int first = attn::first_key(p, key_count - 1);
 
     extern __shared__ __align__(16) unsigned char shared_memory[];
     const auto tiles = decode_tiles<scalar_t, head_dim, nwarps>::carve(shared_memory);
@@ -456,7 +458,7 @@ __global__ void __launch_bounds__(nwarps * 32) attn_decode_tc_kernel(const paged
         p,
         s,
         g,
-        ctx_len,
+        key_count,
         first,
         attn::sequence_key_positions(p, s, page_size),
         group_mass_entries(p, s, g),
@@ -492,8 +494,8 @@ __global__ void __launch_bounds__(nwarps * 32) paged_decode_split_kernel(
     const int sg = blockIdx.x / nsplits;
     const int g = sg % p.n_kv_heads;
     const int s = sg / p.n_kv_heads;
-    const int ctx_len = p.seqlens_k[s];
-    const int first = attn::first_key(p, ctx_len - 1);
+    const int key_count = p.key_counts[s];
+    const int first = attn::first_key(p, key_count - 1);
 
     extern __shared__ __align__(16) unsigned char shared_memory[];
     const auto tiles = decode_tiles<scalar_t, head_dim, nwarps>::carve(shared_memory);
@@ -508,7 +510,7 @@ __global__ void __launch_bounds__(nwarps * 32) paged_decode_split_kernel(
     constexpr int tiles_per_page = decode_tiles_per_page(page_size, head_dim);
     constexpr int key_tile = decode_tiles<scalar_t, head_dim, nwarps>::key_tile;
     const int first_tile = first / key_tile / tiles_per_page * tiles_per_page;
-    const int attended_tiles = (ctx_len - 1) / key_tile + 1 - first_tile;
+    const int attended_tiles = (key_count - 1) / key_tile + 1 - first_tile;
     const int tiles_per_split = ((attended_tiles + nsplits - 1) / nsplits + tiles_per_page - 1) / tiles_per_page *
         tiles_per_page;
     const int t_start = first_tile + split * tiles_per_split;
@@ -516,7 +518,7 @@ __global__ void __launch_bounds__(nwarps * 32) paged_decode_split_kernel(
         p,
         s,
         g,
-        ctx_len,
+        key_count,
         first,
         attn::sequence_key_positions(p, s, page_size),
         group_mass_entries(p, s, g),
@@ -621,14 +623,19 @@ template <typename scalar_t, bool bf16> int64_t resident_split_ctas(const attn::
         attn::dispatch_attn_tuning([&](auto row_tag) {
             constexpr int nwarps = attn::attn_tuning_table[decltype(row_tag)::value].decode_warps;
             constexpr size_t smem = decode_tiles<scalar_t, hd, nwarps>::bytes();
-            static const int64_t kernel_resident = [] {
+            // The CTAs of this kernel that each device holds at once, by device index.
+            static std::unordered_map<c10::DeviceIndex, int64_t> device_resident_ctas;
+            static std::mutex device_resident_ctas_mutex;
+            const std::lock_guard lock(device_resident_ctas_mutex);
+            const auto [entry, inserted] = device_resident_ctas.try_emplace(at::cuda::current_device());
+            if (inserted) {
                 const auto kernel = paged_decode_split_kernel<scalar_t, bs, hd, bf16, nwarps>;
-                attn::allow_shared_memory(kernel, smem);
+                allow_shared_memory(kernel, smem);
                 int per_sm = 0;
                 C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, nwarps * 32, smem));
-                return static_cast<int64_t>(per_sm) * at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-            }();
-            resident = kernel_resident;
+                entry->second = static_cast<int64_t>(per_sm) * sm_count();
+            }
+            resident = entry->second;
         });
     });
     return resident;
@@ -662,7 +669,7 @@ void launch_tc_decode(const attn::paged_attn_batch& b, int64_t forced_splits, cu
                 constexpr int nwarps = attn::attn_tuning_table[decltype(row_tag)::value].decode_warps;
                 constexpr size_t smem = decode_tiles<scalar_t, hd, nwarps>::bytes();
                 const auto kernel = attn_decode_tc_kernel<scalar_t, bs, hd, bf16, nwarps>;
-                attn::allow_shared_memory(kernel, smem);
+                allow_shared_memory(kernel, smem);
                 launch_dependent(kernel, static_cast<int>(base_ctas), nwarps * 32, smem, stream, p);
             });
         });
@@ -684,7 +691,7 @@ void launch_tc_decode(const attn::paged_attn_batch& b, int64_t forced_splits, cu
             constexpr int nwarps = attn::attn_tuning_table[decltype(row_tag)::value].decode_warps;
             constexpr size_t smem = decode_tiles<scalar_t, hd, nwarps>::bytes();
             const auto kernel = paged_decode_split_kernel<scalar_t, bs, hd, bf16, nwarps>;
-            attn::allow_shared_memory(kernel, smem);
+            allow_shared_memory(kernel, smem);
             launch_dependent(
                 kernel,
                 static_cast<int>(base_ctas * nsplits),
@@ -721,7 +728,7 @@ bool attn::decode_fits(int64_t page_size, int64_t head_dim) {
     attn::dispatch_page_head("attn_decode", page_size, head_dim, [&](auto, auto hd_tag) {
         attn::dispatch_attn_tuning([&](auto row_tag) {
             constexpr int nwarps = attn::attn_tuning_table[decltype(row_tag)::value].decode_warps;
-            fits = attn::fits_shared_memory(decode_tiles<at::Half, decltype(hd_tag)::value, nwarps>::bytes());
+            fits = fits_shared_memory(decode_tiles<at::Half, decltype(hd_tag)::value, nwarps>::bytes());
         });
     });
     return fits;
@@ -758,22 +765,24 @@ at::Tensor paged_decode(const attn::paged_attn_batch& b, int64_t num_splits) {
 }  // namespace
 
 void write_kv_cuda(
-    const at::Tensor& k_pool,
-    const at::Tensor& v_pool,
+    const kv_pools& pools,
     const at::Tensor& k_new,
     const at::Tensor& v_new,
-    const at::Tensor& page_tables,
-    const std::optional<at::Tensor>& cu_seqlens_q,
-    const at::Tensor& seqlens_k
+    const page_views& views,
+    const std::optional<at::Tensor>& cu_seqlens_q
 ) {
+    const at::Tensor& k_pool = pools.keys;
+    const at::Tensor& v_pool = pools.values;
+    const at::Tensor& page_tables = views.page_tables;
+    const at::Tensor& key_counts = views.key_counts;
     TORCH_CHECK(
         k_pool.is_cuda() && v_pool.is_cuda() && k_new.is_cuda() && v_new.is_cuda() && page_tables.is_cuda() &&
-            seqlens_k.is_cuda() && (!cu_seqlens_q || cu_seqlens_q->is_cuda()),
+            key_counts.is_cuda() && (!cu_seqlens_q || cu_seqlens_q->is_cuda()),
         "write_kv: all inputs must be CUDA tensors"
     );
     check_on_current_device(
         "write_kv",
-        {k_pool, v_pool, k_new, v_new, page_tables, seqlens_k, cu_seqlens_q.value_or(at::Tensor())}
+        {k_pool, v_pool, k_new, v_new, page_tables, key_counts, cu_seqlens_q.value_or(at::Tensor())}
     );
     TORCH_CHECK(
         k_pool.scalar_type() == v_pool.scalar_type() && k_pool.scalar_type() == k_new.scalar_type() &&
@@ -795,8 +804,8 @@ void write_kv_cuda(
     );
     const int64_t num_seqs = page_tables.size(0);
     TORCH_CHECK(
-        seqlens_k.scalar_type() == at::kInt && seqlens_k.dim() == 1 && seqlens_k.size(0) == num_seqs,
-        "write_kv: seqlens_k must be int32 [num_seqs]"
+        key_counts.scalar_type() == at::kInt && key_counts.dim() == 1 && key_counts.size(0) == num_seqs,
+        "write_kv: key_counts must be int32 [num_seqs]"
     );
     if (cu_seqlens_q) {
         TORCH_CHECK(
@@ -819,7 +828,7 @@ void write_kv_cuda(
     auto kn = k_new.contiguous();
     auto vn = v_new.contiguous();
     auto tables = page_tables.contiguous();
-    auto seqlens = seqlens_k.contiguous();
+    auto counts = key_counts.contiguous();
     auto cu = cu_seqlens_q ? cu_seqlens_q->contiguous() : at::Tensor();
 
     const int threads = static_cast<int>(std::min<int64_t>(256, n_kv_heads * head_dim));
@@ -840,7 +849,7 @@ void write_kv_cuda(
                 vn.data_ptr<scalar_t>(),
                 tables.data_ptr<int32_t>(),
                 cu.defined() ? cu.data_ptr<int32_t>() : nullptr,
-                seqlens.data_ptr<int32_t>(),
+                counts.data_ptr<int32_t>(),
                 static_cast<int>(num_seqs),
                 static_cast<int>(tables.size(1)),
                 static_cast<int>(n_kv_heads),
@@ -855,39 +864,13 @@ void write_kv_cuda(
 
 at::Tensor attn_decode_cuda(
     const at::Tensor& q,
-    const at::Tensor& k_pool,
-    const at::Tensor& v_pool,
-    const at::Tensor& page_tables,
-    const at::Tensor& context_lens,
-    const at::Tensor& page_positions,
-    const rope_parameters& rope,
-    double scale,
-    std::optional<int64_t> sliding_window,
-    const std::optional<at::Tensor>& k_norm_weight,
-    const std::optional<at::Tensor>& mass_sum,
-    const std::optional<at::Tensor>& weight_sum,
-    const std::optional<at::Tensor>& cu_view_pages,
-    const std::optional<at::Tensor>& query_weights,
+    const kv_pools& pools,
+    const page_views& views,
+    const attention_layer& layer,
+    const std::optional<page_mass>& mass,
     int64_t num_splits
 ) {
-    const auto batch = attn::make_paged_attn_batch(
-        "attn_decode",
-        q,
-        k_pool,
-        v_pool,
-        page_tables,
-        std::nullopt,
-        context_lens,
-        page_positions,
-        rope,
-        scale,
-        sliding_window,
-        k_norm_weight,
-        mass_sum,
-        weight_sum,
-        cu_view_pages,
-        query_weights
-    );
+    const auto batch = attn::make_paged_attn_batch("attn_decode", q, pools, views, std::nullopt, layer, mass);
     return paged_decode(batch, num_splits);
 }
 

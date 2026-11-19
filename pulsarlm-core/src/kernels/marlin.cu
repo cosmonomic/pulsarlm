@@ -1,8 +1,8 @@
 #include "pulsarlm/kernels/dependent_launch.cuh"
-#include "pulsarlm/kernels/device_check.hpp"
+#include "pulsarlm/kernels/device.hpp"
 #include "pulsarlm/kernels/dequant_gemm_common.cuh"
 
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/dequant_gemm.hpp"
 
 #include "pulsarlm/kernels/mma.cuh"
 
@@ -587,7 +587,6 @@ at::Tensor gemm(
     TORCH_CHECK(group_size > 0 && group_size % 16 == 0, op, ": group_size must be a positive multiple of 16");
     const int64_t k = x.size(1);
     TORCH_CHECK(k % group_size == 0, op, ": K must be a multiple of group_size");
-    constexpr int64_t int32_max = std::numeric_limits<int32_t>::max();
     TORCH_CHECK(
         x.size(0) <= int32_max && k <= int32_max && n <= int32_max && block_n <= int32_max && group_size <= int32_max,
         op,

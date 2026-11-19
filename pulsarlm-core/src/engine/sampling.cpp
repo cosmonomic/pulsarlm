@@ -1,6 +1,6 @@
 #include "pulsarlm/engine/sampling.hpp"
 
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/sampling.hpp"
 
 #include <ATen/ATen.h>
 

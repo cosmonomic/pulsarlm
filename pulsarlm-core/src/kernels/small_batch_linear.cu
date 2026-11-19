@@ -1,6 +1,7 @@
 #include "pulsarlm/kernels/dependent_launch.cuh"
-#include "pulsarlm/kernels/device_check.hpp"
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/device.hpp"
+#include "pulsarlm/kernels/gating.hpp"
+#include "pulsarlm/kernels/small_batch_linear.hpp"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -141,15 +142,12 @@ template <typename Body> void dispatch_tokens(int64_t tokens, Body body) {
     }
 }
 
-bool vector_rows(const at::Tensor& t) {
-    return t.stride(-1) == 1 && t.stride(0) % 8 == 0 && reinterpret_cast<uintptr_t>(t.const_data_ptr()) % 16 == 0;
-}
-
 // Whether x and weight take the matrix-vector kernel.
 bool fits(const at::Tensor& x, const at::Tensor& weight) {
     return x.is_cuda() && x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= max_tokens &&
         (x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kHalf) && weight.scalar_type() == x.scalar_type() &&
-        weight.dim() == 2 && weight.size(1) == x.size(1) && x.size(1) % 8 == 0 && vector_rows(x) && vector_rows(weight);
+        weight.dim() == 2 && weight.size(1) == x.size(1) && x.size(1) % 8 == 0 && vector_rows(x, x.stride(0)) &&
+        vector_rows(weight, weight.stride(0));
 }
 
 template <bool gated> at::Tensor launch(const at::Tensor& x, const at::Tensor& weight) {

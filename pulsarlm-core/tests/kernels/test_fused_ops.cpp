@@ -1,4 +1,7 @@
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/gating.hpp"
+#include "pulsarlm/kernels/hyper_connection.hpp"
+#include "pulsarlm/kernels/normalization.hpp"
+#include "pulsarlm/kernels/small_batch_linear.hpp"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAFunctions.h>

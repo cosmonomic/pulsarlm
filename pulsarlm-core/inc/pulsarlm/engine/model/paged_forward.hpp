@@ -1,7 +1,7 @@
 #pragma once
 
 #include "pulsarlm/engine/model/interface.hpp"
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/gated_deltanet.hpp"
 #include "pulsarlm/kernels/rope.hpp"
 
 #include <ATen/core/Tensor.h>
@@ -21,7 +21,7 @@ rope_q(const at::Tensor& q, const at::Tensor& pos, int64_t n_q_heads, int64_t he
 // Writes the batch's new keys k and values v, [ntok, n_kv_heads, head_dim] with k unrotated, into KV layer kv_layer's
 // lines, then attends them with the rotated queries q [ntok, n_q_heads, head_dim] and returns o [ntok, n_q_heads,
 // head_dim]. Undefined k and v leave the lines as they are, for a layer reading another layer's KV. sliding_window and
-// k_norm_weight are as attn_prefill_cuda takes them. When g.page_mass_sum[kv_layer] is defined, the layer writes the
+// k_norm_weight are as attention_layer holds them. When g.page_mass_sum[kv_layer] is defined, the layer writes the
 // mass_sum attn_prefill_cuda measures into reader's columns of it, reader being the layer's index among those reading
 // kv_layer, and reader 0 writes the weight_sum into g.page_weight_sum[kv_layer]. In a verify batch each query measures
 // its mass in a view of its own (attn_prefill_verify_cuda).

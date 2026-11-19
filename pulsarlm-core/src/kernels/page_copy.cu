@@ -1,5 +1,5 @@
 #include "pulsarlm/kernels/dependent_launch.cuh"
-#include "pulsarlm/kernels/device_check.hpp"
+#include "pulsarlm/kernels/device.hpp"
 #include "pulsarlm/kernels/page_copy.hpp"
 
 #include <ATen/ATen.h>

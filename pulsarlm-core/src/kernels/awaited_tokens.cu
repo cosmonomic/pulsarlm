@@ -1,6 +1,6 @@
 #include "pulsarlm/kernels/dependent_launch.cuh"
-#include "pulsarlm/kernels/device_check.hpp"
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/device.hpp"
+#include "pulsarlm/kernels/sampling.hpp"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -44,7 +44,7 @@ void fill_awaited_tokens_cuda(const at::Tensor& tokens, const at::Tensor& sample
     }
     launch_dependent(
         fill_awaited_tokens_kernel,
-        static_cast<unsigned>((rows + cta_threads - 1) / cta_threads),
+        cta_count(rows, cta_threads),
         cta_threads,
         0,
         at::cuda::getCurrentCUDAStream(),

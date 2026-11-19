@@ -1,4 +1,4 @@
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/gated_deltanet.hpp"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAFunctions.h>

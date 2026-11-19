@@ -1,6 +1,7 @@
 #include "pulsarlm/kernels/dependent_launch.cuh"
-#include "pulsarlm/kernels/device_check.hpp"
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/device.hpp"
+#include "pulsarlm/kernels/hyper_connection.hpp"
+#include "pulsarlm/kernels/normalization.hpp"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -121,10 +122,6 @@ __global__ void hyper_connection_inject_kernel(
         static_cast<float>(injection_weights[token * streams + s])
     ));
     y[index] = static_cast<scalar_t>(static_cast<float>(x[index]) + injected);
-}
-
-unsigned blocks_for(int64_t threads) {
-    return static_cast<unsigned>((threads + cta_threads - 1) / cta_threads);
 }
 
 // The token counts the fused matrix-vector kernels serve; larger batches take the separate kernels and cuBLAS.
@@ -420,10 +417,6 @@ template <typename Body> void dispatch_tokens(int64_t tokens, Body body) {
     }
 }
 
-bool vector_rows(const at::Tensor& t, int64_t row_stride) {
-    return t.stride(-1) == 1 && row_stride % 8 == 0 && reinterpret_cast<uintptr_t>(t.const_data_ptr()) % 16 == 0;
-}
-
 std::tuple<at::Tensor, at::Tensor>
 mix_streams(const at::Tensor& normed, const at::Tensor& gate_logits, const at::Tensor& inject_logits) {
     const int64_t tokens = normed.size(0);
@@ -438,7 +431,7 @@ mix_streams(const at::Tensor& normed, const at::Tensor& gate_logits, const at::T
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, normed.scalar_type(), "hyper_connection_mix_cuda", [&] {
         launch_dependent(
             hyper_connection_mix_kernel<scalar_t>,
-            blocks_for(tokens * hidden),
+            cta_count(tokens * hidden, cta_threads),
             cta_threads,
             0,
             stream,
@@ -674,9 +667,7 @@ std::tuple<at::Tensor, at::Tensor> hyper_connection_mix_cuda(
     AT_DISPATCH_REDUCED_FLOATING_TYPES(normed.scalar_type(), "hyper_connection_mix_cuda", [&] {
         dispatch_tokens(tokens, [&](auto tokens_tag) {
             auto kernel = hyper_connection_mix_linear_kernel<scalar_t, decltype(tokens_tag)::value, 4>;
-            C10_CUDA_CHECK(
-                cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared))
-            );
+            allow_shared_memory(kernel, shared);
             launch_dependent(
                 kernel,
                 static_cast<unsigned>((hidden + warps - 1) / warps),
@@ -726,7 +717,7 @@ hyper_connection_inject_cuda(const at::Tensor& x, const at::Tensor& out, const a
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "hyper_connection_inject_cuda", [&] {
         launch_dependent(
             hyper_connection_inject_kernel<scalar_t>,
-            blocks_for(x.numel()),
+            cta_count(x.numel(), cta_threads),
             cta_threads,
             0,
             stream,

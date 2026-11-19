@@ -1,8 +1,8 @@
 #include "pulsarlm/kernels/arrival_counters.cuh"
 #include "pulsarlm/kernels/dependent_launch.cuh"
-#include "pulsarlm/kernels/device_check.hpp"
+#include "pulsarlm/kernels/device.hpp"
 #include "pulsarlm/kernels/mma.cuh"
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/routed_experts.hpp"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -610,7 +610,7 @@ int64_t gate_up_column_blocks(int64_t intermediate) {
 std::pair<int64_t, int64_t> gate_up_splits(int64_t max_tiles, int64_t intermediate, int64_t hidden) {
     const int64_t gate_up_blocks = max_tiles * gate_up_column_blocks(intermediate);
     const int64_t chunks = (hidden + chunk_k - 1) / chunk_k;
-    const int64_t sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    const int64_t sms = sm_count();
     const int64_t splits = std::clamp<int64_t>(split_target_per_sm * sms / gate_up_blocks, 1, chunks);
     const int64_t chunks_per_split = (chunks + splits - 1) / splits;
     return {(chunks + chunks_per_split - 1) / chunks_per_split, chunks_per_split};

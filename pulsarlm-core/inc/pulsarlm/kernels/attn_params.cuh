@@ -1,5 +1,7 @@
 #pragma once
 
+#include "pulsarlm/kernels/device.hpp"
+
 #include <c10/macros/Macros.h>
 
 #include <cuda_runtime.h>
@@ -19,8 +21,6 @@
 namespace pulsarlm {
 namespace attn {
 
-constexpr size_t shared_memory_without_opt_in = 48 * 1024;
-
 template <typename scalar_t> struct paged_attn_params {
     const scalar_t* q;  // [total_q, n_q_heads, head_dim], rotated
     const scalar_t* k_pool;  // [num_pages, page_size, n_kv_heads, head_dim], unrotated
@@ -31,7 +31,7 @@ template <typename scalar_t> struct paged_attn_params {
     int64_t head_stride;
     const int32_t* page_tables;  // [num_seqs, max_pages]
     const int32_t* cu_seqlens_q;  // [num_seqs + 1]; null when each sequence has one query
-    const int32_t* seqlens_k;  // [num_seqs]
+    const int32_t* key_counts;  // [num_seqs]
     const int32_t* page_positions;  // [num_seqs, max_pages]: each view page's first RoPE position
     const uint64_t* rope_turns;  // [head_dim / 2], see rope_turns_per_position
     const float* k_norm_weight;  // [head_dim] or null

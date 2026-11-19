@@ -3,8 +3,8 @@
 #include <cstdint>
 
 // Counters by which the CTAs sharing a piece of work find the last of them to finish it, so that it can finish the work
-// alone within the same kernel. The caller passes them zeroed, and the kernels return them to zero, so the ordered calls
-// of one stream can share them.
+// alone within the same kernel. An op taking counters takes int32 zeros on its tensors' device, at least as many as its
+// count function gives, and leaves them zero; the ordered calls of one stream may share them.
 
 namespace pulsarlm {
 

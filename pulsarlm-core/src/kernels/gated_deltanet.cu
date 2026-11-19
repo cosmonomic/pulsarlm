@@ -1,7 +1,7 @@
 #include "pulsarlm/kernels/arrival_counters.cuh"
 #include "pulsarlm/kernels/dependent_launch.cuh"
-#include "pulsarlm/kernels/device_check.hpp"
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/device.hpp"
+#include "pulsarlm/kernels/gated_deltanet.hpp"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -10,7 +10,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <limits>
 #include <optional>
 #include <type_traits>
 
@@ -22,8 +21,6 @@ constexpr int conv_threads = 256;
 constexpr int max_conv_window = 16;
 // Value columns per delta rule CTA.
 constexpr int columns = 16;
-constexpr size_t shared_memory_without_opt_in = 48 * 1024;
-constexpr int64_t int32_max = std::numeric_limits<int32_t>::max();
 
 // Sequence s holds tokens [first(s), first(s) + count(s)); without cu_seqlens_q, the per_sequence tokens from
 // s * per_sequence.
@@ -1238,13 +1235,7 @@ at::Tensor gated_delta_rule(
             } else {
                 const auto kernel = delta_rule_chunk_kernel<scalar_t, key_dim>;
                 constexpr size_t bytes = delta_rule_chunk_tile<key_dim>::bytes;
-                if (bytes > shared_memory_without_opt_in) {
-                    C10_CUDA_CHECK(cudaFuncSetAttribute(
-                        kernel,
-                        cudaFuncAttributeMaxDynamicSharedMemorySize,
-                        static_cast<int>(bytes)
-                    ));
-                }
+                allow_shared_memory(kernel, bytes);
                 launch_dependent(
                     kernel,
                     blocks,

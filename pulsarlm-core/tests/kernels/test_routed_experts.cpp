@@ -1,4 +1,4 @@
-#include "pulsarlm/kernels/ops.hpp"
+#include "pulsarlm/kernels/routed_experts.hpp"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAGraph.h>
