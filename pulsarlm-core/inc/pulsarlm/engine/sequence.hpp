@@ -22,7 +22,18 @@
 
 namespace pulsarlm {
 
-class executor;
+// What a sequence needs to know about each KV layer of its executor.
+struct view_layout {
+    struct layer {
+        bool is_recurrent;
+        bool mirrors_held_pages;
+        std::optional<std::size_t> sliding_window;
+        std::size_t state_slots;
+        std::size_t mass_heads;
+    };
+    std::vector<layer> layers;
+    std::size_t page_size;
+};
 
 // Holds a lease of a store and releases it once: on release, or when destroyed before it, as with a frame destroyed
 // after a panic, since the lease is the store's.
@@ -71,10 +82,8 @@ class sequence {
     static constexpr std::int64_t awaited_token = -1;
 
   private:
-    result_writer& writer;
+    result_writer& request_writer;
     lease_guard lease;
-    // The state the request resumed, then the last state written to the store.
-    std::shared_ptr<const state> last_state;
     sampling_params sampling;
     std::uint64_t seed;
     // Tokens sampled so far, each with its own draw of the seed's noise.
@@ -92,12 +101,7 @@ class sequence {
     // joined the history.
     std::vector<digest> prompt_digests;
     std::size_t next_prompt_digest = 0;
-    // Per KV layer, whether it is recurrent and its sliding window; the executor's.
-    const std::vector<bool>& recurrent;
-    const std::vector<std::size_t>& state_slots;
-    const std::vector<bool>& mirrors;
-    const std::vector<std::optional<std::size_t>>& sliding_windows;
-    std::size_t page_size;
+    const view_layout& layout;
     // One per KV layer.
     std::vector<layer_view> layers;
     // The ascending history indices of the full pages some layer with pages, other than a mirroring one, holds. A full page's RoPE position is its
@@ -141,9 +145,24 @@ class sequence {
     std::size_t device_cached_count = 0;
     std::size_t peak_device_memory = 0;
 
+    // The view index of recurrent KV layer layer's line holding the state at the end of head's page.
+    std::size_t head_state_line_index(std::size_t layer) const;
+    // The RoPE position of the first key of view page page in KV layer layer.
+    std::size_t page_position(std::size_t layer, std::size_t page) const;
+    // Sets held_pages from the layers' indices.
+    void update_held();
+    // Moves the first count pending tokens to tail.
+    void advance(std::size_t count);
+    // After a verify step that forwarded its pending token at history position start, in tail, and its drafts: inserts
+    // after it the first accepted_tokens.size() - 1 of accepted_tokens, the drafts they equal, and sets the next token,
+    // awaited after them in tail or pending, to the last.
+    void accept_tokens(std::size_t start, std::span<const std::int64_t> accepted_tokens);
+    // Sets the token at history position index, in tail or pending, which was awaited_token.
+    void resolve_token(std::size_t index, std::int64_t token);
+
   public:
     // Resumes initial_state, the newest stored state reaching a prefix of r's tokens, leased from store by lease_id.
-    // digests are the digests of the full pages of r's tokens, chained from root.
+    // digests are the digests of the full pages of r's tokens, chained from root. layout outlives the sequence.
     sequence(
         request&& r,
         std::shared_ptr<const state>&& initial_state,
@@ -151,47 +170,57 @@ class sequence {
         state::lease_id_type lease_id,
         std::vector<digest>&& digests,
         const digest& root,
-        const executor& owner,
+        const view_layout& layout,
         result_writer& writer,
         std::span<const at::Device> devices
     );
 
-  private:
+    // One per KV layer.
+    std::span<const layer_view> views() const noexcept;
+    std::span<const std::int64_t> tail_tokens() const noexcept;
+    std::span<const std::int64_t> pending_token_list() const noexcept;
+    std::span<const std::int64_t> draft_tokens() const noexcept;
+    const sampling_params& sampling_parameters() const noexcept;
+    // The draw of the next token sampled.
+    sampling_draw next_draw() const noexcept;
+    const std::optional<std::size_t>& token_limit() const noexcept;
+    std::size_t generated_token_count() const noexcept;
+    std::size_t prompt_token_count() const noexcept;
+    std::size_t cached_token_count() const noexcept;
+    std::size_t device_cached_token_count() const noexcept;
+    std::size_t device_memory_peak() const noexcept;
+    std::size_t history_page_count() const noexcept;
+    const std::optional<digest>& head_digest() const noexcept;
+    std::span<const std::size_t> held_page_indices() const noexcept;
+    bool has_pending_state() const noexcept;
+    const std::shared_ptr<pending_writes>& pending_page_writes() const noexcept;
+    // Shard shard's table of lines, and of RoPE positions.
+    const at::Tensor& line_table(std::size_t shard) const;
+    const at::Tensor& position_table(std::size_t shard) const;
+    bool has_exited() const noexcept;
+    std::optional<exit_reason> reason_of_exit() const noexcept;
+    std::size_t launched_step_count() const noexcept;
+    bool has_launched_last_step() const noexcept;
+    std::size_t awaited_sample_row() const noexcept;
+    std::size_t rejected_token_count() const noexcept;
+    std::size_t end_of_draft_rows() const noexcept;
+    std::size_t unapplied_position_shift() const noexcept;
+    const page_eviction_policy& eviction_policy_in_pages() const noexcept;
+    state::lease_id_type lease_id() const noexcept;
+    result_writer& writer() const noexcept;
+    // Recurrent KV layer layer's line holding the state at the end of head's page.
+    std::uint32_t head_state_line(std::size_t layer) const;
     // The view index of the next token in KV layer layer's view.
     std::size_t next_index(std::size_t layer) const noexcept;
     // The RoPE position of the next token, the same in every layer.
     std::size_t next_position() const noexcept;
-    // The RoPE position of the first key of view page page in KV layer layer.
-    std::size_t page_position(std::size_t layer, std::size_t page) const;
     // The full pages of KV layer layer's view wholly before the window of a query at view index query.
     std::size_t passed_pages(std::size_t layer, std::size_t query) const noexcept;
     // The state the sequence reached: per KV layer, its view's full pages within the window of the next token.
     state to_state() const;
-    // Sets held from the layers' indices, after pages left them.
-    void update_held();
     bool may_sample() const noexcept;
-    // Moves the first count pending tokens to tail.
-    void advance(std::size_t count);
-    // Moves the full pages of tail before history position end to every layer with pages, and returns how many. The
-    // tokens of those pages are not awaited_token.
-    std::size_t complete_pages(std::size_t end);
-    // Recurrent KV layer layer's line holding the state at the end of head's page.
-    std::uint32_t& head_state_line(std::size_t layer);
-    // After a verify step that forwarded its pending token at history position start, in tail, and its drafts: inserts
-    // after it the first accepted_tokens.size() - 1 of accepted_tokens, the drafts they equal, and sets the next token, awaited
-    // after them in tail or pending, to the last.
-    void accept_tokens(std::size_t start, std::span<const std::int64_t> accepted_tokens);
-    // Undoes the launch of the latest step, a verify step whose pending token and drafts the GPU took and which is not
-    // written back: its pending token, in tail, returns to pending.
-    void withdraw_latest_verify_step();
-    // Sets the token at history position index, in tail or pending, which was awaited_token.
-    void resolve_token(std::size_t index, std::int64_t token);
-    // Undoes the advance by one token of the latest launched step, whose pages are not completed yet, and its sample if
-    // it took one: the token it forwarded returns to pending.
-    void withdraw_latest_step();
     // The tokens of the history up to the next token: its full pages, then tail.
     std::size_t history_position() const noexcept;
-    void start_next_cycle() noexcept;
     // The history position from which the cycle's queries add mass: the cycle's last mass_tokens tokens, less those
     // the masses already hold.
     std::size_t measured_start() const noexcept;
@@ -204,16 +233,74 @@ class sequence {
     std::size_t cycle_tokens_left() const noexcept;
     // The columns of table the lines take.
     std::size_t table_width() const noexcept;
-    // Queues on each shard's stream the upload of the lines and positions from column first_page on into its tables,
-    // all of them when the tables grow.
-    void upload_table(std::size_t first_page, std::span<const cudaStream_t> streams);
     // One line per page the cycle's tokens fill, in each KV layer with pages. Called at the start of a cycle, with an
     // empty tail.
     std::size_t cycle_lines() const noexcept;
     // Per KV layer, the lines the sequence lacks to forward every token left in its cycle.
     std::vector<std::size_t> missing_lines() const;
+    // The view indices of the full pages a cycle's end evicts from KV layer layer, which measures mass, ascending.
+    std::vector<std::size_t> pages_to_evict(std::size_t layer) const;
 
-    friend class executor;
+    // Launches a step forwarding the first token_count pending tokens, which move to tail. With sample_row, the step
+    // samples a token, awaited_token in pending until apply_sample, into that row of its sampled tokens. The step adds
+    // draft_row_count rows to the draft head's KV layer and drafts draft_count tokens, awaited until set_drafts.
+    void launch_step(
+        std::size_t token_count,
+        const std::optional<std::size_t>& sample_row,
+        std::size_t draft_row_count,
+        std::size_t draft_count
+    );
+    // Launches a step verifying the drafts after the first token_count pending tokens, which move to tail. The token
+    // after those it accepts is awaited_token in pending until apply_accepted_tokens, as if it accepted only its
+    // pending token. The step drafts draft_count tokens, awaited until set_drafts.
+    void launch_verify_step(std::size_t token_count, std::size_t draft_count);
+    // Sets the awaited token at history position position to token, which a step written back sampled.
+    void apply_sample(std::size_t position, std::int64_t token);
+    // A verify step written back, whose pending token is at history position start, verified verified_count tokens
+    // and accepted accepted_tokens, its samples after the pending token and the drafts they equal: inserts them and
+    // sets the awaited token after them to the last.
+    void
+    apply_accepted_tokens(std::size_t start, std::span<const std::int64_t> accepted_tokens, std::size_t verified_count);
+    // One launched step of the sequence was written back.
+    void finish_step() noexcept;
+    // Undoes the advance by one token of the latest launched step, whose pages are not completed yet, and its sample if
+    // it took one: the token it forwarded returns to pending.
+    void withdraw_latest_step();
+    // Undoes the launch of the latest step, a verify step whose pending token and drafts the GPU took and which is not
+    // written back: its pending token, in tail, returns to pending.
+    void withdraw_latest_verify_step();
+    void set_drafts(std::span<const std::int64_t> tokens);
+    // Moves the full pages of tail before history position end to every layer with pages, and returns how many. The
+    // tokens of those pages are not awaited_token. With a recurrent layer, the state at the new head is then pending.
+    std::size_t complete_pages(std::size_t end);
+    // The store has the state at head.
+    void store_head_state() noexcept;
+    // Appends added to KV layer layer's lines.
+    void add_lines(std::size_t layer, std::span<const std::uint32_t> added);
+    // Drops the full pages at the ascending view_indices from KV layer layer's view and returns their lines.
+    std::vector<std::uint32_t> remove_pages(std::size_t layer, std::span<const std::size_t> view_indices);
+    // Removes every line of every KV layer and returns them, per layer.
+    std::vector<std::vector<std::uint32_t>> take_lines();
+    // Sets recurrent KV layer layer's line holding the state at the end of head's page, and returns the previous one.
+    std::uint32_t replace_head_state_line(std::size_t layer, std::uint32_t line);
+    // Adds the mass a step ending at history position end measured: per KV layer that measures mass, the mass_sum and
+    // weight_sum it gave each line of the view, which may hold more lines than the view; empty for other layers.
+    void add_step_mass(
+        std::span<const std::span<const float>> step_mass_sums,
+        std::span<const std::span<const float>> step_weight_sums,
+        std::size_t end
+    );
+    // At the end of the cycle, adds to the moments of each layer that measures mass its full pages outside the sinks
+    // whose last token is at least cycle_tokens and less than twice cycle_tokens before that end.
+    void sample_pages();
+    void start_next_cycle() noexcept;
+    void exit(exit_reason reason) noexcept;
+    // Queues on each shard's stream the upload of the lines and positions from column first_page on into its tables,
+    // all of them when the tables grow.
+    void upload_table(std::size_t first_page, std::span<const cudaStream_t> streams);
+    void record_device_cached_tokens(std::size_t count) noexcept;
+    // Raises the peak of the bytes of each device's pool the lines take to bytes.
+    void record_device_memory(std::size_t bytes) noexcept;
 };
 
 }  // namespace pulsarlm
