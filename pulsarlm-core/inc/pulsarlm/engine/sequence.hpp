@@ -121,7 +121,7 @@ class sequence {
     std::size_t awaited_row = 0;
     // The tokens the draft head drafted after the pending token, which the next step verifies; empty when it does not.
     std::vector<std::int64_t> drafts;
-    // The tokens the last step forwarded and did not accept (group_batch::rejected_tokens).
+    // The tokens the last step forwarded and did not accept (model::batch::rejected_tokens).
     std::size_t rejected_tokens = 0;
     // The history position before which the draft head's KV layer holds a row for every position.
     std::size_t draft_rows_end = 0;

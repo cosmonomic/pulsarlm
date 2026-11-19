@@ -195,12 +195,8 @@ at::Tensor gemma4_model::per_layer_inputs(const at::Tensor& tokens, const at::Te
     return (projected + by_token) * std::pow(2.0, -0.5);
 }
 
-at::Tensor gemma4_model::attention(
-    const at::Tensor& h,
-    std::int64_t layer,
-    const group_batch& g,
-    std::span<const kv> lines
-) const {
+at::Tensor
+gemma4_model::attention(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const {
     const layer_weights& w = layers[layer];
     const std::int64_t ntok = h.size(0);
     const std::size_t kv_index = kv_layer_of[layer];
@@ -268,7 +264,7 @@ at::Tensor gemma4_model::block(
     at::Tensor x,
     std::int64_t layer,
     const at::Tensor& per_layer_input,
-    const group_batch& g,
+    const batch& g,
     std::span<const kv> lines
 ) const {
     const layer_weights& w = layers[layer];
@@ -299,16 +295,21 @@ at::Tensor gemma4_model::head(const at::Tensor& x) const {
     return logits;
 }
 
-at::Tensor gemma4_model::group_forward(const group_batch& g, std::span<const kv> lines) const {
-    at::Tensor x = scaled(embed_tokens.index_select(0, g.tokens), std::sqrt(static_cast<double>(config.hidden_size)));
+model::output gemma4_model::forward(const batch& b, std::span<const kv> lines) {
+    check_batch(b);
+    TORCH_CHECK(
+        b.kind != batch_kind::verify,
+        "gemma4_model::forward: a model without a draft head computes no verify batch"
+    );
+    at::Tensor x = scaled(embed_tokens.index_select(0, b.tokens), std::sqrt(static_cast<double>(config.hidden_size)));
     at::Tensor per_layer;
     if (config.hidden_size_per_layer_input > 0) {
-        per_layer = per_layer_inputs(g.tokens, x);
+        per_layer = per_layer_inputs(b.tokens, x);
     }
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
-        x = block(x, layer, per_layer.defined() ? per_layer.select(1, layer) : at::Tensor(), g, lines);
+        x = block(x, layer, per_layer.defined() ? per_layer.select(1, layer) : at::Tensor(), b, lines);
     }
-    return head(logit_inputs(x, g));
+    return output{.logits = head(logit_inputs(x, b))};
 }
 
 std::int64_t gemma4_model::arrival_counter_count(std::int64_t, std::int64_t tokens) const {
@@ -323,10 +324,6 @@ std::int64_t gemma4_model::arrival_counter_count(std::int64_t, std::int64_t toke
         w.experts_down_proj.size(2),
         config.hidden_size
     );
-}
-
-step_logits gemma4_model::forward(const step_batch& batch, std::span<const kv> lines) {
-    return paged_forward(batch, [&](const group_batch& g) { return group_forward(g, lines); });
 }
 
 }  // namespace pulsarlm

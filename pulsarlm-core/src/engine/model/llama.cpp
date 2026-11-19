@@ -79,7 +79,7 @@ std::vector<kv_layer> llama_model::kv_layers() const {
 }
 
 at::Tensor
-llama_model::attention(const at::Tensor& h, std::int64_t layer, const group_batch& g, std::span<const kv> lines) const {
+llama_model::attention(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const {
     const layer_weights& w = layers[layer];
     const dense_config& c = config;
     const std::int64_t ntok = h.size(0);
@@ -101,20 +101,21 @@ llama_model::attention(const at::Tensor& h, std::int64_t layer, const group_batc
     return at::linear(o.reshape({ntok, c.n_heads * c.head_dim}), w.o_proj);
 }
 
-at::Tensor llama_model::group_forward(const group_batch& g, std::span<const kv> lines) const {
+model::output llama_model::forward(const batch& b, std::span<const kv> lines) {
+    check_batch(b);
+    TORCH_CHECK(
+        b.kind != batch_kind::verify,
+        "llama_model::forward: a model without a draft head computes no verify batch"
+    );
     const double eps = config.rms_norm_eps;
-    at::Tensor x = embed_tokens.index_select(0, g.tokens);
+    at::Tensor x = embed_tokens.index_select(0, b.tokens);
     for (std::int64_t layer = 0; layer < config.n_layers; layer++) {
         const layer_weights& w = layers[layer];
-        x = x + attention(rmsnorm_cuda(x, w.input_layernorm, eps), layer, g, lines);
+        x = x + attention(rmsnorm_cuda(x, w.input_layernorm, eps), layer, b, lines);
         at::Tensor h = rmsnorm_cuda(x, w.post_attention_layernorm, eps);
         x = x + at::linear(at::silu(at::linear(h, w.gate_proj)) * at::linear(h, w.up_proj), w.down_proj);
     }
-    return at::matmul(rmsnorm_cuda(logit_inputs(x, g), norm, eps), lm_head.t());
-}
-
-step_logits llama_model::forward(const step_batch& batch, std::span<const kv> lines) {
-    return paged_forward(batch, [&](const group_batch& g) { return group_forward(g, lines); });
+    return output{.logits = at::matmul(rmsnorm_cuda(logit_inputs(x, b), norm, eps), lm_head.t())};
 }
 
 }  // namespace pulsarlm

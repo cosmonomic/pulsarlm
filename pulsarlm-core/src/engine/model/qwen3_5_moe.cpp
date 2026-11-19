@@ -204,12 +204,8 @@ std::vector<kv_layer> qwen3_5_moe_model::kv_layers() const {
     return kv_specs;
 }
 
-at::Tensor qwen3_5_moe_model::attention(
-    const at::Tensor& h,
-    std::int64_t layer,
-    const group_batch& g,
-    std::span<const kv> lines
-) const {
+at::Tensor
+qwen3_5_moe_model::attention(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const {
     const attention_weights& w = *layers[layer].attention;
     const qwen3_5_moe_config& c = config;
     const std::int64_t ntok = h.size(0);
@@ -239,19 +235,15 @@ at::Tensor qwen3_5_moe_model::attention(
     return at::linear(o.reshape({ntok, c.n_heads * c.head_dim}) * at::sigmoid(gate), w.o_proj);
 }
 
-at::Tensor qwen3_5_moe_model::deltanet(
-    const at::Tensor& h,
-    std::int64_t layer,
-    const group_batch& g,
-    std::span<const kv> lines
-) const {
+at::Tensor
+qwen3_5_moe_model::deltanet(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const {
     const deltanet_weights& w = *layers[layer].deltanet;
     const qwen3_5_moe_config& c = config;
     const std::int64_t ntok = h.size(0);
     const std::size_t state_layer = kv_layer_of[layer];
     const std::size_t conv_layer = state_layer + 1;
     std::optional<at::Tensor> cu_seqlens_q;
-    if (g.is_prefill()) {
+    if (g.kind != batch_kind::decode) {
         cu_seqlens_q = g.cu_seqlens_q;
     }
 
@@ -301,16 +293,21 @@ at::Tensor qwen3_5_moe_model::moe(const at::Tensor& h, std::int64_t layer, const
     return sigmoid_gated_add_cuda(routed, at::linear(h, m.shared_expert_gate), shared);
 }
 
-at::Tensor qwen3_5_moe_model::group_forward(const group_batch& g, std::span<const kv> lines) const {
+model::output qwen3_5_moe_model::forward(const batch& b, std::span<const kv> lines) {
+    check_batch(b);
+    TORCH_CHECK(
+        b.kind != batch_kind::verify,
+        "qwen3_5_moe_model::forward: a model without a draft head computes no verify batch"
+    );
     const double eps = config.rms_norm_eps;
-    at::Tensor x = embed_tokens.index_select(0, g.tokens);
+    at::Tensor x = embed_tokens.index_select(0, b.tokens);
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
         const layer_weights& w = layers[layer];
         at::Tensor h = rmsnorm_cuda(x, w.input_layernorm, eps);
-        x = x + (full_attention(layer) ? attention(h, layer, g, lines) : deltanet(h, layer, g, lines));
-        x = x + moe(rmsnorm_cuda(x, w.post_attention_layernorm, eps), layer, g.arrival_counters);
+        x = x + (full_attention(layer) ? attention(h, layer, b, lines) : deltanet(h, layer, b, lines));
+        x = x + moe(rmsnorm_cuda(x, w.post_attention_layernorm, eps), layer, b.arrival_counters);
     }
-    return at::matmul(rmsnorm_cuda(logit_inputs(x, g), norm, eps), lm_head.t());
+    return output{.logits = at::matmul(rmsnorm_cuda(logit_inputs(x, b), norm, eps), lm_head.t())};
 }
 
 std::int64_t qwen3_5_moe_model::arrival_counter_count(std::int64_t sequences, std::int64_t tokens) const {
@@ -325,10 +322,6 @@ std::int64_t qwen3_5_moe_model::arrival_counter_count(std::int64_t sequences, st
             m.experts_down_proj.size(1)
         )
     );
-}
-
-step_logits qwen3_5_moe_model::forward(const step_batch& batch, std::span<const kv> lines) {
-    return paged_forward(batch, [&](const group_batch& g) { return group_forward(g, lines); });
 }
 
 }  // namespace pulsarlm

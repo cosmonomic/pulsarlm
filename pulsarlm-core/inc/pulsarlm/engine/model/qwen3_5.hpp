@@ -69,10 +69,6 @@ class qwen3_5_model : public model, public draft_head {
         at::Tensor norm;
     };
 
-    // The group of a step a forward runs: a verify group runs as a prefill group, with cu_seqlens_q, except that its
-    // recurrent layers keep a state after each token and its attention measures each row's mass apart.
-    enum class group_kind { prefill, decode, verify };
-
     qwen3_5_config config;
     communicator comm;
     // This GPU's heads.
@@ -93,34 +89,13 @@ class qwen3_5_model : public model, public draft_head {
     std::optional<mtp_weights> mtp;
 
     bool full_attention(std::int64_t layer) const;
-    at::Tensor attention(
-        const at::Tensor& h,
-        std::int64_t layer,
-        const group_batch& g,
-        group_kind kind,
-        std::span<const kv> lines
-    ) const;
-    at::Tensor deltanet(
-        const at::Tensor& h,
-        std::int64_t layer,
-        const group_batch& g,
-        group_kind kind,
-        std::span<const kv> lines
-    ) const;
+    at::Tensor attention(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const;
+    at::Tensor deltanet(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const;
     at::Tensor embed(const at::Tensor& tokens) const;
     // The decoder layer layer over x, its attention or delta rule then its MLP, each with its residual.
-    at::Tensor decoder_layer(
-        const at::Tensor& x,
-        std::int64_t layer,
-        const group_batch& g,
-        group_kind kind,
-        std::span<const kv> lines
-    ) const;
+    at::Tensor decoder_layer(const at::Tensor& x, std::int64_t layer, const batch& g, std::span<const kv> lines) const;
     // The logits [rows, vocab_size] of the normed hidden rows, from every rank's part of lm_head.
     at::Tensor logits(const at::Tensor& rows) const;
-    // The group's logits, and with a draft head the normed hidden rows of every token.
-    std::pair<at::Tensor, at::Tensor>
-    group_forward(const group_batch& g, group_kind kind, std::span<const kv> lines) const;
 
   public:
     // weights are on the lines' device, in the attention lines' dtype, except that fp8 linears and their scales may
@@ -131,11 +106,11 @@ class qwen3_5_model : public model, public draft_head {
 
     std::vector<kv_layer> kv_layers() const override;
     std::vector<kv_layer_shard> kv_layer_shards() const override;
-    step_logits forward(const step_batch& batch, std::span<const kv> lines) override;
+    output forward(const batch& b, std::span<const kv> lines) override;
     std::int64_t arrival_counter_count(std::int64_t sequences, std::int64_t tokens) const override;
     draft_head* drafter() override;
     std::int64_t hidden_dim() const override;
-    draft_output draft(const group_batch& g, const at::Tensor& hidden, std::span<const kv> lines) override;
+    output draft(const batch& b, const at::Tensor& hidden, std::span<const kv> lines) override;
 };
 
 }  // namespace pulsarlm

@@ -17,19 +17,15 @@
 
 namespace {
 
-// batch with each group's own arrival counters, as many as model needs for it.
-pulsarlm::step_batch with_arrival_counters(pulsarlm::step_batch batch, const pulsarlm::model& model) {
-    for (std::optional<pulsarlm::group_batch>* group : {&batch.decode_group, &batch.prefill_group}) {
-        if (*group) {
-            const std::int64_t tokens = (*group)->tokens.size(0);
-            const std::int64_t sequences = (*group)->is_prefill() ? (*group)->cu_seqlens_q.size(0) - 1 : tokens;
-            (*group)->arrival_counters = at::zeros(
-                {model.arrival_counter_count(sequences, tokens)},
-                (*group)->tokens.options().dtype(at::kInt)
-            );
-        }
-    }
-    return batch;
+// b with its own arrival counters, as many as model needs for it.
+pulsarlm::model::batch with_arrival_counters(pulsarlm::model::batch b, const pulsarlm::model& model) {
+    const std::int64_t tokens = b.tokens.size(0);
+    const std::int64_t sequences = b.kind == pulsarlm::model::batch_kind::decode ? tokens : b.cu_seqlens_q.size(0) - 1;
+    b.arrival_counters = at::zeros(
+        {model.arrival_counter_count(sequences, tokens)},
+        b.tokens.options().dtype(at::kInt)
+    );
+    return b;
 }
 
 using pulsarlm::qwen3_5_layer_type;
@@ -303,7 +299,7 @@ std::vector<std::int64_t> rope_permutation() {
 }
 
 // A step of the single sequence forwarding the tokens at positions [first, last).
-pulsarlm::group_batch step(
+pulsarlm::model::batch step(
     const at::Tensor& tokens,
     std::int64_t first,
     std::int64_t last,
@@ -321,7 +317,8 @@ pulsarlm::group_batch step(
     }
     auto n_kv_layers = static_cast<std::int64_t>(specs.size());
     auto key_count = int32_cuda({static_cast<std::int32_t>(last)}).expand({n_kv_layers, 1}).contiguous();
-    pulsarlm::group_batch g{
+    pulsarlm::model::batch g{
+        .kind = prefill ? pulsarlm::model::batch_kind::prefill : pulsarlm::model::batch_kind::decode,
         .tokens = tokens.narrow(0, first, last - first),
         .pos = at::arange(first, last, cuda(at::kLong)),
         .page_tables = int32_cuda(rows).view({n_kv_layers, 1, -1}),
@@ -395,13 +392,10 @@ void check_against_dense(at::ScalarType dtype, double tolerance, std::int64_t to
     for (chunk c :
          {chunk{0, 21, true}, chunk{21, 37, true}, chunk{37, 47, true}, chunk{47, 48, false}, chunk{48, 49, false}}) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
-        pulsarlm::step_batch batch;
-        (c.prefill ? batch.prefill_group : batch.decode_group) = step(tokens, c.first, c.last, c.prefill, specs);
-        pulsarlm::step_logits logits = model.forward(with_arrival_counters(batch, model), kv);
+        pulsarlm::model::batch batch = step(tokens, c.first, c.last, c.prefill, specs);
+        pulsarlm::model::output output = model.forward(with_arrival_counters(batch, model), kv);
         auto expected_logits = dense.logits.narrow(0, c.first, c.last - c.first);
-        CHECK(
-            max_relative_error(*(c.prefill ? logits.prefill_logits : logits.decode_logits), expected_logits) < tolerance
-        );
+        CHECK(max_relative_error(output.logits, expected_logits) < tolerance);
     }
 
     auto permutation = at::tensor(rope_permutation()).to(at::kCUDA);

@@ -609,12 +609,12 @@ class counting_model final : public pulsarlm::qwen4_exp_model {
 
     using pulsarlm::qwen4_exp_model::qwen4_exp_model;
 
-    pulsarlm::step_logits forward(const pulsarlm::step_batch& batch, std::span<const pulsarlm::kv> lines) override {
-        if (batch.verify_group) {
+    output forward(const batch& b, std::span<const pulsarlm::kv> lines) override {
+        if (b.kind == batch_kind::verify) {
             (*verify_steps)++;
-            *verify_rows += static_cast<std::size_t>(batch.verify_group->tokens.size(0));
+            *verify_rows += static_cast<std::size_t>(b.tokens.size(0));
         }
-        return pulsarlm::qwen4_exp_model::forward(batch, lines);
+        return pulsarlm::qwen4_exp_model::forward(b, lines);
     }
 };
 

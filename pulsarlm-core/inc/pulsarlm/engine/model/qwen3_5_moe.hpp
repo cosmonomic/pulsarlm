@@ -78,18 +78,16 @@ class qwen3_5_moe_model : public model {
     std::vector<layer_weights> layers;
 
     bool full_attention(std::int64_t layer) const;
-    at::Tensor
-    attention(const at::Tensor& h, std::int64_t layer, const group_batch& g, std::span<const kv> lines) const;
-    at::Tensor deltanet(const at::Tensor& h, std::int64_t layer, const group_batch& g, std::span<const kv> lines) const;
+    at::Tensor attention(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const;
+    at::Tensor deltanet(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const;
     at::Tensor moe(const at::Tensor& h, std::int64_t layer, const at::Tensor& counters) const;
-    at::Tensor group_forward(const group_batch& g, std::span<const kv> lines) const;
 
   public:
     // weights are on the lines' device, in the attention lines' dtype.
     qwen3_5_moe_model(qwen3_5_moe_config config, const c10::Dict<std::string, at::Tensor>& weights);
 
     std::vector<kv_layer> kv_layers() const override;
-    step_logits forward(const step_batch& batch, std::span<const kv> lines) override;
+    output forward(const batch& b, std::span<const kv> lines) override;
     std::int64_t arrival_counter_count(std::int64_t sequences, std::int64_t tokens) const override;
 };
 

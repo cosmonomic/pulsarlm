@@ -31,20 +31,15 @@
 
 namespace {
 
-// batch with each group's own arrival counters, as many as model needs for it.
-pulsarlm::step_batch with_arrival_counters(pulsarlm::step_batch batch, const pulsarlm::model& model) {
-    for (std::optional<pulsarlm::group_batch>* group :
-         {&batch.decode_group, &batch.prefill_group, &batch.verify_group}) {
-        if (*group) {
-            const std::int64_t tokens = (*group)->tokens.size(0);
-            const std::int64_t sequences = (*group)->is_prefill() ? (*group)->cu_seqlens_q.size(0) - 1 : tokens;
-            (*group)->arrival_counters = at::zeros(
-                {model.arrival_counter_count(sequences, tokens)},
-                (*group)->tokens.options().dtype(at::kInt)
-            );
-        }
-    }
-    return batch;
+// b with its own arrival counters, as many as model needs for it.
+pulsarlm::model::batch with_arrival_counters(pulsarlm::model::batch b, const pulsarlm::model& model) {
+    const std::int64_t tokens = b.tokens.size(0);
+    const std::int64_t sequences = b.kind == pulsarlm::model::batch_kind::decode ? tokens : b.cu_seqlens_q.size(0) - 1;
+    b.arrival_counters = at::zeros(
+        {model.arrival_counter_count(sequences, tokens)},
+        b.tokens.options().dtype(at::kInt)
+    );
+    return b;
 }
 
 using pulsarlm::qwen4_exp_layer_type;
@@ -615,7 +610,7 @@ std::size_t slots_of(const pulsarlm::kv_layer& spec, std::int64_t draft_tokens) 
 
 // A step of the single sequence forwarding the tokens at positions [first, last), in an engine drafting draft_tokens
 // tokens.
-pulsarlm::group_batch step(
+pulsarlm::model::batch step(
     const at::Tensor& tokens,
     std::int64_t first,
     std::int64_t last,
@@ -639,7 +634,8 @@ pulsarlm::group_batch step(
     }
     auto n_kv_layers = static_cast<std::int64_t>(specs.size());
     auto key_count = int32_cuda({static_cast<std::int32_t>(last)}).expand({n_kv_layers, 1}).contiguous();
-    pulsarlm::group_batch g{
+    pulsarlm::model::batch g{
+        .kind = prefill ? pulsarlm::model::batch_kind::prefill : pulsarlm::model::batch_kind::decode,
         .tokens = tokens.narrow(0, first, last - first),
         .pos = at::arange(first, last, cuda(at::kLong)),
         .page_tables = int32_cuda(rows).view({n_kv_layers, 1, -1}),
@@ -719,20 +715,13 @@ std::pair<at::Tensor, std::vector<std::int64_t>> make_tokens() {
     };
 }
 
-pulsarlm::step_batch chunk_batch(
+pulsarlm::model::batch chunk_batch(
     const at::Tensor& tokens,
     chunk c,
     const std::vector<pulsarlm::kv_layer>& specs,
     std::int64_t draft_tokens
 ) {
-    pulsarlm::step_batch batch;
-    (c.prefill ? batch.prefill_group
-               : batch.decode_group) = step(tokens, c.first, c.last, c.prefill, specs, draft_tokens);
-    return batch;
-}
-
-const at::Tensor& chunk_logits(const pulsarlm::step_logits& logits, chunk c) {
-    return *(c.prefill ? logits.prefill_logits : logits.decode_logits);
+    return step(tokens, c.first, c.last, c.prefill, specs, draft_tokens);
 }
 
 // The equal part of [count] along dim that GPU rank of gpus holds, starting at first within t.
@@ -863,12 +852,12 @@ void check_against_dense(
 
     for (chunk c : chunks) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
-        pulsarlm::step_logits logits = model.forward(
+        pulsarlm::model::output output = model.forward(
             with_arrival_counters(chunk_batch(tokens, c, specs, draft_tokens), model),
             kv
         );
         auto expected_logits = dense.logits.narrow(0, c.first, c.last - c.first);
-        CHECK(max_relative_error(chunk_logits(logits, c), expected_logits) < tolerance);
+        CHECK(max_relative_error(output.logits, expected_logits) < tolerance);
     }
 
     std::size_t kv_index = 0;
@@ -923,26 +912,26 @@ void check_against_dense(
 }
 
 // Each rank's forward on its own thread and stream, as the ranks of a communicator run.
-std::vector<pulsarlm::step_logits> sharded_forward(
+std::vector<pulsarlm::model::output> sharded_forward(
     const std::vector<std::unique_ptr<pulsarlm::qwen4_exp_model>>& shards,
     const std::vector<std::vector<pulsarlm::kv>>& lines,
     const std::vector<c10::cuda::CUDAStream>& streams,
-    const pulsarlm::step_batch& batch
+    const pulsarlm::model::batch& batch
 ) {
     c10::cuda::device_synchronize();
-    std::vector<pulsarlm::step_logits> logits(shards.size());
+    std::vector<pulsarlm::model::output> outputs(shards.size());
     std::vector<std::thread> threads;
     for (std::size_t rank = 0; rank < shards.size(); rank++) {
         threads.emplace_back([&, rank] {
             c10::cuda::CUDAStreamGuard guard(streams[rank]);
-            logits[rank] = shards[rank]->forward(with_arrival_counters(batch, *shards[rank]), lines[rank]);
+            outputs[rank] = shards[rank]->forward(with_arrival_counters(batch, *shards[rank]), lines[rank]);
             streams[rank].synchronize();
         });
     }
     for (std::thread& thread : threads) {
         thread.join();
     }
-    return logits;
+    return outputs;
 }
 
 void check_sharded(
@@ -986,13 +975,13 @@ void check_sharded(
 
     for (chunk c : chunks) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
-        pulsarlm::step_batch batch = chunk_batch(tokens, c, specs, 0);
+        pulsarlm::model::batch batch = chunk_batch(tokens, c, specs, 0);
         single.forward(with_arrival_counters(batch, single), single_lines);
-        std::vector<pulsarlm::step_logits> logits = sharded_forward(shards, lines, streams, batch);
-        const at::Tensor& rank_0 = chunk_logits(logits.front(), c);
+        std::vector<pulsarlm::model::output> outputs = sharded_forward(shards, lines, streams, batch);
+        const at::Tensor& rank_0 = outputs.front().logits;
         CHECK(max_relative_error(rank_0, dense.logits.narrow(0, c.first, c.last - c.first)) < tolerance);
         for (std::size_t rank = 1; rank < gpus; rank++) {
-            CHECK(at::equal(chunk_logits(logits[rank], c), rank_0));
+            CHECK(at::equal(outputs[rank].logits, rank_0));
         }
     }
 
@@ -1174,18 +1163,16 @@ TEST_CASE("Qwen4-Exp drafts as a dense MTP layer a position after each row", "[m
                                              .last_hidden[view_lines[static_cast<std::size_t>((first - 1) / page_size)]]
                                              .unsqueeze(0)
                                              .clone();
-        pulsarlm::step_logits logits = model.forward(
+        pulsarlm::model::output output = model.forward(
             with_arrival_counters(chunk_batch(tokens, c, specs, 0), model),
             kv
         );
-        const at::Tensor& streams = *(c.prefill ? logits.prefill_hidden : logits.decode_hidden);
+        const at::Tensor& streams = output.hidden;
         CHECK(max_relative_error(streams, dense.streams.narrow(0, c.first, c.last - c.first)) < 1e-4);
 
         at::Tensor hidden_rows = at::cat({before, streams.narrow(0, 0, last - first - 1)});
-        pulsarlm::step_batch drafting;
-        drafting.prefill_group = step(tokens, first, last, true, specs, 0);
-        drafting = with_arrival_counters(drafting, model);
-        pulsarlm::draft_output drafted = drafter->draft(*drafting.prefill_group, hidden_rows, kv);
+        pulsarlm::model::batch drafting = with_arrival_counters(step(tokens, first, last, true, specs, 0), model);
+        pulsarlm::model::output drafted = drafter->draft(drafting, hidden_rows, kv);
         CHECK(max_relative_error(drafted.logits, expected.logits.narrow(0, first, last - first)) < 1e-4);
         CHECK(max_relative_error(drafted.hidden, expected.streams.narrow(0, first, last - first)) < 1e-4);
     }
@@ -1199,7 +1186,7 @@ TEST_CASE("Qwen4-Exp drafts as a dense MTP layer a position after each row", "[m
 
 // A verify group of the tokens at [first, last), the previous step having forwarded rejected tokens it did not accept, in
 // an engine drafting draft_tokens tokens.
-pulsarlm::step_batch verify_batch(
+pulsarlm::model::batch verify_batch(
     const at::Tensor& tokens,
     std::int64_t first,
     std::int64_t last,
@@ -1207,9 +1194,9 @@ pulsarlm::step_batch verify_batch(
     const std::vector<pulsarlm::kv_layer>& specs,
     std::int64_t draft_tokens
 ) {
-    pulsarlm::step_batch batch;
-    batch.verify_group = step(tokens, first, last, true, specs, draft_tokens);
-    batch.verify_group->rejected_tokens = int32_cuda({static_cast<std::int32_t>(rejected)});
+    pulsarlm::model::batch batch = step(tokens, first, last, true, specs, draft_tokens);
+    batch.kind = pulsarlm::model::batch_kind::verify;
+    batch.rejected_tokens = int32_cuda({static_cast<std::int32_t>(rejected)});
     return batch;
 }
 
@@ -1238,8 +1225,7 @@ TEST_CASE("Qwen4-Exp's verify groups match a dense forward and continue from the
     at::Tensor wrong_drafts = tokens.clone();
     wrong_drafts.narrow(0, 44, 2).copy_(at::remainder(tokens.narrow(0, 44, 2) + 1, vocab));
 
-    pulsarlm::step_batch prefill;
-    prefill.prefill_group = step(tokens, 0, 40, true, specs, draft_tokens);
+    pulsarlm::model::batch prefill = step(tokens, 0, 40, true, specs, draft_tokens);
     model.forward(with_arrival_counters(prefill, model), kv);
 
     struct verify_step {
@@ -1256,15 +1242,15 @@ TEST_CASE("Qwen4-Exp's verify groups match a dense forward and continue from the
              verify_step{47, 49, 0, tokens, 2},
          }) {
         INFO("verify [" << v.first << ", " << v.last << ") after " << v.rejected << " rejected");
-        pulsarlm::step_logits logits = model.forward(
+        pulsarlm::model::output output = model.forward(
             with_arrival_counters(verify_batch(v.tokens, v.first, v.last, v.rejected, specs, draft_tokens), model),
             kv
         );
-        REQUIRE(logits.verify_logits);
-        REQUIRE(logits.verify_hidden);
+        REQUIRE(output.logits.defined());
+        REQUIRE(output.hidden.defined());
         CHECK(
             max_relative_error(
-                logits.verify_logits->narrow(0, 0, v.matching_rows),
+                output.logits.narrow(0, 0, v.matching_rows),
                 dense.logits.narrow(0, v.first, v.matching_rows)
             ) < tolerance
         );
@@ -1330,19 +1316,20 @@ void check_sharded_draft(const split_dims& dims, std::size_t gpus) {
                                             .unsqueeze(0)
                                             .clone();
         }
-        std::vector<pulsarlm::step_logits>
-            logits = sharded_forward(shards, lines, streams, chunk_batch(tokens, c, specs, 0));
-        std::vector<pulsarlm::draft_output> drafted(gpus);
+        std::vector<pulsarlm::model::output>
+            outputs = sharded_forward(shards, lines, streams, chunk_batch(tokens, c, specs, 0));
+        std::vector<pulsarlm::model::output> drafted(gpus);
         std::vector<std::thread> threads;
         for (std::size_t rank = 0; rank < gpus; rank++) {
             threads.emplace_back([&, rank] {
                 c10::cuda::CUDAStreamGuard guard(streams[rank]);
-                const at::Tensor& streams_out = *(c.prefill ? logits[rank].prefill_hidden : logits[rank].decode_hidden);
-                pulsarlm::step_batch drafting;
-                drafting.prefill_group = step(tokens, first, last, true, specs, 0);
-                drafting = with_arrival_counters(drafting, *shards[rank]);
+                const at::Tensor& streams_out = outputs[rank].hidden;
+                pulsarlm::model::batch drafting = with_arrival_counters(
+                    step(tokens, first, last, true, specs, 0),
+                    *shards[rank]
+                );
                 drafted[rank] = shards[rank]->draft(
-                    *drafting.prefill_group,
+                    drafting,
                     at::cat({before[rank], streams_out.narrow(0, 0, last - first - 1)}),
                     lines[rank]
                 );

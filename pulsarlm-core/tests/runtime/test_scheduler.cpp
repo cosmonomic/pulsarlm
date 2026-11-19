@@ -332,36 +332,34 @@ class sum_model final : public pulsarlm::model {
         return layers;
     }
 
-    pulsarlm::step_logits forward(const pulsarlm::step_batch& batch, std::span<const pulsarlm::kv> lines) override {
+    output forward(const batch& b, std::span<const pulsarlm::kv> lines) override {
         forward_count++;
         if (on_forward) {
             on_forward();
         }
-        pulsarlm::step_logits logits;
-        if (batch.prefill_group) {
-            at::Tensor starts = batch.prefill_group->cu_seqlens_q.cpu().to(at::kLong);
+        if (b.kind == batch_kind::prefill) {
+            at::Tensor starts = b.cu_seqlens_q.cpu().to(at::kLong);
             prefill_chunks.push_back(token_list(starts.size(0) - 1));
             for (std::size_t s = 0; s < prefill_chunks.back().size(); s++) {
                 prefill_chunks.back()[s] = starts[s + 1].item<std::int64_t>() - starts[s].item<std::int64_t>();
             }
-            logits.prefill_logits = predict(*batch.prefill_group, lines);
         }
-        if (batch.decode_group) {
-            decode_sizes.push_back(batch.decode_group->tokens.size(0));
-            decode_page_positions.push_back(batch.decode_group->page_positions.cpu());
-            logits.decode_logits = predict(*batch.decode_group, lines);
+        if (b.kind == batch_kind::decode) {
+            decode_sizes.push_back(b.tokens.size(0));
+            decode_page_positions.push_back(b.page_positions.cpu());
         }
-        return logits;
+        return output{.logits = predict(b, lines)};
     }
 
   private:
-    at::Tensor predict(const pulsarlm::group_batch& g, std::span<const pulsarlm::kv> lines) const {
+    at::Tensor predict(const batch& g, std::span<const pulsarlm::kv> lines) const {
         std::int64_t n_tokens = g.tokens.size(0);
         at::Tensor positions = g.pos.cpu();
         at::Tensor all_tables = g.page_tables.cpu();
         at::Tensor all_page_positions = g.page_positions.cpu();
         at::Tensor key_counts = g.key_counts.cpu();
-        at::Tensor query_starts = g.is_prefill() ? g.cu_seqlens_q.cpu() : at::arange(all_tables.size(1) + 1, at::kInt);
+        at::Tensor query_starts = g.kind == batch_kind::decode ? at::arange(all_tables.size(1) + 1, at::kInt)
+                                                               : g.cu_seqlens_q.cpu();
         auto position = positions.accessor<std::int64_t, 1>();
         auto page_position = all_page_positions.accessor<std::int32_t, 3>();
         auto key_count = key_counts.accessor<std::int32_t, 2>();
@@ -502,12 +500,12 @@ class sum_model final : public pulsarlm::model {
     // Each row's sum of every token forwarded through it. Starts from the slot of each sequence's state_rows, writes
     // the sum after its last token into its last slot, and the sum at its newest page end into that page's boundary
     // line.
-    static std::vector<double>
-    run_state(const pulsarlm::group_batch& g, const pulsarlm::kv& lines, const at::Tensor& rows) {
+    static std::vector<double> run_state(const batch& g, const pulsarlm::kv& lines, const at::Tensor& rows) {
         at::Tensor tokens = g.tokens.cpu();
         at::Tensor history_positions = g.history_positions.cpu();
         at::Tensor rejected_tokens = g.rejected_tokens.cpu();
-        at::Tensor query_starts = g.is_prefill() ? g.cu_seqlens_q.cpu() : at::arange(rows.size(0) + 1, at::kInt);
+        at::Tensor query_starts = g.kind == batch_kind::decode ? at::arange(rows.size(0) + 1, at::kInt)
+                                                               : g.cu_seqlens_q.cpu();
         at::Tensor states = lines.k.cpu();
         auto token = tokens.accessor<std::int64_t, 1>();
         auto history_position = history_positions.accessor<std::int64_t, 1>();

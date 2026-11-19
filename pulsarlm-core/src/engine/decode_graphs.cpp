@@ -59,14 +59,15 @@ std::size_t decode_graphs::page_width() const noexcept {
     return static_cast<std::size_t>(width);
 }
 
-group_batch decode_graphs::make_inputs(std::int64_t sequences, bool measures_mass, bool verifies) const {
+model::batch decode_graphs::make_inputs(std::int64_t sequences, bool measures_mass, bool verifies) const {
     auto device = lines.front().k.options();
     auto ints = device.dtype(at::kInt);
     auto longs = device.dtype(at::kLong);
     const auto layers = static_cast<std::int64_t>(lines.size());
     const std::int64_t rows = verifies ? state_slots : 1;
     const std::int64_t tokens = sequences * rows;
-    group_batch inputs{
+    model::batch inputs{
+        .kind = verifies ? model::batch_kind::verify : model::batch_kind::decode,
         .tokens = at::zeros({tokens}, longs),
         .pos = at::zeros({tokens}, longs),
         .page_tables = at::zeros({layers, sequences, width}, ints),
@@ -110,19 +111,15 @@ std::unique_ptr<decode_graphs::captured_forward>
 decode_graphs::capture(std::int64_t sequences, bool measures_mass, bool verifies) {
     auto captured = std::make_unique<captured_forward>();
     captured->inputs = make_inputs(sequences, measures_mass, verifies);
-    const group_batch& inputs = captured->inputs;
+    const model::batch& inputs = captured->inputs;
     // Thread-local capture leaves the other GPUs' threads free to launch while this one captures.
     captured->graph.capture_begin({0, 0}, cudaStreamCaptureModeThreadLocal);
-    if (verifies) {
-        step_logits logits = shard_model.forward(step_batch{.verify_group = inputs}, lines);
-        captured->logits = *logits.verify_logits;
-        captured->hidden = logits.verify_hidden.value_or(at::Tensor());
-    } else {
+    if (!verifies) {
         fill_awaited_tokens_cuda(inputs.tokens, samples);
-        step_logits logits = shard_model.forward(step_batch{.decode_group = inputs}, lines);
-        captured->logits = *logits.decode_logits;
-        captured->hidden = logits.decode_hidden.value_or(at::Tensor());
     }
+    model::output output = shard_model.forward(inputs, lines);
+    captured->logits = output.logits;
+    captured->hidden = output.hidden;
     captured->graph.capture_end();
     return captured;
 }
@@ -148,11 +145,7 @@ void decode_graphs::capture_startup() {
             if (measures_mass && !any_mass) {
                 continue;
             }
-            group_batch warmup = make_inputs(1, measures_mass, verifies);
-            shard_model.forward(
-                verifies ? step_batch{.verify_group = warmup} : step_batch{.decode_group = warmup},
-                lines
-            );
+            shard_model.forward(make_inputs(1, measures_mass, verifies), lines);
         }
     }
     if (state_slots > 1 && shard_model.drafter() != nullptr) {
@@ -197,14 +190,14 @@ void decode_graphs::capture_startup() {
     }
 }
 
-const decode_graphs::captured_forward& decode_graphs::replay(const group_batch& g, bool verifies) {
+const decode_graphs::captured_forward& decode_graphs::replay(const model::batch& g, bool verifies) {
     const std::int64_t sequences = g.page_tables.size(1);
     const bool measures_mass = g.cu_view_pages.defined();
     std::unique_ptr<captured_forward>& captured = forwards[{sequences, measures_mass, verifies}];
     if (!captured) {
         captured = capture(sequences, measures_mass, verifies);
     }
-    group_batch& inputs = captured->inputs;
+    model::batch& inputs = captured->inputs;
     TORCH_CHECK(
         g.page_size == page_size && g.state_slots == state_slots && g.tokens.sizes() == inputs.tokens.sizes(),
         "decode_graphs: the group's page size, state slots or tokens are not the graph's"
@@ -237,14 +230,15 @@ const decode_graphs::captured_forward& decode_graphs::replay(const group_batch& 
     return *captured;
 }
 
-std::pair<group_batch, at::Tensor> decode_graphs::make_draft_inputs(std::int64_t sequences, bool verify_rows) const {
+std::pair<model::batch, at::Tensor> decode_graphs::make_draft_inputs(std::int64_t sequences, bool verify_rows) const {
     auto device = lines.front().k.options();
     auto ints = device.dtype(at::kInt);
     auto longs = device.dtype(at::kLong);
     const auto layers = static_cast<std::int64_t>(lines.size());
     const std::int64_t rows = verify_rows ? state_slots : 1;
     const std::int64_t tokens = sequences * rows;
-    group_batch inputs{
+    model::batch inputs{
+        .kind = verify_rows ? model::batch_kind::prefill : model::batch_kind::decode,
         .tokens = at::zeros({tokens}, longs),
         .pos = at::zeros({tokens}, longs),
         .page_tables = at::zeros({layers, sequences, width}, ints),
@@ -274,14 +268,14 @@ std::unique_ptr<decode_graphs::captured_draft> decode_graphs::capture_draft(std:
     return captured;
 }
 
-draft_output decode_graphs::draft(const group_batch& g, const at::Tensor& hidden, bool verify_rows) {
+model::output decode_graphs::draft(const model::batch& g, const at::Tensor& hidden, bool verify_rows) {
     require_draft_head(shard_model);
     const std::int64_t sequences = g.page_tables.size(1);
     std::unique_ptr<captured_draft>& captured = drafts[{sequences, verify_rows}];
     if (!captured) {
         captured = capture_draft(sequences, verify_rows);
     }
-    group_batch& inputs = captured->inputs;
+    model::batch& inputs = captured->inputs;
     TORCH_CHECK(
         g.tokens.sizes() == inputs.tokens.sizes() && hidden.sizes() == captured->hidden_rows.sizes(),
         "decode_graphs: the draft pass's rows are not the graph's"
@@ -322,15 +316,15 @@ decode_graphs::capture_step(std::int64_t sequences, bool measures_mass, bool fil
     auto [later_pass, later_hidden] = make_draft_inputs(sequences, false);
     captured->first_pass = std::move(first_pass);
     captured->later_pass = std::move(later_pass);
-    const group_batch& inputs = captured->inputs;
+    const model::batch& inputs = captured->inputs;
     const auto layers = static_cast<std::int64_t>(lines.size());
     auto every_layer = [&](const at::Tensor& counts) {
         return counts.to(at::kInt).unsqueeze(0).expand({layers, sequences});
     };
     draft_head& head = *shard_model.drafter();
     captured->graph.capture_begin({0, 0}, cudaStreamCaptureModeThreadLocal);
-    step_logits logits = shard_model.forward(step_batch{.verify_group = inputs}, lines);
-    at::Tensor samples = sample(*logits.verify_logits, captured->sampling);
+    model::output verified_rows = shard_model.forward(inputs, lines);
+    at::Tensor samples = sample(verified_rows.logits, captured->sampling);
     at::Tensor verified = samples.view({sequences, rows});
     at::Tensor drafted = inputs.tokens.view({sequences, rows}).narrow(1, 1, rows - 1);
     at::Tensor accepted_counts = verified.narrow(1, 0, rows - 1).eq(drafted).to(at::kLong).cumprod(1).sum(1) + 1;
@@ -341,25 +335,25 @@ decode_graphs::capture_step(std::int64_t sequences, bool measures_mass, bool fil
     }
     accepted_counts = at::minimum(accepted_counts, captured->max_accepted_token_counts);
     at::Tensor drafting_rows = at::arange(sequences, longs) * rows + accepted_counts - 1;
-    group_batch& first = captured->first_pass;
+    model::batch& first = captured->first_pass;
     first.tokens.copy_(samples);
     first.pos.copy_(captured->draft_positions);
     first.page_tables.copy_(inputs.page_tables);
     first.page_positions.copy_(inputs.page_positions);
     first.key_counts.copy_(every_layer(captured->draft_key_counts));
     first.logit_rows.copy_(drafting_rows);
-    draft_output drafted_rows = head.draft(first, *logits.verify_hidden, lines);
+    model::output drafted_rows = head.draft(first, verified_rows.hidden, lines);
     at::Tensor token = drafted_rows.logits.argmax(-1);
     at::Tensor previous_hidden = drafted_rows.hidden.index_select(0, drafting_rows);
     std::vector<at::Tensor> next{samples.index_select(0, drafting_rows), token};
-    group_batch& one_row = captured->later_pass;
+    model::batch& one_row = captured->later_pass;
     for (std::int64_t j = 0; j < later; j++) {
         one_row.tokens.copy_(token);
         one_row.pos.copy_(captured->later_positions[j] + accepted_counts);
         one_row.page_tables.copy_(inputs.page_tables);
         one_row.page_positions.copy_(inputs.page_positions);
         one_row.key_counts.copy_(every_layer(captured->later_key_counts[j] + accepted_counts));
-        draft_output following = head.draft(one_row, previous_hidden, lines);
+        model::output following = head.draft(one_row, previous_hidden, lines);
         token = following.logits.argmax(-1);
         previous_hidden = following.hidden;
         next.push_back(token);
@@ -372,7 +366,7 @@ decode_graphs::capture_step(std::int64_t sequences, bool measures_mass, bool fil
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> decode_graphs::verify_step(
-    const group_batch& g,
+    const model::batch& g,
     const sampling_inputs& sampling,
     const at::Tensor& max_accepted_token_counts,
     const at::Tensor& draft_positions,
@@ -387,7 +381,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> decode_graphs::verify_step(
     if (!captured) {
         captured = capture_step(sequences, measures_mass, sampling.filters);
     }
-    group_batch& inputs = captured->inputs;
+    model::batch& inputs = captured->inputs;
     TORCH_CHECK(
         g.page_size == page_size && g.state_slots == state_slots && g.tokens.sizes() == inputs.tokens.sizes(),
         "decode_graphs: the verify step's group is not the graph's"
@@ -428,14 +422,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> decode_graphs::verify_step(
     return {captured->samples, captured->accepted_token_counts, captured->next_tokens};
 }
 
-std::pair<at::Tensor, at::Tensor> decode_graphs::decode(const group_batch& g) {
+model::output decode_graphs::decode(const model::batch& g) {
     const captured_forward& captured = replay(g, false);
-    return {captured.logits, captured.hidden};
+    return model::output{.logits = captured.logits, .hidden = captured.hidden};
 }
 
-std::pair<at::Tensor, at::Tensor> decode_graphs::verify(const group_batch& g) {
+model::output decode_graphs::verify(const model::batch& g) {
     const captured_forward& captured = replay(g, true);
-    return {captured.logits, captured.hidden};
+    return model::output{.logits = captured.logits, .hidden = captured.hidden};
 }
 
 }  // namespace pulsarlm

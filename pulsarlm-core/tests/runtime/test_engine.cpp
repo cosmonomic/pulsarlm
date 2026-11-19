@@ -100,23 +100,13 @@ class successor_model final : public pulsarlm::model {
         return one_layer;
     }
 
-    pulsarlm::step_logits forward(const pulsarlm::step_batch& batch, std::span<const pulsarlm::kv>) override {
-        pulsarlm::step_logits logits;
-        if (batch.prefill_group) {
-            logits.prefill_logits = predict(*batch.prefill_group);
-        }
-        if (batch.decode_group) {
-            logits.decode_logits = predict(*batch.decode_group);
-        }
-        return logits;
-    }
-
-  private:
-    static at::Tensor predict(const pulsarlm::group_batch& g) {
-        return pulsarlm::logit_inputs(
-            at::one_hot((g.tokens + 1) % static_cast<std::int64_t>(vocab), vocab).to(at::kFloat),
-            g
-        );
+    output forward(const batch& b, std::span<const pulsarlm::kv>) override {
+        return output{
+            .logits = pulsarlm::logit_inputs(
+                at::one_hot((b.tokens + 1) % static_cast<std::int64_t>(vocab), vocab).to(at::kFloat),
+                b
+            ),
+        };
     }
 };
 
@@ -126,7 +116,7 @@ class failing_model final : public pulsarlm::model {
         return one_layer;
     }
 
-    pulsarlm::step_logits forward(const pulsarlm::step_batch&, std::span<const pulsarlm::kv>) override {
+    output forward(const batch&, std::span<const pulsarlm::kv>) override {
         throw std::runtime_error("forward failed");
     }
 };
@@ -174,7 +164,9 @@ std::unique_ptr<recording_callbacks> record_into(const std::shared_ptr<request_r
 
 void wait_for_end(request_results& recorded_results) {
     std::unique_lock lock(recorded_results.mutex);
-    REQUIRE(recorded_results.end_condition.wait_for(lock, end_timeout, [&] { return recorded_results.end.has_value(); }));
+    REQUIRE(recorded_results.end_condition.wait_for(lock, end_timeout, [&] {
+        return recorded_results.end.has_value();
+    }));
 }
 
 pulsarlm::engine_config config(std::size_t n_lines) {

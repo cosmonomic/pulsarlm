@@ -327,13 +327,8 @@ std::vector<kv_layer_shard> qwen3_5_model::kv_layer_shards() const {
     return kv_shards;
 }
 
-at::Tensor qwen3_5_model::attention(
-    const at::Tensor& h,
-    std::int64_t layer,
-    const group_batch& g,
-    group_kind kind,
-    std::span<const kv> lines
-) const {
+at::Tensor
+qwen3_5_model::attention(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const {
     const attention_weights& w = *layers[layer].attention;
     const qwen3_5_config& c = config;
     const std::int64_t ntok = h.size(0);
@@ -346,38 +341,31 @@ at::Tensor qwen3_5_model::attention(
     at::Tensor k = rmsnorm_cuda(w.k_proj.apply(h).view({ntok, n_kv_heads, c.head_dim}), w.k_norm, c.rms_norm_eps);
     at::Tensor v = w.v_proj.apply(h).view({ntok, n_kv_heads, c.head_dim}).contiguous();
     const double scale = 1.0 / std::sqrt(static_cast<double>(c.head_dim));
-    at::Tensor o = kind == group_kind::verify
-        ? paged_verify_attention(q, k, v, lines[kv_index], kv_index, 0, g, scale, rope)
-        : paged_attention(q, k, v, lines[kv_index], kv_index, 0, g, scale, rope);
+    at::Tensor o = paged_attention(q, k, v, lines[kv_index], kv_index, 0, g, scale, rope);
     at::Tensor out = w.o_proj.apply(o.reshape({ntok, n_heads * c.head_dim}) * at::sigmoid(gate));
     comm.all_reduce(out);
     return out;
 }
 
-at::Tensor qwen3_5_model::deltanet(
-    const at::Tensor& h,
-    std::int64_t layer,
-    const group_batch& g,
-    group_kind kind,
-    std::span<const kv> lines
-) const {
+at::Tensor
+qwen3_5_model::deltanet(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const {
     const deltanet_weights& w = *layers[layer].deltanet;
     const qwen3_5_config& c = config;
     const std::int64_t ntok = h.size(0);
     const std::size_t state_layer = kv_layer_of[layer];
     const std::size_t conv_layer = state_layer + 1;
     std::optional<at::Tensor> cu_seqlens_q;
-    if (kind != group_kind::decode) {
+    if (g.kind != batch_kind::decode) {
         cu_seqlens_q = g.cu_seqlens_q;
     }
     const state_rows window_rows = window_layer_rows(g, conv_layer);
     const state_rows state_rows = state_layer_rows(g, state_layer);
     at::Tensor gated;
-    if (kind == group_kind::verify) {
+    if (g.kind == batch_kind::verify) {
         const std::int64_t sequences = window_rows.lines.size(0);
         TORCH_CHECK(
             sequences > 0 && ntok > 0 && ntok % sequences == 0,
-            "qwen3_5_model: a verify group of ",
+            "qwen3_5_model: a verify batch of ",
             ntok,
             " tokens does not hold the same count for each of its ",
             sequences,
@@ -449,18 +437,12 @@ at::Tensor qwen3_5_model::embed(const at::Tensor& tokens) const {
     return x;
 }
 
-at::Tensor qwen3_5_model::decoder_layer(
-    const at::Tensor& x,
-    std::int64_t layer,
-    const group_batch& g,
-    group_kind kind,
-    std::span<const kv> lines
-) const {
+at::Tensor
+qwen3_5_model::decoder_layer(const at::Tensor& x, std::int64_t layer, const batch& g, std::span<const kv> lines) const {
     const double eps = config.rms_norm_eps;
     const layer_weights& w = layers[layer];
     at::Tensor h = rmsnorm_cuda(x, w.input_layernorm, eps);
-    at::Tensor mixed = x +
-        (full_attention(layer) ? attention(h, layer, g, kind, lines) : deltanet(h, layer, g, kind, lines));
+    at::Tensor mixed = x + (full_attention(layer) ? attention(h, layer, g, lines) : deltanet(h, layer, g, lines));
     at::Tensor h2 = rmsnorm_cuda(mixed, w.post_attention_layernorm, eps);
     at::Tensor mlp = w.down_proj.apply(at::silu(w.gate_proj.apply(h2)) * w.up_proj.apply(h2));
     comm.all_reduce(mlp);
@@ -478,47 +460,26 @@ at::Tensor qwen3_5_model::logits(const at::Tensor& rows) const {
 }
 
 // Normed row by row, the logit rows' hidden rows equal the normed hidden rows' logit rows.
-std::pair<at::Tensor, at::Tensor>
-qwen3_5_model::group_forward(const group_batch& g, group_kind kind, std::span<const kv> lines) const {
-    at::Tensor x = embed(g.tokens);
+model::output qwen3_5_model::forward(const batch& b, std::span<const kv> lines) {
+    check_batch(b);
+    TORCH_CHECK(
+        mtp || b.kind != batch_kind::verify,
+        "qwen3_5_model: a model without its MTP layer forwards no verify batch"
+    );
+    at::Tensor x = embed(b.tokens);
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
-        x = decoder_layer(x, layer, g, kind, lines);
+        x = decoder_layer(x, layer, b, lines);
     }
     if (!mtp) {
-        return {logits(rmsnorm_cuda(logit_inputs(x, g), norm, config.rms_norm_eps)), at::Tensor()};
+        return output{.logits = logits(rmsnorm_cuda(logit_inputs(x, b), norm, config.rms_norm_eps))};
     }
     at::Tensor normed = rmsnorm_cuda(x, norm, config.rms_norm_eps);
-    keep_last_hidden(g, normed, lines[kv_layer_of[n_layers]], kv_layer_of[n_layers]);
-    return {logits(logit_inputs(normed, g)), normed};
+    keep_last_hidden(b, normed, lines[kv_layer_of[n_layers]], kv_layer_of[n_layers]);
+    return output{.logits = logits(logit_inputs(normed, b)), .hidden = normed};
 }
 
 std::int64_t qwen3_5_model::arrival_counter_count(std::int64_t sequences, std::int64_t) const {
     return gated_delta_rule_counters(sequences, linear_n_value_heads);
-}
-
-step_logits qwen3_5_model::forward(const step_batch& batch, std::span<const kv> lines) {
-    step_logits out;
-    if (batch.prefill_group) {
-        auto [group_logits, hidden] = group_forward(*batch.prefill_group, group_kind::prefill, lines);
-        out.prefill_logits = group_logits;
-        if (mtp) {
-            out.prefill_hidden = hidden;
-        }
-    }
-    if (batch.decode_group) {
-        auto [group_logits, hidden] = group_forward(*batch.decode_group, group_kind::decode, lines);
-        out.decode_logits = group_logits;
-        if (mtp) {
-            out.decode_hidden = hidden;
-        }
-    }
-    if (batch.verify_group) {
-        TORCH_CHECK(mtp, "qwen3_5_model: a model without its MTP layer forwards no verify group");
-        auto [group_logits, hidden] = group_forward(*batch.verify_group, group_kind::verify, lines);
-        out.verify_logits = group_logits;
-        out.verify_hidden = hidden;
-    }
-    return out;
 }
 
 draft_head* qwen3_5_model::drafter() {
@@ -530,15 +491,15 @@ std::int64_t qwen3_5_model::hidden_dim() const {
 }
 
 // The token's embedding and the hidden row, each normed, go through fc into the MTP layer, whose output is normed.
-draft_output qwen3_5_model::draft(const group_batch& g, const at::Tensor& hidden, std::span<const kv> lines) {
+model::output qwen3_5_model::draft(const batch& b, const at::Tensor& hidden, std::span<const kv> lines) {
     const mtp_weights& m = *mtp;
     const double eps = config.rms_norm_eps;
-    at::Tensor embedded = rmsnorm_cuda(embed(g.tokens), m.pre_fc_norm_embedding, eps);
+    at::Tensor embedded = rmsnorm_cuda(embed(b.tokens), m.pre_fc_norm_embedding, eps);
     at::Tensor previous = rmsnorm_cuda(hidden.contiguous(), m.pre_fc_norm_hidden, eps);
     at::Tensor x = at::linear(at::cat({embedded, previous}, -1), m.fc);
-    x = decoder_layer(x, n_layers, g, g.is_prefill() ? group_kind::prefill : group_kind::decode, lines);
+    x = decoder_layer(x, n_layers, b, lines);
     at::Tensor normed = rmsnorm_cuda(x, m.norm, eps);
-    return draft_output{.logits = logits(logit_inputs(normed, g)), .hidden = normed};
+    return output{.logits = logits(logit_inputs(normed, b)), .hidden = normed};
 }
 
 }  // namespace pulsarlm

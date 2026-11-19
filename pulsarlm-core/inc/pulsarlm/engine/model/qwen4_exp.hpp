@@ -154,10 +154,6 @@ class qwen4_exp_model : public model, public draft_head {
     std::vector<layer_weights> layers;
     std::optional<mtp_weights> mtp;
 
-    // The group of a step a forward runs: a verify group runs as a prefill group, with cu_seqlens_q, except that its
-    // recurrent layers keep a state after each token and its attention measures each row's mass apart.
-    enum class group_kind { prefill, decode, verify };
-
     bool indexed_attention(std::int64_t layer) const;
     // The rows of a table split across the GPUs at ids, [ids..., table columns], summed across the GPUs; this GPU's
     // part of the table starts at first_row.
@@ -188,32 +184,12 @@ class qwen4_exp_model : public model, public draft_head {
     mixed_input
     mix_normed(const at::Tensor& normed, const at::Tensor& projected, const hyper_connection_weights& w) const;
     at::Tensor final_mix(const at::Tensor& x) const;
-    at::Tensor attention(
-        const at::Tensor& h,
-        std::int64_t layer,
-        const group_batch& g,
-        group_kind kind,
-        std::span<const kv> lines
-    ) const;
-    at::Tensor deltanet(
-        const at::Tensor& h,
-        std::int64_t layer,
-        const group_batch& g,
-        group_kind kind,
-        std::span<const kv> lines
-    ) const;
+    at::Tensor attention(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const;
+    at::Tensor deltanet(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const;
     at::Tensor moe(const at::Tensor& h, std::int64_t layer, const at::Tensor& counters) const;
     // Each token's n-gram ids into the layer's table, [ntok, n-gram heads], updating its token lines.
-    at::Tensor ngram_ids(const ple_weights& w, std::size_t token_layer, const group_batch& g, const kv& lines) const;
-    at::Tensor
-    ple(const at::Tensor& x,
-        std::int64_t layer,
-        const group_batch& g,
-        group_kind kind,
-        std::span<const kv> lines) const;
-    // The group's logits and the streams after the last layer at every token.
-    std::pair<at::Tensor, at::Tensor>
-    group_forward(const group_batch& g, group_kind kind, std::span<const kv> lines) const;
+    at::Tensor ngram_ids(const ple_weights& w, std::size_t token_layer, const batch& g, const kv& lines) const;
+    at::Tensor ple(const at::Tensor& x, std::int64_t layer, const batch& g, std::span<const kv> lines) const;
 
   public:
     // weights are this GPU's parts, on the lines' device, in the attention lines' dtype; the PLE buffers are int64.
@@ -222,11 +198,11 @@ class qwen4_exp_model : public model, public draft_head {
 
     std::vector<kv_layer> kv_layers() const override;
     std::vector<kv_layer_shard> kv_layer_shards() const override;
-    step_logits forward(const step_batch& batch, std::span<const kv> lines) override;
+    output forward(const batch& b, std::span<const kv> lines) override;
     std::int64_t arrival_counter_count(std::int64_t sequences, std::int64_t tokens) const override;
     draft_head* drafter() override;
     std::int64_t hidden_dim() const override;
-    draft_output draft(const group_batch& g, const at::Tensor& hidden, std::span<const kv> lines) override;
+    output draft(const batch& b, const at::Tensor& hidden, std::span<const kv> lines) override;
 };
 
 }  // namespace pulsarlm

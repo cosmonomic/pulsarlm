@@ -35,16 +35,14 @@ class llama_model : public model {
     at::Tensor norm;
     std::vector<layer_weights> layers;
 
-    at::Tensor
-    attention(const at::Tensor& h, std::int64_t layer, const group_batch& g, std::span<const kv> lines) const;
-    at::Tensor group_forward(const group_batch& g, std::span<const kv> lines) const;
+    at::Tensor attention(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const;
 
   public:
     // weights are on the lines' device and dtype.
     llama_model(dense_config config, const c10::Dict<std::string, at::Tensor>& weights);
 
     std::vector<kv_layer> kv_layers() const override;
-    step_logits forward(const step_batch& batch, std::span<const kv> lines) override;
+    output forward(const batch& b, std::span<const kv> lines) override;
 };
 
 }  // namespace pulsarlm
