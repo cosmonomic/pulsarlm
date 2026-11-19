@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <iterator>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -11,7 +12,8 @@
 namespace pulsarlm {
 
 // Values in slots that keep their address, each named by a key that stops matching once its value is erased, also
-// after the slot holds another value. A value is constructed in its slot and need not be movable.
+// after the slot holds another value. A value is constructed in its slot and need not be movable. Adding a value
+// invalidates every iterator and no reference. Erasing a value invalidates the iterators and references to that value.
 template <typename value_type> class slot_map {
     using generation_type = std::uint32_t;
     // The generation, incremented when the value is erased, and the value.
@@ -36,7 +38,58 @@ template <typename value_type> class slot_map {
         return &slots[slot];
     }
 
+    // Visits the values in slot order and passes over the empty slots.
+    template <typename slot_iterator_type, typename referenced_type> class value_iterator {
+        slot_iterator_type position;
+        slot_iterator_type slots_end;
+
+        void pass_empty_slots() {
+            while (position != slots_end && !position->second) {
+                ++position;
+            }
+        }
+
+      public:
+        using iterator_concept = std::forward_iterator_tag;
+        using difference_type = std::ptrdiff_t;
+        using element_type = referenced_type;
+
+        value_iterator() = default;
+        value_iterator(slot_iterator_type position, slot_iterator_type slots_end)
+        : position(position),
+          slots_end(slots_end) {
+            pass_empty_slots();
+        }
+
+        referenced_type& operator*() const {
+            return *position->second;
+        }
+
+        referenced_type* operator->() const {
+            return &*position->second;
+        }
+
+        value_iterator& operator++() {
+            ++position;
+            pass_empty_slots();
+            return *this;
+        }
+
+        value_iterator operator++(int) {
+            value_iterator before = *this;
+            ++*this;
+            return before;
+        }
+
+        bool operator==(const value_iterator& other) const {
+            return position == other.position;
+        }
+    };
+
   public:
+    using iterator = value_iterator<typename std::deque<slot_type>::iterator, value_type>;
+    using const_iterator = value_iterator<typename std::deque<slot_type>::const_iterator, const value_type>;
+
     // Constructs a value from arguments in a free slot, or in a new one, and returns its key.
     template <typename... argument_types> key_type emplace(argument_types&&... arguments) {
         if (free_slots.empty()) {
@@ -84,13 +137,20 @@ template <typename value_type> class slot_map {
         return slot == nullptr ? nullptr : &*slot->second;
     }
 
-    // Calls visit with each value.
-    template <typename visitor_type> void for_each(visitor_type&& visit) {
-        for (slot_type& slot : slots) {
-            if (slot.second) {
-                visit(*slot.second);
-            }
-        }
+    iterator begin() noexcept {
+        return iterator(slots.begin(), slots.end());
+    }
+
+    iterator end() noexcept {
+        return iterator(slots.end(), slots.end());
+    }
+
+    const_iterator begin() const noexcept {
+        return const_iterator(slots.begin(), slots.end());
+    }
+
+    const_iterator end() const noexcept {
+        return const_iterator(slots.end(), slots.end());
     }
 
     bool contains(key_type key) const noexcept {

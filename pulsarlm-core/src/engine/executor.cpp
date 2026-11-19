@@ -1608,7 +1608,9 @@ bool executor::release_passed_pages(sequence& seq) {
 }
 
 executor::~executor() {
-    sequences.for_each([&](sequence& unstopped) { store.release(unstopped.lease_id()); });
+    for (const sequence& unstopped : sequences) {
+        store.release(unstopped.lease_id());
+    }
 }
 
 void executor::update_views(sequence& seq) {

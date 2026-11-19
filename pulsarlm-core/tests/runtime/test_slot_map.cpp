@@ -2,7 +2,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <iterator>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 
@@ -16,6 +18,9 @@ struct pinned_value {
     pinned_value(const pinned_value&) = delete;
     pinned_value& operator=(const pinned_value&) = delete;
 };
+
+static_assert(std::forward_iterator<slot_map<pinned_value>::iterator>);
+static_assert(std::forward_iterator<slot_map<pinned_value>::const_iterator>);
 
 }  // namespace
 
@@ -62,4 +67,24 @@ TEST_CASE("an erased key stops matching, also after its slot holds another value
     CHECK_THROWS_AS(values.at(erased), std::out_of_range);
     CHECK(values.at(reusing).number == 3);
     CHECK(values.at(other).number == 2);
+}
+
+TEST_CASE("a slot_map's iterators visit its values in slot order and pass over erased ones") {
+    slot_map<pinned_value> values;
+    CHECK(values.begin() == values.end());
+
+    values.emplace(1);
+    slot_map<pinned_value>::key_type erased = values.emplace(2);
+    values.emplace(3);
+    values.erase(erased);
+
+    std::vector<int> numbers;
+    for (pinned_value& value : values) {
+        numbers.push_back(value.number);
+    }
+    CHECK((numbers == std::vector<int>{1, 3}));
+
+    const slot_map<pinned_value>& read_only = values;
+    CHECK(std::distance(read_only.begin(), read_only.end()) == 2);
+    CHECK(read_only.begin()->number == 1);
 }
