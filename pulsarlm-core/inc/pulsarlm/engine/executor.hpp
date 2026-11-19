@@ -65,15 +65,37 @@ class executor {
     // Each request from start until its end.
     slot_map<running_request> requests;
 
-    // One model per shard of the cache, each holding its part of every layer.
-    std::vector<model*> shards;
+    // Everything the executor keeps on one GPU across steps.
+    class shard {
+      public:
+        // Holds the shard's part of every layer.
+        pulsarlm::model* model;
+        // One kv per KV layer.
+        std::vector<kv> lines;
+        // Per KV layer, the shard's part of the layer's mass_heads; the shards' parts in shard order make up the
+        // layer's.
+        std::vector<std::size_t> mass_heads;
+        // stop_ids on the shard's device, int64.
+        at::Tensor stop_tokens;
+        cudaStream_t compute_stream;
+        // The stream a write-back's copies to the store run on, after its step and alongside the next.
+        cudaStream_t copy_stream;
+        // The loop the shard's forward runs on, or nullptr for shard 0, whose forward runs on the executor's loop.
+        event_loop* worker_loop;
+        // None when decode and verify groups forward without graphs.
+        std::unique_ptr<step_graphs> graphs;
+        // int64 [sampled_row_capacity] on the shard's device: the tokens the latest launched step sampled, every shard
+        // sampling them alike.
+        at::Tensor samples;
+        // The arrival counters of the steps that run without a graph, grown to the largest step's.
+        at::Tensor arrival_counters;
+    };
+
     // One layer per KV layer, in the models' KV layer order.
     kv_cache cache;
     page_store& store;
-    // Per shard, one kv per KV layer.
-    std::vector<std::vector<kv>> lines;
-    // One per shard, or none when decode and verify groups forward without graphs.
-    std::vector<std::unique_ptr<step_graphs>> graphs;
+    // One per shard of the cache.
+    std::vector<shard> shards;
     // The page-table width of the graphs, the pages of the longest view they cover.
     std::optional<std::size_t> graph_pages;
     // A recurrent layer's state_slots are draft_state_slots for a state and 1 for a window. A layer's mass_heads are
@@ -84,20 +106,11 @@ class executor {
     std::size_t draft_state_slots;
     // When steps draft, the draft head's KV layer (kv_layer::last_hidden_dim above 0).
     std::optional<std::size_t> draft_layer;
-    // Per shard, stop_ids on its device, int64.
-    std::vector<at::Tensor> stop_tokens;
     std::atomic<std::uint64_t> drafted_tokens{0};
     std::atomic<std::uint64_t> accepted_drafts{0};
     std::size_t slots_of(const kv_layer& layer) const noexcept;
-    // Per shard, per KV layer, the shard's part of the layer's mass_heads; the shards' parts in shard order make up the
-    // layer's.
-    std::vector<std::vector<std::size_t>> shard_mass_heads;
-    // One stream per shard.
-    std::vector<cudaStream_t> streams;
-    // Per shard, the stream a write-back's copies to the store run on, after its step and alongside the next.
-    std::vector<cudaStream_t> copy_streams;
-    // The loops of shards 1 on: shard s's forward runs on worker_loops[s - 1]; shard 0's on the executor's loop.
-    std::vector<event_loop*> worker_loops;
+    // stream of every shard, in shard order.
+    std::vector<cudaStream_t> streams_of(cudaStream_t shard::* stream) const;
     digest root;
     std::vector<std::int64_t> stop_ids;
     // The steps queued on the GPUs and not written back yet, in launch order.
@@ -105,13 +118,8 @@ class executor {
     // The page writes write-backs spawned, at most max_store_writes at once.
     pending_writes store_writes;
     static constexpr std::size_t max_store_writes = 8;
-    // Per shard, the arrival counters of the steps that run without a graph, grown to the largest step's.
-    std::vector<at::Tensor> eager_counters;
     // The most rows of sampled tokens a batch has.
     std::size_t sampled_row_capacity;
-    // Per shard, int64 [sampled_row_capacity] on its device: the tokens the latest launched step sampled, every shard
-    // sampling them alike.
-    std::vector<at::Tensor> samples;
 
     // The tokens of seq's full history pages that every KV layer reading the page holds resident.
     std::size_t device_cached_tokens(const sequence& seq) const;
@@ -192,7 +200,7 @@ class executor {
     task<void> write_cycle_end(sequence& seq, request_callbacks& callbacks);
 
   public:
-    // shards[s] runs on cache shard s with streams[s], shards 1 on on worker_loops[s - 1], and its write-backs' copies
+    // models[s] runs on cache shard s with streams[s], for s above 0 on worker_loops[s - 1], and its write-backs' copies
     // to the store on copy_streams[s], which the caller synchronizes before freeing what the copies read; the cache holds one layer
     // per entry of each model's kv_layers(), and the shards agree on which layers are recurrent or sliding. store is the
     // cache's. root is the engine's root digest (make_root_digest). With graph_pages, a decode group whose sequences'
@@ -200,7 +208,7 @@ class executor {
     // draft_tokens tokens per sequence with the shards' draft heads, which they have when draft_tokens is above 0, and
     // the cache's recurrent layers are laid out for them (recurrent_state).
     executor(
-        std::vector<model*>&& shards,
+        std::vector<model*>&& models,
         kv_cache cache,
         page_store& store,
         std::vector<cudaStream_t>&& streams,

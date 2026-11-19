@@ -164,7 +164,7 @@ class kv_cache {
         std::vector<sharded_page> pages,
         std::vector<std::pair<state::lease_id_type, page_store::page_index_type>> page_owners,
         std::vector<layer_line> sources,
-        std::span<const cudaStream_t> streams
+        std::vector<cudaStream_t> streams
     );
 
   public:
@@ -207,7 +207,7 @@ class kv_cache {
         const std::vector<std::vector<digest>>& hashes,
         const std::vector<std::vector<state::lease_id_type>>& owners,
         const std::vector<std::vector<std::uint32_t>>& line_ids,
-        std::span<const cudaStream_t> streams
+        std::vector<cudaStream_t> streams
     );
     void release(std::size_t layer, std::span<const std::uint32_t> line_ids) noexcept;
     // Whether layer caches the page hash in a line, which get then holds without fetching; a page being fetched is not

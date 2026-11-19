@@ -86,8 +86,8 @@ executor::start(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
     }
     std::shared_ptr<const state> initial_state = extend_with_hot_pages(std::move(stored_state), r, digests);
     std::vector<at::Device> devices;
-    for (const std::vector<kv>& shard_lines : lines) {
-        devices.push_back(shard_lines.front().k.device());
+    for (const shard& s : shards) {
+        devices.push_back(s.lines.front().k.device());
     }
     sequence& seq = running.state.emplace(
         std::move(r),
@@ -119,7 +119,7 @@ executor::start(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
         end_request(id, std::unexpected(request_error::oom), request_statistics{});
         co_return std::nullopt;
     }
-    seq.upload_table(0, streams);
+    seq.upload_table(0, streams_of(&shard::compute_stream));
     co_return id;
 }
 
@@ -223,7 +223,7 @@ task<std::expected<void, page_error>> executor::own_pages_from(sequence& seq, st
             }
         }
     }
-    co_return co_await cache.sync(hashes, owners, line_ids, streams);
+    co_return co_await cache.sync(hashes, owners, line_ids, streams_of(&shard::compute_stream));
 }
 
 task<void> executor::stop(sequence_id id) {
@@ -281,7 +281,7 @@ task<std::expected<void, page_error>> executor::take_lines(sequence& seq, std::s
     // A get failing with miss releases the lines it held_hashes while it fetched.
     std::expected<std::vector<std::vector<std::uint32_t>>, page_error> page_lines = co_await cache.get(
         held_hashes,
-        streams
+        streams_of(&shard::compute_stream)
     );
     if (!page_lines) {
         co_return std::unexpected(page_lines.error());
@@ -299,7 +299,7 @@ task<std::expected<void, page_error>> executor::take_lines(sequence& seq, std::s
     for (std::size_t layer = 0; layer < cache.layer_count() && copied; layer++) {
         if (layout.layers[layer].is_recurrent && !(*page_lines)[layer].empty()) {
             std::expected<std::vector<std::uint32_t>, page_error>
-                state_copy = cache.clone(layer, (*page_lines)[layer].front(), 1, streams);
+                state_copy = cache.clone(layer, (*page_lines)[layer].front(), 1, streams_of(&shard::compute_stream));
             copied = state_copy.has_value();
             if (copied) {
                 states[layer] = std::move(*state_copy);
@@ -325,9 +325,12 @@ task<std::expected<void, page_error>> executor::take_lines(sequence& seq, std::s
             if (states[layer].empty()) {
                 for (std::size_t shard = 0; shard < shards.size(); shard++) {
                     c10::cuda::CUDAStreamGuard guard(
-                        c10::cuda::getStreamFromExternal(streams[shard], lines[shard][layer].k.device().index())
+                        c10::cuda::getStreamFromExternal(
+                            shards[shard].compute_stream,
+                            shards[shard].lines[layer].k.device().index()
+                        )
                     );
-                    lines[shard][layer].k.select(0, allocated.front()).zero_();
+                    shards[shard].lines[layer].k.select(0, allocated.front()).zero_();
                 }
                 seq.add_lines(layer, allocated.first(1));
                 allocated = allocated.subspan(1);

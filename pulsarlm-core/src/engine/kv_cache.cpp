@@ -751,7 +751,7 @@ task<std::expected<void, page_error>> kv_cache::sync(
     const std::vector<std::vector<digest>>& hashes,
     const std::vector<std::vector<state::lease_id_type>>& owners,
     const std::vector<std::vector<std::uint32_t>>& line_ids,
-    std::span<const cudaStream_t> streams
+    std::vector<cudaStream_t> streams
 ) {
     assert(hashes.size() == layers.size() && owners.size() == layers.size() && line_ids.size() == layers.size());
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
@@ -789,7 +789,13 @@ task<std::expected<void, page_error>> kv_cache::sync(
     for (const layer_line& source : sources) {
         line(source.layer, source.line_id).ref++;
     }
-    return write_synced(std::move(keys), std::move(pages), std::move(page_owners), std::move(sources), streams);
+    return write_synced(
+        std::move(keys),
+        std::move(pages),
+        std::move(page_owners),
+        std::move(sources),
+        std::move(streams)
+    );
 }
 
 task<std::expected<void, page_error>> kv_cache::write_synced(
@@ -797,7 +803,7 @@ task<std::expected<void, page_error>> kv_cache::write_synced(
     std::vector<sharded_page> pages,
     std::vector<std::pair<state::lease_id_type, page_store::page_index_type>> page_owners,
     std::vector<layer_line> sources,
-    std::span<const cudaStream_t> streams
+    std::vector<cudaStream_t> streams
 ) {
     std::expected<void, page_error> written;
     if (!sources.empty()) {

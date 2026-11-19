@@ -275,7 +275,7 @@ class executor::batch {
     // entries].
     at::Tensor previous_shift(std::size_t shard, at::Device device) const;
     // Joins the shards' page mass, each shard's heads after the previous shards', once their copies completed.
-    void join_mass(const std::vector<std::vector<std::size_t>>& shard_mass_heads, const view_layout& layout);
+    void join_mass(std::span<const shard> shards, const view_layout& layout);
     // Per KV layer, the mass_sum the step gave each page of a view, the layer's mass_heads values per page, and their
     // weight_sum; empty for a layer that measures none.
     struct layer_step_mass {

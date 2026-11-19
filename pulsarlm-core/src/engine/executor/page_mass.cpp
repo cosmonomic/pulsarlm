@@ -74,10 +74,7 @@ std::vector<executor::batch::layer_step_mass> executor::batch::view_mass(
     return by_layer;
 }
 
-void executor::batch::join_mass(
-    const std::vector<std::vector<std::size_t>>& shard_mass_heads,
-    const view_layout& layout
-) {
+void executor::batch::join_mass(std::span<const shard> shards, const view_layout& layout) {
     for (group* g : groups()) {
         if (!g->mass_by_shard.front().defined() || g->mass_by_shard.size() == 1) {
             g->mass = g->mass_by_shard.front();
@@ -105,7 +102,7 @@ void executor::batch::join_mass(
             auto pages = static_cast<std::size_t>(cu_view_pages[layer * row_size + row_size - 1]);
             for (std::size_t page = 0; page < pages; page++) {
                 for (std::size_t shard = 0; shard < in.size(); shard++) {
-                    std::size_t heads = shard_mass_heads[shard][layer];
+                    std::size_t heads = shards[shard].mass_heads[layer];
                     out = std::copy_n(in[shard], heads, out);
                     in[shard] += heads;
                 }

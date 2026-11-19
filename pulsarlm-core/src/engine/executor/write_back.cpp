@@ -52,7 +52,7 @@ task<void> executor::join(batch& b) {
             throw std::runtime_error(std::string("write_back: ") + cudaGetErrorString(status));
         }
     }
-    b.join_mass(shard_mass_heads, layout);
+    b.join_mass(shards, layout);
 }
 
 executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clock::duration step_duration) {
@@ -222,8 +222,8 @@ task<void> executor::write_pages_and_states(batch& b, batch_writes&& writes) {
     // The copies wait for this step only, its draft pass included, not for the step launched after it, which writes none
     // of the copied lines.
     for (std::size_t shard = 0; shard < shards.size(); shard++) {
-        at::Device device = lines[shard].front().k.device();
-        b.ends[shard].block(c10::cuda::getStreamFromExternal(copy_streams[shard], device.index()));
+        at::Device device = shards[shard].lines.front().k.device();
+        b.ends[shard].block(c10::cuda::getStreamFromExternal(shards[shard].copy_stream, device.index()));
     }
     if (!writes.spawned_writers.empty()) {
         while (store_writes.size() >= max_store_writes) {
@@ -235,7 +235,12 @@ task<void> executor::write_pages_and_states(batch& b, batch_writes&& writes) {
         }
         // kv_cache::sync holds the lines before the write-back below releases the ones that left a view.
         event_loop::current()->spawn(async_write_back(
-            cache.sync(writes.spawned_hashes, writes.spawned_owners, writes.spawned_lines, copy_streams),
+            cache.sync(
+                writes.spawned_hashes,
+                writes.spawned_owners,
+                writes.spawned_lines,
+                streams_of(&shard::copy_stream)
+            ),
             std::move(writes.spawned_writers)
         ));
     }
@@ -246,8 +251,12 @@ task<void> executor::write_pages_and_states(batch& b, batch_writes&& writes) {
             seq->exit(sequence::exit_reason::oom);
         }
     }
-    std::expected<void, page_error>
-        sync_result = co_await cache.sync(writes.new_hashes, writes.new_owners, writes.new_lines, copy_streams);
+    std::expected<void, page_error> sync_result = co_await cache.sync(
+        writes.new_hashes,
+        writes.new_owners,
+        writes.new_lines,
+        streams_of(&shard::copy_stream)
+    );
     if (!sync_result) {
         for (sequence* seq : writes.page_writers) {
             seq->exit(sequence::exit_reason::oom);
@@ -328,7 +337,7 @@ task<void> executor::refresh_views(batch& b) {
                 record_device_memory(seq);
             }
             if (first_stale_page) {
-                seq.upload_table(*first_stale_page, streams);
+                seq.upload_table(*first_stale_page, streams_of(&shard::compute_stream));
             }
         }
     }
@@ -405,8 +414,8 @@ void executor::update_views(sequence& seq) {
 }
 
 task<void> executor::synchronize_shards() {
-    for (cudaStream_t stream : streams) {
-        co_await synchronize(stream);
+    for (const shard& s : shards) {
+        co_await synchronize(s.compute_stream);
     }
 }
 
