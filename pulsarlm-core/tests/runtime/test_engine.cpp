@@ -262,7 +262,7 @@ TEST_CASE("an engine that prefills no token per step is rejected") {
     );
 }
 
-TEST_CASE("an engine whose drafts of one sequence exceed a step's sampled rows is rejected") {
+TEST_CASE("an engine whose drafts of one request exceed a step's samples is rejected") {
     pulsarlm::engine_config drafting = config(16);
     drafting.draft_tokens = 4096;
     REQUIRE_THROWS_AS(
@@ -271,7 +271,7 @@ TEST_CASE("an engine whose drafts of one sequence exceed a step's sampled rows i
     );
 }
 
-TEST_CASE("an engine whose verify step of one sequence exceeds a page is rejected") {
+TEST_CASE("an engine whose verify step of one request exceeds a page is rejected") {
     pulsarlm::engine_config drafting = config(16);
     drafting.draft_tokens = drafting.page_size;
     REQUIRE_THROWS_AS(

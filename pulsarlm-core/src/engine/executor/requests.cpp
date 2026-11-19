@@ -28,23 +28,23 @@ bool lists_page_twice(const layer_sequence& layer) {
     return !std::ranges::all_of(layer.pages, [&](const active_page& page) { return hashes.insert(page.hash).second; });
 }
 
-request_statistics statistics_of(const sequence& seq) {
+request_statistics statistics_of(const request_state& req) {
     return request_statistics{
-        .total_token_count = seq.prompt_token_count() + seq.delivered_token_count(),
-        .cached_token_count = seq.cached_token_count(),
-        .device_cached_token_count = seq.device_cached_token_count(),
-        .peak_device_memory = seq.device_memory_peak(),
-        .drafted_token_count = seq.drafted_token_count(),
-        .accepted_draft_count = seq.accepted_draft_count(),
-        .step_duration = seq.step_duration(),
+        .total_token_count = req.prompt_token_count() + req.delivered_token_count(),
+        .cached_token_count = req.cached_token_count(),
+        .device_cached_token_count = req.device_cached_token_count(),
+        .peak_device_memory = req.device_memory_peak(),
+        .drafted_token_count = req.drafted_token_count(),
+        .accepted_draft_count = req.accepted_draft_count(),
+        .step_duration = req.step_duration(),
     };
 }
 
 }  // namespace
 
-task<std::optional<executor::sequence_id>>
+task<std::optional<executor::request_id_type>>
 executor::start(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
-    const sequence_id id = requests.emplace(std::move(callbacks));
+    const request_id_type id = requests.emplace(std::move(callbacks));
     running_request& running = requests[id];
     if (running.callbacks->cancelled()) {
         end_request(id, std::unexpected(request_error::cancelled), request_statistics{});
@@ -89,7 +89,7 @@ executor::start(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
     for (const shard& s : shards) {
         devices.push_back(s.lines.front().k.device());
     }
-    sequence& seq = running.state.emplace(
+    request_state& req = running.state.emplace(
         std::move(r),
         std::move(initial_state),
         lease_id,
@@ -99,11 +99,11 @@ executor::start(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
         std::span<const at::Device>(devices)
     );
     // take_lines holds the resident pages before it first suspends, so they are the ones counted here.
-    seq.record_device_cached_tokens(device_cached_tokens(seq));
-    std::expected<void, page_error> line_allocation = co_await take_lines(seq, seq.cycle_lines());
+    req.record_device_cached_tokens(device_cached_tokens(req));
+    std::expected<void, page_error> line_allocation = co_await take_lines(req, req.cycle_lines());
     if (!line_allocation) {
-        release_lines(seq);
-        store.release(seq.lease_id());
+        release_lines(req);
+        store.release(req.lease_id());
         end_request(
             id,
             std::unexpected(
@@ -113,13 +113,13 @@ executor::start(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
         );
         co_return std::nullopt;
     }
-    if (seq.history_page_count() > stored_pages && !co_await own_pages_from(seq, stored_pages)) {
-        release_lines(seq);
-        store.release(seq.lease_id());
+    if (req.history_page_count() > stored_pages && !co_await own_pages_from(req, stored_pages)) {
+        release_lines(req);
+        store.release(req.lease_id());
         end_request(id, std::unexpected(request_error::oom), request_statistics{});
         co_return std::nullopt;
     }
-    seq.upload_table(0, streams_of(&shard::compute_stream));
+    req.upload_table(0, streams_of(&shard::compute_stream));
     co_return id;
 }
 
@@ -133,7 +133,7 @@ void executor::deliver_end(
 }
 
 void executor::end_request(
-    sequence_id id,
+    request_id_type id,
     std::expected<std::shared_ptr<const state>, request_error>&& result,
     const request_statistics& statistics
 ) noexcept {
@@ -208,17 +208,17 @@ std::shared_ptr<const state> executor::extend_with_hot_pages(
     return std::make_shared<const state>(std::move(extended));
 }
 
-task<std::expected<void, page_error>> executor::own_pages_from(sequence& seq, std::size_t first_index) {
+task<std::expected<void, page_error>> executor::own_pages_from(request_state& req, std::size_t first_index) {
     std::size_t n_layers = cache.layer_count();
     std::vector<std::vector<digest>> hashes(n_layers);
     std::vector<std::vector<state::lease_id_type>> owners(n_layers);
     std::vector<std::vector<std::uint32_t>> line_ids(n_layers);
     for (std::size_t layer = 0; layer < n_layers; layer++) {
-        const layer_view& view = seq.views()[layer];
+        const layer_view& view = req.views()[layer];
         for (std::size_t page = 0; page < view.pages.size(); page++) {
             if (view.indices[page] >= first_index) {
                 hashes[layer].push_back(view.pages[page]);
-                owners[layer].push_back(seq.lease_id());
+                owners[layer].push_back(req.lease_id());
                 line_ids[layer].push_back(view.lines[page]);
             }
         }
@@ -226,36 +226,36 @@ task<std::expected<void, page_error>> executor::own_pages_from(sequence& seq, st
     co_return co_await cache.sync(hashes, owners, line_ids, streams_of(&shard::compute_stream));
 }
 
-task<void> executor::stop(sequence_id id) {
-    sequence& seq = sequence_of(id);
-    assert(seq.has_exited() && seq.launched_step_count() == 0);
-    release_lines(seq);
+task<void> executor::stop(request_id_type id) {
+    request_state& req = state_of(id);
+    assert(req.has_exited() && req.launched_step_count() == 0);
+    release_lines(req);
     std::expected<std::shared_ptr<const state>, request_error> result = std::unexpected(request_error::cancelled);
-    switch (*seq.reason_of_exit()) {
-    case sequence::exit_reason::finished: {
-        auto end_state = std::make_shared<const state>(seq.to_state());
-        co_await store.write_state(seq.lease_id(), std::shared_ptr<const state>(end_state));
+    switch (*req.reason_of_exit()) {
+    case request_state::exit_reason::finished: {
+        auto end_state = std::make_shared<const state>(req.to_state());
+        co_await store.write_state(req.lease_id(), std::shared_ptr<const state>(end_state));
         result = std::move(end_state);
         break;
     }
-    case sequence::exit_reason::cancelled:
+    case request_state::exit_reason::cancelled:
         result = std::unexpected(request_error::cancelled);
         break;
-    case sequence::exit_reason::oom:
+    case request_state::exit_reason::oom:
         result = std::unexpected(request_error::oom);
         break;
     }
-    store.release(seq.lease_id());
-    end_request(id, std::move(result), statistics_of(seq));
+    store.release(req.lease_id());
+    end_request(id, std::move(result), statistics_of(req));
 }
 
-std::size_t executor::device_cached_tokens(const sequence& seq) const {
-    std::vector<bool> page_fetched(seq.history_page_count(), false);
+std::size_t executor::device_cached_tokens(const request_state& req) const {
+    std::vector<bool> page_fetched(req.history_page_count(), false);
     for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
-        const layer_view& view = seq.views()[layer];
+        const layer_view& view = req.views()[layer];
         if (layout.layers[layer].is_recurrent) {
-            if (seq.head_digest() && !cache.contains(layer, *seq.head_digest())) {
-                page_fetched[seq.history_page_count() - 1] = true;
+            if (req.head_digest() && !cache.contains(layer, *req.head_digest())) {
+                page_fetched[req.history_page_count() - 1] = true;
             }
             continue;
         }
@@ -265,17 +265,17 @@ std::size_t executor::device_cached_tokens(const sequence& seq) const {
             }
         }
     }
-    return (seq.history_page_count() - static_cast<std::size_t>(std::ranges::count(page_fetched, true))) *
+    return (req.history_page_count() - static_cast<std::size_t>(std::ranges::count(page_fetched, true))) *
         layout.page_size;
 }
 
-task<std::expected<void, page_error>> executor::take_lines(sequence& seq, std::size_t line_count) {
+task<std::expected<void, page_error>> executor::take_lines(request_state& req, std::size_t line_count) {
     std::vector<std::span<const digest>> held_hashes(cache.layer_count());
     for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
         if (!layout.layers[layer].is_recurrent) {
-            held_hashes[layer] = seq.views()[layer].pages;
-        } else if (seq.head_digest()) {
-            held_hashes[layer] = std::span(&*seq.head_digest(), 1);
+            held_hashes[layer] = req.views()[layer].pages;
+        } else if (req.head_digest()) {
+            held_hashes[layer] = std::span(&*req.head_digest(), 1);
         }
     }
     // A get failing with miss releases the lines it held_hashes while it fetched.
@@ -320,7 +320,7 @@ task<std::expected<void, page_error>> executor::take_lines(sequence& seq, std::s
         std::span<const std::uint32_t> allocated = (*allocation)[layer];
         if (layout.layers[layer].is_recurrent) {
             const std::size_t first_slots = layout.layers[layer].state_slots - 1;
-            seq.add_lines(layer, allocated.first(first_slots));
+            req.add_lines(layer, allocated.first(first_slots));
             allocated = allocated.subspan(first_slots);
             if (states[layer].empty()) {
                 for (std::size_t shard = 0; shard < shards.size(); shard++) {
@@ -332,15 +332,15 @@ task<std::expected<void, page_error>> executor::take_lines(sequence& seq, std::s
                     );
                     shards[shard].lines[layer].k.select(0, allocated.front()).zero_();
                 }
-                seq.add_lines(layer, allocated.first(1));
+                req.add_lines(layer, allocated.first(1));
                 allocated = allocated.subspan(1);
             } else {
-                seq.add_lines(layer, states[layer]);
+                req.add_lines(layer, states[layer]);
             }
         } else {
-            seq.add_lines(layer, (*page_lines)[layer]);
+            req.add_lines(layer, (*page_lines)[layer]);
         }
-        seq.add_lines(layer, allocated);
+        req.add_lines(layer, allocated);
     }
     // The copies of the states at head read the fetched lines.
     co_await synchronize_shards();
@@ -349,24 +349,24 @@ task<std::expected<void, page_error>> executor::take_lines(sequence& seq, std::s
             cache.release(layer, (*page_lines)[layer]);
         }
     }
-    record_device_memory(seq);
+    record_device_memory(req);
     co_return std::expected<void, page_error>{};
 }
 
-std::size_t executor::device_memory(const sequence& seq) const noexcept {
+std::size_t executor::device_memory(const request_state& req) const noexcept {
     std::size_t bytes = 0;
     for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
-        bytes += seq.views()[layer].lines.size() * cache.line_block_bytes(layer);
+        bytes += req.views()[layer].lines.size() * cache.line_block_bytes(layer);
     }
     return bytes;
 }
 
-void executor::record_device_memory(sequence& seq) const noexcept {
-    seq.record_device_memory(device_memory(seq));
+void executor::record_device_memory(request_state& req) const noexcept {
+    req.record_device_memory(device_memory(req));
 }
 
-void executor::release_lines(sequence& seq) noexcept {
-    const std::vector<std::vector<std::uint32_t>> taken_lines = seq.take_lines();
+void executor::release_lines(request_state& req) noexcept {
+    const std::vector<std::vector<std::uint32_t>> taken_lines = req.take_lines();
     for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
         cache.release(layer, taken_lines[layer]);
     }

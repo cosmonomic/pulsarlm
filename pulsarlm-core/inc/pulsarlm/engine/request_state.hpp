@@ -22,7 +22,7 @@
 
 namespace pulsarlm {
 
-// What a sequence needs to know about each KV layer of its executor.
+// What a request state needs to know about each KV layer of its executor.
 struct view_layout {
     struct layer {
         bool is_recurrent;
@@ -35,7 +35,7 @@ struct view_layout {
     std::size_t page_size;
 };
 
-// One KV layer's view of a sequence. A layer with pages has one line per view page: its full pages, each with its index
+// One KV layer's view of a request. A layer with pages has one line per view page: its full pages, each with its index
 // in the history, then the pages of tail and pending. A layer that measures mass keeps, per line, mass_heads mass_sum
 // values and one weight_sum (add_step_mass), as of the last step that measured them, 0 for a page never measured, and
 // the moments of the pages it sampled (add_sampled_page). A recurrent layer has no pages: its lines are its state
@@ -59,7 +59,7 @@ class layer_view {
 // A request being served. Its tokens move from pending to tail as steps forward them, and the pages the tail fills
 // join every layer's view, the last of them head. A step moves its tokens to tail when it is launched, and its
 // write-back completes the pages they fill; a token it samples is awaited_token until the step is written back.
-class sequence {
+class request_state {
   public:
     enum class exit_reason { finished, cancelled, oom };
     static constexpr std::int64_t awaited_token = -1;
@@ -93,16 +93,16 @@ class sequence {
     std::vector<std::size_t> held_pages;
     // Whether the recurrent layers' head_state_line hold the state at head, which the store does not have yet.
     bool state_pending = false;
-    // The writes of the sequence's pages to the store not waited for; shared with the tasks writing them.
+    // The writes of the request's pages to the store not waited for; shared with the tasks writing them.
     std::shared_ptr<pending_writes> page_writes = std::make_shared<pending_writes>();
     // Per shard, int32 [n_kv_layers, capacity] on its device: each view page's line, and the RoPE position of its
     // first key. Columns past those of a layer's lines are unused.
     std::vector<at::Tensor> tables;
     std::vector<at::Tensor> position_tables;
     std::optional<exit_reason> end_reason;
-    // The launched steps the sequence is in that are not written back yet.
+    // The launched steps the request is in that are not written back yet.
     std::size_t steps_in_flight = 0;
-    // Whether a launched step forwards the sequence's last tokens: it samples the last token max_tokens allows, or it
+    // Whether a launched step forwards the request's last tokens: it samples the last token max_tokens allows, or it
     // forwards the last pending tokens and does not sample.
     bool last_step_launched = false;
     // While a pending token is awaited_token: the row of its step's sampled tokens that holds it.
@@ -121,7 +121,7 @@ class sequence {
     // the resumed state, so that forwarding its tail again never reaches a cycle end that state already passed.
     std::size_t next_cycle_end = 0;
     // The history position up to which the layers' mass_sum and weight_sum hold the queries' mass.
-    std::size_t measured_end = 0;
+    std::size_t mass_end_position = 0;
     // The request's tokens.
     std::size_t prompt_count = 0;
     // The tokens of the resumed state's full pages, and of those every layer reading them had resident at the start.
@@ -156,8 +156,8 @@ class sequence {
 
   public:
     // Resumes initial_state, the newest stored state reaching a prefix of r's tokens, leased by lease_id.
-    // digests are the digests of the full pages of r's tokens, chained from root. layout outlives the sequence.
-    sequence(
+    // digests are the digests of the full pages of r's tokens, chained from root. layout outlives the request state.
+    request_state(
         request&& r,
         std::shared_ptr<const state>&& initial_state,
         state::lease_id_type lease_id,
@@ -216,16 +216,16 @@ class sequence {
     std::size_t next_position() const noexcept;
     // The full pages of KV layer layer's view wholly before the window of a query at view index query.
     std::size_t passed_pages(std::size_t layer, std::size_t query) const noexcept;
-    // The state the sequence reached: per KV layer, its view's full pages within the window of the next token.
+    // The state the request reached: per KV layer, its view's full pages within the window of the next token.
     state to_state() const;
     bool may_sample() const noexcept;
     // The tokens of the history up to the next token: its full pages, then tail.
     std::size_t history_position() const noexcept;
     // The history position from which the cycle's queries add mass: the cycle's last mass_tokens tokens, less those
     // the masses already hold.
-    std::size_t measured_start() const noexcept;
+    std::size_t mass_start_position() const noexcept;
     // The weight of the queries of weights.size() tokens from history position first (query_weights), 0 for those
-    // before measured_start.
+    // before mass_start_position.
     void fill_query_weights(std::size_t first, std::span<float> weights) const noexcept;
     // Whether forwarding token_count more tokens ends the eviction cycle.
     bool ends_cycle(std::size_t token_count) const noexcept;
@@ -236,7 +236,7 @@ class sequence {
     // One line per page the cycle's tokens fill, in each KV layer with pages. Called at the start of a cycle, with an
     // empty tail.
     std::size_t cycle_lines() const noexcept;
-    // Per KV layer, the lines the sequence lacks to forward every token left in its cycle.
+    // Per KV layer, the lines the request lacks to forward every token left in its cycle.
     std::vector<std::size_t> missing_lines() const;
     // The view indices of the full pages a cycle's end evicts from KV layer layer, which measures mass, ascending.
     std::vector<std::size_t> pages_to_evict(std::size_t layer) const;
@@ -261,7 +261,7 @@ class sequence {
     // sets the awaited token after them to the last.
     void
     apply_accepted_tokens(std::size_t start, std::span<const std::int64_t> accepted_tokens, std::size_t verified_count);
-    // One launched step of the sequence was written back.
+    // One launched step of the request was written back.
     void finish_step() noexcept;
     // Adds a step written back, which took duration from its launch to its write-back, to the prefill's steps until
     // end_prefill and to the summed duration.

@@ -221,7 +221,7 @@ std::unique_ptr<step_graphs::captured_forward> step_graphs::capture_verify(std::
 
 // A capture cannot create what the forward creates at its first run, such as cuBLAS handles and RoPE tables, so an eager
 // forward of each kind runs first, and an eager draft pass of each kind before the verify steps. Their tables point
-// every view at line 0, which is zeroed first so that the forward reads no uninitialized memory; no sequence holds a
+// every view at line 0, which is zeroed first so that the forward reads no uninitialized memory; no request holds a
 // line yet.
 void step_graphs::capture_startup() {
     for (const kv& layer : lines) {

@@ -123,14 +123,14 @@ void executor::batch::add_measured_mass(
     const view_layout& layout
 ) const {
     const entry& e = g.entries[position];
-    sequence& seq = *e.seq;
+    request_state& req = *e.req;
     const std::size_t n_layers = layout.layers.size();
     std::vector<layer_step_mass> step_mass;
     std::vector<std::vector<float>> verified_mass(n_layers);
     std::vector<std::vector<float>> verified_weight(n_layers);
     if (&g == &verify_group) {
         std::vector<float> weights(accepted_count);
-        seq.fill_query_weights(e.start_position, weights);
+        req.fill_query_weights(e.start_position, weights);
         step_mass.resize(n_layers);
         for (std::size_t row = 0; row < accepted_count; row++) {
             std::vector<layer_step_mass> row_mass = view_mass(g.inputs, g.mass, position * verify_rows + row, layout);
@@ -161,7 +161,7 @@ void executor::batch::add_measured_mass(
         step_mass_sums.push_back(layer_mass.mass_sum);
         step_weight_sums.push_back(layer_mass.weight_sum);
     }
-    seq.add_step_mass(step_mass_sums, step_weight_sums, e.end_position);
+    req.add_step_mass(step_mass_sums, step_weight_sums, e.end_position);
 }
 
 }  // namespace pulsarlm

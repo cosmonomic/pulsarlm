@@ -13,11 +13,11 @@ namespace pulsarlm {
 
 // model_name names the model and model_hash its files' version; with the page shapes of the whole model's KV layers
 // they make the root digest. Shard s of the model runs on devices[s], its part of the KV layers' lines sharing one pool of
-// kv_cache_pool_bytes there, which must hold a line of every KV layer. A step forwards every decoding sequence and at
-// most prefill_tokens_per_step tokens of the others. With decode_graphs and max_context_window, the decoding sequences'
+// kv_cache_pool_bytes there, which must hold a line of every KV layer. A step forwards every decoding request and at
+// most prefill_tokens_per_step tokens of the others. With decode_graphs and max_context_window, the decoding requests'
 // forward is replayed from CUDA graphs (step_graphs.hpp) over page tables wide enough for a view of
 // max_context_window tokens, the requests' eviction_policy::max_context_window; a step with a wider view runs without a
-// graph. A step drafts up to draft_tokens tokens per sequence with the model's drafter (model::drafter), which it needs
+// graph. A step drafts up to draft_tokens tokens per request with the model's drafter (model::drafter), which it needs
 // when draft_tokens is above 0.
 struct engine_config {
     std::string model_name;

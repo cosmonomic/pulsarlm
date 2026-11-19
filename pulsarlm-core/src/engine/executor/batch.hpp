@@ -35,16 +35,16 @@ at::Tensor zero_page_mass(
     const std::vector<std::size_t>& mass_heads
 );
 
-// The tokens each running sequence forwards in one step, the model inputs for them, and the tokens sampled from the
+// The tokens each running request forwards in one step, the model inputs for them, and the tokens sampled from the
 // step's logits.
 class executor::batch {
-    // One sequence's part of the batch, as recorded at its launch.
+    // One request's part of the batch, as recorded at its launch.
     struct entry {
-        sequence_ref seq;
+        request_ref req;
         std::size_t token_count;
         bool is_sampling;
         bool ends_cycle;
-        bool ends_sequence = false;
+        bool ends_request = false;
         bool is_measured = false;
         bool stores_head_state = false;
         std::size_t start_position = 0;
@@ -53,8 +53,8 @@ class executor::batch {
         std::size_t first_sample_row = 0;
         std::optional<std::size_t> prior_row;
 
-        // The sequence's rows in the draft pass. logit_row is the row that drafts, before a verify entry's accepted
-        // count - 1 is added, and key_count the sequence's keys after its rows in the draft head's KV layer.
+        // The request's rows in the draft pass. logit_row is the row that drafts, before a verify entry's accepted
+        // count - 1 is added, and key_count the request's keys after its rows in the draft head's KV layer.
         struct draft_rows {
             std::size_t row_count;
             std::size_t logit_row;
@@ -63,11 +63,11 @@ class executor::batch {
         };
         std::optional<draft_rows> draft;
 
-        // Of a verify entry, the most tokens it may accept (max_tokens), and its sequence's measured_start.
+        // Of a verify entry, the most tokens it may accept (max_tokens), and its request's mass_start_position.
         std::size_t max_accepted_token_count = 0;
-        std::size_t measured_start = 0;
-        // Of a verify entry whose sequence's previous step is launched and not written back, its position among
-        // that step's verify entries and among its drafting sequences: its tokens are that step's next tokens, and its
+        std::size_t mass_start_position = 0;
+        // Of a verify entry whose request's previous step is launched and not written back, its position among
+        // that step's verify entries and among its drafting requests: its tokens are that step's next tokens, and its
         // positions lie that step's accepted count - 1 after those its inputs hold.
         std::optional<std::size_t> previous_verify_row;
         std::optional<std::size_t> previous_drafting_row;
@@ -90,7 +90,7 @@ class executor::batch {
         std::vector<at::Tensor> hidden_by_shard;
     };
 
-    // Each decode entry forwards its sequence's only pending token, a verify entry with its drafts after it.
+    // Each decode entry forwards its request's only pending token, a verify entry with its drafts after it.
     group decode_group{.inputs = {.kind = model::batch_kind::decode}};
     group verify_group{.inputs = {.kind = model::batch_kind::verify}};
     group prefill_group{.inputs = {.kind = model::batch_kind::prefill}};
@@ -121,11 +121,11 @@ class executor::batch {
     // row, its token, -(r + 1) for the step's sampled row r, its RoPE position, and its hidden row (draft_head::draft)
     // as an index into a zeros row, then the prior hidden rows, then the hidden rows of the decode, verify and prefill
     // groups. A verify entry's rows are the verify_rows positions after its pending token's, the row after its accepted
-    // tokens drafting: its first row's index plus its accepted count - 1. Another sequence drafts from its last row.
+    // tokens drafting: its first row's index plus its accepted count - 1. Another request drafts from its last row.
     std::vector<std::int64_t> draft_tokens;
     std::vector<std::int64_t> draft_positions;
     std::vector<std::int64_t> draft_sources;
-    // Per draft after the first, the RoPE position and key count of each sequence that drafts, in entry order, before a
+    // Per draft after the first, the RoPE position and key count of each request that drafts, in entry order, before a
     // verify entry's accepted count is added.
     std::vector<std::vector<std::int64_t>> later_positions;
     std::vector<std::vector<std::int32_t>> later_key_counts;
@@ -133,14 +133,14 @@ class executor::batch {
     const batch* previous_batch = nullptr;
     // Per shard, the verify group's tokens on its device.
     std::vector<at::Tensor> verify_tokens;
-    // Per shard, each verify entry's accepted tokens (int64 [verify entries]), and each drafting sequence's next token
+    // Per shard, each verify entry's accepted tokens (int64 [verify entries]), and each drafting request's next token
     // then its drafts (int64 [drafting, verify_rows]); shard 0's copies to the host.
     std::vector<at::Tensor> accepted_token_counts_by_shard;
     std::vector<at::Tensor> shard_next_tokens;
     at::Tensor accepted_token_counts;
     at::Tensor next_tokens;
 
-    // scheduled with their sequences found in owner, each recorded with whether it samples after its tokens and
+    // scheduled with their requests found in owner, each recorded with whether it samples after its tokens and
     // whether they end its eviction cycle. With owner's graph_pages, a decode or verify group whose tables fit
     // graph_pages pages takes tables that wide and replays a graph.
     batch(executor& owner, std::span<const scheduled_request> scheduled);
@@ -148,15 +148,15 @@ class executor::batch {
     // The groups in entry order: decode, verify, prefill.
     std::array<group*, 3> groups() noexcept;
     std::array<const group*, 3> groups() const noexcept;
-    // The entries of the sequences that draft, in entry order.
+    // The entries of the requests that draft, in entry order.
     std::vector<entry> drafting_entries() const;
     // A verify group measures each row's mass apart (model::batch::cu_view_pages), its queries weighing 1 from
-    // measured_start on: the rows its write-back accepts are then weighed as one step's.
+    // mass_start_position on: the rows its write-back accepts are then weighed as one step's.
     static model::batch
     make_group(std::span<const entry> group, std::size_t page_size, std::size_t state_slots, model::batch_kind kind);
     // The tokens e forwards: its pending tokens', and its drafts.
     static std::size_t forwarded(const entry& e) noexcept;
-    // The widest table among the group's sequences.
+    // The widest table among the group's requests.
     static std::size_t table_width(std::span<const entry> group) noexcept;
     static bool measures_mass(std::span<const entry> group) noexcept;
     // Whether e forwards a query that adds mass.
@@ -197,9 +197,9 @@ class executor::batch {
         const at::Tensor& samples,
         at::Tensor& counters
     );
-    // Adds to the draft head's pass the rows of e's sequence, at launch before it advances: those of an entry of the
+    // Adds to the draft head's pass the rows of e's request, at launch before it advances: those of an entry of the
     // verify group, with verifies, its verify_rows rows, another's from its first position without one through its
-    // tokens and, with next_row, its next token, the sequence drafting draft_count tokens after them with drafts. The
+    // tokens and, with next_row, its next token, the request drafting draft_count tokens after them with drafts. The
     // entry's hidden rows start at first_hidden_row of the pass's hidden rows.
     void plan_draft_rows(
         entry& e,
@@ -221,7 +221,7 @@ class executor::batch {
         std::size_t shard,
         at::Tensor& counters
     );
-    // Of the sequences that draft, in entry order, after the draft head's first pass: each one's next token then its
+    // Of the requests that draft, in entry order, after the draft head's first pass: each one's next token then its
     // first draft, the hidden rows its second draft reads, and the shift of its later positions and key counts.
     struct first_draft {
         std::vector<at::Tensor> tokens;
@@ -268,7 +268,7 @@ class executor::batch {
     // Takes into g, the verify group on shard's device, the previous step's next tokens of the entries whose previous
     // step is launched, and moves their positions by its accepted count - 1.
     void take_previous_tokens(model::batch& g, std::size_t shard, at::Device device) const;
-    // On device, shard's, per row sampled, the tokens the previous step of a verify entry's sequence accepts, by which its
+    // On device, shard's, per row sampled, the tokens the previous step of a verify entry's request accepts, by which its
     // draw counts lag; 0 for the other rows.
     at::Tensor previous_draw_shifts(std::size_t shard, at::Device device) const;
     // On device, shard's, each verify entry's accepted count - 1 of its previous step, 0 without one, int64 [verify
@@ -285,8 +285,8 @@ class executor::batch {
     // The page mass of the view view of group from mass, laid out as join_mass leaves it.
     static std::vector<layer_step_mass>
     view_mass(const model::batch& group, const at::Tensor& mass, std::size_t view, const view_layout& layout);
-    // Adds the page mass of the entry at position of g, which measures mass and whose sequence accepted accepted_count
-    // tokens, to its sequence's layers. layout is the executor's.
+    // Adds the page mass of the entry at position of g, which measures mass and whose request accepted accepted_count
+    // tokens, to its request's layers. layout is the executor's.
     void add_measured_mass(
         const group& g,
         std::size_t position,
@@ -298,7 +298,7 @@ class executor::batch {
 };
 
 struct executor::batch_writes {
-    // The pages of the sequences reaching a state, written now with state_writers' states, and those a spawned task
+    // The pages of the requests reaching a state, written now with state_writers' states, and those a spawned task
     // writes.
     std::vector<std::vector<digest>> new_hashes;
     std::vector<std::vector<state::lease_id_type>> new_owners;
@@ -307,9 +307,9 @@ struct executor::batch_writes {
     std::vector<std::vector<state::lease_id_type>> spawned_owners;
     std::vector<std::vector<std::uint32_t>> spawned_lines;
     std::vector<std::shared_ptr<pending_writes>> spawned_writers;
-    std::vector<sequence*> page_writers;
-    std::vector<sequence*> state_reachers;
-    std::vector<sequence*> state_writers;
+    std::vector<request_state*> page_writers;
+    std::vector<request_state*> state_reachers;
+    std::vector<request_state*> state_writers;
 };
 
 }  // namespace pulsarlm

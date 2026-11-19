@@ -1171,7 +1171,7 @@ TEST_CASE("max_tokens 0 forwards the tokens and ends with their state") {
 
 // The prefill's page goes to the store in a write the write-back does not wait for. The write-back seeing its failure
 // is the first after the write ran, which depends on when the loop runs it, and at the latest the one reaching the end
-// state, which waits for the sequence's page writes; either ends the request with oom and writes no state.
+// state, which waits for the request's page writes; either ends the request with oom and writes no state.
 TEST_CASE("a page write that fails after its write-back ends the request with oom") {
     fixture f(16);
     f.store->failing_put = 1;
@@ -1239,7 +1239,7 @@ TEST_CASE("a request cancelled while a step is launched counts only the tokens i
     REQUIRE(results[0].statistics.total_token_count == prompt.size() + results[0].tokens.size());
 }
 
-// The executor owns a request that was not ended until its own destruction, and the request's sequence holds the lease.
+// The executor owns a request that was not ended until its own destruction, and the request state holds the lease.
 TEST_CASE("a request is ended and its lease released once, with the executor, when the loop stops while it runs") {
     std::shared_ptr<store_contents> store;
     auto recorded_results = std::make_shared<request_results>();
@@ -2234,15 +2234,15 @@ task<void> start_then_stop_loop(
     pulsarlm::executor& exec,
     request r,
     std::unique_ptr<pulsarlm::request_callbacks> callbacks,
-    std::optional<pulsarlm::executor::sequence_id>& started
+    std::optional<pulsarlm::executor::request_id_type>& started
 ) {
     started = co_await exec.start(std::move(r), std::move(callbacks));
     event_loop::current()->stop();
 }
 
-std::optional<pulsarlm::executor::sequence_id>
-start_sequence(pulsarlm::executor& exec, request r, const std::shared_ptr<request_results>& recorded_results) {
-    std::optional<pulsarlm::executor::sequence_id> started;
+std::optional<pulsarlm::executor::request_id_type>
+start_request(pulsarlm::executor& exec, request r, const std::shared_ptr<request_results>& recorded_results) {
+    std::optional<pulsarlm::executor::request_id_type> started;
     event_loop loop;
     loop.spawn(start_then_stop_loop(exec, std::move(r), make_callbacks(recorded_results), started));
     REQUIRE(loop.run() == nullptr);
@@ -2253,7 +2253,7 @@ TEST_CASE("a request whose callbacks are cancelled before the start ends with ca
     fixture f(16);
     auto recorded_results = std::make_shared<request_results>();
     recorded_results->cancelled = true;
-    std::optional<pulsarlm::executor::sequence_id> started = start_sequence(
+    std::optional<pulsarlm::executor::request_id_type> started = start_request(
         f.exec,
         request{.tokens = {1, 2, 3}, .max_tokens = 10},
         recorded_results
@@ -2267,14 +2267,14 @@ TEST_CASE("a request whose callbacks are cancelled before the start ends with ca
     REQUIRE(f.store->releases.empty());
 }
 
-TEST_CASE("an entry takes a row of sampled tokens when it computes its sequence's last pending token") {
+TEST_CASE("an entry takes a sample when it computes its request's last pending token") {
     fixture f(16);
-    std::optional<pulsarlm::executor::sequence_id> decoding = start_sequence(
+    std::optional<pulsarlm::executor::request_id_type> decoding = start_request(
         f.exec,
         request{.tokens = {1}, .max_tokens = 2},
         std::make_shared<request_results>()
     );
-    std::optional<pulsarlm::executor::sequence_id> prefilling = start_sequence(
+    std::optional<pulsarlm::executor::request_id_type> prefilling = start_request(
         f.exec,
         request{.tokens = {1, 2, 3}, .max_tokens = 2},
         std::make_shared<request_results>()

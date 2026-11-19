@@ -252,14 +252,14 @@ void executor::batch::take_previous_tokens(model::batch& g, std::size_t shard, a
     const auto verifying = static_cast<std::int64_t>(verify_group.entries.size());
     std::vector<std::int64_t> entries_with_previous;
     std::vector<std::int64_t> drafting_rows;
-    std::vector<std::int64_t> verify_measured_starts;
+    std::vector<std::int64_t> verify_mass_start_positions;
     for (std::size_t v = 0; v < verify_group.entries.size(); v++) {
         const entry& e = verify_group.entries[v];
         if (e.previous_drafting_row) {
             entries_with_previous.push_back(static_cast<std::int64_t>(v));
             drafting_rows.push_back(static_cast<std::int64_t>(*e.previous_drafting_row));
         }
-        verify_measured_starts.push_back(static_cast<std::int64_t>(e.measured_start));
+        verify_mass_start_positions.push_back(static_cast<std::int64_t>(e.mass_start_position));
     }
     g.tokens.view({verifying, rows})
         .index_copy_(
@@ -276,8 +276,9 @@ void executor::batch::take_previous_tokens(model::batch& g, std::size_t shard, a
     if (g.query_weights.defined()) {
         at::Tensor row_positions = at::repeat_interleave(g.history_positions, rows) +
             at::arange(rows, g.history_positions.options()).repeat({verifying});
-        at::Tensor measured_starts = at::tensor(verify_measured_starts, longs).to(device, /*non_blocking=*/true);
-        g.query_weights = row_positions.ge(at::repeat_interleave(measured_starts, rows)).to(at::kFloat);
+        at::Tensor mass_start_positions = at::tensor(verify_mass_start_positions, longs)
+                                              .to(device, /*non_blocking=*/true);
+        g.query_weights = row_positions.ge(at::repeat_interleave(mass_start_positions, rows)).to(at::kFloat);
     }
 }
 

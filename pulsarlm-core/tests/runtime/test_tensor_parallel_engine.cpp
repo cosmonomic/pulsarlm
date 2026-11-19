@@ -447,7 +447,7 @@ class recording_callbacks final : public pulsarlm::request_callbacks {
     }
 };
 
-// With decode_graphs, decoding sequences replay graphs over views of up to 1024 tokens. A step drafts draft_tokens
+// With decode_graphs, decoding requests replay graphs over views of up to 1024 tokens. A step drafts draft_tokens
 // tokens.
 pulsarlm::engine_config
 engine_config(std::size_t shard_count, bool decode_graphs = false, std::size_t draft_tokens = 0) {
@@ -778,7 +778,7 @@ TEST_CASE("decode graphs captured during a step sample as the eager forward", "[
     const run replayed = serve_all(true);
 
     for (std::size_t s = 0; s < sequence_count; s++) {
-        INFO("sequence " << s);
+        INFO("request " << s);
         REQUIRE(eager.all[s].tokens.size() == decode_tokens);
         CHECK(replayed.all[s].tokens == eager.all[s].tokens);
         check_same_state(replayed.all[s].end_state, eager.all[s].end_state);

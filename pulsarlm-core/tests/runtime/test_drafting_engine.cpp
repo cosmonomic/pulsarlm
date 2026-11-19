@@ -809,8 +809,8 @@ TEST_CASE("Qwen4-Exp drafting with top_k and top_p samples from graphs as it doe
     CHECK(captured_step_count <= 2);
 }
 
-// The four prompts fit one step's prefill, so the sequences verify in one group for most of their tokens, each row
-// sampled by its own sequence's parameters and seed. With top_k and top_p every sequence that draws filters, as a row's
+// The four prompts fit one step's prefill, so the requests verify in one group for most of their tokens, each row
+// sampled by its own request's parameters and seed. With top_k and top_p every request that draws filters, as a row's
 // draw depends on whether a row of its batch filters (sampling_inputs::filters).
 TEST_CASE(
     "Qwen4-Exp drafting samples each sequence of a group by its own parameters with graphs as without",
@@ -856,7 +856,7 @@ TEST_CASE(
     std::vector<served> got = serve_all(*replayed.engine, requests());
 
     for (std::size_t s = 0; s < sampling.size(); s++) {
-        INFO("sequence " << s);
+        INFO("request " << s);
         REQUIRE(expected[s].tokens.size() == decode_tokens);
         CHECK(got[s].tokens == expected[s].tokens);
         check_same_state(got[s].end_state, expected[s].end_state);

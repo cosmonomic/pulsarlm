@@ -22,26 +22,26 @@
 #include "pulsarlm/engine/pending_writes.hpp"
 #include "pulsarlm/engine/request.hpp"
 #include "pulsarlm/engine/request_callbacks.hpp"
-#include "pulsarlm/engine/sequence.hpp"
+#include "pulsarlm/engine/request_state.hpp"
 #include "pulsarlm/engine/step_graphs.hpp"
 #include "pulsarlm/slot_map.hpp"
 
 namespace pulsarlm {
 
-// Runs sequences on the model: it owns the model shards, the KV cache and the store's side of a request, and does
+// Runs requests on the model: it owns the model shards, the KV cache and the store's side of a request, and does
 // whatever touches them, while the scheduler decides what runs.
 class executor {
-    // A request the executor runs: its callbacks, and its sequence once the stored state was read.
+    // A request the executor runs: its callbacks, and its request state once the stored state was read.
     struct running_request {
         std::unique_ptr<request_callbacks> callbacks;
-        std::optional<sequence> state;
+        std::optional<request_state> state;
     };
 
   public:
-    using sequence_id = slot_map<running_request>::key_type;
+    using request_id_type = slot_map<running_request>::key_type;
     // A request that the scheduler puts into a step, and how many of its pending tokens the step computes.
     struct scheduled_request {
-        sequence_id request_id;
+        request_id_type request_id;
         std::size_t token_count;
     };
 
@@ -49,17 +49,17 @@ class executor {
     class batch;
     struct batch_writes;
 
-    // Names a sequence of an executor without owning it. The sequence's request is not erased at an access.
-    class sequence_ref {
+    // Names a request state of an executor without owning it. The request state's request is not erased at an access.
+    class request_ref {
         executor* owner;
-        sequence_id id;
+        request_id_type id;
 
       public:
-        sequence_ref(executor& owner, sequence_id id) noexcept;
-        sequence& operator*() const;
-        sequence* operator->() const;
-        sequence_id key() const noexcept;
-        bool operator==(const sequence_ref& other) const noexcept = default;
+        request_ref(executor& owner, request_id_type id) noexcept;
+        request_state& operator*() const;
+        request_state* operator->() const;
+        request_id_type key() const noexcept;
+        bool operator==(const request_ref& other) const noexcept = default;
     };
 
     // Each request from start until its end.
@@ -121,37 +121,37 @@ class executor {
     // The most rows of sampled tokens a batch has.
     std::size_t sampled_row_capacity;
 
-    // The tokens of seq's full history pages that every KV layer reading the page holds resident.
-    std::size_t device_cached_tokens(const sequence& seq) const;
+    // The tokens of req's full history pages that every KV layer reading the page holds resident.
+    std::size_t device_cached_tokens(const request_state& req) const;
     // Per KV layer with pages, lines for its pages, then line_count empty lines; per recurrent layer, a copy of the
     // state at head, or zeros without head, and two empty lines. Holds nothing on failure.
-    task<std::expected<void, page_error>> take_lines(sequence& seq, std::size_t line_count);
+    task<std::expected<void, page_error>> take_lines(request_state& req, std::size_t line_count);
     // s, the state the store returned for r, extended by the full pages of r's tokens after its head that every layer
     // with pages caches, up to its cycle's mass window and leaving a token to forward: no query between them adds mass,
     // so it is the state the request reaches there. s itself when it ends inside the window or the model has recurrent
     // layers. digests are the digests of r's full pages.
     std::shared_ptr<const state>
     extend_with_hot_pages(std::shared_ptr<const state>&& s, const request& r, std::span<const digest> digests) const;
-    // Makes the store keep, for seq's lease, the pages its views hold from history index first_index on, which the
+    // Makes the store keep, for req's lease, the pages its views hold from history index first_index on, which the
     // state the store returned does not reference.
-    task<std::expected<void, page_error>> own_pages_from(sequence& seq, std::size_t first_index);
-    void release_lines(sequence& seq) noexcept;
+    task<std::expected<void, page_error>> own_pages_from(request_state& req, std::size_t first_index);
+    void release_lines(request_state& req) noexcept;
     // Captures each shard's graphs of up to step_graphs::startup_sequences sequences, every shard at once.
     void capture_step_graphs();
-    // The bytes of each device's pool that seq's lines take now.
-    std::size_t device_memory(const sequence& seq) const noexcept;
-    // Raises seq's device_memory_peak to its device_memory.
-    void record_device_memory(sequence& seq) const noexcept;
+    // The bytes of each device's pool that req's lines take now.
+    std::size_t device_memory(const request_state& req) const noexcept;
+    // Raises req's device_memory_peak to its device_memory.
+    void record_device_memory(request_state& req) const noexcept;
     // Drops from each sliding layer's view the pages before the window of the tail's first token, and returns whether
     // any view changed.
-    bool release_passed_pages(sequence& seq);
-    // After seq's views changed: drops from each mirroring layer the pages no other layer holds.
-    void update_views(sequence& seq);
-    // Whether token_count more tokens fill a page of seq.
-    bool completes_page(const sequence& seq, std::size_t token_count) const noexcept;
-    // The sequence of id's request, which is not erased and whose stored state start has read.
-    sequence& sequence_of(sequence_id id);
-    const sequence& sequence_of(sequence_id id) const;
+    bool release_passed_pages(request_state& req);
+    // After req's views changed: drops from each mirroring layer the pages no other layer holds.
+    void update_views(request_state& req);
+    // Whether token_count more tokens fill a page of req.
+    bool completes_page(const request_state& req, std::size_t token_count) const noexcept;
+    // The request state of id's request, which is not erased and whose stored state start has read.
+    request_state& state_of(request_id_type id);
+    const request_state& state_of(request_id_type id) const;
     // Calls on_end of running's callbacks with result and statistics and destroys the callbacks.
     void deliver_end(
         running_request& running,
@@ -160,16 +160,16 @@ class executor {
     ) noexcept;
     // Delivers result and statistics to id's request (deliver_end), then erases it.
     void end_request(
-        sequence_id id,
+        request_id_type id,
         std::expected<std::shared_ptr<const state>, request_error>&& result,
         const request_statistics& statistics
     ) noexcept;
-    // Moves each entry's tokens to its sequence's tail (sequence::launch_step, sequence::launch_verify_step), switches
-    // the boundary lines of the sequences whose pages it fills, and appends each token the step samples to pending as
+    // Moves each entry's tokens to its request's tail (request_state::launch_step, request_state::launch_verify_step), switches
+    // the boundary lines of the requests whose pages it fills, and appends each token the step samples to pending as
     // awaited_token.
     void advance(batch& b);
     task<void> enqueue_on_shard(batch& b, std::size_t shard);
-    // Points b's verify entries whose sequences' previous step is launched to that step, of which each such sequence
+    // Points b's verify entries whose requests' previous step is launched to that step, of which each such request
     // is a verify entry and a drafting entry.
     void link_previous(batch& b) const;
     // Whether a step of the requests in scheduled ends no cycle and, in a model with sliding layers, completes no page, or in an executor
@@ -177,7 +177,7 @@ class executor {
     // next step reads, and copies to the store only lines the next step does not write.
     bool entries_allow_overlap(std::span<const scheduled_request> scheduled) const;
     // Whether launch can launch a step of the requests in scheduled now, the limit sampled_row_limit() aside: scheduled is not empty and
-    // names no sequence twice, each token count is above 0 and at most the sequence's pending tokens, each sequence is
+    // names no request twice, each token count is above 0 and at most the request's pending tokens, each request is
     // steppable (is_steppable), fewer than two steps are launched, and no step is launched or allows_overlap(scheduled).
     bool is_launchable(std::span<const scheduled_request> scheduled) const;
 
@@ -194,18 +194,18 @@ class executor {
         std::vector<std::shared_ptr<pending_writes>> writers
     );
     task<void> synchronize_shards();
-    // Evicts at the end of seq's cycle and returns whether a view changed.
-    bool evict(sequence& seq);
-    // Writes the state seq reached to the store and passes it to callbacks, those of seq's request.
-    task<void> write_cycle_end(sequence& seq, request_callbacks& callbacks);
+    // Evicts at the end of req's cycle and returns whether a view changed.
+    bool evict(request_state& req);
+    // Writes the state req reached to the store and passes it to callbacks, those of req's request.
+    task<void> write_cycle_end(request_state& req, request_callbacks& callbacks);
 
   public:
     // models[s] runs on cache shard s with streams[s], for s above 0 on worker_loops[s - 1], and its write-backs' copies
     // to the store on copy_streams[s], which the caller synchronizes before freeing what the copies read; the cache holds one layer
     // per entry of each model's kv_layers(), and the shards agree on which layers are recurrent or sliding. store is the
-    // cache's. root is the engine's root digest (make_root_digest). With graph_pages, a decode group whose sequences'
+    // cache's. root is the engine's root digest (make_root_digest). With graph_pages, a decode group whose requests'
     // tables fit graph_pages pages replays a step_graphs graph over tables that wide, and so does a verify group. A step drafts
-    // draft_tokens tokens per sequence with the shards' draft heads, which they have when draft_tokens is above 0, and
+    // draft_tokens tokens per request with the shards' draft heads, which they have when draft_tokens is above 0, and
     // the cache's recurrent layers are laid out for them (recurrent_state).
     executor(
         std::vector<model*>&& models,
@@ -222,14 +222,14 @@ class executor {
     );
     ~executor();
 
-    // Serves r with callbacks, which it takes before it first suspends. Returns the sequence of r, resuming the newest
+    // Serves r with callbacks, which it takes before it first suspends. Returns the request id of r, resuming the newest
     // state the store holds for a prefix of its tokens, with lines for its first cycle. Returns std::nullopt after it
     // ended the request through on_end, with value-initialized statistics: with cancelled when the callbacks are
     // cancelled at the start, before the store is read, with missing_state when the lookup or a page read fails, with
     // invalid_state when the stored state's head is not a digest of r's full pages, its tail is not a proper prefix
     // of r's tokens after its head, or one of its layers lists a page hash twice, and with oom when the free lines do
     // not cover the state's pages and one cycle's tokens. The lease of a request that fails is released before on_end.
-    task<std::optional<sequence_id>> start(request&& r, std::unique_ptr<request_callbacks>&& callbacks);
+    task<std::optional<request_id_type>> start(request&& r, std::unique_ptr<request_callbacks>&& callbacks);
     // Whether a step of the requests in scheduled can be launched now, before any write-back: no step is launched or the last launched
     // step allows overlap, and so does a step of the requests in scheduled. A step allows overlap when it ends no cycle and, in a model
     // with sliding layers, completes no page, or in an executor whose steps draft, when every entry verifies drafts.
@@ -238,41 +238,41 @@ class executor {
     std::size_t launched_batch_count() const noexcept;
     // The most rows of sampled tokens a batch has.
     std::size_t sampled_row_limit() const noexcept;
-    // The rows of a batch's sampled tokens that the sequence takes when it computes token_count tokens.
-    std::size_t sampled_row_count(sequence_id id, std::size_t token_count) const;
-    // Launches one step of the requests in scheduled, decoding requests first, after the launched steps: advances each sequence by its
+    // The rows of a batch's sampled tokens that the request takes when it computes token_count tokens.
+    std::size_t sampled_row_count(request_id_type id, std::size_t token_count) const;
+    // Launches one step of the requests in scheduled, decoding requests first, after the launched steps: advances each request by its
     // tokens, then queues the forward and the sampling on every shard without waiting for them. A decoding entry whose token is awaited reads
     // it from the previous launched step's samples on the GPUs, which needs both steps to allow overlap.
-    // scheduled is not empty and names no sequence twice, each token count is above 0 and at most the sequence's pending
-    // tokens, each sequence is steppable (is_steppable), fewer than two steps are launched, no step is launched or
+    // scheduled is not empty and names no request twice, each token count is above 0 and at most the request's pending
+    // tokens, each request is steppable (is_steppable), fewer than two steps are launched, no step is launched or
     // allows_overlap(scheduled), and the step samples at most sampled_row_limit() rows.
     task<void> launch(std::span<const scheduled_request> scheduled);
     // Writes back the oldest launched step: waits for it, then completes the pages its tokens filled, sets each awaited token it sampled, writes the
     // completed pages, evicts and writes the state at a cycle end, and takes lines for the next tokens. The pages of a
-    // sequence writing no state are written by a spawned task; a sequence writing its state waits for its pages' writes
-    // first, and a failed write ends its sequence with oom at a later write-back. Sets the exit reason of each sequence that finished,
-    // by a stop token or max_tokens, or ran out of lines. A sequence stopped by a token while in a later launched step
-    // withdraws that step's token (sequence::withdraw_latest_step); entries of sequences that exited before are
-    // skipped. Returns the sequences of the step's entries, in entry order. A step is launched.
-    task<std::vector<sequence_id>> write_back();
-    // Ends the request of id, whose sequence exited and is in no launched step: releases its lines, writes its end state
+    // request writing no state are written by a spawned task; a request writing its state waits for its pages' writes
+    // first, and a failed write ends its request with oom at a later write-back. Sets the exit reason of each request that finished,
+    // by a stop token or max_tokens, or ran out of lines. A request stopped by a token while in a later launched step
+    // withdraws that step's token (request_state::withdraw_latest_step); entries of requests that exited before are
+    // skipped. Returns the requests of the step's entries, in entry order. A step is launched.
+    task<std::vector<request_id_type>> write_back();
+    // Ends the request of id, whose request state exited and is in no launched step: releases its lines, writes its end state
     // when it finished, releases its lease, delivers the state or the error and the statistics through on_end, and
     // erases it.
-    task<void> stop(sequence_id id);
-    // Releases the lines and the lease of every request's sequence, delivers error and the request's statistics so far
+    task<void> stop(request_id_type id);
+    // Releases the lines and the lease of every request state, delivers error and the request's statistics so far
     // through on_end, and erases the request. Called when the loop has exited.
     void end_requests(request_error error) noexcept;
-    // Whether the sequence has not exited and no launched step forwards its last tokens.
-    bool is_steppable(sequence_id id) const;
-    std::size_t pending_token_count(sequence_id id) const;
-    // The tokens the sequence's eviction cycle can still forward.
-    std::size_t cycle_tokens_left(sequence_id id) const;
-    bool has_exited(sequence_id id) const;
-    bool is_in_launched_batch(sequence_id id) const;
-    // Whether the sequence's callbacks are cancelled.
-    bool is_cancelled(sequence_id id) const;
-    // Makes a sequence that has not exited exit as cancelled.
-    void cancel(sequence_id id);
+    // Whether the request has not exited and no launched step forwards its last tokens.
+    bool is_steppable(request_id_type id) const;
+    std::size_t pending_token_count(request_id_type id) const;
+    // The tokens the request's eviction cycle can still forward.
+    std::size_t cycle_tokens_left(request_id_type id) const;
+    bool has_exited(request_id_type id) const;
+    bool is_in_launched_batch(request_id_type id) const;
+    // Whether the request's callbacks are cancelled.
+    bool is_cancelled(request_id_type id) const;
+    // Makes a request that has not exited exit as cancelled.
+    void cancel(request_id_type id);
     // kv_cache::used_bytes of the executor's cache. Safe to call from any thread.
     std::size_t kv_cache_bytes() const noexcept;
     // The drafts the verify steps written back forwarded, and those of them they accepted. Safe to call from any thread.

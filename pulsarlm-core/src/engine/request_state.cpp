@@ -1,4 +1,4 @@
-#include "pulsarlm/engine/sequence.hpp"
+#include "pulsarlm/engine/request_state.hpp"
 
 #include "pinned_tensor.hpp"
 
@@ -62,7 +62,7 @@ void layer_view::append_lines(std::span<const std::uint32_t> added) {
     weight_sum.resize(lines.size(), 0.0f);
 }
 
-sequence::sequence(
+request_state::request_state(
     request&& r,
     std::shared_ptr<const state>&& initial_state,
     state::lease_id_type lease_id,
@@ -131,21 +131,21 @@ sequence::sequence(
     std::size_t resumed_end = cached_count + initial_state->tail.size();
     next_cycle_end = (resumed_end / eviction.cycle_tokens + 1) * eviction.cycle_tokens;
     std::size_t window_start = next_cycle_end - eviction.mass_tokens;
-    measured_end = resumed_end > window_start ? resumed_end : next_cycle_end - eviction.cycle_tokens;
+    mass_end_position = resumed_end > window_start ? resumed_end : next_cycle_end - eviction.cycle_tokens;
     prompt_count = r.tokens.size();
     draft_rows_end = cached_count;
     update_held();
 }
 
-std::size_t sequence::next_index(std::size_t layer) const noexcept {
+std::size_t request_state::next_index(std::size_t layer) const noexcept {
     return layers[layer].pages.size() * layout.page_size + tail.size();
 }
 
-std::size_t sequence::next_position() const noexcept {
+std::size_t request_state::next_position() const noexcept {
     return held_pages.size() * layout.page_size + tail.size();
 }
 
-std::size_t sequence::page_position(std::size_t layer, std::size_t page) const {
+std::size_t request_state::page_position(std::size_t layer, std::size_t page) const {
     const layer_view& view = layers[layer];
     if (page >= view.pages.size()) {
         return (held_pages.size() + page - view.pages.size()) * layout.page_size;
@@ -154,7 +154,7 @@ std::size_t sequence::page_position(std::size_t layer, std::size_t page) const {
     return static_cast<std::size_t>(rank) * layout.page_size;
 }
 
-void sequence::update_held() {
+void request_state::update_held() {
     held_pages.clear();
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
         if (!layout.layers[layer].is_recurrent && !layout.layers[layer].mirrors_held_pages) {
@@ -165,17 +165,17 @@ void sequence::update_held() {
     held_pages.erase(std::ranges::unique(held_pages).begin(), held_pages.end());
 }
 
-bool sequence::may_sample() const noexcept {
+bool request_state::may_sample() const noexcept {
     return !max_tokens || generated_count < *max_tokens;
 }
 
-void sequence::advance(std::size_t count) {
+void request_state::advance(std::size_t count) {
     assert(count <= pending_tokens.size());
     tail.insert(tail.end(), pending_tokens.begin(), pending_tokens.begin() + count);
     pending_tokens.erase(pending_tokens.begin(), pending_tokens.begin() + count);
 }
 
-std::size_t sequence::complete_pages(std::size_t end) {
+std::size_t request_state::complete_pages(std::size_t end) {
     std::size_t full_page_count = std::min(tail.size(), end - history_pages * layout.page_size) / layout.page_size;
     if (full_page_count == 0) {
         return 0;
@@ -214,31 +214,31 @@ std::size_t sequence::complete_pages(std::size_t end) {
     return full_page_count;
 }
 
-std::size_t sequence::head_state_line_index(std::size_t layer) const {
+std::size_t request_state::head_state_line_index(std::size_t layer) const {
     assert(layout.layers[layer].is_recurrent && history_pages > 0);
     return layout.layers[layer].state_slots + (history_pages - 1) % 2;
 }
 
-std::uint32_t sequence::head_state_line(std::size_t layer) const {
+std::uint32_t request_state::head_state_line(std::size_t layer) const {
     return layers[layer].lines[head_state_line_index(layer)];
 }
 
-std::uint32_t sequence::replace_head_state_line(std::size_t layer, std::uint32_t line) {
+std::uint32_t request_state::replace_head_state_line(std::size_t layer, std::uint32_t line) {
     return std::exchange(layers[layer].lines[head_state_line_index(layer)], line);
 }
 
-void sequence::store_head_state() noexcept {
+void request_state::store_head_state() noexcept {
     state_pending = false;
 }
 
-void sequence::accept_tokens(std::size_t start, std::span<const std::int64_t> accepted_tokens) {
+void request_state::accept_tokens(std::size_t start, std::span<const std::int64_t> accepted_tokens) {
     assert(!accepted_tokens.empty() && start >= history_pages * layout.page_size);
     auto after = tail.begin() + static_cast<std::ptrdiff_t>(start - history_pages * layout.page_size) + 1;
     tail.insert(after, accepted_tokens.begin(), accepted_tokens.end() - 1);
     resolve_token(start + accepted_tokens.size(), accepted_tokens.back());
 }
 
-void sequence::withdraw_latest_verify_step() {
+void request_state::withdraw_latest_verify_step() {
     assert(!tail.empty());
     pending_tokens.assign(1, tail.back());
     tail.pop_back();
@@ -247,14 +247,14 @@ void sequence::withdraw_latest_verify_step() {
     last_step_launched = false;
 }
 
-void sequence::resolve_token(std::size_t index, std::int64_t token) {
+void request_state::resolve_token(std::size_t index, std::int64_t token) {
     std::size_t offset = index - history_pages * layout.page_size;
     std::int64_t& awaited = offset < tail.size() ? tail[offset] : pending_tokens[offset - tail.size()];
     assert(awaited == awaited_token);
     awaited = token;
 }
 
-void sequence::withdraw_latest_step() {
+void request_state::withdraw_latest_step() {
     assert(!tail.empty() && pending_tokens.size() <= 1);
     if (!pending_tokens.empty()) {
         generated_count--;
@@ -265,7 +265,7 @@ void sequence::withdraw_latest_step() {
     last_step_launched = false;
 }
 
-std::size_t sequence::passed_pages(std::size_t layer, std::size_t query) const noexcept {
+std::size_t request_state::passed_pages(std::size_t layer, std::size_t query) const noexcept {
     const std::optional<std::size_t>& window = layout.layers[layer].sliding_window;
     if (!window || query + 1 <= *window) {
         return 0;
@@ -273,7 +273,7 @@ std::size_t sequence::passed_pages(std::size_t layer, std::size_t query) const n
     return (query + 1 - *window) / layout.page_size;
 }
 
-state sequence::to_state() const {
+state request_state::to_state() const {
     state s{.head = head, .layers = std::vector<layer_sequence>(layers.size()), .tail = tail};
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
         std::vector<active_page>& pages = s.layers[layer].pages;
@@ -302,29 +302,29 @@ state sequence::to_state() const {
     return s;
 }
 
-std::size_t sequence::history_position() const noexcept {
+std::size_t request_state::history_position() const noexcept {
     return history_pages * layout.page_size + tail.size();
 }
 
-void sequence::start_next_cycle() noexcept {
+void request_state::start_next_cycle() noexcept {
     next_cycle_end += eviction.cycle_tokens;
 }
 
-std::size_t sequence::measured_start() const noexcept {
-    return std::max(next_cycle_end - eviction.mass_tokens, measured_end);
+std::size_t request_state::mass_start_position() const noexcept {
+    return std::max(next_cycle_end - eviction.mass_tokens, mass_end_position);
 }
 
-void sequence::fill_query_weights(std::size_t first, std::span<float> weights) const noexcept {
-    std::size_t unmeasured = std::min(weights.size(), std::max(measured_start(), first) - first);
+void request_state::fill_query_weights(std::size_t first, std::span<float> weights) const noexcept {
+    std::size_t unmeasured = std::min(weights.size(), std::max(mass_start_position(), first) - first);
     std::fill_n(weights.begin(), unmeasured, 0.0f);
     query_weights(weights.subspan(unmeasured), eviction.attention_mass_decay);
 }
 
-bool sequence::ends_cycle(std::size_t token_count) const noexcept {
+bool request_state::ends_cycle(std::size_t token_count) const noexcept {
     return history_position() + token_count >= next_cycle_end;
 }
 
-std::size_t sequence::cycle_tokens_left() const noexcept {
+std::size_t request_state::cycle_tokens_left() const noexcept {
     std::size_t left = next_cycle_end - history_position();
     if (max_tokens) {
         // Every token sampled from here is forwarded but the last.
@@ -334,7 +334,7 @@ std::size_t sequence::cycle_tokens_left() const noexcept {
     return left;
 }
 
-std::size_t sequence::table_width() const noexcept {
+std::size_t request_state::table_width() const noexcept {
     std::size_t width = 0;
     for (const layer_view& view : layers) {
         width = std::max(width, view.lines.size());
@@ -342,7 +342,7 @@ std::size_t sequence::table_width() const noexcept {
     return width;
 }
 
-void sequence::upload_table(std::size_t first_page, std::span<const cudaStream_t> streams) {
+void request_state::upload_table(std::size_t first_page, std::span<const cudaStream_t> streams) {
     auto n_layers = static_cast<std::int64_t>(layers.size());
     auto width = static_cast<std::int64_t>(table_width());
     if (tables.front().size(1) < width) {
@@ -382,12 +382,12 @@ void sequence::upload_table(std::size_t first_page, std::span<const cudaStream_t
     }
 }
 
-std::size_t sequence::cycle_lines() const noexcept {
+std::size_t request_state::cycle_lines() const noexcept {
     assert(tail.empty());
     return ceil_div(cycle_tokens_left(), layout.page_size);
 }
 
-std::vector<std::size_t> sequence::missing_lines() const {
+std::vector<std::size_t> request_state::missing_lines() const {
     std::size_t left = cycle_tokens_left();
     std::vector<std::size_t> counts;
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
@@ -399,151 +399,151 @@ std::vector<std::size_t> sequence::missing_lines() const {
     return counts;
 }
 
-std::span<const layer_view> sequence::views() const noexcept {
+std::span<const layer_view> request_state::views() const noexcept {
     return layers;
 }
 
-std::span<const std::int64_t> sequence::tail_tokens() const noexcept {
+std::span<const std::int64_t> request_state::tail_tokens() const noexcept {
     return tail;
 }
 
-std::span<const std::int64_t> sequence::pending_token_list() const noexcept {
+std::span<const std::int64_t> request_state::pending_token_list() const noexcept {
     return pending_tokens;
 }
 
-std::span<const std::int64_t> sequence::draft_tokens() const noexcept {
+std::span<const std::int64_t> request_state::draft_tokens() const noexcept {
     return drafts;
 }
 
-const sampling_params& sequence::sampling_parameters() const noexcept {
+const sampling_params& request_state::sampling_parameters() const noexcept {
     return sampling;
 }
 
-sampling_draw sequence::next_draw() const noexcept {
+sampling_draw request_state::next_draw() const noexcept {
     return sampling_draw{.seed = seed, .count = draw_count};
 }
 
-const std::optional<std::size_t>& sequence::token_limit() const noexcept {
+const std::optional<std::size_t>& request_state::token_limit() const noexcept {
     return max_tokens;
 }
 
-std::size_t sequence::generated_token_count() const noexcept {
+std::size_t request_state::generated_token_count() const noexcept {
     return generated_count;
 }
 
-std::size_t sequence::delivered_token_count() const noexcept {
+std::size_t request_state::delivered_token_count() const noexcept {
     return delivered_count;
 }
 
-std::size_t sequence::prompt_token_count() const noexcept {
+std::size_t request_state::prompt_token_count() const noexcept {
     return prompt_count;
 }
 
-std::size_t sequence::cached_token_count() const noexcept {
+std::size_t request_state::cached_token_count() const noexcept {
     return cached_count;
 }
 
-std::size_t sequence::device_cached_token_count() const noexcept {
+std::size_t request_state::device_cached_token_count() const noexcept {
     return device_cached_count;
 }
 
-std::size_t sequence::device_memory_peak() const noexcept {
+std::size_t request_state::device_memory_peak() const noexcept {
     return peak_device_memory;
 }
 
-bool sequence::has_ended_prefill() const noexcept {
+bool request_state::has_ended_prefill() const noexcept {
     return has_prefill_ended;
 }
 
-std::size_t sequence::prefill_step_count() const noexcept {
+std::size_t request_state::prefill_step_count() const noexcept {
     return prefill_steps;
 }
 
-std::chrono::steady_clock::duration sequence::prefill_step_duration() const noexcept {
+std::chrono::steady_clock::duration request_state::prefill_step_duration() const noexcept {
     return prefill_duration;
 }
 
-std::chrono::steady_clock::duration sequence::step_duration() const noexcept {
+std::chrono::steady_clock::duration request_state::step_duration() const noexcept {
     return total_step_duration;
 }
 
-std::size_t sequence::drafted_token_count() const noexcept {
+std::size_t request_state::drafted_token_count() const noexcept {
     return drafted_tokens;
 }
 
-std::size_t sequence::accepted_draft_count() const noexcept {
+std::size_t request_state::accepted_draft_count() const noexcept {
     return accepted_drafts;
 }
 
-std::size_t sequence::history_page_count() const noexcept {
+std::size_t request_state::history_page_count() const noexcept {
     return history_pages;
 }
 
-const std::optional<digest>& sequence::head_digest() const noexcept {
+const std::optional<digest>& request_state::head_digest() const noexcept {
     return head;
 }
 
-std::span<const std::size_t> sequence::held_page_indices() const noexcept {
+std::span<const std::size_t> request_state::held_page_indices() const noexcept {
     return held_pages;
 }
 
-bool sequence::has_pending_state() const noexcept {
+bool request_state::has_pending_state() const noexcept {
     return state_pending;
 }
 
-const std::shared_ptr<pending_writes>& sequence::pending_page_writes() const noexcept {
+const std::shared_ptr<pending_writes>& request_state::pending_page_writes() const noexcept {
     return page_writes;
 }
 
-const at::Tensor& sequence::line_table(std::size_t shard) const {
+const at::Tensor& request_state::line_table(std::size_t shard) const {
     return tables[shard];
 }
 
-const at::Tensor& sequence::position_table(std::size_t shard) const {
+const at::Tensor& request_state::position_table(std::size_t shard) const {
     return position_tables[shard];
 }
 
-bool sequence::has_exited() const noexcept {
+bool request_state::has_exited() const noexcept {
     return end_reason.has_value();
 }
 
-std::optional<sequence::exit_reason> sequence::reason_of_exit() const noexcept {
+std::optional<request_state::exit_reason> request_state::reason_of_exit() const noexcept {
     return end_reason;
 }
 
-std::size_t sequence::launched_step_count() const noexcept {
+std::size_t request_state::launched_step_count() const noexcept {
     return steps_in_flight;
 }
 
-bool sequence::has_launched_last_step() const noexcept {
+bool request_state::has_launched_last_step() const noexcept {
     return last_step_launched;
 }
 
-std::size_t sequence::awaited_sample_row() const noexcept {
+std::size_t request_state::awaited_sample_row() const noexcept {
     return awaited_row;
 }
 
-std::size_t sequence::rejected_token_count() const noexcept {
+std::size_t request_state::rejected_token_count() const noexcept {
     return rejected_tokens;
 }
 
-std::size_t sequence::end_of_draft_rows() const noexcept {
+std::size_t request_state::end_of_draft_rows() const noexcept {
     return draft_rows_end;
 }
 
-std::size_t sequence::unapplied_position_shift() const noexcept {
+std::size_t request_state::unapplied_position_shift() const noexcept {
     return unapplied_shift;
 }
 
-const page_eviction_policy& sequence::eviction_policy_in_pages() const noexcept {
+const page_eviction_policy& request_state::eviction_policy_in_pages() const noexcept {
     return eviction;
 }
 
-state::lease_id_type sequence::lease_id() const noexcept {
+state::lease_id_type request_state::lease_id() const noexcept {
     return held_lease_id;
 }
 
-std::vector<std::size_t> sequence::pages_to_evict(std::size_t layer) const {
+std::vector<std::size_t> request_state::pages_to_evict(std::size_t layer) const {
     const layer_view& view = layers[layer];
     return pulsarlm::pages_to_evict(
         std::span(view.mass_sum).first(view.pages.size() * view.mass_heads),
@@ -556,7 +556,7 @@ std::vector<std::size_t> sequence::pages_to_evict(std::size_t layer) const {
     );
 }
 
-void sequence::launch_step(
+void request_state::launch_step(
     std::size_t token_count,
     const std::optional<std::size_t>& sample_row,
     std::size_t draft_row_count,
@@ -576,7 +576,7 @@ void sequence::launch_step(
     steps_in_flight++;
 }
 
-void sequence::launch_verify_step(std::size_t token_count, std::size_t draft_count) {
+void request_state::launch_verify_step(std::size_t token_count, std::size_t draft_count) {
     advance(token_count);
     pending_tokens.push_back(awaited_token);
     rejected_tokens = drafts.size();
@@ -584,12 +584,12 @@ void sequence::launch_verify_step(std::size_t token_count, std::size_t draft_cou
     steps_in_flight++;
 }
 
-void sequence::apply_sample(std::size_t position, std::int64_t token) {
+void request_state::apply_sample(std::size_t position, std::int64_t token) {
     resolve_token(position, token);
     delivered_count++;
 }
 
-void sequence::apply_accepted_tokens(
+void request_state::apply_accepted_tokens(
     std::size_t start,
     std::span<const std::int64_t> accepted_tokens,
     std::size_t verified_count
@@ -609,12 +609,12 @@ void sequence::apply_accepted_tokens(
     }
 }
 
-void sequence::finish_step() noexcept {
+void request_state::finish_step() noexcept {
     assert(steps_in_flight > 0);
     steps_in_flight--;
 }
 
-void sequence::record_step(std::chrono::steady_clock::duration duration) noexcept {
+void request_state::record_step(std::chrono::steady_clock::duration duration) noexcept {
     if (!has_prefill_ended) {
         prefill_steps++;
         prefill_duration += duration;
@@ -622,25 +622,25 @@ void sequence::record_step(std::chrono::steady_clock::duration duration) noexcep
     total_step_duration += duration;
 }
 
-void sequence::end_prefill() noexcept {
+void request_state::end_prefill() noexcept {
     has_prefill_ended = true;
 }
 
-void sequence::set_drafts(std::span<const std::int64_t> tokens) {
+void request_state::set_drafts(std::span<const std::int64_t> tokens) {
     drafts.assign(tokens.begin(), tokens.end());
 }
 
-void sequence::add_lines(std::size_t layer, std::span<const std::uint32_t> added) {
+void request_state::add_lines(std::size_t layer, std::span<const std::uint32_t> added) {
     layers[layer].append_lines(added);
 }
 
-std::vector<std::uint32_t> sequence::remove_pages(std::size_t layer, std::span<const std::size_t> view_indices) {
+std::vector<std::uint32_t> request_state::remove_pages(std::size_t layer, std::span<const std::size_t> view_indices) {
     std::vector<std::uint32_t> removed_lines = layers[layer].remove(view_indices);
     update_held();
     return removed_lines;
 }
 
-std::vector<std::vector<std::uint32_t>> sequence::take_lines() {
+std::vector<std::vector<std::uint32_t>> request_state::take_lines() {
     std::vector<std::vector<std::uint32_t>> taken_lines;
     for (layer_view& view : layers) {
         taken_lines.push_back(std::exchange(view.lines, {}));
@@ -648,7 +648,7 @@ std::vector<std::vector<std::uint32_t>> sequence::take_lines() {
     return taken_lines;
 }
 
-void sequence::add_step_mass(
+void request_state::add_step_mass(
     std::span<const std::span<const float>> step_mass_sums,
     std::span<const std::span<const float>> step_weight_sums,
     std::size_t end
@@ -661,15 +661,15 @@ void sequence::add_step_mass(
                 view.weight_sum,
                 step_mass_sums[layer].first(view.mass_sum.size()),
                 step_weight_sums[layer].first(view.weight_sum.size()),
-                end - measured_end,
+                end - mass_end_position,
                 eviction.attention_mass_decay
             );
         }
     }
-    measured_end = end;
+    mass_end_position = end;
 }
 
-void sequence::sample_pages() {
+void request_state::sample_pages() {
     if (!eviction.can_evict()) {
         return;
     }
@@ -695,15 +695,15 @@ void sequence::sample_pages() {
     }
 }
 
-void sequence::exit(exit_reason reason) noexcept {
+void request_state::exit(exit_reason reason) noexcept {
     end_reason = reason;
 }
 
-void sequence::record_device_cached_tokens(std::size_t count) noexcept {
+void request_state::record_device_cached_tokens(std::size_t count) noexcept {
     device_cached_count = count;
 }
 
-void sequence::record_device_memory(std::size_t bytes) noexcept {
+void request_state::record_device_memory(std::size_t bytes) noexcept {
     peak_device_memory = std::max(peak_device_memory, bytes);
 }
 

@@ -36,12 +36,12 @@ task<void> scheduler::submit(request&& r, std::unique_ptr<request_callbacks>&& c
 }
 
 task<void> scheduler::serve(request r, unstarted_callbacks callbacks) {
-    const std::optional<executor::sequence_id> id = co_await exec.start(std::move(r), callbacks.release());
+    const std::optional<executor::request_id_type> id = co_await exec.start(std::move(r), callbacks.release());
     if (!id) {
         co_return;
     }
     event& exit_event = exit_events.try_emplace(*id).first->second;
-    running_sequences.push_back(*id);
+    running_requests.push_back(*id);
     wake(join_event);
     co_await exit_event;
     exit_events.erase(*id);
@@ -68,14 +68,14 @@ task<void> scheduler::run() {
 }
 
 task<void> scheduler::retire() {
-    const std::vector<executor::sequence_id> stepped = co_await exec.write_back();
-    for (executor::sequence_id id : stepped) {
+    const std::vector<executor::request_id_type> stepped = co_await exec.write_back();
+    for (executor::request_id_type id : stepped) {
         if (!exec.has_exited(id) && exec.is_cancelled(id)) {
             exec.cancel(id);
         }
     }
-    std::erase_if(running_sequences, [&](executor::sequence_id id) { return exec.has_exited(id); });
-    for (executor::sequence_id id : stepped) {
+    std::erase_if(running_requests, [&](executor::request_id_type id) { return exec.has_exited(id); });
+    for (executor::request_id_type id : stepped) {
         if (exec.has_exited(id) && !exec.is_in_launched_batch(id)) {
             exit_events.at(id).set();
         }
@@ -83,15 +83,15 @@ task<void> scheduler::retire() {
 }
 
 std::pair<std::vector<executor::scheduled_request>, std::size_t> scheduler::next_scheduled_requests() const {
-    const std::size_t sequence_count = running_sequences.size();
-    std::vector<std::size_t> token_counts(sequence_count, 0);
-    std::vector<bool> is_decoding(sequence_count, false);
+    const std::size_t request_count = running_requests.size();
+    std::vector<std::size_t> token_counts(request_count, 0);
+    std::vector<bool> is_decoding(request_count, false);
     std::size_t budget = prefill_tokens_per_step;
     std::size_t row_total = 0;
     std::optional<std::size_t> first_index_left_out;
-    for (std::size_t offset = 0; offset < sequence_count; offset++) {
-        const std::size_t index = (sampled_row_scan_start + offset) % sequence_count;
-        const executor::sequence_id id = running_sequences[index];
+    for (std::size_t offset = 0; offset < request_count; offset++) {
+        const std::size_t index = (sampled_row_scan_start + offset) % request_count;
+        const executor::request_id_type id = running_requests[index];
         if (!exec.is_steppable(id)) {
             continue;
         }
@@ -122,9 +122,9 @@ std::pair<std::vector<executor::scheduled_request>, std::size_t> scheduler::next
 
     std::vector<executor::scheduled_request> scheduled;
     for (const bool decodes : {true, false}) {
-        for (std::size_t index = 0; index < sequence_count; index++) {
+        for (std::size_t index = 0; index < request_count; index++) {
             if (token_counts[index] > 0 && is_decoding[index] == decodes) {
-                scheduled.emplace_back(running_sequences[index], token_counts[index]);
+                scheduled.emplace_back(running_requests[index], token_counts[index]);
             }
         }
     }

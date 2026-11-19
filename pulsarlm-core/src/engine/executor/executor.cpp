@@ -151,63 +151,63 @@ executor::~executor() {
     end_requests(request_error::loop_exited);
 }
 
-executor::sequence_ref::sequence_ref(executor& owner, sequence_id id) noexcept
+executor::request_ref::request_ref(executor& owner, request_id_type id) noexcept
 : owner(&owner),
   id(id) {}
 
-sequence& executor::sequence_ref::operator*() const {
-    return owner->sequence_of(id);
+request_state& executor::request_ref::operator*() const {
+    return owner->state_of(id);
 }
 
-sequence* executor::sequence_ref::operator->() const {
+request_state* executor::request_ref::operator->() const {
     return &**this;
 }
 
-executor::sequence_id executor::sequence_ref::key() const noexcept {
+executor::request_id_type executor::request_ref::key() const noexcept {
     return id;
 }
 
-sequence& executor::sequence_of(sequence_id id) {
-    std::optional<sequence>& state = requests[id].state;
+request_state& executor::state_of(request_id_type id) {
+    std::optional<request_state>& state = requests[id].state;
     assert(state);
     return *state;
 }
 
-const sequence& executor::sequence_of(sequence_id id) const {
-    const std::optional<sequence>& state = requests[id].state;
+const request_state& executor::state_of(request_id_type id) const {
+    const std::optional<request_state>& state = requests[id].state;
     assert(state);
     return *state;
 }
 
-bool executor::is_steppable(sequence_id id) const {
-    const sequence& seq = sequence_of(id);
-    return !seq.has_launched_last_step() && !seq.has_exited();
+bool executor::is_steppable(request_id_type id) const {
+    const request_state& req = state_of(id);
+    return !req.has_launched_last_step() && !req.has_exited();
 }
 
-std::size_t executor::pending_token_count(sequence_id id) const {
-    return sequence_of(id).pending_token_list().size();
+std::size_t executor::pending_token_count(request_id_type id) const {
+    return state_of(id).pending_token_list().size();
 }
 
-std::size_t executor::cycle_tokens_left(sequence_id id) const {
-    return sequence_of(id).cycle_tokens_left();
+std::size_t executor::cycle_tokens_left(request_id_type id) const {
+    return state_of(id).cycle_tokens_left();
 }
 
-bool executor::has_exited(sequence_id id) const {
-    return sequence_of(id).has_exited();
+bool executor::has_exited(request_id_type id) const {
+    return state_of(id).has_exited();
 }
 
-bool executor::is_in_launched_batch(sequence_id id) const {
-    return sequence_of(id).launched_step_count() > 0;
+bool executor::is_in_launched_batch(request_id_type id) const {
+    return state_of(id).launched_step_count() > 0;
 }
 
-bool executor::is_cancelled(sequence_id id) const {
+bool executor::is_cancelled(request_id_type id) const {
     return requests[id].callbacks->cancelled();
 }
 
-void executor::cancel(sequence_id id) {
-    sequence& seq = sequence_of(id);
-    if (!seq.has_exited()) {
-        seq.exit(sequence::exit_reason::cancelled);
+void executor::cancel(request_id_type id) {
+    request_state& req = state_of(id);
+    if (!req.has_exited()) {
+        req.exit(request_state::exit_reason::cancelled);
     }
 }
 
@@ -223,16 +223,16 @@ std::uint64_t executor::accepted_draft_count() const noexcept {
     return accepted_drafts.load(std::memory_order_relaxed);
 }
 
-bool executor::completes_page(const sequence& seq, std::size_t token_count) const noexcept {
-    std::size_t start = seq.tail_tokens().size();
+bool executor::completes_page(const request_state& req, std::size_t token_count) const noexcept {
+    std::size_t start = req.tail_tokens().size();
     return (start + token_count) / layout.page_size * layout.page_size > start;
 }
 
-// A drafting sequence's verify step ends neither its cycle nor max_tokens (executor::advance).
+// A drafting request's verify step ends neither its cycle nor max_tokens (executor::advance).
 bool executor::entries_allow_overlap(std::span<const scheduled_request> scheduled) const {
     if (draft_layer) {
         return std::ranges::all_of(scheduled, [&](const scheduled_request& e) {
-            return !sequence_of(e.request_id).draft_tokens().empty();
+            return !state_of(e.request_id).draft_tokens().empty();
         });
     }
     const bool sliding = std::ranges::any_of(layout.layers, [](const view_layout::layer& layer) {
@@ -240,8 +240,8 @@ bool executor::entries_allow_overlap(std::span<const scheduled_request> schedule
     });
     return std::ranges::none_of(scheduled, [&](const scheduled_request& e) {
         const auto& [id, token_count] = e;
-        const sequence& seq = sequence_of(id);
-        return seq.ends_cycle(token_count) || (sliding && completes_page(seq, token_count));
+        const request_state& req = state_of(id);
+        return req.ends_cycle(token_count) || (sliding && completes_page(req, token_count));
     });
 }
 
@@ -257,19 +257,19 @@ std::size_t executor::sampled_row_limit() const noexcept {
     return sampled_row_capacity;
 }
 
-std::size_t executor::sampled_row_count(sequence_id id, std::size_t token_count) const {
-    const sequence& seq = sequence_of(id);
-    if (token_count != seq.pending_token_list().size() || !seq.may_sample()) {
+std::size_t executor::sampled_row_count(request_id_type id, std::size_t token_count) const {
+    const request_state& req = state_of(id);
+    if (token_count != req.pending_token_list().size() || !req.may_sample()) {
         return 0;
     }
-    return seq.draft_tokens().empty() ? 1 : token_count + seq.draft_tokens().size();
+    return req.draft_tokens().empty() ? 1 : token_count + req.draft_tokens().size();
 }
 
 bool executor::is_launchable(std::span<const scheduled_request> scheduled) const {
     if (scheduled.empty() || launched_batches.size() >= 2) {
         return false;
     }
-    std::unordered_set<sequence_id> entered;
+    std::unordered_set<request_id_type> entered;
     for (const auto& [id, token_count] : scheduled) {
         if (!entered.insert(id).second || token_count == 0 || token_count > pending_token_count(id) ||
             !is_steppable(id)) {
@@ -280,16 +280,16 @@ bool executor::is_launchable(std::span<const scheduled_request> scheduled) const
 }
 
 // A verify entry's tokens are accepted, and its samples taken, at its write-back. Its pending token and drafts are
-// awaited_token until then, and a sequence whose previous step is launched lags it by up to that step's drafts.
+// awaited_token until then, and a request whose previous step is launched lags it by up to that step's drafts.
 void executor::advance(batch& b) {
     const std::size_t draft_count = draft_state_slots - 1;
     for (batch::group* g : b.groups()) {
         for (batch::entry& e : g->entries) {
-            sequence& seq = *e.seq;
-            if (draft_layer && seq.end_of_draft_rows() == seq.history_position() && seq.history_position() > 0) {
-                const layer_view& view = seq.views()[*draft_layer];
+            request_state& req = *e.req;
+            if (draft_layer && req.end_of_draft_rows() == req.history_position() && req.history_position() > 0) {
+                const layer_view& view = req.views()[*draft_layer];
                 e.prior_row = b.prior_lines.size();
-                b.prior_lines.push_back(view.lines[(seq.next_index(*draft_layer) - 1) / layout.page_size]);
+                b.prior_lines.push_back(view.lines[(req.next_index(*draft_layer) - 1) / layout.page_size]);
             }
         }
     }
@@ -297,44 +297,43 @@ void executor::advance(batch& b) {
     for (batch::group* g : b.groups()) {
         const bool verifies = g == &b.verify_group;
         for (batch::entry& e : g->entries) {
-            sequence& seq = *e.seq;
-            const std::size_t lag = seq.launched_step_count() > 0 ? draft_count : 0;
+            request_state& req = *e.req;
+            const std::size_t lag = req.launched_step_count() > 0 ? draft_count : 0;
             e.is_measured = batch::measures_mass(e);
-            e.start_position = seq.history_position();
+            e.start_position = req.history_position();
             bool drafts = false;
             if (draft_layer) {
-                const std::optional<std::size_t>& token_limit = seq.token_limit();
-                const bool ends_sequence = e.is_sampling
-                    ? token_limit && seq.generated_token_count() + 1 >= *token_limit
-                    : seq.pending_token_list().size() == e.token_count;
-                const bool next_row = verifies || (!e.ends_cycle && !ends_sequence);
+                const std::optional<std::size_t>& token_limit = req.token_limit();
+                const bool ends_request = e.is_sampling ? token_limit && req.generated_token_count() + 1 >= *token_limit
+                                                        : req.pending_token_list().size() == e.token_count;
+                const bool next_row = verifies || (!e.ends_cycle && !ends_request);
                 // The next step's verify group then ends neither the cycle nor max_tokens, whatever this one accepts.
                 drafts = next_row && (verifies || e.is_sampling) &&
-                    seq.cycle_tokens_left() >= batch::forwarded(e) + lag + draft_count + 2;
+                    req.cycle_tokens_left() >= batch::forwarded(e) + lag + draft_count + 2;
                 b.plan_draft_rows(e, verifies, first_hidden_row, next_row, drafts, *draft_layer, draft_count);
                 first_hidden_row += batch::forwarded(e);
                 if (verifies) {
-                    const std::size_t remaining = token_limit ? *token_limit - seq.generated_token_count()
+                    const std::size_t remaining = token_limit ? *token_limit - req.generated_token_count()
                                                               : b.verify_rows;
                     e.max_accepted_token_count = std::clamp<std::size_t>(remaining, 1, b.verify_rows);
-                    e.measured_start = seq.measured_start();
+                    e.mass_start_position = req.mass_start_position();
                 }
             }
             if (verifies) {
-                e.end_position = seq.history_position();
-                e.sampled_position = seq.history_position() + e.token_count;
-                seq.launch_verify_step(e.token_count, drafts ? draft_count : 0);
+                e.end_position = req.history_position();
+                e.sampled_position = req.history_position() + e.token_count;
+                req.launch_verify_step(e.token_count, drafts ? draft_count : 0);
             } else {
-                e.end_position = seq.history_position() + e.token_count;
-                e.sampled_position = seq.history_position() + seq.pending_token_list().size();
-                seq.launch_step(
+                e.end_position = req.history_position() + e.token_count;
+                e.sampled_position = req.history_position() + req.pending_token_list().size();
+                req.launch_step(
                     e.token_count,
                     e.is_sampling ? std::optional(e.first_sample_row) : std::nullopt,
                     e.draft ? e.draft->row_count : 0,
                     drafts ? draft_count : 0
                 );
             }
-            e.ends_sequence = !verifies && seq.has_launched_last_step();
+            e.ends_request = !verifies && req.has_launched_last_step();
         }
     }
 }
@@ -383,16 +382,16 @@ void executor::link_previous(batch& b) const {
     b.previous_batch = &previous;
     const std::vector<batch::entry> previous_drafting_entries = previous.drafting_entries();
     for (batch::entry& e : b.verify_group.entries) {
-        if (e.seq->launched_step_count() == 0) {
+        if (e.req->launched_step_count() == 0) {
             continue;
         }
         for (std::size_t pv = 0; pv < previous.verify_group.entries.size(); pv++) {
-            if (previous.verify_group.entries[pv].seq == e.seq) {
+            if (previous.verify_group.entries[pv].req == e.req) {
                 e.previous_verify_row = pv;
             }
         }
         for (std::size_t d = 0; d < previous_drafting_entries.size(); d++) {
-            if (previous_drafting_entries[d].seq == e.seq) {
+            if (previous_drafting_entries[d].req == e.req) {
                 e.previous_drafting_row = d;
             }
         }

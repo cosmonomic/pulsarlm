@@ -15,8 +15,8 @@
 
 namespace pulsarlm {
 
-// Decides what the executor runs: which requests join, which sequences each step forwards and how many tokens, and when
-// a sequence leaves.
+// Decides what the executor runs: which requests join, which requests each step forwards and how many tokens, and when
+// a request leaves.
 class scheduler {
     // The callbacks of a request whose task has not passed them to the executor. Destroyed while it still holds
     // them, it ends them with loop_exited.
@@ -26,23 +26,23 @@ class scheduler {
 
     executor& exec;
     std::size_t prefill_tokens_per_step;
-    std::vector<executor::sequence_id> running_sequences;
-    // Set when a sequence joins the running set.
+    std::vector<executor::request_id_type> running_requests;
+    // Set when a request joins the running set.
     std::optional<event> join_event;
-    // Per running sequence, set once it exited and no launched step holds it; its request's task awaits it.
-    std::unordered_map<executor::sequence_id, event> exit_events;
-    // The position in running_sequences from which the next step grants rows of sampled tokens.
+    // Per running request, set once it exited and no launched step holds it; its request's task awaits it.
+    std::unordered_map<executor::request_id_type, event> exit_events;
+    // The position in running_requests from which the next step grants rows of sampled tokens.
     std::size_t sampled_row_scan_start = 0;
 
     static event& emplace_event(std::optional<event>& waited);
     static void wake(std::optional<event>& waited) noexcept;
-    // The next step's scheduled requests: every decoding sequence, then the others' tokens up to prefill_tokens_per_step, never
-    // past the end of a sequence's cycle. Leaves out the sequences whose last step is launched. Rows of sampled tokens
-    // are granted from sampled_row_scan_start on, and a sequence whose rows would raise the step's above
-    // executor::sampled_row_limit is left out. Also returns the position of the first sequence left out, or
+    // The next step's scheduled requests: every decoding request, then the others' tokens up to prefill_tokens_per_step, never
+    // past the end of a request's cycle. Leaves out the requests whose last step is launched. Rows of sampled tokens
+    // are granted from sampled_row_scan_start on, and a request whose rows would raise the step's above
+    // executor::sampled_row_limit is left out. Also returns the position of the first request left out, or
     // sampled_row_scan_start when none was.
     std::pair<std::vector<executor::scheduled_request>, std::size_t> next_scheduled_requests() const;
-    // Writes the oldest launched step back, ends the sequences in it whose callbacks are cancelled, and lets each sequence
+    // Writes the oldest launched step back, ends the requests in it whose callbacks are cancelled, and lets each request
     // that exited leave once no launched step holds it.
     task<void> retire();
     task<void> serve(request r, unstarted_callbacks callbacks);
@@ -58,8 +58,8 @@ class scheduler {
     // lines do not cover the state's pages and one cycle's tokens at the start, or the next cycle's tokens while
     // running; the caller resubmits.
     task<void> submit(request&& r, std::unique_ptr<request_callbacks>&& callbacks);
-    // Steps the running sequences until the loop stops, launching each step before the previous one is written back
-    // when executor::allows_overlap. A sequence whose callbacks are cancelled leaves after the
+    // Steps the running requests until the loop stops, launching each step before the previous one is written back
+    // when executor::allows_overlap. A request whose callbacks are cancelled leaves after the
     // steps it is in.
     task<void> run();
 };

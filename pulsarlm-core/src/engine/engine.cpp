@@ -116,7 +116,7 @@ std::size_t checked_draft_tokens(const engine_config& config, const std::vector<
     if (config.draft_tokens + 1 > sampled_row_limit) {
         throw std::invalid_argument(
             std::format(
-                "the engine drafts {} tokens a step; a step samples at most {} rows, draft_tokens + 1 of one sequence",
+                "the engine drafts {} tokens a step; a step takes at most {} samples, draft_tokens + 1 of one request",
                 config.draft_tokens,
                 sampled_row_limit
             )

@@ -133,7 +133,7 @@ class step_graphs {
     // Captures the graphs of 1 to startup_sequences sequences, with mass when a layer measures it and without: decode
     // groups, with state_slots above 1 verify groups, and with a draft head too the verify steps that do not filter.
     // It runs on the current stream, which is not the default stream, after an eager forward of each kind that zeroes
-    // line 0 of each layer and writes into it. Every GPU of the model runs it at once, before any sequence holds a
+    // line 0 of each layer and writes into it. Every GPU of the model runs it at once, before any request holds a
     // line.
     void capture_startup();
     // model::forward's decode logits and hidden rows of g, its awaited tokens filled from samples, on the current

@@ -17,16 +17,16 @@ namespace pulsarlm {
 
 executor::batch::batch(executor& owner, std::span<const scheduled_request> scheduled) {
     for (const auto& [id, token_count] : scheduled) {
-        sequence& seq = owner.sequence_of(id);
-        group& g = seq.pending_token_list().size() > 1 ? prefill_group
-            : !seq.draft_tokens().empty()              ? verify_group
+        request_state& req = owner.state_of(id);
+        group& g = req.pending_token_list().size() > 1 ? prefill_group
+            : !req.draft_tokens().empty()              ? verify_group
                                                        : decode_group;
         g.entries.push_back(
             entry{
-                .seq = sequence_ref(owner, id),
+                .req = request_ref(owner, id),
                 .token_count = token_count,
-                .is_sampling = token_count == seq.pending_token_list().size() && seq.may_sample(),
-                .ends_cycle = seq.ends_cycle(token_count),
+                .is_sampling = token_count == req.pending_token_list().size() && req.may_sample(),
+                .ends_cycle = req.ends_cycle(token_count),
             }
         );
     }
@@ -48,7 +48,7 @@ executor::batch::batch(executor& owner, std::span<const scheduled_request> sched
         }
     }
     awaits_tokens = std::ranges::any_of(decode_group.entries, [](const entry& e) {
-        return e.seq->pending_token_list().front() == sequence::awaited_token;
+        return e.req->pending_token_list().front() == request_state::awaited_token;
     });
     // A verify entry's draws advance by the tokens its write-back accepts.
     for (group* g : groups()) {
@@ -57,9 +57,9 @@ executor::batch::batch(executor& owner, std::span<const scheduled_request> sched
             if (!e.is_sampling) {
                 continue;
             }
-            const sampling_draw next_draw = e.seq->next_draw();
+            const sampling_draw next_draw = e.req->next_draw();
             for (std::size_t row = 0; row < (g == &verify_group ? verify_rows : 1); row++) {
-                sample_params.push_back(e.seq->sampling_parameters());
+                sample_params.push_back(e.req->sampling_parameters());
                 sample_draws.push_back(sampling_draw{.seed = next_draw.seed, .count = next_draw.count + row});
             }
         }
@@ -87,7 +87,7 @@ std::vector<executor::batch::entry> executor::batch::drafting_entries() const {
 }
 
 std::size_t executor::batch::forwarded(const entry& e) noexcept {
-    return e.token_count + e.seq->draft_tokens().size();
+    return e.token_count + e.req->draft_tokens().size();
 }
 
 model::batch executor::batch::make_group(
@@ -100,7 +100,7 @@ model::batch executor::batch::make_group(
     for (const entry& e : group) {
         token_count += forwarded(e);
     }
-    std::size_t n_layers = group.front().seq->views().size();
+    std::size_t n_layers = group.front().req->views().size();
     auto n_tokens = static_cast<std::int64_t>(token_count);
     auto n_seqs = static_cast<std::int64_t>(group.size());
     auto n_kv_layers = static_cast<std::int64_t>(n_layers);
@@ -119,19 +119,19 @@ model::batch executor::batch::make_group(
     std::size_t first_row = 0;
     query_start[0] = 0;
     for (std::size_t s = 0; s < group.size(); s++) {
-        const sequence& seq = *group[s].seq;
-        std::size_t first_position = seq.next_position();
+        const request_state& req = *group[s].req;
+        std::size_t first_position = req.next_position();
         const std::size_t count = forwarded(group[s]);
         for (std::size_t i = 0; i < count; i++) {
-            const std::int64_t token = i < group[s].token_count ? seq.pending_token_list()[i]
-                                                                : seq.draft_tokens()[i - group[s].token_count];
-            tokens[first_row + i] = token == sequence::awaited_token
-                ? -static_cast<std::int64_t>(seq.awaited_sample_row()) - 1
+            const std::int64_t token = i < group[s].token_count ? req.pending_token_list()[i]
+                                                                : req.draft_tokens()[i - group[s].token_count];
+            tokens[first_row + i] = token == request_state::awaited_token
+                ? -static_cast<std::int64_t>(req.awaited_sample_row()) - 1
                 : token;
             positions[first_row + i] = static_cast<std::int64_t>(first_position + i);
         }
         for (std::size_t layer = 0; layer < n_layers; layer++) {
-            std::size_t start = seq.next_index(layer);
+            std::size_t start = req.next_index(layer);
             key_count[layer * group.size() + s] = static_cast<std::int32_t>(start + count);
         }
         first_row += count;
@@ -144,12 +144,12 @@ model::batch executor::batch::make_group(
     g.history_positions = pinned({n_seqs}, at::kLong);
     auto* history_position = g.history_positions.mutable_data_ptr<std::int64_t>();
     for (std::size_t s = 0; s < group.size(); s++) {
-        history_position[s] = static_cast<std::int64_t>(group[s].seq->history_position());
+        history_position[s] = static_cast<std::int64_t>(group[s].req->history_position());
     }
     g.rejected_tokens = pinned({n_seqs}, at::kInt);
     auto* rejected = g.rejected_tokens.mutable_data_ptr<std::int32_t>();
     for (std::size_t s = 0; s < group.size(); s++) {
-        rejected[s] = static_cast<std::int32_t>(group[s].seq->rejected_token_count());
+        rejected[s] = static_cast<std::int32_t>(group[s].req->rejected_token_count());
     }
     g.page_size = static_cast<std::int64_t>(page_size);
     g.state_slots = static_cast<std::int64_t>(state_slots);
@@ -165,7 +165,7 @@ model::batch executor::batch::make_group(
             row[0] = 0;
             std::size_t view = 0;
             for (const entry& e : group) {
-                const auto pages = static_cast<std::int32_t>(e.seq->views()[layer].lines.size());
+                const auto pages = static_cast<std::int32_t>(e.req->views()[layer].lines.size());
                 for (std::size_t i = 0; i < (per_row ? forwarded(e) : 1); i++, view++) {
                     row[view + 1] = row[view] + pages;
                 }
@@ -175,13 +175,13 @@ model::batch executor::batch::make_group(
         std::size_t first = 0;
         for (const entry& e : group) {
             const std::size_t count = forwarded(e);
-            const std::size_t start = e.seq->history_position();
+            const std::size_t start = e.req->history_position();
             if (per_row) {
                 for (std::size_t i = 0; i < count; i++) {
-                    weights[first + i] = start + i >= e.seq->measured_start() ? 1.0f : 0.0f;
+                    weights[first + i] = start + i >= e.req->mass_start_position() ? 1.0f : 0.0f;
                 }
             } else {
-                e.seq->fill_query_weights(start, weights.subspan(first, count));
+                e.req->fill_query_weights(start, weights.subspan(first, count));
             }
             first += count;
         }
@@ -192,7 +192,7 @@ model::batch executor::batch::make_group(
 std::size_t executor::batch::table_width(std::span<const entry> group) noexcept {
     std::size_t width = 0;
     for (const entry& e : group) {
-        width = std::max(width, e.seq->table_width());
+        width = std::max(width, e.req->table_width());
     }
     return width;
 }
@@ -201,11 +201,11 @@ bool executor::batch::measures_mass(std::span<const entry> group) noexcept {
     return std::ranges::any_of(group, [](const entry& e) { return measures_mass(e); });
 }
 
-// A sequence whose previous step is launched may lie up to that step's drafts further on.
+// A request whose previous step is launched may lie up to that step's drafts further on.
 bool executor::batch::measures_mass(const entry& e) noexcept {
-    const std::size_t lag = e.seq->launched_step_count() > 0 ? e.seq->draft_tokens().size() : 0;
-    return e.seq->eviction_policy_in_pages().can_evict() &&
-        e.seq->history_position() + forwarded(e) + lag > e.seq->measured_start();
+    const std::size_t lag = e.req->launched_step_count() > 0 ? e.req->draft_tokens().size() : 0;
+    return e.req->eviction_policy_in_pages().can_evict() &&
+        e.req->history_position() + forwarded(e) + lag > e.req->mass_start_position();
 }
 
 at::Tensor executor::batch::page_tables(
@@ -218,8 +218,8 @@ at::Tensor executor::batch::page_tables(
     std::vector<at::Tensor> tables;
     std::vector<std::size_t> page_counts;
     for (const entry& e : group) {
-        tables.push_back(positions ? e.seq->position_table(shard) : e.seq->line_table(shard));
-        page_counts.push_back(e.seq->table_width());
+        tables.push_back(positions ? e.req->position_table(shard) : e.req->line_table(shard));
+        page_counts.push_back(e.req->table_width());
     }
     return gather_page_tables_cuda(
         tables,
@@ -238,10 +238,10 @@ void executor::batch::plan_draft_rows(
     std::size_t draft_layer,
     std::size_t draft_count
 ) {
-    const sequence& seq = *e.seq;
-    const std::size_t start = seq.history_position();
-    const std::size_t next_index = seq.next_index(draft_layer);
-    const std::size_t next_position = seq.next_position();
+    const request_state& req = *e.req;
+    const std::size_t start = req.history_position();
+    const std::size_t next_index = req.next_index(draft_layer);
+    const std::size_t next_position = req.next_position();
     const auto sampled = static_cast<std::int64_t>(e.first_sample_row);
     const std::size_t first_draft_row = draft_tokens.size();
     // The position after the row that drafts, before a verify entry's accepted count is added.
@@ -259,15 +259,15 @@ void executor::batch::plan_draft_rows(
             .is_drafting = drafts,
         };
     } else {
-        const std::size_t first = seq.end_of_draft_rows();
+        const std::size_t first = req.end_of_draft_rows();
         const std::size_t next = start + e.token_count;
         const std::size_t end = next_row ? next + 1 : next;
         assert((first == start || first == start + 1) && (next_row || !drafts));
         for (std::size_t t = first; t < end; t++) {
             if (t < next) {
-                draft_tokens.push_back(seq.pending_token_list()[t - start]);
+                draft_tokens.push_back(req.pending_token_list()[t - start]);
             } else {
-                draft_tokens.push_back(e.is_sampling ? -sampled - 1 : seq.pending_token_list()[e.token_count]);
+                draft_tokens.push_back(e.is_sampling ? -sampled - 1 : req.pending_token_list()[e.token_count]);
             }
             draft_positions.push_back(static_cast<std::int64_t>(next_position + t - start));
             if (t == 0) {
