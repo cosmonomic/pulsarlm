@@ -39,6 +39,9 @@ task<std::vector<executor::request_id_type>> executor::write_back() {
     std::vector<request_id_type> written_requests;
     for (const batch::group* g : std::as_const(b).groups()) {
         for (const batch::entry& e : g->entries) {
+            if (e.req->has_exit_cause() && e.req->unfinished_step_count() == 0) {
+                e.req->exit();
+            }
             written_requests.push_back(e.req.key());
         }
     }
@@ -88,16 +91,16 @@ executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clo
                 samples = std::span(next_sampled, verifies ? b.verify_rows : 1);
                 next_sampled += samples.size();
             }
-            if (req.has_exited()) {
+            if (req.discards_steps()) {
                 continue;
             }
             if (req.pending_page_writes()->any_failed()) {
-                req.exit(request_state::exit_reason::oom);
+                req.fail_store_write();
                 continue;
             }
             // The tokens the step accepts, and of its samples those it emits. A step launched after this one took its next
             // tokens on the GPU and lags its accepted count - 1.
-            const bool next_launched = req.launched_step_count() > 1;
+            const bool next_launched = req.unfinished_step_count() > 1;
             std::size_t accepted_count = batch::forwarded(e);
             std::span<const std::int64_t> emitted = samples;
             if (verifies) {
@@ -139,6 +142,7 @@ executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clo
                 .accepted_draft_count = verifies ? accepted_count - 1 : 0,
                 .step_duration = is_prefill_step ? std::chrono::steady_clock::duration::zero() : step_duration,
             };
+            bool reaches_end = e.ends_request;
             if (verifies) {
                 for (std::int64_t token : emitted) {
                     callbacks.on_decode(token, token_statistics);
@@ -147,7 +151,7 @@ executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clo
                     token_statistics.step_duration = std::chrono::steady_clock::duration::zero();
                 }
                 if (std::ranges::contains(stop_ids, emitted.back()) || !req.may_sample()) {
-                    req.exit(request_state::exit_reason::finished);
+                    reaches_end = true;
                     if (next_launched) {
                         req.withdraw_latest_verify_step();
                     }
@@ -157,21 +161,19 @@ executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clo
                 req.apply_sample(e.sampled_position, token);
                 callbacks.on_decode(token, token_statistics);
                 if (std::ranges::contains(stop_ids, token)) {
-                    req.exit(request_state::exit_reason::finished);
-                    if (req.launched_step_count() > 1) {
+                    reaches_end = true;
+                    if (next_launched) {
                         req.withdraw_latest_step();
                     }
                 }
             }
-            if (e.ends_request) {
-                req.exit(request_state::exit_reason::finished);
-            }
-            if (req.has_exited()) {
+            if (reaches_end) {
+                req.reach_end();
                 req.set_drafts({});
             } else if (auto found = drafted.find(&req); found != drafted.end() && !next_launched) {
                 req.set_drafts(found->second.subspan(1));
             }
-            const bool reaches_state = e.ends_cycle || req.reason_of_exit() == request_state::exit_reason::finished;
+            const bool reaches_state = e.ends_cycle || reaches_end;
             if (reaches_state) {
                 writes.state_reachers.push_back(&req);
                 if (req.has_pending_state()) {
@@ -248,7 +250,7 @@ task<void> executor::write_pages_and_states(batch& b, batch_writes&& writes) {
     for (request_state* req : writes.state_reachers) {
         co_await req->pending_page_writes()->wait();
         if (req->pending_page_writes()->any_failed()) {
-            req->exit(request_state::exit_reason::oom);
+            req->fail_store_write();
         }
     }
     std::expected<void, page_error> sync_result = co_await cache.sync(
@@ -259,14 +261,14 @@ task<void> executor::write_pages_and_states(batch& b, batch_writes&& writes) {
     );
     if (!sync_result) {
         for (request_state* req : writes.page_writers) {
-            req->exit(request_state::exit_reason::oom);
+            req->fail_store_write();
         }
         for (request_state* req : writes.state_writers) {
-            req->exit(request_state::exit_reason::oom);
+            req->fail_store_write();
         }
     } else {
         for (request_state* req : writes.state_writers) {
-            if (req->reason_of_exit() == request_state::exit_reason::oom) {
+            if (req->has_failed_store_write()) {
                 continue;
             }
             req->store_head_state();
@@ -277,7 +279,7 @@ task<void> executor::write_pages_and_states(batch& b, batch_writes&& writes) {
             }
             std::expected<std::vector<std::vector<std::uint32_t>>, page_error> replacements = cache.allocate(counts);
             if (!replacements) {
-                req->exit(request_state::exit_reason::oom);
+                req->run_out_of_lines();
                 continue;
             }
             for (std::size_t layer = 0; layer < n_layers; layer++) {
@@ -299,7 +301,7 @@ task<void> executor::refresh_views(batch& b) {
         for (const batch::entry& e : g->entries) {
             request_state& req = *e.req;
             req.finish_step();
-            if (req.has_exited()) {
+            if (req.has_exit_cause()) {
                 continue;
             }
             bool views_changed = release_passed_pages(req);
@@ -324,7 +326,7 @@ task<void> executor::refresh_views(batch& b) {
                     missing_counts
                 );
                 if (!allocation) {
-                    req.exit(request_state::exit_reason::oom);
+                    req.run_out_of_lines();
                     continue;
                 }
                 for (std::size_t layer = 0; layer < n_layers; layer++) {

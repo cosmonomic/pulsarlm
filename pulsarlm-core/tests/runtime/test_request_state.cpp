@@ -95,21 +95,21 @@ TEST_CASE("a prefill step and a decode step move their tokens to the tail and ap
     REQUIRE(to_list(req.pending_token_list()) == token_list{request_state::awaited_token});
     REQUIRE(req.awaited_sample_row() == 0);
     REQUIRE(req.history_position() == 6);
-    REQUIRE(req.generated_token_count() == 1);
+    REQUIRE(req.prepared_sample_count() == 1);
     REQUIRE(req.next_draw().count == 1);
-    REQUIRE(req.launched_step_count() == 1);
+    REQUIRE(req.unfinished_step_count() == 1);
     REQUIRE_FALSE(req.has_launched_last_step());
 
     req.apply_sample(6, 20);
     req.finish_step();
     REQUIRE(to_list(req.pending_token_list()) == token_list{20});
-    REQUIRE(req.launched_step_count() == 0);
+    REQUIRE(req.unfinished_step_count() == 0);
 
     req.launch_step(1, 5, 0, 0);
     REQUIRE(to_list(req.tail_tokens()) == token_list{10, 11, 12, 13, 14, 15, 20});
     REQUIRE(to_list(req.pending_token_list()) == token_list{request_state::awaited_token});
     REQUIRE(req.awaited_sample_row() == 5);
-    REQUIRE(req.generated_token_count() == 2);
+    REQUIRE(req.prepared_sample_count() == 2);
     REQUIRE_FALSE(req.has_launched_last_step());
 
     req.apply_sample(7, 21);
@@ -117,7 +117,7 @@ TEST_CASE("a prefill step and a decode step move their tokens to the tail and ap
     REQUIRE(to_list(req.pending_token_list()) == token_list{21});
 
     req.launch_step(1, 0, 0, 0);
-    REQUIRE(req.generated_token_count() == 3);
+    REQUIRE(req.prepared_sample_count() == 3);
     REQUIRE(req.delivered_token_count() == 2);
     REQUIRE_FALSE(req.may_sample());
     REQUIRE(req.has_launched_last_step());
@@ -130,7 +130,7 @@ TEST_CASE("a prefill step that samples no token leaves no awaited token") {
     req.launch_step(4, std::nullopt, 0, 0);
     REQUIRE(to_list(req.tail_tokens()) == token_list{1, 2, 3, 4});
     REQUIRE(to_list(req.pending_token_list()) == token_list{5});
-    REQUIRE(req.generated_token_count() == 0);
+    REQUIRE(req.prepared_sample_count() == 0);
     REQUIRE(req.next_draw().count == 0);
     REQUIRE_FALSE(req.has_launched_last_step());
 }
@@ -195,7 +195,7 @@ TEST_CASE("a verify step inserts the tokens it accepts and counts the drafts it 
     REQUIRE(to_list(req.tail_tokens()) == token_list{1, 2, 3, 30});
     REQUIRE(to_list(req.pending_token_list()) == token_list{request_state::awaited_token});
     REQUIRE(req.rejected_token_count() == 2);
-    REQUIRE(req.generated_token_count() == 1);
+    REQUIRE(req.prepared_sample_count() == 1);
     REQUIRE(req.next_draw().count == 1);
 
     const token_list accepted_tokens{31, 40};
@@ -206,7 +206,7 @@ TEST_CASE("a verify step inserts the tokens it accepts and counts the drafts it 
     REQUIRE(req.rejected_token_count() == 1);
     REQUIRE(req.end_of_draft_rows() == 6);
     REQUIRE(req.unapplied_position_shift() == 0);
-    REQUIRE(req.generated_token_count() == 3);
+    REQUIRE(req.prepared_sample_count() == 3);
     REQUIRE(req.next_draw().count == 3);
     REQUIRE(req.drafted_token_count() == 2);
     REQUIRE(req.accepted_draft_count() == 1);
@@ -247,7 +247,7 @@ TEST_CASE("a verify step written back before a later one leaves its accepted cou
     REQUIRE(req.unapplied_position_shift() == 2);
     REQUIRE(req.rejected_token_count() == 2);
 
-    req.exit(request_state::exit_reason::finished);
+    req.reach_end();
     req.withdraw_latest_verify_step();
     REQUIRE(to_list(req.tail_tokens()) == token_list{1, 2, 3, 30, 31, 32});
     REQUIRE(to_list(req.pending_token_list()) == token_list{33});
@@ -261,33 +261,67 @@ TEST_CASE("a stop token withdraws the step launched after the one that sampled i
     req.launch_step(2, 0, 0, 0);
     req.launch_step(1, 0, 0, 0);
     REQUIRE(to_list(req.tail_tokens()) == token_list{1, 2, request_state::awaited_token});
-    REQUIRE(req.generated_token_count() == 2);
-    REQUIRE(req.launched_step_count() == 2);
+    REQUIRE(req.prepared_sample_count() == 2);
+    REQUIRE(req.unfinished_step_count() == 2);
 
     req.apply_sample(2, 99);
-    req.exit(request_state::exit_reason::finished);
+    req.reach_end();
     req.withdraw_latest_step();
     req.finish_step();
     REQUIRE(to_list(req.tail_tokens()) == token_list{1, 2});
     REQUIRE(to_list(req.pending_token_list()) == token_list{99});
-    REQUIRE(req.generated_token_count() == 1);
+    REQUIRE(req.prepared_sample_count() == 1);
     REQUIRE(req.next_draw().count == 1);
-    REQUIRE(req.launched_step_count() == 1);
+    REQUIRE(req.unfinished_step_count() == 1);
     REQUIRE(req.to_state().tail == token_list{1, 2});
 }
 
-TEST_CASE("a request state exits with the last reason given and keeps the id of its lease") {
+TEST_CASE("a request state cancelled in no launched step exits as cancelled and keeps the id of its lease") {
     started_request started({1, 2}, std::nullopt, make_layout(4, false));
     request_state& req = started.req;
+    REQUIRE_FALSE(req.has_exit_cause());
     REQUIRE_FALSE(req.has_exited());
     REQUIRE_FALSE(req.reason_of_exit().has_value());
     REQUIRE(req.lease_id() == lease_id);
 
-    req.exit(request_state::exit_reason::cancelled);
+    req.cancel();
+    REQUIRE(req.has_exit_cause());
+    REQUIRE_FALSE(req.discards_steps());
+    req.exit();
     REQUIRE(req.has_exited());
     REQUIRE((req.reason_of_exit() == request_state::exit_reason::cancelled));
+}
 
-    req.exit(request_state::exit_reason::oom);
+TEST_CASE("a request state that reached its end exits as finished whether it ran out of lines or was cancelled") {
+    started_request started({1, 2}, std::nullopt, make_layout(4, false));
+    request_state& req = started.req;
+    req.launch_step(2, 0, 0, 0);
+    req.cancel();
+    req.run_out_of_lines();
+    req.apply_sample(2, 9);
+    req.reach_end();
+    req.finish_step();
+    REQUIRE(req.discards_steps());
+    req.exit();
+    REQUIRE((req.reason_of_exit() == request_state::exit_reason::finished));
+}
+
+TEST_CASE("a request state that ran out of lines exits with oom even when cancelled") {
+    started_request started({1, 2}, std::nullopt, make_layout(4, false));
+    request_state& req = started.req;
+    req.cancel();
+    req.run_out_of_lines();
+    req.exit();
+    REQUIRE((req.reason_of_exit() == request_state::exit_reason::oom));
+}
+
+TEST_CASE("a request state whose store write failed exits with oom even when it reached its end") {
+    started_request started({1, 2}, std::nullopt, make_layout(4, false));
+    request_state& req = started.req;
+    req.reach_end();
+    req.fail_store_write();
+    REQUIRE(req.has_failed_store_write());
+    req.exit();
     REQUIRE((req.reason_of_exit() == request_state::exit_reason::oom));
 }
 

@@ -166,7 +166,7 @@ void request_state::update_held() {
 }
 
 bool request_state::may_sample() const noexcept {
-    return !max_tokens || generated_count < *max_tokens;
+    return !max_tokens || prepared_samples < *max_tokens;
 }
 
 void request_state::advance(std::size_t count) {
@@ -257,7 +257,7 @@ void request_state::resolve_token(std::size_t index, std::int64_t token) {
 void request_state::withdraw_latest_step() {
     assert(!tail.empty() && pending_tokens.size() <= 1);
     if (!pending_tokens.empty()) {
-        generated_count--;
+        prepared_samples--;
         draw_count--;
     }
     pending_tokens.assign(1, tail.back());
@@ -328,7 +328,7 @@ std::size_t request_state::cycle_tokens_left() const noexcept {
     std::size_t left = next_cycle_end - history_position();
     if (max_tokens) {
         // Every token sampled from here is forwarded but the last.
-        std::size_t samples_left = *max_tokens - generated_count;
+        std::size_t samples_left = *max_tokens - prepared_samples;
         left = std::min(left, pending_tokens.size() + (samples_left > 0 ? samples_left - 1 : 0));
     }
     return left;
@@ -427,12 +427,12 @@ const std::optional<std::size_t>& request_state::token_limit() const noexcept {
     return max_tokens;
 }
 
-std::size_t request_state::generated_token_count() const noexcept {
-    return generated_count;
+std::size_t request_state::prepared_sample_count() const noexcept {
+    return prepared_samples;
 }
 
 std::size_t request_state::delivered_token_count() const noexcept {
-    return delivered_count;
+    return delivered_tokens;
 }
 
 std::size_t request_state::prompt_token_count() const noexcept {
@@ -511,8 +511,20 @@ std::optional<request_state::exit_reason> request_state::reason_of_exit() const 
     return end_reason;
 }
 
-std::size_t request_state::launched_step_count() const noexcept {
-    return steps_in_flight;
+bool request_state::has_exit_cause() const noexcept {
+    return has_reached_end || has_failed_write || is_out_of_lines || is_cancelled;
+}
+
+bool request_state::discards_steps() const noexcept {
+    return has_reached_end || has_failed_write;
+}
+
+bool request_state::has_failed_store_write() const noexcept {
+    return has_failed_write;
+}
+
+std::size_t request_state::unfinished_step_count() const noexcept {
+    return prepared_step_count - written_back_step_count;
 }
 
 bool request_state::has_launched_last_step() const noexcept {
@@ -567,13 +579,13 @@ void request_state::launch_step(
     if (sample_row) {
         pending_tokens.push_back(awaited_token);
         awaited_row = *sample_row;
-        generated_count++;
+        prepared_samples++;
         draw_count++;
     }
     last_step_launched = sample_row ? !may_sample() : pending_tokens.empty();
     draft_rows_end += draft_row_count;
     drafts.assign(draft_count, awaited_token);
-    steps_in_flight++;
+    prepared_step_count++;
 }
 
 void request_state::launch_verify_step(std::size_t token_count, std::size_t draft_count) {
@@ -581,12 +593,12 @@ void request_state::launch_verify_step(std::size_t token_count, std::size_t draf
     pending_tokens.push_back(awaited_token);
     rejected_tokens = drafts.size();
     drafts.assign(draft_count, awaited_token);
-    steps_in_flight++;
+    prepared_step_count++;
 }
 
 void request_state::apply_sample(std::size_t position, std::int64_t token) {
     resolve_token(position, token);
-    delivered_count++;
+    delivered_tokens++;
 }
 
 void request_state::apply_accepted_tokens(
@@ -594,12 +606,12 @@ void request_state::apply_accepted_tokens(
     std::span<const std::int64_t> accepted_tokens,
     std::size_t verified_count
 ) {
-    const bool has_later_step = steps_in_flight > 1;
+    const bool has_later_step = unfinished_step_count() > 1;
     const std::size_t accepted_count = accepted_tokens.size();
     accept_tokens(start, accepted_tokens);
     draw_count += accepted_count;
-    generated_count += accepted_count;
-    delivered_count += accepted_count;
+    prepared_samples += accepted_count;
+    delivered_tokens += accepted_count;
     drafted_tokens += verified_count - 1;
     accepted_drafts += accepted_count - 1;
     unapplied_shift = has_later_step ? accepted_count - 1 : 0;
@@ -610,8 +622,24 @@ void request_state::apply_accepted_tokens(
 }
 
 void request_state::finish_step() noexcept {
-    assert(steps_in_flight > 0);
-    steps_in_flight--;
+    assert(unfinished_step_count() > 0);
+    written_back_step_count++;
+}
+
+void request_state::reach_end() noexcept {
+    has_reached_end = true;
+}
+
+void request_state::fail_store_write() noexcept {
+    has_failed_write = true;
+}
+
+void request_state::run_out_of_lines() noexcept {
+    is_out_of_lines = true;
+}
+
+void request_state::cancel() noexcept {
+    is_cancelled = true;
 }
 
 void request_state::record_step(std::chrono::steady_clock::duration duration) noexcept {
@@ -695,8 +723,17 @@ void request_state::sample_pages() {
     }
 }
 
-void request_state::exit(exit_reason reason) noexcept {
-    end_reason = reason;
+void request_state::exit() noexcept {
+    assert(has_exit_cause() && unfinished_step_count() == 0 && !end_reason);
+    if (has_failed_write) {
+        end_reason = exit_reason::oom;
+    } else if (has_reached_end) {
+        end_reason = exit_reason::finished;
+    } else if (is_out_of_lines) {
+        end_reason = exit_reason::oom;
+    } else {
+        end_reason = exit_reason::cancelled;
+    }
 }
 
 void request_state::record_device_cached_tokens(std::size_t count) noexcept {

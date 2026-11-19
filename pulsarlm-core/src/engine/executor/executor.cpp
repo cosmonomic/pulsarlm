@@ -177,7 +177,7 @@ const request_state& executor::state_of(request_id_type id) const {
 
 bool executor::is_steppable(request_id_type id) const {
     const request_state& req = state_of(id);
-    return !req.has_launched_last_step() && !req.has_exited();
+    return !req.has_launched_last_step() && !req.has_exit_cause();
 }
 
 std::size_t executor::pending_token_count(request_id_type id) const {
@@ -193,7 +193,7 @@ bool executor::has_exited(request_id_type id) const {
 }
 
 bool executor::is_in_launched_batch(request_id_type id) const {
-    return state_of(id).launched_step_count() > 0;
+    return state_of(id).unfinished_step_count() > 0;
 }
 
 bool executor::is_cancelled(request_id_type id) const {
@@ -202,8 +202,12 @@ bool executor::is_cancelled(request_id_type id) const {
 
 void executor::cancel(request_id_type id) {
     request_state& req = state_of(id);
-    if (!req.has_exited()) {
-        req.exit(request_state::exit_reason::cancelled);
+    if (req.has_exited()) {
+        return;
+    }
+    req.cancel();
+    if (req.unfinished_step_count() == 0) {
+        req.exit();
     }
 }
 
@@ -294,13 +298,13 @@ void executor::advance(batch& b) {
         const bool verifies = g == &b.verify_group;
         for (batch::entry& e : g->entries) {
             request_state& req = *e.req;
-            const std::size_t lag = req.launched_step_count() > 0 ? draft_count : 0;
+            const std::size_t lag = req.unfinished_step_count() > 0 ? draft_count : 0;
             e.is_measured = batch::measures_mass(e);
             e.start_position = req.history_position();
             bool drafts = false;
             if (draft_layer) {
                 const std::optional<std::size_t>& token_limit = req.token_limit();
-                const bool ends_request = e.is_sampling ? token_limit && req.generated_token_count() + 1 >= *token_limit
+                const bool ends_request = e.is_sampling ? token_limit && req.prepared_sample_count() + 1 >= *token_limit
                                                         : req.pending_token_list().size() == e.token_count;
                 const bool next_row = verifies || (!e.ends_cycle && !ends_request);
                 // The next step's verify group then ends neither the cycle nor max_tokens, whatever this one accepts.
@@ -309,7 +313,7 @@ void executor::advance(batch& b) {
                 b.plan_draft_rows(e, verifies, first_hidden_row, next_row, drafts, *draft_layer, draft_count);
                 first_hidden_row += batch::forwarded(e);
                 if (verifies) {
-                    const std::size_t remaining = token_limit ? *token_limit - req.generated_token_count()
+                    const std::size_t remaining = token_limit ? *token_limit - req.prepared_sample_count()
                                                               : b.verify_rows;
                     e.max_accepted_token_count = std::clamp<std::size_t>(remaining, 1, b.verify_rows);
                     e.mass_start_position = req.mass_start_position();
@@ -378,7 +382,7 @@ void executor::link_previous(batch& b) const {
     b.previous_batch = &previous;
     const std::vector<batch::entry> previous_drafting_entries = previous.drafting_entries();
     for (batch::entry& e : b.verify_group.entries) {
-        if (e.req->launched_step_count() == 0) {
+        if (e.req->unfinished_step_count() == 0) {
             continue;
         }
         for (std::size_t pv = 0; pv < previous.verify_group.entries.size(); pv++) {

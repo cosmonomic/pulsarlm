@@ -71,9 +71,10 @@ class request_state {
     // Tokens sampled so far, each with its own draw of the seed's noise.
     std::uint64_t draw_count = 0;
     std::optional<std::size_t> max_tokens;
-    std::size_t generated_count = 0;
+    // The tokens the launched steps sampled. A verify step's are counted at its write-back, as the tokens it accepted.
+    std::size_t prepared_samples = 0;
     // The sampled tokens that steps written back applied.
-    std::size_t delivered_count = 0;
+    std::size_t delivered_tokens = 0;
     // The digest the page chain starts from.
     digest root;
     std::optional<digest> head;
@@ -99,9 +100,18 @@ class request_state {
     // first key. Columns past those of a layer's lines are unused.
     std::vector<at::Tensor> tables;
     std::vector<at::Tensor> position_tables;
+    // Set by exit only, once no step of the request is unfinished.
     std::optional<exit_reason> end_reason;
-    // The launched steps the request is in that are not written back yet.
-    std::size_t steps_in_flight = 0;
+    // Whether a step written back sampled a stop token or reached the end that max_tokens or the prompt sets.
+    bool has_reached_end = false;
+    // Whether a write of the request's pages or state to the store failed.
+    bool has_failed_write = false;
+    // Whether a line allocation for the request's next tokens failed.
+    bool is_out_of_lines = false;
+    bool is_cancelled = false;
+    // The steps of the request launched, and those of them written back.
+    std::size_t prepared_step_count = 0;
+    std::size_t written_back_step_count = 0;
     // Whether a launched step forwards the request's last tokens: it samples the last token max_tokens allows, or it
     // forwards the last pending tokens and does not sample.
     bool last_step_launched = false;
@@ -176,7 +186,7 @@ class request_state {
     // The draw of the next token sampled.
     sampling_draw next_draw() const noexcept;
     const std::optional<std::size_t>& token_limit() const noexcept;
-    std::size_t generated_token_count() const noexcept;
+    std::size_t prepared_sample_count() const noexcept;
     // The sampled tokens that steps written back applied, without those of launched steps.
     std::size_t delivered_token_count() const noexcept;
     std::size_t prompt_token_count() const noexcept;
@@ -200,7 +210,15 @@ class request_state {
     const at::Tensor& position_table(std::size_t shard) const;
     bool has_exited() const noexcept;
     std::optional<exit_reason> reason_of_exit() const noexcept;
-    std::size_t launched_step_count() const noexcept;
+    // Whether the request exits once no step of it is unfinished: a step written back reached the end, a store write
+    // failed, it ran out of lines or it was cancelled.
+    bool has_exit_cause() const noexcept;
+    // Whether the write-back of a later step of the request applies nothing: a step written back reached the end or a
+    // store write failed.
+    bool discards_steps() const noexcept;
+    bool has_failed_store_write() const noexcept;
+    // The launched steps of the request not written back yet.
+    std::size_t unfinished_step_count() const noexcept;
     bool has_launched_last_step() const noexcept;
     std::size_t awaited_sample_row() const noexcept;
     std::size_t rejected_token_count() const noexcept;
@@ -263,6 +281,11 @@ class request_state {
     apply_accepted_tokens(std::size_t start, std::span<const std::int64_t> accepted_tokens, std::size_t verified_count);
     // One launched step of the request was written back.
     void finish_step() noexcept;
+    // A step written back sampled a stop token or reached the end that max_tokens or the prompt sets.
+    void reach_end() noexcept;
+    void fail_store_write() noexcept;
+    void run_out_of_lines() noexcept;
+    void cancel() noexcept;
     // Adds a step written back, which took duration from its launch to its write-back, to the prefill's steps until
     // end_prefill and to the summed duration.
     void record_step(std::chrono::steady_clock::duration duration) noexcept;
@@ -298,7 +321,10 @@ class request_state {
     // whose last token is at least cycle_tokens and less than twice cycle_tokens before that end.
     void sample_pages();
     void start_next_cycle() noexcept;
-    void exit(exit_reason reason) noexcept;
+    // Sets the exit reason of a request with an exit cause and no unfinished step: oom when a store write failed,
+    // otherwise finished when a step written back reached the end, otherwise oom when it ran out of lines, otherwise
+    // cancelled.
+    void exit() noexcept;
     // Queues on each shard's stream the upload of the lines and positions from column first_page on into its tables,
     // all of them when the tables grow.
     void upload_table(std::size_t first_page, std::span<const cudaStream_t> streams);

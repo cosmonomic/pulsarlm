@@ -203,7 +203,7 @@ bool executor::batch::measures_mass(std::span<const entry> group) noexcept {
 
 // A request whose previous step is launched may lie up to that step's drafts further on.
 bool executor::batch::measures_mass(const entry& e) noexcept {
-    const std::size_t lag = e.req->launched_step_count() > 0 ? e.req->draft_tokens().size() : 0;
+    const std::size_t lag = e.req->unfinished_step_count() > 0 ? e.req->draft_tokens().size() : 0;
     return e.req->eviction_policy_in_pages().can_evict() &&
         e.req->history_position() + forwarded(e) + lag > e.req->mass_start_position();
 }

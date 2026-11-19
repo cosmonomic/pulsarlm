@@ -221,7 +221,7 @@ task<std::expected<void, page_error>> executor::own_pages_from(request_state& re
 
 task<void> executor::stop(request_id_type id) {
     request_state& req = state_of(id);
-    assert(req.has_exited() && req.launched_step_count() == 0);
+    assert(req.has_exited() && req.unfinished_step_count() == 0);
     release_lines(req);
     std::expected<std::shared_ptr<const state>, request_error> result = std::unexpected(request_error::cancelled);
     switch (*req.reason_of_exit()) {

@@ -1208,8 +1208,8 @@ TEST_CASE("a request cancelled before it runs ends with cancelled") {
 }
 
 // The third forward launches the third step before the second is written back; that write-back sees the cancellation,
-// so the third step's token is dropped.
-TEST_CASE("a request cancelled while decoding ends with cancelled at the next write-back") {
+// and the third step's write-back still delivers its token.
+TEST_CASE("a request cancelled while decoding ends with cancelled after its launched step is written back") {
     fixture f(16);
     token_list prompt{1, 2, 3};
     submission s = make_submission(request{.tokens = prompt, .max_tokens = 10});
@@ -1222,7 +1222,7 @@ TEST_CASE("a request cancelled while decoding ends with cancelled at the next wr
     submissions.push_back(std::move(s));
     std::vector<request_results> results = serve_submissions(f.sched, std::move(submissions));
 
-    REQUIRE(results[0].tokens == continuation(prompt, 2));
+    REQUIRE(results[0].tokens == continuation(prompt, 3));
     REQUIRE(f.model.forward_count == 3);
     REQUIRE(ended_error(results[0]) == request_error::cancelled);
     REQUIRE(f.store->releases == f.store->leases);
@@ -1242,8 +1242,31 @@ TEST_CASE("a request cancelled while a step is launched counts only the tokens i
     std::vector<request_results> results = serve_submissions(f.sched, std::move(submissions));
 
     REQUIRE(ended_error(results[0]) == request_error::cancelled);
-    REQUIRE(results[0].tokens.size() == 2);
+    REQUIRE(results[0].tokens.size() == 3);
     REQUIRE(results[0].statistics.total_token_count == prompt.size() + results[0].tokens.size());
+}
+
+// The third forward launches the step sampling the last token max_tokens allows before the second step's write-back,
+// which sees the cancellation.
+TEST_CASE("a request cancelled while its last step is launched ends with finished and its tokens") {
+    fixture f(16);
+    token_list prompt{1, 2, 3};
+    submission s = make_submission(request{.tokens = prompt, .max_tokens = 3});
+    f.model.on_forward = [&f, recorded_results = s.recorded_results] {
+        if (f.model.forward_count == 3) {
+            recorded_results->cancelled = true;
+        }
+    };
+    std::vector<submission> submissions;
+    submissions.push_back(std::move(s));
+    std::vector<request_results> results = serve_submissions(f.sched, std::move(submissions));
+
+    REQUIRE(results[0].tokens == continuation(prompt, 3));
+    REQUIRE(f.model.forward_count == 3);
+    pulsarlm::state end = ended_state(results[0]);
+    REQUIRE((hashes_of(end) == pulsarlm::make_page_digests(root(), token_list{1, 2, 3, 6}, page_size)));
+    REQUIRE(end.tail == token_list{12});
+    REQUIRE(f.store->releases == f.store->leases);
 }
 
 // The executor owns a request that was not ended until its own destruction, and the request state holds the lease.

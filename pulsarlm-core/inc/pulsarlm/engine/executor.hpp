@@ -258,10 +258,12 @@ class executor {
     // Writes back the oldest launched step: waits for it, then completes the pages its tokens filled, sets each awaited token it sampled, writes the
     // completed pages, evicts and writes the state at a cycle end, and takes lines for the next tokens. The pages of a
     // request writing no state are written by a spawned task; a request writing its state waits for its pages' writes
-    // first, and a failed write ends its request with oom at a later write-back. Sets the exit reason of each request that finished,
-    // by a stop token or max_tokens, or ran out of lines. A request stopped by a token while in a later launched step
-    // withdraws that step's token (request_state::withdraw_latest_step); entries of requests that exited before are
-    // skipped. Returns the requests of the step's entries, in entry order. A step is launched.
+    // first, and a failed write is found at a later write-back. Records on each request a stop token or max_tokens it
+    // reached, a failed store write, or a line allocation that failed, and sets the exit reason (request_state::exit) of
+    // each request with an exit cause that the step leaves in no launched step. A request stopped by a token while in a
+    // later launched step withdraws that step's token (request_state::withdraw_latest_step); entries of requests that
+    // reached the end or whose store write failed before are skipped. Returns the requests of the step's entries, in
+    // entry order. A step is launched.
     task<std::vector<request_id_type>> write_back();
     // Ends the request of id, whose request state exited and is in no launched step: releases its lines, writes its end state
     // when it finished, releases its lease, delivers the state or the error and the statistics through on_end, and
@@ -270,7 +272,8 @@ class executor {
     // Releases the lines and the lease of every request, delivers error and the request's statistics so far through
     // on_end, and erases the request. Called when the loop has exited.
     void end_requests(request_error error) noexcept;
-    // Whether the request has not exited and no launched step forwards its last tokens.
+    // Whether the request has no exit cause (request_state::has_exit_cause) and no launched step forwards its last
+    // tokens.
     bool is_steppable(request_id_type id) const;
     std::size_t pending_token_count(request_id_type id) const;
     // The tokens the request's eviction cycle can still forward.
@@ -279,7 +282,7 @@ class executor {
     bool is_in_launched_batch(request_id_type id) const;
     // Whether the request's callbacks are cancelled.
     bool is_cancelled(request_id_type id) const;
-    // Makes a request that has not exited exit as cancelled.
+    // Cancels a request that has not exited, which exits right away when it is in no launched step.
     void cancel(request_id_type id);
     // kv_cache::used_bytes of the executor's cache. Safe to call from any thread.
     std::size_t kv_cache_bytes() const noexcept;
