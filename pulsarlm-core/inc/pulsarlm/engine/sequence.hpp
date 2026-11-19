@@ -35,23 +35,6 @@ struct view_layout {
     std::size_t page_size;
 };
 
-// Holds a lease of a store and releases it once: on release, or when destroyed before it, as with a frame destroyed
-// after a panic, since the lease is the store's.
-class lease_guard {
-    page_store& store;
-    state::lease_id_type lease_id;
-    bool held = true;
-
-  public:
-    lease_guard(page_store& store, state::lease_id_type lease_id) noexcept;
-    lease_guard(const lease_guard&) = delete;
-    lease_guard& operator=(const lease_guard&) = delete;
-    ~lease_guard();
-
-    state::lease_id_type id() const noexcept;
-    void release() noexcept;
-};
-
 // One KV layer's view of a sequence. A layer with pages has one line per view page: its full pages, each with its index
 // in the history, then the pages of tail and pending. A layer that measures mass keeps, per line, mass_heads mass_sum
 // values and one weight_sum (add_step_mass), as of the last step that measured them, 0 for a page never measured, and
@@ -83,7 +66,7 @@ class sequence {
 
   private:
     result_writer& request_writer;
-    lease_guard lease;
+    state::lease_id_type held_lease_id;
     sampling_params sampling;
     std::uint64_t seed;
     // Tokens sampled so far, each with its own draw of the seed's noise.
@@ -161,12 +144,11 @@ class sequence {
     void resolve_token(std::size_t index, std::int64_t token);
 
   public:
-    // Resumes initial_state, the newest stored state reaching a prefix of r's tokens, leased from store by lease_id.
+    // Resumes initial_state, the newest stored state reaching a prefix of r's tokens, leased by lease_id.
     // digests are the digests of the full pages of r's tokens, chained from root. layout outlives the sequence.
     sequence(
         request&& r,
         std::shared_ptr<const state>&& initial_state,
-        page_store& store,
         state::lease_id_type lease_id,
         std::vector<digest>&& digests,
         const digest& root,

@@ -28,25 +28,6 @@ at::Tensor pinned(at::IntArrayRef sizes, at::ScalarType dtype) {
 
 }  // namespace
 
-lease_guard::lease_guard(page_store& store, state::lease_id_type lease_id) noexcept
-: store(store),
-  lease_id(lease_id) {}
-
-lease_guard::~lease_guard() {
-    release();
-}
-
-state::lease_id_type lease_guard::id() const noexcept {
-    return lease_id;
-}
-
-void lease_guard::release() noexcept {
-    if (held) {
-        held = false;
-        store.release(lease_id);
-    }
-}
-
 std::vector<std::uint32_t> layer_view::remove(std::span<const std::size_t> view_indices) {
     std::vector<std::uint32_t> removed_lines;
     std::size_t kept_count = 0;
@@ -85,7 +66,6 @@ void layer_view::append_lines(std::span<const std::uint32_t> added) {
 sequence::sequence(
     request&& r,
     std::shared_ptr<const state>&& initial_state,
-    page_store& store,
     state::lease_id_type lease_id,
     std::vector<digest>&& digests,
     const digest& root,
@@ -94,7 +74,7 @@ sequence::sequence(
     std::span<const at::Device> devices
 )
 : request_writer(writer),
-  lease(store, lease_id),
+  held_lease_id(lease_id),
   sampling(r.sampling),
   seed(sampling_seed(r.sampling.seed)),
   max_tokens(r.max_tokens),
@@ -535,7 +515,7 @@ const page_eviction_policy& sequence::eviction_policy_in_pages() const noexcept 
 }
 
 state::lease_id_type sequence::lease_id() const noexcept {
-    return lease.id();
+    return held_lease_id;
 }
 
 result_writer& sequence::writer() const noexcept {

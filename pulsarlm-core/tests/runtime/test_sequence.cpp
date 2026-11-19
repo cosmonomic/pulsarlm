@@ -34,46 +34,6 @@ using token_list = std::vector<std::int64_t>;
 constexpr digest root{.hi = 1, .lo = 2};
 constexpr state::lease_id_type lease_id = 7;
 
-using lease_list = std::vector<state::lease_id_type>;
-
-class recording_store final : public pulsarlm::page_store {
-    std::shared_ptr<lease_list> released_leases;
-
-  public:
-    explicit recording_store(std::shared_ptr<lease_list> released_leases)
-    : released_leases(std::move(released_leases)) {}
-
-    task<std::vector<bool>> read_pages(
-        std::span<const digest> hashes,
-        std::vector<pulsarlm::sharded_page>&&,
-        std::span<const cudaStream_t>
-    ) override {
-        co_return std::vector<bool>(hashes.size(), false);
-    }
-
-    task<std::expected<void, page_error>> write_pages(
-        std::vector<digest>&&,
-        std::vector<pulsarlm::sharded_page>&&,
-        std::vector<std::pair<state::lease_id_type, page_index_type>>&&,
-        std::span<const cudaStream_t>
-    ) override {
-        co_return std::expected<void, page_error>{};
-    }
-
-    task<std::expected<std::pair<std::shared_ptr<const state>, state::lease_id_type>, page_error>>
-    read_state(std::span<const std::int64_t>, std::span<const digest>) override {
-        co_return std::unexpected(page_error::miss);
-    }
-
-    task<void> write_state(state::lease_id_type, std::shared_ptr<const state>&&) override {
-        co_return;
-    }
-
-    void release(state::lease_id_type released_lease) noexcept override {
-        released_leases->push_back(released_lease);
-    }
-};
-
 class silent_callbacks final : public pulsarlm::request_callbacks {
   public:
     void on_token(std::int64_t) noexcept override {}
@@ -117,11 +77,6 @@ class started_sequence {
     view_layout layout;
     std::vector<at::Device> devices{at::Device(at::kCUDA, 0)};
 
-  public:
-    std::shared_ptr<lease_list> released_leases = std::make_shared<lease_list>();
-
-  private:
-    recording_store store;
     pulsarlm::result_writer writer;
 
   public:
@@ -129,11 +84,9 @@ class started_sequence {
 
     started_sequence(const token_list& tokens, std::optional<std::size_t> max_tokens, view_layout&& layout)
     : layout(std::move(layout)),
-      store(released_leases),
       writer(std::make_unique<silent_callbacks>()),
       seq(pulsarlm::request{.tokens = tokens, .max_tokens = max_tokens},
           std::make_shared<const state>(),
-          store,
           lease_id,
           pulsarlm::make_page_digests(root, tokens, this->layout.page_size),
           root,
@@ -321,25 +274,19 @@ TEST_CASE("a stop token withdraws the step launched after the one that sampled i
     REQUIRE(seq.to_state().tail == token_list{1, 2});
 }
 
-TEST_CASE("a sequence exits with the last reason given and releases its lease when destroyed") {
-    std::shared_ptr<lease_list> released_leases;
-    {
-        started_sequence started({1, 2}, std::nullopt, make_layout(4, false));
-        sequence& seq = started.seq;
-        released_leases = started.released_leases;
-        REQUIRE_FALSE(seq.has_exited());
-        REQUIRE_FALSE(seq.reason_of_exit().has_value());
-        REQUIRE(seq.lease_id() == lease_id);
+TEST_CASE("a sequence exits with the last reason given and keeps the id of its lease") {
+    started_sequence started({1, 2}, std::nullopt, make_layout(4, false));
+    sequence& seq = started.seq;
+    REQUIRE_FALSE(seq.has_exited());
+    REQUIRE_FALSE(seq.reason_of_exit().has_value());
+    REQUIRE(seq.lease_id() == lease_id);
 
-        seq.exit(sequence::exit_reason::cancelled);
-        REQUIRE(seq.has_exited());
-        REQUIRE((seq.reason_of_exit() == sequence::exit_reason::cancelled));
+    seq.exit(sequence::exit_reason::cancelled);
+    REQUIRE(seq.has_exited());
+    REQUIRE((seq.reason_of_exit() == sequence::exit_reason::cancelled));
 
-        seq.exit(sequence::exit_reason::oom);
-        REQUIRE((seq.reason_of_exit() == sequence::exit_reason::oom));
-        REQUIRE(released_leases->empty());
-    }
-    REQUIRE(*released_leases == lease_list{lease_id});
+    seq.exit(sequence::exit_reason::oom);
+    REQUIRE((seq.reason_of_exit() == sequence::exit_reason::oom));
 }
 
 }  // namespace

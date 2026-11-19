@@ -84,6 +84,15 @@ template <typename value_type> class slot_map {
         return slot == nullptr ? nullptr : &*slot->second;
     }
 
+    // Calls visit with each value.
+    template <typename visitor_type> void for_each(visitor_type&& visit) {
+        for (slot_type& slot : slots) {
+            if (slot.second) {
+                visit(*slot.second);
+            }
+        }
+    }
+
     bool contains(key_type key) const noexcept {
         return slot_of(key) != nullptr;
     }

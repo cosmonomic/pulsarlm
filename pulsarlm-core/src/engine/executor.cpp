@@ -1299,7 +1299,6 @@ task<std::expected<executor::sequence_id, request_error>> executor::start(reques
     const sequence_id id = sequences.emplace(
         std::move(r),
         std::move(initial_state),
-        store,
         lease_id,
         std::move(digests),
         chain_root,
@@ -1340,6 +1339,7 @@ sequence* executor::sequence_ref::operator->() const {
 void executor::drop(sequence_id id) noexcept {
     if (sequence* dropped = sequences.find(id)) {
         release_lines(*dropped);
+        store.release(dropped->lease_id());
         sequences.erase(id);
     }
 }
@@ -1607,7 +1607,9 @@ bool executor::release_passed_pages(sequence& seq) {
     return changed;
 }
 
-executor::~executor() = default;
+executor::~executor() {
+    sequences.for_each([&](sequence& unstopped) { store.release(unstopped.lease_id()); });
+}
 
 void executor::update_views(sequence& seq) {
     for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {

@@ -127,7 +127,7 @@ class executor {
     void update_views(sequence& seq);
     // Whether token_count more tokens fill a page of seq.
     bool completes_page(const sequence& seq, std::size_t token_count) const noexcept;
-    // Releases the lines of id's sequence, then erases it, which releases its lease.
+    // Releases the lines and the lease of id's sequence, then erases it.
     void drop(sequence_id id) noexcept;
     // Moves each entry's tokens to its sequence's tail (sequence::launch_step, sequence::launch_verify_step), switches
     // the boundary lines of the sequences whose pages it fills, and appends each token the step samples to pending as
