@@ -64,13 +64,16 @@ class qwen3_5_moe_model : public model {
         moe_weights moe;
         std::optional<attention_weights> attention;
         std::optional<deltanet_weights> deltanet;
+        // An attention layer's KV layer.
+        std::size_t kv_layer = 0;
+        // A Gated DeltaNet layer's KV layers.
+        std::size_t state_kv_layer = 0;
+        std::size_t conv_kv_layer = 0;
     };
 
     qwen3_5_moe_config config;
     std::int64_t n_layers;
     rope_parameters rope;
-    // The first KV layer of each layer.
-    std::vector<std::size_t> kv_layer_of;
     std::vector<kv_layer> kv_specs;
     at::Tensor embed_tokens;
     at::Tensor lm_head;

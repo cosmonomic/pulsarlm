@@ -2,6 +2,7 @@
 
 #include "pulsarlm/engine/model/paged_forward.hpp"
 #include "pulsarlm/kernels/ops.hpp"
+#include "weights.hpp"
 
 #include <ATen/ATen.h>
 
@@ -12,6 +13,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace pulsarlm {
@@ -20,11 +22,10 @@ namespace {
 
 const std::string prefix = "model.language_model.";
 
-at::Tensor need(const c10::Dict<std::string, at::Tensor>& weights, const std::string& name) {
-    if (!weights.contains(prefix + name)) {
-        throw std::invalid_argument(std::format("gemma4_model: missing weight {:?}", prefix + name));
-    }
-    return weights.at(prefix + name);
+constexpr std::string_view model_name = "gemma4_model";
+
+at::Tensor text_weight(const c10::Dict<std::string, at::Tensor>& weights, const std::string& name) {
+    return required_weight(weights, model_name, prefix + name);
 }
 
 void check_size(const at::Tensor& tensor, std::int64_t dim, std::int64_t size, const std::string& name) {
@@ -47,8 +48,8 @@ at::Tensor scaled(const at::Tensor& x, double scale) {
 gemma4_model::gemma4_model(gemma4_config config, const c10::Dict<std::string, at::Tensor>& weights)
 : config(std::move(config)),
   n_layers(static_cast<std::int64_t>(this->config.layer_types.size())),
-  embed_tokens(need(weights, "embed_tokens.weight")),
-  norm(need(weights, "norm.weight")) {
+  embed_tokens(text_weight(weights, "embed_tokens.weight")),
+  norm(text_weight(weights, "norm.weight")) {
     const gemma4_config& c = this->config;
     if (c.layer_types.empty() || c.layer_types.back() != gemma4_layer_type::full_attention) {
         throw std::invalid_argument("gemma4_model: the last layer must be a full-attention layer");
@@ -61,6 +62,7 @@ gemma4_model::gemma4_model(gemma4_config config, const c10::Dict<std::string, at
         if (layer < first_shared) {
             kv_layer_of.push_back(kv_specs.size());
             reader_of.push_back(0);
+            source_layer_of.push_back(layer);
             bool full = !sliding(layer);
             kv_specs.push_back(
                 kv_layer{
@@ -85,49 +87,50 @@ gemma4_model::gemma4_model(gemma4_config config, const c10::Dict<std::string, at
         }
         kv_layer_of.push_back(kv_layer_of[source]);
         reader_of.push_back(kv_specs[kv_layer_of[source]].n_readers++);
+        source_layer_of.push_back(source);
     }
 
     if (c.hidden_size_per_layer_input > 0) {
-        embed_tokens_per_layer = need(weights, "embed_tokens_per_layer.weight");
-        per_layer_model_projection = need(weights, "per_layer_model_projection.weight");
-        per_layer_projection_norm = need(weights, "per_layer_projection_norm.weight");
+        embed_tokens_per_layer = text_weight(weights, "embed_tokens_per_layer.weight");
+        per_layer_model_projection = text_weight(weights, "per_layer_model_projection.weight");
+        per_layer_projection_norm = text_weight(weights, "per_layer_projection_norm.weight");
     }
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
         const std::string p = "layers." + std::to_string(layer) + ".";
         layer_weights w{
-            .input_layernorm = need(weights, p + "input_layernorm.weight"),
-            .post_attention_layernorm = need(weights, p + "post_attention_layernorm.weight"),
-            .pre_feedforward_layernorm = need(weights, p + "pre_feedforward_layernorm.weight"),
-            .post_feedforward_layernorm = need(weights, p + "post_feedforward_layernorm.weight"),
-            .q_proj = need(weights, p + "self_attn.q_proj.weight"),
-            .q_norm = need(weights, p + "self_attn.q_norm.weight"),
-            .o_proj = need(weights, p + "self_attn.o_proj.weight"),
-            .gate_proj = need(weights, p + "mlp.gate_proj.weight"),
-            .up_proj = need(weights, p + "mlp.up_proj.weight"),
-            .down_proj = need(weights, p + "mlp.down_proj.weight"),
-            .layer_scalar = need(weights, p + "layer_scalar"),
+            .input_layernorm = text_weight(weights, p + "input_layernorm.weight"),
+            .post_attention_layernorm = text_weight(weights, p + "post_attention_layernorm.weight"),
+            .pre_feedforward_layernorm = text_weight(weights, p + "pre_feedforward_layernorm.weight"),
+            .post_feedforward_layernorm = text_weight(weights, p + "post_feedforward_layernorm.weight"),
+            .q_proj = text_weight(weights, p + "self_attn.q_proj.weight"),
+            .q_norm = text_weight(weights, p + "self_attn.q_norm.weight"),
+            .o_proj = text_weight(weights, p + "self_attn.o_proj.weight"),
+            .gate_proj = text_weight(weights, p + "mlp.gate_proj.weight"),
+            .up_proj = text_weight(weights, p + "mlp.up_proj.weight"),
+            .down_proj = text_weight(weights, p + "mlp.down_proj.weight"),
+            .layer_scalar = text_weight(weights, p + "layer_scalar"),
         };
         if (layer < first_shared) {
-            w.k_proj = need(weights, p + "self_attn.k_proj.weight");
-            w.k_norm = need(weights, p + "self_attn.k_norm.weight");
+            w.k_proj = text_weight(weights, p + "self_attn.k_proj.weight");
+            w.k_norm = text_weight(weights, p + "self_attn.k_norm.weight");
             if (!kv_specs[kv_layer_of[layer]].values_only) {
-                w.v_proj = need(weights, p + "self_attn.v_proj.weight");
+                w.v_proj = text_weight(weights, p + "self_attn.v_proj.weight");
             }
         }
         if (c.hidden_size_per_layer_input > 0) {
-            w.per_layer_input_gate = need(weights, p + "per_layer_input_gate.weight");
-            w.per_layer_projection = need(weights, p + "per_layer_projection.weight");
-            w.post_per_layer_input_norm = need(weights, p + "post_per_layer_input_norm.weight");
+            w.per_layer_input_gate = text_weight(weights, p + "per_layer_input_gate.weight");
+            w.per_layer_projection = text_weight(weights, p + "per_layer_projection.weight");
+            w.post_per_layer_input_norm = text_weight(weights, p + "post_per_layer_input_norm.weight");
         }
         if (c.enable_moe_block) {
-            w.router_proj = need(weights, p + "router.proj.weight");
-            w.router_scale = need(weights, p + "router.scale");
-            w.router_per_expert_scale = need(weights, p + "router.per_expert_scale");
-            w.experts_gate_up_proj = need(weights, p + "experts.gate_up_proj");
-            w.experts_down_proj = need(weights, p + "experts.down_proj");
-            w.pre_feedforward_layernorm_2 = need(weights, p + "pre_feedforward_layernorm_2.weight");
-            w.post_feedforward_layernorm_1 = need(weights, p + "post_feedforward_layernorm_1.weight");
-            w.post_feedforward_layernorm_2 = need(weights, p + "post_feedforward_layernorm_2.weight");
+            w.router_proj = text_weight(weights, p + "router.proj.weight");
+            w.router_scale = text_weight(weights, p + "router.scale");
+            w.router_per_expert_scale = text_weight(weights, p + "router.per_expert_scale");
+            w.experts_gate_up_proj = text_weight(weights, p + "experts.gate_up_proj");
+            w.experts_down_proj = text_weight(weights, p + "experts.down_proj");
+            w.pre_feedforward_layernorm_2 = text_weight(weights, p + "pre_feedforward_layernorm_2.weight");
+            w.post_feedforward_layernorm_1 = text_weight(weights, p + "post_feedforward_layernorm_1.weight");
+            w.post_feedforward_layernorm_2 = text_weight(weights, p + "post_feedforward_layernorm_2.weight");
             check_size(w.router_proj, 1, c.hidden_size, p + "router.proj.weight");
             const std::int64_t experts = w.router_proj.size(0);
             if (c.top_k_experts < 1 || c.top_k_experts > experts) {
@@ -227,7 +230,7 @@ gemma4_model::attention(const at::Tensor& h, std::int64_t layer, const batch& g,
         }
     }
     if (spec.values_only) {
-        k_norm_weight = layers[static_cast<std::int64_t>(kv_index)].k_norm;
+        k_norm_weight = layers[source_layer_of[layer]].k_norm;
     }
     std::optional<std::int64_t> window;
     if (spec.sliding_window) {

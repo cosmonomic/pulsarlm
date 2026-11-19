@@ -2,6 +2,7 @@
 
 #include "pulsarlm/engine/model/paged_forward.hpp"
 #include "pulsarlm/kernels/ops.hpp"
+#include "weights.hpp"
 
 #include <ATen/ATen.h>
 
@@ -9,18 +10,14 @@
 #include <format>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace pulsarlm {
 
 namespace {
 
-at::Tensor need(const c10::Dict<std::string, at::Tensor>& weights, const std::string& name) {
-    if (!weights.contains(name)) {
-        throw std::invalid_argument(std::format("llama_model: missing weight {:?}", name));
-    }
-    return weights.at(name);
-}
+constexpr std::string_view model_name = "llama_model";
 
 void check_size(const at::Tensor& tensor, std::int64_t dim, std::int64_t size, const std::string& name) {
     if (tensor.dim() <= dim || tensor.size(dim) != size) {
@@ -32,8 +29,8 @@ void check_size(const at::Tensor& tensor, std::int64_t dim, std::int64_t size, c
 
 llama_model::llama_model(dense_config config, const c10::Dict<std::string, at::Tensor>& weights)
 : config(std::move(config)),
-  embed_tokens(need(weights, "model.embed_tokens.weight")),
-  norm(need(weights, "model.norm.weight")) {
+  embed_tokens(required_weight(weights, model_name, "model.embed_tokens.weight")),
+  norm(required_weight(weights, model_name, "model.norm.weight")) {
     if (embed_tokens.dim() != 2) {
         throw std::invalid_argument("llama_model: \"model.embed_tokens.weight\" must have 2 dims");
     }
@@ -43,25 +40,45 @@ llama_model::llama_model(dense_config config, const c10::Dict<std::string, at::T
         const std::string a = p + "self_attn.";
         const dense_config& c = this->config;
         const std::int64_t hidden = embed_tokens.size(1);
-        check_size(need(weights, a + "q_proj.weight"), 0, c.n_heads * c.head_dim, a + "q_proj.weight");
-        check_size(need(weights, a + "q_proj.weight"), 1, hidden, a + "q_proj.weight");
-        check_size(need(weights, a + "k_proj.weight"), 0, c.n_kv_heads * c.head_dim, a + "k_proj.weight");
-        check_size(need(weights, a + "k_proj.weight"), 1, hidden, a + "k_proj.weight");
-        check_size(need(weights, a + "v_proj.weight"), 0, c.n_kv_heads * c.head_dim, a + "v_proj.weight");
-        check_size(need(weights, a + "v_proj.weight"), 1, hidden, a + "v_proj.weight");
-        check_size(need(weights, a + "o_proj.weight"), 0, hidden, a + "o_proj.weight");
-        check_size(need(weights, a + "o_proj.weight"), 1, c.n_heads * c.head_dim, a + "o_proj.weight");
+        check_size(
+            required_weight(weights, model_name, a + "q_proj.weight"),
+            0,
+            c.n_heads * c.head_dim,
+            a + "q_proj.weight"
+        );
+        check_size(required_weight(weights, model_name, a + "q_proj.weight"), 1, hidden, a + "q_proj.weight");
+        check_size(
+            required_weight(weights, model_name, a + "k_proj.weight"),
+            0,
+            c.n_kv_heads * c.head_dim,
+            a + "k_proj.weight"
+        );
+        check_size(required_weight(weights, model_name, a + "k_proj.weight"), 1, hidden, a + "k_proj.weight");
+        check_size(
+            required_weight(weights, model_name, a + "v_proj.weight"),
+            0,
+            c.n_kv_heads * c.head_dim,
+            a + "v_proj.weight"
+        );
+        check_size(required_weight(weights, model_name, a + "v_proj.weight"), 1, hidden, a + "v_proj.weight");
+        check_size(required_weight(weights, model_name, a + "o_proj.weight"), 0, hidden, a + "o_proj.weight");
+        check_size(
+            required_weight(weights, model_name, a + "o_proj.weight"),
+            1,
+            c.n_heads * c.head_dim,
+            a + "o_proj.weight"
+        );
         layers.push_back(
             layer_weights{
-                .input_layernorm = need(weights, p + "input_layernorm.weight"),
-                .post_attention_layernorm = need(weights, p + "post_attention_layernorm.weight"),
-                .q_proj = need(weights, p + "self_attn.q_proj.weight"),
-                .k_proj = need(weights, p + "self_attn.k_proj.weight"),
-                .v_proj = need(weights, p + "self_attn.v_proj.weight"),
-                .o_proj = need(weights, p + "self_attn.o_proj.weight"),
-                .gate_proj = need(weights, p + "mlp.gate_proj.weight"),
-                .up_proj = need(weights, p + "mlp.up_proj.weight"),
-                .down_proj = need(weights, p + "mlp.down_proj.weight"),
+                .input_layernorm = required_weight(weights, model_name, p + "input_layernorm.weight"),
+                .post_attention_layernorm = required_weight(weights, model_name, p + "post_attention_layernorm.weight"),
+                .q_proj = required_weight(weights, model_name, p + "self_attn.q_proj.weight"),
+                .k_proj = required_weight(weights, model_name, p + "self_attn.k_proj.weight"),
+                .v_proj = required_weight(weights, model_name, p + "self_attn.v_proj.weight"),
+                .o_proj = required_weight(weights, model_name, p + "self_attn.o_proj.weight"),
+                .gate_proj = required_weight(weights, model_name, p + "mlp.gate_proj.weight"),
+                .up_proj = required_weight(weights, model_name, p + "mlp.up_proj.weight"),
+                .down_proj = required_weight(weights, model_name, p + "mlp.down_proj.weight"),
             }
         );
     }

@@ -59,14 +59,19 @@ class qwen3_5_model : public model, public draft_head {
         linear down_proj;
         std::optional<attention_weights> attention;
         std::optional<deltanet_weights> deltanet;
+        // An attention layer's KV layer.
+        std::size_t kv_layer = 0;
+        // A Gated DeltaNet layer's KV layers.
+        std::size_t state_kv_layer = 0;
+        std::size_t conv_kv_layer = 0;
     };
 
-    // The MTP layer's own weights; its decoder layer is layers[n_layers].
     struct mtp_weights {
         at::Tensor pre_fc_norm_embedding;  // fp32 1 + weight
         at::Tensor pre_fc_norm_hidden;
         at::Tensor fc;  // [hidden, 2 * hidden], the embedding's columns first
         at::Tensor norm;
+        layer_weights layer;
     };
 
     qwen3_5_config config;
@@ -78,22 +83,22 @@ class qwen3_5_model : public model, public draft_head {
     std::int64_t linear_n_value_heads;
     std::int64_t n_layers;
     rope_parameters rope;
-    // The first KV layer of each layer.
-    std::vector<std::size_t> kv_layer_of;
     std::vector<kv_layer_shard> kv_shards;
     at::Tensor embed_tokens;
     at::Tensor lm_head;
     at::Tensor norm;  // fp32 1 + weight
-    // The decoder layers, then the MTP layer when the model drafts.
     std::vector<layer_weights> layers;
     std::optional<mtp_weights> mtp;
 
     bool full_attention(std::int64_t layer) const;
-    at::Tensor attention(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const;
-    at::Tensor deltanet(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const;
+    at::Tensor
+    attention(const at::Tensor& h, const layer_weights& layer, const batch& g, std::span<const kv> lines) const;
+    at::Tensor
+    deltanet(const at::Tensor& h, const layer_weights& layer, const batch& g, std::span<const kv> lines) const;
     at::Tensor embed(const at::Tensor& tokens) const;
-    // The decoder layer layer over x, its attention or delta rule then its MLP, each with its residual.
-    at::Tensor decoder_layer(const at::Tensor& x, std::int64_t layer, const batch& g, std::span<const kv> lines) const;
+    // The decoder layer of weights w over x, its attention or delta rule then its MLP, each with its residual.
+    at::Tensor
+    decoder_layer(const at::Tensor& x, const layer_weights& w, const batch& g, std::span<const kv> lines) const;
     // The logits [rows, vocab_size] of the normed hidden rows, from every rank's part of lm_head.
     at::Tensor logits(const at::Tensor& rows) const;
 

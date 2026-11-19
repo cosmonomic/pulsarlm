@@ -3,6 +3,7 @@
 #include "pulsarlm/engine/model/paged_forward.hpp"
 #include "pulsarlm/engine/model/partial_rope.hpp"
 #include "pulsarlm/kernels/ops.hpp"
+#include "weights.hpp"
 
 #include <ATen/ATen.h>
 
@@ -14,6 +15,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -23,17 +25,7 @@ namespace {
 
 const std::string prefix = "model.language_model.";
 
-// The weight of the checkpoint's full name.
-at::Tensor need_named(const c10::Dict<std::string, at::Tensor>& weights, const std::string& name) {
-    if (!weights.contains(name)) {
-        throw std::invalid_argument(std::format("qwen4_exp_model: missing weight {:?}", name));
-    }
-    return weights.at(name);
-}
-
-at::Tensor need(const c10::Dict<std::string, at::Tensor>& weights, const std::string& name) {
-    return need_named(weights, prefix + name);
-}
+constexpr std::string_view model_name = "qwen4_exp_model";
 
 // Hugging Face's Qwen4-Exp RMSNorm scales by 1 + weight, in fp32.
 at::Tensor zero_centered(const at::Tensor& weight) {
@@ -77,7 +69,7 @@ qwen4_exp_model::qwen4_exp_model(
 : config(std::move(config)),
   comm(std::move(comm)),
   n_layers(static_cast<std::int64_t>(this->config.layer_types.size())),
-  embed_tokens(need(weights, "embed_tokens.weight")) {
+  embed_tokens(required_weight(weights, model_name, prefix + "embed_tokens.weight")) {
     const qwen4_exp_config& c = this->config;
     const auto gpus = static_cast<std::int64_t>(this->comm.size());
     const auto rank = static_cast<std::int64_t>(this->comm.rank());
@@ -139,19 +131,19 @@ qwen4_exp_model::qwen4_exp_model(
     };
     auto hyper_connection = [&](const std::string& p) {
         return hyper_connection_weights{
-            .hc_norm = zero_centered(need_named(weights, p + "hc_norm.weight")),
+            .hc_norm = zero_centered(required_weight(weights, model_name, p + "hc_norm.weight")),
             .down_and_inject = at::cat(
-                {need_named(weights, p + "input_mix_weight_down.weight"),
-                 need_named(weights, p + "block_inject_weight.weight")}
+                {required_weight(weights, model_name, p + "input_mix_weight_down.weight"),
+                 required_weight(weights, model_name, p + "block_inject_weight.weight")}
             ),
-            .input_mix_weight_up = need_named(weights, p + "input_mix_weight_up.weight"),
+            .input_mix_weight_up = required_weight(weights, model_name, p + "input_mix_weight_up.weight"),
         };
     };
     auto mixer_named = [&](const std::string& p) {
         return mixer_weights{
-            .hc_norm = zero_centered(need_named(weights, p + "hc_norm.weight")),
-            .input_mix_weight_down = need_named(weights, p + "input_mix_weight_down.weight"),
-            .input_mix_weight_up = need_named(weights, p + "input_mix_weight_up.weight"),
+            .hc_norm = zero_centered(required_weight(weights, model_name, p + "hc_norm.weight")),
+            .input_mix_weight_down = required_weight(weights, model_name, p + "input_mix_weight_down.weight"),
+            .input_mix_weight_up = required_weight(weights, model_name, p + "input_mix_weight_up.weight"),
         };
     };
     hyper_connection_mixer = mixer_named(prefix + "hyper_connection_mixer.");
@@ -179,39 +171,69 @@ qwen4_exp_model::qwen4_exp_model(
         add_kv_layer(layer, layer, {rows(0, first_size)});
     };
 
-    // p is the layer's weight prefix; layer n_layers is the MTP layer, an indexed attention layer without PLE.
-    auto load_layer = [&](const std::string& p, std::int64_t layer) {
+    // p is the layer's weight prefix.
+    auto load_layer = [&](const std::string& p, bool has_attention, bool is_mtp_layer, bool has_ple) {
         const std::string m = p + "mlp.";
         const std::string shared = m + "shared_expert.";
-        check_size(need_named(weights, m + "gate.weight"), 1, c.hidden_size, m + "gate.weight");
-        check_size(need_named(weights, m + "shared_expert_gate.weight"), 0, 1, m + "shared_expert_gate.weight");
+        check_size(required_weight(weights, model_name, m + "gate.weight"), 1, c.hidden_size, m + "gate.weight");
         check_size(
-            need_named(weights, m + "shared_expert_gate.weight"),
+            required_weight(weights, model_name, m + "shared_expert_gate.weight"),
+            0,
+            1,
+            m + "shared_expert_gate.weight"
+        );
+        check_size(
+            required_weight(weights, model_name, m + "shared_expert_gate.weight"),
             1,
             c.hidden_size,
             m + "shared_expert_gate.weight"
         );
-        check_size(need_named(weights, shared + "gate_proj.weight"), 1, c.hidden_size, shared + "gate_proj.weight");
-        const std::int64_t shared_rows = need_named(weights, shared + "gate_proj.weight").size(0);
-        check_size(need_named(weights, shared + "up_proj.weight"), 0, shared_rows, shared + "up_proj.weight");
-        check_size(need_named(weights, shared + "up_proj.weight"), 1, c.hidden_size, shared + "up_proj.weight");
-        check_size(need_named(weights, shared + "down_proj.weight"), 0, c.hidden_size, shared + "down_proj.weight");
-        check_size(need_named(weights, shared + "down_proj.weight"), 1, shared_rows, shared + "down_proj.weight");
+        check_size(
+            required_weight(weights, model_name, shared + "gate_proj.weight"),
+            1,
+            c.hidden_size,
+            shared + "gate_proj.weight"
+        );
+        const std::int64_t shared_rows = required_weight(weights, model_name, shared + "gate_proj.weight").size(0);
+        check_size(
+            required_weight(weights, model_name, shared + "up_proj.weight"),
+            0,
+            shared_rows,
+            shared + "up_proj.weight"
+        );
+        check_size(
+            required_weight(weights, model_name, shared + "up_proj.weight"),
+            1,
+            c.hidden_size,
+            shared + "up_proj.weight"
+        );
+        check_size(
+            required_weight(weights, model_name, shared + "down_proj.weight"),
+            0,
+            c.hidden_size,
+            shared + "down_proj.weight"
+        );
+        check_size(
+            required_weight(weights, model_name, shared + "down_proj.weight"),
+            1,
+            shared_rows,
+            shared + "down_proj.weight"
+        );
         layer_weights w{
             .attn_hyper_connection = hyper_connection(p + "attn_hyper_connection."),
             .mlp_hyper_connection = hyper_connection(p + "mlp_hyper_connection."),
             .moe = moe_weights{
                 .router_and_gate = at::cat(
-                    {need_named(weights, p + "mlp.gate.weight"),
-                     need_named(weights, p + "mlp.shared_expert_gate.weight")}
+                    {required_weight(weights, model_name, p + "mlp.gate.weight"),
+                     required_weight(weights, model_name, p + "mlp.shared_expert_gate.weight")}
                 ),
-                .experts_gate_up_proj = need_named(weights, p + "mlp.experts.gate_up_proj"),
-                .experts_down_proj = need_named(weights, p + "mlp.experts.down_proj"),
+                .experts_gate_up_proj = required_weight(weights, model_name, p + "mlp.experts.gate_up_proj"),
+                .experts_down_proj = required_weight(weights, model_name, p + "mlp.experts.down_proj"),
                 .shared_gate_up_proj = at::cat(
-                    {need_named(weights, p + "mlp.shared_expert.gate_proj.weight"),
-                     need_named(weights, p + "mlp.shared_expert.up_proj.weight")}
+                    {required_weight(weights, model_name, p + "mlp.shared_expert.gate_proj.weight"),
+                     required_weight(weights, model_name, p + "mlp.shared_expert.up_proj.weight")}
                 ),
-                .shared_down_proj = need_named(weights, p + "mlp.shared_expert.down_proj.weight"),
+                .shared_down_proj = required_weight(weights, model_name, p + "mlp.shared_expert.down_proj.weight"),
             },
         };
         const std::int64_t experts = w.moe.router_and_gate.size(0) - 1;
@@ -238,42 +260,88 @@ qwen4_exp_model::qwen4_exp_model(
                 std::format("qwen4_exp_model: {} experts held of {} over {} GPUs", held_experts, experts, gpus)
             );
         }
-        kv_layer_of.push_back(kv_specs.size());
-        if (indexed_attention(layer)) {
+        if (has_attention) {
             const std::string a = p + "self_attn.";
             const std::string index_qk = a + "indexer.index_qk_proj.weight";
             const std::int64_t index_rows = (c.indexer_n_heads + 1) * c.indexer_head_dim;
             check_size(
-                need_named(weights, a + "q_proj.weight"),
+                required_weight(weights, model_name, a + "q_proj.weight"),
                 0,
                 heads.n_heads * 2 * c.head_dim,
                 a + "q_proj.weight"
             );
-            check_size(need_named(weights, a + "q_proj.weight"), 1, c.hidden_size, a + "q_proj.weight");
-            check_size(need_named(weights, a + "k_proj.weight"), 0, heads.n_kv_heads * c.head_dim, a + "k_proj.weight");
-            check_size(need_named(weights, a + "k_proj.weight"), 1, c.hidden_size, a + "k_proj.weight");
-            check_size(need_named(weights, a + "v_proj.weight"), 0, heads.n_kv_heads * c.head_dim, a + "v_proj.weight");
-            check_size(need_named(weights, a + "v_proj.weight"), 1, c.hidden_size, a + "v_proj.weight");
-            check_size(need_named(weights, index_qk), 0, index_rows, index_qk);
-            check_size(need_named(weights, index_qk), 1, c.hidden_size, index_qk);
-            check_size(need_named(weights, a + "o_proj.weight"), 0, c.hidden_size, a + "o_proj.weight");
-            check_size(need_named(weights, a + "o_proj.weight"), 1, heads.n_heads * c.head_dim, a + "o_proj.weight");
-            check_size(need_named(weights, a + "q_norm.weight"), 0, c.head_dim, a + "q_norm.weight");
-            check_size(need_named(weights, a + "k_norm.weight"), 0, c.head_dim, a + "k_norm.weight");
+            check_size(
+                required_weight(weights, model_name, a + "q_proj.weight"),
+                1,
+                c.hidden_size,
+                a + "q_proj.weight"
+            );
+            check_size(
+                required_weight(weights, model_name, a + "k_proj.weight"),
+                0,
+                heads.n_kv_heads * c.head_dim,
+                a + "k_proj.weight"
+            );
+            check_size(
+                required_weight(weights, model_name, a + "k_proj.weight"),
+                1,
+                c.hidden_size,
+                a + "k_proj.weight"
+            );
+            check_size(
+                required_weight(weights, model_name, a + "v_proj.weight"),
+                0,
+                heads.n_kv_heads * c.head_dim,
+                a + "v_proj.weight"
+            );
+            check_size(
+                required_weight(weights, model_name, a + "v_proj.weight"),
+                1,
+                c.hidden_size,
+                a + "v_proj.weight"
+            );
+            check_size(required_weight(weights, model_name, index_qk), 0, index_rows, index_qk);
+            check_size(required_weight(weights, model_name, index_qk), 1, c.hidden_size, index_qk);
+            check_size(
+                required_weight(weights, model_name, a + "o_proj.weight"),
+                0,
+                c.hidden_size,
+                a + "o_proj.weight"
+            );
+            check_size(
+                required_weight(weights, model_name, a + "o_proj.weight"),
+                1,
+                heads.n_heads * c.head_dim,
+                a + "o_proj.weight"
+            );
+            check_size(required_weight(weights, model_name, a + "q_norm.weight"), 0, c.head_dim, a + "q_norm.weight");
+            check_size(required_weight(weights, model_name, a + "k_norm.weight"), 0, c.head_dim, a + "k_norm.weight");
             w.attention = attention_weights{
                 .projections = at::cat(
-                    {permute_queries(need_named(weights, p + "self_attn.q_proj.weight"), heads.n_heads, permutation),
-                     permute_heads(need_named(weights, p + "self_attn.k_proj.weight"), heads.n_kv_heads, permutation),
-                     need_named(weights, p + "self_attn.v_proj.weight"),
-                     need_named(weights, p + "self_attn.indexer.index_qk_proj.weight")}
+                    {permute_queries(
+                         required_weight(weights, model_name, p + "self_attn.q_proj.weight"),
+                         heads.n_heads,
+                         permutation
+                     ),
+                     permute_heads(
+                         required_weight(weights, model_name, p + "self_attn.k_proj.weight"),
+                         heads.n_kv_heads,
+                         permutation
+                     ),
+                     required_weight(weights, model_name, p + "self_attn.v_proj.weight"),
+                     required_weight(weights, model_name, p + "self_attn.indexer.index_qk_proj.weight")}
                 ),
-                .o_proj = need_named(weights, p + "self_attn.o_proj.weight"),
-                .q_norm = zero_centered(need_named(weights, p + "self_attn.q_norm.weight"))
+                .o_proj = required_weight(weights, model_name, p + "self_attn.o_proj.weight"),
+                .q_norm = zero_centered(required_weight(weights, model_name, p + "self_attn.q_norm.weight"))
                               .index_select(0, permutation),
-                .k_norm = zero_centered(need_named(weights, p + "self_attn.k_norm.weight"))
+                .k_norm = zero_centered(required_weight(weights, model_name, p + "self_attn.k_norm.weight"))
                               .index_select(0, permutation),
-                .index_q_norm = zero_centered(need_named(weights, p + "self_attn.indexer.q_layernorm.weight")),
-                .index_k_norm = zero_centered(need_named(weights, p + "self_attn.indexer.k_layernorm.weight")),
+                .index_q_norm = zero_centered(
+                    required_weight(weights, model_name, p + "self_attn.indexer.q_layernorm.weight")
+                ),
+                .index_k_norm = zero_centered(
+                    required_weight(weights, model_name, p + "self_attn.indexer.k_layernorm.weight")
+                ),
             };
             auto attention_layer = [&](std::int64_t n_kv_heads, std::int64_t n_q_heads) {
                 return kv_layer{
@@ -283,12 +351,13 @@ qwen4_exp_model::qwen4_exp_model(
                     .index_head_dim = static_cast<std::size_t>(c.indexer_head_dim),
                 };
             };
+            w.kv_layer = kv_specs.size();
             add_kv_layer(
                 attention_layer(heads.n_kv_heads, heads.n_heads),
                 attention_layer(c.n_kv_heads, c.n_heads),
                 {rows(first_kv_head, heads.n_kv_heads)}
             );
-            if (layer == n_layers) {
+            if (is_mtp_layer) {
                 for (kv_layer* drafting : {&kv_specs.back(), &kv_shards.back().full}) {
                     drafting->mirrors_held_pages = true;
                     drafting->last_hidden_dim = static_cast<std::size_t>(c.hc_count * c.hidden_size);
@@ -298,39 +367,101 @@ qwen4_exp_model::qwen4_exp_model(
             const std::string l = p + "linear_attn.";
             const std::int64_t value_heads = heads.linear_n_value_heads;
             const std::int64_t channels = 2 * key_channels + value_channels;
-            check_size(need_named(weights, l + "in_proj_qkv.weight"), 0, channels, l + "in_proj_qkv.weight");
-            check_size(need_named(weights, l + "in_proj_qkv.weight"), 1, c.hidden_size, l + "in_proj_qkv.weight");
-            check_size(need_named(weights, l + "in_proj_a.weight"), 0, value_heads, l + "in_proj_a.weight");
-            check_size(need_named(weights, l + "in_proj_a.weight"), 1, c.hidden_size, l + "in_proj_a.weight");
-            check_size(need_named(weights, l + "in_proj_b.weight"), 0, value_heads, l + "in_proj_b.weight");
-            check_size(need_named(weights, l + "in_proj_b.weight"), 1, c.hidden_size, l + "in_proj_b.weight");
-            check_size(need_named(weights, l + "in_proj_z.weight"), 0, value_channels, l + "in_proj_z.weight");
-            check_size(need_named(weights, l + "in_proj_z.weight"), 1, c.hidden_size, l + "in_proj_z.weight");
-            check_size(need_named(weights, l + "conv1d.weight"), 0, channels, l + "conv1d.weight");
-            check_size(need_named(weights, l + "conv1d.weight"), 2, c.linear_conv_kernel, l + "conv1d.weight");
-            check_size(need_named(weights, l + "dt_bias"), 0, value_heads, l + "dt_bias");
-            check_size(need_named(weights, l + "A_log"), 0, value_heads, l + "A_log");
-            check_size(need_named(weights, l + "norm.weight"), 0, c.linear_value_head_dim, l + "norm.weight");
-            check_size(need_named(weights, l + "out_proj.weight"), 0, c.hidden_size, l + "out_proj.weight");
-            check_size(need_named(weights, l + "out_proj.weight"), 1, value_channels, l + "out_proj.weight");
+            check_size(
+                required_weight(weights, model_name, l + "in_proj_qkv.weight"),
+                0,
+                channels,
+                l + "in_proj_qkv.weight"
+            );
+            check_size(
+                required_weight(weights, model_name, l + "in_proj_qkv.weight"),
+                1,
+                c.hidden_size,
+                l + "in_proj_qkv.weight"
+            );
+            check_size(
+                required_weight(weights, model_name, l + "in_proj_a.weight"),
+                0,
+                value_heads,
+                l + "in_proj_a.weight"
+            );
+            check_size(
+                required_weight(weights, model_name, l + "in_proj_a.weight"),
+                1,
+                c.hidden_size,
+                l + "in_proj_a.weight"
+            );
+            check_size(
+                required_weight(weights, model_name, l + "in_proj_b.weight"),
+                0,
+                value_heads,
+                l + "in_proj_b.weight"
+            );
+            check_size(
+                required_weight(weights, model_name, l + "in_proj_b.weight"),
+                1,
+                c.hidden_size,
+                l + "in_proj_b.weight"
+            );
+            check_size(
+                required_weight(weights, model_name, l + "in_proj_z.weight"),
+                0,
+                value_channels,
+                l + "in_proj_z.weight"
+            );
+            check_size(
+                required_weight(weights, model_name, l + "in_proj_z.weight"),
+                1,
+                c.hidden_size,
+                l + "in_proj_z.weight"
+            );
+            check_size(required_weight(weights, model_name, l + "conv1d.weight"), 0, channels, l + "conv1d.weight");
+            check_size(
+                required_weight(weights, model_name, l + "conv1d.weight"),
+                2,
+                c.linear_conv_kernel,
+                l + "conv1d.weight"
+            );
+            check_size(required_weight(weights, model_name, l + "dt_bias"), 0, value_heads, l + "dt_bias");
+            check_size(required_weight(weights, model_name, l + "A_log"), 0, value_heads, l + "A_log");
+            check_size(
+                required_weight(weights, model_name, l + "norm.weight"),
+                0,
+                c.linear_value_head_dim,
+                l + "norm.weight"
+            );
+            check_size(
+                required_weight(weights, model_name, l + "out_proj.weight"),
+                0,
+                c.hidden_size,
+                l + "out_proj.weight"
+            );
+            check_size(
+                required_weight(weights, model_name, l + "out_proj.weight"),
+                1,
+                value_channels,
+                l + "out_proj.weight"
+            );
             w.deltanet = deltanet_weights{
                 .in_proj = at::cat(
-                    {need_named(weights, p + "linear_attn.in_proj_qkv.weight"),
-                     need_named(weights, p + "linear_attn.in_proj_a.weight"),
-                     need_named(weights, p + "linear_attn.in_proj_b.weight"),
-                     need_named(weights, p + "linear_attn.in_proj_z.weight")}
+                    {required_weight(weights, model_name, p + "linear_attn.in_proj_qkv.weight"),
+                     required_weight(weights, model_name, p + "linear_attn.in_proj_a.weight"),
+                     required_weight(weights, model_name, p + "linear_attn.in_proj_b.weight"),
+                     required_weight(weights, model_name, p + "linear_attn.in_proj_z.weight")}
                 ),
-                .conv = need_named(weights, p + "linear_attn.conv1d.weight"),
-                .dt_bias = need_named(weights, p + "linear_attn.dt_bias").to(at::kFloat),
-                .neg_a = -need_named(weights, p + "linear_attn.A_log").to(at::kFloat).exp(),
-                .norm = need_named(weights, p + "linear_attn.norm.weight"),
-                .out_proj = need_named(weights, p + "linear_attn.out_proj.weight"),
+                .conv = required_weight(weights, model_name, p + "linear_attn.conv1d.weight"),
+                .dt_bias = required_weight(weights, model_name, p + "linear_attn.dt_bias").to(at::kFloat),
+                .neg_a = -required_weight(weights, model_name, p + "linear_attn.A_log").to(at::kFloat).exp(),
+                .norm = required_weight(weights, model_name, p + "linear_attn.norm.weight"),
+                .out_proj = required_weight(weights, model_name, p + "linear_attn.out_proj.weight"),
             };
+            w.state_kv_layer = kv_specs.size();
             add_kv_layer(
                 state_layer({heads.linear_n_value_heads, c.linear_key_head_dim, c.linear_value_head_dim}, at::kFloat),
                 state_layer({c.linear_n_value_heads, c.linear_key_head_dim, c.linear_value_head_dim}, at::kFloat),
                 {rows(rank * heads.linear_n_value_heads, heads.linear_n_value_heads)}
             );
+            w.conv_kv_layer = kv_specs.size();
             add_kv_layer(
                 window_layer({2 * key_channels + value_channels, c.linear_conv_kernel - 1}, embed_tokens.scalar_type()),
                 window_layer(
@@ -342,19 +473,19 @@ qwen4_exp_model::qwen4_exp_model(
                  rows(2 * full_key_channels + rank * value_channels, value_channels)}
             );
         }
-        if (std::ranges::contains(c.ple_layers, layer)) {
+        if (has_ple) {
             const std::string e = p + "ple.ple_embedding.";
             at::Tensor table = ngram_table(weights, e + "ngram_embedding.");
             w.ple = ple_weights{
-                .key_proj = need_named(weights, p + "ple.key_proj.weight"),
-                .value_proj = need_named(weights, p + "ple.value_proj.weight"),
-                .norm_key = zero_centered(need_named(weights, p + "ple.norm_key.weight")),
-                .norm_query = zero_centered(need_named(weights, p + "ple.norm_query.weight")),
-                .norm_conv = zero_centered(need_named(weights, p + "ple.norm_conv.weight")),
-                .conv = need_named(weights, p + "ple.conv1d.weight"),
-                .layer_multipliers = need_named(weights, e + "layer_multipliers").to(at::kLong),
-                .head_vocab_sizes = need_named(weights, e + "ngram_heads_vocab_sizes").to(at::kLong),
-                .head_offsets = need_named(weights, e + "ngram_heads_offsets").to(at::kLong),
+                .key_proj = required_weight(weights, model_name, p + "ple.key_proj.weight"),
+                .value_proj = required_weight(weights, model_name, p + "ple.value_proj.weight"),
+                .norm_key = zero_centered(required_weight(weights, model_name, p + "ple.norm_key.weight")),
+                .norm_query = zero_centered(required_weight(weights, model_name, p + "ple.norm_query.weight")),
+                .norm_conv = zero_centered(required_weight(weights, model_name, p + "ple.norm_conv.weight")),
+                .conv = required_weight(weights, model_name, p + "ple.conv1d.weight"),
+                .layer_multipliers = required_weight(weights, model_name, e + "layer_multipliers").to(at::kLong),
+                .head_vocab_sizes = required_weight(weights, model_name, e + "ngram_heads_vocab_sizes").to(at::kLong),
+                .head_offsets = required_weight(weights, model_name, e + "ngram_heads_offsets").to(at::kLong),
                 .ngram_embedding = table,
                 .first_row = rank * table.size(0),
             };
@@ -366,21 +497,30 @@ qwen4_exp_model::qwen4_exp_model(
                 throw std::invalid_argument("qwen4_exp_model: the n-gram buffers must match ngram_size");
             }
             const std::int64_t history = (w.ple->conv.size(2) - 1) * c.ngram_size;
+            w.ple_conv_kv_layer = kv_specs.size();
             whole_window({c.hc_count * c.hidden_size, history}, embed_tokens.scalar_type());
+            w.ple_token_kv_layer = kv_specs.size();
             whole_window({1, c.ngram_size - 1}, at::kLong);
         }
-        layers.push_back(std::move(w));
+        return w;
     };
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
-        load_layer(prefix + "layers." + std::to_string(layer) + ".", layer);
+        layers.push_back(load_layer(
+            prefix + "layers." + std::to_string(layer) + ".",
+            indexed_attention(layer),
+            false,
+            std::ranges::contains(c.ple_layers, layer)
+        ));
     }
     if (weights.contains("mtp.fc_embedding.weight")) {
-        load_layer("mtp.layers.0.", n_layers);
         mtp = mtp_weights{
-            .pre_fc_norm_embedding = zero_centered(need_named(weights, "mtp.pre_fc_norm_embedding.weight")),
-            .pre_fc_norm_hidden = zero_centered(need_named(weights, "mtp.pre_fc_norm_hidden.weight")),
-            .fc_embedding = need_named(weights, "mtp.fc_embedding.weight"),
-            .fc_hidden = need_named(weights, "mtp.fc_hidden.weight"),
+            .layer = load_layer("mtp.layers.0.", true, true, false),
+            .pre_fc_norm_embedding = zero_centered(
+                required_weight(weights, model_name, "mtp.pre_fc_norm_embedding.weight")
+            ),
+            .pre_fc_norm_hidden = zero_centered(required_weight(weights, model_name, "mtp.pre_fc_norm_hidden.weight")),
+            .fc_embedding = required_weight(weights, model_name, "mtp.fc_embedding.weight"),
+            .fc_hidden = required_weight(weights, model_name, "mtp.fc_hidden.weight"),
             .mixer = mixer_named("mtp.hyper_connection_mixer."),
         };
     }
@@ -416,7 +556,7 @@ at::Tensor qwen4_exp_model::logits(const at::Tensor& x) const {
 }
 
 bool qwen4_exp_model::indexed_attention(std::int64_t layer) const {
-    return layer == n_layers || config.layer_types[layer] == qwen4_exp_layer_type::indexed_attention;
+    return config.layer_types[layer] == qwen4_exp_layer_type::indexed_attention;
 }
 
 // Hugging Face takes a query's top blocks with torch.topk, whose order among equal scores is unspecified; here the lower
@@ -529,12 +669,16 @@ at::Tensor qwen4_exp_model::final_mix(const at::Tensor& x) const {
     return mixed_streams(stream_norm(x, hyper_connection_mixer.hc_norm), hyper_connection_mixer);
 }
 
-at::Tensor
-qwen4_exp_model::attention(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const {
-    const attention_weights& w = *layers[layer].attention;
+at::Tensor qwen4_exp_model::attention(
+    const at::Tensor& h,
+    const layer_weights& layer,
+    const batch& g,
+    std::span<const kv> lines
+) const {
+    const attention_weights& w = *layer.attention;
     const qwen4_exp_config& c = config;
     const std::int64_t ntok = h.size(0);
-    const std::size_t kv_index = kv_layer_of[layer];
+    const std::size_t kv_index = layer.kv_layer;
 
     const std::int64_t query_rows = heads.n_heads * 2 * c.head_dim;
     const std::int64_t key_rows = heads.n_kv_heads * c.head_dim;
@@ -633,82 +777,40 @@ qwen4_exp_model::attention(const at::Tensor& h, std::int64_t layer, const batch&
     return out;
 }
 
-at::Tensor
-qwen4_exp_model::deltanet(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const {
-    const deltanet_weights& w = *layers[layer].deltanet;
+at::Tensor qwen4_exp_model::deltanet(
+    const at::Tensor& h,
+    const layer_weights& layer,
+    const batch& g,
+    std::span<const kv> lines
+) const {
+    const deltanet_weights& w = *layer.deltanet;
     const qwen4_exp_config& c = config;
-    const std::int64_t ntok = h.size(0);
-    const std::size_t state_layer = kv_layer_of[layer];
-    const std::size_t conv_layer = state_layer + 1;
-    std::optional<at::Tensor> cu_seqlens_q;
-    if (g.kind != batch_kind::decode) {
-        cu_seqlens_q = g.cu_seqlens_q;
-    }
-
     const std::int64_t channels = w.conv.size(0);
     const std::int64_t value_heads = heads.linear_n_value_heads;
     at::Tensor projected = small_batch_linear_cuda(h, w.in_proj);
-    const state_rows window_rows = window_layer_rows(g, conv_layer);
-    const state_rows state_rows = state_layer_rows(g, state_layer);
-    at::Tensor qkv = projected.narrow(1, 0, channels);
-    at::Tensor a = projected.narrow(1, channels, value_heads);
-    at::Tensor b = projected.narrow(1, channels + value_heads, value_heads);
-    at::Tensor z = projected.narrow(1, channels + 2 * value_heads, value_heads * c.linear_value_head_dim);
-    at::Tensor gated;
-    if (g.kind == batch_kind::verify) {
-        const std::int64_t sequences = window_rows.lines.size(0);
-        TORCH_CHECK(
-            sequences > 0 && ntok > 0 && ntok % sequences == 0,
-            "qwen4_exp_model: a verify batch of ",
-            ntok,
-            " tokens does not hold the same count for each of its ",
-            sequences,
-            " sequences"
-        );
-        const std::int64_t per_sequence = ntok / sequences;
-        at::Tensor convolved = causal_conv_verify_cuda(qkv, w.conv, lines[conv_layer].k, window_rows, per_sequence, 1);
-        gated = gated_delta_rule_verify_cuda(
-            convolved,
-            a,
-            b,
-            w.dt_bias,
-            w.neg_a,
-            lines[state_layer].k,
-            state_rows,
-            per_sequence,
-            heads.linear_n_key_heads,
-            z,
-            w.norm,
-            c.rms_norm_eps,
-            c.linear_output_gate,
-            g.arrival_counters
-        );
-    } else {
-        at::Tensor convolved = causal_conv_cuda(qkv, w.conv, lines[conv_layer].k, window_rows, cu_seqlens_q, 1);
-        gated = gated_delta_rule_cuda(
-            convolved,
-            a,
-            b,
-            w.dt_bias,
-            w.neg_a,
-            lines[state_layer].k,
-            state_rows,
-            cu_seqlens_q,
-            heads.linear_n_key_heads,
-            z,
-            w.norm,
-            c.rms_norm_eps,
-            c.linear_output_gate,
-            g.arrival_counters
-        );
-    }
+    at::Tensor gated = gated_deltanet(
+        g,
+        gated_deltanet_inputs{
+            .qkv = projected.narrow(1, 0, channels),
+            .a = projected.narrow(1, channels, value_heads),
+            .b = projected.narrow(1, channels + value_heads, value_heads),
+            .z = projected.narrow(1, channels + 2 * value_heads, value_heads * c.linear_value_head_dim),
+        },
+        gated_deltanet_weights{.conv = w.conv, .dt_bias = w.dt_bias, .neg_a = w.neg_a, .norm = w.norm},
+        lines[layer.state_kv_layer],
+        lines[layer.conv_kv_layer],
+        layer.state_kv_layer,
+        layer.conv_kv_layer,
+        heads.linear_n_key_heads,
+        c.rms_norm_eps,
+        c.linear_output_gate
+    );
     at::Tensor out = small_batch_linear_cuda(gated, w.out_proj);
     comm.all_reduce(out);
     return out;
 }
 
-at::Tensor qwen4_exp_model::moe(const at::Tensor& h, std::int64_t layer, const at::Tensor& counters) const {
-    const moe_weights& m = layers[layer].moe;
+at::Tensor qwen4_exp_model::moe(const at::Tensor& h, const moe_weights& m, const at::Tensor& counters) const {
     at::Tensor logits = small_batch_linear_cuda(h, m.router_and_gate);
     const std::int64_t experts = m.router_and_gate.size(0) - 1;
     at::Tensor routed = routed_experts_cuda(
@@ -811,12 +913,12 @@ qwen4_exp_model::ngram_ids(const ple_weights& w, std::size_t token_layer, const 
 }
 
 at::Tensor
-qwen4_exp_model::ple(const at::Tensor& x, std::int64_t layer, const batch& g, std::span<const kv> lines) const {
-    const ple_weights& w = *layers[layer].ple;
+qwen4_exp_model::ple(const at::Tensor& x, const layer_weights& layer, const batch& g, std::span<const kv> lines) const {
+    const ple_weights& w = *layer.ple;
     const qwen4_exp_config& c = config;
     const std::int64_t ntok = x.size(0);
-    const std::size_t conv_layer = kv_layer_of[layer] + 2;
-    const std::size_t token_layer = conv_layer + 1;
+    const std::size_t conv_layer = layer.ple_conv_kv_layer;
+    const std::size_t token_layer = layer.ple_token_kv_layer;
     std::optional<at::Tensor> cu_seqlens_q;
     if (g.kind != batch_kind::decode) {
         cu_seqlens_q = g.cu_seqlens_q;
@@ -875,18 +977,17 @@ model::output qwen4_exp_model::forward(const batch& b, std::span<const kv> lines
         const layer_weights& w = layers[layer];
         if (w.ple) {
             inject_pending();
-            x = x + ple(x, layer, b, lines);
+            x = x + ple(x, w, b, lines);
         }
         mixed_input mixed = mix_pending(w.attn_hyper_connection);
-        at::Tensor out = indexed_attention(layer) ? attention(mixed.input, layer, b, lines)
-                                                  : deltanet(mixed.input, layer, b, lines);
+        at::Tensor out = w.attention ? attention(mixed.input, w, b, lines) : deltanet(mixed.input, w, b, lines);
         pending.emplace(out, mixed.injection_weights);
         mixed = mix_pending(w.mlp_hyper_connection);
-        pending.emplace(moe(mixed.input, layer, b.arrival_counters), mixed.injection_weights);
+        pending.emplace(moe(mixed.input, w.moe, b.arrival_counters), mixed.injection_weights);
     }
     inject_pending();
     if (mtp) {
-        keep_last_hidden(b, x, lines[kv_layer_of[n_layers]], kv_layer_of[n_layers]);
+        keep_last_hidden(b, x, lines[mtp->layer.kv_layer], mtp->layer.kv_layer);
     }
     return output{.logits = logits(final_mix(logit_inputs(x, b))), .hidden = mtp ? x : at::Tensor()};
 }
@@ -916,7 +1017,7 @@ std::int64_t qwen4_exp_model::hidden_dim() const {
 model::output qwen4_exp_model::draft(const batch& b, const at::Tensor& hidden, std::span<const kv> lines) {
     const mtp_weights& m = *mtp;
     const qwen4_exp_config& c = config;
-    const layer_weights& w = layers[n_layers];
+    const layer_weights& w = m.layer;
     const std::int64_t ntok = b.tokens.size(0);
     at::Tensor embedded = at::linear(
         rmsnorm_cuda(lookup(embed_tokens, first_vocab_row, b.tokens), m.pre_fc_norm_embedding, c.rms_norm_eps),
@@ -930,11 +1031,11 @@ model::output qwen4_exp_model::draft(const batch& b, const at::Tensor& hidden, s
                              .view({ntok, c.hc_count * c.hidden_size});
     at::Tensor whole = at::ones({ntok, c.hc_count}, embedded.options());
     auto [x, mixed] = injected_mix(streams, embedded, whole, w.attn_hyper_connection);
-    at::Tensor attended = attention(mixed.input, n_layers, b, lines);
+    at::Tensor attended = attention(mixed.input, w, b, lines);
     auto [summed, mlp_mixed] = injected_mix(x, attended, mixed.injection_weights, w.mlp_hyper_connection);
     x = hyper_connection_inject_cuda(
         summed,
-        moe(mlp_mixed.input, n_layers, b.arrival_counters),
+        moe(mlp_mixed.input, w.moe, b.arrival_counters),
         mlp_mixed.injection_weights
     );
     at::Tensor rows = logit_inputs(x, b);

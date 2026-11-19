@@ -104,14 +104,6 @@ class qwen4_exp_model : public model, public draft_head {
         std::int64_t first_row;  // of the whole table, the row ngram_embedding starts at
     };
 
-    struct mtp_weights {
-        at::Tensor pre_fc_norm_embedding;  // fp32 1 + weight
-        at::Tensor pre_fc_norm_hidden;  // fp32 1 + weight, [hc_count * hidden], one RMSNorm over every stream
-        at::Tensor fc_embedding;
-        at::Tensor fc_hidden;  // [hidden, hidden], each stream's
-        mixer_weights mixer;
-    };
-
     struct layer_weights {
         hyper_connection_weights attn_hyper_connection;
         hyper_connection_weights mlp_hyper_connection;
@@ -119,6 +111,23 @@ class qwen4_exp_model : public model, public draft_head {
         std::optional<attention_weights> attention;
         std::optional<deltanet_weights> deltanet;
         std::optional<ple_weights> ple;
+        // An indexed attention layer's KV layer.
+        std::size_t kv_layer = 0;
+        // A Gated DeltaNet layer's KV layers.
+        std::size_t state_kv_layer = 0;
+        std::size_t conv_kv_layer = 0;
+        // A PLE layer's KV layers.
+        std::size_t ple_conv_kv_layer = 0;
+        std::size_t ple_token_kv_layer = 0;
+    };
+
+    struct mtp_weights {
+        layer_weights layer;
+        at::Tensor pre_fc_norm_embedding;  // fp32 1 + weight
+        at::Tensor pre_fc_norm_hidden;  // fp32 1 + weight, [hc_count * hidden], one RMSNorm over every stream
+        at::Tensor fc_embedding;
+        at::Tensor fc_hidden;  // [hidden, hidden], each stream's
+        mixer_weights mixer;
     };
 
     // This GPU's head counts.
@@ -141,8 +150,6 @@ class qwen4_exp_model : public model, public draft_head {
     rope_parameters rope;
     // fp32 [rotary_dim / 2]: Hugging Face's RoPE frequencies, which the indexer rotates its queries and blocks by.
     at::Tensor index_inv_freq;
-    // The first KV layer of each layer.
-    std::vector<std::size_t> kv_layer_of;
     std::vector<kv_layer> kv_specs;
     std::vector<kv_layer_shard> kv_shards;
     at::Tensor embed_tokens;
@@ -150,7 +157,6 @@ class qwen4_exp_model : public model, public draft_head {
     std::int64_t first_vocab_row;
     at::Tensor lm_head;
     mixer_weights hyper_connection_mixer;
-    // The decoder layers, then the MTP layer when the model drafts.
     std::vector<layer_weights> layers;
     std::optional<mtp_weights> mtp;
 
@@ -184,12 +190,14 @@ class qwen4_exp_model : public model, public draft_head {
     mixed_input
     mix_normed(const at::Tensor& normed, const at::Tensor& projected, const hyper_connection_weights& w) const;
     at::Tensor final_mix(const at::Tensor& x) const;
-    at::Tensor attention(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const;
-    at::Tensor deltanet(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const;
-    at::Tensor moe(const at::Tensor& h, std::int64_t layer, const at::Tensor& counters) const;
+    at::Tensor
+    attention(const at::Tensor& h, const layer_weights& layer, const batch& g, std::span<const kv> lines) const;
+    at::Tensor
+    deltanet(const at::Tensor& h, const layer_weights& layer, const batch& g, std::span<const kv> lines) const;
+    at::Tensor moe(const at::Tensor& h, const moe_weights& m, const at::Tensor& counters) const;
     // Each token's n-gram ids into the layer's table, [ntok, n-gram heads], updating its token lines.
     at::Tensor ngram_ids(const ple_weights& w, std::size_t token_layer, const batch& g, const kv& lines) const;
-    at::Tensor ple(const at::Tensor& x, std::int64_t layer, const batch& g, std::span<const kv> lines) const;
+    at::Tensor ple(const at::Tensor& x, const layer_weights& layer, const batch& g, std::span<const kv> lines) const;
 
   public:
     // weights are this GPU's parts, on the lines' device, in the attention lines' dtype; the PLE buffers are int64.

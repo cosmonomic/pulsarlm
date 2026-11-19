@@ -3,6 +3,7 @@
 #include "pulsarlm/engine/model/paged_forward.hpp"
 #include "pulsarlm/engine/model/partial_rope.hpp"
 #include "pulsarlm/kernels/ops.hpp"
+#include "weights.hpp"
 
 #include <ATen/ATen.h>
 
@@ -13,6 +14,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -22,16 +24,7 @@ namespace {
 
 const std::string prefix = "model.language_model.";
 
-at::Tensor need(const c10::Dict<std::string, at::Tensor>& weights, const std::string& name) {
-    if (!weights.contains(name)) {
-        throw std::invalid_argument(std::format("qwen3_5_model: missing weight {:?}", name));
-    }
-    return weights.at(name);
-}
-
-at::Tensor need_text(const c10::Dict<std::string, at::Tensor>& weights, const std::string& name) {
-    return need(weights, prefix + name);
-}
+constexpr std::string_view model_name = "qwen3_5_model";
 
 bool quantized(const c10::Dict<std::string, at::Tensor>& weights, const std::string& name) {
     return weights.contains(name + ".weight_scale_inv");
@@ -52,12 +45,17 @@ linear need_linear(
     const std::optional<fp8_block>& block,
     at::Device device
 ) {
-    at::Tensor weight = need(weights, name + ".weight");
+    at::Tensor weight = required_weight(weights, model_name, name + ".weight");
     if (!quantized(weights, name)) {
         return linear::dense(std::move(weight));
     }
     const fp8_block& b = block_of(block, name);
-    return linear::fp8(weight.to(device), need(weights, name + ".weight_scale_inv").to(device), b.n, b.k);
+    return linear::fp8(
+        weight.to(device),
+        required_weight(weights, model_name, name + ".weight_scale_inv").to(device),
+        b.n,
+        b.k
+    );
 }
 
 // permute reorders a linear's output rows. An fp8 linear's scales expand to one per row first, since the permutation
@@ -70,12 +68,12 @@ linear need_permuted_linear(
     at::Device device,
     row_permutation permute
 ) {
-    const at::Tensor weight = need(weights, name + ".weight").to(device);
+    const at::Tensor weight = required_weight(weights, model_name, name + ".weight").to(device);
     if (!quantized(weights, name)) {
         return linear::dense(permute(weight));
     }
     const fp8_block& b = block_of(block, name);
-    const at::Tensor row_scale = need(weights, name + ".weight_scale_inv")
+    const at::Tensor row_scale = required_weight(weights, model_name, name + ".weight_scale_inv")
                                      .to(device)
                                      .repeat_interleave(b.n, 0)
                                      .narrow(0, 0, weight.size(0));
@@ -126,8 +124,8 @@ qwen3_5_model::qwen3_5_model(
 : config(std::move(config)),
   comm(std::move(comm)),
   n_layers(static_cast<std::int64_t>(this->config.layer_types.size())),
-  embed_tokens(need_text(weights, "embed_tokens.weight")),
-  norm(zero_centered(need_text(weights, "norm.weight"))) {
+  embed_tokens(required_weight(weights, model_name, prefix + "embed_tokens.weight")),
+  norm(zero_centered(required_weight(weights, model_name, prefix + "norm.weight"))) {
     const qwen3_5_config& c = this->config;
     const auto rotary_dim = static_cast<std::int64_t>(std::llround(c.partial_rotary_factor * c.head_dim));
     if (rotary_dim % 2 != 0 || rotary_dim > c.head_dim || c.head_dim % 2 != 0) {
@@ -175,19 +173,40 @@ qwen3_5_model::qwen3_5_model(
     // holds the pages the other attention layers hold.
     auto load_layer = [&](const std::string& p, bool attends, bool drafts) {
         layer_weights w{
-            .input_layernorm = zero_centered(need(weights, p + "input_layernorm.weight")),
-            .post_attention_layernorm = zero_centered(need(weights, p + "post_attention_layernorm.weight")),
+            .input_layernorm = zero_centered(required_weight(weights, model_name, p + "input_layernorm.weight")),
+            .post_attention_layernorm = zero_centered(
+                required_weight(weights, model_name, p + "post_attention_layernorm.weight")
+            ),
             .gate_proj = need_linear(weights, p + "mlp.gate_proj", c.fp8_weight_block, device),
             .up_proj = need_linear(weights, p + "mlp.up_proj", c.fp8_weight_block, device),
             .down_proj = need_linear(weights, p + "mlp.down_proj", c.fp8_weight_block, device),
         };
-        kv_layer_of.push_back(kv_shards.size());
         if (attends) {
             const std::string a = p + "self_attn.";
-            check_size(need(weights, a + "q_proj.weight"), 0, n_heads * 2 * c.head_dim, a + "q_proj.weight");
-            check_size(need(weights, a + "k_proj.weight"), 0, n_kv_heads * c.head_dim, a + "k_proj.weight");
-            check_size(need(weights, a + "v_proj.weight"), 0, n_kv_heads * c.head_dim, a + "v_proj.weight");
-            check_size(need(weights, a + "o_proj.weight"), 1, n_heads * c.head_dim, a + "o_proj.weight");
+            check_size(
+                required_weight(weights, model_name, a + "q_proj.weight"),
+                0,
+                n_heads * 2 * c.head_dim,
+                a + "q_proj.weight"
+            );
+            check_size(
+                required_weight(weights, model_name, a + "k_proj.weight"),
+                0,
+                n_kv_heads * c.head_dim,
+                a + "k_proj.weight"
+            );
+            check_size(
+                required_weight(weights, model_name, a + "v_proj.weight"),
+                0,
+                n_kv_heads * c.head_dim,
+                a + "v_proj.weight"
+            );
+            check_size(
+                required_weight(weights, model_name, a + "o_proj.weight"),
+                1,
+                n_heads * c.head_dim,
+                a + "o_proj.weight"
+            );
             w.attention = attention_weights{
                 .q_proj = need_permuted_linear(
                     weights,
@@ -205,9 +224,12 @@ qwen3_5_model::qwen3_5_model(
                 ),
                 .v_proj = need_linear(weights, a + "v_proj", c.fp8_weight_block, device),
                 .o_proj = need_linear(weights, a + "o_proj", c.fp8_weight_block, device),
-                .q_norm = zero_centered(need(weights, a + "q_norm.weight")).index_select(0, permutation),
-                .k_norm = zero_centered(need(weights, a + "k_norm.weight")).index_select(0, permutation),
+                .q_norm = zero_centered(required_weight(weights, model_name, a + "q_norm.weight"))
+                              .index_select(0, permutation),
+                .k_norm = zero_centered(required_weight(weights, model_name, a + "k_norm.weight"))
+                              .index_select(0, permutation),
             };
+            w.kv_layer = kv_shards.size();
             kv_shards.push_back(
                 kv_layer_shard{
                     .full =
@@ -223,25 +245,56 @@ qwen3_5_model::qwen3_5_model(
             );
         } else {
             const std::string l = p + "linear_attn.";
-            check_size(need(weights, l + "in_proj_qkv.weight"), 0, conv_channels, l + "in_proj_qkv.weight");
-            check_size(need(weights, l + "in_proj_z.weight"), 0, value_dim, l + "in_proj_z.weight");
-            check_size(need(weights, l + "in_proj_b.weight"), 0, linear_n_value_heads, l + "in_proj_b.weight");
-            check_size(need(weights, l + "in_proj_a.weight"), 0, linear_n_value_heads, l + "in_proj_a.weight");
-            check_size(need(weights, l + "conv1d.weight"), 0, conv_channels, l + "conv1d.weight");
-            check_size(need(weights, l + "dt_bias"), 0, linear_n_value_heads, l + "dt_bias");
-            check_size(need(weights, l + "A_log"), 0, linear_n_value_heads, l + "A_log");
-            check_size(need(weights, l + "out_proj.weight"), 1, value_dim, l + "out_proj.weight");
+            check_size(
+                required_weight(weights, model_name, l + "in_proj_qkv.weight"),
+                0,
+                conv_channels,
+                l + "in_proj_qkv.weight"
+            );
+            check_size(
+                required_weight(weights, model_name, l + "in_proj_z.weight"),
+                0,
+                value_dim,
+                l + "in_proj_z.weight"
+            );
+            check_size(
+                required_weight(weights, model_name, l + "in_proj_b.weight"),
+                0,
+                linear_n_value_heads,
+                l + "in_proj_b.weight"
+            );
+            check_size(
+                required_weight(weights, model_name, l + "in_proj_a.weight"),
+                0,
+                linear_n_value_heads,
+                l + "in_proj_a.weight"
+            );
+            check_size(
+                required_weight(weights, model_name, l + "conv1d.weight"),
+                0,
+                conv_channels,
+                l + "conv1d.weight"
+            );
+            check_size(required_weight(weights, model_name, l + "dt_bias"), 0, linear_n_value_heads, l + "dt_bias");
+            check_size(required_weight(weights, model_name, l + "A_log"), 0, linear_n_value_heads, l + "A_log");
+            check_size(
+                required_weight(weights, model_name, l + "out_proj.weight"),
+                1,
+                value_dim,
+                l + "out_proj.weight"
+            );
             w.deltanet = deltanet_weights{
                 .in_proj_qkv = need_linear(weights, l + "in_proj_qkv", c.fp8_weight_block, device),
                 .in_proj_z = need_linear(weights, l + "in_proj_z", c.fp8_weight_block, device),
                 .in_proj_b = need_linear(weights, l + "in_proj_b", c.fp8_weight_block, device),
                 .in_proj_a = need_linear(weights, l + "in_proj_a", c.fp8_weight_block, device),
-                .conv = need(weights, l + "conv1d.weight"),
-                .dt_bias = need(weights, l + "dt_bias").to(at::kFloat),
-                .neg_a = -need(weights, l + "A_log").to(at::kFloat).exp(),
-                .norm = need(weights, l + "norm.weight"),
+                .conv = required_weight(weights, model_name, l + "conv1d.weight"),
+                .dt_bias = required_weight(weights, model_name, l + "dt_bias").to(at::kFloat),
+                .neg_a = -required_weight(weights, model_name, l + "A_log").to(at::kFloat).exp(),
+                .norm = required_weight(weights, model_name, l + "norm.weight"),
                 .out_proj = need_linear(weights, l + "out_proj", c.fp8_weight_block, device),
             };
+            w.state_kv_layer = kv_shards.size();
             kv_shards.push_back(
                 kv_layer_shard{
                     .full =
@@ -257,6 +310,7 @@ qwen3_5_model::qwen3_5_model(
                     .rows = {row_range(rank * linear_n_value_heads, linear_n_value_heads)},
                 }
             );
+            w.conv_kv_layer = kv_shards.size();
             kv_shards.push_back(
                 kv_layer_shard{
                     .full =
@@ -280,26 +334,33 @@ qwen3_5_model::qwen3_5_model(
                 }
             );
         }
-        layers.push_back(std::move(w));
+        return w;
     };
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
-        load_layer(prefix + "layers." + std::to_string(layer) + ".", full_attention(layer), false);
+        layers.push_back(load_layer(prefix + "layers." + std::to_string(layer) + ".", full_attention(layer), false));
     }
     if (weights.contains("mtp.fc.weight")) {
+        at::Tensor pre_fc_norm_embedding = zero_centered(
+            required_weight(weights, model_name, "mtp.pre_fc_norm_embedding.weight")
+        );
+        at::Tensor pre_fc_norm_hidden = zero_centered(
+            required_weight(weights, model_name, "mtp.pre_fc_norm_hidden.weight")
+        );
+        at::Tensor fc = required_weight(weights, model_name, "mtp.fc.weight");
+        at::Tensor mtp_norm = zero_centered(required_weight(weights, model_name, "mtp.norm.weight"));
+        check_size(fc, 1, 2 * c.hidden_size, "mtp.fc.weight");
         mtp = mtp_weights{
-            .pre_fc_norm_embedding = zero_centered(need(weights, "mtp.pre_fc_norm_embedding.weight")),
-            .pre_fc_norm_hidden = zero_centered(need(weights, "mtp.pre_fc_norm_hidden.weight")),
-            .fc = need(weights, "mtp.fc.weight"),
-            .norm = zero_centered(need(weights, "mtp.norm.weight")),
+            .pre_fc_norm_embedding = std::move(pre_fc_norm_embedding),
+            .pre_fc_norm_hidden = std::move(pre_fc_norm_hidden),
+            .fc = std::move(fc),
+            .norm = std::move(mtp_norm),
+            .layer = load_layer("mtp.layers.0.", true, true),
         };
-        check_size(mtp->fc, 1, 2 * c.hidden_size, "mtp.fc.weight");
-        load_layer("mtp.layers.0.", true, true);
     }
 }
 
-// Layer n_layers is the MTP layer, a full-attention layer.
 bool qwen3_5_model::full_attention(std::int64_t layer) const {
-    return layer == n_layers || config.layer_types[layer] == qwen3_5_layer_type::full_attention;
+    return config.layer_types[layer] == qwen3_5_layer_type::full_attention;
 }
 
 // The full layers, cut along the line's first dimension to this rank's rows; an attention layer's query heads are
@@ -327,12 +388,16 @@ std::vector<kv_layer_shard> qwen3_5_model::kv_layer_shards() const {
     return kv_shards;
 }
 
-at::Tensor
-qwen3_5_model::attention(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const {
-    const attention_weights& w = *layers[layer].attention;
+at::Tensor qwen3_5_model::attention(
+    const at::Tensor& h,
+    const layer_weights& layer,
+    const batch& g,
+    std::span<const kv> lines
+) const {
+    const attention_weights& w = *layer.attention;
     const qwen3_5_config& c = config;
     const std::int64_t ntok = h.size(0);
-    const std::size_t kv_index = kv_layer_of[layer];
+    const std::size_t kv_index = layer.kv_layer;
 
     at::Tensor query_gate = w.q_proj.apply(h).view({ntok, n_heads, 2 * c.head_dim});
     at::Tensor q = rmsnorm_cuda(query_gate.narrow(-1, 0, c.head_dim), w.q_norm, c.rms_norm_eps);
@@ -347,81 +412,30 @@ qwen3_5_model::attention(const at::Tensor& h, std::int64_t layer, const batch& g
     return out;
 }
 
-at::Tensor
-qwen3_5_model::deltanet(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const {
-    const deltanet_weights& w = *layers[layer].deltanet;
-    const qwen3_5_config& c = config;
-    const std::int64_t ntok = h.size(0);
-    const std::size_t state_layer = kv_layer_of[layer];
-    const std::size_t conv_layer = state_layer + 1;
-    std::optional<at::Tensor> cu_seqlens_q;
-    if (g.kind != batch_kind::decode) {
-        cu_seqlens_q = g.cu_seqlens_q;
-    }
-    const state_rows window_rows = window_layer_rows(g, conv_layer);
-    const state_rows state_rows = state_layer_rows(g, state_layer);
-    at::Tensor gated;
-    if (g.kind == batch_kind::verify) {
-        const std::int64_t sequences = window_rows.lines.size(0);
-        TORCH_CHECK(
-            sequences > 0 && ntok > 0 && ntok % sequences == 0,
-            "qwen3_5_model: a verify batch of ",
-            ntok,
-            " tokens does not hold the same count for each of its ",
-            sequences,
-            " sequences"
-        );
-        const std::int64_t per_sequence = ntok / sequences;
-        at::Tensor convolved = causal_conv_verify_cuda(
-            w.in_proj_qkv.apply(h),
-            w.conv,
-            lines[conv_layer].k,
-            window_rows,
-            per_sequence,
-            1
-        );
-        gated = gated_delta_rule_verify_cuda(
-            convolved,
-            w.in_proj_a.apply(h),
-            w.in_proj_b.apply(h),
-            w.dt_bias,
-            w.neg_a,
-            lines[state_layer].k,
-            state_rows,
-            per_sequence,
-            linear_n_key_heads,
-            w.in_proj_z.apply(h),
-            w.norm,
-            c.rms_norm_eps,
-            gate_activation::silu,
-            g.arrival_counters
-        );
-    } else {
-        at::Tensor convolved = causal_conv_cuda(
-            w.in_proj_qkv.apply(h),
-            w.conv,
-            lines[conv_layer].k,
-            window_rows,
-            cu_seqlens_q,
-            1
-        );
-        gated = gated_delta_rule_cuda(
-            convolved,
-            w.in_proj_a.apply(h),
-            w.in_proj_b.apply(h),
-            w.dt_bias,
-            w.neg_a,
-            lines[state_layer].k,
-            state_rows,
-            cu_seqlens_q,
-            linear_n_key_heads,
-            w.in_proj_z.apply(h),
-            w.norm,
-            c.rms_norm_eps,
-            gate_activation::silu,
-            g.arrival_counters
-        );
-    }
+at::Tensor qwen3_5_model::deltanet(
+    const at::Tensor& h,
+    const layer_weights& layer,
+    const batch& g,
+    std::span<const kv> lines
+) const {
+    const deltanet_weights& w = *layer.deltanet;
+    at::Tensor gated = gated_deltanet(
+        g,
+        gated_deltanet_inputs{
+            .qkv = w.in_proj_qkv.apply(h),
+            .a = w.in_proj_a.apply(h),
+            .b = w.in_proj_b.apply(h),
+            .z = w.in_proj_z.apply(h),
+        },
+        gated_deltanet_weights{.conv = w.conv, .dt_bias = w.dt_bias, .neg_a = w.neg_a, .norm = w.norm},
+        lines[layer.state_kv_layer],
+        lines[layer.conv_kv_layer],
+        layer.state_kv_layer,
+        layer.conv_kv_layer,
+        linear_n_key_heads,
+        config.rms_norm_eps,
+        gate_activation::silu
+    );
     at::Tensor out = w.out_proj.apply(gated);
     comm.all_reduce(out);
     return out;
@@ -437,12 +451,15 @@ at::Tensor qwen3_5_model::embed(const at::Tensor& tokens) const {
     return x;
 }
 
-at::Tensor
-qwen3_5_model::decoder_layer(const at::Tensor& x, std::int64_t layer, const batch& g, std::span<const kv> lines) const {
+at::Tensor qwen3_5_model::decoder_layer(
+    const at::Tensor& x,
+    const layer_weights& w,
+    const batch& g,
+    std::span<const kv> lines
+) const {
     const double eps = config.rms_norm_eps;
-    const layer_weights& w = layers[layer];
     at::Tensor h = rmsnorm_cuda(x, w.input_layernorm, eps);
-    at::Tensor mixed = x + (full_attention(layer) ? attention(h, layer, g, lines) : deltanet(h, layer, g, lines));
+    at::Tensor mixed = x + (w.attention ? attention(h, w, g, lines) : deltanet(h, w, g, lines));
     at::Tensor h2 = rmsnorm_cuda(mixed, w.post_attention_layernorm, eps);
     at::Tensor mlp = w.down_proj.apply(at::silu(w.gate_proj.apply(h2)) * w.up_proj.apply(h2));
     comm.all_reduce(mlp);
@@ -468,13 +485,13 @@ model::output qwen3_5_model::forward(const batch& b, std::span<const kv> lines) 
     );
     at::Tensor x = embed(b.tokens);
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
-        x = decoder_layer(x, layer, b, lines);
+        x = decoder_layer(x, layers[layer], b, lines);
     }
     if (!mtp) {
         return output{.logits = logits(rmsnorm_cuda(logit_inputs(x, b), norm, config.rms_norm_eps))};
     }
     at::Tensor normed = rmsnorm_cuda(x, norm, config.rms_norm_eps);
-    keep_last_hidden(b, normed, lines[kv_layer_of[n_layers]], kv_layer_of[n_layers]);
+    keep_last_hidden(b, normed, lines[mtp->layer.kv_layer], mtp->layer.kv_layer);
     return output{.logits = logits(logit_inputs(normed, b)), .hidden = normed};
 }
 
@@ -497,7 +514,7 @@ model::output qwen3_5_model::draft(const batch& b, const at::Tensor& hidden, std
     at::Tensor embedded = rmsnorm_cuda(embed(b.tokens), m.pre_fc_norm_embedding, eps);
     at::Tensor previous = rmsnorm_cuda(hidden.contiguous(), m.pre_fc_norm_hidden, eps);
     at::Tensor x = at::linear(at::cat({embedded, previous}, -1), m.fc);
-    x = decoder_layer(x, n_layers, b, lines);
+    x = decoder_layer(x, m.layer, b, lines);
     at::Tensor normed = rmsnorm_cuda(x, m.norm, eps);
     return output{.logits = logits(logit_inputs(normed, b)), .hidden = normed};
 }
