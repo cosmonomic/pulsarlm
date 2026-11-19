@@ -15,7 +15,6 @@
 #include <vector>
 
 #include "pulsarlm/digest.hpp"
-#include "pulsarlm/engine/decode_graphs.hpp"
 #include "pulsarlm/engine/event_loop.hpp"
 #include "pulsarlm/engine/kv_cache.hpp"
 #include "pulsarlm/engine/model/interface.hpp"
@@ -24,6 +23,7 @@
 #include "pulsarlm/engine/request.hpp"
 #include "pulsarlm/engine/request_callbacks.hpp"
 #include "pulsarlm/engine/sequence.hpp"
+#include "pulsarlm/engine/step_graphs.hpp"
 #include "pulsarlm/slot_map.hpp"
 
 namespace pulsarlm {
@@ -70,9 +70,9 @@ class executor {
     page_store& store;
     // Per shard, one kv per KV layer.
     std::vector<std::vector<kv>> lines;
-    // One per shard, or none when decode groups forward without graphs.
-    std::vector<std::unique_ptr<decode_graphs>> graphs;
-    // The page-table width of the decode graphs, the pages of the longest view they cover.
+    // One per shard, or none when decode and verify groups forward without graphs.
+    std::vector<std::unique_ptr<step_graphs>> graphs;
+    // The page-table width of the graphs, the pages of the longest view they cover.
     std::optional<std::size_t> graph_pages;
     // A recurrent layer's state_slots are draft_state_slots for a state and 1 for a window. A layer's mass_heads are
     // the query heads it measures mass and evicts pages in, those of every attention layer reading a full-attention
@@ -126,8 +126,8 @@ class executor {
     // state the store returned does not reference.
     task<std::expected<void, page_error>> own_pages_from(sequence& seq, std::size_t first_index);
     void release_lines(sequence& seq) noexcept;
-    // Captures each shard's decode graphs of up to decode_graphs::startup_sequences sequences, every shard at once.
-    void capture_decode_graphs();
+    // Captures each shard's graphs of up to step_graphs::startup_sequences sequences, every shard at once.
+    void capture_step_graphs();
     // The bytes of each device's pool that seq's lines take now.
     std::size_t device_memory(const sequence& seq) const noexcept;
     // Raises seq's device_memory_peak to its device_memory.
@@ -193,7 +193,7 @@ class executor {
     // to the store on copy_streams[s], which the caller synchronizes before freeing what the copies read; the cache holds one layer
     // per entry of each model's kv_layers(), and the shards agree on which layers are recurrent or sliding. store is the
     // cache's. root is the engine's root digest (make_root_digest). With graph_pages, a decode group whose sequences'
-    // tables fit graph_pages pages replays a decode_graphs graph over tables that wide, and so does a verify group. A step drafts
+    // tables fit graph_pages pages replays a step_graphs graph over tables that wide, and so does a verify group. A step drafts
     // draft_tokens tokens per sequence with the shards' draft heads, which they have when draft_tokens is above 0, and
     // the cache's recurrent layers are laid out for them (recurrent_state).
     executor(

@@ -1,6 +1,6 @@
 #include "pulsarlm/engine/model/qwen3.hpp"
 
-#include "pulsarlm/engine/decode_graphs.hpp"
+#include "pulsarlm/engine/step_graphs.hpp"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAFunctions.h>
@@ -16,7 +16,7 @@
 
 // qwen3_model's paged forward against a dense ATen Qwen3: chunked prefill then decode over pages scattered across the
 // lines, checking the logits, the unrotated K the lines hold, and the per-page attention mass. The decode steps forward
-// through the model or through decode_graphs.
+// through the model or through step_graphs.
 
 namespace {
 
@@ -233,7 +233,7 @@ void check_against_dense(at::ScalarType dtype, double tolerance, bool graphs) {
 
     // The graphs read each decode step's token from row 2 of samples.
     at::Tensor samples = at::zeros({4}, cuda(at::kLong));
-    pulsarlm::decode_graphs decode(
+    pulsarlm::step_graphs decode(
         model,
         kv,
         view_lines.size(),

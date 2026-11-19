@@ -126,7 +126,7 @@ executor::executor(
         for (std::size_t shard = 0; shard < this->shards.size(); shard++) {
             c10::cuda::CUDAGuard device_guard(lines[shard].front().k.device());
             graphs.push_back(
-                std::make_unique<decode_graphs>(
+                std::make_unique<step_graphs>(
                     *this->shards[shard],
                     lines[shard],
                     *this->graph_pages,
@@ -138,7 +138,7 @@ executor::executor(
                 )
             );
         }
-        capture_decode_graphs();
+        capture_step_graphs();
     }
 }
 
@@ -425,7 +425,7 @@ task<void> executor::enqueue_on_shard(batch& b, std::size_t shard) {
 }
 
 // Each shard on its own thread, as the eager forwards' collectives need every shard at once.
-void executor::capture_decode_graphs() {
+void executor::capture_step_graphs() {
     std::vector<std::exception_ptr> failures(shards.size());
     std::vector<std::thread> threads;
     for (std::size_t shard = 0; shard < shards.size(); shard++) {

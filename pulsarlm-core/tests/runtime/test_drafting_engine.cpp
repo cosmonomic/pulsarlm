@@ -468,6 +468,31 @@ served serve(pulsarlm::engine& e, pulsarlm::request&& r) {
     };
 }
 
+// Serves requests on e at once; the results are in request order.
+std::vector<served> serve_all(pulsarlm::engine& e, std::vector<pulsarlm::request>&& requests) {
+    std::vector<std::shared_ptr<request_results>> recorded_results;
+    for (pulsarlm::request& r : requests) {
+        recorded_results.push_back(std::make_shared<request_results>());
+        e.submit(std::move(r), std::make_unique<recording_callbacks>(recorded_results.back()));
+    }
+    std::vector<served> all;
+    for (const std::shared_ptr<request_results>& results : recorded_results) {
+        std::unique_lock lock(results->mutex);
+        REQUIRE(results->end_condition.wait_for(lock, end_timeout, [&] { return results->end.has_value(); }));
+        REQUIRE(e.exception() == nullptr);
+        REQUIRE(results->end->has_value());
+        all.push_back(
+            served{
+                .tokens = results->tokens,
+                .end_state = std::move(**results->end),
+                .decodes = results->decodes,
+                .statistics = results->statistics,
+            }
+        );
+    }
+    return all;
+}
+
 token_list random_tokens(std::size_t count, std::uint32_t seed) {
     std::mt19937 generator(seed);
     std::uniform_int_distribution<std::int64_t> token(0, vocab - 1);
@@ -748,6 +773,95 @@ TEST_CASE("Qwen4-Exp drafting emits the tokens and reaches the state it does wit
         CHECK(*drafting.verify_steps < decode_tokens - 1);
         CHECK(*drafting.verify_rows > decode_tokens - 1);
     }
+}
+
+// A verify step that filters is captured at its first use, with mass and without, so the model forwards a verify
+// group once or twice during the request with graphs.
+TEST_CASE("Qwen4-Exp drafting with top_k and top_p samples from graphs as it does without graphs", "[runtime][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const std::size_t draft_tokens = GENERATE(1, 2);
+    // top_k drops tokens that top_p keeps in the first setting, and top_p tokens that top_k keeps in the second.
+    const auto [top_k, top_p] = GENERATE(table<std::size_t, double>({{20, 0.95}, {200, 0.5}}));
+    INFO(draft_tokens << " drafts with top_k " << top_k << " and top_p " << top_p);
+    const weights w(at::kFloat, base_dims, /*drafts=*/true);
+    const auto request = [&] {
+        return pulsarlm::request{
+            .tokens = random_tokens(prompt_tokens, 8),
+            .sampling = pulsarlm::sampling_params{.temperature = 2.5, .top_p = top_p, .top_k = top_k, .seed = 7},
+            .max_tokens = decode_tokens,
+            .eviction = eviction,
+        };
+    };
+    drafting_engine eager = make_engine(w, draft_tokens, {}, /*decode_graphs=*/false);
+    drafting_engine replayed = make_engine(w, draft_tokens, {}, /*decode_graphs=*/true);
+    const std::size_t startup_verify_steps = *replayed.verify_steps;
+    served expected = serve(*eager.engine, request());
+    served got = serve(*replayed.engine, request());
+
+    REQUIRE(expected.tokens.size() == decode_tokens);
+    CHECK(got.tokens == expected.tokens);
+    check_same_state(got.end_state, expected.end_state);
+    CHECK(replayed.engine->stat().accepted_draft_count == eager.engine->stat().accepted_draft_count);
+    const std::size_t captured_step_count = *replayed.verify_steps - startup_verify_steps;
+    CHECK(captured_step_count >= 1);
+    CHECK(captured_step_count <= 2);
+}
+
+// The four prompts fit one step's prefill, so the sequences verify in one group for most of their tokens, each row
+// sampled by its own sequence's parameters and seed. With top_k and top_p every sequence that draws filters, as a row's
+// draw depends on whether a row of its batch filters (sampling_inputs::filters).
+TEST_CASE(
+    "Qwen4-Exp drafting samples each sequence of a group by its own parameters with graphs as without",
+    "[runtime][cuda]"
+) {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const bool filters = GENERATE(false, true);
+    INFO((filters ? "with" : "without") << " top_k and top_p");
+    const std::vector<pulsarlm::sampling_params> sampling = filters
+        ? std::vector<pulsarlm::sampling_params>{
+            {.temperature = 2.0, .top_k = 50, .seed = 11},
+            {.temperature = 0.0, .seed = 12},
+            {.temperature = 2.5, .top_k = 20, .seed = 13},
+            {.temperature = 3.0, .top_p = 0.9, .seed = 14},
+        }
+        : std::vector<pulsarlm::sampling_params>{
+            {.temperature = 2.0, .seed = 11},
+            {.temperature = 0.0, .seed = 12},
+            {.temperature = 1.6, .seed = 13},
+            {.temperature = 2.4, .seed = 14},
+        };
+    const std::size_t group_prompt_tokens = 8;
+    const weights w(at::kFloat, base_dims, /*drafts=*/true);
+    const auto requests = [&] {
+        std::vector<pulsarlm::request> all;
+        for (std::size_t s = 0; s < sampling.size(); s++) {
+            all.push_back(
+                pulsarlm::request{
+                    .tokens = random_tokens(group_prompt_tokens, 20 + static_cast<std::uint32_t>(s)),
+                    .sampling = sampling[s],
+                    .max_tokens = decode_tokens,
+                    .eviction = eviction,
+                }
+            );
+        }
+        return all;
+    };
+    drafting_engine eager = make_engine(w, 2, {}, /*decode_graphs=*/false);
+    drafting_engine replayed = make_engine(w, 2, {}, /*decode_graphs=*/true);
+    std::vector<served> expected = serve_all(*eager.engine, requests());
+    std::vector<served> got = serve_all(*replayed.engine, requests());
+
+    for (std::size_t s = 0; s < sampling.size(); s++) {
+        INFO("sequence " << s);
+        REQUIRE(expected[s].tokens.size() == decode_tokens);
+        CHECK(got[s].tokens == expected[s].tokens);
+        check_same_state(got[s].end_state, expected[s].end_state);
+    }
+    CHECK(replayed.engine->stat().accepted_draft_count > 0);
 }
 
 TEST_CASE("Qwen4-Exp drafting reports per token the drafts that sum to the request's", "[runtime][cuda]") {

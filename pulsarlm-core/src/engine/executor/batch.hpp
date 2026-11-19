@@ -193,7 +193,7 @@ class executor::batch {
         const at::Tensor& stop_tokens,
         cudaStream_t stream,
         std::size_t shard,
-        decode_graphs* graphs,
+        step_graphs* graphs,
         const at::Tensor& samples,
         at::Tensor& counters
     );
@@ -228,6 +228,8 @@ class executor::batch {
         at::Tensor hidden;
         at::Tensor later_shift;
     };
+    // On device, shard's, pulsarlm::count_accepted_tokens of the verify entries' rows of samples, each entry accepting at
+    // most its max_accepted_token_count; empty without verify entries.
     at::Tensor count_accepted_tokens(
         const at::Tensor& samples,
         const at::Tensor& stop_tokens,
@@ -250,7 +252,7 @@ class executor::batch {
         std::size_t shard,
         at::Tensor& counters
     );
-    // Whether the step replays a decode_graphs verify step: every entry verifies and drafts, and the verify group
+    // Whether the step replays a step_graphs verify step: every entry verifies and drafts, and the verify group
     // replays.
     bool steps_replay() const noexcept;
     // Queues on device, shard's, the replay of its verify step from graphs, on_device being the verify group and
@@ -260,7 +262,7 @@ class executor::batch {
         const at::Tensor& verify_mass,
         std::size_t shard,
         at::Device device,
-        decode_graphs* graphs,
+        step_graphs* graphs,
         const at::Tensor& samples
     );
     // Takes into g, the verify group on shard's device, the previous step's next tokens of the entries whose previous

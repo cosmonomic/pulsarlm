@@ -6,6 +6,7 @@
 #include "pulsarlm/engine/model/qwen3_5.hpp"
 #include "pulsarlm/engine/request_callbacks.hpp"
 #include "pulsarlm/engine/scheduler.hpp"
+#include "pulsarlm/engine/step_graphs.hpp"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAFunctions.h>
@@ -16,6 +17,7 @@
 #include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -713,6 +715,76 @@ TEST_CASE("decode graphs sample as the eager forward while steps overlap", "[run
     REQUIRE(eager.tokens.size() == decode_tokens);
     CHECK(replayed.tokens == eager.tokens);
     check_same_state(replayed.end_state, eager.end_state);
+}
+
+// Counts the decode groups it forwards of more sequences than step_graphs captures at startup.
+class wide_group_counting_model final : public pulsarlm::qwen3_5_model {
+  public:
+    std::shared_ptr<std::atomic<std::size_t>> wide_decode_group_count = std::make_shared<std::atomic<std::size_t>>(0);
+
+    using pulsarlm::qwen3_5_model::qwen3_5_model;
+
+    output forward(const batch& b, std::span<const pulsarlm::kv> lines) override {
+        if (b.kind == batch_kind::decode && b.page_tables.size(1) > pulsarlm::step_graphs::startup_sequences) {
+            (*wide_decode_group_count)++;
+        }
+        return pulsarlm::qwen3_5_model::forward(b, lines);
+    }
+};
+
+// A graph of more sequences than the startup graphs is captured in the step that first needs it and replayed after:
+// with graphs the model forwards such a group only at a capture.
+TEST_CASE("decode graphs captured during a step sample as the eager forward", "[runtime][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const std::size_t sequence_count = 12;
+    const c10::Dict<std::string, at::Tensor> weights = full_weights(n_kv_heads);
+    struct run {
+        std::vector<served> all;
+        std::size_t wide_decode_group_count;
+    };
+    const auto serve_all = [&](bool decode_graphs) {
+        auto model = std::make_unique<wide_group_counting_model>(model_config(n_kv_heads), weights);
+        std::shared_ptr<std::atomic<std::size_t>> wide_decode_group_count = model->wide_decode_group_count;
+        auto store = std::make_unique<memory_store>();
+        store->contents = std::make_shared<store_contents>();
+        pulsarlm::engine e(std::move(model), vocab, engine_config(1, decode_graphs), std::move(store));
+        std::vector<std::shared_ptr<request_results>> recorded_results;
+        for (std::size_t s = 0; s < sequence_count; s++) {
+            recorded_results.push_back(std::make_shared<request_results>());
+            e.submit(
+                pulsarlm::request{
+                    .tokens = random_tokens(prompt_tokens, 10 + static_cast<std::uint32_t>(s)),
+                    .sampling = pulsarlm::sampling_params{.temperature = 0.8, .seed = 30 + s},
+                    .max_tokens = decode_tokens,
+                    .eviction = eviction,
+                },
+                std::make_unique<recording_callbacks>(recorded_results.back())
+            );
+        }
+        run finished;
+        for (const std::shared_ptr<request_results>& results : recorded_results) {
+            std::unique_lock lock(results->mutex);
+            REQUIRE(results->end_condition.wait_for(lock, end_timeout, [&] { return results->end.has_value(); }));
+            REQUIRE(e.exception() == nullptr);
+            REQUIRE(results->end->has_value());
+            finished.all.push_back(served{.tokens = results->tokens, .end_state = std::move(**results->end)});
+        }
+        finished.wide_decode_group_count = *wide_decode_group_count;
+        return finished;
+    };
+    const run eager = serve_all(false);
+    const run replayed = serve_all(true);
+
+    for (std::size_t s = 0; s < sequence_count; s++) {
+        INFO("sequence " << s);
+        REQUIRE(eager.all[s].tokens.size() == decode_tokens);
+        CHECK(replayed.all[s].tokens == eager.all[s].tokens);
+        check_same_state(replayed.all[s].end_state, eager.all[s].end_state);
+    }
+    CHECK(replayed.wide_decode_group_count > 0);
+    CHECK(replayed.wide_decode_group_count < eager.wide_decode_group_count);
 }
 
 // The drafting engine's layers are the other's then the MTP layer's, and its root digest differs with its layout, so

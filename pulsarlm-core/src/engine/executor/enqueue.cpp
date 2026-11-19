@@ -81,7 +81,7 @@ void executor::batch::enqueue(
     const at::Tensor& stop_tokens,
     cudaStream_t stream,
     std::size_t shard,
-    decode_graphs* graphs,
+    step_graphs* graphs,
     const at::Tensor& samples,
     at::Tensor& counters
 ) {
@@ -191,7 +191,7 @@ void executor::batch::enqueue_step(
     const at::Tensor& verify_mass,
     std::size_t shard,
     at::Device device,
-    decode_graphs* graphs,
+    step_graphs* graphs,
     const at::Tensor& samples
 ) {
     const auto longs = at::TensorOptions().dtype(at::kLong);
@@ -220,7 +220,7 @@ void executor::batch::enqueue_step(
         max_accepted_token_counts.push_back(static_cast<std::int64_t>(e.max_accepted_token_count));
         key_counts.push_back(static_cast<std::int64_t>(e.draft->key_count));
     }
-    auto [sampled, verified_accepted_counts, next] = graphs->verify_step(
+    const step_graphs::verify_step_outputs outputs = graphs->verify_step(
         on_device,
         sampling,
         on_device_tensor(max_accepted_token_counts),
@@ -229,20 +229,20 @@ void executor::batch::enqueue_step(
         on_device_tensor(later_positions_flat).view({later, sequences}) + shift,
         on_device_tensor(later_key_counts_flat).view({later, sequences}) + shift
     );
-    accepted_token_counts_by_shard[shard] = verified_accepted_counts;
-    shard_next_tokens[shard] = next;
-    samples.narrow(0, 0, sampled.size(0)).copy_(sampled);
+    accepted_token_counts_by_shard[shard] = outputs.accepted_token_counts;
+    shard_next_tokens[shard] = outputs.next_tokens;
+    samples.narrow(0, 0, outputs.samples.size(0)).copy_(outputs.samples);
     if (verify_mass.defined()) {
         verify_group.mass_by_shard[shard] = pinned(verify_mass.sizes(), at::kFloat);
         verify_group.mass_by_shard[shard].copy_(verify_mass, /*non_blocking=*/true);
     }
     if (shard == 0) {
-        sampled_tokens = pinned(sampled.sizes(), at::kLong);
-        sampled_tokens.copy_(sampled, /*non_blocking=*/true);
-        accepted_token_counts = pinned(verified_accepted_counts.sizes(), at::kLong);
-        accepted_token_counts.copy_(verified_accepted_counts, /*non_blocking=*/true);
-        next_tokens = pinned(next.sizes(), at::kLong);
-        next_tokens.copy_(next, /*non_blocking=*/true);
+        sampled_tokens = pinned(outputs.samples.sizes(), at::kLong);
+        sampled_tokens.copy_(outputs.samples, /*non_blocking=*/true);
+        accepted_token_counts = pinned(outputs.accepted_token_counts.sizes(), at::kLong);
+        accepted_token_counts.copy_(outputs.accepted_token_counts, /*non_blocking=*/true);
+        next_tokens = pinned(outputs.next_tokens.sizes(), at::kLong);
+        next_tokens.copy_(outputs.next_tokens, /*non_blocking=*/true);
     }
 }
 
@@ -378,33 +378,26 @@ at::Tensor executor::batch::count_accepted_tokens(
     std::size_t shard,
     at::Device device
 ) const {
-    const auto longs = at::TensorOptions().dtype(at::kLong);
-    // Each verify entry accepts its pending token and its drafts while sample t equals draft t + 1, then the sample
-    // after them, up to and including a stop token, and at most its max_accepted_token_count.
-    at::Tensor accepted_counts = at::empty({0}, at::device(device).dtype(at::kLong));
     const auto verifying = static_cast<std::int64_t>(verify_group.entries.size());
-    if (verifying > 0) {
-        const auto rows = static_cast<std::int64_t>(verify_rows);
-        std::vector<std::int64_t> sample_indices;
-        std::vector<std::int64_t> max_accepted_token_counts;
-        for (const entry& e : verify_group.entries) {
-            for (std::size_t j = 0; j < verify_rows; j++) {
-                sample_indices.push_back(static_cast<std::int64_t>(e.first_sample_row + j));
-            }
-            max_accepted_token_counts.push_back(static_cast<std::int64_t>(e.max_accepted_token_count));
-        }
-        at::Tensor verified = samples.index_select(0, tensor_on_device(sample_indices, longs, device))
-                                  .view({verifying, rows});
-        at::Tensor drafted = verify_tokens[shard].view({verifying, rows}).narrow(1, 1, rows - 1);
-        accepted_counts = verified.narrow(1, 0, rows - 1).eq(drafted).to(at::kLong).cumprod(1).sum(1) + 1;
-        if (stop_tokens.numel() > 0) {
-            at::Tensor stops = at::isin(verified, stop_tokens);
-            at::Tensor first_stop = at::where(stops.any(1), stops.to(at::kLong).argmax(1), rows);
-            accepted_counts = at::minimum(accepted_counts, first_stop + 1);
-        }
-        accepted_counts = at::minimum(accepted_counts, tensor_on_device(max_accepted_token_counts, longs, device));
+    if (verifying == 0) {
+        return at::empty({0}, at::device(device).dtype(at::kLong));
     }
-    return accepted_counts;
+    const auto longs = at::TensorOptions().dtype(at::kLong);
+    const auto rows = static_cast<std::int64_t>(verify_rows);
+    std::vector<std::int64_t> sample_indices;
+    std::vector<std::int64_t> max_accepted_token_counts;
+    for (const entry& e : verify_group.entries) {
+        for (std::size_t j = 0; j < verify_rows; j++) {
+            sample_indices.push_back(static_cast<std::int64_t>(e.first_sample_row + j));
+        }
+        max_accepted_token_counts.push_back(static_cast<std::int64_t>(e.max_accepted_token_count));
+    }
+    return pulsarlm::count_accepted_tokens(
+        samples.index_select(0, tensor_on_device(sample_indices, longs, device)).view({verifying, rows}),
+        verify_tokens[shard].view({verifying, rows}).narrow(1, 1, rows - 1),
+        stop_tokens,
+        tensor_on_device(max_accepted_token_counts, longs, device)
+    );
 }
 
 std::optional<executor::batch::first_draft> executor::batch::enqueue_first_draft_pass(

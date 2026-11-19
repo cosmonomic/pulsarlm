@@ -107,4 +107,21 @@ sample(const at::Tensor& logits, std::span<const sampling_params> params, std::s
     return sample(logits, params, draws, at::Tensor());
 }
 
+// A sequence accepts while sample t equals draft t + 1, then the sample after them.
+at::Tensor count_accepted_tokens(
+    const at::Tensor& verified,
+    const at::Tensor& drafted,
+    const at::Tensor& stop_tokens,
+    const at::Tensor& max_accepted_token_counts
+) {
+    const std::int64_t rows = verified.size(1);
+    at::Tensor accepted_counts = verified.narrow(1, 0, rows - 1).eq(drafted).to(at::kLong).cumprod(1).sum(1) + 1;
+    if (stop_tokens.numel() > 0) {
+        at::Tensor stops = at::isin(verified, stop_tokens);
+        at::Tensor first_stop = at::where(stops.any(1), stops.to(at::kLong).argmax(1), rows);
+        accepted_counts = at::minimum(accepted_counts, first_stop + 1);
+    }
+    return at::minimum(accepted_counts, max_accepted_token_counts);
+}
+
 }  // namespace pulsarlm
