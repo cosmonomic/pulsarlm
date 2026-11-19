@@ -71,6 +71,8 @@ struct store_contents {
     std::vector<lease_id_type> releases;
     lease_id_type next_lease_id = 100;
     bool lookup_fails = false;
+    // A lookup stops the loop and never completes.
+    bool lookup_stops_loop = false;
     // The put, counting from 1, that fails with oom.
     std::optional<std::size_t> failing_put;
 };
@@ -285,6 +287,11 @@ struct memory_store final : pulsarlm::page_store {
         );
         if (shared->lookup_fails) {
             co_return std::unexpected(pulsarlm::page_error::miss);
+        }
+        if (shared->lookup_stops_loop) {
+            event_loop::current()->stop();
+            pulsarlm::event never_set;
+            co_await never_set;
         }
         lease_id_type lease_id = shared->next_lease_id++;
         shared->leases.push_back(lease_id);
@@ -1327,6 +1334,31 @@ TEST_CASE("a submitted request whose task is destroyed without being spawned end
     REQUIRE(f.store->leases.empty());
 }
 
+TEST_CASE("a request whose loop exits while its start reads the stored state ends with loop_exited once") {
+    auto recorded_results = std::make_shared<request_results>();
+    std::shared_ptr<store_contents> store;
+    {
+        fixture f(16);
+        store = f.store;
+        store->lookup_stops_loop = true;
+        {
+            event_loop loop;
+            loop.spawn(
+                f.sched.submit(request{.tokens = {1, 2, 3}, .max_tokens = 10}, make_callbacks(recorded_results))
+            );
+            REQUIRE(loop.run() == nullptr);
+            REQUIRE(store->state_reads.size() == 1);
+            REQUIRE(recorded_results->end_count == 0);
+        }
+        REQUIRE(recorded_results->end_count == 1);
+    }
+    REQUIRE(recorded_results->end_count == 1);
+    REQUIRE(ended_error(*recorded_results) == request_error::loop_exited);
+    REQUIRE(recorded_results->statistics.total_token_count == 0);
+    REQUIRE(recorded_results->statistics.peak_device_memory == 0);
+    REQUIRE(store->leases.empty());
+}
+
 TEST_CASE("a request that finds too few free lines ends with oom without waiting") {
     fixture f(3);
     token_list first{1, 2, 3, 4, 5};
@@ -2236,7 +2268,10 @@ task<void> start_then_stop_loop(
     std::unique_ptr<pulsarlm::request_callbacks> callbacks,
     std::optional<pulsarlm::executor::request_id_type>& started
 ) {
-    started = co_await exec.start(std::move(r), std::move(callbacks));
+    started = co_await exec.start(
+        std::move(r),
+        pulsarlm::executor::unstarted_callbacks(std::move(callbacks), pulsarlm::end_with_loop_exited)
+    );
     event_loop::current()->stop();
 }
 

@@ -24,6 +24,7 @@
 #include "pulsarlm/engine/request_callbacks.hpp"
 #include "pulsarlm/engine/request_state.hpp"
 #include "pulsarlm/engine/step_graphs.hpp"
+#include "pulsarlm/resource.hpp"
 #include "pulsarlm/slot_map.hpp"
 
 namespace pulsarlm {
@@ -31,10 +32,10 @@ namespace pulsarlm {
 // Runs requests on the model: it owns the model shards, the KV cache and the store's side of a request, and does
 // whatever touches them, while the scheduler decides what runs.
 class executor {
-    // A request the executor runs: its callbacks, and its request state once the stored state was read.
+    // A request the executor runs, from the creation of its request state until its end.
     struct running_request {
         std::unique_ptr<request_callbacks> callbacks;
-        std::optional<request_state> state;
+        request_state state;
     };
 
   public:
@@ -62,7 +63,7 @@ class executor {
         bool operator==(const request_ref& other) const noexcept = default;
     };
 
-    // Each request from start until its end.
+    // Each request from the creation of its request state until its end.
     slot_map<running_request> requests;
 
     // Everything the executor keeps on one GPU across steps.
@@ -149,7 +150,7 @@ class executor {
     void update_views(request_state& req);
     // Whether token_count more tokens fill a page of req.
     bool completes_page(const request_state& req, std::size_t token_count) const noexcept;
-    // The request state of id's request, which is not erased and whose stored state start has read.
+    // The request state of id's request, which is not erased.
     request_state& state_of(request_id_type id);
     const request_state& state_of(request_id_type id) const;
     // Calls on_end of running's callbacks with result and statistics and destroys the callbacks.
@@ -222,14 +223,21 @@ class executor {
     );
     ~executor();
 
-    // Serves r with callbacks, which it takes before it first suspends. Returns the request id of r, resuming the newest
-    // state the store holds for a prefix of its tokens, with lines for its first cycle. Returns std::nullopt after it
-    // ended the request through on_end, with value-initialized statistics: with cancelled when the callbacks are
-    // cancelled at the start, before the store is read, with missing_state when the lookup or a page read fails, with
-    // invalid_state when the stored state's head is not a digest of r's full pages, its tail is not a proper prefix
-    // of r's tokens after its head, or one of its layers lists a page hash twice, and with oom when the free lines do
-    // not cover the state's pages and one cycle's tokens. The lease of a request that fails is released before on_end.
-    task<std::optional<request_id_type>> start(request&& r, std::unique_ptr<request_callbacks>&& callbacks);
+    // The callbacks of a request whose state does not exist yet. Destroyed while it still holds them, it ends them
+    // with loop_exited.
+    using unstarted_callbacks = resource<
+        std::unique_ptr<request_callbacks>,
+        void (*)(std::unique_ptr<request_callbacks>&) noexcept>;
+
+    // Serves r with callbacks, which stay in the guard until r's request state exists, so a start destroyed while it
+    // is suspended before then ends them with loop_exited. Returns the request id of r, resuming the newest state the
+    // store holds for a prefix of its tokens, with lines for its first cycle. Returns std::nullopt after it ended the
+    // request through on_end, with value-initialized statistics: with cancelled when the callbacks are cancelled at the
+    // start, before the store is read, with missing_state when the lookup or a page read fails, with invalid_state when
+    // the stored state's head is not a digest of r's full pages, its tail is not a proper prefix of r's tokens after
+    // its head, or one of its layers lists a page hash twice, and with oom when the free lines do not cover the state's
+    // pages and one cycle's tokens. The lease of a request that fails is released before on_end.
+    task<std::optional<request_id_type>> start(request&& r, unstarted_callbacks callbacks);
     // Whether a step of the requests in scheduled can be launched now, before any write-back: no step is launched or the last launched
     // step allows overlap, and so does a step of the requests in scheduled. A step allows overlap when it ends no cycle and, in a model
     // with sliding layers, completes no page, or in an executor whose steps draft, when every entry verifies drafts.
@@ -259,8 +267,8 @@ class executor {
     // when it finished, releases its lease, delivers the state or the error and the statistics through on_end, and
     // erases it.
     task<void> stop(request_id_type id);
-    // Releases the lines and the lease of every request state, delivers error and the request's statistics so far
-    // through on_end, and erases the request. Called when the loop has exited.
+    // Releases the lines and the lease of every request, delivers error and the request's statistics so far through
+    // on_end, and erases the request. Called when the loop has exited.
     void end_requests(request_error error) noexcept;
     // Whether the request has not exited and no launched step forwards its last tokens.
     bool is_steppable(request_id_type id) const;

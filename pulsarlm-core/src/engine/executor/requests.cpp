@@ -42,12 +42,9 @@ request_statistics statistics_of(const request_state& req) {
 
 }  // namespace
 
-task<std::optional<executor::request_id_type>>
-executor::start(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
-    const request_id_type id = requests.emplace(std::move(callbacks));
-    running_request& running = requests[id];
-    if (running.callbacks->cancelled()) {
-        end_request(id, std::unexpected(request_error::cancelled), request_statistics{});
+task<std::optional<executor::request_id_type>> executor::start(request&& r, unstarted_callbacks callbacks) {
+    if (callbacks.value()->cancelled()) {
+        callbacks.release()->on_end(std::unexpected(request_error::cancelled), request_statistics{});
         co_return std::nullopt;
     }
     assert(
@@ -62,7 +59,7 @@ executor::start(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
     std::expected<std::pair<std::shared_ptr<const state>, state::lease_id_type>, page_error>
         lookup = co_await store.read_state(r.tokens, digests);
     if (!lookup) {
-        end_request(id, std::unexpected(request_error::missing_state), request_statistics{});
+        callbacks.release()->on_end(std::unexpected(request_error::missing_state), request_statistics{});
         co_return std::nullopt;
     }
     auto& [stored_state, lease_id] = *lookup;
@@ -71,7 +68,7 @@ executor::start(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
         auto head_digest = std::ranges::find(digests, *stored_state->head);
         if (head_digest == digests.end()) {
             store.release(lease_id);
-            end_request(id, std::unexpected(request_error::invalid_state), request_statistics{});
+            callbacks.release()->on_end(std::unexpected(request_error::invalid_state), request_statistics{});
             co_return std::nullopt;
         }
         stored_pages = static_cast<std::size_t>(head_digest - digests.begin()) + 1;
@@ -81,7 +78,7 @@ executor::start(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
         !std::ranges::equal(stored_state->tail, unstored_tokens.first(stored_state->tail.size())) ||
         std::ranges::any_of(stored_state->layers, lists_page_twice)) {
         store.release(lease_id);
-        end_request(id, std::unexpected(request_error::invalid_state), request_statistics{});
+        callbacks.release()->on_end(std::unexpected(request_error::invalid_state), request_statistics{});
         co_return std::nullopt;
     }
     std::shared_ptr<const state> initial_state = extend_with_hot_pages(std::move(stored_state), r, digests);
@@ -89,7 +86,7 @@ executor::start(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
     for (const shard& s : shards) {
         devices.push_back(s.lines.front().k.device());
     }
-    request_state& req = running.state.emplace(
+    request_state started(
         std::move(r),
         std::move(initial_state),
         lease_id,
@@ -98,6 +95,8 @@ executor::start(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
         layout,
         std::span<const at::Device>(devices)
     );
+    const request_id_type id = requests.emplace(callbacks.release(), std::move(started));
+    request_state& req = requests[id].state;
     // take_lines holds the resident pages before it first suspends, so they are the ones counted here.
     req.record_device_cached_tokens(device_cached_tokens(req));
     std::expected<void, page_error> line_allocation = co_await take_lines(req, req.cycle_lines());
@@ -145,15 +144,9 @@ void executor::end_request(
 
 void executor::end_requests(request_error error) noexcept {
     for (running_request& running : requests) {
-        if (running.state) {
-            release_lines(*running.state);
-            store.release(running.state->lease_id());
-        }
-        deliver_end(
-            running,
-            std::unexpected(error),
-            running.state ? statistics_of(*running.state) : request_statistics{}
-        );
+        release_lines(running.state);
+        store.release(running.state.lease_id());
+        deliver_end(running, std::unexpected(error), statistics_of(running.state));
     }
     requests.clear();
 }

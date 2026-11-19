@@ -32,11 +32,11 @@ void scheduler::wake(std::optional<event>& waited) noexcept {
 }
 
 task<void> scheduler::submit(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
-    return serve(std::move(r), unstarted_callbacks(std::move(callbacks), end_with_loop_exited));
+    return serve(std::move(r), executor::unstarted_callbacks(std::move(callbacks), end_with_loop_exited));
 }
 
-task<void> scheduler::serve(request r, unstarted_callbacks callbacks) {
-    const std::optional<executor::request_id_type> id = co_await exec.start(std::move(r), callbacks.release());
+task<void> scheduler::serve(request r, executor::unstarted_callbacks callbacks) {
+    const std::optional<executor::request_id_type> id = co_await exec.start(std::move(r), std::move(callbacks));
     if (!id) {
         co_return;
     }

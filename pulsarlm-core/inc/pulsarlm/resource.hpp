@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <optional>
 #include <utility>
 
@@ -8,19 +9,19 @@ namespace pulsarlm {
 // Holds a value and calls exit_function with it when destroyed, unless the value was released. An exit function that
 // throws terminates the program.
 template <typename value_type, typename exit_function_type> class resource {
-    std::optional<value_type> value;
+    std::optional<value_type> held_value;
     exit_function_type exit_function;
 
   public:
     resource(value_type&& value, exit_function_type exit_function)
-    : value(std::move(value)),
+    : held_value(std::move(value)),
       exit_function(std::move(exit_function)) {}
 
     // Takes other's value; other holds none afterwards.
     resource(resource&& other)
-    : value(std::move(other.value)),
+    : held_value(std::move(other.held_value)),
       exit_function(std::move(other.exit_function)) {
-        other.value.reset();
+        other.held_value.reset();
     }
 
     resource(const resource&) = delete;
@@ -28,15 +29,21 @@ template <typename value_type, typename exit_function_type> class resource {
     resource& operator=(resource&&) = delete;
 
     ~resource() {
-        if (value) {
-            exit_function(*value);
+        if (held_value) {
+            exit_function(*held_value);
         }
+    }
+
+    // The value, which was not released.
+    const value_type& value() const noexcept {
+        assert(held_value);
+        return *held_value;
     }
 
     // The value; the guard holds none afterwards and calls nothing when destroyed.
     value_type release() {
-        value_type released = std::move(*value);
-        value.reset();
+        value_type released = std::move(*held_value);
+        held_value.reset();
         return released;
     }
 };

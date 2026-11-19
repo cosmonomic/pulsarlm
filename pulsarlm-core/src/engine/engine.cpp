@@ -440,7 +440,7 @@ void engine::run_worker_loop(std::size_t shard) {
 }
 
 // A submit racing the loop's exit finds loop null; the task is then destroyed without running, and the
-// scheduler::unstarted_callbacks in its frame ends the callbacks with loop_exited.
+// executor::unstarted_callbacks in its frame ends the callbacks with loop_exited.
 void engine::submit(request&& r, std::unique_ptr<request_callbacks> callbacks) {
     validate(r, vocab_size);
     task<void> serving = sched.submit(std::move(r), std::move(callbacks));

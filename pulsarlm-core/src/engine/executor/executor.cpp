@@ -168,15 +168,11 @@ executor::request_id_type executor::request_ref::key() const noexcept {
 }
 
 request_state& executor::state_of(request_id_type id) {
-    std::optional<request_state>& state = requests[id].state;
-    assert(state);
-    return *state;
+    return requests[id].state;
 }
 
 const request_state& executor::state_of(request_id_type id) const {
-    const std::optional<request_state>& state = requests[id].state;
-    assert(state);
-    return *state;
+    return requests[id].state;
 }
 
 bool executor::is_steppable(request_id_type id) const {

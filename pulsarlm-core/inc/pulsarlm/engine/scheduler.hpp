@@ -11,19 +11,12 @@
 #include "pulsarlm/engine/executor.hpp"
 #include "pulsarlm/engine/request.hpp"
 #include "pulsarlm/engine/request_callbacks.hpp"
-#include "pulsarlm/resource.hpp"
 
 namespace pulsarlm {
 
 // Decides what the executor runs: which requests join, which requests each step forwards and how many tokens, and when
 // a request leaves.
 class scheduler {
-    // The callbacks of a request whose task has not passed them to the executor. Destroyed while it still holds
-    // them, it ends them with loop_exited.
-    using unstarted_callbacks = resource<
-        std::unique_ptr<request_callbacks>,
-        void (*)(std::unique_ptr<request_callbacks>&) noexcept>;
-
     executor& exec;
     std::size_t prefill_tokens_per_step;
     std::vector<executor::request_id_type> running_requests;
@@ -45,7 +38,7 @@ class scheduler {
     // Writes the oldest launched step back, ends the requests in it whose callbacks are cancelled, and lets each request
     // that exited leave once no launched step holds it.
     task<void> retire();
-    task<void> serve(request r, unstarted_callbacks callbacks);
+    task<void> serve(request r, executor::unstarted_callbacks callbacks);
 
   public:
     scheduler(executor& exec, std::size_t prefill_tokens_per_step);
