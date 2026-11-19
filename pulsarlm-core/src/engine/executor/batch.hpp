@@ -100,6 +100,8 @@ class executor::batch {
     // Whether a decode entry's token is awaited, -(r + 1) in the decode group's tokens for row r of the previous
     // launched step's samples.
     bool awaits_tokens = false;
+    // executor::entries_allow_overlap of the step's entries at its launch.
+    bool allows_overlap = false;
     // Per row sampled, in entry order: a row of each entry that samples but a verify entry's verify_rows, the params
     // and draw.
     std::vector<sampling_params> sample_params;

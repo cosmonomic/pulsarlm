@@ -2022,4 +2022,76 @@ TEST_CASE("each state a recurrent request reaches has the state at its head in t
     }
 }
 
+task<void> write_back_once(pulsarlm::executor& exec) {
+    co_await exec.write_back();
+}
+
+TEST_CASE("a write-back with no launched step panics the loop with a logic error") {
+    fixture f(16);
+    event_loop loop;
+    loop.spawn(write_back_once(f.exec));
+    std::exception_ptr thrown = loop.run();
+
+    REQUIRE(thrown != nullptr);
+    REQUIRE_THROWS_AS(std::rethrow_exception(thrown), std::logic_error);
+}
+
+task<void> launch_no_entries(pulsarlm::executor& exec) {
+    co_await exec.launch({});
+}
+
+TEST_CASE("a launch of no entries panics the loop with a logic error") {
+    fixture f(16);
+    event_loop loop;
+    loop.spawn(launch_no_entries(f.exec));
+    std::exception_ptr thrown = loop.run();
+
+    REQUIRE(thrown != nullptr);
+    REQUIRE_THROWS_AS(std::rethrow_exception(thrown), std::logic_error);
+}
+
+task<void> start_then_stop_loop(
+    pulsarlm::executor& exec,
+    request r,
+    result_writer& writer,
+    std::optional<pulsarlm::executor::sequence_id>& started
+) {
+    std::expected<pulsarlm::executor::sequence_id, request_error> id = co_await exec.start(std::move(r), writer);
+    if (id) {
+        started = *id;
+    }
+    event_loop::current()->stop();
+}
+
+std::optional<pulsarlm::executor::sequence_id>
+start_sequence(pulsarlm::executor& exec, request r, result_writer& writer) {
+    std::optional<pulsarlm::executor::sequence_id> started;
+    event_loop loop;
+    loop.spawn(start_then_stop_loop(exec, std::move(r), writer, started));
+    REQUIRE(loop.run() == nullptr);
+    return started;
+}
+
+TEST_CASE("an entry takes a row of sampled tokens when it computes its sequence's last pending token") {
+    fixture f(16);
+    result_writer decode_writer = make_writer(std::make_shared<request_results>());
+    result_writer prefill_writer = make_writer(std::make_shared<request_results>());
+    std::optional<pulsarlm::executor::sequence_id> decoding = start_sequence(
+        f.exec,
+        request{.tokens = {1}, .max_tokens = 2},
+        decode_writer
+    );
+    std::optional<pulsarlm::executor::sequence_id> prefilling = start_sequence(
+        f.exec,
+        request{.tokens = {1, 2, 3}, .max_tokens = 2},
+        prefill_writer
+    );
+    REQUIRE(decoding.has_value());
+    REQUIRE(prefilling.has_value());
+
+    REQUIRE(f.exec.sampled_row_count(*decoding, 1) == 1);
+    REQUIRE(f.exec.sampled_row_count(*prefilling, 3) == 1);
+    REQUIRE(f.exec.sampled_row_count(*prefilling, 2) == 0);
+}
+
 }  // namespace

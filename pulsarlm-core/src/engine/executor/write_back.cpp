@@ -25,7 +25,10 @@ namespace pulsarlm {
 // A sequence ends with oom when the sync of its new pages fails, as a state names only pages the store has. The step
 // that last read the lines of pages that left a view has completed, so they are released right after the sync. A
 // recurrent layer's state at head reaches the store at the resume points, cycle ends and the end, that find it pending.
-task<void> executor::write_back() {
+task<std::vector<executor::sequence_id>> executor::write_back() {
+    if (launched_batches.empty()) {
+        throw std::logic_error("executor::write_back: no step is launched");
+    }
     std::unique_ptr<batch> written = std::move(launched_batches.front());
     launched_batches.pop_front();
     batch& b = *written;
@@ -33,6 +36,13 @@ task<void> executor::write_back() {
     batch_writes writes = apply_entries(b);
     co_await write_pages_and_states(b, std::move(writes));
     co_await refresh_views(b);
+    std::vector<sequence_id> written_sequences;
+    for (const batch::group* g : std::as_const(b).groups()) {
+        for (const batch::entry& e : g->entries) {
+            written_sequences.push_back(e.seq.key());
+        }
+    }
+    co_return written_sequences;
 }
 
 task<void> executor::join(batch& b) {

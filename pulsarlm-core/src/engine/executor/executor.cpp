@@ -8,14 +8,15 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -101,7 +102,9 @@ executor::executor(
     }
     require(layout.page_size > 0, "executor: the model must have a KV layer with pages");
     for (std::size_t shard = 0; shard < this->shards.size(); shard++) {
-        samples.push_back(at::zeros({max_sampled_rows}, lines[shard].front().k.options().dtype(at::kLong)));
+        samples.push_back(
+            at::zeros({static_cast<std::int64_t>(max_sampled_rows)}, lines[shard].front().k.options().dtype(at::kLong))
+        );
         stop_tokens.push_back(
             at::tensor(this->stop_ids, at::TensorOptions().dtype(at::kLong)).to(lines[shard].front().k.device())
         );
@@ -143,6 +146,10 @@ sequence& executor::sequence_ref::operator*() const {
 
 sequence* executor::sequence_ref::operator->() const {
     return &**this;
+}
+
+executor::sequence_id executor::sequence_ref::key() const noexcept {
+    return id;
 }
 
 bool executor::is_steppable(sequence_id id) const {
@@ -195,7 +202,7 @@ bool executor::completes_page(const sequence& seq, std::size_t token_count) cons
 }
 
 // A drafting sequence's verify step ends neither its cycle nor max_tokens (executor::advance).
-bool executor::allows_overlap(std::span<const batch_tokens> entries) const {
+bool executor::entries_allow_overlap(std::span<const batch_tokens> entries) const {
     if (draft_layer) {
         return std::ranges::all_of(entries, [&](const batch_tokens& e) {
             return !sequences.at(e.first).draft_tokens().empty();
@@ -209,6 +216,46 @@ bool executor::allows_overlap(std::span<const batch_tokens> entries) const {
         const sequence& seq = sequences.at(id);
         return seq.ends_cycle(token_count) || (sliding && completes_page(seq, token_count));
     });
+}
+
+bool executor::allows_overlap(std::span<const batch_tokens> entries) const {
+    return (launched_batches.empty() || launched_batches.back()->allows_overlap) && entries_allow_overlap(entries);
+}
+
+std::size_t executor::launched_batch_count() const noexcept {
+    return launched_batches.size();
+}
+
+std::size_t executor::sampled_row_count(sequence_id id, std::size_t token_count) const {
+    const sequence& seq = sequences.at(id);
+    if (token_count != seq.pending_token_list().size() || !seq.may_sample()) {
+        return 0;
+    }
+    return seq.draft_tokens().empty() ? 1 : token_count + seq.draft_tokens().size();
+}
+
+void executor::check_launch(std::span<const batch_tokens> entries) const {
+    if (entries.empty()) {
+        throw std::logic_error("executor::launch: a step has at least one entry");
+    }
+    if (launched_batches.size() >= 2) {
+        throw std::logic_error("executor::launch: two steps are launched already");
+    }
+    std::unordered_set<sequence_id> entered;
+    for (const auto& [id, token_count] : entries) {
+        if (!entered.insert(id).second) {
+            throw std::logic_error("executor::launch: a sequence has two entries");
+        }
+        if (token_count == 0 || token_count > pending_token_count(id)) {
+            throw std::logic_error("executor::launch: an entry computes no token or more than its sequence's pending");
+        }
+        if (!is_steppable(id)) {
+            throw std::logic_error("executor::launch: a sequence is not steppable");
+        }
+    }
+    if (!launched_batches.empty() && !allows_overlap(entries)) {
+        throw std::logic_error("executor::launch: the launched step and the entries do not allow overlap");
+    }
 }
 
 // A verify entry's tokens are accepted, and its samples taken, at its write-back. Its pending token and drafts are
@@ -274,13 +321,12 @@ void executor::advance(batch& b) {
 // Shard 0 queues on the executor's thread while the others queue on their own, so every shard's kernels launch at
 // once. Each shard's completion is taken once every shard has queued, before any later step queues.
 task<void> executor::launch(std::span<const batch_tokens> entries) {
+    check_launch(entries);
     std::unique_ptr<batch> b(new batch(*this, entries));
-    TORCH_CHECK(
-        static_cast<std::int64_t>(b->sample_params.size()) <= max_sampled_rows,
-        "executor: a step samples at most ",
-        max_sampled_rows,
-        " tokens"
-    );
+    if (b->sample_params.size() > max_sampled_rows) {
+        throw std::logic_error("executor::launch: the step samples more than max_sampled_rows rows");
+    }
+    b->allows_overlap = entries_allow_overlap(entries);
     link_previous(*b);
     advance(*b);
     for (batch::group* g : b->groups()) {
@@ -329,7 +375,11 @@ void executor::link_previous(batch& b) const {
                 e.previous_drafting_row = d;
             }
         }
-        assert(e.previous_verify_row && e.previous_drafting_row);
+        if (!e.previous_verify_row || !e.previous_drafting_row) {
+            throw std::logic_error(
+                "executor::launch: a sequence with a launched step is not a verify and drafting entry of that step"
+            );
+        }
     }
 }
 

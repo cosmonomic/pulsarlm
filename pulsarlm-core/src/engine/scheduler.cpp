@@ -55,8 +55,7 @@ task<void> scheduler::submit(request r, result_writer writer) {
 task<void> scheduler::run() {
     for (;;) {
         std::vector<executor::batch_tokens> entries = next_entries();
-        if (!in_flight_sequences.empty() &&
-            (entries.empty() || !in_flight_allows_overlap || !exec.allows_overlap(entries))) {
+        if (exec.launched_batch_count() > 0 && (entries.empty() || !exec.allows_overlap(entries))) {
             co_await retire();
             continue;
         }
@@ -64,24 +63,15 @@ task<void> scheduler::run() {
             co_await emplace_event(join_event);
             continue;
         }
-        std::vector<executor::sequence_id> stepped;
-        for (const executor::batch_tokens& e : entries) {
-            stepped.push_back(e.first);
-        }
-        const bool allows_overlap = exec.allows_overlap(entries);
         co_await exec.launch(entries);
-        if (!in_flight_sequences.empty()) {
+        if (exec.launched_batch_count() > 1) {
             co_await retire();
         }
-        in_flight_sequences = std::move(stepped);
-        in_flight_allows_overlap = allows_overlap;
     }
 }
 
 task<void> scheduler::retire() {
-    std::vector<executor::sequence_id> stepped = std::move(in_flight_sequences);
-    in_flight_sequences.clear();
-    co_await exec.write_back();
+    const std::vector<executor::sequence_id> stepped = co_await exec.write_back();
     for (executor::sequence_id id : stepped) {
         if (!exec.has_exited(id) && exec.is_cancelled(id)) {
             exec.cancel(id);
@@ -97,8 +87,14 @@ task<void> scheduler::retire() {
 
 std::vector<executor::batch_tokens> scheduler::next_entries() const {
     std::vector<executor::batch_tokens> entries;
+    std::size_t row_total = 0;
     for (executor::sequence_id id : running_sequences) {
         if (exec.is_steppable(id) && exec.pending_token_count(id) == 1) {
+            const std::size_t row_count = exec.sampled_row_count(id, 1);
+            if (row_total + row_count > executor::max_sampled_rows) {
+                continue;
+            }
+            row_total += row_count;
             entries.emplace_back(id, 1);
         }
     }
@@ -113,6 +109,11 @@ std::vector<executor::batch_tokens> scheduler::next_entries() const {
         const std::size_t pending_count = exec.pending_token_count(id);
         if (pending_count > 1) {
             std::size_t count = std::min({pending_count, budget, exec.cycle_tokens_left(id)});
+            const std::size_t row_count = exec.sampled_row_count(id, count);
+            if (row_total + row_count > executor::max_sampled_rows) {
+                continue;
+            }
+            row_total += row_count;
             budget -= count;
             entries.emplace_back(id, count);
         }
