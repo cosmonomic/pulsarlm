@@ -143,9 +143,7 @@ executor::executor(
 }
 
 executor::~executor() {
-    for (const sequence& unstopped : sequences) {
-        store.release(unstopped.lease_id());
-    }
+    end_requests(request_error::loop_exited);
 }
 
 executor::sequence_ref::sequence_ref(executor& owner, sequence_id id) noexcept
@@ -153,7 +151,7 @@ executor::sequence_ref::sequence_ref(executor& owner, sequence_id id) noexcept
   id(id) {}
 
 sequence& executor::sequence_ref::operator*() const {
-    return owner->sequences.at(id);
+    return owner->sequence_of(id);
 }
 
 sequence* executor::sequence_ref::operator->() const {
@@ -164,33 +162,41 @@ executor::sequence_id executor::sequence_ref::key() const noexcept {
     return id;
 }
 
+sequence& executor::sequence_of(sequence_id id) {
+    return requests.at(id).state.value();
+}
+
+const sequence& executor::sequence_of(sequence_id id) const {
+    return requests.at(id).state.value();
+}
+
 bool executor::is_steppable(sequence_id id) const {
-    const sequence& seq = sequences.at(id);
+    const sequence& seq = sequence_of(id);
     return !seq.has_launched_last_step() && !seq.has_exited();
 }
 
 std::size_t executor::pending_token_count(sequence_id id) const {
-    return sequences.at(id).pending_token_list().size();
+    return sequence_of(id).pending_token_list().size();
 }
 
 std::size_t executor::cycle_tokens_left(sequence_id id) const {
-    return sequences.at(id).cycle_tokens_left();
+    return sequence_of(id).cycle_tokens_left();
 }
 
 bool executor::has_exited(sequence_id id) const {
-    return sequences.at(id).has_exited();
+    return sequence_of(id).has_exited();
 }
 
 bool executor::is_in_launched_batch(sequence_id id) const {
-    return sequences.at(id).launched_step_count() > 0;
+    return sequence_of(id).launched_step_count() > 0;
 }
 
 bool executor::is_cancelled(sequence_id id) const {
-    return sequences.at(id).writer().cancelled();
+    return requests.at(id).callbacks->cancelled();
 }
 
 void executor::cancel(sequence_id id) {
-    sequence& seq = sequences.at(id);
+    sequence& seq = sequence_of(id);
     if (!seq.has_exited()) {
         seq.exit(sequence::exit_reason::cancelled);
     }
@@ -217,7 +223,7 @@ bool executor::completes_page(const sequence& seq, std::size_t token_count) cons
 bool executor::entries_allow_overlap(std::span<const batch_tokens> entries) const {
     if (draft_layer) {
         return std::ranges::all_of(entries, [&](const batch_tokens& e) {
-            return !sequences.at(e.first).draft_tokens().empty();
+            return !sequence_of(e.first).draft_tokens().empty();
         });
     }
     const bool sliding = std::ranges::any_of(layout.layers, [](const view_layout::layer& layer) {
@@ -225,7 +231,7 @@ bool executor::entries_allow_overlap(std::span<const batch_tokens> entries) cons
     });
     return std::ranges::none_of(entries, [&](const batch_tokens& e) {
         const auto& [id, token_count] = e;
-        const sequence& seq = sequences.at(id);
+        const sequence& seq = sequence_of(id);
         return seq.ends_cycle(token_count) || (sliding && completes_page(seq, token_count));
     });
 }
@@ -243,7 +249,7 @@ std::size_t executor::sampled_row_limit() const noexcept {
 }
 
 std::size_t executor::sampled_row_count(sequence_id id, std::size_t token_count) const {
-    const sequence& seq = sequences.at(id);
+    const sequence& seq = sequence_of(id);
     if (token_count != seq.pending_token_list().size() || !seq.may_sample()) {
         return 0;
     }

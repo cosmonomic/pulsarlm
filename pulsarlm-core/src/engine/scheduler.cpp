@@ -2,7 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <expected>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -33,24 +33,21 @@ void scheduler::wake(std::optional<event>& waited) noexcept {
     }
 }
 
-task<void> scheduler::submit(request r, result_writer writer) {
-    if (writer.cancelled()) {
-        writer.end(std::unexpected(request_error::cancelled), request_statistics{});
+task<void> scheduler::submit(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
+    return serve(std::move(r), unstarted_callbacks(std::move(callbacks), end_with_loop_exited));
+}
+
+task<void> scheduler::serve(request r, unstarted_callbacks callbacks) {
+    const std::optional<executor::sequence_id> id = co_await exec.start(std::move(r), callbacks.release());
+    if (!id) {
         co_return;
     }
-    std::expected<executor::sequence_id, request_error> started = co_await exec.start(std::move(r), writer);
-    if (!started) {
-        writer.end(std::unexpected(started.error()), request_statistics{});
-        co_return;
-    }
-    const executor::sequence_id id = *started;
-    event& exit_event = exit_events.try_emplace(id).first->second;
-    running_sequences.push_back(id);
+    event& exit_event = exit_events.try_emplace(*id).first->second;
+    running_sequences.push_back(*id);
     wake(join_event);
     co_await exit_event;
-    exit_events.erase(id);
-    auto [result, statistics] = co_await exec.stop(id);
-    writer.end(std::move(result), statistics);
+    exit_events.erase(*id);
+    co_await exec.stop(*id);
 }
 
 task<void> scheduler::run() {

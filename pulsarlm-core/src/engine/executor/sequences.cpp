@@ -21,7 +21,30 @@
 
 namespace pulsarlm {
 
-task<std::expected<executor::sequence_id, request_error>> executor::start(request&& r, result_writer& writer) {
+namespace {
+
+request_statistics statistics_of(const sequence& seq) {
+    return request_statistics{
+        .total_token_count = seq.prompt_token_count() + seq.delivered_token_count(),
+        .cached_token_count = seq.cached_token_count(),
+        .device_cached_token_count = seq.device_cached_token_count(),
+        .peak_device_memory = seq.device_memory_peak(),
+        .drafted_token_count = seq.drafted_token_count(),
+        .accepted_draft_count = seq.accepted_draft_count(),
+        .step_duration = seq.step_duration(),
+    };
+}
+
+}  // namespace
+
+task<std::optional<executor::sequence_id>>
+executor::start(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
+    const sequence_id id = requests.emplace(std::move(callbacks));
+    served_request& served = requests.at(id);
+    if (served.callbacks->cancelled()) {
+        end_request(id, std::unexpected(request_error::cancelled), request_statistics{});
+        co_return std::nullopt;
+    }
     require(
         !r.tokens.empty() && r.eviction.n_working >= 1 && r.eviction.cycle_tokens >= 1 &&
             r.eviction.attention_mass_decay > 0.0 && r.eviction.attention_mass_decay <= 1.0 &&
@@ -35,7 +58,8 @@ task<std::expected<executor::sequence_id, request_error>> executor::start(reques
     std::expected<std::pair<std::shared_ptr<const state>, state::lease_id_type>, page_error>
         lookup = co_await store.read_state(r.tokens, digests);
     if (!lookup) {
-        co_return std::unexpected(request_error::miss);
+        end_request(id, std::unexpected(request_error::miss), request_statistics{});
+        co_return std::nullopt;
     }
     auto& [stored_state, lease_id] = *lookup;
     std::size_t stored_pages = 0;
@@ -43,7 +67,8 @@ task<std::expected<executor::sequence_id, request_error>> executor::start(reques
         auto head_digest = std::ranges::find(digests, *stored_state->head);
         if (head_digest == digests.end()) {
             store.release(lease_id);
-            co_return std::unexpected(request_error::miss);
+            end_request(id, std::unexpected(request_error::miss), request_statistics{});
+            co_return std::nullopt;
         }
         stored_pages = static_cast<std::size_t>(head_digest - digests.begin()) + 1;
     }
@@ -51,47 +76,71 @@ task<std::expected<executor::sequence_id, request_error>> executor::start(reques
     if (stored_state->tail.size() >= unstored_tokens.size() ||
         !std::ranges::equal(stored_state->tail, unstored_tokens.first(stored_state->tail.size()))) {
         store.release(lease_id);
-        co_return std::unexpected(request_error::miss);
+        end_request(id, std::unexpected(request_error::miss), request_statistics{});
+        co_return std::nullopt;
     }
     std::shared_ptr<const state> initial_state = extend_with_hot_pages(std::move(stored_state), r, digests);
     std::vector<at::Device> devices;
     for (const std::vector<kv>& shard_lines : lines) {
         devices.push_back(shard_lines.front().k.device());
     }
-    const sequence_id id = sequences.emplace(
+    sequence& seq = served.state.emplace(
         std::move(r),
         std::move(initial_state),
         lease_id,
         std::move(digests),
         chain_root,
         layout,
-        writer,
         std::span<const at::Device>(devices)
     );
-    sequence& seq = sequences.at(id);
     // take_lines holds the resident pages before it first suspends, so they are the ones counted here.
     seq.record_device_cached_tokens(device_cached_tokens(seq));
     std::expected<void, page_error> line_allocation = co_await take_lines(seq, seq.cycle_lines());
     if (!line_allocation) {
-        drop(id);
-        co_return std::unexpected(
-            line_allocation.error() == page_error::miss ? request_error::miss : request_error::oom
+        end_request(
+            id,
+            std::unexpected(line_allocation.error() == page_error::miss ? request_error::miss : request_error::oom),
+            request_statistics{}
         );
+        co_return std::nullopt;
     }
     if (seq.history_page_count() > stored_pages && !co_await own_pages_from(seq, stored_pages)) {
-        drop(id);
-        co_return std::unexpected(request_error::oom);
+        end_request(id, std::unexpected(request_error::oom), request_statistics{});
+        co_return std::nullopt;
     }
     seq.upload_table(0, streams);
     co_return id;
 }
 
-void executor::drop(sequence_id id) noexcept {
-    if (sequence* dropped = sequences.find(id)) {
-        release_lines(*dropped);
-        store.release(dropped->lease_id());
-        sequences.erase(id);
+void executor::deliver_end(
+    served_request& served,
+    std::expected<std::shared_ptr<const state>, request_error>&& result,
+    const request_statistics& statistics
+) noexcept {
+    if (served.state) {
+        release_lines(*served.state);
+        store.release(served.state->lease_id());
     }
+    std::unique_ptr<request_callbacks> ended = std::move(served.callbacks);
+    ended->on_end(std::move(result), statistics);
+}
+
+void executor::end_request(
+    sequence_id id,
+    std::expected<std::shared_ptr<const state>, request_error>&& result,
+    const request_statistics& statistics
+) noexcept {
+    if (served_request* served = requests.find(id)) {
+        deliver_end(*served, std::move(result), statistics);
+        requests.erase(id);
+    }
+}
+
+void executor::end_requests(request_error error) noexcept {
+    for (served_request& served : requests) {
+        deliver_end(served, std::unexpected(error), served.state ? statistics_of(*served.state) : request_statistics{});
+    }
+    requests.clear();
 }
 
 std::shared_ptr<const state> executor::extend_with_hot_pages(
@@ -162,9 +211,8 @@ task<std::expected<void, page_error>> executor::own_pages_from(sequence& seq, st
     co_return co_await cache.sync(hashes, owners, line_ids, streams);
 }
 
-task<std::pair<std::expected<std::shared_ptr<const state>, request_error>, request_statistics>>
-executor::stop(sequence_id id) {
-    sequence& seq = sequences.at(id);
+task<void> executor::stop(sequence_id id) {
+    sequence& seq = sequence_of(id);
     if (!seq.has_exited() || seq.launched_step_count() > 0) {
         throw std::logic_error("executor::stop: the sequence has not exited or a launched step holds it");
     }
@@ -184,17 +232,7 @@ executor::stop(sequence_id id) {
         result = std::unexpected(request_error::oom);
         break;
     }
-    const request_statistics statistics{
-        .total_token_count = seq.prompt_token_count() + seq.delivered_token_count(),
-        .cached_token_count = seq.cached_token_count(),
-        .device_cached_token_count = seq.device_cached_token_count(),
-        .peak_device_memory = seq.device_memory_peak(),
-        .drafted_token_count = seq.drafted_token_count(),
-        .accepted_draft_count = seq.accepted_draft_count(),
-        .step_duration = seq.step_duration(),
-    };
-    drop(id);
-    co_return std::pair(std::move(result), statistics);
+    end_request(id, std::move(result), statistics_of(seq));
 }
 
 std::size_t executor::device_cached_tokens(const sequence& seq) const {

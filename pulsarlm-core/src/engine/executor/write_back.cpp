@@ -83,6 +83,7 @@ executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clo
         for (std::size_t position = 0; position < g->entries.size(); position++) {
             batch::entry& e = g->entries[position];
             sequence& seq = *e.seq;
+            request_callbacks& callbacks = *requests.at(e.seq.key()).callbacks;
             std::span<const std::int64_t> samples;
             if (e.is_sampling) {
                 samples = std::span(next_sampled, verifies ? b.verify_rows : 1);
@@ -120,7 +121,7 @@ executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clo
             seq.record_step(step_duration);
             if (is_prefill_step && e.end_position >= seq.prompt_token_count()) {
                 seq.end_prefill();
-                seq.writer().append(
+                callbacks.on_prefill(
                     prefill_statistics{
                         .cached_token_count = seq.cached_token_count(),
                         .device_cached_token_count = seq.device_cached_token_count(),
@@ -141,7 +142,7 @@ executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clo
             };
             if (verifies) {
                 for (std::int64_t token : emitted) {
-                    seq.writer().append(token, token_statistics);
+                    callbacks.on_decode(token, token_statistics);
                     token_statistics.drafted_token_count = 0;
                     token_statistics.accepted_draft_count = 0;
                     token_statistics.step_duration = std::chrono::steady_clock::duration::zero();
@@ -155,7 +156,7 @@ executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clo
             } else if (!samples.empty()) {
                 const std::int64_t token = samples.front();
                 seq.apply_sample(e.sampled_position, token);
-                seq.writer().append(token, token_statistics);
+                callbacks.on_decode(token, token_statistics);
                 if (std::ranges::contains(stop_ids, token)) {
                     seq.exit(sequence::exit_reason::finished);
                     if (seq.launched_step_count() > 1) {
@@ -302,7 +303,7 @@ task<void> executor::refresh_views(batch& b) {
                 update_views(seq);
             }
             if (e.ends_cycle) {
-                co_await write_cycle_end(seq);
+                co_await write_cycle_end(seq, *requests.at(e.seq.key()).callbacks);
                 seq.start_next_cycle();
             }
             std::optional<std::size_t> first_stale_page;
@@ -366,10 +367,10 @@ bool executor::evict(sequence& seq) {
     return evicted;
 }
 
-task<void> executor::write_cycle_end(sequence& seq) {
+task<void> executor::write_cycle_end(sequence& seq, request_callbacks& callbacks) {
     auto cycle_end_state = std::make_shared<const state>(seq.to_state());
     co_await store.write_state(seq.lease_id(), std::shared_ptr<const state>(cycle_end_state));
-    seq.writer().append(cycle_end{.state = std::move(cycle_end_state)});
+    callbacks.on_cycle(cycle_end{.state = std::move(cycle_end_state)});
 }
 
 bool executor::release_passed_pages(sequence& seq) {

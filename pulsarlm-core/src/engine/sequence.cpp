@@ -71,11 +71,9 @@ sequence::sequence(
     std::vector<digest>&& digests,
     const digest& root,
     const view_layout& layout,
-    result_writer& writer,
     std::span<const at::Device> devices
 )
-: request_writer(writer),
-  held_lease_id(lease_id),
+: held_lease_id(lease_id),
   sampling(r.sampling),
   seed(sampling_seed(r.sampling.seed)),
   max_tokens(r.max_tokens),
@@ -545,10 +543,6 @@ const page_eviction_policy& sequence::eviction_policy_in_pages() const noexcept 
 
 state::lease_id_type sequence::lease_id() const noexcept {
     return held_lease_id;
-}
-
-result_writer& sequence::writer() const noexcept {
-    return request_writer;
 }
 
 std::vector<std::size_t> sequence::pages_to_evict(std::size_t layer) const {

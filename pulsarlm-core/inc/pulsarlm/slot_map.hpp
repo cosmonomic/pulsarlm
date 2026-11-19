@@ -114,6 +114,17 @@ template <typename value_type> class slot_map {
         return true;
     }
 
+    // Erases every value.
+    void clear() noexcept {
+        for (std::size_t slot = 0; slot < slots.size(); slot++) {
+            if (slots[slot].second) {
+                slots[slot].second.reset();
+                slots[slot].first++;
+                free_slots.push_back(static_cast<std::uint32_t>(slot));
+            }
+        }
+    }
+
     // Throws std::out_of_range when key's value was erased.
     value_type& at(key_type key) {
         return const_cast<value_type&>(std::as_const(*this).at(key));

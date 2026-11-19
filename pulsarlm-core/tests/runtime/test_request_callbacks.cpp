@@ -1,4 +1,3 @@
-#include "pulsarlm/digest.hpp"
 #include "pulsarlm/engine/request_callbacks.hpp"
 
 #undef CHECK
@@ -11,25 +10,15 @@
 #include <memory>
 #include <optional>
 #include <utility>
-#include <vector>
 
 namespace {
 
 using pulsarlm::request_error;
-using pulsarlm::result_writer;
-
-using token_list = std::vector<std::int64_t>;
 
 struct request_results {
-    token_list tokens;
-    std::vector<pulsarlm::prefill_statistics> prefills;
-    std::vector<pulsarlm::decode_statistics> decodes;
+    std::optional<std::expected<std::shared_ptr<const pulsarlm::state>, request_error>> end;
     pulsarlm::request_statistics statistics{};
-    std::vector<pulsarlm::cycle_end> cycle_ends;
-    std::optional<std::expected<pulsarlm::state, request_error>> end;
-    std::size_t end_count = 0;
-    bool cancelled = false;
-    bool callbacks_destroyed = false;
+    std::size_t call_count = 0;
 };
 
 class recording_callbacks final : public pulsarlm::request_callbacks {
@@ -39,141 +28,48 @@ class recording_callbacks final : public pulsarlm::request_callbacks {
     explicit recording_callbacks(std::shared_ptr<request_results> recorded_results)
     : recorded_results(std::move(recorded_results)) {}
 
-    ~recording_callbacks() override {
-        recorded_results->callbacks_destroyed = true;
+    void on_prefill(const pulsarlm::prefill_statistics&) noexcept override {
+        recorded_results->call_count++;
     }
 
-    void on_prefill(const pulsarlm::prefill_statistics& statistics) noexcept override {
-        recorded_results->prefills.push_back(statistics);
+    void on_decode(std::int64_t, const pulsarlm::decode_statistics&) noexcept override {
+        recorded_results->call_count++;
     }
 
-    void on_decode(std::int64_t token, const pulsarlm::decode_statistics& statistics) noexcept override {
-        recorded_results->tokens.push_back(token);
-        recorded_results->decodes.push_back(statistics);
-    }
-
-    void on_cycle(pulsarlm::cycle_end&& ended) noexcept override {
-        recorded_results->cycle_ends.push_back(std::move(ended));
+    void on_cycle(pulsarlm::cycle_end&&) noexcept override {
+        recorded_results->call_count++;
     }
 
     void on_end(
         std::expected<std::shared_ptr<const pulsarlm::state>, request_error>&& result,
         const pulsarlm::request_statistics& statistics
     ) noexcept override {
-        recorded_results->end.emplace(std::move(result).transform([](std::shared_ptr<const pulsarlm::state>&& ended) {
-            return *ended;
-        }));
+        recorded_results->end.emplace(std::move(result));
         recorded_results->statistics = statistics;
-        recorded_results->end_count++;
+        recorded_results->call_count++;
     }
 
     bool cancelled() const noexcept override {
-        return recorded_results->cancelled;
+        return false;
     }
 };
 
-result_writer make_writer(const std::shared_ptr<request_results>& recorded_results) {
-    return result_writer(std::make_unique<recording_callbacks>(recorded_results));
-}
-
-bool ended_with(const request_results& recorded_results, request_error error) {
-    return recorded_results.end && !recorded_results.end->has_value() && recorded_results.end->error() == error;
-}
-
-TEST_CASE("the writer passes the prefill statistics and tokens with their statistics to its callbacks") {
+TEST_CASE("end_with_loop_exited ends the callbacks once with loop_exited and value-initialized statistics") {
     auto recorded_results = std::make_shared<request_results>();
-    result_writer writer = make_writer(recorded_results);
-    pulsarlm::digest page_hash{.hi = 3, .lo = 4};
-    writer.append(pulsarlm::prefill_statistics{.cached_token_count = 8, .computed_token_count = 3, .step_count = 2});
-    writer.append(1, pulsarlm::decode_statistics{});
-    writer.append(
-        pulsarlm::cycle_end{
-            .state = std::make_shared<const pulsarlm::state>(pulsarlm::state{.head = page_hash, .tail = {1}})
-        }
-    );
-    writer.append(
-        2,
-        pulsarlm::decode_statistics{
-            .drafted_token_count = 2,
-            .accepted_draft_count = 1,
-            .step_duration = std::chrono::milliseconds(3),
-        }
-    );
+    std::unique_ptr<pulsarlm::request_callbacks> callbacks = std::make_unique<recording_callbacks>(recorded_results);
+    pulsarlm::end_with_loop_exited(callbacks);
 
-    REQUIRE(recorded_results->tokens == token_list{1, 2});
-    REQUIRE(recorded_results->prefills.size() == 1);
-    REQUIRE(recorded_results->prefills[0].cached_token_count == 8);
-    REQUIRE(recorded_results->prefills[0].computed_token_count == 3);
-    REQUIRE(recorded_results->prefills[0].step_count == 2);
-    REQUIRE(recorded_results->decodes.size() == 2);
-    REQUIRE(recorded_results->decodes[0].drafted_token_count == 0);
-    REQUIRE(recorded_results->decodes[1].drafted_token_count == 2);
-    REQUIRE(recorded_results->decodes[1].accepted_draft_count == 1);
-    REQUIRE(recorded_results->decodes[1].step_duration == std::chrono::milliseconds(3));
-    REQUIRE(recorded_results->cycle_ends.size() == 1);
-    REQUIRE((recorded_results->cycle_ends[0].state->head == page_hash));
-    REQUIRE(recorded_results->cycle_ends[0].state->tail == token_list{1});
-    REQUIRE(!recorded_results->end);
-}
-
-TEST_CASE("the writer ends its callbacks once, then destroys them") {
-    auto recorded_results = std::make_shared<request_results>();
-    {
-        result_writer writer = make_writer(recorded_results);
-        pulsarlm::digest page_hash{.hi = 1, .lo = 2};
-        writer.end(
-            std::make_shared<const pulsarlm::state>(pulsarlm::state{.head = page_hash, .tail = {5}}),
-            pulsarlm::request_statistics{
-                .total_token_count = 5,
-                .cached_token_count = 4,
-                .device_cached_token_count = 4,
-                .step_duration = std::chrono::milliseconds(7),
-            }
-        );
-
-        REQUIRE(recorded_results->callbacks_destroyed);
-        REQUIRE(recorded_results->end->has_value());
-        REQUIRE(((*recorded_results->end)->head == page_hash));
-        REQUIRE((*recorded_results->end)->tail == token_list{5});
-        REQUIRE(recorded_results->statistics.total_token_count == 5);
-        REQUIRE(recorded_results->statistics.cached_token_count == 4);
-        REQUIRE(recorded_results->statistics.step_duration == std::chrono::milliseconds(7));
-    }
-
-    REQUIRE(recorded_results->end_count == 1);
-}
-
-TEST_CASE("a writer destroyed before ending its callbacks ends them with loop_exited") {
-    auto recorded_results = std::make_shared<request_results>();
-    {
-        result_writer writer = make_writer(recorded_results);
-        writer.append(4, pulsarlm::decode_statistics{});
-    }
-
-    REQUIRE(recorded_results->tokens == token_list{4});
-    REQUIRE(ended_with(*recorded_results, request_error::loop_exited));
+    REQUIRE(recorded_results->call_count == 1);
+    REQUIRE(recorded_results->end.has_value());
+    REQUIRE(!recorded_results->end->has_value());
+    REQUIRE(recorded_results->end->error() == request_error::loop_exited);
     REQUIRE(recorded_results->statistics.total_token_count == 0);
+    REQUIRE(recorded_results->statistics.cached_token_count == 0);
+    REQUIRE(recorded_results->statistics.device_cached_token_count == 0);
+    REQUIRE(recorded_results->statistics.peak_device_memory == 0);
+    REQUIRE(recorded_results->statistics.drafted_token_count == 0);
+    REQUIRE(recorded_results->statistics.accepted_draft_count == 0);
     REQUIRE(recorded_results->statistics.step_duration == std::chrono::steady_clock::duration::zero());
-    REQUIRE(recorded_results->end_count == 1);
-}
-
-TEST_CASE("a moved-from writer does not end the callbacks") {
-    auto recorded_results = std::make_shared<request_results>();
-    std::optional<result_writer> source(make_writer(recorded_results));
-    result_writer target(std::move(*source));
-    source.reset();
-    REQUIRE(!recorded_results->end);
-
-    target.end(std::unexpected(request_error::miss), pulsarlm::request_statistics{});
-    REQUIRE(ended_with(*recorded_results, request_error::miss));
-}
-
-TEST_CASE("cancelled reads the callbacks") {
-    auto recorded_results = std::make_shared<request_results>();
-    result_writer writer = make_writer(recorded_results);
-    REQUIRE(!writer.cancelled());
-    recorded_results->cancelled = true;
-    REQUIRE(writer.cancelled());
 }
 
 }  // namespace

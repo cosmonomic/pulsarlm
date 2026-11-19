@@ -3,7 +3,6 @@
 #include "pulsarlm/engine/event_loop.hpp"
 #include "pulsarlm/engine/page_store.hpp"
 #include "pulsarlm/engine/request.hpp"
-#include "pulsarlm/engine/request_callbacks.hpp"
 #include "pulsarlm/engine/state.hpp"
 
 #include <ATen/ATen.h>
@@ -35,24 +34,6 @@ using token_list = std::vector<std::int64_t>;
 constexpr digest root{.hi = 1, .lo = 2};
 constexpr state::lease_id_type lease_id = 7;
 
-class silent_callbacks final : public pulsarlm::request_callbacks {
-  public:
-    void on_prefill(const pulsarlm::prefill_statistics&) noexcept override {}
-
-    void on_decode(std::int64_t, const pulsarlm::decode_statistics&) noexcept override {}
-
-    void on_cycle(pulsarlm::cycle_end&&) noexcept override {}
-
-    void on_end(
-        std::expected<std::shared_ptr<const pulsarlm::state>, pulsarlm::request_error>&&,
-        const pulsarlm::request_statistics&
-    ) noexcept override {}
-
-    bool cancelled() const noexcept override {
-        return false;
-    }
-};
-
 view_layout make_layout(std::size_t page_size, bool has_recurrent_layer) {
     view_layout layout{.layers = {}, .page_size = page_size};
     layout.layers.push_back(
@@ -83,21 +64,17 @@ class started_sequence {
     view_layout layout;
     std::vector<at::Device> devices{at::Device(at::kCUDA, 0)};
 
-    pulsarlm::result_writer writer;
-
   public:
     sequence seq;
 
     started_sequence(const token_list& tokens, std::optional<std::size_t> max_tokens, view_layout&& layout)
     : layout(std::move(layout)),
-      writer(std::make_unique<silent_callbacks>()),
       seq(pulsarlm::request{.tokens = tokens, .max_tokens = max_tokens},
           std::make_shared<const state>(),
           lease_id,
           pulsarlm::make_page_digests(root, tokens, this->layout.page_size),
           root,
           this->layout,
-          writer,
           devices) {}
 };
 

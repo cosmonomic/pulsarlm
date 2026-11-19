@@ -17,7 +17,6 @@
 #include "pulsarlm/engine/page_store.hpp"
 #include "pulsarlm/engine/pending_writes.hpp"
 #include "pulsarlm/engine/request.hpp"
-#include "pulsarlm/engine/request_callbacks.hpp"
 #include "pulsarlm/engine/sampling.hpp"
 #include "pulsarlm/engine/state.hpp"
 
@@ -66,7 +65,6 @@ class sequence {
     static constexpr std::int64_t awaited_token = -1;
 
   private:
-    result_writer& request_writer;
     state::lease_id_type held_lease_id;
     sampling_params sampling;
     std::uint64_t seed;
@@ -166,7 +164,6 @@ class sequence {
         std::vector<digest>&& digests,
         const digest& root,
         const view_layout& layout,
-        result_writer& writer,
         std::span<const at::Device> devices
     );
 
@@ -211,7 +208,6 @@ class sequence {
     std::size_t unapplied_position_shift() const noexcept;
     const page_eviction_policy& eviction_policy_in_pages() const noexcept;
     state::lease_id_type lease_id() const noexcept;
-    result_writer& writer() const noexcept;
     // Recurrent KV layer layer's line holding the state at the end of head's page.
     std::uint32_t head_state_line(std::size_t layer) const;
     // The view index of the next token in KV layer layer's view.

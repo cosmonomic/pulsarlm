@@ -31,8 +31,14 @@ namespace pulsarlm {
 // Runs sequences on the model: it owns the model shards, the KV cache and the store's side of a request, and does
 // whatever touches them, while the scheduler decides what runs.
 class executor {
+    // A request being served: its callbacks, and its sequence once the stored state was read.
+    struct served_request {
+        std::unique_ptr<request_callbacks> callbacks;
+        std::optional<sequence> state;
+    };
+
   public:
-    using sequence_id = slot_map<sequence>::key_type;
+    using sequence_id = slot_map<served_request>::key_type;
     // A sequence and the tokens it computes in a batch.
     using batch_tokens = std::pair<sequence_id, std::size_t>;
 
@@ -40,8 +46,8 @@ class executor {
     class batch;
     struct batch_writes;
 
-    // Names a sequence of an executor without owning it. Each access throws std::out_of_range once the sequence was
-    // stopped.
+    // Names a sequence of an executor without owning it. Each access throws std::out_of_range once the sequence's
+    // request was erased.
     class sequence_ref {
         executor* owner;
         sequence_id id;
@@ -54,8 +60,8 @@ class executor {
         bool operator==(const sequence_ref& other) const noexcept = default;
     };
 
-    // Each sequence from start until stop.
-    slot_map<sequence> sequences;
+    // Each request from start until its end.
+    slot_map<served_request> requests;
 
     // One model per shard of the cache, each holding its part of every layer.
     std::vector<model*> shards;
@@ -133,8 +139,23 @@ class executor {
     void update_views(sequence& seq);
     // Whether token_count more tokens fill a page of seq.
     bool completes_page(const sequence& seq, std::size_t token_count) const noexcept;
-    // Releases the lines and the lease of id's sequence, then erases it.
-    void drop(sequence_id id) noexcept;
+    // The sequence of id's request. Throws std::out_of_range once the request was erased, and
+    // std::bad_optional_access before start read the stored state.
+    sequence& sequence_of(sequence_id id);
+    const sequence& sequence_of(sequence_id id) const;
+    // Releases the lines and the lease of served's sequence, when it has one, then calls on_end with result and
+    // statistics and destroys the callbacks.
+    void deliver_end(
+        served_request& served,
+        std::expected<std::shared_ptr<const state>, request_error>&& result,
+        const request_statistics& statistics
+    ) noexcept;
+    // Ends id's request with result and statistics (deliver_end), then erases it.
+    void end_request(
+        sequence_id id,
+        std::expected<std::shared_ptr<const state>, request_error>&& result,
+        const request_statistics& statistics
+    ) noexcept;
     // Moves each entry's tokens to its sequence's tail (sequence::launch_step, sequence::launch_verify_step), switches
     // the boundary lines of the sequences whose pages it fills, and appends each token the step samples to pending as
     // awaited_token.
@@ -165,8 +186,8 @@ class executor {
     task<void> synchronize_shards();
     // Evicts at the end of seq's cycle and returns whether a view changed.
     bool evict(sequence& seq);
-    // Writes the state seq reached to the store and passes it to seq's callbacks.
-    task<void> write_cycle_end(sequence& seq);
+    // Writes the state seq reached to the store and passes it to callbacks, those of seq's request.
+    task<void> write_cycle_end(sequence& seq, request_callbacks& callbacks);
 
   public:
     // shards[s] runs on cache shard s with streams[s], shards 1 on on worker_loops[s - 1], and its write-backs' copies
@@ -191,10 +212,13 @@ class executor {
     );
     ~executor();
 
-    // The sequence of r, resuming the newest state the store holds for a prefix of its tokens, with lines for its
-    // first cycle. Fails with miss when the lookup or a page read fails, and with oom when the free lines do not cover
-    // the state's pages and one cycle's tokens; its lease is then released. writer outlives the sequence.
-    task<std::expected<sequence_id, request_error>> start(request&& r, result_writer& writer);
+    // Serves r with callbacks, which it takes before it first suspends. Returns the sequence of r, resuming the newest
+    // state the store holds for a prefix of its tokens, with lines for its first cycle. Returns std::nullopt after it
+    // ended the request through on_end, with value-initialized statistics: with cancelled when the callbacks are
+    // cancelled at the start, before the store is read, with miss when the lookup or a page read fails, and with oom
+    // when the free lines do not cover the state's pages and one cycle's tokens. The lease of a request that fails is
+    // released before on_end.
+    task<std::optional<sequence_id>> start(request&& r, std::unique_ptr<request_callbacks>&& callbacks);
     // Whether a step of entries can be launched now, before any write-back: no step is launched or the last launched
     // step allows overlap, and so does a step of entries. A step allows overlap when it ends no cycle and, in a model
     // with sliding layers, completes no page, or in an executor whose steps draft, when every entry verifies drafts.
@@ -222,11 +246,12 @@ class executor {
     // skipped. Returns the sequences of the step's entries, in entry order. Throws std::logic_error, which panics the
     // loop, when no step is launched.
     task<std::vector<sequence_id>> write_back();
-    // Ends the sequence of id, which exited and is in no launched step: releases its lines, writes its end state when it
-    // finished, releases its lease and erases it. Returns that state or the error it exited with, and its statistics.
-    // Throws std::logic_error for a sequence that has not exited or that a launched step holds.
-    task<std::pair<std::expected<std::shared_ptr<const state>, request_error>, request_statistics>>
-    stop(sequence_id id);
+    // Ends the request of id, whose sequence exited and is in no launched step: releases its lines, writes its end state
+    // when it finished, releases its lease, delivers the state or the error and the statistics through on_end, and
+    // erases it. Throws std::logic_error for a sequence that has not exited or that a launched step holds.
+    task<void> stop(sequence_id id);
+    // Ends every request with error and its statistics so far, and erases it. Called when the loop has exited.
+    void end_requests(request_error error) noexcept;
     // Whether the sequence has not exited and no launched step forwards its last tokens.
     bool is_steppable(sequence_id id) const;
     std::size_t pending_token_count(sequence_id id) const;

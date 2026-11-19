@@ -18,7 +18,7 @@ namespace pulsarlm {
 executor::batch::batch(executor& owner, std::span<const batch_tokens> step_entries) {
     bool has_prefill = false;
     for (const auto& [id, token_count] : step_entries) {
-        sequence& seq = owner.sequences.at(id);
+        sequence& seq = owner.sequence_of(id);
         has_prefill = has_prefill || seq.pending_token_list().size() > 1;
         group& g = has_prefill ? prefill_group : seq.draft_tokens().empty() ? decode_group : verify_group;
         g.entries.push_back(

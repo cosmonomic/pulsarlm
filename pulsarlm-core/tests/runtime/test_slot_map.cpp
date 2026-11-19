@@ -88,3 +88,22 @@ TEST_CASE("a slot_map's iterators visit its values in slot order and pass over e
     CHECK(std::distance(read_only.begin(), read_only.end()) == 2);
     CHECK(read_only.begin()->number == 1);
 }
+
+TEST_CASE("a cleared slot_map holds no value, and its keys stop matching after their slots hold other values") {
+    slot_map<pinned_value> values;
+    slot_map<pinned_value>::key_type first = values.emplace(1);
+    slot_map<pinned_value>::key_type second = values.emplace(2);
+    values.erase(first);
+    values.clear();
+
+    REQUIRE(values.size() == 0);
+    REQUIRE(values.begin() == values.end());
+    REQUIRE(!values.contains(second));
+    slot_map<pinned_value>::key_type third = values.emplace(3);
+    slot_map<pinned_value>::key_type fourth = values.emplace(4);
+    REQUIRE(!values.contains(first));
+    REQUIRE(!values.contains(second));
+    REQUIRE(values.at(third).number == 3);
+    REQUIRE(values.at(fourth).number == 4);
+    REQUIRE(values.size() == 2);
+}

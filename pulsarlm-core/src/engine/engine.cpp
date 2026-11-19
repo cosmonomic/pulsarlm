@@ -337,7 +337,7 @@ engine::~engine() {
 
 // The worker loops' tasks hold references into the loop's frames, so the workers stop before those frames are
 // destroyed; the frames hold host buffers the streams may still use, so they are destroyed after the streams finish.
-// Their writers end their callbacks with loop_exited after loop_exception is set.
+// The requests end with loop_exited after loop_exception is set.
 void engine::run_loop(std::latch& started) {
     c10::cuda::CUDAGuard device_guard(devices.front());
     {
@@ -372,6 +372,7 @@ void engine::run_loop(std::latch& started) {
             }
             loop = nullptr;
         }
+        exec.end_requests(request_error::loop_exited);
     }
 }
 
@@ -390,13 +391,14 @@ void engine::run_worker_loop(std::size_t shard) {
     }
 }
 
-// A submit racing the loop's exit finds loop null; its writer then ends the callbacks with loop_exited.
+// A submit racing the loop's exit finds loop null; the task is then destroyed without running, and the
+// scheduler::unstarted_callbacks in its frame ends the callbacks with loop_exited.
 void engine::submit(request&& r, std::unique_ptr<request_callbacks> callbacks) {
     validate(r, vocab_size);
-    result_writer writer(std::move(callbacks));
+    task<void> serving = sched.submit(std::move(r), std::move(callbacks));
     std::lock_guard lock(mutex);
     if (loop != nullptr) {
-        loop->spawn(sched.submit(std::move(r), std::move(writer)));
+        loop->spawn(std::move(serving));
     }
 }
 

@@ -83,26 +83,7 @@ class request_callbacks {
     virtual bool cancelled() const noexcept = 0;
 };
 
-// The engine's side of a request's callbacks. Destroyed before ending them, it ends them with loop_exited.
-class result_writer {
-    std::unique_ptr<request_callbacks> callbacks;
-
-  public:
-    explicit result_writer(std::unique_ptr<request_callbacks> callbacks) noexcept;
-    result_writer(const result_writer&) = delete;
-    result_writer& operator=(const result_writer&) = delete;
-    result_writer(result_writer&& other) noexcept = default;
-    result_writer& operator=(result_writer&&) = delete;
-    ~result_writer();
-
-    void append(const prefill_statistics& statistics) noexcept;
-    void append(std::int64_t token, const decode_statistics& statistics) noexcept;
-    void append(cycle_end&& ended) noexcept;
-    // Called once; the callbacks are destroyed once it returns.
-    void
-    end(std::expected<std::shared_ptr<const pulsarlm::state>, request_error>&& result,
-        const request_statistics& statistics) noexcept;
-    bool cancelled() const noexcept;
-};
+// Ends callbacks with loop_exited and value-initialized statistics.
+void end_with_loop_exited(std::unique_ptr<request_callbacks>& callbacks) noexcept;
 
 }  // namespace pulsarlm

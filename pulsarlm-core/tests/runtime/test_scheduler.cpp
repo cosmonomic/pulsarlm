@@ -41,7 +41,6 @@ using pulsarlm::event_loop;
 using pulsarlm::page;
 using pulsarlm::request;
 using pulsarlm::request_error;
-using pulsarlm::result_writer;
 using pulsarlm::sharded_page;
 using pulsarlm::task;
 
@@ -92,6 +91,7 @@ struct request_results {
     std::vector<std::size_t> writes_at_cycle_ends;
     std::optional<std::size_t> writes_at_end;
     std::optional<std::size_t> releases_at_end;
+    std::size_t end_count = 0;
 };
 
 class recording_callbacks final : public pulsarlm::request_callbacks {
@@ -128,6 +128,7 @@ class recording_callbacks final : public pulsarlm::request_callbacks {
         if (recorded_results->observed_store) {
             recorded_results->releases_at_end = recorded_results->observed_store->releases.size();
         }
+        recorded_results->end_count++;
         recorded_results->prefills_at_end = recorded_results->prefills.size();
         recorded_results->statistics = statistics;
         if (result) {
@@ -143,8 +144,8 @@ class recording_callbacks final : public pulsarlm::request_callbacks {
     }
 };
 
-result_writer make_writer(const std::shared_ptr<request_results>& recorded_results) {
-    return result_writer(std::make_unique<recording_callbacks>(recorded_results));
+std::unique_ptr<pulsarlm::request_callbacks> make_callbacks(const std::shared_ptr<request_results>& recorded_results) {
+    return std::make_unique<recording_callbacks>(recorded_results);
 }
 
 constexpr std::size_t page_size = 4;
@@ -771,16 +772,25 @@ bool page_holds(const pulsarlm::kv& p, const token_list& tokens, std::size_t fir
 struct submission {
     request r;
     std::shared_ptr<request_results> recorded_results;
-    result_writer writer;
+    std::unique_ptr<pulsarlm::request_callbacks> callbacks;
 };
 
 submission make_submission(request r) {
     auto recorded_results = std::make_shared<request_results>();
-    return submission{.r = std::move(r), .recorded_results = recorded_results, .writer = make_writer(recorded_results)};
+    return submission{
+        .r = std::move(r),
+        .recorded_results = recorded_results,
+        .callbacks = make_callbacks(recorded_results)
+    };
 }
 
-task<void> serve(pulsarlm::scheduler& sched, request r, result_writer writer, std::size_t& remaining) {
-    co_await sched.submit(std::move(r), std::move(writer));
+task<void> serve(
+    pulsarlm::scheduler& sched,
+    request r,
+    std::unique_ptr<pulsarlm::request_callbacks> callbacks,
+    std::size_t& remaining
+) {
+    co_await sched.submit(std::move(r), std::move(callbacks));
     if (--remaining == 0) {
         event_loop::current()->stop();
     }
@@ -791,7 +801,7 @@ std::vector<request_results> serve_submissions(pulsarlm::scheduler& sched, std::
     event_loop loop;
     loop.spawn(sched.run());
     for (submission& s : submissions) {
-        loop.spawn(serve(sched, std::move(s.r), std::move(s.writer), remaining));
+        loop.spawn(serve(sched, std::move(s.r), std::move(s.callbacks), remaining));
     }
     REQUIRE(loop.run() == nullptr);
     std::vector<request_results> results;
@@ -816,10 +826,10 @@ task<void> serve_then(
     std::vector<request_results>& results
 ) {
     auto first_results = std::make_shared<request_results>();
-    co_await sched.submit(std::move(first), make_writer(first_results));
+    co_await sched.submit(std::move(first), make_callbacks(first_results));
     results.push_back(*first_results);
     auto second_results = std::make_shared<request_results>();
-    co_await sched.submit(next(results.front()), make_writer(second_results));
+    co_await sched.submit(next(results.front()), make_callbacks(second_results));
     results.push_back(*second_results);
     event_loop::current()->stop();
 }
@@ -1211,8 +1221,8 @@ TEST_CASE("a request cancelled while a step is launched counts only the tokens i
     REQUIRE(results[0].statistics.total_token_count == prompt.size() + results[0].tokens.size());
 }
 
-// The executor owns a sequence that was not stopped until its own destruction, and the sequence holds the lease.
-TEST_CASE("a request's lease is released once, with the executor, when the loop stops while it runs") {
+// The executor owns a request that was not ended until its own destruction, and the request's sequence holds the lease.
+TEST_CASE("a request is ended and its lease released once, with the executor, when the loop stops while it runs") {
     std::shared_ptr<store_contents> store;
     auto recorded_results = std::make_shared<request_results>();
     {
@@ -1222,16 +1232,81 @@ TEST_CASE("a request's lease is released once, with the executor, when the loop 
         {
             event_loop loop;
             loop.spawn(f.sched.run());
-            loop.spawn(f.sched.submit(request{.tokens = {1, 2, 3}, .max_tokens = 10}, make_writer(recorded_results)));
+            loop.spawn(
+                f.sched.submit(request{.tokens = {1, 2, 3}, .max_tokens = 10}, make_callbacks(recorded_results))
+            );
             REQUIRE(loop.run() == nullptr);
             c10::cuda::getCurrentCUDAStream().synchronize();
             REQUIRE(store->leases.size() == 1);
             REQUIRE(store->releases.empty());
         }
-        REQUIRE(ended_error(*recorded_results) == request_error::loop_exited);
+        REQUIRE(!recorded_results->end);
         REQUIRE(store->releases.empty());
     }
+    REQUIRE(ended_error(*recorded_results) == request_error::loop_exited);
     REQUIRE(store->releases == store->leases);
+}
+
+TEST_CASE("end_requests ends a running request with the given error and releases its lease once") {
+    std::shared_ptr<store_contents> store;
+    auto recorded_results = std::make_shared<request_results>();
+    const token_list prompt{1, 2, 3};
+    {
+        fixture f(16);
+        store = f.store;
+        recorded_results->observed_store = store;
+        f.model.on_forward = [&f] {
+            if (f.model.forward_count == 3) {
+                event_loop::current()->stop();
+            }
+        };
+        event_loop loop;
+        loop.spawn(f.sched.run());
+        loop.spawn(f.sched.submit(request{.tokens = prompt, .max_tokens = 10}, make_callbacks(recorded_results)));
+        REQUIRE(loop.run() == nullptr);
+        c10::cuda::getCurrentCUDAStream().synchronize();
+        REQUIRE(store->leases.size() == 1);
+        REQUIRE(store->releases.empty());
+        REQUIRE(!recorded_results->end);
+
+        f.exec.end_requests(request_error::oom);
+        REQUIRE(ended_error(*recorded_results) == request_error::oom);
+        REQUIRE(recorded_results->releases_at_end == 1);
+        REQUIRE(!recorded_results->tokens.empty());
+        REQUIRE(recorded_results->statistics.total_token_count == prompt.size() + recorded_results->tokens.size());
+        REQUIRE(store->releases == store->leases);
+    }
+    REQUIRE(store->releases == store->leases);
+    REQUIRE(store->written_states.empty());
+}
+
+TEST_CASE("a submitted request whose task never runs ends with loop_exited when the loop is destroyed") {
+    fixture f(16);
+    auto recorded_results = std::make_shared<request_results>();
+    {
+        event_loop loop;
+        loop.spawn(f.sched.submit(request{.tokens = {1, 2, 3}, .max_tokens = 10}, make_callbacks(recorded_results)));
+        REQUIRE(!recorded_results->end);
+    }
+    REQUIRE(ended_error(*recorded_results) == request_error::loop_exited);
+    REQUIRE(recorded_results->statistics.total_token_count == 0);
+    REQUIRE(f.store->leases.empty());
+}
+
+TEST_CASE("a submitted request whose task is destroyed without being spawned ends with loop_exited once") {
+    fixture f(16);
+    auto recorded_results = std::make_shared<request_results>();
+    {
+        task<void> serving = f.sched.submit(
+            request{.tokens = {1, 2, 3}, .max_tokens = 10},
+            make_callbacks(recorded_results)
+        );
+        REQUIRE(recorded_results->end_count == 0);
+    }
+    REQUIRE(recorded_results->end_count == 1);
+    REQUIRE(ended_error(*recorded_results) == request_error::loop_exited);
+    REQUIRE(recorded_results->statistics.total_token_count == 0);
+    REQUIRE(f.store->leases.empty());
 }
 
 TEST_CASE("a request that finds too few free lines ends with oom without waiting") {
@@ -2168,38 +2243,51 @@ TEST_CASE("a launch of no entries panics the loop with a logic error") {
 task<void> start_then_stop_loop(
     pulsarlm::executor& exec,
     request r,
-    result_writer& writer,
+    std::unique_ptr<pulsarlm::request_callbacks> callbacks,
     std::optional<pulsarlm::executor::sequence_id>& started
 ) {
-    std::expected<pulsarlm::executor::sequence_id, request_error> id = co_await exec.start(std::move(r), writer);
-    if (id) {
-        started = *id;
-    }
+    started = co_await exec.start(std::move(r), std::move(callbacks));
     event_loop::current()->stop();
 }
 
 std::optional<pulsarlm::executor::sequence_id>
-start_sequence(pulsarlm::executor& exec, request r, result_writer& writer) {
+start_sequence(pulsarlm::executor& exec, request r, const std::shared_ptr<request_results>& recorded_results) {
     std::optional<pulsarlm::executor::sequence_id> started;
     event_loop loop;
-    loop.spawn(start_then_stop_loop(exec, std::move(r), writer, started));
+    loop.spawn(start_then_stop_loop(exec, std::move(r), make_callbacks(recorded_results), started));
     REQUIRE(loop.run() == nullptr);
     return started;
 }
 
+TEST_CASE("a request whose callbacks are cancelled before the start ends with cancelled and takes no lease") {
+    fixture f(16);
+    auto recorded_results = std::make_shared<request_results>();
+    recorded_results->cancelled = true;
+    std::optional<pulsarlm::executor::sequence_id> started = start_sequence(
+        f.exec,
+        request{.tokens = {1, 2, 3}, .max_tokens = 10},
+        recorded_results
+    );
+
+    REQUIRE(!started.has_value());
+    REQUIRE(ended_error(*recorded_results) == request_error::cancelled);
+    REQUIRE(recorded_results->statistics.total_token_count == 0);
+    REQUIRE(f.store->state_reads.empty());
+    REQUIRE(f.store->leases.empty());
+    REQUIRE(f.store->releases.empty());
+}
+
 TEST_CASE("an entry takes a row of sampled tokens when it computes its sequence's last pending token") {
     fixture f(16);
-    result_writer decode_writer = make_writer(std::make_shared<request_results>());
-    result_writer prefill_writer = make_writer(std::make_shared<request_results>());
     std::optional<pulsarlm::executor::sequence_id> decoding = start_sequence(
         f.exec,
         request{.tokens = {1}, .max_tokens = 2},
-        decode_writer
+        std::make_shared<request_results>()
     );
     std::optional<pulsarlm::executor::sequence_id> prefilling = start_sequence(
         f.exec,
         request{.tokens = {1, 2, 3}, .max_tokens = 2},
-        prefill_writer
+        std::make_shared<request_results>()
     );
     REQUIRE(decoding.has_value());
     REQUIRE(prefilling.has_value());
