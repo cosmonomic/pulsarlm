@@ -54,7 +54,7 @@ task<void> scheduler::submit(request r, result_writer writer) {
 
 task<void> scheduler::run() {
     for (;;) {
-        std::vector<executor::batch_tokens> entries = next_entries();
+        auto [entries, next_scan_start] = next_entries();
         if (exec.launched_batch_count() > 0 && (entries.empty() || !exec.allows_overlap(entries))) {
             co_await retire();
             continue;
@@ -64,6 +64,7 @@ task<void> scheduler::run() {
             continue;
         }
         co_await exec.launch(entries);
+        sampled_row_scan_start = next_scan_start;
         if (exec.launched_batch_count() > 1) {
             co_await retire();
         }
@@ -85,40 +86,53 @@ task<void> scheduler::retire() {
     }
 }
 
-std::vector<executor::batch_tokens> scheduler::next_entries() const {
-    std::vector<executor::batch_tokens> entries;
-    std::size_t row_total = 0;
-    for (executor::sequence_id id : running_sequences) {
-        if (exec.is_steppable(id) && exec.pending_token_count(id) == 1) {
-            const std::size_t row_count = exec.sampled_row_count(id, 1);
-            if (row_total + row_count > executor::max_sampled_rows) {
-                continue;
-            }
-            row_total += row_count;
-            entries.emplace_back(id, 1);
-        }
-    }
+std::pair<std::vector<executor::batch_tokens>, std::size_t> scheduler::next_entries() const {
+    const std::size_t sequence_count = running_sequences.size();
+    std::vector<std::size_t> token_counts(sequence_count, 0);
+    std::vector<bool> is_decoding(sequence_count, false);
     std::size_t budget = prefill_tokens_per_step;
-    for (executor::sequence_id id : running_sequences) {
-        if (budget == 0) {
-            break;
-        }
+    for (std::size_t index = 0; index < sequence_count; index++) {
+        const executor::sequence_id id = running_sequences[index];
         if (!exec.is_steppable(id)) {
             continue;
         }
         const std::size_t pending_count = exec.pending_token_count(id);
-        if (pending_count > 1) {
-            std::size_t count = std::min({pending_count, budget, exec.cycle_tokens_left(id)});
-            const std::size_t row_count = exec.sampled_row_count(id, count);
-            if (row_total + row_count > executor::max_sampled_rows) {
-                continue;
-            }
-            row_total += row_count;
-            budget -= count;
-            entries.emplace_back(id, count);
+        if (pending_count == 1) {
+            token_counts[index] = 1;
+            is_decoding[index] = true;
+        } else if (budget > 0) {
+            token_counts[index] = std::min({pending_count, budget, exec.cycle_tokens_left(id)});
+            budget -= token_counts[index];
         }
     }
-    return entries;
+
+    std::size_t row_total = 0;
+    std::optional<std::size_t> first_index_left_out;
+    for (std::size_t offset = 0; offset < sequence_count; offset++) {
+        const std::size_t index = (sampled_row_scan_start + offset) % sequence_count;
+        if (token_counts[index] == 0) {
+            continue;
+        }
+        const std::size_t row_count = exec.sampled_row_count(running_sequences[index], token_counts[index]);
+        if (row_total + row_count > exec.sampled_row_limit()) {
+            token_counts[index] = 0;
+            if (!first_index_left_out) {
+                first_index_left_out = index;
+            }
+            continue;
+        }
+        row_total += row_count;
+    }
+
+    std::vector<executor::batch_tokens> entries;
+    for (const bool decodes : {true, false}) {
+        for (std::size_t index = 0; index < sequence_count; index++) {
+            if (token_counts[index] > 0 && is_decoding[index] == decodes) {
+                entries.emplace_back(running_sequences[index], token_counts[index]);
+            }
+        }
+    }
+    return {std::move(entries), first_index_left_out.value_or(sampled_row_scan_start)};
 }
 
 }  // namespace pulsarlm

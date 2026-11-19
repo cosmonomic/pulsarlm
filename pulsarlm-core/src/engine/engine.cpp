@@ -28,6 +28,8 @@ namespace pulsarlm {
 
 namespace {
 
+constexpr std::size_t sampled_row_limit = 4096;
+
 void check_tokens(std::span<const std::int64_t> tokens, std::size_t vocab_size) {
     for (std::int64_t token : tokens) {
         if (token < 0 || static_cast<std::uint64_t>(token) >= vocab_size) {
@@ -303,7 +305,8 @@ engine::engine(
       make_root_digest(config.model_name, config.model_hash, page_shapes(config, full_layers(*this->shards.front()))),
       std::vector<std::int64_t>(config.stop_ids),
       graph_pages(config),
-      checked_draft_tokens(config, this->shards)
+      checked_draft_tokens(config, this->shards),
+      sampled_row_limit
   ),
   sched(exec, config.prefill_tokens_per_step) {
     for (std::size_t shard = 1; shard < devices.size(); shard++) {

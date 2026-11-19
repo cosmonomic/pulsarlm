@@ -323,6 +323,8 @@ class sum_model final : public pulsarlm::model {
     std::size_t forward_count = 0;
     std::vector<token_list> prefill_chunks;
     std::vector<std::int64_t> decode_sizes;
+    // Each decode step's tokens, on the host.
+    std::vector<token_list> decode_tokens;
     // Each decode step's page_positions, on the host.
     std::vector<at::Tensor> decode_page_positions;
     std::function<void()> on_forward;
@@ -346,6 +348,11 @@ class sum_model final : public pulsarlm::model {
         }
         if (b.kind == batch_kind::decode) {
             decode_sizes.push_back(b.tokens.size(0));
+            at::Tensor step_tokens = b.tokens.cpu().to(at::kLong).contiguous();
+            decode_tokens.emplace_back(
+                step_tokens.data_ptr<std::int64_t>(),
+                step_tokens.data_ptr<std::int64_t>() + step_tokens.numel()
+            );
             decode_page_positions.push_back(b.page_positions.cpu());
         }
         return output{.logits = predict(b, lines)};
@@ -603,7 +610,8 @@ struct fixture {
         std::vector<std::int64_t> stop_ids = {},
         memory_store backing_store = {},
         std::vector<pulsarlm::kv_layer> layers = two_full_layers,
-        std::optional<std::size_t> pool_bytes = std::nullopt
+        std::optional<std::size_t> pool_bytes = std::nullopt,
+        std::size_t sampled_row_limit = 4096
     )
     : backing(std::move(backing_store)),
       store(backing.contents),
@@ -618,7 +626,8 @@ struct fixture {
           root(),
           std::move(stop_ids),
           std::nullopt,
-          draft_tokens
+          draft_tokens,
+          sampled_row_limit
       ),
       sched(exec, prefill_tokens_per_step) {}
 
@@ -2092,6 +2101,121 @@ TEST_CASE("an entry takes a row of sampled tokens when it computes its sequence'
     REQUIRE(f.exec.sampled_row_count(*decoding, 1) == 1);
     REQUIRE(f.exec.sampled_row_count(*prefilling, 3) == 1);
     REQUIRE(f.exec.sampled_row_count(*prefilling, 2) == 0);
+}
+
+const std::vector<token_list> three_decode_prompts{{1}, {3}, {5}};
+constexpr std::size_t three_decode_max_tokens = 8;
+
+struct limited_run {
+    std::vector<request_results> results;
+    std::vector<std::int64_t> decode_sizes;
+    std::vector<token_list> decode_tokens;
+    std::size_t prefill_count;
+};
+
+// Serves three_decode_prompts at once, each a single token so that every step is one decode forward.
+limited_run serve_three_under_row_limit(std::size_t sampled_row_limit) {
+    fixture f(32, 64, {}, {}, two_full_layers, std::nullopt, sampled_row_limit);
+    std::vector<request> requests;
+    for (const token_list& prompt : three_decode_prompts) {
+        requests.push_back(request{.tokens = prompt, .max_tokens = three_decode_max_tokens});
+    }
+    std::vector<request_results> results = serve_all(f.sched, std::move(requests));
+    return limited_run{
+        .results = std::move(results),
+        .decode_sizes = f.model.decode_sizes,
+        .decode_tokens = f.model.decode_tokens,
+        .prefill_count = f.model.prefill_chunks.size(),
+    };
+}
+
+// Per request of three_decode_prompts, per decode step, whether the step forwards a token of the request. The tokens
+// the three requests forward are disjoint.
+std::vector<std::vector<bool>> participation_of(const std::vector<token_list>& decode_tokens) {
+    std::vector<std::vector<bool>> participation;
+    for (const token_list& prompt : three_decode_prompts) {
+        token_list forwarded = concat(prompt, continuation(prompt, three_decode_max_tokens));
+        std::vector<bool> takes_part;
+        for (const token_list& step_tokens : decode_tokens) {
+            takes_part.push_back(std::ranges::any_of(step_tokens, [&](std::int64_t token) {
+                return std::ranges::find(forwarded, token) != forwarded.end();
+            }));
+        }
+        participation.push_back(std::move(takes_part));
+    }
+    return participation;
+}
+
+TEST_CASE("requests decoding under a row limit below their count end with the tokens each produces alone") {
+    limited_run run = serve_three_under_row_limit(2);
+
+    for (std::size_t i = 0; i < three_decode_prompts.size(); i++) {
+        fixture alone(16);
+        std::vector<request_results> alone_results = serve_all(
+            alone.sched,
+            {request{.tokens = three_decode_prompts[i], .max_tokens = three_decode_max_tokens}}
+        );
+        REQUIRE(alone_results[0].tokens == continuation(three_decode_prompts[i], three_decode_max_tokens));
+        REQUIRE(run.results[i].tokens == alone_results[0].tokens);
+        REQUIRE(run.results[i].end.has_value());
+        REQUIRE(run.results[i].end->has_value());
+    }
+    REQUIRE(run.prefill_count == 0);
+    REQUIRE(!run.decode_sizes.empty());
+    for (std::int64_t size : run.decode_sizes) {
+        REQUIRE(size <= 2);
+    }
+    REQUIRE(
+        std::accumulate(run.decode_sizes.begin(), run.decode_sizes.end(), std::int64_t{0}) ==
+        static_cast<std::int64_t>(three_decode_prompts.size() * three_decode_max_tokens)
+    );
+}
+
+TEST_CASE("the row limit leaves each decoding request out in turn, so none waits for another to finish") {
+    limited_run run = serve_three_under_row_limit(2);
+    std::vector<std::vector<bool>> participation = participation_of(run.decode_tokens);
+
+    std::vector<std::size_t> last_steps;
+    for (const std::vector<bool>& takes_part : participation) {
+        REQUIRE(std::ranges::count(takes_part, true) == static_cast<std::ptrdiff_t>(three_decode_max_tokens));
+        last_steps.push_back(
+            takes_part.size() - 1 -
+            (std::ranges::find(takes_part.rbegin(), takes_part.rend(), true) - takes_part.rbegin())
+        );
+    }
+    const std::size_t earliest_last_step = *std::ranges::min_element(last_steps);
+    REQUIRE(*std::ranges::max_element(last_steps) - earliest_last_step <= 2);
+    for (const std::vector<bool>& takes_part : participation) {
+        const auto while_all_run = takes_part.begin() + static_cast<std::ptrdiff_t>(earliest_last_step);
+        REQUIRE(std::find(takes_part.begin(), while_all_run, false) != while_all_run);
+        REQUIRE(std::find(takes_part.begin(), while_all_run, true) != while_all_run);
+    }
+    for (std::size_t step = 0; step + 2 < earliest_last_step; step++) {
+        for (const std::vector<bool>& takes_part : participation) {
+            REQUIRE((takes_part[step] || takes_part[step + 1]));
+        }
+    }
+}
+
+TEST_CASE("an executor with a row limit of 0 is not constructed") {
+    memory_store backing;
+    sum_model model;
+    REQUIRE_THROWS_AS(
+        pulsarlm::executor(
+            {&model},
+            make_cache(model.layers, 16, std::nullopt, backing),
+            backing,
+            compute_streams(),
+            copy_streams(),
+            {},
+            root(),
+            {},
+            std::nullopt,
+            0,
+            0
+        ),
+        std::invalid_argument
+    );
 }
 
 }  // namespace

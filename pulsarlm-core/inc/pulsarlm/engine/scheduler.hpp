@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <optional>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "pulsarlm/engine/event_loop.hpp"
@@ -22,13 +23,17 @@ class scheduler {
     std::optional<event> join_event;
     // Per running sequence, set once it exited and no launched step holds it; its request's task awaits it.
     std::unordered_map<executor::sequence_id, event> exit_events;
+    // The position in running_sequences from which the next step grants rows of sampled tokens.
+    std::size_t sampled_row_scan_start = 0;
 
     static event& emplace_event(std::optional<event>& waited);
     static void wake(std::optional<event>& waited) noexcept;
     // The next step's entries: every decoding sequence, then the others' tokens up to prefill_tokens_per_step, never
-    // past the end of a sequence's cycle. Leaves out the sequences whose last step is launched, and each sequence
-    // whose rows of sampled tokens would raise the step's above executor::max_sampled_rows.
-    std::vector<executor::batch_tokens> next_entries() const;
+    // past the end of a sequence's cycle. Leaves out the sequences whose last step is launched. Rows of sampled tokens
+    // are granted from sampled_row_scan_start on, and a sequence whose rows would raise the step's above
+    // executor::sampled_row_limit is left out. Also returns the position of the first sequence left out, or
+    // sampled_row_scan_start when none was.
+    std::pair<std::vector<executor::batch_tokens>, std::size_t> next_entries() const;
     // Writes the oldest launched step back, ends the sequences in it whose callbacks are cancelled, and lets each sequence
     // that exited leave once no launched step holds it.
     task<void> retire();

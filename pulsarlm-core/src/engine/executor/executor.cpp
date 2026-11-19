@@ -39,7 +39,8 @@ executor::executor(
     digest root,
     std::vector<std::int64_t>&& stop_ids,
     std::optional<std::size_t> graph_pages,
-    std::size_t draft_tokens
+    std::size_t draft_tokens,
+    std::size_t sampled_row_limit
 )
 : shards(std::move(shards)),
   cache(std::move(cache)),
@@ -51,7 +52,14 @@ executor::executor(
   root(root),
   stop_ids(std::move(stop_ids)),
   graph_pages(graph_pages),
-  draft_state_slots(draft_tokens + 1) {
+  draft_state_slots(draft_tokens + 1),
+  sampled_row_capacity(sampled_row_limit) {
+    if (sampled_row_limit == 0) {
+        throw std::invalid_argument("executor: sampled_row_limit must be at least 1");
+    }
+    if (sampled_row_limit < draft_tokens + 1) {
+        throw std::invalid_argument("executor: sampled_row_limit must cover one verify entry, draft_tokens + 1 rows");
+    }
     require(
         !this->shards.empty() && this->shards.size() == this->cache.shard_count() &&
             this->streams.size() == this->shards.size() && this->copy_streams.size() == this->shards.size() &&
@@ -103,7 +111,10 @@ executor::executor(
     require(layout.page_size > 0, "executor: the model must have a KV layer with pages");
     for (std::size_t shard = 0; shard < this->shards.size(); shard++) {
         samples.push_back(
-            at::zeros({static_cast<std::int64_t>(max_sampled_rows)}, lines[shard].front().k.options().dtype(at::kLong))
+            at::zeros(
+                {static_cast<std::int64_t>(sampled_row_capacity)},
+                lines[shard].front().k.options().dtype(at::kLong)
+            )
         );
         stop_tokens.push_back(
             at::tensor(this->stop_ids, at::TensorOptions().dtype(at::kLong)).to(lines[shard].front().k.device())
@@ -226,6 +237,10 @@ std::size_t executor::launched_batch_count() const noexcept {
     return launched_batches.size();
 }
 
+std::size_t executor::sampled_row_limit() const noexcept {
+    return sampled_row_capacity;
+}
+
 std::size_t executor::sampled_row_count(sequence_id id, std::size_t token_count) const {
     const sequence& seq = sequences.at(id);
     if (token_count != seq.pending_token_list().size() || !seq.may_sample()) {
@@ -323,8 +338,8 @@ void executor::advance(batch& b) {
 task<void> executor::launch(std::span<const batch_tokens> entries) {
     check_launch(entries);
     std::unique_ptr<batch> b(new batch(*this, entries));
-    if (b->sample_params.size() > max_sampled_rows) {
-        throw std::logic_error("executor::launch: the step samples more than max_sampled_rows rows");
+    if (b->sample_params.size() > sampled_row_capacity) {
+        throw std::logic_error("executor::launch: the step samples more than sampled_row_limit rows");
     }
     b->allows_overlap = entries_allow_overlap(entries);
     link_previous(*b);

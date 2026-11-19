@@ -34,8 +34,6 @@ class executor {
     using sequence_id = slot_map<sequence>::key_type;
     // A sequence and the tokens it computes in a batch.
     using batch_tokens = std::pair<sequence_id, std::size_t>;
-    // The most rows of sampled tokens a batch has.
-    static constexpr std::size_t max_sampled_rows = 4096;
 
   private:
     class batch;
@@ -100,7 +98,9 @@ class executor {
     static constexpr std::size_t max_store_writes = 8;
     // Per shard, the arrival counters of the steps that run without a graph, grown to the largest step's.
     std::vector<at::Tensor> eager_counters;
-    // Per shard, int64 [max_sampled_rows] on its device: the tokens the latest launched step sampled, every shard
+    // The most rows of sampled tokens a batch has.
+    std::size_t sampled_row_capacity;
+    // Per shard, int64 [sampled_row_capacity] on its device: the tokens the latest launched step sampled, every shard
     // sampling them alike.
     std::vector<at::Tensor> samples;
 
@@ -144,7 +144,7 @@ class executor {
     // whose steps draft, whether every entry verifies drafts: its write-back then changes no view or table that the
     // next step reads, and copies to the store only lines the next step does not write.
     bool entries_allow_overlap(std::span<const batch_tokens> entries) const;
-    // Throws std::logic_error unless launch can launch a step of entries now, the limit max_sampled_rows aside.
+    // Throws std::logic_error unless launch can launch a step of entries now, the limit sampled_row_limit() aside.
     void check_launch(std::span<const batch_tokens> entries) const;
 
     task<void> join(batch& b);
@@ -182,7 +182,8 @@ class executor {
         digest root,
         std::vector<std::int64_t>&& stop_ids,
         std::optional<std::size_t> graph_pages,
-        std::size_t draft_tokens
+        std::size_t draft_tokens,
+        std::size_t sampled_row_limit
     );
     ~executor();
 
@@ -196,6 +197,8 @@ class executor {
     bool allows_overlap(std::span<const batch_tokens> entries) const;
     // The launched steps not written back yet, at most 2.
     std::size_t launched_batch_count() const noexcept;
+    // The most rows of sampled tokens a batch has.
+    std::size_t sampled_row_limit() const noexcept;
     // The rows of a batch's sampled tokens that the sequence takes when it computes token_count tokens.
     std::size_t sampled_row_count(sequence_id id, std::size_t token_count) const;
     // Launches one step of entries, decoding entries first, after the launched steps: advances each sequence by its
@@ -204,7 +207,7 @@ class executor {
     // Throws std::logic_error, which panics the loop, before it changes a sequence or queues work, when entries is
     // empty or names a sequence twice, a token count is 0 or above the sequence's pending tokens, a sequence is not
     // steppable (is_steppable), two steps are launched, a step is launched and allows_overlap(entries) is false, or
-    // the step samples more than max_sampled_rows rows.
+    // the step samples more than sampled_row_limit() rows.
     task<void> launch(std::span<const batch_tokens> entries);
     // Writes back the oldest launched step: waits for it, then completes the pages its tokens filled, sets each awaited token it sampled, writes the
     // completed pages, evicts and writes the state at a cycle end, and takes lines for the next tokens. The pages of a
