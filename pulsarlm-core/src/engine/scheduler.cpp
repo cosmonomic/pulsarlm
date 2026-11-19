@@ -89,37 +89,37 @@ std::pair<std::vector<executor::batch_tokens>, std::size_t> scheduler::next_entr
     std::vector<std::size_t> token_counts(sequence_count, 0);
     std::vector<bool> is_decoding(sequence_count, false);
     std::size_t budget = prefill_tokens_per_step;
-    for (std::size_t index = 0; index < sequence_count; index++) {
+    std::size_t row_total = 0;
+    std::optional<std::size_t> first_index_left_out;
+    for (std::size_t offset = 0; offset < sequence_count; offset++) {
+        const std::size_t index = (sampled_row_scan_start + offset) % sequence_count;
         const executor::sequence_id id = running_sequences[index];
         if (!exec.is_steppable(id)) {
             continue;
         }
         const std::size_t pending_count = exec.pending_token_count(id);
-        if (pending_count == 1) {
-            token_counts[index] = 1;
-            is_decoding[index] = true;
+        is_decoding[index] = pending_count == 1;
+        std::size_t token_count = 0;
+        if (is_decoding[index]) {
+            token_count = 1;
         } else if (budget > 0) {
-            token_counts[index] = std::min({pending_count, budget, exec.cycle_tokens_left(id)});
-            budget -= token_counts[index];
+            token_count = std::min({pending_count, budget, exec.cycle_tokens_left(id)});
         }
-    }
-
-    std::size_t row_total = 0;
-    std::optional<std::size_t> first_index_left_out;
-    for (std::size_t offset = 0; offset < sequence_count; offset++) {
-        const std::size_t index = (sampled_row_scan_start + offset) % sequence_count;
-        if (token_counts[index] == 0) {
+        if (token_count == 0) {
             continue;
         }
-        const std::size_t row_count = exec.sampled_row_count(running_sequences[index], token_counts[index]);
+        const std::size_t row_count = exec.sampled_row_count(id, token_count);
         if (row_total + row_count > exec.sampled_row_limit()) {
-            token_counts[index] = 0;
             if (!first_index_left_out) {
                 first_index_left_out = index;
             }
             continue;
         }
         row_total += row_count;
+        if (!is_decoding[index]) {
+            budget -= token_count;
+        }
+        token_counts[index] = token_count;
     }
 
     std::vector<executor::batch_tokens> entries;

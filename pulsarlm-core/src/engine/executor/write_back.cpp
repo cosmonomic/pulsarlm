@@ -307,9 +307,7 @@ task<void> executor::refresh_views(batch& b) {
                 seq.start_next_cycle();
             }
             std::optional<std::size_t> first_stale_page;
-            if (views_changed) {
-                first_stale_page = 0;
-            } else if (e.stores_head_state) {
+            if (views_changed || e.stores_head_state) {
                 first_stale_page = 0;
             }
             std::vector<std::size_t> missing_counts = seq.missing_lines();

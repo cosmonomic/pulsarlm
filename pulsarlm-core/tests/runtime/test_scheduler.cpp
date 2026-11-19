@@ -2391,6 +2391,22 @@ TEST_CASE("the row limit leaves each decoding request out in turn, so none waits
     }
 }
 
+TEST_CASE("a prefilling request left out by the row limit leaves its prefill tokens to the requests after it") {
+    fixture f(32, 6, {}, {}, two_full_layers, std::nullopt, 2);
+    std::vector<token_list> prompts{{1, 2}, {3, 4}, {5, 6}, {7, 8, 9, 10, 11, 12}};
+    std::vector<request> requests;
+    for (const token_list& prompt : prompts) {
+        requests.push_back(request{.tokens = prompt, .max_tokens = 2});
+    }
+    std::vector<request_results> results = serve_all(f.sched, std::move(requests));
+
+    for (std::size_t i = 0; i < prompts.size(); i++) {
+        REQUIRE(results[i].tokens == continuation(prompts[i], 2));
+    }
+    REQUIRE(!f.model.prefill_chunks.empty());
+    REQUIRE(f.model.prefill_chunks.front() == token_list{2, 2, 2});
+}
+
 TEST_CASE("an executor with a row limit of 0 is not constructed") {
     memory_store backing;
     sum_model model;

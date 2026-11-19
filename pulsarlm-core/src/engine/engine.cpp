@@ -154,6 +154,7 @@ kv_cache make_cache(const engine_config& config, std::span<const std::unique_ptr
     std::vector<kv_cache_shard> cache_shards;
     for (std::size_t shard = 0; shard < shards.size(); shard++) {
         std::vector<kv_layer> layers = shards[shard]->kv_layers();
+        c10::cuda::CUDAGuard device_guard(config.devices[shard]);
         check_attention(config, layers);
         kv_cache_shard cache_shard{.device = config.devices[shard], .shapes = page_shapes(config, layers)};
         for (const kv_layer_shard& layer : shards[shard]->kv_layer_shards()) {

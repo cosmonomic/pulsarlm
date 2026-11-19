@@ -1,5 +1,7 @@
 #include "pulsarlm/engine/sequence.hpp"
 
+#include "pinned_tensor.hpp"
+
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -21,10 +23,6 @@ namespace {
 
 std::size_t ceil_div(std::size_t n, std::size_t d) {
     return (n + d - 1) / d;
-}
-
-at::Tensor pinned(at::IntArrayRef sizes, at::ScalarType dtype) {
-    return at::empty(sizes, at::TensorOptions().dtype(dtype).pinned_memory(true));
 }
 
 }  // namespace

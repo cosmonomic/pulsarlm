@@ -143,14 +143,13 @@ class executor {
     // std::bad_optional_access before start read the stored state.
     sequence& sequence_of(sequence_id id);
     const sequence& sequence_of(sequence_id id) const;
-    // Releases the lines and the lease of served's sequence, when it has one, then calls on_end with result and
-    // statistics and destroys the callbacks.
+    // Calls on_end of served's callbacks with result and statistics and destroys the callbacks.
     void deliver_end(
         served_request& served,
         std::expected<std::shared_ptr<const state>, request_error>&& result,
         const request_statistics& statistics
     ) noexcept;
-    // Ends id's request with result and statistics (deliver_end), then erases it.
+    // Delivers result and statistics to id's request (deliver_end), then erases it.
     void end_request(
         sequence_id id,
         std::expected<std::shared_ptr<const state>, request_error>&& result,
@@ -250,7 +249,8 @@ class executor {
     // when it finished, releases its lease, delivers the state or the error and the statistics through on_end, and
     // erases it. Throws std::logic_error for a sequence that has not exited or that a launched step holds.
     task<void> stop(sequence_id id);
-    // Ends every request with error and its statistics so far, and erases it. Called when the loop has exited.
+    // Releases the lines and the lease of every request's sequence, delivers error and the request's statistics so far
+    // through on_end, and erases the request. Called when the loop has exited.
     void end_requests(request_error error) noexcept;
     // Whether the sequence has not exited and no launched step forwards its last tokens.
     bool is_steppable(sequence_id id) const;

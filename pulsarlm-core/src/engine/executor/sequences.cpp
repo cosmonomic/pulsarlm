@@ -45,11 +45,10 @@ executor::start(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
         end_request(id, std::unexpected(request_error::cancelled), request_statistics{});
         co_return std::nullopt;
     }
-    require(
+    assert(
         !r.tokens.empty() && r.eviction.n_working >= 1 && r.eviction.cycle_tokens >= 1 &&
-            r.eviction.attention_mass_decay > 0.0 && r.eviction.attention_mass_decay <= 1.0 &&
-            r.eviction.eviction_threshold >= 0.0 && r.eviction.eviction_threshold <= 1.0,
-        "executor::start: the request has no token or an eviction policy out of range"
+        r.eviction.attention_mass_decay > 0.0 && r.eviction.attention_mass_decay <= 1.0 &&
+        r.eviction.eviction_threshold >= 0.0 && r.eviction.eviction_threshold <= 1.0
     );
     digest chain_root = r.initial_digest.value_or(
         make_request_root_digest(root, to_pages(r.eviction, layout.page_size))
@@ -97,6 +96,8 @@ executor::start(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
     seq.record_device_cached_tokens(device_cached_tokens(seq));
     std::expected<void, page_error> line_allocation = co_await take_lines(seq, seq.cycle_lines());
     if (!line_allocation) {
+        release_lines(seq);
+        store.release(seq.lease_id());
         end_request(
             id,
             std::unexpected(line_allocation.error() == page_error::miss ? request_error::miss : request_error::oom),
@@ -105,6 +106,8 @@ executor::start(request&& r, std::unique_ptr<request_callbacks>&& callbacks) {
         co_return std::nullopt;
     }
     if (seq.history_page_count() > stored_pages && !co_await own_pages_from(seq, stored_pages)) {
+        release_lines(seq);
+        store.release(seq.lease_id());
         end_request(id, std::unexpected(request_error::oom), request_statistics{});
         co_return std::nullopt;
     }
@@ -117,10 +120,6 @@ void executor::deliver_end(
     std::expected<std::shared_ptr<const state>, request_error>&& result,
     const request_statistics& statistics
 ) noexcept {
-    if (served.state) {
-        release_lines(*served.state);
-        store.release(served.state->lease_id());
-    }
     std::unique_ptr<request_callbacks> ended = std::move(served.callbacks);
     ended->on_end(std::move(result), statistics);
 }
@@ -138,6 +137,10 @@ void executor::end_request(
 
 void executor::end_requests(request_error error) noexcept {
     for (served_request& served : requests) {
+        if (served.state) {
+            release_lines(*served.state);
+            store.release(served.state->lease_id());
+        }
         deliver_end(served, std::unexpected(error), served.state ? statistics_of(*served.state) : request_statistics{});
     }
     requests.clear();
@@ -232,6 +235,7 @@ task<void> executor::stop(sequence_id id) {
         result = std::unexpected(request_error::oom);
         break;
     }
+    store.release(seq.lease_id());
     end_request(id, std::move(result), statistics_of(seq));
 }
 

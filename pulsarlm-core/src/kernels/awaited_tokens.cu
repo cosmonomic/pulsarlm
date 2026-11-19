@@ -6,6 +6,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 
+#include <cassert>
 #include <cstdint>
 
 namespace pulsarlm {
@@ -36,6 +37,7 @@ void fill_awaited_tokens_cuda(const at::Tensor& tokens, const at::Tensor& sample
             samples.device() == tokens.device(),
         "fill_awaited_tokens: samples must be contiguous int64 on tokens' device"
     );
+    assert(samples.dim() == 1);
     const int64_t rows = tokens.size(0);
     if (rows == 0) {
         return;

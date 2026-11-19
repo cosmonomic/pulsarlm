@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../pinned_tensor.hpp"
+
 #include "pulsarlm/engine/executor.hpp"
 
 #include <ATen/ATen.h>
@@ -22,10 +24,6 @@ inline void require(bool condition, const char* message) {
     if (!condition) {
         throw std::invalid_argument(message);
     }
-}
-
-inline at::Tensor pinned(at::IntArrayRef sizes, at::ScalarType dtype) {
-    return at::empty(sizes, at::TensorOptions().dtype(dtype).pinned_memory(true));
 }
 
 // Sets on_device's page mass_sum and weight_sum for the KV layers that measure mass, those with mass_heads above 0, to

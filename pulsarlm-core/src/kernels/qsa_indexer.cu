@@ -13,6 +13,7 @@
 #include <math_constants.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cstdint>
 #include <limits>
 
@@ -780,6 +781,7 @@ at::Tensor select_blocks_cuda(
     );
     const int64_t rows = scores.size(0);
     const query_rows layout = rows_of("select_blocks", key_counts, cu_seqlens_q, first_row, ratio);
+    assert(cu_seqlens_q || first_row + rows <= key_counts.size(0));
     TORCH_CHECK(
         top >= 1 && words * 32 > scores.size(1),
         "select_blocks: top must be positive and words cover a block past the scores"
