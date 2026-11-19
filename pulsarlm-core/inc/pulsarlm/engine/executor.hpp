@@ -37,6 +37,7 @@ class executor {
 
   private:
     class batch;
+    struct batch_writes;
 
     // Names a sequence of an executor without owning it. Each access throws std::out_of_range once the sequence was
     // stopped.
@@ -136,6 +137,11 @@ class executor {
     task<void> enqueue_on_shard(batch& b, std::size_t shard);
     // Points b's verify entries whose sequences' previous step is launched to that step.
     void link_previous(batch& b) const;
+
+    task<void> join(batch& b);
+    batch_writes apply_entries(batch& b);
+    task<void> write_pages_and_states(batch& b, batch_writes&& writes);
+    task<void> refresh_views(batch& b);
 
     // Awaits syncing, the task of a kv_cache::sync on the copy streams, then ends the write in store_writes and in each
     // of writers.
