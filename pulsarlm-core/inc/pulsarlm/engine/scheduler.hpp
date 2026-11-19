@@ -31,7 +31,7 @@ class scheduler {
     static void wake(std::optional<event>& waited) noexcept;
     // The next step's entries: every decoding sequence, then the others' tokens up to prefill_tokens_per_step, never
     // past the end of a sequence's cycle. Leaves out the sequences whose last step is launched.
-    std::vector<batch_entry> next_entries() const;
+    std::vector<executor::batch_tokens> next_entries() const;
     // Writes the step in flight back, ends the sequences in it whose callbacks are cancelled, and lets each sequence
     // that exited leave once no launched step holds it.
     task<void> retire();

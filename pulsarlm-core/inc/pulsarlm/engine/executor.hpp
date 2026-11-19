@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "pulsarlm/digest.hpp"
@@ -26,17 +27,16 @@
 
 namespace pulsarlm {
 
-struct batch_entry;
-
 // Runs sequences on the model: it owns the model shards, the KV cache and the store's side of a request, and does
 // whatever touches them, while the scheduler decides what runs.
 class executor {
   public:
     using sequence_id = slot_map<sequence>::key_type;
+    // A sequence and the tokens it computes in a batch.
+    using batch_tokens = std::pair<sequence_id, std::size_t>;
 
   private:
     class batch;
-    struct resolved_entry;
 
     // Names a sequence of an executor without owning it. Each access throws std::out_of_range once the sequence was
     // stopped.
@@ -133,9 +133,6 @@ class executor {
     void update_views(sequence& seq);
     // Whether token_count more tokens fill a page of seq.
     bool completes_page(const sequence& seq, std::size_t token_count) const noexcept;
-    // entries with their sequences found, and for each whether it samples after its tokens and whether they end its
-    // eviction cycle.
-    std::vector<resolved_entry> resolve(std::span<const batch_entry> entries);
     // Releases the lines of id's sequence, then erases it, which releases its lease.
     void drop(sequence_id id) noexcept;
     // Moves each entry's tokens to its sequence's tail (sequence::advance), switches the boundary lines of the
@@ -144,8 +141,6 @@ class executor {
     task<void> enqueue_on_shard(batch& b, std::size_t shard);
     // Points b's verify entries whose sequences' previous step is launched to that step.
     void link_previous(batch& b) const;
-    // Adds the page mass of entry index of b's step, whose sequence accepted accepted_count tokens, to its sequence's layers.
-    void add_measured_mass(const batch& b, std::size_t index, std::size_t accepted_count);
 
     // Awaits syncing, the task of a kv_cache::sync on the copy streams, then ends the write in store_writes and in each
     // of writers.
@@ -194,12 +189,12 @@ class executor {
     // whose steps draft, whether every entry verifies drafts: its write-back
     // then changes no view or table that the next step reads, and copies to the store only lines the next step does not
     // write, so the next step can be launched before it.
-    bool allows_overlap(std::span<const batch_entry> entries) const;
+    bool allows_overlap(std::span<const batch_tokens> entries) const;
     // Launches one step of entries, decoding entries first, after the launched steps: advances each sequence by its
     // tokens, then queues the forward and the sampling on every shard without waiting for them. A decoding entry whose token is awaited reads
     // it from the previous launched step's samples on the GPUs, which needs both steps to allow overlap.
     // A step samples at most max_sampled_rows tokens.
-    task<void> launch(std::vector<batch_entry> entries);
+    task<void> launch(std::span<const batch_tokens> entries);
     // Writes back the oldest launched step: waits for it, then completes the pages its tokens filled, sets each awaited token it sampled, writes the
     // completed pages, evicts and writes the state at a cycle end, and takes lines for the next tokens. The pages of a
     // sequence writing no state are written by a spawned task; a sequence writing its state waits for its pages' writes
@@ -228,12 +223,6 @@ class executor {
     // The drafts the verify steps written back forwarded, and those of them they accepted. Safe to call from any thread.
     std::uint64_t drafted_tokens() const noexcept;
     std::uint64_t accepted_drafts() const noexcept;
-};
-
-// One sequence's part of a step: the tokens it forwards.
-struct batch_entry {
-    executor::sequence_id sequence_id;
-    std::size_t token_count;
 };
 
 }  // namespace pulsarlm

@@ -54,7 +54,7 @@ task<void> scheduler::submit(request r, result_writer writer) {
 
 task<void> scheduler::run() {
     for (;;) {
-        std::vector<batch_entry> entries = next_entries();
+        std::vector<executor::batch_tokens> entries = next_entries();
         if (!in_flight_sequences.empty() &&
             (entries.empty() || !in_flight_allows_overlap || !exec.allows_overlap(entries))) {
             co_await retire();
@@ -65,11 +65,11 @@ task<void> scheduler::run() {
             continue;
         }
         std::vector<executor::sequence_id> stepped;
-        for (const batch_entry& e : entries) {
-            stepped.push_back(e.sequence_id);
+        for (const executor::batch_tokens& e : entries) {
+            stepped.push_back(e.first);
         }
         const bool allows_overlap = exec.allows_overlap(entries);
-        co_await exec.launch(std::move(entries));
+        co_await exec.launch(entries);
         if (!in_flight_sequences.empty()) {
             co_await retire();
         }
@@ -95,11 +95,11 @@ task<void> scheduler::retire() {
     }
 }
 
-std::vector<batch_entry> scheduler::next_entries() const {
-    std::vector<batch_entry> entries;
+std::vector<executor::batch_tokens> scheduler::next_entries() const {
+    std::vector<executor::batch_tokens> entries;
     for (executor::sequence_id id : running_sequences) {
         if (exec.is_steppable(id) && exec.pending_token_count(id) == 1) {
-            entries.push_back(batch_entry{.sequence_id = id, .token_count = 1});
+            entries.emplace_back(id, 1);
         }
     }
     std::size_t budget = prefill_tokens_per_step;
@@ -114,7 +114,7 @@ std::vector<batch_entry> scheduler::next_entries() const {
         if (pending_count > 1) {
             std::size_t count = std::min({pending_count, budget, exec.cycle_tokens_left(id)});
             budget -= count;
-            entries.push_back(batch_entry{.sequence_id = id, .token_count = count});
+            entries.emplace_back(id, count);
         }
     }
     return entries;

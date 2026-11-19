@@ -99,149 +99,150 @@ at::Tensor zero_page_mass(
 
 }  // namespace
 
-struct executor::resolved_entry {
-    sequence_ref seq;
-    std::size_t token_count;
-    bool samples;
-    bool ends_cycle;
-};
-
 // The tokens each running sequence forwards in one step, the model inputs for them, and the tokens sampled from the
 // step's logits.
 class executor::batch {
-    // decode_count decode entries first, each forwarding its sequence's only pending token, the last verify_count of
-    // them with their drafts after it.
-    std::vector<resolved_entry> entries;
-    std::size_t decode_count = 0;
-    std::size_t verify_count = 0;
+    // One sequence's part of the batch, as recorded at its launch.
+    struct entry {
+        sequence_ref seq;
+        std::size_t token_count;
+        bool is_sampling;
+        bool ends_cycle;
+        bool ends_sequence = false;
+        bool is_measured = false;
+        std::size_t start_position = 0;
+        std::size_t end_position = 0;
+        std::size_t sampled_position = 0;
+        std::size_t first_sample_row = 0;
+        std::optional<std::size_t> prior_row;
+
+        // The sequence's rows in the draft pass. logit_row is the row that drafts, before a verify entry's accepted
+        // count - 1 is added, and key_count the sequence's keys after its rows in the draft head's KV layer.
+        struct draft_rows {
+            std::size_t row_count;
+            std::size_t logit_row;
+            std::size_t key_count;
+            bool is_drafting;
+        };
+        std::optional<draft_rows> draft;
+
+        // Of a verify entry, the most tokens it may accept (max_tokens), and its sequence's measured_start.
+        std::size_t max_accepted_token_count = 0;
+        std::size_t measured_start = 0;
+        // Of a verify entry whose sequence's previous step is launched and not written back, its position among
+        // that step's verify entries and among its drafting sequences: its tokens are that step's next tokens, and its
+        // positions lie that step's accepted count - 1 after those its inputs hold.
+        std::optional<std::size_t> previous_verify_row;
+        std::optional<std::size_t> previous_drafting_row;
+    };
+
+    struct group {
+        // Empty when the batch has no group of the kind.
+        std::vector<entry> entries;
+        // Pinned host tensors.
+        model::batch inputs;
+        // The page-table width, and whether the group's forward replays a graph.
+        std::size_t table_width = 0;
+        bool is_replayed = false;
+        // Pinned host fp32, defined for a group that measures mass: the page mass of each KV layer that measures it in
+        // turn, laid out as the layer's row of the group's cu_view_pages, its heads innermost; per shard, its heads,
+        // then joined over the shards.
+        std::vector<at::Tensor> mass_by_shard;
+        at::Tensor mass;
+        // Per shard, the group's hidden rows, which the draft head's pass reads.
+        std::vector<at::Tensor> hidden_by_shard;
+    };
+
+    // Each decode entry forwards its sequence's only pending token, a verify entry with its drafts after it.
+    group decode_group{.inputs = {.kind = model::batch_kind::decode}};
+    group verify_group{.inputs = {.kind = model::batch_kind::verify}};
+    group prefill_group{.inputs = {.kind = model::batch_kind::prefill}};
     // The tokens a verify entry forwards and samples after: its pending token and its drafts.
     std::size_t verify_rows = 0;
-    // Pinned host tensors.
-    std::optional<model::batch> decode_inputs;
-    std::optional<model::batch> verify_inputs;
-    std::optional<model::batch> prefill_inputs;
     // Whether a decode entry's token is awaited, -(r + 1) in the decode group's tokens for row r of the previous
     // launched step's samples.
     bool awaits_tokens = false;
-    // Per entry, its first row among the rows sampled.
-    std::vector<std::size_t> sample_rows;
     // Per row sampled, in entry order: a row of each entry that samples but a verify entry's verify_rows, the params
     // and draw.
     std::vector<sampling_params> sample_params;
     std::vector<sampling_draw> sample_draws;
     // Pinned host int64, one token per row sampled.
     at::Tensor sampled_tokens;
-    // Per entry, as of its launch: whether it measures mass, the history position its tokens end at, the history
-    // position of the token it samples, and whether it forwards its sequence's last tokens.
-    std::vector<bool> is_measured;
-    std::vector<std::size_t> step_starts;
-    std::vector<std::size_t> step_ends;
-    // Per entry, whether its tokens end its sequence's eviction cycle; a verify entry's is set at its write-back.
-    std::vector<bool> ends_cycle;
-    std::vector<std::size_t> sampled_positions;
-    std::vector<bool> ends_sequence;
     // Per shard, completing once the step's work on its stream has, and an event recorded after that work.
     std::vector<external_task<cudaError_t>> completions;
     std::vector<at::cuda::CUDAEvent> ends;
-    // Pinned host fp32, defined for a group that measures mass: the page mass of each KV layer that measures it in
-    // turn, laid out as the layer's row of the group's cu_view_pages, its heads innermost; per shard, its heads, then
-    // joined over the shards.
-    std::vector<at::Tensor> shard_decode_mass;
-    std::vector<at::Tensor> shard_verify_mass;
-    std::vector<at::Tensor> shard_prefill_mass;
-    at::Tensor decode_mass;
-    at::Tensor verify_mass;
-    at::Tensor prefill_mass;
     // Per entry whose draft rows start at its first token after an earlier step forwarded the position before it,
     // the line of the draft head's KV layer holding that position, and per shard, those lines' last_hidden as of the
-    // step's launch; prior_rows gives each entry's row, if it has one.
+    // step's launch; the entry's prior_row is its row.
     std::vector<std::int64_t> prior_lines;
-    std::vector<std::optional<std::size_t>> prior_rows;
     std::vector<at::Tensor> shard_prior_hidden;
-    // Per shard, the step's prefill, decode and verify hidden rows, which the draft head's pass reads.
-    std::vector<std::array<at::Tensor, 3>> shard_hidden;
-    // The draft head's pass, queued after the step's sampling: per sequence writing draft rows, its entry, its rows'
-    // tokens, -(r + 1) for the step's sampled row r, their RoPE positions and its key count after them in the draft
-    // head's KV layer, and the verify entry it is, -1 for another; per row, its hidden row (draft_head::draft) as an
-    // index into a zeros row, then the prior hidden rows, then the step's prefill, decode and verify hidden rows. A
-    // verify entry's rows are the verify_rows positions after its pending token's, the row after its accepted tokens
-    // drafting: its first row's index plus its accepted count - 1. Another sequence drafts from its last row.
-    std::vector<resolved_entry> draft_entries;
+    // The draft head's pass, queued after the step's sampling, over the entries with draft rows in entry order: per
+    // row, its token, -(r + 1) for the step's sampled row r, its RoPE position, and its hidden row (draft_head::draft)
+    // as an index into a zeros row, then the prior hidden rows, then the hidden rows of the decode, verify and prefill
+    // groups. A verify entry's rows are the verify_rows positions after its pending token's, the row after its accepted
+    // tokens drafting: its first row's index plus its accepted count - 1. Another sequence drafts from its last row.
     std::vector<std::int64_t> draft_tokens;
     std::vector<std::int64_t> draft_positions;
-    std::vector<std::int32_t> draft_key_counts;
     std::vector<std::int64_t> draft_sources;
-    std::vector<std::int64_t> draft_logit_rows;
-    std::vector<std::int64_t> draft_verify_index;
-    // The sequences that draft, as indices among draft_entries, and per draft after the first, each one's RoPE
-    // position and key count before a verify entry's accepted count is added.
-    std::vector<std::int64_t> drafting_indices;
+    // Per draft after the first, the RoPE position and key count of each sequence that drafts, in entry order, before a
+    // verify entry's accepted count is added.
     std::vector<std::vector<std::int64_t>> later_positions;
     std::vector<std::vector<std::int32_t>> later_key_counts;
-    // Per verify entry, the most tokens it may accept (max_tokens), and its sequence's measured_start.
-    std::vector<std::int64_t> max_accepted_token_counts;
-    std::vector<std::int64_t> verify_measured_starts;
-    // Per verify entry whose sequence's previous step is launched and not written back, that step and the entry's
-    // index among its verify entries and among its drafting sequences, -1 for the others: its tokens are that
-    // step's next tokens, and its positions lie that step's accepted count - 1 after those its inputs hold.
+    // The step the verify entries' previous_verify_row and previous_drafting_row index.
     const batch* previous_batch = nullptr;
-    std::vector<std::int64_t> previous_verify_rows;
-    std::vector<std::int64_t> previous_drafting_rows;
     // Per shard, the verify group's tokens on its device.
     std::vector<at::Tensor> verify_tokens;
-    // Per shard, each verify entry's accepted tokens (int64 [verify_count]), and each drafting sequence's next token then
-    // its drafts (int64 [drafting, verify_rows]); shard 0's copies to the host.
+    // Per shard, each verify entry's accepted tokens (int64 [verify entries]), and each drafting sequence's next token
+    // then its drafts (int64 [drafting, verify_rows]); shard 0's copies to the host.
     std::vector<at::Tensor> accepted_token_counts_by_shard;
     std::vector<at::Tensor> shard_next_tokens;
     at::Tensor accepted_token_counts;
     at::Tensor next_tokens;
 
-    // The decode and verify groups' page-table widths, and whether their forwards replay graphs.
-    std::size_t decode_width = 0;
-    bool decode_replays = false;
-    std::size_t verify_width = 0;
-    bool verify_replays = false;
+    // step_entries with their sequences found in owner, each recorded with whether it samples after its tokens and
+    // whether they end its eviction cycle. With owner's graph_pages, a decode or verify group whose tables fit
+    // graph_pages pages takes tables that wide and replays a graph.
+    batch(executor& owner, std::span<const batch_tokens> step_entries);
 
-    // With graph_pages, a decode group whose tables fit graph_pages pages takes tables that wide and replays a graph.
-    batch(
-        std::span<const resolved_entry> step_entries,
-        std::size_t page_size,
-        std::size_t state_slots,
-        std::optional<std::size_t> graph_pages
-    );
-
+    // The groups in entry order: decode, verify, prefill.
+    std::array<group*, 3> groups() noexcept;
+    std::array<const group*, 3> groups() const noexcept;
+    // The entries of the sequences that draft, in entry order.
+    std::vector<entry> drafting_entries() const;
     // A verify group measures each row's mass apart (model::batch::cu_view_pages), its queries weighing 1 from
     // measured_start on: the rows its write-back accepts are then weighed as one step's.
-    static model::batch make_group(
-        std::span<const resolved_entry> group,
-        std::size_t page_size,
-        std::size_t state_slots,
-        model::batch_kind kind
-    );
+    static model::batch
+    make_group(std::span<const entry> group, std::size_t page_size, std::size_t state_slots, model::batch_kind kind);
     // The tokens e forwards: its pending tokens', and its drafts.
-    static std::size_t forwarded(const resolved_entry& e) noexcept;
-    // Whether entry index is a plain decode, a verify or a prefill entry.
-    model::batch_kind kind_of(std::size_t index) const noexcept;
-    // The first row of entry index in its group.
-    std::size_t first_row(std::size_t index) const noexcept;
+    static std::size_t forwarded(const entry& e) noexcept;
     // The widest table among the group's sequences.
-    static std::size_t table_width(std::span<const resolved_entry> group) noexcept;
-    static bool measures_mass(std::span<const resolved_entry> group) noexcept;
+    static std::size_t table_width(std::span<const entry> group) noexcept;
+    static bool measures_mass(std::span<const entry> group) noexcept;
     // Whether e forwards a query that adds mass.
-    static bool measures_mass(const resolved_entry& e) noexcept;
+    static bool measures_mass(const entry& e) noexcept;
     // The group's tables of lines, or of positions with positions, on shard's device, as model::batch lays them out.
     static at::Tensor page_tables(
-        std::span<const resolved_entry> group,
+        std::span<const entry> group,
         std::size_t n_kv_layers,
         bool positions,
         std::size_t shard,
         std::size_t width
     );
-    // Queues on stream shard's copies of the inputs, the filling of the awaited tokens from samples, the copy of the
-    // prior hidden rows from draft_layer's lines, its forward, the copies of its page mass to the host and the
-    // sampling into samples; shard 0 also queues the copy of the sampled tokens to the host. mass_heads is the shard's
-    // part of the executor's. graphs is the shard's when decode_replays. Every shard's call may run at once, each on
-    // its own thread.
+    // Queues on the current stream, shard's, the copies of g's inputs to its device, with its tables, the filling of a
+    // decode group's awaited tokens from samples and a verify group's tokens of the previous step. Returns the inputs
+    // on the device and their zeroed page mass, undefined for a group that measures none. mass_heads is the shard's
+    // part of the executor's.
+    std::pair<model::batch, at::Tensor> upload_inputs(
+        const group& g,
+        std::span<const kv> lines,
+        const std::vector<std::size_t>& mass_heads,
+        std::size_t shard,
+        const at::Tensor& samples
+    );
+    // Queues on stream shard's copy of the prior hidden rows from draft_layer's lines, then per group its inputs
+    // (upload_inputs), its forward and the copy of its page mass to the host, then the sampling into samples; shard 0
+    // also queues the copy of the sampled tokens to the host. mass_heads is the shard's part of the executor's. graphs
+    // is the shard's when a group is replayed. Every shard's call may run at once, each on its own thread.
     void enqueue(
         model& shard_model,
         std::span<const kv> lines,
@@ -254,11 +255,19 @@ class executor::batch {
         const at::Tensor& samples,
         at::Tensor& counters
     );
-    // Adds to the draft head's pass the rows of entry index's sequence, at launch before it advances: a verify entry's
-    // verify_rows rows, another's from its first position without one through its tokens and, with next_row, its
-    // next token, the sequence drafting draft_count tokens after them with drafts.
-    void
-    plan_draft_rows(std::size_t index, bool next_row, bool drafts, std::size_t draft_layer, std::size_t draft_count);
+    // Adds to the draft head's pass the rows of e's sequence, at launch before it advances: those of an entry of the
+    // verify group, with verifies, its verify_rows rows, another's from its first position without one through its
+    // tokens and, with next_row, its next token, the sequence drafting draft_count tokens after them with drafts. The
+    // entry's hidden rows start at first_hidden_row of the pass's hidden rows.
+    void plan_draft_rows(
+        entry& e,
+        bool verifies,
+        std::size_t first_hidden_row,
+        bool next_row,
+        bool drafts,
+        std::size_t draft_layer,
+        std::size_t draft_count
+    );
     // Queues on stream shard, after the step's sampling into samples, the verify entries' acceptance of their samples,
     // stop_tokens ending a run (int64), and the draft head's pass; shard 0 also queues the copies of the accepted
     // counts and next tokens to the host.
@@ -289,23 +298,20 @@ class executor::batch {
     // On device, shard's, per row sampled, the tokens the previous step of a verify entry's sequence accepts, by which its
     // draw counts lag; 0 for the other rows.
     at::Tensor previous_draw_shifts(std::size_t shard, at::Device device) const;
-    // On device, shard's, each verify entry's accepted count - 1 of its previous step, 0 without one, int64 [verify_count].
+    // On device, shard's, each verify entry's accepted count - 1 of its previous step, 0 without one, int64 [verify
+    // entries].
     at::Tensor previous_shift(std::size_t shard, at::Device device) const;
     // Joins the shards' page mass, each shard's heads after the previous shards', once their copies completed.
     void join_mass(
         const std::vector<std::vector<std::size_t>>& shard_mass_heads,
         const std::vector<std::size_t>& mass_heads
     );
-    // Per KV layer, the mass_sum the step gave each of entry index's view pages, mass_heads[layer] values per page, and
-    // their weight_sum; empty for a layer that measures none. The entry's group measures mass.
+    // Per KV layer, the mass_sum the step gave each page of a view, mass_heads[layer] values per page, and their
+    // weight_sum; empty for a layer that measures none.
     struct layer_step_mass {
         std::span<const float> mass_sum;
         std::span<const float> weight_sum;
     };
-    std::vector<layer_step_mass> step_mass(std::size_t index, const std::vector<std::size_t>& mass_heads) const;
-    // step_mass of row row of verify entry index, its query weighing 1.
-    std::vector<layer_step_mass>
-    verify_row_mass(std::size_t index, std::size_t row, const std::vector<std::size_t>& mass_heads) const;
     // The page mass of the view view of group from mass, laid out as join_mass leaves it.
     static std::vector<layer_step_mass> view_mass(
         const model::batch& group,
@@ -313,6 +319,14 @@ class executor::batch {
         std::size_t view,
         const std::vector<std::size_t>& mass_heads
     );
+    // Adds the page mass of the entry at position of g, which measures mass and whose sequence accepted accepted_count
+    // tokens, to its sequence's layers. mass_heads is the executor's.
+    void add_measured_mass(
+        const group& g,
+        std::size_t position,
+        std::size_t accepted_count,
+        const std::vector<std::size_t>& mass_heads
+    ) const;
 
     friend class executor;
 };
@@ -416,113 +430,93 @@ executor::executor(
     }
 }
 
-executor::batch::batch(
-    std::span<const resolved_entry> step_entries,
-    std::size_t page_size,
-    std::size_t state_slots,
-    std::optional<std::size_t> graph_pages
-)
-: entries(step_entries.begin(), step_entries.end()) {
-    auto first_prefill = std::ranges::find_if(entries, [](const resolved_entry& e) {
-        return e.seq->pending_tokens.size() > 1;
-    });
-    decode_count = static_cast<std::size_t>(first_prefill - entries.begin());
-    auto first_verify = std::stable_partition(entries.begin(), first_prefill, [](const resolved_entry& e) {
-        return e.seq->drafts.empty();
-    });
-    verify_count = static_cast<std::size_t>(first_prefill - first_verify);
-    const std::size_t plain_count = decode_count - verify_count;
-    std::span<const resolved_entry> entry_span(entries);
-    if (verify_count > 0) {
-        verify_rows = forwarded(entries[plain_count]);
-        assert(std::ranges::all_of(entry_span.subspan(plain_count, verify_count), [&](const resolved_entry& e) {
-            return e.samples && forwarded(e) == verify_rows;
+executor::batch::batch(executor& owner, std::span<const batch_tokens> step_entries) {
+    bool has_prefill = false;
+    for (const auto& [id, token_count] : step_entries) {
+        sequence& seq = owner.sequences.at(id);
+        has_prefill = has_prefill || seq.pending_tokens.size() > 1;
+        group& g = has_prefill ? prefill_group : seq.drafts.empty() ? decode_group : verify_group;
+        g.entries.push_back(
+            entry{
+                .seq = sequence_ref(owner, id),
+                .token_count = token_count,
+                .is_sampling = token_count == seq.pending_tokens.size() && seq.may_sample(),
+                .ends_cycle = seq.ends_cycle(token_count),
+            }
+        );
+    }
+    if (!verify_group.entries.empty()) {
+        verify_rows = forwarded(verify_group.entries.front());
+        assert(std::ranges::all_of(verify_group.entries, [&](const entry& e) {
+            return e.is_sampling && forwarded(e) == verify_rows;
         }));
     }
-    if (plain_count > 0) {
-        decode_inputs = make_group(entry_span.first(plain_count), page_size, state_slots, model::batch_kind::decode);
-        decode_width = table_width(entry_span.first(plain_count));
-        decode_replays = graph_pages && decode_width <= *graph_pages;
-        if (decode_replays) {
-            decode_width = *graph_pages;
+    for (group* g : groups()) {
+        if (g->entries.empty()) {
+            continue;
+        }
+        g->inputs = make_group(g->entries, owner.page_size, owner.draft_state_slots, g->inputs.kind);
+        g->table_width = table_width(g->entries);
+        if (g != &prefill_group && owner.graph_pages && g->table_width <= *owner.graph_pages) {
+            g->is_replayed = true;
+            g->table_width = *owner.graph_pages;
         }
     }
-    if (verify_count > 0) {
-        verify_inputs = make_group(
-            entry_span.subspan(plain_count, verify_count),
-            page_size,
-            state_slots,
-            model::batch_kind::verify
-        );
-        verify_width = table_width(entry_span.subspan(plain_count, verify_count));
-        verify_replays = graph_pages && verify_width <= *graph_pages;
-        if (verify_replays) {
-            verify_width = *graph_pages;
-        }
-    }
-    if (entries.size() > decode_count) {
-        prefill_inputs = make_group(
-            entry_span.subspan(decode_count),
-            page_size,
-            state_slots,
-            model::batch_kind::prefill
-        );
-    }
-    awaits_tokens = std::ranges::any_of(entry_span.first(plain_count), [](const resolved_entry& e) {
+    awaits_tokens = std::ranges::any_of(decode_group.entries, [](const entry& e) {
         return e.seq->pending_tokens.front() == sequence::awaited_token;
     });
     // A verify entry's draws advance by the tokens its write-back accepts.
-    for (std::size_t i = 0; i < entries.size(); i++) {
-        const resolved_entry& e = entries[i];
-        sample_rows.push_back(sample_params.size());
-        if (!e.samples) {
-            continue;
-        }
-        if (kind_of(i) == model::batch_kind::verify) {
-            for (std::size_t row = 0; row < verify_rows; row++) {
-                sample_params.push_back(e.seq->sampling);
-                sample_draws.push_back(sampling_draw{.seed = e.seq->seed, .count = e.seq->draw_count + row});
+    for (group* g : groups()) {
+        for (entry& e : g->entries) {
+            e.first_sample_row = sample_params.size();
+            if (!e.is_sampling) {
+                continue;
             }
-        } else {
-            sample_params.push_back(e.seq->sampling);
-            sample_draws.push_back(sampling_draw{.seed = e.seq->seed, .count = e.seq->draw_count++});
+            if (g == &verify_group) {
+                for (std::size_t row = 0; row < verify_rows; row++) {
+                    sample_params.push_back(e.seq->sampling);
+                    sample_draws.push_back(sampling_draw{.seed = e.seq->seed, .count = e.seq->draw_count + row});
+                }
+            } else {
+                sample_params.push_back(e.seq->sampling);
+                sample_draws.push_back(sampling_draw{.seed = e.seq->seed, .count = e.seq->draw_count++});
+            }
         }
     }
 }
 
-std::size_t executor::batch::forwarded(const resolved_entry& e) noexcept {
+std::array<executor::batch::group*, 3> executor::batch::groups() noexcept {
+    return {&decode_group, &verify_group, &prefill_group};
+}
+
+std::array<const executor::batch::group*, 3> executor::batch::groups() const noexcept {
+    return {&decode_group, &verify_group, &prefill_group};
+}
+
+std::vector<executor::batch::entry> executor::batch::drafting_entries() const {
+    std::vector<entry> drafting;
+    for (const group* g : groups()) {
+        for (const entry& e : g->entries) {
+            if (e.draft && e.draft->is_drafting) {
+                drafting.push_back(e);
+            }
+        }
+    }
+    return drafting;
+}
+
+std::size_t executor::batch::forwarded(const entry& e) noexcept {
     return e.token_count + e.seq->drafts.size();
 }
 
-model::batch_kind executor::batch::kind_of(std::size_t index) const noexcept {
-    if (index >= decode_count) {
-        return model::batch_kind::prefill;
-    }
-    return index >= decode_count - verify_count ? model::batch_kind::verify : model::batch_kind::decode;
-}
-
-std::size_t executor::batch::first_row(std::size_t index) const noexcept {
-    switch (kind_of(index)) {
-    case model::batch_kind::decode:
-        return index;
-    case model::batch_kind::verify:
-        return (index - (decode_count - verify_count)) * verify_rows;
-    case model::batch_kind::prefill:
-        return static_cast<std::size_t>(
-            prefill_inputs->cu_seqlens_q.const_data_ptr<std::int32_t>()[index - decode_count]
-        );
-    }
-    return 0;
-}
-
 model::batch executor::batch::make_group(
-    std::span<const resolved_entry> group,
+    std::span<const entry> group,
     std::size_t page_size,
     std::size_t state_slots,
     model::batch_kind kind
 ) {
     std::size_t token_count = 0;
-    for (const resolved_entry& e : group) {
+    for (const entry& e : group) {
         token_count += forwarded(e);
     }
     std::size_t n_layers = group.front().seq->layers.size();
@@ -588,7 +582,7 @@ model::batch executor::batch::make_group(
             std::int32_t* row = cu_view_pages + layer * static_cast<std::size_t>(views + 1);
             row[0] = 0;
             std::size_t view = 0;
-            for (const resolved_entry& e : group) {
+            for (const entry& e : group) {
                 const auto pages = static_cast<std::int32_t>(e.seq->layers[layer].lines.size());
                 for (std::size_t i = 0; i < (per_row ? forwarded(e) : 1); i++, view++) {
                     row[view + 1] = row[view] + pages;
@@ -597,7 +591,7 @@ model::batch executor::batch::make_group(
         }
         std::span<float> weights(g.query_weights.mutable_data_ptr<float>(), token_count);
         std::size_t first = 0;
-        for (const resolved_entry& e : group) {
+        for (const entry& e : group) {
             const std::size_t count = forwarded(e);
             const std::size_t start = e.seq->history_position();
             if (per_row) {
@@ -613,26 +607,26 @@ model::batch executor::batch::make_group(
     return g;
 }
 
-std::size_t executor::batch::table_width(std::span<const resolved_entry> group) noexcept {
+std::size_t executor::batch::table_width(std::span<const entry> group) noexcept {
     std::size_t width = 0;
-    for (const resolved_entry& e : group) {
+    for (const entry& e : group) {
         width = std::max(width, e.seq->table_width());
     }
     return width;
 }
 
-bool executor::batch::measures_mass(std::span<const resolved_entry> group) noexcept {
-    return std::ranges::any_of(group, [](const resolved_entry& e) { return measures_mass(e); });
+bool executor::batch::measures_mass(std::span<const entry> group) noexcept {
+    return std::ranges::any_of(group, [](const entry& e) { return measures_mass(e); });
 }
 
 // A sequence whose previous step is launched may lie up to that step's drafts further on.
-bool executor::batch::measures_mass(const resolved_entry& e) noexcept {
+bool executor::batch::measures_mass(const entry& e) noexcept {
     const std::size_t lag = e.seq->steps_in_flight > 0 ? e.seq->drafts.size() : 0;
     return e.seq->eviction.can_evict() && e.seq->history_position() + forwarded(e) + lag > e.seq->measured_start();
 }
 
 at::Tensor executor::batch::page_tables(
-    std::span<const resolved_entry> group,
+    std::span<const entry> group,
     std::size_t n_kv_layers,
     bool positions,
     std::size_t shard,
@@ -640,7 +634,7 @@ at::Tensor executor::batch::page_tables(
 ) {
     std::vector<at::Tensor> tables;
     std::vector<std::size_t> page_counts;
-    for (const resolved_entry& e : group) {
+    for (const entry& e : group) {
         tables.push_back(positions ? e.seq->position_tables[shard] : e.seq->tables[shard]);
         page_counts.push_back(e.seq->table_width());
     }
@@ -650,6 +644,37 @@ at::Tensor executor::batch::page_tables(
         static_cast<std::int64_t>(n_kv_layers),
         static_cast<std::int64_t>(width)
     );
+}
+
+std::pair<model::batch, at::Tensor> executor::batch::upload_inputs(
+    const group& g,
+    std::span<const kv> lines,
+    const std::vector<std::size_t>& mass_heads,
+    std::size_t shard,
+    const at::Tensor& samples
+) {
+    at::Device device = lines.front().k.device();
+    model::batch on_device = to_device(g.inputs, device);
+    on_device.page_tables = page_tables(g.entries, lines.size(), false, shard, g.table_width);
+    on_device.page_positions = page_tables(g.entries, lines.size(), true, shard, g.table_width);
+    if (&g == &decode_group) {
+        if (awaits_tokens && !g.is_replayed) {
+            fill_awaited_tokens_cuda(on_device.tokens, samples);
+        }
+    } else if (&g == &verify_group) {
+        if (previous_batch) {
+            take_previous_tokens(on_device, shard, device);
+        }
+        verify_tokens[shard] = on_device.tokens;
+    } else {
+        const at::Tensor& cu_seqlens_q = on_device.cu_seqlens_q;
+        on_device.logit_rows = cu_seqlens_q.narrow(0, 1, cu_seqlens_q.size(0) - 1).to(at::kLong) - 1;
+    }
+    at::Tensor mass;
+    if (g.inputs.cu_view_pages.defined()) {
+        mass = zero_page_mass(on_device, g.inputs.cu_view_pages, mass_heads);
+    }
+    return {std::move(on_device), std::move(mass)};
 }
 
 void executor::batch::enqueue(
@@ -666,134 +691,56 @@ void executor::batch::enqueue(
 ) {
     at::Device device = lines.front().k.device();
     c10::cuda::CUDAStreamGuard guard(c10::cuda::getStreamFromExternal(stream, device.index()));
-    std::optional<model::batch> decode_group, verify_group, prefill_group;
-    std::span<resolved_entry> entry_span(entries);
-    const std::size_t plain_count = decode_count - verify_count;
     if (draft_layer && !prior_lines.empty()) {
         at::Tensor line_ids = at::tensor(prior_lines, at::TensorOptions().dtype(at::kLong)).to(device, true);
         shard_prior_hidden[shard] = lines[*draft_layer].last_hidden.index_select(0, line_ids);
     }
-    at::Tensor decode_on_device, verify_on_device, prefill_on_device;
-    if (decode_inputs) {
-        decode_group = to_device(*decode_inputs, device);
-        if (awaits_tokens && !decode_replays) {
-            fill_awaited_tokens_cuda(decode_group->tokens, samples);
-        }
-        std::span<resolved_entry> group = entry_span.first(plain_count);
-        decode_group->page_tables = page_tables(group, lines.size(), false, shard, decode_width);
-        decode_group->page_positions = page_tables(group, lines.size(), true, shard, decode_width);
-        if (decode_inputs->cu_view_pages.defined()) {
-            decode_on_device = zero_page_mass(*decode_group, decode_inputs->cu_view_pages, mass_heads);
-        }
-    }
-    if (verify_inputs) {
-        model::batch& g = verify_group.emplace(to_device(*verify_inputs, device));
-        std::span<resolved_entry> group = entry_span.subspan(plain_count, verify_count);
-        g.page_tables = page_tables(group, lines.size(), false, shard, verify_width);
-        g.page_positions = page_tables(group, lines.size(), true, shard, verify_width);
-        if (previous_batch) {
-            take_previous_tokens(g, shard, device);
-        }
-        if (verify_inputs->cu_view_pages.defined()) {
-            verify_on_device = zero_page_mass(g, verify_inputs->cu_view_pages, mass_heads);
-        }
-        verify_tokens[shard] = g.tokens;
-    }
-    if (prefill_inputs) {
-        prefill_group = to_device(*prefill_inputs, device);
-        std::span<resolved_entry> group = entry_span.subspan(decode_count);
-        std::size_t width = table_width(group);
-        prefill_group->page_tables = page_tables(group, lines.size(), false, shard, width);
-        prefill_group->page_positions = page_tables(group, lines.size(), true, shard, width);
-        const at::Tensor& cu_seqlens_q = prefill_group->cu_seqlens_q;
-        prefill_group->logit_rows = cu_seqlens_q.narrow(0, 1, cu_seqlens_q.size(0) - 1).to(at::kLong) - 1;
-        if (prefill_inputs->cu_view_pages.defined()) {
-            prefill_on_device = zero_page_mass(*prefill_group, prefill_inputs->cu_view_pages, mass_heads);
-        }
-    }
     if (steps_replay()) {
-        enqueue_step(*verify_group, verify_on_device, shard, device, graphs, samples);
+        auto [on_device, mass] = upload_inputs(verify_group, lines, mass_heads, shard, samples);
+        enqueue_step(on_device, mass, shard, device, graphs, samples);
         return;
     }
     // A replayed group reads its graph's own counters.
     std::int64_t needed = 0;
-    if (decode_group && !decode_replays) {
-        needed = shard_model.arrival_counter_count(
-            static_cast<std::int64_t>(plain_count),
-            decode_group->tokens.size(0)
-        );
-    }
-    if (verify_group && !verify_replays) {
-        needed = std::max(
-            needed,
-            shard_model.arrival_counter_count(static_cast<std::int64_t>(verify_count), verify_group->tokens.size(0))
-        );
-    }
-    if (prefill_group) {
-        needed = std::max(
-            needed,
-            shard_model.arrival_counter_count(
-                static_cast<std::int64_t>(entries.size() - decode_count),
-                prefill_group->tokens.size(0)
-            )
-        );
+    for (const group* g : groups()) {
+        if (!g->entries.empty() && !g->is_replayed) {
+            needed = std::max(
+                needed,
+                shard_model
+                    .arrival_counter_count(static_cast<std::int64_t>(g->entries.size()), g->inputs.tokens.size(0))
+            );
+        }
     }
     if (!counters.defined() || counters.numel() < needed) {
         counters = at::zeros({needed}, at::device(device).dtype(at::kInt));
     }
-    for (std::optional<model::batch>* group : {&decode_group, &verify_group, &prefill_group}) {
-        if (*group) {
-            (*group)->arrival_counters = counters;
-        }
-    }
-    model::output prefill_output, decode_output, verify_output;
-    if (prefill_group) {
-        prefill_output = shard_model.forward(*prefill_group, lines);
-    }
-    if (decode_group && !decode_replays) {
-        decode_output = shard_model.forward(*decode_group, lines);
-    }
-    if (verify_group && !verify_replays) {
-        verify_output = shard_model.forward(*verify_group, lines);
-    }
-    if (decode_replays) {
-        decode_output = graphs->decode(*decode_group);
-    }
-    if (verify_replays) {
-        verify_output = graphs->verify(*verify_group);
-    }
-    for (auto [by_shard, on_shard] : {
-             std::pair{&shard_decode_mass, &decode_on_device},
-             std::pair{&shard_verify_mass, &verify_on_device},
-             std::pair{&shard_prefill_mass, &prefill_on_device},
-         }) {
-        if (on_shard->defined()) {
-            (*by_shard)[shard] = pinned(on_shard->sizes(), at::kFloat);
-            (*by_shard)[shard].copy_(*on_shard, /*non_blocking=*/true);
-        }
-    }
     std::vector<at::Tensor> rows;
-    for (std::size_t i = 0; i < entries.size(); i++) {
-        if (!entries[i].samples) {
+    for (group* g : groups()) {
+        if (g->entries.empty()) {
             continue;
         }
-        switch (kind_of(i)) {
-        case model::batch_kind::decode:
-            rows.push_back(decode_output.logits.narrow(0, static_cast<std::int64_t>(i), 1));
-            break;
-        case model::batch_kind::verify:
-            rows.push_back(verify_output.logits.narrow(
-                0,
-                static_cast<std::int64_t>(first_row(i)),
-                static_cast<std::int64_t>(verify_rows)
-            ));
-            break;
-        case model::batch_kind::prefill:
-            rows.push_back(prefill_output.logits.narrow(0, static_cast<std::int64_t>(i - decode_count), 1));
-            break;
+        auto [on_device, mass] = upload_inputs(*g, lines, mass_heads, shard, samples);
+        on_device.arrival_counters = counters;
+        model::output output;
+        if (!g->is_replayed) {
+            output = shard_model.forward(on_device, lines);
+        } else if (g == &decode_group) {
+            output = graphs->decode(on_device);
+        } else {
+            output = graphs->verify(on_device);
+        }
+        g->hidden_by_shard[shard] = output.hidden;
+        if (mass.defined()) {
+            g->mass_by_shard[shard] = pinned(mass.sizes(), at::kFloat);
+            g->mass_by_shard[shard].copy_(mass, /*non_blocking=*/true);
+        }
+        const auto entry_rows = static_cast<std::int64_t>(g == &verify_group ? verify_rows : 1);
+        for (std::size_t position = 0; position < g->entries.size(); position++) {
+            if (g->entries[position].is_sampling) {
+                rows.push_back(output.logits.narrow(0, static_cast<std::int64_t>(position) * entry_rows, entry_rows));
+            }
         }
     }
-    shard_hidden[shard] = {prefill_output.hidden, decode_output.hidden, verify_output.hidden};
     if (!rows.empty()) {
         at::Tensor tokens = previous_batch
             ? sample(at::cat(rows), sample_params, sample_draws, previous_draw_shifts(shard, device))
@@ -804,7 +751,7 @@ void executor::batch::enqueue(
             sampled_tokens.copy_(tokens, /*non_blocking=*/true);
         }
     }
-    if (draft_layer && !draft_entries.empty()) {
+    if (draft_layer && !draft_tokens.empty()) {
         enqueue_drafts(shard_model, lines, samples, stop_tokens, shard, counters);
     }
 }
@@ -813,12 +760,13 @@ at::Tensor executor::batch::previous_draw_shifts(std::size_t shard, at::Device d
     const auto longs = at::TensorOptions().dtype(at::kLong);
     std::vector<std::int64_t> rows;
     std::vector<std::int64_t> verify_entries;
-    for (std::size_t v = 0; v < previous_verify_rows.size(); v++) {
-        if (previous_verify_rows[v] < 0) {
+    for (std::size_t v = 0; v < verify_group.entries.size(); v++) {
+        const entry& e = verify_group.entries[v];
+        if (!e.previous_verify_row) {
             continue;
         }
         for (std::size_t j = 0; j < verify_rows; j++) {
-            rows.push_back(static_cast<std::int64_t>(sample_rows[decode_count - verify_count + v] + j));
+            rows.push_back(static_cast<std::int64_t>(e.first_sample_row + j));
             verify_entries.push_back(static_cast<std::int64_t>(v));
         }
     }
@@ -838,7 +786,8 @@ at::Tensor executor::batch::previous_draw_shifts(std::size_t shard, at::Device d
 }
 
 bool executor::batch::steps_replay() const noexcept {
-    return verify_replays && verify_count == entries.size() && drafting_indices.size() == entries.size();
+    return verify_group.is_replayed && decode_group.entries.empty() && prefill_group.entries.empty() &&
+        std::ranges::all_of(verify_group.entries, [](const entry& e) { return e.draft && e.draft->is_drafting; });
 }
 
 void executor::batch::enqueue_step(
@@ -854,7 +803,7 @@ void executor::batch::enqueue_step(
         return at::tensor(values, longs).to(device, /*non_blocking=*/true);
     };
     const auto rows = static_cast<std::int64_t>(verify_rows);
-    const auto sequences = static_cast<std::int64_t>(verify_count);
+    const auto sequences = static_cast<std::int64_t>(verify_group.entries.size());
     sampling_inputs sampling = sampling_inputs_of(sample_params, sample_draws, device);
     at::Tensor shift = at::zeros({sequences}, at::device(device).dtype(at::kLong));
     if (previous_batch) {
@@ -869,7 +818,12 @@ void executor::batch::enqueue_step(
             .insert(later_key_counts_flat.end(), later_key_counts[j].begin(), later_key_counts[j].end());
     }
     const auto later = static_cast<std::int64_t>(later_positions.size());
-    std::vector<std::int64_t> key_counts(draft_key_counts.begin(), draft_key_counts.end());
+    std::vector<std::int64_t> max_accepted_token_counts;
+    std::vector<std::int64_t> key_counts;
+    for (const entry& e : verify_group.entries) {
+        max_accepted_token_counts.push_back(static_cast<std::int64_t>(e.max_accepted_token_count));
+        key_counts.push_back(static_cast<std::int64_t>(e.draft->key_count));
+    }
     auto [sampled, verified_accepted_counts, next] = graphs->verify_step(
         on_device,
         sampling,
@@ -883,8 +837,8 @@ void executor::batch::enqueue_step(
     shard_next_tokens[shard] = next;
     samples.narrow(0, 0, sampled.size(0)).copy_(sampled);
     if (verify_mass.defined()) {
-        shard_verify_mass[shard] = pinned(verify_mass.sizes(), at::kFloat);
-        shard_verify_mass[shard].copy_(verify_mass, /*non_blocking=*/true);
+        verify_group.mass_by_shard[shard] = pinned(verify_mass.sizes(), at::kFloat);
+        verify_group.mass_by_shard[shard].copy_(verify_mass, /*non_blocking=*/true);
     }
     if (shard == 0) {
         sampled_tokens = pinned(sampled.sizes(), at::kLong);
@@ -899,15 +853,19 @@ void executor::batch::enqueue_step(
 void executor::batch::take_previous_tokens(model::batch& g, std::size_t shard, at::Device device) const {
     const auto longs = at::TensorOptions().dtype(at::kLong);
     const auto rows = static_cast<std::int64_t>(verify_rows);
+    const auto verifying = static_cast<std::int64_t>(verify_group.entries.size());
     std::vector<std::int64_t> entries_with_previous;
     std::vector<std::int64_t> drafting_rows;
-    for (std::size_t v = 0; v < previous_drafting_rows.size(); v++) {
-        if (previous_drafting_rows[v] >= 0) {
+    std::vector<std::int64_t> verify_measured_starts;
+    for (std::size_t v = 0; v < verify_group.entries.size(); v++) {
+        const entry& e = verify_group.entries[v];
+        if (e.previous_drafting_row) {
             entries_with_previous.push_back(static_cast<std::int64_t>(v));
-            drafting_rows.push_back(previous_drafting_rows[v]);
+            drafting_rows.push_back(static_cast<std::int64_t>(*e.previous_drafting_row));
         }
+        verify_measured_starts.push_back(static_cast<std::int64_t>(e.measured_start));
     }
-    g.tokens.view({static_cast<std::int64_t>(verify_count), rows})
+    g.tokens.view({verifying, rows})
         .index_copy_(
             0,
             at::tensor(entries_with_previous, longs).to(device, /*non_blocking=*/true),
@@ -921,24 +879,10 @@ void executor::batch::take_previous_tokens(model::batch& g, std::size_t shard, a
     g.rejected_tokens -= shift.to(at::kInt);
     if (g.query_weights.defined()) {
         at::Tensor row_positions = at::repeat_interleave(g.history_positions, rows) +
-            at::arange(rows, g.history_positions.options()).repeat({static_cast<std::int64_t>(verify_count)});
+            at::arange(rows, g.history_positions.options()).repeat({verifying});
         at::Tensor measured_starts = at::tensor(verify_measured_starts, longs).to(device, /*non_blocking=*/true);
         g.query_weights = row_positions.ge(at::repeat_interleave(measured_starts, rows)).to(at::kFloat);
     }
-}
-
-std::vector<executor::batch::layer_step_mass>
-executor::batch::step_mass(std::size_t index, const std::vector<std::size_t>& mass_heads) const {
-    if (kind_of(index) == model::batch_kind::decode) {
-        return view_mass(*decode_inputs, decode_mass, index, mass_heads);
-    }
-    assert(kind_of(index) == model::batch_kind::prefill);
-    return view_mass(*prefill_inputs, prefill_mass, index - decode_count, mass_heads);
-}
-
-std::vector<executor::batch::layer_step_mass>
-executor::batch::verify_row_mass(std::size_t index, std::size_t row, const std::vector<std::size_t>& mass_heads) const {
-    return view_mass(*verify_inputs, verify_mass, first_row(index) + row, mass_heads);
 }
 
 std::vector<executor::batch::layer_step_mass> executor::batch::view_mass(
@@ -971,42 +915,34 @@ std::vector<executor::batch::layer_step_mass> executor::batch::view_mass(
 }
 
 void executor::batch::plan_draft_rows(
-    std::size_t index,
+    entry& e,
+    bool verifies,
+    std::size_t first_hidden_row,
     bool next_row,
     bool drafts,
     std::size_t draft_layer,
     std::size_t draft_count
 ) {
-    const resolved_entry& e = entries[index];
     sequence& seq = *e.seq;
     const std::size_t start = seq.history_position();
     const std::size_t next_index = seq.next_index(draft_layer);
     const std::size_t next_position = seq.next_position();
-    auto rows_of = [](const std::optional<model::batch>& group) {
-        return group ? static_cast<std::size_t>(group->tokens.size(0)) : 0;
-    };
-    std::size_t step_source = 1 + prior_lines.size() + first_row(index);
-    if (kind_of(index) != model::batch_kind::prefill) {
-        step_source += rows_of(prefill_inputs);
-    }
-    if (kind_of(index) == model::batch_kind::verify) {
-        step_source += rows_of(decode_inputs);
-    }
-    const auto sampled = static_cast<std::int64_t>(sample_rows[index]);
-    const auto first_draft_row = static_cast<std::int64_t>(draft_tokens.size());
-    std::size_t rows = 0;
+    const auto sampled = static_cast<std::int64_t>(e.first_sample_row);
+    const std::size_t first_draft_row = draft_tokens.size();
     // The position after the row that drafts, before a verify entry's accepted count is added.
     std::size_t drafted_after = 0;
-    if (kind_of(index) == model::batch_kind::verify) {
-        rows = verify_rows;
-        for (std::size_t j = 0; j < rows; j++) {
+    if (verifies) {
+        for (std::size_t j = 0; j < verify_rows; j++) {
             draft_tokens.push_back(-(sampled + static_cast<std::int64_t>(j)) - 1);
             draft_positions.push_back(static_cast<std::int64_t>(next_position + j + 1));
-            draft_sources.push_back(static_cast<std::int64_t>(step_source + j));
+            draft_sources.push_back(static_cast<std::int64_t>(first_hidden_row + j));
         }
-        draft_key_counts.push_back(static_cast<std::int32_t>(next_index + rows + 1));
-        draft_logit_rows.push_back(first_draft_row);
-        draft_verify_index.push_back(static_cast<std::int64_t>(index - (decode_count - verify_count)));
+        e.draft = entry::draft_rows{
+            .row_count = verify_rows,
+            .logit_row = first_draft_row,
+            .key_count = next_index + verify_rows + 1,
+            .is_drafting = drafts,
+        };
     } else {
         const std::size_t first = seq.draft_rows_end;
         const std::size_t next = start + e.token_count;
@@ -1016,30 +952,31 @@ void executor::batch::plan_draft_rows(
             if (t < next) {
                 draft_tokens.push_back(seq.pending_tokens[t - start]);
             } else {
-                draft_tokens.push_back(e.samples ? -sampled - 1 : seq.pending_tokens[e.token_count]);
+                draft_tokens.push_back(e.is_sampling ? -sampled - 1 : seq.pending_tokens[e.token_count]);
             }
             draft_positions.push_back(static_cast<std::int64_t>(next_position + t - start));
             if (t == 0) {
                 draft_sources.push_back(0);
             } else if (t == start) {
-                assert(prior_rows[index]);
-                draft_sources.push_back(static_cast<std::int64_t>(1 + *prior_rows[index]));
+                assert(e.prior_row);
+                draft_sources.push_back(static_cast<std::int64_t>(1 + *e.prior_row));
             } else {
-                draft_sources.push_back(static_cast<std::int64_t>(step_source + t - 1 - start));
+                draft_sources.push_back(static_cast<std::int64_t>(first_hidden_row + t - 1 - start));
             }
         }
-        rows = end - first;
         seq.draft_rows_end = end;
-        if (rows == 0) {
+        if (end == first) {
             return;
         }
-        draft_key_counts.push_back(static_cast<std::int32_t>(next_index + end - start));
-        draft_logit_rows.push_back(first_draft_row + static_cast<std::int64_t>(rows) - 1);
-        draft_verify_index.push_back(-1);
+        e.draft = entry::draft_rows{
+            .row_count = end - first,
+            .logit_row = first_draft_row + end - first - 1,
+            .key_count = next_index + end - start,
+            .is_drafting = drafts,
+        };
         drafted_after = e.token_count;
     }
     if (drafts) {
-        drafting_indices.push_back(static_cast<std::int64_t>(draft_entries.size()));
         later_positions.resize(draft_count - 1);
         later_key_counts.resize(draft_count - 1);
         for (std::size_t j = 1; j < draft_count; j++) {
@@ -1047,17 +984,19 @@ void executor::batch::plan_draft_rows(
             later_key_counts[j - 1].push_back(static_cast<std::int32_t>(next_index + drafted_after + j + 1));
         }
     }
-    draft_entries.push_back(resolved_entry{.seq = e.seq, .token_count = rows, .samples = drafts});
 }
 
 at::Tensor executor::batch::previous_shift(std::size_t shard, at::Device device) const {
-    at::Tensor shift = at::zeros({static_cast<std::int64_t>(verify_count)}, at::device(device).dtype(at::kLong));
+    at::Tensor shift = at::zeros(
+        {static_cast<std::int64_t>(verify_group.entries.size())},
+        at::device(device).dtype(at::kLong)
+    );
     std::vector<std::int64_t> entries_with_previous;
     std::vector<std::int64_t> previous_rows;
-    for (std::size_t v = 0; v < previous_verify_rows.size(); v++) {
-        if (previous_verify_rows[v] >= 0) {
+    for (std::size_t v = 0; v < verify_group.entries.size(); v++) {
+        if (const std::optional<std::size_t>& previous_row = verify_group.entries[v].previous_verify_row) {
             entries_with_previous.push_back(static_cast<std::int64_t>(v));
-            previous_rows.push_back(previous_verify_rows[v]);
+            previous_rows.push_back(static_cast<std::int64_t>(*previous_row));
         }
     }
     if (entries_with_previous.empty()) {
@@ -1092,7 +1031,7 @@ void executor::batch::enqueue_drafts(
     auto key_counts = [&](const at::Tensor& counts) {
         return counts.to(at::kInt).unsqueeze(0).expand({static_cast<std::int64_t>(n_layers), -1}).contiguous();
     };
-    auto tables = [&](std::span<const resolved_entry> group, model::batch& g) {
+    auto tables = [&](std::span<const entry> group, model::batch& g) {
         const std::size_t width = table_width(group);
         g.page_tables = page_tables(group, n_layers, false, shard, width);
         g.page_positions = page_tables(group, n_layers, true, shard, width);
@@ -1106,17 +1045,19 @@ void executor::batch::enqueue_drafts(
     };
 
     // Each verify entry accepts its pending token and its drafts while sample t equals draft t + 1, then the sample
-    // after them, up to and including a stop token, and at most max_accepted_token_counts.
+    // after them, up to and including a stop token, and at most its max_accepted_token_count.
     at::Tensor accepted_counts = at::empty({0}, at::device(device).dtype(at::kLong));
     at::Tensor shift = previous_shift(shard, device);
-    if (verify_count > 0) {
+    const auto verifying = static_cast<std::int64_t>(verify_group.entries.size());
+    if (verifying > 0) {
         const auto rows = static_cast<std::int64_t>(verify_rows);
-        const auto verifying = static_cast<std::int64_t>(verify_count);
         std::vector<std::int64_t> sample_indices;
-        for (std::size_t v = 0; v < verify_count; v++) {
+        std::vector<std::int64_t> max_accepted_token_counts;
+        for (const entry& e : verify_group.entries) {
             for (std::size_t j = 0; j < verify_rows; j++) {
-                sample_indices.push_back(static_cast<std::int64_t>(sample_rows[decode_count - verify_count + v] + j));
+                sample_indices.push_back(static_cast<std::int64_t>(e.first_sample_row + j));
             }
+            max_accepted_token_counts.push_back(static_cast<std::int64_t>(e.max_accepted_token_count));
         }
         at::Tensor verified = samples.index_select(0, on_device(sample_indices, longs)).view({verifying, rows});
         at::Tensor drafted = verify_tokens[shard].view({verifying, rows}).narrow(1, 1, rows - 1);
@@ -1130,32 +1071,50 @@ void executor::batch::enqueue_drafts(
     }
     accepted_token_counts_by_shard[shard] = accepted_counts;
 
-    std::vector<at::Tensor> step_rows;
-    for (const at::Tensor& hidden : shard_hidden[shard]) {
-        if (hidden.defined()) {
-            step_rows.push_back(hidden);
-        }
-    }
-    std::vector<at::Tensor> sources{at::zeros({1, head.hidden_dim()}, step_rows.front().options())};
+    std::vector<at::Tensor> sources;
     if (shard_prior_hidden[shard].defined()) {
         sources.push_back(shard_prior_hidden[shard]);
     }
-    sources.insert(sources.end(), step_rows.begin(), step_rows.end());
+    for (const group* g : groups()) {
+        if (g->hidden_by_shard[shard].defined()) {
+            sources.push_back(g->hidden_by_shard[shard]);
+        }
+    }
+    sources.insert(sources.begin(), at::zeros({1, head.hidden_dim()}, sources.back().options()));
+    // Per entry with draft rows, its position among the verify entries, -1 for another.
+    std::vector<entry> draft_entries;
+    std::vector<std::int64_t> verify_indices;
+    std::vector<std::int64_t> drafting_indices;
     std::vector<std::int32_t> starts{0};
     std::vector<std::int64_t> entry_rows;
-    for (const resolved_entry& e : draft_entries) {
-        starts.push_back(starts.back() + static_cast<std::int32_t>(e.token_count));
-        entry_rows.push_back(static_cast<std::int64_t>(e.token_count));
+    std::vector<std::int64_t> draft_key_counts;
+    std::vector<std::int64_t> draft_logit_rows;
+    for (const group* g : groups()) {
+        for (std::size_t position = 0; position < g->entries.size(); position++) {
+            const entry& e = g->entries[position];
+            if (!e.draft) {
+                continue;
+            }
+            if (e.draft->is_drafting) {
+                drafting_indices.push_back(static_cast<std::int64_t>(draft_entries.size()));
+            }
+            draft_entries.push_back(e);
+            verify_indices.push_back(g == &verify_group ? static_cast<std::int64_t>(position) : -1);
+            starts.push_back(starts.back() + static_cast<std::int32_t>(e.draft->row_count));
+            entry_rows.push_back(static_cast<std::int64_t>(e.draft->row_count));
+            draft_key_counts.push_back(static_cast<std::int64_t>(e.draft->key_count));
+            draft_logit_rows.push_back(static_cast<std::int64_t>(e.draft->logit_row));
+        }
     }
     // Per draft entry, the accepted count - 1 of a verify entry, and the previous step's shift of its positions.
     const auto draft_count = static_cast<std::int64_t>(draft_entries.size());
-    at::Tensor verify_index = on_device(draft_verify_index, longs);
+    at::Tensor verify_index = on_device(verify_indices, longs);
     at::Tensor is_verify = verify_index.ge(0);
     at::Tensor clamped = verify_index.clamp_min(0);
-    at::Tensor accepted_after = verify_count > 0 ? at::where(is_verify, accepted_counts.index_select(0, clamped) - 1, 0)
-                                                 : at::zeros({draft_count}, at::device(device).dtype(at::kLong));
-    at::Tensor entry_shift = verify_count > 0 ? at::where(is_verify, shift.index_select(0, clamped), 0)
+    at::Tensor accepted_after = verifying > 0 ? at::where(is_verify, accepted_counts.index_select(0, clamped) - 1, 0)
                                               : at::zeros({draft_count}, at::device(device).dtype(at::kLong));
+    at::Tensor entry_shift = verifying > 0 ? at::where(is_verify, shift.index_select(0, clamped), 0)
+                                           : at::zeros({draft_count}, at::device(device).dtype(at::kLong));
     at::Tensor row_shift = at::repeat_interleave(
         entry_shift,
         on_device(entry_rows, longs),
@@ -1177,10 +1136,7 @@ void executor::batch::enqueue_drafts(
     model::output drafted_rows = head.draft(rows, hidden, lines);
     if (!drafting_indices.empty()) {
         at::Tensor drafting_entries_index = on_device(drafting_indices, longs);
-        std::vector<resolved_entry> drafting_entries;
-        for (std::int64_t d : drafting_indices) {
-            drafting_entries.push_back(draft_entries[static_cast<std::size_t>(d)]);
-        }
+        const std::vector<entry> drafting = drafting_entries();
         at::Tensor drafting_rows = rows.logit_rows.index_select(0, drafting_entries_index);
         at::Tensor later_shift = (accepted_after + 1).mul(is_verify.to(at::kLong)) + entry_shift;
         later_shift = later_shift.index_select(0, drafting_entries_index);
@@ -1194,8 +1150,8 @@ void executor::batch::enqueue_drafts(
                 .pos = on_device(later_positions[j], longs) + later_shift,
                 .key_counts = key_counts(on_device(later_key_counts[j], longs) + later_shift),
             };
-            tables(drafting_entries, one_row);
-            with_counters(one_row, static_cast<std::int64_t>(drafting_entries.size()));
+            tables(drafting, one_row);
+            with_counters(one_row, static_cast<std::int64_t>(drafting.size()));
             model::output next = head.draft(one_row, previous_hidden, lines);
             token = next.logits.argmax(-1);
             previous_hidden = next.hidden;
@@ -1217,23 +1173,24 @@ void executor::batch::join_mass(
     const std::vector<std::vector<std::size_t>>& shard_mass_heads,
     const std::vector<std::size_t>& mass_heads
 ) {
-    auto join = [&](const std::vector<at::Tensor>& by_shard, const std::optional<model::batch>& group) {
-        if (!by_shard.front().defined() || by_shard.size() == 1) {
-            return by_shard.front();
+    for (group* g : groups()) {
+        if (!g->mass_by_shard.front().defined() || g->mass_by_shard.size() == 1) {
+            g->mass = g->mass_by_shard.front();
+            continue;
         }
         std::int64_t total = 0;
-        auto row_size = static_cast<std::size_t>(group->cu_view_pages.size(1));
-        const auto* cu_view_pages = group->cu_view_pages.const_data_ptr<std::int32_t>();
+        auto row_size = static_cast<std::size_t>(g->inputs.cu_view_pages.size(1));
+        const auto* cu_view_pages = g->inputs.cu_view_pages.const_data_ptr<std::int32_t>();
         for (std::size_t layer = 0; layer < mass_heads.size(); layer++) {
             if (mass_heads[layer] > 0) {
                 auto pages = static_cast<std::int64_t>(cu_view_pages[layer * row_size + row_size - 1]);
                 total += pages * static_cast<std::int64_t>(mass_heads[layer] + 1);
             }
         }
-        at::Tensor joined = pinned({total}, at::kFloat);
-        float* out = joined.mutable_data_ptr<float>();
+        g->mass = pinned({total}, at::kFloat);
+        float* out = g->mass.mutable_data_ptr<float>();
         std::vector<const float*> in;
-        for (const at::Tensor& mass : by_shard) {
+        for (const at::Tensor& mass : g->mass_by_shard) {
             in.push_back(mass.const_data_ptr<float>());
         }
         for (std::size_t layer = 0; layer < mass_heads.size(); layer++) {
@@ -1253,11 +1210,62 @@ void executor::batch::join_mass(
                 shard_in += pages;
             }
         }
-        return joined;
-    };
-    decode_mass = join(shard_decode_mass, decode_inputs);
-    verify_mass = join(shard_verify_mass, verify_inputs);
-    prefill_mass = join(shard_prefill_mass, prefill_inputs);
+    }
+}
+
+// A verify entry measured each row's mass with weight 1; its accepted rows are weighed as one step of accepted tokens.
+void executor::batch::add_measured_mass(
+    const group& g,
+    std::size_t position,
+    std::size_t accepted_count,
+    const std::vector<std::size_t>& mass_heads
+) const {
+    const entry& e = g.entries[position];
+    sequence& seq = *e.seq;
+    std::vector<layer_step_mass> step_mass;
+    std::vector<std::vector<float>> verified_mass(mass_heads.size());
+    std::vector<std::vector<float>> verified_weight(mass_heads.size());
+    if (&g == &verify_group) {
+        std::vector<float> weights(accepted_count);
+        seq.fill_query_weights(e.start_position, weights);
+        step_mass.resize(mass_heads.size());
+        for (std::size_t row = 0; row < accepted_count; row++) {
+            std::vector<layer_step_mass>
+                row_mass = view_mass(g.inputs, g.mass, position * verify_rows + row, mass_heads);
+            for (std::size_t layer = 0; layer < mass_heads.size(); layer++) {
+                if (mass_heads[layer] == 0) {
+                    continue;
+                }
+                verified_mass[layer].resize(row_mass[layer].mass_sum.size());
+                verified_weight[layer].resize(row_mass[layer].weight_sum.size());
+                for (std::size_t j = 0; j < verified_mass[layer].size(); j++) {
+                    verified_mass[layer][j] += weights[row] * row_mass[layer].mass_sum[j];
+                }
+                for (std::size_t j = 0; j < verified_weight[layer].size(); j++) {
+                    verified_weight[layer][j] += weights[row] * row_mass[layer].weight_sum[j];
+                }
+                step_mass[layer] = layer_step_mass{
+                    .mass_sum = verified_mass[layer],
+                    .weight_sum = verified_weight[layer],
+                };
+            }
+        }
+    } else {
+        step_mass = view_mass(g.inputs, g.mass, position, mass_heads);
+    }
+    for (std::size_t layer = 0; layer < mass_heads.size(); layer++) {
+        if (mass_heads[layer] > 0) {
+            layer_view& view = seq.layers[layer];
+            add_step_mass(
+                view.mass_sum,
+                view.weight_sum,
+                step_mass[layer].mass_sum.first(view.mass_sum.size()),
+                step_mass[layer].weight_sum.first(view.weight_sum.size()),
+                e.end_position - seq.measured_end,
+                seq.eviction.attention_mass_decay
+            );
+        }
+    }
 }
 
 task<std::expected<executor::sequence_id, request_error>> executor::start(request&& r, result_writer& writer) {
@@ -1341,22 +1349,6 @@ void executor::drop(sequence_id id) noexcept {
         release_lines(*dropped);
         sequences.erase(id);
     }
-}
-
-std::vector<executor::resolved_entry> executor::resolve(std::span<const batch_entry> entries) {
-    std::vector<resolved_entry> resolved;
-    for (const batch_entry& e : entries) {
-        sequence& seq = sequences.at(e.sequence_id);
-        resolved.push_back(
-            resolved_entry{
-                .seq = sequence_ref(*this, e.sequence_id),
-                .token_count = e.token_count,
-                .samples = e.token_count == seq.pending_tokens.size() && seq.may_sample(),
-                .ends_cycle = seq.ends_cycle(e.token_count),
-            }
-        );
-    }
-    return resolved;
 }
 
 bool executor::is_steppable(sequence_id id) const {
@@ -1648,141 +1640,91 @@ bool executor::completes_page(const sequence& seq, std::size_t token_count) cons
 }
 
 // A drafting sequence's verify step ends neither its cycle nor max_tokens (executor::advance).
-bool executor::allows_overlap(std::span<const batch_entry> entries) const {
+bool executor::allows_overlap(std::span<const batch_tokens> entries) const {
     if (draft_layer) {
-        return std::ranges::all_of(entries, [&](const batch_entry& e) {
-            return !sequences.at(e.sequence_id).drafts.empty();
+        return std::ranges::all_of(entries, [&](const batch_tokens& e) {
+            return !sequences.at(e.first).drafts.empty();
         });
     }
     const bool sliding = std::ranges::any_of(sliding_windows, [](const std::optional<std::size_t>& window) {
         return window.has_value();
     });
-    return std::ranges::none_of(entries, [&](const batch_entry& e) {
-        const sequence& seq = sequences.at(e.sequence_id);
-        return seq.ends_cycle(e.token_count) || (sliding && completes_page(seq, e.token_count));
+    return std::ranges::none_of(entries, [&](const batch_tokens& e) {
+        const auto& [id, token_count] = e;
+        const sequence& seq = sequences.at(id);
+        return seq.ends_cycle(token_count) || (sliding && completes_page(seq, token_count));
     });
-}
-
-// A verify entry measured each row's mass with weight 1; its accepted rows are weighed as one step of accepted tokens.
-void executor::add_measured_mass(const batch& b, std::size_t index, std::size_t accepted_count) {
-    sequence& seq = *b.entries[index].seq;
-    std::vector<batch::layer_step_mass> step_mass;
-    std::vector<std::vector<float>> verified_mass(mass_heads.size());
-    std::vector<std::vector<float>> verified_weight(mass_heads.size());
-    if (b.kind_of(index) == model::batch_kind::verify) {
-        std::vector<float> weights(accepted_count);
-        seq.fill_query_weights(b.step_starts[index], weights);
-        step_mass.resize(mass_heads.size());
-        for (std::size_t row = 0; row < accepted_count; row++) {
-            std::vector<batch::layer_step_mass> row_mass = b.verify_row_mass(index, row, mass_heads);
-            for (std::size_t layer = 0; layer < mass_heads.size(); layer++) {
-                if (mass_heads[layer] == 0) {
-                    continue;
-                }
-                verified_mass[layer].resize(row_mass[layer].mass_sum.size());
-                verified_weight[layer].resize(row_mass[layer].weight_sum.size());
-                for (std::size_t j = 0; j < verified_mass[layer].size(); j++) {
-                    verified_mass[layer][j] += weights[row] * row_mass[layer].mass_sum[j];
-                }
-                for (std::size_t j = 0; j < verified_weight[layer].size(); j++) {
-                    verified_weight[layer][j] += weights[row] * row_mass[layer].weight_sum[j];
-                }
-                step_mass[layer] = batch::layer_step_mass{
-                    .mass_sum = verified_mass[layer],
-                    .weight_sum = verified_weight[layer],
-                };
-            }
-        }
-    } else {
-        step_mass = b.step_mass(index, mass_heads);
-    }
-    for (std::size_t layer = 0; layer < mass_heads.size(); layer++) {
-        if (mass_heads[layer] > 0) {
-            layer_view& view = seq.layers[layer];
-            add_step_mass(
-                view.mass_sum,
-                view.weight_sum,
-                step_mass[layer].mass_sum.first(view.mass_sum.size()),
-                step_mass[layer].weight_sum.first(view.weight_sum.size()),
-                b.step_ends[index] - seq.measured_end,
-                seq.eviction.attention_mass_decay
-            );
-        }
-    }
 }
 
 // A verify entry's tokens are accepted, and its samples taken, at its write-back. Its pending token and drafts are
 // awaited_token until then, and a sequence whose previous step is launched lags it by up to that step's drafts.
 void executor::advance(batch& b) {
     const std::size_t draft_count = draft_state_slots - 1;
-    for (const resolved_entry& e : b.entries) {
-        sequence& seq = *e.seq;
-        if (draft_layer && seq.draft_rows_end == seq.history_position() && seq.history_position() > 0) {
-            const layer_view& view = seq.layers[*draft_layer];
-            b.prior_rows.push_back(b.prior_lines.size());
-            b.prior_lines.push_back(view.lines[(seq.next_index(*draft_layer) - 1) / page_size]);
-        } else {
-            b.prior_rows.emplace_back();
+    for (batch::group* g : b.groups()) {
+        for (batch::entry& e : g->entries) {
+            sequence& seq = *e.seq;
+            if (draft_layer && seq.draft_rows_end == seq.history_position() && seq.history_position() > 0) {
+                const layer_view& view = seq.layers[*draft_layer];
+                e.prior_row = b.prior_lines.size();
+                b.prior_lines.push_back(view.lines[(seq.next_index(*draft_layer) - 1) / page_size]);
+            }
         }
     }
-    std::size_t sampled_row = 0;
-    for (std::size_t i = 0; i < b.entries.size(); i++) {
-        const resolved_entry& e = b.entries[i];
-        sequence& seq = *e.seq;
-        const bool verifies = b.kind_of(i) == model::batch_kind::verify;
-        const std::size_t lag = seq.steps_in_flight > 0 ? draft_count : 0;
-        b.is_measured.push_back(batch::measures_mass(e));
-        b.step_starts.push_back(seq.history_position());
-        b.ends_cycle.push_back(e.ends_cycle);
-        bool drafts = false;
-        if (draft_layer) {
-            const bool ends_sequence = e.samples ? seq.max_tokens && seq.generated_count + 1 >= *seq.max_tokens
-                                                 : seq.pending_tokens.size() == e.token_count;
-            const bool next_row = verifies || (!e.ends_cycle && !ends_sequence);
-            // The next step's verify group then ends neither the cycle nor max_tokens, whatever this one accepts.
-            drafts = next_row && (verifies || e.samples) &&
-                seq.cycle_tokens_left() >= batch::forwarded(e) + lag + draft_count + 2;
-            b.plan_draft_rows(i, next_row, drafts, *draft_layer, draft_count);
+    std::size_t first_hidden_row = 1 + b.prior_lines.size();
+    for (batch::group* g : b.groups()) {
+        const bool verifies = g == &b.verify_group;
+        for (batch::entry& e : g->entries) {
+            sequence& seq = *e.seq;
+            const std::size_t lag = seq.steps_in_flight > 0 ? draft_count : 0;
+            e.is_measured = batch::measures_mass(e);
+            e.start_position = seq.history_position();
+            bool drafts = false;
+            if (draft_layer) {
+                const bool ends_sequence = e.is_sampling ? seq.max_tokens && seq.generated_count + 1 >= *seq.max_tokens
+                                                         : seq.pending_tokens.size() == e.token_count;
+                const bool next_row = verifies || (!e.ends_cycle && !ends_sequence);
+                // The next step's verify group then ends neither the cycle nor max_tokens, whatever this one accepts.
+                drafts = next_row && (verifies || e.is_sampling) &&
+                    seq.cycle_tokens_left() >= batch::forwarded(e) + lag + draft_count + 2;
+                b.plan_draft_rows(e, verifies, first_hidden_row, next_row, drafts, *draft_layer, draft_count);
+                first_hidden_row += batch::forwarded(e);
+                if (verifies) {
+                    const std::size_t remaining = seq.max_tokens ? *seq.max_tokens - seq.generated_count
+                                                                 : b.verify_rows;
+                    e.max_accepted_token_count = std::clamp<std::size_t>(remaining, 1, b.verify_rows);
+                    e.measured_start = seq.measured_start();
+                }
+            }
             if (verifies) {
-                const std::size_t remaining = seq.max_tokens ? *seq.max_tokens - seq.generated_count : b.verify_rows;
-                b.max_accepted_token_counts.push_back(
-                    static_cast<std::int64_t>(std::clamp<std::size_t>(remaining, 1, b.verify_rows))
-                );
-                b.verify_measured_starts.push_back(static_cast<std::int64_t>(seq.measured_start()));
-            }
-        }
-        if (verifies) {
-            b.step_ends.push_back(seq.history_position());
-            seq.advance(e.token_count);
-            b.sampled_positions.push_back(seq.history_position());
-            seq.pending_tokens.push_back(sequence::awaited_token);
-            // As if it accepted only its pending token, until its write-back.
-            seq.rejected_tokens = seq.drafts.size();
-        } else {
-            seq.rejected_tokens = 0;
-            b.step_ends.push_back(seq.history_position() + e.token_count);
-            seq.advance(e.token_count);
-            b.sampled_positions.push_back(seq.history_position() + seq.pending_tokens.size());
-            if (e.samples) {
+                e.end_position = seq.history_position();
+                seq.advance(e.token_count);
+                e.sampled_position = seq.history_position();
                 seq.pending_tokens.push_back(sequence::awaited_token);
-                seq.awaited_row = sampled_row;
-                seq.generated_count++;
+                // As if it accepted only its pending token, until its write-back.
+                seq.rejected_tokens = seq.drafts.size();
+            } else {
+                seq.rejected_tokens = 0;
+                e.end_position = seq.history_position() + e.token_count;
+                seq.advance(e.token_count);
+                e.sampled_position = seq.history_position() + seq.pending_tokens.size();
+                if (e.is_sampling) {
+                    seq.pending_tokens.push_back(sequence::awaited_token);
+                    seq.awaited_row = e.first_sample_row;
+                    seq.generated_count++;
+                }
+                seq.last_step_launched = e.is_sampling ? !seq.may_sample() : seq.pending_tokens.empty();
             }
-            seq.last_step_launched = e.samples ? !seq.may_sample() : seq.pending_tokens.empty();
+            seq.drafts.assign(drafts ? draft_count : 0, sequence::awaited_token);
+            e.ends_sequence = !verifies && seq.last_step_launched;
+            seq.steps_in_flight++;
         }
-        if (e.samples) {
-            sampled_row += verifies ? b.verify_rows : 1;
-        }
-        seq.drafts.assign(drafts ? draft_count : 0, sequence::awaited_token);
-        b.ends_sequence.push_back(!verifies && seq.last_step_launched);
-        seq.steps_in_flight++;
     }
 }
 
 // Shard 0 queues on the executor's thread while the others queue on their own, so every shard's kernels launch at
 // once. Each shard's completion is taken once every shard has queued, before any later step queues.
-task<void> executor::launch(std::vector<batch_entry> entries) {
-    std::unique_ptr<batch> b(new batch(resolve(entries), page_size, draft_state_slots, graph_pages));
+task<void> executor::launch(std::span<const batch_tokens> entries) {
+    std::unique_ptr<batch> b(new batch(*this, entries));
     TORCH_CHECK(
         static_cast<std::int64_t>(b->sample_params.size()) <= max_sampled_rows,
         "executor: a step samples at most ",
@@ -1791,11 +1733,11 @@ task<void> executor::launch(std::vector<batch_entry> entries) {
     );
     link_previous(*b);
     advance(*b);
-    b->shard_decode_mass.assign(shards.size(), at::Tensor());
-    b->shard_verify_mass.assign(shards.size(), at::Tensor());
-    b->shard_prefill_mass.assign(shards.size(), at::Tensor());
+    for (batch::group* g : b->groups()) {
+        g->mass_by_shard.assign(shards.size(), at::Tensor());
+        g->hidden_by_shard.assign(shards.size(), at::Tensor());
+    }
     b->shard_prior_hidden.assign(shards.size(), at::Tensor());
-    b->shard_hidden.assign(shards.size(), {});
     b->verify_tokens.assign(shards.size(), at::Tensor());
     b->accepted_token_counts_by_shard.assign(shards.size(), at::Tensor());
     b->shard_next_tokens.assign(shards.size(), at::Tensor());
@@ -1817,32 +1759,27 @@ task<void> executor::launch(std::vector<batch_entry> entries) {
 }
 
 void executor::link_previous(batch& b) const {
-    if (launched_batches.empty() || b.verify_count == 0) {
+    if (launched_batches.empty() || b.verify_group.entries.empty()) {
         return;
     }
     const batch& previous = *launched_batches.back();
     b.previous_batch = &previous;
-    const std::size_t plain_count = b.decode_count - b.verify_count;
-    const std::size_t previous_plain = previous.decode_count - previous.verify_count;
-    for (std::size_t v = 0; v < b.verify_count; v++) {
-        const sequence_ref& seq = b.entries[plain_count + v].seq;
-        std::int64_t verify_row = -1;
-        std::int64_t drafting_row = -1;
-        if (seq->steps_in_flight > 0) {
-            for (std::size_t pv = 0; pv < previous.verify_count; pv++) {
-                if (previous.entries[previous_plain + pv].seq == seq) {
-                    verify_row = static_cast<std::int64_t>(pv);
-                }
-            }
-            for (std::size_t d = 0; d < previous.drafting_indices.size(); d++) {
-                if (previous.draft_entries[static_cast<std::size_t>(previous.drafting_indices[d])].seq == seq) {
-                    drafting_row = static_cast<std::int64_t>(d);
-                }
-            }
-            assert(verify_row >= 0 && drafting_row >= 0);
+    const std::vector<batch::entry> previous_drafting_entries = previous.drafting_entries();
+    for (batch::entry& e : b.verify_group.entries) {
+        if (e.seq->steps_in_flight == 0) {
+            continue;
         }
-        b.previous_verify_rows.push_back(verify_row);
-        b.previous_drafting_rows.push_back(drafting_row);
+        for (std::size_t pv = 0; pv < previous.verify_group.entries.size(); pv++) {
+            if (previous.verify_group.entries[pv].seq == e.seq) {
+                e.previous_verify_row = pv;
+            }
+        }
+        for (std::size_t d = 0; d < previous_drafting_entries.size(); d++) {
+            if (previous_drafting_entries[d].seq == e.seq) {
+                e.previous_drafting_row = d;
+            }
+        }
+        assert(e.previous_verify_row && e.previous_drafting_row);
     }
 }
 
@@ -1914,10 +1851,6 @@ task<void> executor::write_back() {
     b.join_mass(shard_mass_heads, mass_heads);
     std::size_t n_layers = cache.layer_count();
     const bool has_recurrent = std::ranges::contains(recurrent, true);
-    std::vector<bool> exited;
-    for (const resolved_entry& e : b.entries) {
-        exited.push_back(e.seq->end_reason.has_value());
-    }
     // The pages of the sequences reaching a state, written now with state_writers' states, and those a spawned task
     // writes.
     std::vector<std::vector<digest>> new_hashes(n_layers);
@@ -1934,119 +1867,122 @@ task<void> executor::write_back() {
                                                                   : nullptr;
     // Each drafting sequence's next token then its drafts.
     std::unordered_map<const sequence*, std::span<const std::int64_t>> drafted;
-    for (std::size_t d = 0; d < b.drafting_indices.size(); d++) {
+    const std::vector<batch::entry> drafting_entries = b.drafting_entries();
+    for (std::size_t d = 0; d < drafting_entries.size(); d++) {
         const auto row = static_cast<std::size_t>(b.next_tokens.size(1));
         drafted.emplace(
-            &*b.draft_entries[static_cast<std::size_t>(b.drafting_indices[d])].seq,
+            &*drafting_entries[d].seq,
             std::span(b.next_tokens.const_data_ptr<std::int64_t>() + d * row, row)
         );
     }
-    for (std::size_t i = 0; i < b.entries.size(); i++) {
-        const resolved_entry& e = b.entries[i];
-        sequence& seq = *e.seq;
-        const bool verifies = b.kind_of(i) == model::batch_kind::verify;
-        std::span<const std::int64_t> samples;
-        if (e.samples) {
-            samples = std::span(next_sampled, verifies ? b.verify_rows : 1);
-            next_sampled += samples.size();
-        }
-        if (exited[i]) {
-            continue;
-        }
-        if (seq.page_writes->any_failed()) {
-            seq.end_reason = sequence::exit_reason::oom;
-            continue;
-        }
-        // The tokens the step accepts, and of its samples those it emits. A step launched after this one took its next
-        // tokens on the GPU and lags its accepted count - 1.
-        const bool next_launched = seq.steps_in_flight > 1;
-        std::size_t accepted_count = batch::forwarded(e);
-        std::span<const std::int64_t> emitted = samples;
-        if (verifies) {
-            accepted_count = static_cast<std::size_t>(
-                b.accepted_token_counts.const_data_ptr<std::int64_t>()[i - (b.decode_count - b.verify_count)]
-            );
-            emitted = samples.first(accepted_count);
-            const std::size_t start = b.step_starts[i] + seq.unapplied_shift;
-            seq.accept_tokens(start, emitted);
-            drafted_count.fetch_add(b.verify_rows - 1, std::memory_order_relaxed);
-            accepted_draft_count.fetch_add(accepted_count - 1, std::memory_order_relaxed);
-            seq.draw_count += accepted_count;
-            seq.generated_count += accepted_count;
-            b.step_starts[i] = start;
-            b.step_ends[i] = start + accepted_count;
-            seq.unapplied_shift = next_launched ? accepted_count - 1 : 0;
-            if (!next_launched) {
-                seq.rejected_tokens = b.verify_rows - accepted_count;
-                seq.draft_rows_end = start + accepted_count + 1;
+    for (batch::group* g : b.groups()) {
+        const bool verifies = g == &b.verify_group;
+        for (std::size_t position = 0; position < g->entries.size(); position++) {
+            batch::entry& e = g->entries[position];
+            sequence& seq = *e.seq;
+            std::span<const std::int64_t> samples;
+            if (e.is_sampling) {
+                samples = std::span(next_sampled, verifies ? b.verify_rows : 1);
+                next_sampled += samples.size();
             }
-        }
-        std::size_t completed_count = seq.complete_pages(b.step_ends[i]);
-        if (completed_count > 0 && has_recurrent) {
-            seq.state_pending = true;
-        }
-        if (b.is_measured[i]) {
-            add_measured_mass(b, i, accepted_count);
-            seq.measured_end = b.step_ends[i];
-        }
-        if (verifies) {
-            for (std::int64_t token : emitted) {
-                seq.writer.append(token);
+            if (seq.end_reason) {
+                continue;
             }
-            if (std::ranges::contains(stop_ids, emitted.back()) || !seq.may_sample()) {
-                seq.end_reason = sequence::exit_reason::finished;
-                if (next_launched) {
-                    seq.withdraw_latest_verify_step();
-                }
+            if (seq.page_writes->any_failed()) {
+                seq.end_reason = sequence::exit_reason::oom;
+                continue;
             }
-        } else if (!samples.empty()) {
-            const std::int64_t token = samples.front();
-            seq.resolve_token(b.sampled_positions[i], token);
-            seq.writer.append(token);
-            if (std::ranges::contains(stop_ids, token)) {
-                seq.end_reason = sequence::exit_reason::finished;
-                if (seq.steps_in_flight > 1) {
-                    seq.withdraw_latest_step();
-                }
-            }
-        }
-        if (b.ends_sequence[i]) {
-            seq.end_reason = sequence::exit_reason::finished;
-        }
-        if (seq.end_reason) {
-            seq.drafts.clear();
-        } else if (auto found = drafted.find(&seq); found != drafted.end() && !next_launched) {
-            seq.drafts.assign(found->second.begin() + 1, found->second.end());
-        }
-        const bool reaches_state = b.ends_cycle[i] || seq.end_reason == sequence::exit_reason::finished;
-        if (reaches_state) {
-            state_reachers.push_back(&seq);
-            if (seq.state_pending) {
-                state_writers.push_back(&seq);
-            }
-        }
-        if (completed_count > 0) {
-            auto& hashes = reaches_state ? new_hashes : spawned_hashes;
-            auto& owners = reaches_state ? new_owners : spawned_owners;
-            auto& line_ids = reaches_state ? new_lines : spawned_lines;
-            for (std::size_t layer = 0; layer < n_layers; layer++) {
-                if (recurrent[layer]) {
-                    continue;
-                }
-                const layer_view& view = seq.layers[layer];
-                std::size_t first_new_page = view.pages.size() - completed_count;
-                hashes[layer].insert(hashes[layer].end(), view.pages.begin() + first_new_page, view.pages.end());
-                owners[layer].resize(hashes[layer].size(), seq.lease.id());
-                line_ids[layer].insert(
-                    line_ids[layer].end(),
-                    view.lines.begin() + first_new_page,
-                    view.lines.begin() + view.pages.size()
+            // The tokens the step accepts, and of its samples those it emits. A step launched after this one took its next
+            // tokens on the GPU and lags its accepted count - 1.
+            const bool next_launched = seq.steps_in_flight > 1;
+            std::size_t accepted_count = batch::forwarded(e);
+            std::span<const std::int64_t> emitted = samples;
+            if (verifies) {
+                accepted_count = static_cast<std::size_t>(
+                    b.accepted_token_counts.const_data_ptr<std::int64_t>()[position]
                 );
+                emitted = samples.first(accepted_count);
+                const std::size_t start = e.start_position + seq.unapplied_shift;
+                seq.accept_tokens(start, emitted);
+                drafted_count.fetch_add(b.verify_rows - 1, std::memory_order_relaxed);
+                accepted_draft_count.fetch_add(accepted_count - 1, std::memory_order_relaxed);
+                seq.draw_count += accepted_count;
+                seq.generated_count += accepted_count;
+                e.start_position = start;
+                e.end_position = start + accepted_count;
+                seq.unapplied_shift = next_launched ? accepted_count - 1 : 0;
+                if (!next_launched) {
+                    seq.rejected_tokens = b.verify_rows - accepted_count;
+                    seq.draft_rows_end = start + accepted_count + 1;
+                }
             }
+            std::size_t completed_count = seq.complete_pages(e.end_position);
+            if (completed_count > 0 && has_recurrent) {
+                seq.state_pending = true;
+            }
+            if (e.is_measured) {
+                b.add_measured_mass(*g, position, accepted_count, mass_heads);
+                seq.measured_end = e.end_position;
+            }
+            if (verifies) {
+                for (std::int64_t token : emitted) {
+                    seq.writer.append(token);
+                }
+                if (std::ranges::contains(stop_ids, emitted.back()) || !seq.may_sample()) {
+                    seq.end_reason = sequence::exit_reason::finished;
+                    if (next_launched) {
+                        seq.withdraw_latest_verify_step();
+                    }
+                }
+            } else if (!samples.empty()) {
+                const std::int64_t token = samples.front();
+                seq.resolve_token(e.sampled_position, token);
+                seq.writer.append(token);
+                if (std::ranges::contains(stop_ids, token)) {
+                    seq.end_reason = sequence::exit_reason::finished;
+                    if (seq.steps_in_flight > 1) {
+                        seq.withdraw_latest_step();
+                    }
+                }
+            }
+            if (e.ends_sequence) {
+                seq.end_reason = sequence::exit_reason::finished;
+            }
+            if (seq.end_reason) {
+                seq.drafts.clear();
+            } else if (auto found = drafted.find(&seq); found != drafted.end() && !next_launched) {
+                seq.drafts.assign(found->second.begin() + 1, found->second.end());
+            }
+            const bool reaches_state = e.ends_cycle || seq.end_reason == sequence::exit_reason::finished;
             if (reaches_state) {
-                page_writers.push_back(&seq);
-            } else {
-                spawned_writers.push_back(seq.page_writes);
+                state_reachers.push_back(&seq);
+                if (seq.state_pending) {
+                    state_writers.push_back(&seq);
+                }
+            }
+            if (completed_count > 0) {
+                auto& hashes = reaches_state ? new_hashes : spawned_hashes;
+                auto& owners = reaches_state ? new_owners : spawned_owners;
+                auto& line_ids = reaches_state ? new_lines : spawned_lines;
+                for (std::size_t layer = 0; layer < n_layers; layer++) {
+                    if (recurrent[layer]) {
+                        continue;
+                    }
+                    const layer_view& view = seq.layers[layer];
+                    std::size_t first_new_page = view.pages.size() - completed_count;
+                    hashes[layer].insert(hashes[layer].end(), view.pages.begin() + first_new_page, view.pages.end());
+                    owners[layer].resize(hashes[layer].size(), seq.lease.id());
+                    line_ids[layer].insert(
+                        line_ids[layer].end(),
+                        view.lines.begin() + first_new_page,
+                        view.lines.begin() + view.pages.size()
+                    );
+                }
+                if (reaches_state) {
+                    page_writers.push_back(&seq);
+                } else {
+                    spawned_writers.push_back(seq.page_writes);
+                }
             }
         }
     }
@@ -2121,51 +2057,52 @@ task<void> executor::write_back() {
         }
     }
 
-    for (std::size_t i = 0; i < b.entries.size(); i++) {
-        const resolved_entry& e = b.entries[i];
-        sequence& seq = *e.seq;
-        seq.steps_in_flight--;
-        if (seq.end_reason) {
-            continue;
-        }
-        bool views_changed = release_passed_pages(seq);
-        if (b.ends_cycle[i]) {
-            add_sampled_pages(seq);
-            views_changed = evict(seq) || views_changed;
-        }
-        if (views_changed) {
-            update_views(seq);
-        }
-        if (b.ends_cycle[i]) {
-            co_await write_cycle_end(seq);
-            seq.start_next_cycle();
-        }
-        std::optional<std::size_t> first_stale_page;
-        if (views_changed) {
-            first_stale_page = 0;
-        } else if (std::ranges::contains(state_writers, &seq)) {
-            first_stale_page = 0;
-        }
-        std::vector<std::size_t> missing_counts = seq.missing_lines();
-        if (std::ranges::any_of(missing_counts, [](std::size_t count) { return count > 0; })) {
-            std::expected<std::vector<std::vector<std::uint32_t>>, page_error> allocation = cache.allocate(
-                missing_counts
-            );
-            if (!allocation) {
-                seq.end_reason = sequence::exit_reason::oom;
+    for (batch::group* g : b.groups()) {
+        for (const batch::entry& e : g->entries) {
+            sequence& seq = *e.seq;
+            seq.steps_in_flight--;
+            if (seq.end_reason) {
                 continue;
             }
-            for (std::size_t layer = 0; layer < n_layers; layer++) {
-                layer_view& view = seq.layers[layer];
-                if (missing_counts[layer] > 0) {
-                    first_stale_page = std::min(first_stale_page.value_or(view.lines.size()), view.lines.size());
-                }
-                view.append_lines((*allocation)[layer]);
+            bool views_changed = release_passed_pages(seq);
+            if (e.ends_cycle) {
+                add_sampled_pages(seq);
+                views_changed = evict(seq) || views_changed;
             }
-            record_device_memory(seq);
-        }
-        if (first_stale_page) {
-            seq.upload_table(*first_stale_page, streams);
+            if (views_changed) {
+                update_views(seq);
+            }
+            if (e.ends_cycle) {
+                co_await write_cycle_end(seq);
+                seq.start_next_cycle();
+            }
+            std::optional<std::size_t> first_stale_page;
+            if (views_changed) {
+                first_stale_page = 0;
+            } else if (std::ranges::contains(state_writers, &seq)) {
+                first_stale_page = 0;
+            }
+            std::vector<std::size_t> missing_counts = seq.missing_lines();
+            if (std::ranges::any_of(missing_counts, [](std::size_t count) { return count > 0; })) {
+                std::expected<std::vector<std::vector<std::uint32_t>>, page_error> allocation = cache.allocate(
+                    missing_counts
+                );
+                if (!allocation) {
+                    seq.end_reason = sequence::exit_reason::oom;
+                    continue;
+                }
+                for (std::size_t layer = 0; layer < n_layers; layer++) {
+                    layer_view& view = seq.layers[layer];
+                    if (missing_counts[layer] > 0) {
+                        first_stale_page = std::min(first_stale_page.value_or(view.lines.size()), view.lines.size());
+                    }
+                    view.append_lines((*allocation)[layer]);
+                }
+                record_device_memory(seq);
+            }
+            if (first_stale_page) {
+                seq.upload_table(*first_stale_page, streams);
+            }
         }
     }
 }
