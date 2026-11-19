@@ -39,8 +39,11 @@ class executor {
 
   public:
     using sequence_id = slot_map<running_request>::key_type;
-    // A sequence and the tokens it computes in a batch.
-    using batch_tokens = std::pair<sequence_id, std::size_t>;
+    // A request that the scheduler puts into a step, and how many of its pending tokens the step computes.
+    struct scheduled_request {
+        sequence_id request_id;
+        std::size_t token_count;
+    };
 
   private:
     class batch;
@@ -161,14 +164,14 @@ class executor {
     // Points b's verify entries whose sequences' previous step is launched to that step, of which each such sequence
     // is a verify entry and a drafting entry.
     void link_previous(batch& b) const;
-    // Whether a step of entries ends no cycle and, in a model with sliding layers, completes no page, or in an executor
+    // Whether a step of the requests in scheduled ends no cycle and, in a model with sliding layers, completes no page, or in an executor
     // whose steps draft, whether every entry verifies drafts: its write-back then changes no view or table that the
     // next step reads, and copies to the store only lines the next step does not write.
-    bool entries_allow_overlap(std::span<const batch_tokens> entries) const;
-    // Whether launch can launch a step of entries now, the limit sampled_row_limit() aside: entries is not empty and
+    bool entries_allow_overlap(std::span<const scheduled_request> scheduled) const;
+    // Whether launch can launch a step of the requests in scheduled now, the limit sampled_row_limit() aside: scheduled is not empty and
     // names no sequence twice, each token count is above 0 and at most the sequence's pending tokens, each sequence is
-    // steppable (is_steppable), fewer than two steps are launched, and no step is launched or allows_overlap(entries).
-    bool is_launchable(std::span<const batch_tokens> entries) const;
+    // steppable (is_steppable), fewer than two steps are launched, and no step is launched or allows_overlap(scheduled).
+    bool is_launchable(std::span<const scheduled_request> scheduled) const;
 
     task<void> join(batch& b);
     // step_duration is the time from b's launch to its write-back.
@@ -219,23 +222,23 @@ class executor {
     // of r's tokens after its head, or one of its layers lists a page hash twice, and with oom when the free lines do
     // not cover the state's pages and one cycle's tokens. The lease of a request that fails is released before on_end.
     task<std::optional<sequence_id>> start(request&& r, std::unique_ptr<request_callbacks>&& callbacks);
-    // Whether a step of entries can be launched now, before any write-back: no step is launched or the last launched
-    // step allows overlap, and so does a step of entries. A step allows overlap when it ends no cycle and, in a model
+    // Whether a step of the requests in scheduled can be launched now, before any write-back: no step is launched or the last launched
+    // step allows overlap, and so does a step of the requests in scheduled. A step allows overlap when it ends no cycle and, in a model
     // with sliding layers, completes no page, or in an executor whose steps draft, when every entry verifies drafts.
-    bool allows_overlap(std::span<const batch_tokens> entries) const;
+    bool allows_overlap(std::span<const scheduled_request> scheduled) const;
     // The launched steps not written back yet, at most 2.
     std::size_t launched_batch_count() const noexcept;
     // The most rows of sampled tokens a batch has.
     std::size_t sampled_row_limit() const noexcept;
     // The rows of a batch's sampled tokens that the sequence takes when it computes token_count tokens.
     std::size_t sampled_row_count(sequence_id id, std::size_t token_count) const;
-    // Launches one step of entries, decoding entries first, after the launched steps: advances each sequence by its
+    // Launches one step of the requests in scheduled, decoding requests first, after the launched steps: advances each sequence by its
     // tokens, then queues the forward and the sampling on every shard without waiting for them. A decoding entry whose token is awaited reads
     // it from the previous launched step's samples on the GPUs, which needs both steps to allow overlap.
-    // entries is not empty and names no sequence twice, each token count is above 0 and at most the sequence's pending
+    // scheduled is not empty and names no sequence twice, each token count is above 0 and at most the sequence's pending
     // tokens, each sequence is steppable (is_steppable), fewer than two steps are launched, no step is launched or
-    // allows_overlap(entries), and the step samples at most sampled_row_limit() rows.
-    task<void> launch(std::span<const batch_tokens> entries);
+    // allows_overlap(scheduled), and the step samples at most sampled_row_limit() rows.
+    task<void> launch(std::span<const scheduled_request> scheduled);
     // Writes back the oldest launched step: waits for it, then completes the pages its tokens filled, sets each awaited token it sampled, writes the
     // completed pages, evicts and writes the state at a cycle end, and takes lines for the next tokens. The pages of a
     // sequence writing no state are written by a spawned task; a sequence writing its state waits for its pages' writes

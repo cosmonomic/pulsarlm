@@ -36,12 +36,12 @@ class scheduler {
 
     static event& emplace_event(std::optional<event>& waited);
     static void wake(std::optional<event>& waited) noexcept;
-    // The next step's entries: every decoding sequence, then the others' tokens up to prefill_tokens_per_step, never
+    // The next step's scheduled requests: every decoding sequence, then the others' tokens up to prefill_tokens_per_step, never
     // past the end of a sequence's cycle. Leaves out the sequences whose last step is launched. Rows of sampled tokens
     // are granted from sampled_row_scan_start on, and a sequence whose rows would raise the step's above
     // executor::sampled_row_limit is left out. Also returns the position of the first sequence left out, or
     // sampled_row_scan_start when none was.
-    std::pair<std::vector<executor::batch_tokens>, std::size_t> next_entries() const;
+    std::pair<std::vector<executor::scheduled_request>, std::size_t> next_scheduled_requests() const;
     // Writes the oldest launched step back, ends the sequences in it whose callbacks are cancelled, and lets each sequence
     // that exited leave once no launched step holds it.
     task<void> retire();

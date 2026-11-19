@@ -140,10 +140,10 @@ class executor::batch {
     at::Tensor accepted_token_counts;
     at::Tensor next_tokens;
 
-    // step_entries with their sequences found in owner, each recorded with whether it samples after its tokens and
+    // scheduled with their sequences found in owner, each recorded with whether it samples after its tokens and
     // whether they end its eviction cycle. With owner's graph_pages, a decode or verify group whose tables fit
     // graph_pages pages takes tables that wide and replays a graph.
-    batch(executor& owner, std::span<const batch_tokens> step_entries);
+    batch(executor& owner, std::span<const scheduled_request> scheduled);
 
     // The groups in entry order: decode, verify, prefill.
     std::array<group*, 3> groups() noexcept;

@@ -50,16 +50,16 @@ task<void> scheduler::serve(request r, unstarted_callbacks callbacks) {
 
 task<void> scheduler::run() {
     for (;;) {
-        auto [entries, next_scan_start] = next_entries();
-        if (exec.launched_batch_count() > 0 && (entries.empty() || !exec.allows_overlap(entries))) {
+        auto [scheduled, next_scan_start] = next_scheduled_requests();
+        if (exec.launched_batch_count() > 0 && (scheduled.empty() || !exec.allows_overlap(scheduled))) {
             co_await retire();
             continue;
         }
-        if (entries.empty()) {
+        if (scheduled.empty()) {
             co_await emplace_event(join_event);
             continue;
         }
-        co_await exec.launch(entries);
+        co_await exec.launch(scheduled);
         sampled_row_scan_start = next_scan_start;
         if (exec.launched_batch_count() > 1) {
             co_await retire();
@@ -82,7 +82,7 @@ task<void> scheduler::retire() {
     }
 }
 
-std::pair<std::vector<executor::batch_tokens>, std::size_t> scheduler::next_entries() const {
+std::pair<std::vector<executor::scheduled_request>, std::size_t> scheduler::next_scheduled_requests() const {
     const std::size_t sequence_count = running_sequences.size();
     std::vector<std::size_t> token_counts(sequence_count, 0);
     std::vector<bool> is_decoding(sequence_count, false);
@@ -120,15 +120,15 @@ std::pair<std::vector<executor::batch_tokens>, std::size_t> scheduler::next_entr
         token_counts[index] = token_count;
     }
 
-    std::vector<executor::batch_tokens> entries;
+    std::vector<executor::scheduled_request> scheduled;
     for (const bool decodes : {true, false}) {
         for (std::size_t index = 0; index < sequence_count; index++) {
             if (token_counts[index] > 0 && is_decoding[index] == decodes) {
-                entries.emplace_back(running_sequences[index], token_counts[index]);
+                scheduled.emplace_back(running_sequences[index], token_counts[index]);
             }
         }
     }
-    return {std::move(entries), first_index_left_out.value_or(sampled_row_scan_start)};
+    return {std::move(scheduled), first_index_left_out.value_or(sampled_row_scan_start)};
 }
 
 }  // namespace pulsarlm

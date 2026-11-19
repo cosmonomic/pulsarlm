@@ -15,8 +15,8 @@
 
 namespace pulsarlm {
 
-executor::batch::batch(executor& owner, std::span<const batch_tokens> step_entries) {
-    for (const auto& [id, token_count] : step_entries) {
+executor::batch::batch(executor& owner, std::span<const scheduled_request> scheduled) {
+    for (const auto& [id, token_count] : scheduled) {
         sequence& seq = owner.sequence_of(id);
         group& g = seq.pending_token_list().size() > 1 ? prefill_group
             : !seq.draft_tokens().empty()              ? verify_group

@@ -219,24 +219,24 @@ bool executor::completes_page(const sequence& seq, std::size_t token_count) cons
 }
 
 // A drafting sequence's verify step ends neither its cycle nor max_tokens (executor::advance).
-bool executor::entries_allow_overlap(std::span<const batch_tokens> entries) const {
+bool executor::entries_allow_overlap(std::span<const scheduled_request> scheduled) const {
     if (draft_layer) {
-        return std::ranges::all_of(entries, [&](const batch_tokens& e) {
-            return !sequence_of(e.first).draft_tokens().empty();
+        return std::ranges::all_of(scheduled, [&](const scheduled_request& e) {
+            return !sequence_of(e.request_id).draft_tokens().empty();
         });
     }
     const bool sliding = std::ranges::any_of(layout.layers, [](const view_layout::layer& layer) {
         return layer.sliding_window.has_value();
     });
-    return std::ranges::none_of(entries, [&](const batch_tokens& e) {
+    return std::ranges::none_of(scheduled, [&](const scheduled_request& e) {
         const auto& [id, token_count] = e;
         const sequence& seq = sequence_of(id);
         return seq.ends_cycle(token_count) || (sliding && completes_page(seq, token_count));
     });
 }
 
-bool executor::allows_overlap(std::span<const batch_tokens> entries) const {
-    return (launched_batches.empty() || launched_batches.back()->allows_overlap) && entries_allow_overlap(entries);
+bool executor::allows_overlap(std::span<const scheduled_request> scheduled) const {
+    return (launched_batches.empty() || launched_batches.back()->allows_overlap) && entries_allow_overlap(scheduled);
 }
 
 std::size_t executor::launched_batch_count() const noexcept {
@@ -255,18 +255,18 @@ std::size_t executor::sampled_row_count(sequence_id id, std::size_t token_count)
     return seq.draft_tokens().empty() ? 1 : token_count + seq.draft_tokens().size();
 }
 
-bool executor::is_launchable(std::span<const batch_tokens> entries) const {
-    if (entries.empty() || launched_batches.size() >= 2) {
+bool executor::is_launchable(std::span<const scheduled_request> scheduled) const {
+    if (scheduled.empty() || launched_batches.size() >= 2) {
         return false;
     }
     std::unordered_set<sequence_id> entered;
-    for (const auto& [id, token_count] : entries) {
+    for (const auto& [id, token_count] : scheduled) {
         if (!entered.insert(id).second || token_count == 0 || token_count > pending_token_count(id) ||
             !is_steppable(id)) {
             return false;
         }
     }
-    return launched_batches.empty() || allows_overlap(entries);
+    return launched_batches.empty() || allows_overlap(scheduled);
 }
 
 // A verify entry's tokens are accepted, and its samples taken, at its write-back. Its pending token and drafts are
@@ -331,13 +331,13 @@ void executor::advance(batch& b) {
 
 // Shard 0 queues on the executor's thread while the others queue on their own, so every shard's kernels launch at
 // once. Each shard's completion is taken once every shard has queued, before any later step queues.
-task<void> executor::launch(std::span<const batch_tokens> entries) {
+task<void> executor::launch(std::span<const scheduled_request> scheduled) {
     const std::chrono::steady_clock::time_point launch_time = std::chrono::steady_clock::now();
-    assert(is_launchable(entries));
-    std::unique_ptr<batch> b(new batch(*this, entries));
+    assert(is_launchable(scheduled));
+    std::unique_ptr<batch> b(new batch(*this, scheduled));
     b->launch_time = launch_time;
     assert(b->sample_params.size() <= sampled_row_capacity);
-    b->allows_overlap = entries_allow_overlap(entries);
+    b->allows_overlap = entries_allow_overlap(scheduled);
     link_previous(*b);
     advance(*b);
     for (batch::group* g : b->groups()) {
