@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -80,10 +81,12 @@ struct request_results {
     std::vector<pulsarlm::cycle_end> cycle_ends;
     std::optional<std::expected<pulsarlm::state, request_error>> end;
     state_pointer end_state;
-    std::size_t total_tokens = 0;
-    std::size_t cached_tokens = 0;
-    std::size_t device_cached_tokens = 0;
-    std::size_t peak_device_memory = 0;
+    std::vector<pulsarlm::prefill_statistics> prefills;
+    // The tokens recorded when each on_prefill arrived.
+    std::vector<std::size_t> tokens_at_prefills;
+    std::vector<pulsarlm::decode_statistics> decodes;
+    std::optional<std::size_t> prefills_at_end;
+    pulsarlm::request_statistics statistics{};
     bool cancelled = false;
     std::shared_ptr<const store_contents> observed_store;
     std::vector<std::size_t> writes_at_cycle_ends;
@@ -102,29 +105,36 @@ class recording_callbacks final : public pulsarlm::request_callbacks {
     explicit recording_callbacks(std::shared_ptr<request_results> recorded_results)
     : recorded_results(std::move(recorded_results)) {}
 
-    void on_token(std::int64_t token) noexcept override {
-        recorded_results->tokens.push_back(token);
+    void on_prefill(const pulsarlm::prefill_statistics& statistics) noexcept override {
+        recorded_results->tokens_at_prefills.push_back(recorded_results->tokens.size());
+        recorded_results->prefills.push_back(statistics);
     }
 
-    void on_cycle_end(pulsarlm::cycle_end&& ended) noexcept override {
+    void on_decode(std::int64_t token, const pulsarlm::decode_statistics& statistics) noexcept override {
+        recorded_results->tokens.push_back(token);
+        recorded_results->decodes.push_back(statistics);
+    }
+
+    void on_cycle(pulsarlm::cycle_end&& ended) noexcept override {
         recorded_results->writes_at_cycle_ends.push_back(observed_writes());
         recorded_results->cycle_ends.push_back(std::move(ended));
     }
 
-    void on_end(std::expected<pulsarlm::request_result, request_error>&& result) noexcept override {
+    void on_end(
+        std::expected<std::shared_ptr<const pulsarlm::state>, request_error>&& result,
+        const pulsarlm::request_statistics& statistics
+    ) noexcept override {
         recorded_results->writes_at_end = observed_writes();
         if (recorded_results->observed_store) {
             recorded_results->releases_at_end = recorded_results->observed_store->releases.size();
         }
+        recorded_results->prefills_at_end = recorded_results->prefills.size();
+        recorded_results->statistics = statistics;
         if (result) {
-            recorded_results->total_tokens = result->total_tokens;
-            recorded_results->cached_tokens = result->cached_tokens;
-            recorded_results->device_cached_tokens = result->device_cached_tokens;
-            recorded_results->peak_device_memory = result->peak_device_memory;
-            recorded_results->end_state = result->state;
+            recorded_results->end_state = *result;
         }
-        recorded_results->end.emplace(std::move(result).transform([](pulsarlm::request_result&& ended) {
-            return *ended.state;
+        recorded_results->end.emplace(std::move(result).transform([](std::shared_ptr<const pulsarlm::state>&& ended) {
+            return *ended;
         }));
     }
 
@@ -936,7 +946,7 @@ TEST_CASE("a request continues from the end state of another in the same cache")
 
     token_list context = concat(concat(prompt, results[0].tokens), user);
     REQUIRE(results[1].tokens == continuation(context, 4));
-    REQUIRE(results[1].cached_tokens == 8);
+    REQUIRE(results[1].statistics.cached_token_count == 8);
     REQUIRE(
         (hashes_of(ended_state(results[1])) ==
          pulsarlm::make_page_digests(root(), concat(context, without_last(results[1].tokens)), page_size))
@@ -976,12 +986,12 @@ TEST_CASE("a request's result counts its tokens and the initial state's full pag
         }
     );
 
-    REQUIRE(results[0].total_tokens == 11);
-    REQUIRE(results[0].cached_tokens == 0);
-    REQUIRE(results[0].device_cached_tokens == 0);
-    REQUIRE(results[1].total_tokens == 8 + 2 + 3 + 4);
-    REQUIRE(results[1].cached_tokens == 8);
-    REQUIRE(results[1].device_cached_tokens == 8);
+    REQUIRE(results[0].statistics.total_token_count == 11);
+    REQUIRE(results[0].statistics.cached_token_count == 0);
+    REQUIRE(results[0].statistics.device_cached_token_count == 0);
+    REQUIRE(results[1].statistics.total_token_count == 8 + 2 + 3 + 4);
+    REQUIRE(results[1].statistics.cached_token_count == 8);
+    REQUIRE(results[1].statistics.device_cached_token_count == 8);
 }
 
 TEST_CASE("pages fetched from the store count as cached but not device cached") {
@@ -997,8 +1007,8 @@ TEST_CASE("pages fetched from the store count as cached but not device cached") 
         {request{.tokens = concat(prompt, first.tokens), .max_tokens = 1}}
     )[0];
 
-    REQUIRE(second.cached_tokens == 8);
-    REQUIRE(second.device_cached_tokens == 0);
+    REQUIRE(second.statistics.cached_token_count == 8);
+    REQUIRE(second.statistics.device_cached_token_count == 0);
 }
 
 TEST_CASE("a state page missing from the store ends the request with miss") {
@@ -1043,6 +1053,82 @@ TEST_CASE("a stop token ends the request after it is emitted") {
     REQUIRE(end.tail == token_list{12});
 }
 
+TEST_CASE("the prefill statistics arrive once, before the first token") {
+    fixture f(16);
+    token_list prompt{1, 2, 3, 4, 5, 6};
+    std::vector<request_results> results = serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 5}});
+
+    REQUIRE(results[0].tokens.size() == 5);
+    REQUIRE(results[0].prefills.size() == 1);
+    REQUIRE(results[0].tokens_at_prefills == std::vector<std::size_t>{0});
+    REQUIRE(results[0].prefills[0].cached_token_count == 0);
+    REQUIRE(results[0].prefills[0].computed_token_count == prompt.size());
+    REQUIRE(results[0].prefills[0].step_count >= 1);
+    REQUIRE(results[0].prefills[0].step_duration > std::chrono::steady_clock::duration::zero());
+    REQUIRE(results[0].prefills[0].device_memory > 0);
+    REQUIRE(results[0].decodes.size() == results[0].tokens.size());
+}
+
+TEST_CASE("a request with max_tokens 0 gets its prefill statistics, then its end") {
+    fixture f(16);
+    token_list prompt{1, 2, 3, 4, 5, 6, 7, 8, 9};
+    std::vector<request_results> results = serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 0}});
+
+    REQUIRE(results[0].end->has_value());
+    REQUIRE(results[0].prefills.size() == 1);
+    REQUIRE(results[0].prefills_at_end == 1);
+    REQUIRE(results[0].decodes.empty());
+    REQUIRE(results[0].prefills[0].computed_token_count == prompt.size());
+    REQUIRE(results[0].statistics.step_duration == results[0].prefills[0].step_duration);
+}
+
+TEST_CASE("a request resumed from a stored state reports its cached tokens in its prefill statistics") {
+    fixture f(16);
+    token_list prompt{1, 2, 3, 4, 5, 6};
+    token_list user{7, 8};
+    std::vector<request_results> results = serve_in_turn(
+        f.sched,
+        request{.tokens = prompt, .max_tokens = 5},
+        [&](const request_results& first) {
+            return request{.tokens = concat(concat(prompt, first.tokens), user), .max_tokens = 4};
+        }
+    );
+
+    token_list context = concat(concat(prompt, results[0].tokens), user);
+    REQUIRE(results[1].prefills.size() == 1);
+    REQUIRE(results[1].prefills[0].cached_token_count == 8);
+    REQUIRE(results[1].prefills[0].device_cached_token_count == 8);
+    REQUIRE(results[1].prefills[0].computed_token_count == context.size() - 8);
+}
+
+TEST_CASE("the first token reports no step duration and the later tokens report their steps'") {
+    fixture f(16);
+    token_list prompt{1, 2, 3, 4, 5, 6};
+    std::vector<request_results> results = serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 5}});
+
+    REQUIRE(results[0].decodes.size() == 5);
+    REQUIRE(results[0].decodes[0].step_duration == std::chrono::steady_clock::duration::zero());
+    for (std::size_t token = 1; token < results[0].decodes.size(); token++) {
+        REQUIRE(results[0].decodes[token].step_duration > std::chrono::steady_clock::duration::zero());
+        REQUIRE(results[0].decodes[token].device_memory > 0);
+        REQUIRE(results[0].decodes[token].drafted_token_count == 0);
+        REQUIRE(results[0].decodes[token].accepted_draft_count == 0);
+    }
+}
+
+TEST_CASE("the step durations of the prefill and of the tokens sum to the request's") {
+    fixture f(16);
+    token_list prompt{1, 2, 3, 4, 5, 6, 7, 8, 9};
+    std::vector<request_results> results = serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 7}});
+
+    REQUIRE(results[0].prefills.size() == 1);
+    std::chrono::steady_clock::duration summed = results[0].prefills[0].step_duration;
+    for (const pulsarlm::decode_statistics& decode : results[0].decodes) {
+        summed += decode.step_duration;
+    }
+    REQUIRE(results[0].statistics.step_duration == summed);
+}
+
 TEST_CASE("max_tokens 0 forwards the tokens and ends with their state") {
     fixture f(16);
     token_list prompt{1, 2, 3, 4, 5, 6, 7, 8, 9};
@@ -1079,6 +1165,8 @@ TEST_CASE("a request cancelled before it runs ends with cancelled") {
 
     REQUIRE(results[0].tokens.empty());
     REQUIRE(ended_error(results[0]) == request_error::cancelled);
+    REQUIRE(results[0].prefills.empty());
+    REQUIRE(results[0].statistics.total_token_count == 0);
     REQUIRE(f.model.forward_count == 0);
     REQUIRE(f.store->releases == f.store->leases);
     REQUIRE(f.store->written_states.empty());
@@ -1103,6 +1191,24 @@ TEST_CASE("a request cancelled while decoding ends with cancelled at the next wr
     REQUIRE(f.model.forward_count == 3);
     REQUIRE(ended_error(results[0]) == request_error::cancelled);
     REQUIRE(f.store->releases == f.store->leases);
+}
+
+TEST_CASE("a request cancelled while a step is launched counts only the tokens its callbacks received") {
+    fixture f(16);
+    token_list prompt{1, 2, 3};
+    submission s = make_submission(request{.tokens = prompt, .max_tokens = 10});
+    f.model.on_forward = [&f, recorded_results = s.recorded_results] {
+        if (f.model.forward_count == 3) {
+            recorded_results->cancelled = true;
+        }
+    };
+    std::vector<submission> submissions;
+    submissions.push_back(std::move(s));
+    std::vector<request_results> results = serve_submissions(f.sched, std::move(submissions));
+
+    REQUIRE(ended_error(results[0]) == request_error::cancelled);
+    REQUIRE(results[0].tokens.size() == 2);
+    REQUIRE(results[0].statistics.total_token_count == prompt.size() + results[0].tokens.size());
 }
 
 // The executor owns a sequence that was not stopped until its own destruction, and the sequence holds the lease.
@@ -1401,8 +1507,8 @@ TEST_CASE("a request takes the hot pages after its state up to its cycle's mass 
 
     REQUIRE(served.first.cycle_ends.size() == 1);
     REQUIRE(served.second_prefill_chunks == std::vector<token_list>{{4}});
-    REQUIRE(served.second.cached_tokens == 12);
-    REQUIRE(served.second.device_cached_tokens == 12);
+    REQUIRE(served.second.statistics.cached_token_count == 12);
+    REQUIRE(served.second.statistics.device_cached_token_count == 12);
     REQUIRE(served.second.tokens == uninterrupted.tokens);
     REQUIRE(served.second.cycle_ends.size() == 1);
     REQUIRE(uninterrupted.cycle_ends.size() == 2);
@@ -1423,11 +1529,11 @@ TEST_CASE("a request takes the hot pages after its state up to its cycle's mass 
 TEST_CASE("a request takes no hot pages after a state inside its cycle's mass window or with recurrent layers") {
     diverging_requests whole_cycle = serve_diverging(windowed_policy(std::nullopt));
     REQUIRE(whole_cycle.second_prefill_chunks == std::vector<token_list>{{4}, {4}});
-    REQUIRE(whole_cycle.second.cached_tokens == 8);
+    REQUIRE(whole_cycle.second.statistics.cached_token_count == 8);
 
     diverging_requests recurrent = serve_diverging(windowed_policy(4), recurrent_and_full);
     REQUIRE(recurrent.second_prefill_chunks == std::vector<token_list>{{4}, {4}});
-    REQUIRE(recurrent.second.cached_tokens == 8);
+    REQUIRE(recurrent.second.statistics.cached_token_count == 8);
 }
 
 TEST_CASE("a cycle's end evicts the pages scoring below the threshold outside the sink and working pages") {
@@ -1592,7 +1698,7 @@ TEST_CASE("a request that needs every line of the pool peaks at the whole pool")
     for (const pulsarlm::page_shape& shape : page_shapes(two_full_layers)) {
         pool_bytes += 4 * std::bit_ceil(pulsarlm::line_bytes(shape));
     }
-    REQUIRE(results[0].peak_device_memory == pool_bytes);
+    REQUIRE(results[0].statistics.peak_device_memory == pool_bytes);
 }
 
 TEST_CASE("prefill forwards at most the step's prefill tokens") {
@@ -1985,7 +2091,7 @@ TEST_CASE("a recurrent request stopped while its next step runs resumes from the
     request_results second = serve_all(second_engine.sched, {request{.tokens = history, .max_tokens = 4}})[0];
 
     REQUIRE(second.tokens == continuation(history, 4));
-    REQUIRE(second.cached_tokens == page_size);
+    REQUIRE(second.statistics.cached_token_count == page_size);
 }
 
 TEST_CASE("a recurrent layer's state covers the pages eviction drops") {

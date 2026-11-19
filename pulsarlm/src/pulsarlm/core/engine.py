@@ -4,6 +4,7 @@ from pulsarlm.core import pulsarlm_core
 
 ActivePage = pulsarlm_core.ActivePage
 CycleEnd = pulsarlm_core.CycleEnd
+DecodeStatistics = pulsarlm_core.DecodeStatistics
 Engine = pulsarlm_core.Engine
 EngineStat = pulsarlm_core.EngineStat
 EvictionPolicy = pulsarlm_core.EvictionPolicy
@@ -14,13 +15,14 @@ LayerSequence = pulsarlm_core.LayerSequence
 Llama3RopeScaling = pulsarlm_core.Llama3RopeScaling
 ModelConfig = pulsarlm_core.ModelConfig
 Moments = pulsarlm_core.Moments
+PrefillStatistics = pulsarlm_core.PrefillStatistics
 Qwen3_5Config = pulsarlm_core.Qwen3_5Config
 Qwen3_5MoeConfig = pulsarlm_core.Qwen3_5MoeConfig
 Qwen4ExpConfig = pulsarlm_core.Qwen4ExpConfig
 Request = pulsarlm_core.Request
 RequestError = pulsarlm_core.RequestError
 RequestFailed = pulsarlm_core.RequestFailed
-RequestResult = pulsarlm_core.RequestResult
+RequestStatistics = pulsarlm_core.RequestStatistics
 RopeParameters = pulsarlm_core.RopeParameters
 SamplingParams = pulsarlm_core.SamplingParams
 State = pulsarlm_core.State

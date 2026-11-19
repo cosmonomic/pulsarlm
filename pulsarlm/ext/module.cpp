@@ -1,5 +1,6 @@
 #include <torch/csrc/utils/pybind.h>
 
+#include <pybind11/chrono.h>
 #include <pybind11/gil_safe_call_once.h>
 #include <pybind11/native_enum.h>
 #include <pybind11/operators.h>
@@ -226,20 +227,33 @@ PYBIND11_MODULE(pulsarlm_core, m) {
         return std::const_pointer_cast<state>(ended.state);
     });
 
-    py::class_<request_result>(m, "RequestResult")
-        .def_property_readonly(
-            "state",
-            [](const request_result& result) { return std::const_pointer_cast<state>(result.state); }
-        )
-        .def_readonly("total_tokens", &request_result::total_tokens)
-        .def_readonly("cached_tokens", &request_result::cached_tokens)
-        .def_readonly("device_cached_tokens", &request_result::device_cached_tokens)
-        .def_readonly("peak_device_memory", &request_result::peak_device_memory);
+    py::class_<prefill_statistics>(m, "PrefillStatistics")
+        .def_readonly("cached_token_count", &prefill_statistics::cached_token_count)
+        .def_readonly("device_cached_token_count", &prefill_statistics::device_cached_token_count)
+        .def_readonly("computed_token_count", &prefill_statistics::computed_token_count)
+        .def_readonly("step_count", &prefill_statistics::step_count)
+        .def_readonly("step_duration", &prefill_statistics::step_duration)
+        .def_readonly("device_memory", &prefill_statistics::device_memory);
+
+    py::class_<decode_statistics>(m, "DecodeStatistics")
+        .def_readonly("device_memory", &decode_statistics::device_memory)
+        .def_readonly("drafted_token_count", &decode_statistics::drafted_token_count)
+        .def_readonly("accepted_draft_count", &decode_statistics::accepted_draft_count)
+        .def_readonly("step_duration", &decode_statistics::step_duration);
+
+    py::class_<request_statistics>(m, "RequestStatistics")
+        .def_readonly("total_token_count", &request_statistics::total_token_count)
+        .def_readonly("cached_token_count", &request_statistics::cached_token_count)
+        .def_readonly("device_cached_token_count", &request_statistics::device_cached_token_count)
+        .def_readonly("peak_device_memory", &request_statistics::peak_device_memory)
+        .def_readonly("drafted_token_count", &request_statistics::drafted_token_count)
+        .def_readonly("accepted_draft_count", &request_statistics::accepted_draft_count)
+        .def_readonly("step_duration", &request_statistics::step_duration);
 
     py::class_<engine_stat>(m, "EngineStat")
         .def_readonly("kv_cache_bytes", &engine_stat::kv_cache_bytes)
-        .def_readonly("drafted_tokens", &engine_stat::drafted_tokens)
-        .def_readonly("accepted_drafts", &engine_stat::accepted_drafts);
+        .def_readonly("drafted_token_count", &engine_stat::drafted_token_count)
+        .def_readonly("accepted_draft_count", &engine_stat::accepted_draft_count);
 
     py::native_enum<request_error>(m, "RequestError", "enum.Enum")
         .value("MISS", request_error::miss)
@@ -734,7 +748,8 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "sampling"_a = sampling_params{},
             "max_tokens"_a = py::none(),
             "eviction"_a = eviction_policy{},
-            "on_cycle_end"_a = py::none(),
+            "on_prefill"_a = py::none(),
+            "on_cycle"_a = py::none(),
             "on_end"_a = py::none()
         )
         .def("eviction_report_of", &python_engine::eviction_report_of, "state"_a, "eviction"_a)

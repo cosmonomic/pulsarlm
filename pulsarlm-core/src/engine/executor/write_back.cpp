@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -33,7 +34,7 @@ task<std::vector<executor::sequence_id>> executor::write_back() {
     launched_batches.pop_front();
     batch& b = *written;
     co_await join(b);
-    batch_writes writes = apply_entries(b);
+    batch_writes writes = apply_entries(b, std::chrono::steady_clock::now() - b.launch_time);
     co_await write_pages_and_states(b, std::move(writes));
     co_await refresh_views(b);
     std::vector<sequence_id> written_sequences;
@@ -55,7 +56,7 @@ task<void> executor::join(batch& b) {
     b.join_mass(shard_mass_heads, layout);
 }
 
-executor::batch_writes executor::apply_entries(batch& b) {
+executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clock::duration step_duration) {
     std::size_t n_layers = cache.layer_count();
     batch_writes writes{
         .new_hashes = std::vector<std::vector<digest>>(n_layers),
@@ -106,8 +107,8 @@ executor::batch_writes executor::apply_entries(batch& b) {
                 emitted = samples.first(accepted_count);
                 const std::size_t start = e.start_position + seq.unapplied_position_shift();
                 seq.apply_accepted_tokens(start, emitted, b.verify_rows);
-                drafted_count.fetch_add(b.verify_rows - 1, std::memory_order_relaxed);
-                accepted_draft_count.fetch_add(accepted_count - 1, std::memory_order_relaxed);
+                drafted_tokens.fetch_add(b.verify_rows - 1, std::memory_order_relaxed);
+                accepted_drafts.fetch_add(accepted_count - 1, std::memory_order_relaxed);
                 e.start_position = start;
                 e.end_position = start + accepted_count;
             }
@@ -115,9 +116,35 @@ executor::batch_writes executor::apply_entries(batch& b) {
             if (e.is_measured) {
                 b.add_measured_mass(*g, position, accepted_count, layout);
             }
+            const bool is_prefill_step = !seq.has_ended_prefill();
+            seq.record_step(step_duration);
+            if (is_prefill_step && e.end_position >= seq.prompt_token_count()) {
+                seq.end_prefill();
+                seq.writer().append(
+                    prefill_statistics{
+                        .cached_token_count = seq.cached_token_count(),
+                        .device_cached_token_count = seq.device_cached_token_count(),
+                        .computed_token_count = seq.prompt_token_count() - seq.cached_token_count(),
+                        .step_count = seq.prefill_step_count(),
+                        .step_duration = seq.prefill_step_duration(),
+                        .device_memory = device_memory(seq),
+                    }
+                );
+            }
+            // The first token a step delivers carries the step's counts and its duration; the prefill statistics hold
+            // the duration of a prefill step.
+            decode_statistics token_statistics{
+                .device_memory = device_memory(seq),
+                .drafted_token_count = verifies ? b.verify_rows - 1 : 0,
+                .accepted_draft_count = verifies ? accepted_count - 1 : 0,
+                .step_duration = is_prefill_step ? std::chrono::steady_clock::duration::zero() : step_duration,
+            };
             if (verifies) {
                 for (std::int64_t token : emitted) {
-                    seq.writer().append(token);
+                    seq.writer().append(token, token_statistics);
+                    token_statistics.drafted_token_count = 0;
+                    token_statistics.accepted_draft_count = 0;
+                    token_statistics.step_duration = std::chrono::steady_clock::duration::zero();
                 }
                 if (std::ranges::contains(stop_ids, emitted.back()) || !seq.may_sample()) {
                     seq.exit(sequence::exit_reason::finished);
@@ -128,7 +155,7 @@ executor::batch_writes executor::apply_entries(batch& b) {
             } else if (!samples.empty()) {
                 const std::int64_t token = samples.front();
                 seq.apply_sample(e.sampled_position, token);
-                seq.writer().append(token);
+                seq.writer().append(token, token_statistics);
                 if (std::ranges::contains(stop_ids, token)) {
                     seq.exit(sequence::exit_reason::finished);
                     if (seq.launched_step_count() > 1) {

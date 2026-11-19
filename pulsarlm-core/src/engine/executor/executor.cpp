@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -199,12 +200,12 @@ std::size_t executor::kv_cache_bytes() const noexcept {
     return cache.used_bytes();
 }
 
-std::uint64_t executor::drafted_tokens() const noexcept {
-    return drafted_count.load(std::memory_order_relaxed);
+std::uint64_t executor::drafted_token_count() const noexcept {
+    return drafted_tokens.load(std::memory_order_relaxed);
 }
 
-std::uint64_t executor::accepted_drafts() const noexcept {
-    return accepted_draft_count.load(std::memory_order_relaxed);
+std::uint64_t executor::accepted_draft_count() const noexcept {
+    return accepted_drafts.load(std::memory_order_relaxed);
 }
 
 bool executor::completes_page(const sequence& seq, std::size_t token_count) const noexcept {
@@ -336,8 +337,10 @@ void executor::advance(batch& b) {
 // Shard 0 queues on the executor's thread while the others queue on their own, so every shard's kernels launch at
 // once. Each shard's completion is taken once every shard has queued, before any later step queues.
 task<void> executor::launch(std::span<const batch_tokens> entries) {
+    const std::chrono::steady_clock::time_point launch_time = std::chrono::steady_clock::now();
     check_launch(entries);
     std::unique_ptr<batch> b(new batch(*this, entries));
+    b->launch_time = launch_time;
     if (b->sample_params.size() > sampled_row_capacity) {
         throw std::logic_error("executor::launch: the step samples more than sampled_row_limit rows");
     }

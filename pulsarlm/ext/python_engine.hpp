@@ -25,7 +25,8 @@ namespace pulsarlm {
 // Python's handle on a request. Dropping it cancels the request.
 class request_handle {
     std::shared_ptr<request_buffer> buffer;
-    pybind11::object on_cycle_end;
+    pybind11::object on_prefill;
+    pybind11::object on_cycle;
     pybind11::object on_end;
     bool ended = false;
     std::optional<request_error> failure;
@@ -33,7 +34,8 @@ class request_handle {
   public:
     request_handle(
         std::shared_ptr<request_buffer> buffer,
-        pybind11::object&& on_cycle_end,
+        pybind11::object&& on_prefill,
+        pybind11::object&& on_cycle,
         pybind11::object&& on_end
     ) noexcept;
     request_handle(const request_handle&) = delete;
@@ -42,9 +44,9 @@ class request_handle {
     request_handle& operator=(request_handle&&) = delete;
     ~request_handle();
 
-    // The tokens sampled since the last take, None once the request ended and every token was taken. Passes each cycle
-    // end to on_cycle_end and the result to on_end first, when they are not None. Raises RequestFailed once every
-    // token before an error was taken.
+    // The tokens sampled since the last take, each with its statistics, None once the request ended and every token was
+    // taken. Passes the prefill statistics to on_prefill, each cycle end to on_cycle and the final state with the request's
+    // statistics to on_end first, when they are not None. Raises RequestFailed once every token before an error was taken.
     pybind11::object take();
     void cancel() noexcept;
 };
@@ -73,7 +75,8 @@ class python_engine {
         const sampling_params& sampling,
         std::optional<std::size_t> max_tokens,
         const eviction_policy& eviction,
-        pybind11::object on_cycle_end,
+        pybind11::object on_prefill,
+        pybind11::object on_cycle,
         pybind11::object on_end
     );
     eviction_report eviction_report_of(const state& s, const eviction_policy& policy) const;

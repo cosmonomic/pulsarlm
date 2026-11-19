@@ -4,6 +4,7 @@
 #include <c10/core/Device.h>
 #include <cuda_runtime_api.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -73,6 +74,8 @@ class sequence {
     std::uint64_t draw_count = 0;
     std::optional<std::size_t> max_tokens;
     std::size_t generated_count = 0;
+    // The sampled tokens that steps written back applied.
+    std::size_t delivered_count = 0;
     // The digest the page chain starts from.
     digest root;
     std::optional<digest> head;
@@ -127,6 +130,16 @@ class sequence {
     std::size_t cached_count = 0;
     std::size_t device_cached_count = 0;
     std::size_t peak_device_memory = 0;
+    // Whether the step that computed the last of the request's tokens was written back.
+    bool has_prefill_ended = false;
+    // The steps written back before the prefill ended, and their durations summed.
+    std::size_t prefill_steps = 0;
+    std::chrono::steady_clock::duration prefill_duration{};
+    // The durations of every step written back, summed.
+    std::chrono::steady_clock::duration total_step_duration{};
+    // The drafts the verify steps written back verified, and those of them they accepted.
+    std::size_t drafted_tokens = 0;
+    std::size_t accepted_drafts = 0;
 
     // The view index of recurrent KV layer layer's line holding the state at the end of head's page.
     std::size_t head_state_line_index(std::size_t layer) const;
@@ -167,10 +180,19 @@ class sequence {
     sampling_draw next_draw() const noexcept;
     const std::optional<std::size_t>& token_limit() const noexcept;
     std::size_t generated_token_count() const noexcept;
+    // The sampled tokens that steps written back applied, without those of launched steps.
+    std::size_t delivered_token_count() const noexcept;
     std::size_t prompt_token_count() const noexcept;
     std::size_t cached_token_count() const noexcept;
     std::size_t device_cached_token_count() const noexcept;
     std::size_t device_memory_peak() const noexcept;
+    bool has_ended_prefill() const noexcept;
+    std::size_t prefill_step_count() const noexcept;
+    std::chrono::steady_clock::duration prefill_step_duration() const noexcept;
+    // The durations of every step written back, summed.
+    std::chrono::steady_clock::duration step_duration() const noexcept;
+    std::size_t drafted_token_count() const noexcept;
+    std::size_t accepted_draft_count() const noexcept;
     std::size_t history_page_count() const noexcept;
     const std::optional<digest>& head_digest() const noexcept;
     std::span<const std::size_t> held_page_indices() const noexcept;
@@ -245,6 +267,10 @@ class sequence {
     apply_accepted_tokens(std::size_t start, std::span<const std::int64_t> accepted_tokens, std::size_t verified_count);
     // One launched step of the sequence was written back.
     void finish_step() noexcept;
+    // Adds a step written back, which took duration from its launch to its write-back, to the prefill's steps until
+    // end_prefill and to the summed duration.
+    void record_step(std::chrono::steady_clock::duration duration) noexcept;
+    void end_prefill() noexcept;
     // Undoes the advance by one token of the latest launched step, whose pages are not completed yet, and its sample if
     // it took one: the token it forwarded returns to pending.
     void withdraw_latest_step();

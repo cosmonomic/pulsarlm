@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import enum
 from collections.abc import Callable
 from typing import Literal, Protocol
@@ -109,26 +110,72 @@ class CycleEnd:
     @property
     def state(self) -> State: ...
 
-class RequestResult:
-    """A request's final state, which leaves out the last sampled token, and its
-    token counts. total_tokens: the request's tokens, then the tokens it sampled.
-    cached_tokens: the tokens of the full pages of the state it resumed, which the
-    request did not forward; that state's tail is forwarded again. device_cached_tokens: those of them on pages every
+class PrefillStatistics:
+    @property
+    def cached_token_count(self) -> int:
+        """The prompt tokens taken from stored pages."""
+    @property
+    def device_cached_token_count(self) -> int:
+        """The cached tokens on pages hot on the device."""
+    @property
+    def computed_token_count(self) -> int:
+        """The prompt tokens the model computed."""
+    @property
+    def step_count(self) -> int:
+        """The steps that computed the prompt tokens."""
+    @property
+    def step_duration(self) -> datetime.timedelta:
+        """Launch to write-back of each of those steps, summed."""
+    @property
+    def device_memory(self) -> int:
+        """The bytes of each device's KV cache pool that the request's lines take
+        when the prefill ends."""
+
+class DecodeStatistics:
+    """A step reports its counts and its duration with the first token it
+    delivers, and zeros with its later tokens. The step that ends the prefill
+    reports a duration of zero with the token it samples."""
+
+    @property
+    def device_memory(self) -> int:
+        """The bytes of each device's KV cache pool that the request's lines take
+        when the token is delivered."""
+    @property
+    def drafted_token_count(self) -> int:
+        """The drafts verified by the step that delivered the token."""
+    @property
+    def accepted_draft_count(self) -> int:
+        """The drafts of drafted_token_count the step accepted."""
+    @property
+    def step_duration(self) -> datetime.timedelta:
+        """Launch to write-back of the step that delivered the token."""
+
+class RequestStatistics:
+    """total_token_count: the request's tokens, then the tokens it sampled.
+    cached_token_count: the tokens of the full pages of the state it resumed, which the
+    request did not forward; that state's tail is forwarded again. device_cached_token_count: those of them on pages every
     KV layer reading the page had resident in the KV cache when the request
     started, not fetched from the store. peak_device_memory: the most bytes of
     each device's KV cache pool that the request's lines took at once, lines it
     shared with other requests included."""
 
     @property
-    def state(self) -> State: ...
+    def total_token_count(self) -> int: ...
     @property
-    def total_tokens(self) -> int: ...
+    def cached_token_count(self) -> int: ...
     @property
-    def cached_tokens(self) -> int: ...
-    @property
-    def device_cached_tokens(self) -> int: ...
+    def device_cached_token_count(self) -> int: ...
     @property
     def peak_device_memory(self) -> int: ...
+    @property
+    def drafted_token_count(self) -> int:
+        """The drafts the request's verify steps verified."""
+    @property
+    def accepted_draft_count(self) -> int:
+        """The drafts of drafted_token_count the steps accepted."""
+    @property
+    def step_duration(self) -> datetime.timedelta:
+        """Launch to write-back of every step of the request, summed."""
 
 class RequestError(enum.Enum):
     MISS = ...
@@ -146,11 +193,11 @@ class EngineStat:
         """The bytes of the KV cache's pool that lines in use take: those of
         running requests, not those only caching a page."""
     @property
-    def drafted_tokens(self) -> int:
+    def drafted_token_count(self) -> int:
         """The drafts verify steps forwarded since the engine started."""
     @property
-    def accepted_drafts(self) -> int:
-        """The drafts of drafted_tokens the verify steps accepted."""
+    def accepted_draft_count(self) -> int:
+        """The drafts of drafted_token_count the verify steps accepted."""
 
 class SamplingParams:
     temperature: float
@@ -365,10 +412,11 @@ class Qwen4ExpConfig:
     ) -> None: ...
 
 class Request:
-    def take(self) -> list[int] | None:
-        """The tokens sampled since the last take; None once the request ended and
-        every token was taken. Passes each cycle end to on_cycle_end, then the
-        result to on_end, before it returns. Raises RequestFailed once every token
+    def take(self) -> list[tuple[int, DecodeStatistics]] | None:
+        """The tokens sampled since the last take, each with its statistics; None
+        once the request ended and every token was taken. Passes the prefill
+        statistics to on_prefill, then each cycle end to on_cycle, then the
+        final state and the request's statistics to on_end, before it returns. Raises RequestFailed once every token
         before an error was taken."""
     def cancel(self) -> None: ...
 
@@ -414,14 +462,15 @@ class Engine:
         sampling: SamplingParams = ...,
         max_tokens: int | None = None,
         eviction: EvictionPolicy = ...,
-        on_cycle_end: Callable[[CycleEnd], None] | None = None,
-        on_end: Callable[[RequestResult], None] | None = None,
+        on_prefill: Callable[[PrefillStatistics], None] | None = None,
+        on_cycle: Callable[[CycleEnd], None] | None = None,
+        on_end: Callable[[State, RequestStatistics], None] | None = None,
     ) -> Request:
         """Serves tokens, a history chained from initial_digest or from the engine's
         root without it, from the newest state the store holds for a prefix of
         them, and writes every state the request reaches to the store. Raises
         ValueError for a request the engine cannot serve. Request.take calls
-        on_cycle_end and on_end on its caller's thread."""
+        on_prefill, on_cycle and on_end on its caller's thread."""
     def eviction_report_of(
         self, state: State, eviction: EvictionPolicy
     ) -> EvictionReport:

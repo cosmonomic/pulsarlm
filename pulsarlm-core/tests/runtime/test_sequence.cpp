@@ -11,6 +11,7 @@
 #undef CHECK
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -36,11 +37,16 @@ constexpr state::lease_id_type lease_id = 7;
 
 class silent_callbacks final : public pulsarlm::request_callbacks {
   public:
-    void on_token(std::int64_t) noexcept override {}
+    void on_prefill(const pulsarlm::prefill_statistics&) noexcept override {}
 
-    void on_cycle_end(pulsarlm::cycle_end&&) noexcept override {}
+    void on_decode(std::int64_t, const pulsarlm::decode_statistics&) noexcept override {}
 
-    void on_end(std::expected<pulsarlm::request_result, pulsarlm::request_error>&&) noexcept override {}
+    void on_cycle(pulsarlm::cycle_end&&) noexcept override {}
+
+    void on_end(
+        std::expected<std::shared_ptr<const pulsarlm::state>, pulsarlm::request_error>&&,
+        const pulsarlm::request_statistics&
+    ) noexcept override {}
 
     bool cancelled() const noexcept override {
         return false;
@@ -135,6 +141,7 @@ TEST_CASE("a prefill step and a decode step move their tokens to the tail and ap
 
     seq.launch_step(1, 0, 0, 0);
     REQUIRE(seq.generated_token_count() == 3);
+    REQUIRE(seq.delivered_token_count() == 2);
     REQUIRE_FALSE(seq.may_sample());
     REQUIRE(seq.has_launched_last_step());
 }
@@ -224,6 +231,24 @@ TEST_CASE("a verify step inserts the tokens it accepts and counts the drafts it 
     REQUIRE(seq.unapplied_position_shift() == 0);
     REQUIRE(seq.generated_token_count() == 3);
     REQUIRE(seq.next_draw().count == 3);
+    REQUIRE(seq.drafted_token_count() == 2);
+    REQUIRE(seq.accepted_draft_count() == 1);
+}
+
+TEST_CASE("a recorded step counts as a prefill step until the prefill ends") {
+    started_sequence started({1, 2, 3, 4, 5}, std::nullopt, make_layout(4, false));
+    sequence& seq = started.seq;
+    REQUIRE_FALSE(seq.has_ended_prefill());
+
+    seq.record_step(std::chrono::milliseconds(3));
+    seq.record_step(std::chrono::milliseconds(4));
+    seq.end_prefill();
+    seq.record_step(std::chrono::milliseconds(5));
+
+    REQUIRE(seq.has_ended_prefill());
+    REQUIRE(seq.prefill_step_count() == 2);
+    REQUIRE(seq.prefill_step_duration() == std::chrono::milliseconds(7));
+    REQUIRE(seq.step_duration() == std::chrono::milliseconds(12));
 }
 
 TEST_CASE("a verify step written back before a later one leaves its accepted count for that step") {

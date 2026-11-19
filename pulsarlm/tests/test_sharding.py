@@ -14,7 +14,7 @@ from torch import Tensor
 from pulsarlm import checkpoint, sharding
 from pulsarlm.checkpoint import PulsarLMModelConfig, PulsarLMModelLoadingError
 from pulsarlm.safetensors_file import SafetensorsFile
-from pulsarlm.core.engine import Engine, RequestResult, State
+from pulsarlm.core.engine import Engine, RequestStatistics, State
 from pulsarlm.engine_model import engine_model
 
 PREFIX = "model.language_model."
@@ -435,8 +435,12 @@ class MemoryStore:
 async def generate(
     engine: Engine, prompt: list[int], max_tokens: int
 ) -> tuple[list[int], State]:
-    results: list[RequestResult] = []
-    request = engine.submit(prompt, max_tokens=max_tokens, on_end=results.append)
+    end_states: list[State] = []
+
+    def record_end(state: State, _: RequestStatistics) -> None:
+        end_states.append(state)
+
+    request = engine.submit(prompt, max_tokens=max_tokens, on_end=record_end)
     loop = asyncio.get_running_loop()
     woke = asyncio.Event()
     loop.add_reader(engine.fileno(), woke.set)
@@ -447,8 +451,8 @@ async def generate(
             engine.clear_wake()
             taken = request.take()
             if taken is None:
-                return tokens, results[0].state
-            tokens += taken
+                return tokens, end_states[0]
+            tokens += [token for token, _ in taken]
             if not taken:
                 await woke.wait()
     finally:

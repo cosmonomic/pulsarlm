@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -434,6 +435,10 @@ std::size_t sequence::generated_token_count() const noexcept {
     return generated_count;
 }
 
+std::size_t sequence::delivered_token_count() const noexcept {
+    return delivered_count;
+}
+
 std::size_t sequence::prompt_token_count() const noexcept {
     return prompt_count;
 }
@@ -448,6 +453,30 @@ std::size_t sequence::device_cached_token_count() const noexcept {
 
 std::size_t sequence::device_memory_peak() const noexcept {
     return peak_device_memory;
+}
+
+bool sequence::has_ended_prefill() const noexcept {
+    return has_prefill_ended;
+}
+
+std::size_t sequence::prefill_step_count() const noexcept {
+    return prefill_steps;
+}
+
+std::chrono::steady_clock::duration sequence::prefill_step_duration() const noexcept {
+    return prefill_duration;
+}
+
+std::chrono::steady_clock::duration sequence::step_duration() const noexcept {
+    return total_step_duration;
+}
+
+std::size_t sequence::drafted_token_count() const noexcept {
+    return drafted_tokens;
+}
+
+std::size_t sequence::accepted_draft_count() const noexcept {
+    return accepted_drafts;
 }
 
 std::size_t sequence::history_page_count() const noexcept {
@@ -565,6 +594,7 @@ void sequence::launch_verify_step(std::size_t token_count, std::size_t draft_cou
 
 void sequence::apply_sample(std::size_t position, std::int64_t token) {
     resolve_token(position, token);
+    delivered_count++;
 }
 
 void sequence::apply_accepted_tokens(
@@ -577,6 +607,9 @@ void sequence::apply_accepted_tokens(
     accept_tokens(start, accepted_tokens);
     draw_count += accepted_count;
     generated_count += accepted_count;
+    delivered_count += accepted_count;
+    drafted_tokens += verified_count - 1;
+    accepted_drafts += accepted_count - 1;
     unapplied_shift = has_later_step ? accepted_count - 1 : 0;
     if (!has_later_step) {
         rejected_tokens = verified_count - accepted_count;
@@ -587,6 +620,18 @@ void sequence::apply_accepted_tokens(
 void sequence::finish_step() noexcept {
     assert(steps_in_flight > 0);
     steps_in_flight--;
+}
+
+void sequence::record_step(std::chrono::steady_clock::duration duration) noexcept {
+    if (!has_prefill_ended) {
+        prefill_steps++;
+        prefill_duration += duration;
+    }
+    total_step_duration += duration;
+}
+
+void sequence::end_prefill() noexcept {
+    has_prefill_ended = true;
 }
 
 void sequence::set_drafts(std::span<const std::int64_t> tokens) {

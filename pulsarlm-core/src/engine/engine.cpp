@@ -412,8 +412,8 @@ std::size_t engine::largest_page_bytes() const noexcept {
 engine_stat engine::stat() const {
     return engine_stat{
         .kv_cache_bytes = exec.kv_cache_bytes(),
-        .drafted_tokens = exec.drafted_tokens(),
-        .accepted_drafts = exec.accepted_drafts(),
+        .drafted_token_count = exec.drafted_token_count(),
+        .accepted_draft_count = exec.accepted_draft_count(),
     };
 }
 

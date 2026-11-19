@@ -3,6 +3,7 @@
 #include <cuda_runtime_api.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -77,8 +78,8 @@ class executor {
     std::optional<std::size_t> draft_layer;
     // Per shard, stop_ids on its device, int64.
     std::vector<at::Tensor> stop_tokens;
-    std::atomic<std::uint64_t> drafted_count{0};
-    std::atomic<std::uint64_t> accepted_draft_count{0};
+    std::atomic<std::uint64_t> drafted_tokens{0};
+    std::atomic<std::uint64_t> accepted_drafts{0};
     std::size_t slots_of(const kv_layer& layer) const noexcept;
     // Per shard, per KV layer, the shard's part of the layer's mass_heads; the shards' parts in shard order make up the
     // layer's.
@@ -121,7 +122,9 @@ class executor {
     void release_lines(sequence& seq) noexcept;
     // Captures each shard's decode graphs of up to decode_graphs::startup_sequences sequences, every shard at once.
     void capture_decode_graphs();
-    // Raises seq's device_memory_peak to the bytes of each device's pool its lines take now.
+    // The bytes of each device's pool that seq's lines take now.
+    std::size_t device_memory(const sequence& seq) const noexcept;
+    // Raises seq's device_memory_peak to its device_memory.
     void record_device_memory(sequence& seq) const noexcept;
     // Drops from each sliding layer's view the pages before the window of the tail's first token, and returns whether
     // any view changed.
@@ -148,7 +151,8 @@ class executor {
     void check_launch(std::span<const batch_tokens> entries) const;
 
     task<void> join(batch& b);
-    batch_writes apply_entries(batch& b);
+    // step_duration is the time from b's launch to its write-back.
+    batch_writes apply_entries(batch& b, std::chrono::steady_clock::duration step_duration);
     task<void> write_pages_and_states(batch& b, batch_writes&& writes);
     task<void> refresh_views(batch& b);
 
@@ -219,9 +223,10 @@ class executor {
     // loop, when no step is launched.
     task<std::vector<sequence_id>> write_back();
     // Ends the sequence of id, which exited and is in no launched step: releases its lines, writes its end state when it
-    // finished, releases its lease and erases it. Throws std::logic_error for a sequence that has not exited or that a
-    // launched step holds.
-    task<std::expected<request_result, request_error>> stop(sequence_id id);
+    // finished, releases its lease and erases it. Returns that state or the error it exited with, and its statistics.
+    // Throws std::logic_error for a sequence that has not exited or that a launched step holds.
+    task<std::pair<std::expected<std::shared_ptr<const state>, request_error>, request_statistics>>
+    stop(sequence_id id);
     // Whether the sequence has not exited and no launched step forwards its last tokens.
     bool is_steppable(sequence_id id) const;
     std::size_t pending_token_count(sequence_id id) const;
@@ -236,8 +241,8 @@ class executor {
     // kv_cache::used_bytes of the executor's cache. Safe to call from any thread.
     std::size_t kv_cache_bytes() const noexcept;
     // The drafts the verify steps written back forwarded, and those of them they accepted. Safe to call from any thread.
-    std::uint64_t drafted_tokens() const noexcept;
-    std::uint64_t accepted_drafts() const noexcept;
+    std::uint64_t drafted_token_count() const noexcept;
+    std::uint64_t accepted_draft_count() const noexcept;
 };
 
 }  // namespace pulsarlm

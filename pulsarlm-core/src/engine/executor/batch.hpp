@@ -6,6 +6,7 @@
 #include <ATen/cuda/CUDAEvent.h>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -95,6 +96,8 @@ class executor::batch {
     group decode_group{.inputs = {.kind = model::batch_kind::decode}};
     group verify_group{.inputs = {.kind = model::batch_kind::verify}};
     group prefill_group{.inputs = {.kind = model::batch_kind::prefill}};
+    // The time at the start of the executor::launch that launched the batch.
+    std::chrono::steady_clock::time_point launch_time;
     // The tokens a verify entry forwards and samples after: its pending token and its drafts.
     std::size_t verify_rows = 0;
     // Whether a decode entry's token is awaited, -(r + 1) in the decode group's tokens for row r of the previous

@@ -136,19 +136,24 @@ class recording_callbacks final : public pulsarlm::request_callbacks {
     explicit recording_callbacks(std::shared_ptr<request_results> recorded_results)
     : recorded_results(std::move(recorded_results)) {}
 
-    void on_token(std::int64_t token) noexcept override {
+    void on_prefill(const pulsarlm::prefill_statistics&) noexcept override {}
+
+    void on_decode(std::int64_t token, const pulsarlm::decode_statistics&) noexcept override {
         std::lock_guard lock(recorded_results->mutex);
         recorded_results->tokens.push_back(token);
     }
 
-    void on_cycle_end(pulsarlm::cycle_end&&) noexcept override {}
+    void on_cycle(pulsarlm::cycle_end&&) noexcept override {}
 
-    void on_end(std::expected<pulsarlm::request_result, request_error>&& result) noexcept override {
+    void on_end(
+        std::expected<std::shared_ptr<const pulsarlm::state>, request_error>&& result,
+        const pulsarlm::request_statistics&
+    ) noexcept override {
         {
             std::lock_guard lock(recorded_results->mutex);
-            recorded_results->end.emplace(std::move(result).transform([](pulsarlm::request_result&& ended) {
-                return *ended.state;
-            }));
+            recorded_results->end.emplace(
+                std::move(result).transform([](std::shared_ptr<const pulsarlm::state>&& ended) { return *ended; })
+            );
         }
         recorded_results->end_condition.notify_all();
     }

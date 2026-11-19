@@ -9,7 +9,7 @@ from pulsarlm.core.engine import (
     EvictionPolicy,
     RequestError,
     RequestFailed,
-    RequestResult,
+    RequestStatistics,
     SamplingParams,
     State,
 )
@@ -59,16 +59,16 @@ async def complete(
     completion_tokens = 0
     first_token_at: float | None = None
     last_token_at = 0.0
-    result: RequestResult | None = None
+    statistics: RequestStatistics | None = None
 
     def pass_state(state: State) -> None:
         if on_state is not None:
             on_state(state)
 
-    def end(request_result: RequestResult) -> None:
-        nonlocal result
-        result = request_result
-        pass_state(request_result.state)
+    def end(state: State, request_statistics: RequestStatistics) -> None:
+        nonlocal statistics
+        statistics = request_statistics
+        pass_state(state)
 
     submitted_at = time.monotonic()
     stream = engine.submit(
@@ -76,7 +76,7 @@ async def complete(
         sampling=sampling,
         max_tokens=max_tokens,
         eviction=eviction,
-        on_cycle_end=lambda cycle_end: pass_state(cycle_end.state),
+        on_cycle=lambda cycle_end: pass_state(cycle_end.state),
         on_end=end,
     )
     try:
@@ -90,14 +90,14 @@ async def complete(
         raise CompletionError(failure.error) from failure
     finally:
         stream.cancel()
-    assert result is not None
+    assert statistics is not None
     if on_completed is not None:
         on_completed(
             CompletionUsage(
                 prompt_tokens=len(prompt),
-                cached_tokens=result.cached_tokens,
-                device_cached_tokens=result.device_cached_tokens,
-                peak_device_memory=result.peak_device_memory,
+                cached_tokens=statistics.cached_token_count,
+                device_cached_tokens=statistics.device_cached_token_count,
+                peak_device_memory=statistics.peak_device_memory,
                 completion_tokens=completion_tokens,
                 time_to_first_token_s=None
                 if first_token_at is None

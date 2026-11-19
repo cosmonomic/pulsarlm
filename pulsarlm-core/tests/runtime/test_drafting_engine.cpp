@@ -397,6 +397,8 @@ struct request_results {
     std::mutex mutex;
     std::condition_variable end_condition;
     token_list tokens;
+    std::vector<pulsarlm::decode_statistics> decodes;
+    pulsarlm::request_statistics statistics{};
     std::optional<std::expected<pulsarlm::state, pulsarlm::request_error>> end;
 };
 
@@ -407,19 +409,26 @@ class recording_callbacks final : public pulsarlm::request_callbacks {
     explicit recording_callbacks(std::shared_ptr<request_results> recorded_results)
     : recorded_results(std::move(recorded_results)) {}
 
-    void on_token(std::int64_t token) noexcept override {
+    void on_prefill(const pulsarlm::prefill_statistics&) noexcept override {}
+
+    void on_decode(std::int64_t token, const pulsarlm::decode_statistics& statistics) noexcept override {
         std::lock_guard lock(recorded_results->mutex);
         recorded_results->tokens.push_back(token);
+        recorded_results->decodes.push_back(statistics);
     }
 
-    void on_cycle_end(pulsarlm::cycle_end&&) noexcept override {}
+    void on_cycle(pulsarlm::cycle_end&&) noexcept override {}
 
-    void on_end(std::expected<pulsarlm::request_result, pulsarlm::request_error>&& result) noexcept override {
+    void on_end(
+        std::expected<std::shared_ptr<const pulsarlm::state>, pulsarlm::request_error>&& result,
+        const pulsarlm::request_statistics& statistics
+    ) noexcept override {
         {
             std::lock_guard lock(recorded_results->mutex);
-            recorded_results->end.emplace(std::move(result).transform([](pulsarlm::request_result&& ended) {
-                return *ended.state;
-            }));
+            recorded_results->statistics = statistics;
+            recorded_results->end.emplace(
+                std::move(result).transform([](std::shared_ptr<const pulsarlm::state>&& ended) { return *ended; })
+            );
         }
         recorded_results->end_condition.notify_all();
     }
@@ -432,6 +441,8 @@ class recording_callbacks final : public pulsarlm::request_callbacks {
 struct served {
     token_list tokens;
     pulsarlm::state end_state;
+    std::vector<pulsarlm::decode_statistics> decodes;
+    pulsarlm::request_statistics statistics;
 };
 
 served serve(pulsarlm::engine& e, pulsarlm::request&& r) {
@@ -449,7 +460,12 @@ served serve(pulsarlm::engine& e, pulsarlm::request&& r) {
         }
     }
     REQUIRE(recorded_results->end->has_value());
-    return served{.tokens = recorded_results->tokens, .end_state = std::move(**recorded_results->end)};
+    return served{
+        .tokens = recorded_results->tokens,
+        .end_state = std::move(**recorded_results->end),
+        .decodes = recorded_results->decodes,
+        .statistics = recorded_results->statistics,
+    };
 }
 
 token_list random_tokens(std::size_t count, std::uint32_t seed) {
@@ -723,15 +739,48 @@ TEST_CASE("Qwen4-Exp drafting emits the tokens and reaches the state it does wit
     check_same_state(got.end_state, expected.end_state);
     CHECK(*plain.verify_steps == 0);
     const pulsarlm::engine_stat drafted = drafting.engine->stat();
-    CHECK(drafted.accepted_drafts > 0);
-    CHECK(drafted.accepted_drafts < drafted.drafted_tokens);
-    CHECK(plain.engine->stat().drafted_tokens == 0);
+    CHECK(drafted.accepted_draft_count > 0);
+    CHECK(drafted.accepted_draft_count < drafted.drafted_token_count);
+    CHECK(plain.engine->stat().drafted_token_count == 0);
     // Fewer verify steps than tokens accept drafts, and more rows than tokens reject them. A graph replays the forward
     // it captured without calling it, so the counts are a run's without graphs.
     if (!decode_graphs) {
         CHECK(*drafting.verify_steps < decode_tokens - 1);
         CHECK(*drafting.verify_rows > decode_tokens - 1);
     }
+}
+
+TEST_CASE("Qwen4-Exp drafting reports per token the drafts that sum to the request's", "[runtime][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const std::size_t draft_tokens = GENERATE(1, 2);
+    const bool decode_graphs = GENERATE(false, true);
+    INFO(draft_tokens << " drafts" << (decode_graphs ? " with" : " without") << " graphs");
+    const weights w(at::kFloat, base_dims, /*drafts=*/true);
+    drafting_engine drafting = make_engine(w, draft_tokens, {}, decode_graphs);
+    served got = serve(
+        *drafting.engine,
+        pulsarlm::request{.tokens = random_tokens(prompt_tokens, 1), .max_tokens = decode_tokens, .eviction = eviction}
+    );
+
+    REQUIRE(got.decodes.size() == got.tokens.size());
+    std::size_t drafted_token_count = 0;
+    std::size_t accepted_draft_count = 0;
+    std::chrono::steady_clock::duration decode_duration{};
+    for (const pulsarlm::decode_statistics& decode : got.decodes) {
+        drafted_token_count += decode.drafted_token_count;
+        accepted_draft_count += decode.accepted_draft_count;
+        decode_duration += decode.step_duration;
+    }
+    CHECK(got.statistics.drafted_token_count > 0);
+    CHECK(got.statistics.accepted_draft_count > 0);
+    CHECK(drafted_token_count == got.statistics.drafted_token_count);
+    CHECK(accepted_draft_count == got.statistics.accepted_draft_count);
+    CHECK(decode_duration < got.statistics.step_duration);
+    const pulsarlm::engine_stat stat = drafting.engine->stat();
+    CHECK(stat.drafted_token_count == got.statistics.drafted_token_count);
+    CHECK(stat.accepted_draft_count == got.statistics.accepted_draft_count);
 }
 
 TEST_CASE("Qwen4-Exp drafting stops at the stop token it stops at without drafts", "[runtime][cuda]") {

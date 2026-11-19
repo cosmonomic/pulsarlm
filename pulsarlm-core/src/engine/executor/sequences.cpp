@@ -162,24 +162,19 @@ task<std::expected<void, page_error>> executor::own_pages_from(sequence& seq, st
     co_return co_await cache.sync(hashes, owners, line_ids, streams);
 }
 
-task<std::expected<request_result, request_error>> executor::stop(sequence_id id) {
+task<std::pair<std::expected<std::shared_ptr<const state>, request_error>, request_statistics>>
+executor::stop(sequence_id id) {
     sequence& seq = sequences.at(id);
     if (!seq.has_exited() || seq.launched_step_count() > 0) {
         throw std::logic_error("executor::stop: the sequence has not exited or a launched step holds it");
     }
     release_lines(seq);
-    std::expected<request_result, request_error> result = std::unexpected(request_error::cancelled);
+    std::expected<std::shared_ptr<const state>, request_error> result = std::unexpected(request_error::cancelled);
     switch (*seq.reason_of_exit()) {
     case sequence::exit_reason::finished: {
         auto end_state = std::make_shared<const state>(seq.to_state());
         co_await store.write_state(seq.lease_id(), std::shared_ptr<const state>(end_state));
-        result = request_result{
-            .state = std::move(end_state),
-            .total_tokens = seq.prompt_token_count() + seq.generated_token_count(),
-            .cached_tokens = seq.cached_token_count(),
-            .device_cached_tokens = seq.device_cached_token_count(),
-            .peak_device_memory = seq.device_memory_peak(),
-        };
+        result = std::move(end_state);
         break;
     }
     case sequence::exit_reason::cancelled:
@@ -189,8 +184,17 @@ task<std::expected<request_result, request_error>> executor::stop(sequence_id id
         result = std::unexpected(request_error::oom);
         break;
     }
+    const request_statistics statistics{
+        .total_token_count = seq.prompt_token_count() + seq.delivered_token_count(),
+        .cached_token_count = seq.cached_token_count(),
+        .device_cached_token_count = seq.device_cached_token_count(),
+        .peak_device_memory = seq.device_memory_peak(),
+        .drafted_token_count = seq.drafted_token_count(),
+        .accepted_draft_count = seq.accepted_draft_count(),
+        .step_duration = seq.step_duration(),
+    };
     drop(id);
-    co_return result;
+    co_return std::pair(std::move(result), statistics);
 }
 
 std::size_t executor::device_cached_tokens(const sequence& seq) const {
@@ -294,12 +298,16 @@ task<std::expected<void, page_error>> executor::take_lines(sequence& seq, std::s
     co_return std::expected<void, page_error>{};
 }
 
-void executor::record_device_memory(sequence& seq) const noexcept {
+std::size_t executor::device_memory(const sequence& seq) const noexcept {
     std::size_t bytes = 0;
     for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
         bytes += seq.views()[layer].lines.size() * cache.line_block_bytes(layer);
     }
-    seq.record_device_memory(bytes);
+    return bytes;
+}
+
+void executor::record_device_memory(sequence& seq) const noexcept {
+    seq.record_device_memory(device_memory(seq));
 }
 
 void executor::release_lines(sequence& seq) noexcept {

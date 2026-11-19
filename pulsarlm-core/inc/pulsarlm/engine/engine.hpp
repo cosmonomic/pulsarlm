@@ -32,12 +32,12 @@
 namespace pulsarlm {
 
 // kv_cache_bytes is the bytes of the KV cache's pool that lines in use take: those of running requests, not those only
-// caching a page. drafted_tokens counts the drafts verify steps forwarded since the engine started, accepted_drafts those
+// caching a page. drafted_token_count counts the drafts verify steps forwarded since the engine started, accepted_draft_count those
 // of them the steps accepted.
 struct engine_stat {
     std::size_t kv_cache_bytes;
-    std::uint64_t drafted_tokens;
-    std::uint64_t accepted_drafts;
+    std::uint64_t drafted_token_count;
+    std::uint64_t accepted_draft_count;
 };
 
 // Loads rank's part of a model split over size ranks: its weights, by Hugging Face's names, on the rank's device.

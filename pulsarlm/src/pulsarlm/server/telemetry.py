@@ -175,13 +175,13 @@ def start_telemetry(
 
     meter.create_observable_counter(
         "pulsarlm.engine.draft.drafted_tokens",
-        callbacks=[draft_observation(lambda s: s.drafted_tokens)],
+        callbacks=[draft_observation(lambda s: s.drafted_token_count)],
         unit="{token}",
         description="Drafts the verify steps forwarded.",
     )
     meter.create_observable_counter(
         "pulsarlm.engine.draft.accepted_tokens",
-        callbacks=[draft_observation(lambda s: s.accepted_drafts)],
+        callbacks=[draft_observation(lambda s: s.accepted_draft_count)],
         unit="{token}",
         description="Drafts the verify steps accepted.",
     )

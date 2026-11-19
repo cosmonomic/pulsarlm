@@ -4,9 +4,14 @@
 
 namespace pulsarlm {
 
-void request_buffer::append(std::int64_t token) {
+void request_buffer::append(const prefill_statistics& statistics) {
     std::lock_guard lock(mutex);
-    results.tokens.push_back(token);
+    results.prefill = statistics;
+}
+
+void request_buffer::append(std::int64_t token, const decode_statistics& statistics) {
+    std::lock_guard lock(mutex);
+    results.tokens.emplace_back(token, statistics);
 }
 
 void request_buffer::append(cycle_end&& ended) {
@@ -14,9 +19,12 @@ void request_buffer::append(cycle_end&& ended) {
     results.cycle_ends.push_back(std::move(ended));
 }
 
-void request_buffer::end(std::expected<request_result, request_error>&& result) {
+void request_buffer::end(
+    std::expected<std::shared_ptr<const state>, request_error>&& result,
+    const request_statistics& statistics
+) {
     std::lock_guard lock(mutex);
-    results.end = std::move(result);
+    results.end.emplace(std::move(result), statistics);
 }
 
 taken_results request_buffer::take() {
@@ -36,18 +44,26 @@ buffered_callbacks::buffered_callbacks(std::shared_ptr<request_buffer> buffer, s
 : buffer(std::move(buffer)),
   wake_signal(std::move(wake)) {}
 
-void buffered_callbacks::on_token(std::int64_t token) noexcept {
-    buffer->append(token);
+void buffered_callbacks::on_prefill(const prefill_statistics& statistics) noexcept {
+    buffer->append(statistics);
     wake_signal->notify();
 }
 
-void buffered_callbacks::on_cycle_end(cycle_end&& ended) noexcept {
+void buffered_callbacks::on_decode(std::int64_t token, const decode_statistics& statistics) noexcept {
+    buffer->append(token, statistics);
+    wake_signal->notify();
+}
+
+void buffered_callbacks::on_cycle(cycle_end&& ended) noexcept {
     buffer->append(std::move(ended));
     wake_signal->notify();
 }
 
-void buffered_callbacks::on_end(std::expected<request_result, request_error>&& result) noexcept {
-    buffer->end(std::move(result));
+void buffered_callbacks::on_end(
+    std::expected<std::shared_ptr<const state>, request_error>&& result,
+    const request_statistics& statistics
+) noexcept {
+    buffer->end(std::move(result), statistics);
     wake_signal->notify();
 }
 

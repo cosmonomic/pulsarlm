@@ -1,20 +1,25 @@
 """The engine binding on a small random Qwen3, with an in-memory page store."""
 
 import asyncio
+import datetime
 
 import pytest
 import torch
 
+from pulsarlm.async_engine import AsyncEngine
 from pulsarlm.core.engine import (
     CycleEnd,
+    DecodeStatistics,
     Engine,
     EvictionPolicy,
     ModelConfig,
+    PrefillStatistics,
     Request,
     RequestError,
     RequestFailed,
-    RequestResult,
+    RequestStatistics,
     RopeParameters,
+    SamplingParams,
     State,
 )
 
@@ -155,18 +160,20 @@ def make_engine(store: MemoryStore, store_pages: int = 0) -> Engine:
 class Recording:
     def __init__(self) -> None:
         self.cycle_ends: list[CycleEnd] = []
-        self.result: RequestResult | None = None
+        self.state: State | None = None
+        self.statistics: RequestStatistics | None = None
 
-    def record_result(self, result: RequestResult) -> None:
-        self.result = result
+    def record_end(self, state: State, statistics: RequestStatistics) -> None:
+        self.state = state
+        self.statistics = statistics
 
 
 def submit(engine: Engine, tokens: list[int], **options) -> tuple[Request, Recording]:
     recording = Recording()
     request = engine.submit(
         tokens,
-        on_cycle_end=recording.cycle_ends.append,
-        on_end=recording.record_result,
+        on_cycle=recording.cycle_ends.append,
+        on_end=recording.record_end,
         **options,
     )
     return request, recording
@@ -188,9 +195,9 @@ async def run(
             except RequestFailed as failure:
                 return tokens, recording.cycle_ends, failure.error
             if taken is None:
-                assert recording.result is not None
-                return tokens, recording.cycle_ends, recording.result.state
-            tokens += taken
+                assert recording.state is not None
+                return tokens, recording.cycle_ends, recording.state
+            tokens += [token for token, _ in taken]
             if not taken:
                 await woke.wait()
     finally:
@@ -269,9 +276,9 @@ def test_the_result_counts_the_tokens_resumed_on_resident_and_fetched_pages():
         request, recording = submit(first, PROMPT, max_tokens=8)
         sampled, _, end_state = await run(first, request, recording)
         assert isinstance(end_state, State)
-        assert recording.result is not None
-        assert recording.result.total_tokens == len(PROMPT) + len(sampled)
-        assert recording.result.cached_tokens == 0
+        assert recording.statistics is not None
+        assert recording.statistics.total_token_count == len(PROMPT) + len(sampled)
+        assert recording.statistics.cached_token_count == 0
 
         history = PROMPT + sampled + [11, 12]
         resumed_tokens = len(end_state.layers[0].pages) * PAGE_SIZE
@@ -281,12 +288,72 @@ def test_the_result_counts_the_tokens_resumed_on_resident_and_fetched_pages():
         request, fetched = submit(second, history, max_tokens=2)
         await run(second, request, fetched)
 
-        assert resident.result is not None and fetched.result is not None
-        assert resident.result.total_tokens == len(history) + 2
-        assert resident.result.cached_tokens == resumed_tokens
-        assert resident.result.device_cached_tokens == resumed_tokens
-        assert fetched.result.cached_tokens == resumed_tokens
-        assert fetched.result.device_cached_tokens == 0
+        assert resident.statistics is not None and fetched.statistics is not None
+        assert resident.statistics.total_token_count == len(history) + 2
+        assert resident.statistics.cached_token_count == resumed_tokens
+        assert resident.statistics.device_cached_token_count == resumed_tokens
+        assert fetched.statistics.cached_token_count == resumed_tokens
+        assert fetched.statistics.device_cached_token_count == 0
+
+    asyncio.run(main())
+
+
+def test_take_pairs_each_token_with_its_statistics_after_the_prefill_statistics():
+    async def main():
+        store = MemoryStore(asyncio.get_running_loop())
+        engine = make_engine(store, store_pages=64)
+        prefills: list[PrefillStatistics] = []
+        ends: list[RequestStatistics] = []
+        request = engine.submit(
+            PROMPT,
+            max_tokens=4,
+            on_prefill=prefills.append,
+            on_end=lambda _, statistics: ends.append(statistics),
+        )
+        loop = asyncio.get_running_loop()
+        woke = asyncio.Event()
+        loop.add_reader(engine.fileno(), woke.set)
+        decodes: list[DecodeStatistics] = []
+        try:
+            while True:
+                woke.clear()
+                engine.clear_wake()
+                taken = request.take()
+                if taken is None:
+                    break
+                assert not taken or len(prefills) == 1
+                decodes += [statistics for _, statistics in taken]
+                if not taken:
+                    await woke.wait()
+        finally:
+            loop.remove_reader(engine.fileno())
+
+        assert len(prefills) == 1 and len(ends) == 1 and len(decodes) == 4
+        assert prefills[0].computed_token_count == len(PROMPT)
+        assert prefills[0].step_duration > datetime.timedelta(0)
+        assert decodes[0].step_duration == datetime.timedelta(0)
+        assert all(d.step_duration > datetime.timedelta(0) for d in decodes[1:])
+        assert all(d.drafted_token_count == 0 for d in decodes)
+        assert ends[0].total_token_count == len(PROMPT) + 4
+
+        async_engine = AsyncEngine(engine)
+        async_prefills: list[PrefillStatistics] = []
+        try:
+            stream = async_engine.submit(
+                PROMPT,
+                sampling=SamplingParams(),
+                max_tokens=2,
+                eviction=EvictionPolicy(),
+                on_prefill=async_prefills.append,
+            )
+            streamed = [token async for token in stream]
+        finally:
+            async_engine.close()
+        assert len(streamed) == 2
+        assert len(async_prefills) == 1
+        assert async_prefills[0].computed_token_count + async_prefills[
+            0
+        ].cached_token_count == len(PROMPT)
 
     asyncio.run(main())
 

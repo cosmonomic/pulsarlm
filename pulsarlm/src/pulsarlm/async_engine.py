@@ -10,10 +10,11 @@ from pulsarlm.core.engine import (
     EngineStat,
     EvictionPolicy,
     EvictionReport,
+    PrefillStatistics,
     Request,
     RequestError,
     RequestFailed,
-    RequestResult,
+    RequestStatistics,
     SamplingParams,
     State,
 )
@@ -49,7 +50,7 @@ class RequestStream:
                 return
             if not tokens:
                 await self._wake_event.wait()
-            for token in tokens:
+            for token, _ in tokens:
                 yield token
 
     def cancel(self) -> None:
@@ -76,12 +77,13 @@ class AsyncEngine:
         sampling: SamplingParams,
         max_tokens: int | None,
         eviction: EvictionPolicy,
-        on_cycle_end: Callable[[CycleEnd], None] | None = None,
-        on_end: Callable[[RequestResult], None] | None = None,
+        on_prefill: Callable[[PrefillStatistics], None] | None = None,
+        on_cycle: Callable[[CycleEnd], None] | None = None,
+        on_end: Callable[[State, RequestStatistics], None] | None = None,
     ) -> RequestStream:
         """Raises EngineStopped when the engine's loop exited, ValueError for a
-        request the engine cannot serve. The stream calls on_cycle_end and on_end
-        on the event loop's thread."""
+        request the engine cannot serve. The stream calls on_prefill, on_cycle
+        and on_end on the event loop's thread."""
         if (message := self._engine.exception()) is not None:
             raise EngineStopped(message)
         request = self._engine.submit(
@@ -89,7 +91,8 @@ class AsyncEngine:
             sampling=sampling,
             max_tokens=max_tokens,
             eviction=eviction,
-            on_cycle_end=on_cycle_end,
+            on_prefill=on_prefill,
+            on_cycle=on_cycle,
             on_end=on_end,
         )
         stream = RequestStream(self._engine, request)

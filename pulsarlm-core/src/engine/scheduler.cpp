@@ -35,12 +35,12 @@ void scheduler::wake(std::optional<event>& waited) noexcept {
 
 task<void> scheduler::submit(request r, result_writer writer) {
     if (writer.cancelled()) {
-        writer.end(std::unexpected(request_error::cancelled));
+        writer.end(std::unexpected(request_error::cancelled), request_statistics{});
         co_return;
     }
     std::expected<executor::sequence_id, request_error> started = co_await exec.start(std::move(r), writer);
     if (!started) {
-        writer.end(std::unexpected(started.error()));
+        writer.end(std::unexpected(started.error()), request_statistics{});
         co_return;
     }
     const executor::sequence_id id = *started;
@@ -49,7 +49,8 @@ task<void> scheduler::submit(request r, result_writer writer) {
     wake(join_event);
     co_await exit_event;
     exit_events.erase(id);
-    writer.end(co_await exec.stop(id));
+    auto [result, statistics] = co_await exec.stop(id);
+    writer.end(std::move(result), statistics);
 }
 
 task<void> scheduler::run() {
