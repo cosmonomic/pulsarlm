@@ -271,6 +271,15 @@ TEST_CASE("an engine whose drafts of one sequence exceed a step's sampled rows i
     );
 }
 
+TEST_CASE("an engine whose verify step of one sequence exceeds a page is rejected") {
+    pulsarlm::engine_config drafting = config(16);
+    drafting.draft_tokens = drafting.page_size;
+    REQUIRE_THROWS_AS(
+        pulsarlm::engine(std::make_unique<drafting_model>(), vocab, drafting, std::make_unique<stalling_store>()),
+        std::invalid_argument
+    );
+}
+
 TEST_CASE("an engine whose page does not hold whole Qwen4-Exp index blocks is rejected before the model loads") {
     bool loaded = false;
     pulsarlm::model_shard_loader loader = [&](std::size_t, std::size_t) {

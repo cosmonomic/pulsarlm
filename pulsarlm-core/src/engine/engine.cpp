@@ -122,6 +122,17 @@ std::size_t checked_draft_tokens(const engine_config& config, const std::vector<
             )
         );
     }
+    // A recurrent layer's state at the end of a page sits in one of two lines that alternate between even and odd
+    // pages, so a verify step that completed two pages could overwrite a stored state before its write-back.
+    if (config.draft_tokens + 1 > config.page_size) {
+        throw std::invalid_argument(
+            std::format(
+                "the engine drafts {} tokens a step; a verify step of draft_tokens + 1 tokens must fit a page of {}",
+                config.draft_tokens,
+                config.page_size
+            )
+        );
+    }
     return config.draft_tokens;
 }
 
