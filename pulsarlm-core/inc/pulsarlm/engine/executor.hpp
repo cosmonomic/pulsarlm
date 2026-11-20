@@ -37,9 +37,8 @@ class executor {
     struct running_request {
         std::unique_ptr<request_callbacks> callbacks;
         request_state state;
-        // Whether a step of the request that is not written back may end its cycle under a policy that evicts or, in a
-        // model with sliding layers, completes a page (step_entry::awaits_write_back), so that no later step of it is
-        // prepared before that step's eviction (evict), or its write-back for a page.
+        // Whether a step of the request that is not evicted yet may end its cycle under a policy that evicts
+        // (step_entry::awaits_write_back), so that no later step of it is prepared before that step's eviction (evict).
         bool awaits_write_back = false;
     };
 
@@ -103,6 +102,11 @@ class executor {
     // The requests whose request_table entries, page tables aside, the shards do not hold as their request states
     // set them, and which no unfinished step holds.
     std::vector<request_id_type> stale_requests;
+    // Per request table key_counts cell, as an index into them flattened, the keys a prologue took out of its sliding
+    // layer's page tables (compact_sliding_views), negative; not moved into a step yet.
+    using key_count_cell = std::int64_t;
+    using key_count_shift = std::int32_t;
+    std::vector<std::pair<key_count_cell, key_count_shift>> key_count_shifts;
     // A recurrent layer's state_slots are draft_state_slots for a state and 1 for a window. A layer's mass_heads are
     // the query heads it measures mass and evicts pages in, those of every attention layer reading a full-attention
     // layer, and 0 for other layers.
@@ -142,6 +146,12 @@ class executor {
     // Moves stale_requests into s: each request's request_table entries from its request state, which s's enqueue
     // sets.
     void move_stale_requests(step& s);
+    // Marks the pages each sliding layer of id's request has passed at its lower bound
+    // (request_state::prepared_position_lower_bound) as passed, takes them out of its page tables from column 0
+    // (mark_stale_tables) and queues the shift of its key counts (key_count_shifts).
+    void compact_sliding_views(request_id_type id);
+    // Moves key_count_shifts into s, whose enqueue applies them.
+    void move_key_count_shifts(step& s);
     // The tokens of req's full history pages that every KV layer reading the page holds resident.
     std::size_t device_cached_tokens(const request_state& req) const;
     // Per KV layer with pages, lines for its pages; per recurrent layer, a copy of the state at head, or zeros without
@@ -163,13 +173,8 @@ class executor {
     std::size_t device_memory(const request_state& req) const noexcept;
     // Raises req's device_memory_peak to its device_memory.
     void record_device_memory(request_state& req) const noexcept;
-    // Drops from each sliding layer's view the pages before the window of the tail's first token, and returns whether
-    // any view changed.
-    bool release_passed_pages(request_state& req);
     // After req's views changed: drops from each mirroring layer the pages no other layer holds.
     void update_views(request_state& req);
-    // Whether token_count more tokens fill a page of req.
-    bool completes_page(const request_state& req, std::size_t token_count) const noexcept;
     // The request state of id's request, which is not erased.
     request_state& get_state(request_id_type id);
     const request_state& get_state(request_id_type id) const;
@@ -209,12 +214,9 @@ class executor {
     apply_entries(const step& s, const launch_result& launched, std::chrono::steady_clock::duration step_duration);
     task<void> write_pages_and_states(launch_result& launched, step_writes& writes);
     // After the step's pages and states are written: releases the detached lines of its requests
-    // (request_state::take_detached_lines), finishes the step in each request, and releases the pages a sliding layer
-    // passed.
+    // (request_state::take_detached_lines) and the lines of the complete pages their sliding layers passed
+    // (request_state::drop_passed_pages), and finishes the step in each request.
     void refresh_views(const step& s, const step_writes& writes);
-    // Whether the request of e awaits the eviction of e's step (evict) rather than its write-back: the step may end
-    // its cycle under a policy that evicts.
-    bool waits_for_eviction(const step_entry& e) const;
     // Whether the request's callbacks are cancelled.
     bool is_cancelled(request_id_type id) const;
     // Cancels a request that has not exited, which exits right away when no step of it is unfinished.
@@ -238,16 +240,17 @@ class executor {
     // models[s] runs on cache shard s with streams[s], for s above 0 on worker_loops[s - 1], and its write-backs'
     // copies to the store on copy_streams[s], which the caller synchronizes before freeing what the copies read; the
     // cache holds one layer per entry of each model's kv_layers(), and the shards agree on which layers are recurrent
-    // or sliding. store is the cache's. root is the engine's root digest (make_root_digest). A request's view takes at
-    // most view_page_capacity pages, and one that would take more ends with context_exceeded. With graph_pages, a
-    // step_graphs graph over tables graph_pages wide replays a step of decoding entries alone that all sample and draft
-    // nothing (a decode step), and a step of verifying entries alone that all draft (a verify step). Any other step
-    // pads its query tokens to their bucket (token_buckets), with graphs or without, and with graph_pages replays the
-    // bucket's segment graphs when the model allows their capture (model::allows_segment_capture). A step drafts
-    // draft_tokens tokens per request with the shards' draft heads, which they have when draft_tokens is above 0, and
-    // the cache's recurrent layers are laid out for them (recurrent_state). At most max_running_requests requests hold
-    // a record at once (start), and a step takes at most prefill_tokens_per_step query tokens of prefill chunks
-    // (scheduler).
+    // or sliding; a model with a sliding layer has a full-attention layer holding every page, and its draft head's KV
+    // layer is not sliding. store is the cache's. root is the engine's root digest (make_root_digest). A request's view
+    // takes at most view_page_capacity pages, and one that would take more ends with context_exceeded. With
+    // graph_pages, a step_graphs graph over tables graph_pages wide replays a step of decoding entries alone that all
+    // sample and draft nothing (a decode step), and a step of verifying entries alone that all draft (a verify step).
+    // Any other step pads its query tokens to their bucket (token_buckets), with graphs or without, and with
+    // graph_pages replays the bucket's segment graphs when the model allows their capture
+    // (model::allows_segment_capture). A step drafts draft_tokens tokens per request with the shards' draft heads,
+    // which they have when draft_tokens is above 0, and the cache's recurrent layers are laid out for them
+    // (recurrent_state). At most max_running_requests requests hold a record at once (start), and a step takes at most
+    // prefill_tokens_per_step query tokens of prefill chunks (scheduler).
     executor(
         std::vector<model*>&& models,
         kv_cache cache,
@@ -293,9 +296,10 @@ class executor {
     std::size_t sampled_row_count(request_id_type id, std::size_t token_count) const;
     // Prepares a step of the requests in scheduled after the prepared steps, ordered into the runs of one model call
     // (model::batch): gives each request the lines its step writes (add_step_lines) and prepares its step in its
-    // request state. A request that gets no lines leaves the step, and exits right away when no step of it is
-    // unfinished; a step that every request leaves is empty. A request whose step may end its cycle or, in a model with
-    // sliding layers, completes a page is not schedulable until the step's write-back. scheduled names no request
+    // request state, and takes the pages its sliding layers passed out of its page tables (compact_sliding_views). A
+    // request that gets no lines leaves the step, and exits right away when no step of it is unfinished; a step that
+    // every request leaves is empty. A request whose step may end its cycle under a policy that evicts is not
+    // schedulable until the step's eviction. scheduled names no request
     // twice, each token count is above 0 and at most the request's pending tokens, each request is schedulable
     // (is_schedulable), the step samples at most sampled_row_limit() rows, and at most one prepared step is not written
     // back.
@@ -327,7 +331,7 @@ class executor {
     // on_end, and erases the request. Called when the loop has exited.
     void end_requests(request_error error) noexcept;
     // Whether a step of the request can be prepared now: it has no exit cause (request_state::has_exit_cause), no
-    // prepared step forwards its last tokens, and it awaits no step's eviction or write-back
+    // prepared step forwards its last tokens, and it awaits no step's eviction
     // (running_request::awaits_write_back). At most one step of the request is unfinished, as at most two steps are
     // unfinished when one is prepared.
     bool is_schedulable(request_id_type id) const;

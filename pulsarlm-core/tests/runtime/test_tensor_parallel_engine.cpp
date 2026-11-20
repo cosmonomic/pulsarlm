@@ -4,6 +4,7 @@
 #include "pulsarlm/engine/event_loop.hpp"
 #include "pulsarlm/engine/executor.hpp"
 #include "pulsarlm/engine/kv_cache.hpp"
+#include "pulsarlm/engine/model/gemma4.hpp"
 #include "pulsarlm/engine/model/qwen3_5.hpp"
 #include "pulsarlm/engine/request_callbacks.hpp"
 #include "pulsarlm/engine/scheduler.hpp"
@@ -1258,15 +1259,14 @@ struct stepped_run {
 
 // Serves r on an executor of the whole model on cuda:0 over a fresh store, which ends a request at stop_ids and drafts
 // draft_tokens tokens per step, its steps overlapping when overlaps.
-stepped_run serve_stepped(
-    const c10::Dict<std::string, at::Tensor>& weights,
+stepped_run serve_stepped_on(
+    pulsarlm::model& model,
     std::vector<std::int64_t> stop_ids,
     std::size_t draft_tokens,
     bool overlaps,
     pulsarlm::request&& r
 ) {
     stepped_run run{.results = {}, .contents = std::make_shared<store_contents>(), .overlapped_steps = 0};
-    pulsarlm::qwen3_5_model model(model_config(n_kv_heads), weights);
     memory_store store;
     store.contents = run.contents;
     const pulsarlm::engine_config config = engine_config(1, false, draft_tokens);
@@ -1295,6 +1295,78 @@ stepped_run serve_stepped(
     }
     run.results = *recorded_results;
     return run;
+}
+
+stepped_run serve_stepped(
+    const c10::Dict<std::string, at::Tensor>& weights,
+    std::vector<std::int64_t> stop_ids,
+    std::size_t draft_tokens,
+    bool overlaps,
+    pulsarlm::request&& r
+) {
+    pulsarlm::qwen3_5_model model(model_config(n_kv_heads), weights);
+    return serve_stepped_on(model, std::move(stop_ids), draft_tokens, overlaps, std::move(r));
+}
+
+using pulsarlm::gemma4_layer_type;
+
+// A Gemma 4 of sliding layers of a window of 20 tokens beside full-attention layers.
+pulsarlm::gemma4_config gemma4_test_config() {
+    constexpr auto sliding = gemma4_layer_type::sliding_attention;
+    constexpr auto full = gemma4_layer_type::full_attention;
+    return pulsarlm::gemma4_config{
+        .vocab_size = vocab,
+        .hidden_size = 128,
+        .n_heads = 4,
+        .n_kv_heads = 2,
+        .head_dim = 64,
+        .global_n_kv_heads = 2,
+        .global_head_dim = 128,
+        .attention_k_eq_v = false,
+        .layer_types = {sliding, sliding, full, sliding, full},
+        .sliding_window = 20,
+        .sliding_rope = {.theta = 1e4},
+        .full_rope = {.theta = 1e6, .partial_rotary_factor = 0.25},
+        .rms_norm_eps = 1e-6,
+        .final_logit_softcapping = 30.0,
+        .num_kv_shared_layers = 0,
+        .hidden_size_per_layer_input = 0,
+    };
+}
+
+c10::Dict<std::string, at::Tensor> gemma4_weights(const pulsarlm::gemma4_config& c) {
+    at::manual_seed(11);
+    c10::Dict<std::string, at::Tensor> named_tensors;
+    auto add = [&](const std::string& name, at::Tensor t) {
+        named_tensors.insert("model.language_model." + name, t.to(at::device(at::kCUDA).dtype(at::kFloat)));
+    };
+    auto projection = [](std::int64_t out, std::int64_t in) { return at::randn({out, in}) / std::sqrt(in); };
+    auto norm = [](std::int64_t size) { return 1.0 + 0.1 * at::randn({size}); };
+    const std::int64_t hidden = c.hidden_size;
+    const std::int64_t intermediate = 2 * hidden;
+    add("embed_tokens.weight", at::randn({c.vocab_size, hidden}) / std::sqrt(hidden));
+    add("norm.weight", norm(hidden));
+    for (std::size_t layer = 0; layer < c.layer_types.size(); layer++) {
+        const std::string p = "layers." + std::to_string(layer) + ".";
+        const bool slides = c.layer_types[layer] == gemma4_layer_type::sliding_attention;
+        const std::int64_t dim = slides ? c.head_dim : c.global_head_dim;
+        const std::int64_t kv_heads = slides ? c.n_kv_heads : c.global_n_kv_heads;
+        add(p + "input_layernorm.weight", norm(hidden));
+        add(p + "post_attention_layernorm.weight", norm(hidden));
+        add(p + "pre_feedforward_layernorm.weight", norm(hidden));
+        add(p + "post_feedforward_layernorm.weight", norm(hidden));
+        add(p + "self_attn.q_proj.weight", projection(c.n_heads * dim, hidden));
+        add(p + "self_attn.q_norm.weight", 0.25 * norm(dim));
+        add(p + "self_attn.k_proj.weight", projection(kv_heads * dim, hidden));
+        add(p + "self_attn.k_norm.weight", 0.25 * norm(dim));
+        add(p + "self_attn.v_proj.weight", projection(kv_heads * dim, hidden));
+        add(p + "self_attn.o_proj.weight", projection(hidden, c.n_heads * dim));
+        add(p + "mlp.gate_proj.weight", projection(intermediate, hidden));
+        add(p + "mlp.up_proj.weight", projection(intermediate, hidden));
+        add(p + "mlp.down_proj.weight", projection(hidden, intermediate));
+        add(p + "layer_scalar", at::full({1}, 0.5 + 0.1 * static_cast<double>(layer)));
+    }
+    return named_tensors;
 }
 
 }  // namespace
@@ -1352,6 +1424,48 @@ TEST_CASE("Qwen3.5 drafting with overlapping steps emits exactly max_tokens toke
 
     REQUIRE(overlapped.results.tokens.size() == max_tokens);
     REQUIRE(overlapped.overlapped_steps > 0);
+}
+
+// The window of 20 tokens passes a page of a sliding layer every page, so most steps take passed pages out of the page
+// tables while the step before them is unfinished and still completes its pages. Overlap changes no token, no stored
+// state and no stored page.
+TEST_CASE("Gemma 4 reaches the same tokens and stored states whether its steps overlap or not", "[runtime][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const pulsarlm::gemma4_config config = gemma4_test_config();
+    const c10::Dict<std::string, at::Tensor> weights = gemma4_weights(config);
+    const auto request = [&] {
+        return pulsarlm::request{
+            .tokens = random_tokens(prompt_tokens, 13),
+            .max_tokens = decode_tokens,
+            .eviction = {.n_sink = page_size, .n_working = 2 * page_size, .cycle_tokens = 2 * page_size},
+        };
+    };
+    auto serve_gemma4 = [&](bool overlaps) {
+        pulsarlm::gemma4_model model(config, weights);
+        return serve_stepped_on(model, {}, 0, overlaps, request());
+    };
+    const stepped_run sequential = serve_gemma4(false);
+    const stepped_run overlapped = serve_gemma4(true);
+
+    REQUIRE(sequential.overlapped_steps == 0);
+    REQUIRE(overlapped.overlapped_steps > 10);
+    REQUIRE(sequential.results.tokens.size() == decode_tokens);
+    REQUIRE(overlapped.results.tokens == sequential.results.tokens);
+    REQUIRE(sequential.results.cycle_states.size() >= 5);
+    REQUIRE(overlapped.results.cycle_states.size() == sequential.results.cycle_states.size());
+    for (std::size_t cycle = 0; cycle < sequential.results.cycle_states.size(); cycle++) {
+        INFO("cycle " << cycle);
+        check_same_state(*overlapped.results.cycle_states[cycle], *sequential.results.cycle_states[cycle]);
+    }
+    REQUIRE(sequential.results.end.has_value());
+    REQUIRE(sequential.results.end->has_value());
+    REQUIRE(overlapped.results.end.has_value());
+    REQUIRE(overlapped.results.end->has_value());
+    check_same_state(***overlapped.results.end, ***sequential.results.end);
+    const store_comparison stores = compare_stores(*overlapped.contents, *sequential.contents);
+    CHECK(stores.identical_pages == sequential.contents->pages.size());
 }
 
 // Cycles of 2 pages end with the recurrent layers' state at head in the store, which gives up its line; the steps

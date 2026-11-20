@@ -49,6 +49,10 @@ class layer_view {
     std::vector<digest> pages;
     std::vector<std::size_t> indices;
     std::vector<std::uint32_t> lines;
+    // The leading pages and lines of a sliding layer's view that the request table no longer holds: they passed the
+    // window of every query after the prepared steps (request_state::pass_pages), and leave the view once their pages
+    // are complete (request_state::drop_passed_pages). A view index is the table column passed_count after it.
+    std::size_t passed_count = 0;
     std::size_t mass_heads = 0;
     std::vector<float> mass_sum;
     std::vector<float> weight_sum;
@@ -285,7 +289,7 @@ class request_state {
     // The tokens the cycle can still forward after the prepared steps: no more than its length allows, nor than the
     // request will forward.
     std::size_t cycle_tokens_left() const noexcept;
-    // The columns of a page table the lines take: the most lines of a KV layer.
+    // The columns of a page table the lines take: the most lines of a KV layer the request table holds.
     std::size_t table_width() const noexcept;
     // The RoPE position of the first key of view page page in KV layer layer, which has pages.
     std::size_t page_position(std::size_t layer, std::size_t page) const;
@@ -338,6 +342,12 @@ class request_state {
     void add_step_lines(std::span<const std::size_t> key_counts, std::span<const std::vector<std::uint32_t>> added);
     // Drops the full pages at the ascending view_indices from KV layer layer's view and returns their lines.
     std::vector<std::uint32_t> remove_pages(std::size_t layer, std::span<const std::size_t> view_indices);
+    // Marks the pages of sliding KV layer layer's view wholly before the window of a query at history position
+    // position, which no query after the prepared steps precedes, as passed (layer_view::passed_count), and returns
+    // how many it newly marked.
+    std::size_t pass_pages(std::size_t layer, std::size_t position);
+    // Drops the passed pages of KV layer layer's view whose pages are complete and returns their lines.
+    std::vector<std::uint32_t> drop_passed_pages(std::size_t layer);
     // Removes every line of every KV layer, detached ones included, and returns them, per layer.
     std::vector<std::vector<std::uint32_t>> take_lines();
     // Takes recurrent KV layer layer's line holding the state at the end of head's page, which the store has, out of

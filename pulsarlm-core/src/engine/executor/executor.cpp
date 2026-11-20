@@ -161,6 +161,20 @@ executor::executor(
         }
     }
     require(layout.page_size > 0, "executor: the model must have a KV layer with pages");
+    const bool slides = std::ranges::any_of(layout.layers, [](const view_layout::layer& layer) {
+        return layer.sliding_window.has_value();
+    });
+    const bool holds_every_page = std::ranges::any_of(layout.layers, [](const view_layout::layer& layer) {
+        return !layer.sliding_window && !layer.is_recurrent && !layer.mirrors_held_pages;
+    });
+    require(
+        !slides || holds_every_page,
+        "executor: a model with a sliding layer must have a full-attention layer that holds every page"
+    );
+    require(
+        !draft_layer || !layout.layers[*draft_layer].sliding_window,
+        "executor: the draft head's KV layer must not be sliding"
+    );
     for (shard& s : shards) {
         s.stop_tokens = at::tensor(this->stop_ids, at::TensorOptions().dtype(at::kLong)).to(s.lines.front().k.device());
         const at::TensorOptions options = s.lines.front().k.options();
@@ -266,7 +280,8 @@ void executor::mark_stale_tables(request_id_type id, std::size_t first_column) {
 std::size_t executor::table_width_after(const request_state& req, std::span<const std::size_t> line_counts) const {
     std::size_t width = 0;
     for (std::size_t layer = 0; layer < layout.layers.size(); layer++) {
-        width = std::max(width, req.views()[layer].lines.size() + line_counts[layer]);
+        const layer_view& view = req.views()[layer];
+        width = std::max(width, view.lines.size() - view.passed_count + line_counts[layer]);
     }
     return width;
 }
@@ -279,6 +294,39 @@ std::vector<std::size_t> executor::start_line_counts(const request_state& req) c
         );
     }
     return counts;
+}
+
+// A query after the prepared steps is at the lower bound or later.
+void executor::compact_sliding_views(request_id_type id) {
+    request_state& req = get_state(id);
+    for (std::size_t layer = 0; layer < layout.layers.size(); layer++) {
+        if (!layout.layers[layer].sliding_window) {
+            continue;
+        }
+        const std::size_t passed = req.pass_pages(layer, req.prepared_position_lower_bound());
+        if (passed > 0) {
+            key_count_shifts.emplace_back(
+                static_cast<std::int64_t>(get_slot(id) * layout.layers.size() + layer),
+                -static_cast<std::int32_t>(passed * layout.page_size)
+            );
+            mark_stale_tables(id, 0);
+        }
+    }
+}
+
+void executor::move_key_count_shifts(step& s) {
+    if (key_count_shifts.empty()) {
+        return;
+    }
+    std::vector<std::int64_t> cells;
+    std::vector<std::int32_t> shifts;
+    for (const auto& [cell, shift] : key_count_shifts) {
+        cells.push_back(cell);
+        shifts.push_back(shift);
+    }
+    key_count_shifts.clear();
+    s.key_count_cells = pinned_values(cells);
+    s.key_count_shifts = pinned_values(shifts);
 }
 
 // The requests erased since they were marked are passed over; a request in a reused slot was marked from column 0 at
@@ -299,18 +347,19 @@ void executor::move_stale_tables(step& s) {
             const layer_view& view = req.views()[layer];
             const std::size_t row_start = (get_slot(id) * n_layers + layer) * view_page_capacity;
             for (std::size_t column = first_column; column < width; column++) {
-                const bool used = column < view.lines.size();
+                const std::size_t view_index = view.passed_count + column;
+                const bool used = view_index < view.lines.size();
                 cells.push_back(static_cast<std::int64_t>(row_start + column));
                 if (!used) {
                     lines.push_back(0);
-                } else if (view.lines[column] == layer_view::no_line) {
+                } else if (view.lines[view_index] == layer_view::no_line) {
                     lines.push_back(-1);
                 } else {
-                    lines.push_back(static_cast<std::int32_t>(view.lines[column]));
+                    lines.push_back(static_cast<std::int32_t>(view.lines[view_index]));
                 }
                 positions.push_back(
                     used && !layout.layers[layer].is_recurrent
-                        ? static_cast<std::int32_t>(req.page_position(layer, column))
+                        ? static_cast<std::int32_t>(req.page_position(layer, view_index))
                         : 0
                 );
             }
@@ -468,11 +517,6 @@ std::uint64_t executor::accepted_draft_count() const noexcept {
     return accepted_drafts.load(std::memory_order_relaxed);
 }
 
-bool executor::completes_page(const request_state& req, std::size_t token_count) const noexcept {
-    std::size_t start = req.prepared_position_bound() % layout.page_size;
-    return start + token_count >= layout.page_size;
-}
-
 std::size_t executor::sampled_row_limit() const noexcept {
     return sampled_row_capacity;
 }
@@ -598,6 +642,7 @@ executor::step executor::prepare(std::span<const scheduled_request> scheduled) {
     std::vector<scheduled_request> lined;
     for (const scheduled_request& requested : scheduled) {
         if (add_step_lines(requested)) {
+            compact_sliding_views(requested.request_id);
             lined.push_back(requested);
         } else if (get_state(requested.request_id).unfinished_step_count() == 0) {
             exit_request(requested.request_id);
@@ -611,6 +656,7 @@ executor::step executor::prepare(std::span<const scheduled_request> scheduled) {
     assert(static_cast<std::size_t>(prepared.sample_slots.size(0)) <= sampled_row_capacity);
     move_stale_tables(prepared);
     move_stale_requests(prepared);
+    move_key_count_shifts(prepared);
     advance(prepared);
     prepared.padded_token_count = prepared.is_uniform(draft_layer.has_value())
         ? prepared.count_tokens()

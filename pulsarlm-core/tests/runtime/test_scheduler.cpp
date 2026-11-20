@@ -2066,11 +2066,10 @@ const std::vector<pulsarlm::kv_layer> full_and_sliding{
     pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .sliding_window = 5},
 };
 
-// With a sliding layer, a step completing a page releases the pages that leave the window at its write-back, so the
-// next step of its request waits for it: the decode at tail position 1 waits for the prefill, which completes a page.
-// The decode steps at tail positions 1, 2 and 3 overlap, the last completing a page; it is prepared over the step
-// before it, so the request holds one more line until that step's write-back.
-TEST_CASE("with a sliding layer, a step after one completing a page waits for its write-back") {
+// With a sliding layer, a step's prologue takes the pages the window passed out of the page tables, and the write-back
+// of the step before it releases their lines, so no step waits for a page completion: the decode at tail position 1
+// runs over the prefill, which completes a page, and the decode steps at tail positions 2 and 3 overlap too.
+TEST_CASE("with a sliding layer, a step after one completing a page overlaps it") {
     fixture f(16, 64, {}, {}, full_and_sliding);
     token_list prompt{1, 2, 3, 4, 5};
     submission s = make_submission(request{.tokens = prompt, .max_tokens = 4});
@@ -2083,7 +2082,7 @@ TEST_CASE("with a sliding layer, a step after one completing a page waits for it
     std::vector<request_results> results = serve_submissions(f.sched, std::move(submissions));
 
     REQUIRE(results[0].tokens == continuation(prompt, 4));
-    REQUIRE(tokens_at_forward == std::vector<std::size_t>{0, 1, 1, 2});
+    REQUIRE(tokens_at_forward == std::vector<std::size_t>{0, 0, 1, 2});
 }
 
 // Each request holds at most 7 full-attention lines and 3 sliding lines at a time: the window's page and a cycle's 2
@@ -2119,10 +2118,13 @@ const std::vector<pulsarlm::kv_layer> full_and_wide_sliding{
     pulsarlm::kv_layer{.n_kv_heads = 2, .head_dim = 2, .sliding_window = 5},
 };
 
-// The request peaks at 768 bytes: its prefill step writes 4 full-attention lines of 64 bytes and 4 sliding lines of 128
-// bytes, and its last step holds 8 full-attention lines and the window's 2 sliding lines. A split sizing the sliding
-// layer for ceil(5 / 4) + 1 lines per request would not serve it. A pool one full-attention line smaller ends the
-// request with oom at the prologue of its prefill step, before any token.
+// The request peaks at 1024 bytes: its prefill step writes 4 full-attention lines of 64 bytes and 4 sliding lines of
+// 128 bytes, and its first decode step takes a fifth line of each before the prefill step's write-back releases the 3
+// sliding lines whose pages the window passed, 5 sliding lines and 3 regions of 2 full-attention lines; its last step
+// holds 8 full-attention lines and 3 sliding lines. A split sizing the sliding layer for ceil(5 / 4) + 1 lines per
+// request would not serve it. A pool one full-attention line
+// smaller than the prefill step's 768 bytes ends the request with oom at the prologue of its prefill step, before any
+// token.
 TEST_CASE("the pool gives each line size the lines its layers need") {
     token_list prompt(16);
     std::iota(prompt.begin(), prompt.end(), 1);
@@ -2131,7 +2133,7 @@ TEST_CASE("the pool gives each line size the lines its layers need") {
         return serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 16, .eviction = {.cycle_tokens = 16}}})[0];
     };
 
-    request_results served = serve_in(4 * 64 + 4 * 128);
+    request_results served = serve_in(6 * 64 + 5 * 128);
     REQUIRE(served.tokens == continuation(prompt, 16));
     REQUIRE(hashes_of(ended_state(served)).size() == 7);
     request_results starved = serve_in(3 * 64 + 4 * 128);
@@ -3235,6 +3237,89 @@ TEST_CASE("a request started while another's steps overlap decodes in the same s
     REQUIRE(first_results->tokens == continuation(first, 24));
     REQUIRE(second_results->tokens == continuation(second, 8));
     REQUIRE(std::ranges::count(f.model.decode_sizes, 2) >= 7);
+}
+
+task<void> step_requests_overlapping(
+    pulsarlm::executor& exec,
+    std::vector<pulsarlm::executor::request_id_type> ids,
+    std::size_t prefill_tokens_per_step,
+    std::size_t& overlapped_steps
+) {
+    std::deque<unfinished_step> unfinished;
+    co_await step_requests(exec, ids, true, prefill_tokens_per_step, unfinished, overlapped_steps);
+    event_loop::current()->stop();
+}
+
+// The sliding layer's window of 5 tokens passes a page at most steps, which take it out of the page tables while the
+// step before them is unfinished and completes pages; sum_model requires every key a sliding layer reads to equal the
+// full-attention layer's at the same distance. Prefill chunks of 3 tokens complete pages while the next chunk runs.
+TEST_CASE("with a sliding layer, steps overlapping page completions reach the states of steps that do not overlap") {
+    const std::size_t prefill_tokens_per_step = 3;
+    token_list first(18);
+    std::iota(first.begin(), first.end(), 1);
+    token_list second(9);
+    std::iota(second.begin(), second.end(), 40);
+    auto run = [&](bool overlaps, std::size_t& overlapped_steps) {
+        fixture f(64, prefill_tokens_per_step, {}, {}, full_and_sliding);
+        auto first_results = std::make_shared<request_results>();
+        auto second_results = std::make_shared<request_results>();
+        std::optional<pulsarlm::executor::request_id_type> first_id = start_request(
+            f.exec,
+            request{.tokens = first, .max_tokens = 14, .eviction = {.cycle_tokens = 8}},
+            first_results
+        );
+        std::optional<pulsarlm::executor::request_id_type> second_id = start_request(
+            f.exec,
+            request{.tokens = second, .max_tokens = 18, .eviction = {.cycle_tokens = 8}},
+            second_results
+        );
+        REQUIRE(first_id.has_value());
+        REQUIRE(second_id.has_value());
+        event_loop loop;
+        if (overlaps) {
+            loop.spawn(
+                step_requests_overlapping(f.exec, {*first_id, *second_id}, prefill_tokens_per_step, overlapped_steps)
+            );
+        } else {
+            loop.spawn(
+                step_requests_in_turn(f.exec, {*first_id, *second_id}, prefill_tokens_per_step, overlapped_steps)
+            );
+        }
+        REQUIRE(loop.run() == nullptr);
+        REQUIRE(f.exec.kv_cache_bytes() == 0);
+        return std::pair{*first_results, *second_results};
+    };
+    std::size_t overlapped_steps = 0;
+    std::size_t sequential_overlapped_steps = 0;
+    const auto [first_overlapped, second_overlapped] = run(true, overlapped_steps);
+    const auto [first_sequential, second_sequential] = run(false, sequential_overlapped_steps);
+
+    REQUIRE(overlapped_steps > 5);
+    REQUIRE(sequential_overlapped_steps == 0);
+    REQUIRE(first_sequential.tokens == continuation(first, 14));
+    REQUIRE(second_sequential.tokens == continuation(second, 18));
+    for (const auto& [overlapped, sequential] :
+         {std::pair{&first_overlapped, &first_sequential}, std::pair{&second_overlapped, &second_sequential}}) {
+        REQUIRE(overlapped->tokens == sequential->tokens);
+        REQUIRE(sequential->cycle_ends.size() >= 2);
+        REQUIRE(overlapped->cycle_ends.size() == sequential->cycle_ends.size());
+        std::vector<state_pointer> overlapped_states;
+        std::vector<state_pointer> sequential_states;
+        for (std::size_t c = 0; c < sequential->cycle_ends.size(); c++) {
+            overlapped_states.push_back(overlapped->cycle_ends[c].state);
+            sequential_states.push_back(sequential->cycle_ends[c].state);
+        }
+        overlapped_states.push_back(overlapped->end_state);
+        sequential_states.push_back(sequential->end_state);
+        for (std::size_t c = 0; c < sequential_states.size(); c++) {
+            INFO("state " << c);
+            REQUIRE(overlapped_states[c]->tail == sequential_states[c]->tail);
+            for (std::size_t layer = 0; layer < 2; layer++) {
+                INFO("KV layer " << layer);
+                REQUIRE((hashes_of(*overlapped_states[c], layer) == hashes_of(*sequential_states[c], layer)));
+            }
+        }
+    }
 }
 
 }  // namespace

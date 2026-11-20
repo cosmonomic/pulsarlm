@@ -35,12 +35,6 @@ task<void> executor::write_back(const step& s, launch_result& launched) {
     step_writes writes = apply_entries(s, launched, std::chrono::steady_clock::now() - s.prepare_time);
     co_await write_pages_and_states(launched, writes);
     refresh_views(s, writes);
-    for (const step_entry& e : s.entries) {
-        running_request& running = requests[e.request_id];
-        if (e.awaits_write_back && !waits_for_eviction(e)) {
-            running.awaits_write_back = false;
-        }
-    }
 }
 
 // The step's write-back came before, so every page it completed is in the views and its pages and states are written.
@@ -65,7 +59,7 @@ task<void> executor::evict(const step& s, const launch_result& launched) {
     }
     for (const step_entry& e : s.entries) {
         running_request& running = requests[e.request_id];
-        if (e.awaits_write_back && waits_for_eviction(e)) {
+        if (e.awaits_write_back) {
             running.awaits_write_back = false;
         }
         if (running.state.has_exit_cause() && running.state.unfinished_step_count() == 0) {
@@ -75,10 +69,6 @@ task<void> executor::evict(const step& s, const launch_result& launched) {
             cancel(e.request_id);
         }
     }
-}
-
-bool executor::waits_for_eviction(const step_entry& e) const {
-    return e.ends_cycle && get_state(e.request_id).eviction_policy_in_pages().can_evict();
 }
 
 task<void> executor::join(const step& s, launch_result& launched) {
@@ -316,17 +306,13 @@ void executor::refresh_views(const step& s, const step_writes& writes) {
         for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
             cache.release(layer, detached[layer]);
         }
+        for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
+            if (layout.layers[layer].sliding_window) {
+                cache.release(layer, req.drop_passed_pages(layer));
+            }
+        }
         req.finish_step();
-        if (req.has_exit_cause()) {
-            continue;
-        }
-        const bool views_changed = release_passed_pages(req);
-        if (views_changed) {
-            update_views(req);
-            assert(req.unfinished_step_count() == 0);
-            stale_requests.push_back(e.request_id);
-        }
-        if (views_changed || std::ranges::contains(writes.state_writers, &req)) {
+        if (!req.has_exit_cause() && std::ranges::contains(writes.state_writers, &req)) {
             mark_stale_tables(e.request_id, 0);
         }
     }
@@ -366,22 +352,6 @@ task<void> executor::write_cycle_end(request_state& req, request_callbacks& call
     auto cycle_end_state = std::make_shared<const state>(req.to_state());
     co_await store.write_state(req.lease_id(), std::shared_ptr<const state>(cycle_end_state));
     callbacks.on_cycle(cycle_end{.state = std::move(cycle_end_state)});
-}
-
-bool executor::release_passed_pages(request_state& req) {
-    bool changed = false;
-    for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
-        std::vector<std::size_t> passed_indices(
-            req.passed_pages(layer, req.views()[layer].pages.size() * layout.page_size)
-        );
-        if (passed_indices.empty()) {
-            continue;
-        }
-        std::iota(passed_indices.begin(), passed_indices.end(), 0);
-        cache.release(layer, req.remove_pages(layer, passed_indices));
-        changed = true;
-    }
-    return changed;
 }
 
 void executor::update_views(request_state& req) {

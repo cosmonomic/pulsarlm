@@ -45,9 +45,8 @@ struct executor::step_entry {
     // Whether the entry may end its request's cycle (request_state::ends_cycle of its query tokens); the write-back
     // takes whether it did from the GPU (launch_result::cycle_end_flags).
     bool ends_cycle;
-    // Whether no later step of the request is prepared before the step's eviction or write-back
-    // (running_request::awaits_write_back): the entry may end its request's cycle under a policy that evicts or, in a
-    // model with sliding layers, completes a page.
+    // Whether no later step of the request is prepared before the step's eviction (running_request::awaits_write_back):
+    // the entry may end its request's cycle under a policy that evicts.
     bool awaits_write_back;
     // Whether the step forwards the request's last tokens.
     bool ends_request = false;
@@ -103,6 +102,11 @@ class executor::step {
     // laid out as the table's, one entry per slot, its page tables undefined.
     at::Tensor stale_slots;
     request_table stale_entries;
+    // Pinned host tensors, undefined when the step shifts none: the cells of each shard's key_counts, as indices into
+    // them flattened (int64), that the step lowers before its forward by the keys of the sliding pages its prologue
+    // passed (request_state::pass_pages), and those shifts (int32, negative).
+    at::Tensor key_count_cells;
+    at::Tensor key_count_shifts;
     // Pinned host int64, per sample in entry order (one of each entry that samples, but one per query token of an
     // entry of the second run): the slot of its request, its offset among its request's samples, which it adds to the
     // request's draw count, and its index among the logit tokens.
@@ -172,8 +176,8 @@ class executor::step {
     // Sets g's page tables and positions to the rows of table's page_tables and page_positions of the requests'
     // entries, as wide as the widest table among them.
     static void set_page_tables(std::span<const step_entry> requests, model::batch& g, const request_table& table);
-    // Queues on the current stream the copies of the step's table cells and stale entries to the device of table, a
-    // shard's, and their writes.
+    // Queues on the current stream the copies of the step's table cells, stale entries and key count shifts to the
+    // device of table, a shard's, and their writes, the shifts after the stale entries.
     void write_tables(request_table& table) const;
     // On shard's device, table's, the inputs of the step's sampling: per sample, its request's columns of table, its
     // draw count moved by the sample's offset.

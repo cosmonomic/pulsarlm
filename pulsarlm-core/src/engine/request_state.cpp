@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <utility>
@@ -336,7 +337,7 @@ std::size_t request_state::cycle_tokens_left() const noexcept {
 std::size_t request_state::table_width() const noexcept {
     std::size_t width = 0;
     for (const layer_view& view : layers) {
-        width = std::max(width, view.lines.size());
+        width = std::max(width, view.lines.size() - view.passed_count);
     }
     return width;
 }
@@ -722,6 +723,27 @@ void request_state::add_step_lines(
             line = added[layer][i];
         }
     }
+}
+
+std::size_t request_state::pass_pages(std::size_t layer, std::size_t position) {
+    assert(layout.layers[layer].sliding_window && position >= history_position());
+    layer_view& view = layers[layer];
+    const std::size_t passed = passed_pages(layer, next_index(layer) + position - history_position());
+    if (passed <= view.passed_count) {
+        return 0;
+    }
+    return passed - std::exchange(view.passed_count, passed);
+}
+
+std::vector<std::uint32_t> request_state::drop_passed_pages(std::size_t layer) {
+    layer_view& view = layers[layer];
+    std::vector<std::size_t> dropped(std::min(view.passed_count, view.pages.size()));
+    if (dropped.empty()) {
+        return {};
+    }
+    std::iota(dropped.begin(), dropped.end(), 0);
+    view.passed_count -= dropped.size();
+    return remove_pages(layer, dropped);
 }
 
 std::vector<std::uint32_t> request_state::remove_pages(std::size_t layer, std::span<const std::size_t> view_indices) {

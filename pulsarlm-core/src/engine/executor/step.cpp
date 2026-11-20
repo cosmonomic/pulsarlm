@@ -16,9 +16,6 @@ namespace pulsarlm {
 
 // A request with more than one pending token prefills; any other verifies its drafts or decodes its pending token.
 executor::step::step(executor& owner, std::span<const scheduled_request> scheduled) {
-    const bool slides = std::ranges::any_of(owner.layout.layers, [](const view_layout::layer& layer) {
-        return layer.sliding_window.has_value();
-    });
     std::vector<step_entry> verifying_entries;
     std::vector<step_entry> prefilling_entries;
     for (const auto& [id, token_count] : scheduled) {
@@ -35,8 +32,7 @@ executor::step::step(executor& owner, std::span<const scheduled_request> schedul
                 .query_token_count = query_token_count,
                 .first_sample_index = std::nullopt,
                 .ends_cycle = ends_cycle,
-                .awaits_write_back = (ends_cycle && req.eviction_policy_in_pages().can_evict()) ||
-                    (slides && owner.completes_page(req, query_token_count)),
+                .awaits_write_back = ends_cycle && req.eviction_policy_in_pages().can_evict(),
                 .table_width = req.table_width(),
             }
         );
@@ -272,9 +268,8 @@ void executor::step::compose_inputs(const executor& owner) {
             row[0] = 0;
             std::size_t view = 0;
             for (std::size_t s = 0; s < entries.size(); s++) {
-                const auto pages = static_cast<std::int32_t>(
-                    owner.get_state(entries[s].request_id).views()[layer].lines.size()
-                );
+                const layer_view& entry_view = owner.get_state(entries[s].request_id).views()[layer];
+                const auto pages = static_cast<std::int32_t>(entry_view.lines.size() - entry_view.passed_count);
                 for (std::size_t i = 0; i < (verifies(s) ? entries[s].query_token_count : 1); i++, view++) {
                     row[view + 1] = row[view] + pages;
                 }

@@ -211,6 +211,13 @@ void executor::step::write_tables(request_table& table) const {
             (table.*column).index_copy_(0, slots, (stale_entries.*column).to(device, /*non_blocking=*/true));
         }
     }
+    if (key_count_cells.defined()) {
+        table.key_counts.view({-1}).index_add_(
+            0,
+            key_count_cells.to(device, /*non_blocking=*/true),
+            key_count_shifts.to(device, /*non_blocking=*/true)
+        );
+    }
 }
 
 sampling_inputs executor::step::gather_sampling_inputs(
