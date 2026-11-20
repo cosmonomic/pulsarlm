@@ -43,7 +43,7 @@
 
 namespace {
 
-// Graph replays of the ranks of a communicator on one device queue their spinning p2p_all_reduce kernels without the
+// Graph replays of the ranks of a communicator on one device queue their spinning p2p kernels without the
 // communicator's wait for every rank, so the process loads its CUDA modules before it runs any
 // (communicator::make_on_one_device).
 const bool loads_modules_eagerly = setenv("CUDA_MODULE_LOADING", "EAGER", 1) == 0;

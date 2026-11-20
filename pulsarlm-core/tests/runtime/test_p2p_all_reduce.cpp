@@ -1,4 +1,4 @@
-#include "pulsarlm/engine/p2p_all_reduce.hpp"
+#include "pulsarlm/engine/p2p_group.hpp"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAGraph.h>
@@ -15,7 +15,7 @@
 #include <thread>
 #include <vector>
 
-// p2p_all_reduce with every rank on one device, each on its own thread and stream, against the fp32 sum in rank order.
+// p2p_group with every rank on one device, each on its own thread and stream, against the fp32 sum in rank order.
 
 namespace {
 
@@ -58,18 +58,18 @@ template <typename Body> void on_every_rank(Body body) {
     }
 }
 
-std::unique_ptr<pulsarlm::p2p_all_reduce> make_ranks() {
+std::unique_ptr<pulsarlm::p2p_group> make_ranks() {
     std::vector<at::Device> devices(ranks, at::Device(at::kCUDA, 0));
-    return pulsarlm::p2p_all_reduce::make(devices, max_bytes);
+    return pulsarlm::p2p_group::make(devices, max_bytes);
 }
 
 }  // namespace
 
-TEST_CASE("p2p_all_reduce sums every rank's tensor in rank order on every rank", "[runtime][cuda]") {
+TEST_CASE("p2p_group sums every rank's tensor in rank order on every rank", "[runtime][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
-    std::unique_ptr<pulsarlm::p2p_all_reduce> all_reduce = make_ranks();
+    std::unique_ptr<pulsarlm::p2p_group> all_reduce = make_ranks();
     REQUIRE(all_reduce != nullptr);
     const at::ScalarType dtype = GENERATE(at::kFloat, at::kBFloat16, at::kHalf);
     // One vector, one block, and more vectors than all blocks hold at once.
@@ -92,11 +92,11 @@ TEST_CASE("p2p_all_reduce sums every rank's tensor in rank order on every rank",
     }
 }
 
-TEST_CASE("p2p_all_reduce replays from CUDA graphs with new inputs", "[runtime][cuda]") {
+TEST_CASE("p2p_group replays from CUDA graphs with new inputs", "[runtime][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
-    std::unique_ptr<pulsarlm::p2p_all_reduce> all_reduce = make_ranks();
+    std::unique_ptr<pulsarlm::p2p_group> all_reduce = make_ranks();
     REQUIRE(all_reduce != nullptr);
     const std::int64_t elements = 2560;
     std::vector<at::Tensor> fixed = rank_inputs(elements, at::kBFloat16, 1);
@@ -120,11 +120,11 @@ TEST_CASE("p2p_all_reduce replays from CUDA graphs with new inputs", "[runtime][
     }
 }
 
-TEST_CASE("p2p_all_reduce fits only small aligned float tensors", "[runtime][cuda]") {
+TEST_CASE("p2p_group fits only small aligned float tensors", "[runtime][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
-    std::unique_ptr<pulsarlm::p2p_all_reduce> all_reduce = make_ranks();
+    std::unique_ptr<pulsarlm::p2p_group> all_reduce = make_ranks();
     REQUIRE(all_reduce != nullptr);
     auto cuda = at::device(at::kCUDA);
     CHECK(all_reduce->fits(at::zeros({8}, cuda.dtype(at::kBFloat16))));

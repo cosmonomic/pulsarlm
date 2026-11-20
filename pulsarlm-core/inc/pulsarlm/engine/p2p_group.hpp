@@ -16,23 +16,23 @@ namespace pulsarlm {
 // order, so every rank computes the same result. To gather, every rank copies its tensor into every rank's buffer,
 // waits until every rank's copies are there, then copies its buffer out. A call can be captured in a CUDA graph. Every
 // rank makes the same calls in the same order, each on its own thread.
-class p2p_all_reduce {
+class p2p_group {
     std::vector<at::Device> devices;
     std::size_t max_bytes;
     std::vector<std::byte*> buffers;
     std::vector<std::uint64_t*> flags;
     std::vector<std::uint64_t*> counters;
 
-    p2p_all_reduce(std::span<const at::Device> devices, std::size_t max_bytes);
+    p2p_group(std::span<const at::Device> devices, std::size_t max_bytes);
 
   public:
     // One rank per entry of devices, reducing tensors of at most max_bytes; null when two of the devices cannot reach
     // each other's memory. A device may repeat, its ranks then sharing it.
-    static std::unique_ptr<p2p_all_reduce> make(std::span<const at::Device> devices, std::size_t max_bytes);
+    static std::unique_ptr<p2p_group> make(std::span<const at::Device> devices, std::size_t max_bytes);
 
-    p2p_all_reduce(const p2p_all_reduce&) = delete;
-    p2p_all_reduce& operator=(const p2p_all_reduce&) = delete;
-    ~p2p_all_reduce();
+    p2p_group(const p2p_group&) = delete;
+    p2p_group& operator=(const p2p_group&) = delete;
+    ~p2p_group();
 
     // Whether x is a contiguous fp32, fp16 or bf16 tensor of at most max_bytes, 16-byte aligned, of a multiple of 16
     // bytes.

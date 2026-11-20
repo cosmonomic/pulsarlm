@@ -1,4 +1,4 @@
-#include "pulsarlm/kernels/p2p_all_reduce.hpp"
+#include "pulsarlm/kernels/p2p_collectives.hpp"
 
 #include "pulsarlm/kernels/device.hpp"
 
@@ -18,8 +18,8 @@ namespace {
 constexpr int cta_threads = 512;
 
 struct rank_pointers {
-    std::byte* buffers[p2p_all_reduce_max_ranks];
-    std::uint64_t* flags[p2p_all_reduce_max_ranks];
+    std::byte* buffers[p2p_max_ranks];
+    std::uint64_t* flags[p2p_max_ranks];
 };
 
 __device__ __forceinline__ void store_release(std::uint64_t* address, std::uint64_t value) {
@@ -38,7 +38,7 @@ __device__ void meet(const rank_pointers& ranks, int rank_count, int rank, int p
     __syncthreads();
     const int peer = static_cast<int>(threadIdx.x);
     if (peer < rank_count) {
-        const int64_t slot = (static_cast<int64_t>(phase) * p2p_all_reduce_max_blocks + blockIdx.x) * rank_count;
+        const int64_t slot = (static_cast<int64_t>(phase) * p2p_max_blocks + blockIdx.x) * rank_count;
         store_release(ranks.flags[peer] + slot + rank, epoch);
         while (load_acquire(ranks.flags[rank] + slot + peer) < epoch) {
         }
@@ -163,11 +163,11 @@ void check_ranks(
 ) {
     const std::size_t rank_count = buffers.size();
     TORCH_CHECK(
-        rank_count >= 1 && rank_count <= p2p_all_reduce_max_ranks && flags.size() == rank_count &&
-            counters.size() == rank_count && rank < rank_count,
+        rank_count >= 1 && rank_count <= p2p_max_ranks && flags.size() == rank_count && counters.size() == rank_count &&
+            rank < rank_count,
         op,
         ": a rank's buffer, flags and counters for each of at most ",
-        p2p_all_reduce_max_ranks,
+        p2p_max_ranks,
         " ranks"
     );
 }
@@ -188,7 +188,7 @@ rank_pointers collect_pointers(std::span<std::byte* const> buffers, std::span<st
 
 // The blocks of a call over vectors 16-byte vectors per rank, and the vectors of each block.
 std::pair<int64_t, int64_t> split_blocks(int64_t vectors) {
-    const int64_t blocks = std::min<int64_t>(p2p_all_reduce_max_blocks, (vectors + cta_threads - 1) / cta_threads);
+    const int64_t blocks = std::min<int64_t>(p2p_max_blocks, (vectors + cta_threads - 1) / cta_threads);
     return {blocks, (vectors + blocks - 1) / blocks};
 }
 

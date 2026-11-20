@@ -1,6 +1,6 @@
 #include "pulsarlm/engine/communicator.hpp"
 
-#include "pulsarlm/engine/p2p_all_reduce.hpp"
+#include "pulsarlm/engine/p2p_group.hpp"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -71,11 +71,11 @@ std::vector<std::int64_t> gathered_sizes(const at::Tensor& x, std::size_t size) 
     return sizes;
 }
 
-// The largest all-reduce that goes through p2p_all_reduce, as vLLM's custom all-reduce limits its own.
-constexpr std::size_t p2p_all_reduce_bytes = std::size_t{8} << 20;
+// The largest all-reduce that goes through p2p_group, as vLLM's custom all-reduce limits its own.
+constexpr std::size_t p2p_max_bytes = std::size_t{8} << 20;
 
-std::unique_ptr<p2p_all_reduce> make_small_all_reduce(std::span<const at::Device> devices) {
-    return p2p_all_reduce::make(devices, p2p_all_reduce_bytes);
+std::unique_ptr<p2p_group> make_p2p_group(std::span<const at::Device> devices) {
+    return p2p_group::make(devices, p2p_max_bytes);
 }
 
 cudaStream_t current_stream(const at::Tensor& x) {
@@ -85,12 +85,12 @@ cudaStream_t current_stream(const at::Tensor& x) {
 class nccl_group final : public communicator::group {
     std::vector<ncclComm_t> comms;
     // Null when the devices do not reach each other's memory.
-    std::unique_ptr<p2p_all_reduce> small_all_reduce;
+    std::unique_ptr<p2p_group> p2p;
 
   public:
     explicit nccl_group(std::span<const at::Device> devices)
     : comms(devices.size()),
-      small_all_reduce(make_small_all_reduce(devices)) {
+      p2p(make_p2p_group(devices)) {
         std::vector<int> ordinals;
         for (const at::Device& device : devices) {
             TORCH_CHECK(
@@ -117,8 +117,8 @@ class nccl_group final : public communicator::group {
 
     void all_reduce(std::size_t rank, at::Tensor& x) override {
         check_contiguous(x);
-        if (small_all_reduce && small_all_reduce->fits(x)) {
-            small_all_reduce->all_reduce(rank, x);
+        if (p2p && p2p->fits(x)) {
+            p2p->all_reduce(rank, x);
             return;
         }
         check_nccl(ncclAllReduce(
@@ -134,8 +134,8 @@ class nccl_group final : public communicator::group {
 
     at::Tensor all_gather(std::size_t rank, const at::Tensor& x) override {
         check_contiguous(x);
-        if (small_all_reduce && small_all_reduce->fits_gather(x)) {
-            return small_all_reduce->all_gather(rank, x);
+        if (p2p && p2p->fits_gather(x)) {
+            return p2p->all_gather(rank, x);
         }
         at::Tensor gathered = at::empty(gathered_sizes(x, comms.size()), x.options());
         check_nccl(ncclAllGather(
@@ -150,7 +150,7 @@ class nccl_group final : public communicator::group {
     }
 
     bool captures_all_reduce(std::size_t byte_count) const noexcept override {
-        return small_all_reduce && small_all_reduce->fits_size(byte_count);
+        return p2p && p2p->fits_size(byte_count);
     }
 };
 
@@ -162,8 +162,8 @@ class one_device_group final : public communicator::group {
     std::vector<cudaEvent_t> written;
     std::barrier<> buffers_written;
     std::barrier<> buffers_read;
-    std::unique_ptr<p2p_all_reduce> small_all_reduce;
-    // Passed by every rank's thread before it queues a small_all_reduce kernel.
+    std::unique_ptr<p2p_group> p2p;
+    // Passed by every rank's thread before it queues a p2p kernel.
     std::barrier<> kernels_queued;
 
     std::span<const at::Tensor> exchange(std::size_t rank, const at::Tensor& x) {
@@ -188,7 +188,7 @@ class one_device_group final : public communicator::group {
       written(size),
       buffers_written(static_cast<std::ptrdiff_t>(size)),
       buffers_read(static_cast<std::ptrdiff_t>(size)),
-      small_all_reduce(make_small_all_reduce(std::vector<at::Device>(size, device))),
+      p2p(make_p2p_group(std::vector<at::Device>(size, device))),
       kernels_queued(static_cast<std::ptrdiff_t>(size)) {
         c10::cuda::CUDAGuard guard(device);
         for (cudaEvent_t& event : written) {
@@ -210,9 +210,9 @@ class one_device_group final : public communicator::group {
     }
 
     void all_reduce(std::size_t rank, at::Tensor& x) override {
-        if (small_all_reduce && small_all_reduce->fits(x)) {
+        if (p2p && p2p->fits(x)) {
             kernels_queued.arrive_and_wait();
-            small_all_reduce->all_reduce(rank, x);
+            p2p->all_reduce(rank, x);
             return;
         }
         std::span<const at::Tensor> all = exchange(rank, x);
@@ -224,9 +224,9 @@ class one_device_group final : public communicator::group {
     }
 
     at::Tensor all_gather(std::size_t rank, const at::Tensor& x) override {
-        if (small_all_reduce && small_all_reduce->fits_gather(x)) {
+        if (p2p && p2p->fits_gather(x)) {
             kernels_queued.arrive_and_wait();
-            return small_all_reduce->all_gather(rank, x);
+            return p2p->all_gather(rank, x);
         }
         std::vector<std::int64_t> sizes = gathered_sizes(x, buffers.size());
         std::span<const at::Tensor> all = exchange(rank, x);
@@ -236,7 +236,7 @@ class one_device_group final : public communicator::group {
     }
 
     bool captures_all_reduce(std::size_t byte_count) const noexcept override {
-        return small_all_reduce && small_all_reduce->fits_size(byte_count);
+        return p2p && p2p->fits_size(byte_count);
     }
 };
 
