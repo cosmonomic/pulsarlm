@@ -18,7 +18,7 @@ void copy_input(const at::Tensor& buffer, const at::Tensor& source) {
     buffer.copy_(source, /*non_blocking=*/true);
 }
 
-// Copies a group's composition into a captured group's buffers, slot_buffer and buffers: the slots of its requests and,
+// Copies a step's composition into a captured step's buffers, slot_buffer and buffers: the slots of its requests and,
 // when it measures mass, its cu_view_pages, zeroing the mass rows of its views in buffers, into which the graph adds
 // the step's mass.
 void copy_composition(
@@ -43,7 +43,7 @@ void copy_composition(
     }
 }
 
-// Copies into page_mass_sum and page_weight_sum the mass a replay added to the rows of the group's views in buffers.
+// Copies into page_mass_sum and page_weight_sum the mass a replay added to the rows of the step's views in buffers.
 void copy_page_mass(
     std::span<const at::Tensor> page_mass_sum,
     std::span<const at::Tensor> page_weight_sum,
@@ -76,7 +76,8 @@ step_graphs::step_graphs(
   state_slots(static_cast<std::int64_t>(state_slots)),
   mass_heads(std::move(mass_heads)),
   stop_tokens(std::move(stop_tokens)),
-  table(std::move(table)) {
+  table(std::move(table)),
+  no_prefill_tokens(at::empty({0}, lines.front().k.options().dtype(at::kLong))) {
     assert(this->table.tokens.size(1) == this->state_slots && this->width <= this->table.page_tables.size(2));
     auto floats = this->lines.front().k.options().dtype(at::kFloat);
     const std::int64_t rows = startup_sequences * this->width;
@@ -102,26 +103,27 @@ at::Tensor step_graphs::make_request_slots(std::int64_t sequences) const {
     return at::zeros({sequences}, lines.front().k.options().dtype(at::kLong));
 }
 
-model::batch step_graphs::make_group_inputs(std::int64_t sequences, bool measures_mass, model::batch_kind kind) const {
-    assert(kind == model::batch_kind::decode || kind == model::batch_kind::verify);
+model::batch step_graphs::make_step_inputs(std::int64_t sequences, bool measures_mass, bool verifies) const {
     auto device = lines.front().k.options();
     auto ints = device.dtype(at::kInt);
     const auto layers = static_cast<std::int64_t>(lines.size());
-    const bool verifies = kind == model::batch_kind::verify;
     const std::int64_t rows = verifies ? state_slots : 1;
     const std::int64_t tokens = sequences * rows;
+    const at::Tensor query_starts = at::arange(sequences + 1, ints) * rows;
     model::batch inputs{
-        .kind = kind,
+        .single_query_request_count = verifies ? 0 : sequences,
+        .per_query_state_request_count = verifies ? sequences : 0,
         .page_size = page_size,
         .state_slots = state_slots,
+        .cu_seqlens_q = query_starts,
+        .cu_seqlens_q_from_second_run = verifies ? query_starts : at::zeros({1}, ints),
+        .cu_seqlens_q_from_third_run = at::zeros({1}, ints),
+        .logit_tokens = at::arange(tokens, device.dtype(at::kLong)),
         .arrival_counters = at::zeros({shard_model.arrival_counter_count(sequences, tokens)}, ints),
     };
-    if (verifies) {
-        inputs.cu_seqlens_q = at::arange(sequences + 1, ints) * rows;
-    }
     if (measures_mass) {
-        // Each view is the one page its key lies on; a verify group's views are its rows'.
-        const std::int64_t views = verifies ? tokens : sequences;
+        // Each view is the one page its key lies on; a verify step's views are its query tokens'.
+        const std::int64_t views = tokens;
         inputs.cu_view_pages = at::arange(views + 1, ints).unsqueeze(0).repeat({layers, 1});
         const std::int64_t mass_rows = views * width;
         auto floats = device.dtype(at::kFloat);
@@ -143,38 +145,37 @@ model::batch step_graphs::make_group_inputs(std::int64_t sequences, bool measure
     return inputs;
 }
 
-model::batch step_graphs::make_draft_pass_inputs(
-    std::int64_t sequences,
-    std::int64_t rows_per_sequence,
-    model::batch_kind kind
-) const {
+model::batch step_graphs::make_draft_pass_inputs(std::int64_t sequences, std::int64_t rows_per_sequence) const {
     auto device = lines.front().k.options();
     auto ints = device.dtype(at::kInt);
     auto longs = device.dtype(at::kLong);
     const auto layers = static_cast<std::int64_t>(lines.size());
     const std::int64_t tokens = sequences * rows_per_sequence;
+    const bool single_queries = rows_per_sequence == 1;
+    const at::Tensor query_starts = at::arange(sequences + 1, ints) * rows_per_sequence;
     return model::batch{
-        .kind = kind,
+        .single_query_request_count = single_queries ? sequences : 0,
         .tokens = at::zeros({tokens}, longs),
         .pos = at::zeros({tokens}, longs),
         .page_tables = at::zeros({layers, sequences, width}, ints),
         .page_size = page_size,
         .state_slots = state_slots,
+        .cu_seqlens_q = query_starts,
+        .cu_seqlens_q_from_second_run = single_queries ? at::zeros({1}, ints) : query_starts,
+        .cu_seqlens_q_from_third_run = single_queries ? at::zeros({1}, ints) : query_starts,
         .key_counts = at::full({layers, sequences}, rows_per_sequence, ints),
         .page_positions = at::zeros({layers, sequences, width}, ints),
+        .logit_tokens = at::arange(sequences, longs) * rows_per_sequence + (rows_per_sequence - 1),
         .arrival_counters = at::zeros({shard_model.arrival_counter_count(sequences, tokens)}, ints),
     };
 }
 
 model::batch step_graphs::make_first_pass_inputs(std::int64_t sequences) const {
-    model::batch inputs = make_draft_pass_inputs(sequences, state_slots, model::batch_kind::prefill);
-    inputs.cu_seqlens_q = at::arange(sequences + 1, inputs.page_tables.options()) * state_slots;
-    inputs.logit_rows = at::arange(sequences, inputs.tokens.options()) * state_slots;
-    return inputs;
+    return make_draft_pass_inputs(sequences, state_slots);
 }
 
 model::batch step_graphs::make_later_pass_inputs(std::int64_t sequences) const {
-    return make_draft_pass_inputs(sequences, 1, model::batch_kind::decode);
+    return make_draft_pass_inputs(sequences, 1);
 }
 
 at::Tensor step_graphs::make_draft_hidden_rows(std::int64_t row_count) const {
@@ -193,29 +194,21 @@ step_graphs::gather_sampling_inputs(const at::Tensor& sample_slots, const at::Te
     };
 }
 
-std::unique_ptr<step_graphs::captured_forward>
-step_graphs::capture_forward(std::int64_t sequences, bool measures_mass, model::batch_kind kind) {
-    auto captured = std::make_unique<captured_forward>();
-    captured->request_slots = make_request_slots(sequences);
-    captured->inputs = make_group_inputs(sequences, measures_mass, kind);
-    // Thread-local capture leaves the other GPUs' threads free to launch while this one captures.
-    captured->graph.capture_begin({0, 0}, cudaStreamCaptureModeThreadLocal);
-    gather_group_inputs(table, captured->request_slots, page_width(), captured->inputs);
-    model::output output = shard_model.forward(captured->inputs, lines);
-    captured->graph.capture_end();
-    captured->logits = output.logits;
-    captured->hidden = output.hidden;
-    return captured;
+void step_graphs::gather_inputs(const at::Tensor& request_slots, model::batch& inputs) const {
+    const std::int64_t token_count = inputs.single_query_request_count +
+        inputs.per_query_state_request_count * inputs.state_slots;
+    gather_step_inputs(table, request_slots, page_width(), token_count, no_prefill_tokens, inputs);
 }
 
 std::unique_ptr<step_graphs::captured_decode_step>
 step_graphs::capture_decode_step(std::int64_t sequences, bool measures_mass, bool filters) {
     auto captured = std::make_unique<captured_decode_step>();
     captured->request_slots = make_request_slots(sequences);
-    captured->inputs = make_group_inputs(sequences, measures_mass, model::batch_kind::decode);
+    captured->inputs = make_step_inputs(sequences, measures_mass, false);
     const at::Tensor& slots = captured->request_slots;
+    // Thread-local capture leaves the other GPUs' threads free to launch while this one captures.
     captured->graph.capture_begin({0, 0}, cudaStreamCaptureModeThreadLocal);
-    gather_group_inputs(table, slots, page_width(), captured->inputs);
+    gather_inputs(slots, captured->inputs);
     const sampling_inputs sampling = gather_sampling_inputs(slots, table.draw_counts.index_select(0, slots), filters);
     model::output output = shard_model.forward(captured->inputs, lines);
     at::Tensor samples = sample(output.logits, sampling);
@@ -240,7 +233,7 @@ step_graphs::capture_verify_step(std::int64_t sequences, bool measures_mass, boo
     const std::int64_t later = state_slots - 2;
     captured->request_slots = make_request_slots(sequences);
     captured->max_accepted_token_counts = at::full({sequences}, rows, longs);
-    captured->inputs = make_group_inputs(sequences, measures_mass, model::batch_kind::verify);
+    captured->inputs = make_step_inputs(sequences, measures_mass, true);
     captured->first_pass = make_first_pass_inputs(sequences);
     captured->later_pass = make_later_pass_inputs(sequences);
     const at::Tensor& slots = captured->request_slots;
@@ -252,7 +245,7 @@ step_graphs::capture_verify_step(std::int64_t sequences, bool measures_mass, boo
     };
     draft_head& head = *shard_model.drafter();
     captured->graph.capture_begin({0, 0}, cudaStreamCaptureModeThreadLocal);
-    gather_group_inputs(table, slots, page_width(), inputs);
+    gather_inputs(slots, inputs);
     const at::Tensor sample_slots = slots.unsqueeze(1).expand({sequences, rows}).reshape({tokens});
     const at::Tensor draw_offsets = at::arange(rows, longs).repeat({sequences});
     const sampling_inputs sampling = gather_sampling_inputs(
@@ -278,7 +271,7 @@ step_graphs::capture_verify_step(std::int64_t sequences, bool measures_mass, boo
     first.page_tables.copy_(inputs.page_tables);
     first.page_positions.copy_(inputs.page_positions);
     first.key_counts.copy_(every_layer(keys + (rows + 1)));
-    first.logit_rows.copy_(drafting_rows);
+    first.logit_tokens.copy_(drafting_rows);
     model::output drafted_rows = head.draft(first, verified_rows.hidden, lines);
     at::Tensor token = drafted_rows.logits.argmax(-1);
     at::Tensor previous_hidden = drafted_rows.hidden.index_select(0, drafting_rows);
@@ -308,9 +301,9 @@ step_graphs::capture_verify_step(std::int64_t sequences, bool measures_mass, boo
 }
 
 // A capture cannot create what the forward creates at its first run, such as cuBLAS handles and RoPE tables, so an eager
-// forward of each kind runs first, and an eager draft pass of each kind before the verify steps. Their tables point
-// every view at line 0, which is zeroed first so that the forward reads no uninitialized memory; no request holds a
-// line or a slot yet, and the forwards write nothing into the table.
+// forward of the captured kind runs first, and an eager draft pass of each kind before the verify steps. Their tables
+// point every view at line 0, which is zeroed first so that the forward reads no uninitialized memory; no request holds
+// a line or a slot yet, and the forwards write nothing into the table.
 void step_graphs::capture_startup() {
     for (const kv& layer : lines) {
         for (const at::Tensor& part : {layer.k, layer.v, layer.index_keys, layer.last_hidden}) {
@@ -323,18 +316,11 @@ void step_graphs::capture_startup() {
     if (std::ranges::any_of(mass_heads, [](std::size_t heads) { return heads > 0; })) {
         mass_options.push_back(true);
     }
-    const bool verifies = state_slots > 1;
-    const bool drafts = verifies && shard_model.drafter() != nullptr;
-    std::vector<model::batch_kind> kinds{model::batch_kind::decode};
-    if (verifies) {
-        kinds.push_back(model::batch_kind::verify);
-    }
-    for (model::batch_kind kind : kinds) {
-        for (bool measures_mass : mass_options) {
-            model::batch inputs = make_group_inputs(1, measures_mass, kind);
-            gather_group_inputs(table, make_request_slots(1), page_width(), inputs);
-            shard_model.forward(inputs, lines);
-        }
+    const bool drafts = state_slots > 1 && shard_model.drafter() != nullptr;
+    for (bool measures_mass : mass_options) {
+        model::batch inputs = make_step_inputs(1, measures_mass, drafts);
+        gather_inputs(make_request_slots(1), inputs);
+        shard_model.forward(inputs, lines);
     }
     if (drafts) {
         shard_model.drafter()->draft(make_first_pass_inputs(1), make_draft_hidden_rows(state_slots), lines);
@@ -342,13 +328,7 @@ void step_graphs::capture_startup() {
     }
     for (std::int64_t sequences = 1; sequences <= startup_sequences; sequences++) {
         for (bool measures_mass : mass_options) {
-            const group_shape shape{sequences, measures_mass};
-            if (!decode_forwards.contains(shape)) {
-                decode_forwards.emplace(shape, capture_forward(sequences, measures_mass, model::batch_kind::decode));
-            }
-            if (verifies && !verify_forwards.contains(shape)) {
-                verify_forwards.emplace(shape, capture_forward(sequences, measures_mass, model::batch_kind::verify));
-            }
+            const step_shape shape{sequences, measures_mass};
             if (drafts && !unfiltered_verify_steps.contains(shape)) {
                 unfiltered_verify_steps.emplace(shape, capture_verify_step(sequences, measures_mass, false));
             }
@@ -359,58 +339,6 @@ void step_graphs::capture_startup() {
     }
 }
 
-model::output step_graphs::replay(
-    captured_forward& captured,
-    const at::Tensor& request_slots,
-    const at::Tensor& cu_view_pages,
-    std::span<const at::Tensor> page_mass_sum,
-    std::span<const at::Tensor> page_weight_sum
-) {
-    copy_composition(
-        captured.request_slots,
-        captured.inputs,
-        request_slots,
-        cu_view_pages,
-        page_mass_sum,
-        page_weight_sum
-    );
-    captured.graph.replay();
-    copy_page_mass(page_mass_sum, page_weight_sum, captured.inputs);
-    return model::output{.logits = captured.logits, .hidden = captured.hidden};
-}
-
-model::output step_graphs::decode(
-    const at::Tensor& request_slots,
-    const at::Tensor& cu_view_pages,
-    std::span<const at::Tensor> page_mass_sum,
-    std::span<const at::Tensor> page_weight_sum
-) {
-    const group_shape shape{request_slots.size(0), cu_view_pages.defined()};
-    auto found = decode_forwards.find(shape);
-    if (found == decode_forwards.end()) {
-        found = decode_forwards.emplace(shape, capture_forward(shape.first, shape.second, model::batch_kind::decode))
-                    .first;
-    }
-    return replay(*found->second, request_slots, cu_view_pages, page_mass_sum, page_weight_sum);
-}
-
-step_graphs::verify_outputs step_graphs::verify(
-    const at::Tensor& request_slots,
-    const at::Tensor& cu_view_pages,
-    std::span<const at::Tensor> page_mass_sum,
-    std::span<const at::Tensor> page_weight_sum
-) {
-    const group_shape shape{request_slots.size(0), cu_view_pages.defined()};
-    auto found = verify_forwards.find(shape);
-    if (found == verify_forwards.end()) {
-        found = verify_forwards.emplace(shape, capture_forward(shape.first, shape.second, model::batch_kind::verify))
-                    .first;
-    }
-    captured_forward& captured = *found->second;
-    model::output output = replay(captured, request_slots, cu_view_pages, page_mass_sum, page_weight_sum);
-    return verify_outputs{.logits = output.logits, .hidden = output.hidden, .tokens = captured.inputs.tokens};
-}
-
 step_graphs::decode_step_outputs step_graphs::decode_step(
     const at::Tensor& request_slots,
     const at::Tensor& cu_view_pages,
@@ -418,7 +346,7 @@ step_graphs::decode_step_outputs step_graphs::decode_step(
     std::span<const at::Tensor> page_weight_sum,
     bool filters
 ) {
-    const group_shape shape{request_slots.size(0), cu_view_pages.defined()};
+    const step_shape shape{request_slots.size(0), cu_view_pages.defined()};
     auto& steps = filters ? filtered_decode_steps : unfiltered_decode_steps;
     auto found = steps.find(shape);
     if (found == steps.end()) {
@@ -447,7 +375,7 @@ step_graphs::verify_step_outputs step_graphs::verify_step(
     const at::Tensor& max_accepted_token_counts
 ) {
     assert(shard_model.drafter() != nullptr);
-    const group_shape shape{request_slots.size(0), cu_view_pages.defined()};
+    const step_shape shape{request_slots.size(0), cu_view_pages.defined()};
     auto& steps = filters ? filtered_verify_steps : unfiltered_verify_steps;
     auto found = steps.find(shape);
     if (found == steps.end()) {

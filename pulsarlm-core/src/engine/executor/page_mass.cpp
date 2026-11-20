@@ -46,15 +46,11 @@ at::Tensor zero_page_mass(
     return mass;
 }
 
-std::vector<executor::batch::layer_step_mass> executor::batch::view_mass(
-    const model::batch& group,
-    const at::Tensor& mass,
-    std::size_t view,
-    const view_layout& layout
-) {
+std::vector<executor::batch::layer_step_mass>
+executor::batch::view_mass(std::size_t view, const view_layout& layout) const {
     const float* values = mass.const_data_ptr<float>();
-    auto row_size = static_cast<std::size_t>(group.cu_view_pages.size(1));
-    const auto* cu_view_pages = group.cu_view_pages.const_data_ptr<std::int32_t>();
+    auto row_size = static_cast<std::size_t>(inputs.cu_view_pages.size(1));
+    const auto* cu_view_pages = inputs.cu_view_pages.const_data_ptr<std::int32_t>();
     std::vector<layer_step_mass> by_layer(layout.layers.size());
     std::size_t first = 0;
     for (std::size_t layer = 0; layer < layout.layers.size(); layer++) {
@@ -76,76 +72,76 @@ std::vector<executor::batch::layer_step_mass> executor::batch::view_mass(
 }
 
 void executor::batch::join_mass(std::span<const shard> shards, const view_layout& layout) {
-    for (group* g : groups()) {
-        if (!g->mass_by_shard.front().defined() || g->mass_by_shard.size() == 1) {
-            g->mass = g->mass_by_shard.front();
+    if (!mass_by_shard.front().defined() || mass_by_shard.size() == 1) {
+        mass = mass_by_shard.front();
+        return;
+    }
+    std::int64_t total = 0;
+    auto row_size = static_cast<std::size_t>(inputs.cu_view_pages.size(1));
+    const auto* cu_view_pages = inputs.cu_view_pages.const_data_ptr<std::int32_t>();
+    for (std::size_t layer = 0; layer < layout.layers.size(); layer++) {
+        if (layout.layers[layer].mass_heads > 0) {
+            auto pages = static_cast<std::int64_t>(cu_view_pages[layer * row_size + row_size - 1]);
+            total += pages * static_cast<std::int64_t>(layout.layers[layer].mass_heads + 1);
+        }
+    }
+    mass = pinned({total}, at::kFloat);
+    float* out = mass.mutable_data_ptr<float>();
+    std::vector<const float*> in;
+    for (const at::Tensor& shard_mass : mass_by_shard) {
+        in.push_back(shard_mass.const_data_ptr<float>());
+    }
+    for (std::size_t layer = 0; layer < layout.layers.size(); layer++) {
+        if (layout.layers[layer].mass_heads == 0) {
             continue;
         }
-        std::int64_t total = 0;
-        auto row_size = static_cast<std::size_t>(g->inputs.cu_view_pages.size(1));
-        const auto* cu_view_pages = g->inputs.cu_view_pages.const_data_ptr<std::int32_t>();
-        for (std::size_t layer = 0; layer < layout.layers.size(); layer++) {
-            if (layout.layers[layer].mass_heads > 0) {
-                auto pages = static_cast<std::int64_t>(cu_view_pages[layer * row_size + row_size - 1]);
-                total += pages * static_cast<std::int64_t>(layout.layers[layer].mass_heads + 1);
+        auto pages = static_cast<std::size_t>(cu_view_pages[layer * row_size + row_size - 1]);
+        for (std::size_t page = 0; page < pages; page++) {
+            for (std::size_t shard = 0; shard < in.size(); shard++) {
+                std::size_t heads = shards[shard].mass_heads[layer];
+                out = std::copy_n(in[shard], heads, out);
+                in[shard] += heads;
             }
         }
-        g->mass = pinned({total}, at::kFloat);
-        float* out = g->mass.mutable_data_ptr<float>();
-        std::vector<const float*> in;
-        for (const at::Tensor& mass : g->mass_by_shard) {
-            in.push_back(mass.const_data_ptr<float>());
-        }
-        for (std::size_t layer = 0; layer < layout.layers.size(); layer++) {
-            if (layout.layers[layer].mass_heads == 0) {
-                continue;
-            }
-            auto pages = static_cast<std::size_t>(cu_view_pages[layer * row_size + row_size - 1]);
-            for (std::size_t page = 0; page < pages; page++) {
-                for (std::size_t shard = 0; shard < in.size(); shard++) {
-                    std::size_t heads = shards[shard].mass_heads[layer];
-                    out = std::copy_n(in[shard], heads, out);
-                    in[shard] += heads;
-                }
-            }
-            out = std::copy_n(in.front(), pages, out);
-            for (const float*& shard_in : in) {
-                shard_in += pages;
-            }
+        out = std::copy_n(in.front(), pages, out);
+        for (const float*& shard_in : in) {
+            shard_in += pages;
         }
     }
 }
 
-// A verify entry measured each row's mass with weight 1; its accepted rows are weighed as one step of accepted tokens.
+// An entry of the second run measured each query token's mass with weight 1; its accepted query tokens are weighed as
+// one step of accepted tokens.
 void executor::batch::add_measured_mass(
-    const group& g,
-    std::size_t position,
+    std::size_t index,
+    request_state& req,
     std::size_t accepted_count,
+    std::size_t end_position,
     const view_layout& layout
 ) const {
-    const entry& e = g.entries[position];
-    request_state& req = *e.req;
+    const batch_entry& e = entries[index];
     const std::size_t n_layers = layout.layers.size();
+    const std::size_t first_view = count_views_before(index);
     std::vector<layer_step_mass> step_mass;
     std::vector<std::vector<float>> verified_mass(n_layers);
     std::vector<std::vector<float>> verified_weight(n_layers);
-    if (&g == &verify_group) {
+    if (verifies(index)) {
         std::vector<float> weights(accepted_count);
         req.fill_query_weights(e.start_position, weights);
         step_mass.resize(n_layers);
-        for (std::size_t row = 0; row < accepted_count; row++) {
-            std::vector<layer_step_mass> row_mass = view_mass(g.inputs, g.mass, position * verify_rows + row, layout);
+        for (std::size_t token = 0; token < accepted_count; token++) {
+            std::vector<layer_step_mass> token_mass = view_mass(first_view + token, layout);
             for (std::size_t layer = 0; layer < n_layers; layer++) {
                 if (layout.layers[layer].mass_heads == 0) {
                     continue;
                 }
-                verified_mass[layer].resize(row_mass[layer].mass_sum.size());
-                verified_weight[layer].resize(row_mass[layer].weight_sum.size());
+                verified_mass[layer].resize(token_mass[layer].mass_sum.size());
+                verified_weight[layer].resize(token_mass[layer].weight_sum.size());
                 for (std::size_t j = 0; j < verified_mass[layer].size(); j++) {
-                    verified_mass[layer][j] += weights[row] * row_mass[layer].mass_sum[j];
+                    verified_mass[layer][j] += weights[token] * token_mass[layer].mass_sum[j];
                 }
                 for (std::size_t j = 0; j < verified_weight[layer].size(); j++) {
-                    verified_weight[layer][j] += weights[row] * row_mass[layer].weight_sum[j];
+                    verified_weight[layer][j] += weights[token] * token_mass[layer].weight_sum[j];
                 }
                 step_mass[layer] = layer_step_mass{
                     .mass_sum = verified_mass[layer],
@@ -154,7 +150,7 @@ void executor::batch::add_measured_mass(
             }
         }
     } else {
-        step_mass = view_mass(g.inputs, g.mass, position, layout);
+        step_mass = view_mass(first_view, layout);
     }
     std::vector<std::span<const float>> step_mass_sums;
     std::vector<std::span<const float>> step_weight_sums;
@@ -162,7 +158,7 @@ void executor::batch::add_measured_mass(
         step_mass_sums.push_back(layer_mass.mass_sum);
         step_weight_sums.push_back(layer_mass.weight_sum);
     }
-    req.add_step_mass(step_mass_sums, step_weight_sums, e.end_position);
+    req.add_step_mass(step_mass_sums, step_weight_sums, end_position);
 }
 
 }  // namespace pulsarlm

@@ -38,13 +38,12 @@ task<std::vector<executor::request_id_type>> executor::write_back() {
     co_await write_pages_and_states(b, std::move(writes));
     co_await refresh_views(b);
     std::vector<request_id_type> written_requests;
-    for (const batch::group* g : std::as_const(b).groups()) {
-        for (const batch::entry& e : g->entries) {
-            if (e.req->has_exit_cause() && e.req->unfinished_step_count() == 0) {
-                e.req->exit();
-            }
-            written_requests.push_back(e.req.key());
+    for (const batch_entry& e : b.entries) {
+        request_state& req = get_state(e.request_id);
+        if (req.has_exit_cause() && req.unfinished_step_count() == 0) {
+            req.exit();
         }
+        written_requests.push_back(e.request_id);
     }
     co_return written_requests;
 }
@@ -73,147 +72,145 @@ executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clo
                                                                   : nullptr;
     // Each drafting request's next token then its drafts.
     std::unordered_map<const request_state*, std::span<const std::int64_t>> drafted;
-    const std::vector<batch::entry> drafting_entries = b.drafting_entries();
+    const std::vector<batch_entry> drafting_entries = b.drafting_entries();
     for (std::size_t d = 0; d < drafting_entries.size(); d++) {
         const auto row = static_cast<std::size_t>(b.next_tokens.size(1));
         drafted.emplace(
-            &*drafting_entries[d].req,
+            &get_state(drafting_entries[d].request_id),
             std::span(b.next_tokens.const_data_ptr<std::int64_t>() + d * row, row)
         );
     }
     assert(
         std::ranges::equal(
             std::span(b.cycle_end_flags.const_data_ptr<bool>(), static_cast<std::size_t>(b.cycle_end_flags.numel())),
-            b.groups() | std::views::transform([](const batch::group* g) { return std::span(g->entries); }) |
-                std::views::join | std::views::transform(&batch::entry::ends_cycle)
+            b.entries | std::views::transform(&batch_entry::ends_cycle)
         )
     );
-    for (batch::group* g : b.groups()) {
-        const bool verifies = g == &b.verify_group;
-        for (std::size_t position = 0; position < g->entries.size(); position++) {
-            batch::entry& e = g->entries[position];
-            request_state& req = *e.req;
-            request_callbacks& callbacks = *requests[e.req.key()].callbacks;
-            std::span<const std::int64_t> samples;
-            if (e.is_sampling) {
-                samples = std::span(next_sampled, verifies ? b.verify_rows : 1);
-                next_sampled += samples.size();
-            }
-            if (req.discards_steps()) {
-                continue;
-            }
-            if (req.pending_page_writes()->any_failed()) {
-                req.fail_store_write();
-                continue;
-            }
-            // The tokens the step accepts, and of its samples those it emits. Each later unfinished step of a request
-            // whose verify step is written back is a verify step, which moved its history position by one token at
-            // its launch.
-            const bool next_launched = req.unfinished_step_count() > 1;
-            std::size_t accepted_count = batch::forwarded(e);
-            std::span<const std::int64_t> emitted = samples;
-            if (verifies) {
-                accepted_count = static_cast<std::size_t>(
-                    b.accepted_token_counts.const_data_ptr<std::int64_t>()[position]
-                );
-                emitted = samples.first(accepted_count);
-                const std::size_t start = req.history_position() - req.unfinished_step_count();
-                assert(start >= e.start_position);
-                req.apply_accepted_tokens(start, emitted, b.verify_rows);
-                drafted_tokens.fetch_add(b.verify_rows - 1, std::memory_order_relaxed);
-                accepted_drafts.fetch_add(accepted_count - 1, std::memory_order_relaxed);
-                e.start_position = start;
-                e.end_position = start + accepted_count;
-            }
-            std::size_t completed_count = req.complete_pages(e.end_position);
-            if (e.is_measured) {
-                b.add_measured_mass(*g, position, accepted_count, layout);
-            }
-            const bool is_prefill_step = !req.has_ended_prefill();
-            req.record_step(step_duration);
-            if (is_prefill_step && e.end_position >= req.prompt_token_count()) {
-                req.end_prefill();
-                callbacks.on_prefill(
-                    prefill_statistics{
-                        .cached_token_count = req.cached_token_count(),
-                        .device_cached_token_count = req.device_cached_token_count(),
-                        .computed_token_count = req.prompt_token_count() - req.cached_token_count(),
-                        .step_count = req.prefill_step_count(),
-                        .step_duration = req.prefill_step_duration(),
-                        .device_memory = device_memory(req),
-                    }
-                );
-            }
-            // The first token a step delivers carries the step's counts and its duration; the prefill statistics hold
-            // the duration of a prefill step.
-            decode_statistics token_statistics{
-                .device_memory = device_memory(req),
-                .drafted_token_count = verifies ? b.verify_rows - 1 : 0,
-                .accepted_draft_count = verifies ? accepted_count - 1 : 0,
-                .step_duration = is_prefill_step ? std::chrono::steady_clock::duration::zero() : step_duration,
-            };
-            bool reaches_end = e.ends_request;
-            if (verifies) {
-                for (std::int64_t token : emitted) {
-                    callbacks.on_decode(token, token_statistics);
-                    token_statistics.drafted_token_count = 0;
-                    token_statistics.accepted_draft_count = 0;
-                    token_statistics.step_duration = std::chrono::steady_clock::duration::zero();
+    for (std::size_t index = 0; index < b.entries.size(); index++) {
+        batch_entry& e = b.entries[index];
+        const bool verifies = b.verifies(index);
+        request_state& req = get_state(e.request_id);
+        request_callbacks& callbacks = *requests[e.request_id].callbacks;
+        std::span<const std::int64_t> samples;
+        if (e.first_sample_index) {
+            samples = std::span(next_sampled, verifies ? e.query_token_count : 1);
+            next_sampled += samples.size();
+        }
+        if (req.discards_steps()) {
+            continue;
+        }
+        if (req.pending_page_writes()->any_failed()) {
+            req.fail_store_write();
+            continue;
+        }
+        // The tokens the step accepts, and of its samples those it emits. Each later unfinished step of a request
+        // whose verify step is written back is a verify step, which moved its history position by one token at
+        // its launch.
+        const bool next_launched = req.unfinished_step_count() > 1;
+        std::size_t accepted_count = e.query_token_count;
+        std::size_t end_position = e.start_position + e.query_token_count;
+        std::span<const std::int64_t> emitted = samples;
+        if (verifies) {
+            accepted_count = static_cast<std::size_t>(
+                b.accepted_token_counts.const_data_ptr<std::int64_t>()[index - b.single_query_request_count]
+            );
+            emitted = samples.first(accepted_count);
+            const std::size_t start = req.history_position() - req.unfinished_step_count();
+            assert(start >= e.start_position);
+            req.apply_accepted_tokens(start, emitted, e.query_token_count);
+            drafted_tokens.fetch_add(e.query_token_count - 1, std::memory_order_relaxed);
+            accepted_drafts.fetch_add(accepted_count - 1, std::memory_order_relaxed);
+            e.start_position = start;
+            end_position = start + accepted_count;
+        }
+        std::size_t completed_count = req.complete_pages(end_position);
+        if (e.is_measured) {
+            b.add_measured_mass(index, req, accepted_count, end_position, layout);
+        }
+        const bool is_prefill_step = !req.has_ended_prefill();
+        req.record_step(step_duration);
+        if (is_prefill_step && end_position >= req.prompt_token_count()) {
+            req.end_prefill();
+            callbacks.on_prefill(
+                prefill_statistics{
+                    .cached_token_count = req.cached_token_count(),
+                    .device_cached_token_count = req.device_cached_token_count(),
+                    .computed_token_count = req.prompt_token_count() - req.cached_token_count(),
+                    .step_count = req.prefill_step_count(),
+                    .step_duration = req.prefill_step_duration(),
+                    .device_memory = device_memory(req),
                 }
-                if (std::ranges::contains(stop_ids, emitted.back()) || !req.may_sample()) {
-                    reaches_end = true;
-                    if (next_launched) {
-                        req.withdraw_latest_verify_step();
-                    }
-                }
-            } else if (!samples.empty()) {
-                const std::int64_t token = samples.front();
-                req.apply_sample(e.sampled_position, token);
+            );
+        }
+        // The first token a step delivers carries the step's counts and its duration; the prefill statistics hold
+        // the duration of a prefill step.
+        decode_statistics token_statistics{
+            .device_memory = device_memory(req),
+            .drafted_token_count = verifies ? e.query_token_count - 1 : 0,
+            .accepted_draft_count = verifies ? accepted_count - 1 : 0,
+            .step_duration = is_prefill_step ? std::chrono::steady_clock::duration::zero() : step_duration,
+        };
+        bool reaches_end = e.ends_request;
+        if (verifies) {
+            for (std::int64_t token : emitted) {
                 callbacks.on_decode(token, token_statistics);
-                if (std::ranges::contains(stop_ids, token)) {
-                    reaches_end = true;
-                    if (next_launched) {
-                        req.withdraw_latest_step();
-                    }
+                token_statistics.drafted_token_count = 0;
+                token_statistics.accepted_draft_count = 0;
+                token_statistics.step_duration = std::chrono::steady_clock::duration::zero();
+            }
+            if (std::ranges::contains(stop_ids, emitted.back()) || !req.may_sample()) {
+                reaches_end = true;
+                if (next_launched) {
+                    req.withdraw_latest_verify_step();
                 }
             }
-            if (reaches_end) {
-                req.reach_end();
-                req.set_drafts({});
-            } else if (auto found = drafted.find(&req); found != drafted.end() && !next_launched) {
-                req.set_drafts(found->second.subspan(1));
+        } else if (!samples.empty()) {
+            const std::int64_t token = samples.front();
+            req.apply_sample(end_position, token);
+            callbacks.on_decode(token, token_statistics);
+            if (std::ranges::contains(stop_ids, token)) {
+                reaches_end = true;
+                if (next_launched) {
+                    req.withdraw_latest_step();
+                }
             }
-            const bool reaches_state = e.ends_cycle || reaches_end;
+        }
+        if (reaches_end) {
+            req.reach_end();
+            req.set_drafts({});
+        } else if (auto found = drafted.find(&req); found != drafted.end() && !next_launched) {
+            req.set_drafts(found->second.subspan(1));
+        }
+        const bool reaches_state = e.ends_cycle || reaches_end;
+        if (reaches_state) {
+            writes.state_reachers.push_back(&req);
+            if (req.has_pending_state()) {
+                writes.state_writers.push_back(&req);
+                e.stores_head_state = true;
+            }
+        }
+        if (completed_count > 0) {
+            auto& hashes = reaches_state ? writes.new_hashes : writes.spawned_hashes;
+            auto& owners = reaches_state ? writes.new_owners : writes.spawned_owners;
+            auto& line_ids = reaches_state ? writes.new_lines : writes.spawned_lines;
+            for (std::size_t layer = 0; layer < n_layers; layer++) {
+                if (layout.layers[layer].is_recurrent) {
+                    continue;
+                }
+                const layer_view& view = req.views()[layer];
+                std::size_t first_new_page = view.pages.size() - completed_count;
+                hashes[layer].insert(hashes[layer].end(), view.pages.begin() + first_new_page, view.pages.end());
+                owners[layer].resize(hashes[layer].size(), req.lease_id());
+                line_ids[layer].insert(
+                    line_ids[layer].end(),
+                    view.lines.begin() + first_new_page,
+                    view.lines.begin() + view.pages.size()
+                );
+            }
             if (reaches_state) {
-                writes.state_reachers.push_back(&req);
-                if (req.has_pending_state()) {
-                    writes.state_writers.push_back(&req);
-                    e.stores_head_state = true;
-                }
-            }
-            if (completed_count > 0) {
-                auto& hashes = reaches_state ? writes.new_hashes : writes.spawned_hashes;
-                auto& owners = reaches_state ? writes.new_owners : writes.spawned_owners;
-                auto& line_ids = reaches_state ? writes.new_lines : writes.spawned_lines;
-                for (std::size_t layer = 0; layer < n_layers; layer++) {
-                    if (layout.layers[layer].is_recurrent) {
-                        continue;
-                    }
-                    const layer_view& view = req.views()[layer];
-                    std::size_t first_new_page = view.pages.size() - completed_count;
-                    hashes[layer].insert(hashes[layer].end(), view.pages.begin() + first_new_page, view.pages.end());
-                    owners[layer].resize(hashes[layer].size(), req.lease_id());
-                    line_ids[layer].insert(
-                        line_ids[layer].end(),
-                        view.lines.begin() + first_new_page,
-                        view.lines.begin() + view.pages.size()
-                    );
-                }
-                if (reaches_state) {
-                    writes.page_writers.push_back(&req);
-                } else {
-                    writes.spawned_writers.push_back(req.pending_page_writes());
-                }
+                writes.page_writers.push_back(&req);
+            } else {
+                writes.spawned_writers.push_back(req.pending_page_writes());
             }
         }
     }
@@ -307,58 +304,56 @@ task<void> executor::write_pages_and_states(batch& b, batch_writes&& writes) {
 
 task<void> executor::refresh_views(batch& b) {
     std::size_t n_layers = cache.layer_count();
-    for (batch::group* g : b.groups()) {
-        for (const batch::entry& e : g->entries) {
-            request_state& req = *e.req;
-            req.finish_step();
-            if (req.has_exit_cause()) {
+    for (const batch_entry& e : b.entries) {
+        request_state& req = get_state(e.request_id);
+        req.finish_step();
+        if (req.has_exit_cause()) {
+            continue;
+        }
+        bool views_changed = release_passed_pages(req);
+        if (e.ends_cycle) {
+            req.sample_pages();
+            views_changed = evict(req) || views_changed;
+        }
+        if (views_changed) {
+            update_views(req);
+        }
+        if (e.ends_cycle) {
+            co_await write_cycle_end(req, *requests[e.request_id].callbacks);
+            req.start_next_cycle();
+        }
+        if (views_changed || e.ends_cycle) {
+            assert(req.unfinished_step_count() == 0);
+            stale_requests.push_back(e.request_id);
+        }
+        std::optional<std::size_t> first_stale_page;
+        if (views_changed || e.stores_head_state) {
+            first_stale_page = 0;
+        }
+        std::vector<std::size_t> missing_counts = req.missing_lines();
+        if (table_width_after(req, missing_counts) > view_page_capacity) {
+            req.exceed_context();
+            continue;
+        }
+        if (std::ranges::any_of(missing_counts, [](std::size_t count) { return count > 0; })) {
+            std::expected<std::vector<std::vector<std::uint32_t>>, page_error> allocation = cache.allocate(
+                missing_counts
+            );
+            if (!allocation) {
+                req.run_out_of_lines();
                 continue;
             }
-            bool views_changed = release_passed_pages(req);
-            if (e.ends_cycle) {
-                req.sample_pages();
-                views_changed = evict(req) || views_changed;
-            }
-            if (views_changed) {
-                update_views(req);
-            }
-            if (e.ends_cycle) {
-                co_await write_cycle_end(req, *requests[e.req.key()].callbacks);
-                req.start_next_cycle();
-            }
-            if (views_changed || e.ends_cycle) {
-                assert(req.unfinished_step_count() == 0);
-                stale_requests.push_back(e.req.key());
-            }
-            std::optional<std::size_t> first_stale_page;
-            if (views_changed || e.stores_head_state) {
-                first_stale_page = 0;
-            }
-            std::vector<std::size_t> missing_counts = req.missing_lines();
-            if (table_width_after(req, missing_counts) > view_page_capacity) {
-                req.exceed_context();
-                continue;
-            }
-            if (std::ranges::any_of(missing_counts, [](std::size_t count) { return count > 0; })) {
-                std::expected<std::vector<std::vector<std::uint32_t>>, page_error> allocation = cache.allocate(
-                    missing_counts
-                );
-                if (!allocation) {
-                    req.run_out_of_lines();
-                    continue;
+            for (std::size_t layer = 0; layer < n_layers; layer++) {
+                const std::size_t line_count = req.views()[layer].lines.size();
+                if (missing_counts[layer] > 0) {
+                    first_stale_page = std::min(first_stale_page.value_or(line_count), line_count);
                 }
-                for (std::size_t layer = 0; layer < n_layers; layer++) {
-                    const std::size_t line_count = req.views()[layer].lines.size();
-                    if (missing_counts[layer] > 0) {
-                        first_stale_page = std::min(first_stale_page.value_or(line_count), line_count);
-                    }
-                    req.add_lines(layer, (*allocation)[layer]);
-                }
-                record_device_memory(req);
+                req.add_lines(layer, (*allocation)[layer]);
             }
-            if (first_stale_page) {
-                mark_stale_tables(e.req.key(), *first_stale_page);
-            }
+            record_device_memory(req);
+        }
+        if (first_stale_page) {
+            mark_stale_tables(e.request_id, *first_stale_page);
         }
     }
 }

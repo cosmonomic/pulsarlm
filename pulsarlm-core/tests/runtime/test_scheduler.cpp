@@ -353,6 +353,8 @@ class sum_model final : public pulsarlm::model {
   public:
     std::vector<pulsarlm::kv_layer> layers = two_full_layers;
     std::size_t forward_count = 0;
+    // Per forward, its requests with one query token and its prefill chunks.
+    std::vector<std::pair<std::int64_t, std::int64_t>> forwarded_runs;
     std::vector<token_list> prefill_chunks;
     std::vector<std::int64_t> decode_sizes;
     // Each decode step's tokens, on the host.
@@ -371,21 +373,27 @@ class sum_model final : public pulsarlm::model {
         if (on_forward) {
             on_forward();
         }
-        if (b.kind == batch_kind::prefill) {
+        REQUIRE(b.per_query_state_request_count == 0);
+        const std::int64_t requests = b.cu_seqlens_q.size(0) - 1;
+        const std::int64_t decoding = b.single_query_request_count;
+        forwarded_runs.emplace_back(decoding, requests - decoding);
+        if (requests > decoding) {
             at::Tensor starts = b.cu_seqlens_q.cpu().to(at::kLong);
-            prefill_chunks.push_back(token_list(starts.size(0) - 1));
+            prefill_chunks.push_back(token_list(static_cast<std::size_t>(requests - decoding)));
             for (std::size_t s = 0; s < prefill_chunks.back().size(); s++) {
-                prefill_chunks.back()[s] = starts[s + 1].item<std::int64_t>() - starts[s].item<std::int64_t>();
+                const auto request = static_cast<std::int64_t>(s) + decoding;
+                prefill_chunks.back()[s] = starts[request + 1].item<std::int64_t>() -
+                    starts[request].item<std::int64_t>();
             }
         }
-        if (b.kind == batch_kind::decode) {
-            decode_sizes.push_back(b.tokens.size(0));
-            at::Tensor step_tokens = b.tokens.cpu().to(at::kLong).contiguous();
+        if (decoding > 0) {
+            decode_sizes.push_back(decoding);
+            at::Tensor step_tokens = b.tokens.narrow(0, 0, decoding).cpu().to(at::kLong).contiguous();
             decode_tokens.emplace_back(
                 step_tokens.data_ptr<std::int64_t>(),
                 step_tokens.data_ptr<std::int64_t>() + step_tokens.numel()
             );
-            decode_page_positions.push_back(b.page_positions.cpu());
+            decode_page_positions.push_back(b.page_positions.narrow(1, 0, decoding).cpu());
         }
         return output{.logits = predict(b, lines)};
     }
@@ -397,8 +405,7 @@ class sum_model final : public pulsarlm::model {
         at::Tensor all_tables = g.page_tables.cpu();
         at::Tensor all_page_positions = g.page_positions.cpu();
         at::Tensor key_counts = g.key_counts.cpu();
-        at::Tensor query_starts = g.kind == batch_kind::decode ? at::arange(all_tables.size(1) + 1, at::kInt)
-                                                               : g.cu_seqlens_q.cpu();
+        at::Tensor query_starts = g.cu_seqlens_q.cpu();
         auto position = positions.accessor<std::int64_t, 1>();
         auto page_position = all_page_positions.accessor<std::int32_t, 3>();
         auto key_count = key_counts.accessor<std::int32_t, 2>();
@@ -543,8 +550,7 @@ class sum_model final : public pulsarlm::model {
         at::Tensor tokens = g.tokens.cpu();
         at::Tensor history_positions = g.history_positions.cpu();
         at::Tensor rejected_tokens = g.rejected_tokens.cpu();
-        at::Tensor query_starts = g.kind == batch_kind::decode ? at::arange(rows.size(0) + 1, at::kInt)
-                                                               : g.cu_seqlens_q.cpu();
+        at::Tensor query_starts = g.cu_seqlens_q.cpu();
         at::Tensor states = lines.k.cpu();
         auto token = tokens.accessor<std::int64_t, 1>();
         auto history_position = history_positions.accessor<std::int64_t, 1>();
@@ -1921,6 +1927,81 @@ TEST_CASE("running requests are forwarded in one step") {
     REQUIRE(results[1].tokens == continuation(second, 3));
     REQUIRE(f.model.prefill_chunks == std::vector<token_list>{{3, 3}});
     REQUIRE(f.model.decode_sizes == std::vector<std::int64_t>{2, 2});
+}
+
+// The prefilling request's three chunks each run beside the decoding request's token, in one forward per step.
+TEST_CASE("a step of a decoding request and a prefilling one forwards both in one call") {
+    fixture f(32, 4);
+    token_list decoding_prompt{1};
+    token_list prefilling_prompt{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    std::vector<request_results> results = serve_all_at_once(
+        f,
+        {request{.tokens = decoding_prompt, .max_tokens = 4}, request{.tokens = prefilling_prompt, .max_tokens = 2}}
+    );
+
+    REQUIRE(results[0].tokens == continuation(decoding_prompt, 4));
+    REQUIRE(results[1].tokens == continuation(prefilling_prompt, 2));
+    REQUIRE(f.model.prefill_chunks == std::vector<token_list>{{4}, {4}, {4}});
+    REQUIRE(f.model.forward_count == f.model.forwarded_runs.size());
+    REQUIRE(f.model.forwarded_runs.size() >= 3);
+    for (std::size_t step = 0; step < 3; step++) {
+        INFO("step " << step);
+        REQUIRE(f.model.forwarded_runs[step] == std::pair<std::int64_t, std::int64_t>{1, 1});
+    }
+}
+
+// The decoding request measures its mass in the steps that forward the prefilling request's chunks beside it, each
+// request in a mass view of its own; each request's cycle-end states, their page mass included, are the ones it
+// reaches served alone.
+TEST_CASE("a request's page mass in steps beside a prefilling request equals its page mass in steps alone") {
+    const pulsarlm::eviction_policy policy{
+        .n_sink = 4,
+        .n_working = 4,
+        .cycle_tokens = 12,
+        .mass_tokens = 10,
+        .eviction_threshold = 0.5,
+        .eviction_warmup = 0,
+        .attention_mass_decay = 0.25,
+    };
+    const std::vector<request> requests{
+        request{.tokens = {1}, .max_tokens = 30, .eviction = policy},
+        request{
+            .tokens = token_list(eight_pages.begin(), eight_pages.begin() + 20),
+            .max_tokens = 10,
+            .eviction = policy
+        },
+    };
+    struct run {
+        std::vector<request_results> results;
+        std::vector<std::pair<std::int64_t, std::int64_t>> forwarded_runs;
+    };
+    const auto serve_requests = [](std::vector<request> served) {
+        fixture f(64, 4);
+        f.model.is_important = [](std::size_t layer, std::int64_t token) { return token % (layer + 3) == 0; };
+        std::vector<request_results> results = serve_all_at_once(f, std::move(served));
+        return run{.results = std::move(results), .forwarded_runs = f.model.forwarded_runs};
+    };
+    const auto same_state = [](const pulsarlm::state& got, const pulsarlm::state& expected) {
+        return got.head == expected.head && got.layers == expected.layers && got.tail == expected.tail;
+    };
+    const run joint_run = serve_requests(requests);
+    REQUIRE(std::ranges::any_of(joint_run.forwarded_runs, [](const std::pair<std::int64_t, std::int64_t>& runs) {
+        return runs.first > 0 && runs.second > 0;
+    }));
+    for (std::size_t r = 0; r < requests.size(); r++) {
+        INFO("request " << r);
+        const run separate_run = serve_requests({requests[r]});
+        const request_results& got = joint_run.results[r];
+        const request_results& expected = separate_run.results.front();
+        REQUIRE(got.tokens == expected.tokens);
+        REQUIRE(!expected.cycle_ends.empty());
+        REQUIRE(got.cycle_ends.size() == expected.cycle_ends.size());
+        for (std::size_t cycle = 0; cycle < expected.cycle_ends.size(); cycle++) {
+            INFO("cycle end " << cycle);
+            REQUIRE(same_state(*got.cycle_ends[cycle].state, *expected.cycle_ends[cycle].state));
+        }
+        REQUIRE(same_state(ended_state(got), ended_state(expected)));
+    }
 }
 
 // Each step is launched before the one before it is written back, page completions included: when the n-th step is

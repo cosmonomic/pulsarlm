@@ -66,15 +66,16 @@ class draft_head;
 
 class model {
   public:
-    enum class batch_kind { prefill, decode, verify };
-
-    // The rows a model computes in one call, concatenated across the sequences, and where they sit. Every KV layer has
-    // its own view of each sequence: a new token is written into its view page's line, at its view index. A token's
-    // RoPE position is the same in every KV layer. A prefill batch carries a ragged cu_seqlens_q; a decode batch has
-    // one row per sequence and leaves it undefined; a verify batch has each sequence's next token then its drafts, the
-    // same count per sequence, and one mass view per row. Only a model with a drafter receives a verify batch.
+    // The query tokens a model computes in one call, concatenated across the requests, and where they sit. The requests
+    // come in three runs: requests with one query token, then requests that keep a recurrent state and a mass view per
+    // query token, then prefill chunks. Every KV layer has its own view of each request: a new token is written into
+    // its view page's line, at its view index. A token's RoPE position is the same in every KV layer.
     struct batch {
-        batch_kind kind;
+        // Requests [0, single_query_request_count) have one query token.
+        std::int64_t single_query_request_count = 0;
+        // The next per_query_state_request_count requests keep a recurrent state and a mass view per query token, and
+        // each has state_slots query tokens. Only a model with a draft head receives such requests.
+        std::int64_t per_query_state_request_count = 0;
         at::Tensor tokens;
         // int64 [ntok]: each token's RoPE position.
         at::Tensor pos;
@@ -88,17 +89,27 @@ class model {
         std::int64_t page_size = 0;
         // The slots of a recurrent layer keeping a state; a window layer keeps one.
         std::int64_t state_slots = 1;
-        // int32 [num_seqs + 1]; prefill and verify batches only.
+        // int32 [num_seqs + 1]: sequence s's query tokens are [cu_seqlens_q[s], cu_seqlens_q[s + 1]).
         at::Tensor cu_seqlens_q;
+        // int32 [num_seqs - single_query_request_count + 1]: cu_seqlens_q of the sequences from the second run on, less
+        // the first run's query tokens.
+        at::Tensor cu_seqlens_q_from_second_run;
+        // int32 [num_seqs - single_query_request_count - per_query_state_request_count + 1]: cu_seqlens_q of the third
+        // run's sequences, less the query tokens of the first two runs.
+        at::Tensor cu_seqlens_q_from_third_run;
+        // int32 [single_query_request_count + per_query_state_request_count]: the trailing query tokens whose recurrent
+        // state each request of the first two runs keeps (gated_delta_rule_step_cuda's kept_state_counts), 1 in the
+        // first run and state_slots in the second. Undefined in a draft head's batch, which reaches no recurrent layer.
+        at::Tensor kept_state_counts;
         // int32 [n_kv_layers, num_seqs]: the keys in sequence s's view in KV layer l, the batch's tokens included.
         at::Tensor key_counts;
         // int32 [n_kv_layers, num_seqs, max_pages], laid out as page_tables: the RoPE position of the first key of
         // sequence s's view pages in KV layer l (see attn_decode_cuda).
         at::Tensor page_positions;
-        // int32 [n_kv_layers, num_seqs + 1], defined when the forward measures attention mass: sequence s's view pages
-        // in KV layer l are the rows [cu_view_pages[l, s], cu_view_pages[l, s + 1]) of page_mass_sum[l] and
-        // page_weight_sum[l], at least as many as its keys fill. A verify batch has [n_kv_layers, tokens + 1], one view
-        // per row.
+        // int32 [n_kv_layers, mass views + 1], defined when the forward measures attention mass: mass view v's pages
+        // in KV layer l are the rows [cu_view_pages[l, v], cu_view_pages[l, v + 1]) of page_mass_sum[l] and
+        // page_weight_sum[l], at least as many as its sequence's keys fill. A sequence of the second run has a mass
+        // view per query token, any other sequence one, in the order of the query tokens.
         at::Tensor cu_view_pages;
         // Per KV layer, fp32 [total_view_pages of the layer, n_readers * n_q_heads of the layer] and [total_view_pages
         // of the layer], zeroed by the caller, or undefined for a layer that measures no mass. The forward sets each
@@ -109,17 +120,17 @@ class model {
         std::vector<at::Tensor> page_weight_sum;
         // fp32 [ntok], defined with cu_view_pages: each token's query weight.
         at::Tensor query_weights;
-        // int64 [n]: the rows whose logits the forward returns, in order. Undefined returns every row's.
-        at::Tensor logit_rows;
+        // int64 [logit tokens]: the query tokens whose logits the forward returns, in order.
+        at::Tensor logit_tokens;
         // int32 zeros, at least the model's arrival_counter_count for the batch: the arrival counters of its ops
         // (kernels/arrival_counters.cuh). The batches of one stream's steps may share them.
         at::Tensor arrival_counters;
     };
 
-    // The logits [rows, vocab] in the model's dtype of the batch's logit rows.
+    // The logits [logit tokens, vocab] in the model's dtype of the batch's logit tokens.
     struct output {
         at::Tensor logits;
-        // The hidden rows of every row; undefined for a model without a draft head.
+        // The hidden rows of every query token; undefined for a model without a draft head.
         at::Tensor hidden;
     };
 
@@ -165,7 +176,7 @@ class draft_head {
     virtual model::output draft(const model::batch& b, const at::Tensor& hidden, std::span<const kv> lines) = 0;
 };
 
-// b.cu_seqlens_q is defined exactly when b.kind is not decode.
+// b's runs lie within its sequences, and its query starts are defined.
 void check_batch(const model::batch& b);
 
 }  // namespace pulsarlm

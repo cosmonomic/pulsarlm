@@ -23,8 +23,9 @@ rope_q(const at::Tensor& q, const at::Tensor& pos, int64_t n_q_heads, int64_t he
 // head_dim]. Undefined k and v leave the lines as they are, for a layer reading another layer's KV. sliding_window and
 // k_norm_weight are as attention_layer holds them. When g.page_mass_sum[kv_layer] is defined, the layer writes the
 // mass_sum attn_prefill_cuda measures into reader's columns of it, reader being the layer's index among those reading
-// kv_layer, and reader 0 writes the weight_sum into g.page_weight_sum[kv_layer]. In a verify batch each query measures
-// its mass in a view of its own (attn_prefill_cuda's per_query_mass_request_count).
+// kv_layer, and reader 0 writes the weight_sum into g.page_weight_sum[kv_layer]. The first run attends by
+// attn_decode_cuda, the later runs together by attn_prefill_cuda, each query token of the second run measuring its mass
+// in a view of its own (per_query_mass_request_count).
 at::Tensor paged_attention(
     const at::Tensor& q,
     const at::Tensor& k,
@@ -39,14 +40,19 @@ at::Tensor paged_attention(
     const std::optional<at::Tensor>& k_norm_weight = std::nullopt
 );
 
-// Writes the hidden rows [rows of g, hidden] at each sequence's last row of g and at each of its rows ending a page into
-// the last_hidden of line, KV layer kv_layer's, so a line keeps the hidden row at the latest position written into it.
+// Writes the hidden rows [query tokens of g, hidden] at each sequence's last query token of g and at each of its query
+// tokens ending a page into the last_hidden of line, KV layer kv_layer's, so a line keeps the hidden row at the latest
+// position written into it.
 void keep_last_hidden(const model::batch& g, const at::Tensor& hidden, const kv& line, std::size_t kv_layer);
 
-// The state rows of g of KV layer kv_layer, a recurrent layer keeping a state.
-state_rows state_layer_rows(const model::batch& g, std::size_t kv_layer);
-// The state rows of g of KV layer kv_layer, a recurrent layer keeping a window of inputs.
-state_rows window_layer_rows(const model::batch& g, std::size_t kv_layer);
+// The state rows of g's sequences [first, first + count) of KV layer kv_layer, a recurrent layer keeping a state.
+state_rows state_layer_rows(const model::batch& g, std::size_t kv_layer, std::int64_t first, std::int64_t count);
+// The state rows of g's sequences [first, first + count) of KV layer kv_layer, a recurrent layer keeping a window of
+// inputs.
+state_rows window_layer_rows(const model::batch& g, std::size_t kv_layer, std::int64_t first, std::int64_t count);
+
+// The query tokens of g's first two runs, which the step kernels of the recurrent layers run.
+std::int64_t count_step_tokens(const model::batch& g);
 
 // The projected rows of a Gated DeltaNet sublayer.
 struct gated_deltanet_inputs {
@@ -65,7 +71,8 @@ struct gated_deltanet_weights {
 };
 
 // The gated outputs of a Gated DeltaNet sublayer for the projected rows of b. Writes the layer's state and
-// convolution window into their lines.
+// convolution window into their lines. The first two runs go through the step ops, keeping b.kept_state_counts states,
+// and the third run through the chunked ops.
 at::Tensor gated_deltanet(
     const model::batch& b,
     const gated_deltanet_inputs& projected,
@@ -79,7 +86,7 @@ at::Tensor gated_deltanet(
     gate_activation activation
 );
 
-// The rows of x whose logits g asks for.
+// The rows of x at g's logit tokens.
 at::Tensor logit_inputs(const at::Tensor& x, const model::batch& g);
 
 }  // namespace pulsarlm

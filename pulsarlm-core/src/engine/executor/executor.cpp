@@ -60,7 +60,6 @@ executor::executor(
   root(root),
   stop_ids(std::move(stop_ids)),
   view_page_capacity(view_page_capacity),
-  graph_pages(graph_pages),
   max_running_requests(max_running_requests),
   draft_state_slots(draft_tokens + 1),
   sampled_row_capacity(sampled_row_limit) {
@@ -163,13 +162,13 @@ executor::executor(
         s.table.top_k = at::zeros({slots}, options.dtype(at::kLong));
         s.table.top_p = at::zeros({slots}, options.dtype(at::kFloat));
     }
-    if (this->graph_pages) {
+    if (graph_pages) {
         for (shard& s : shards) {
             c10::cuda::CUDAGuard device_guard(s.lines.front().k.device());
             s.graphs = std::make_unique<step_graphs>(
                 *s.model,
                 s.lines,
-                *this->graph_pages,
+                *graph_pages,
                 layout.page_size,
                 draft_state_slots,
                 s.mass_heads,
@@ -188,22 +187,6 @@ executor::~executor() {
     }
     // The memory pools of destroyed graphs stay reserved by the caching allocator until its cache is emptied.
     c10::cuda::CUDACachingAllocator::emptyCache();
-}
-
-executor::request_ref::request_ref(executor& owner, request_id_type id) noexcept
-: owner(&owner),
-  id(id) {}
-
-request_state& executor::request_ref::operator*() const {
-    return owner->get_state(id);
-}
-
-request_state* executor::request_ref::operator->() const {
-    return &**this;
-}
-
-executor::request_id_type executor::request_ref::key() const noexcept {
-    return id;
 }
 
 request_state& executor::get_state(request_id_type id) {
@@ -475,59 +458,60 @@ bool executor::is_launchable(std::span<const scheduled_request> scheduled) const
     return launched_batches.empty() || allows_overlap(scheduled);
 }
 
-// A verify entry's tokens are accepted, and its samples taken, at its write-back. Its pending token and drafts are
-// awaited_token until then, and a request whose previous step is launched lags it by up to that step's drafts. An
-// entry whose request reads its last hidden vector is outside the verify group and lags no step.
+// The tokens of an entry of the second run are accepted, and its samples taken, at its write-back. Its pending token
+// and drafts are awaited_token until then, and a request whose previous step is launched lags it by up to that step's
+// drafts. An entry whose request reads its last hidden vector is outside the second run and lags no step.
 void executor::advance(batch& b) {
     const std::size_t draft_count = draft_state_slots - 1;
+    std::size_t prior_hidden_count = 0;
     if (draft_layer) {
         b.draft_count = draft_count;
-        for (batch::group* g : b.groups()) {
-            for (batch::entry& e : g->entries) {
-                if (e.req->reads_last_hidden() && e.req->history_position() > 0) {
-                    e.prior_hidden_index = b.prior_hidden_slots.size();
-                    b.prior_hidden_slots.push_back(static_cast<std::int64_t>(get_slot(e.req.key())));
-                }
+        for (const batch_entry& e : b.entries) {
+            const request_state& req = get_state(e.request_id);
+            if (req.reads_last_hidden() && req.history_position() > 0) {
+                prior_hidden_count++;
             }
         }
     }
-    std::size_t first_hidden_row = 1 + b.prior_hidden_slots.size();
-    for (batch::group* g : b.groups()) {
-        const bool verifies = g == &b.verify_group;
-        for (batch::entry& e : g->entries) {
-            request_state& req = *e.req;
-            const std::size_t lag = req.unfinished_step_count() > 0 ? draft_count : 0;
-            e.is_measured = batch::measures_mass(e);
-            e.start_position = req.history_position();
-            bool drafts = false;
-            bool next_row = false;
-            if (draft_layer) {
-                const std::optional<std::size_t>& token_limit = req.token_limit();
-                const bool ends_request = e.is_sampling ? token_limit && req.prepared_sample_count() + 1 >= *token_limit
-                                                        : req.pending_token_list().size() == e.token_count;
-                next_row = verifies || (!e.ends_cycle && !ends_request);
-                // The next step's verify group then ends neither the cycle nor max_tokens, whatever this one accepts.
-                drafts = next_row && (verifies || e.is_sampling) &&
-                    req.cycle_tokens_left() >= batch::forwarded(e) + lag + draft_count + 2;
-                b.plan_draft_rows(e, verifies, first_hidden_row, next_row, drafts);
-                first_hidden_row += batch::forwarded(e);
-                if (verifies) {
-                    const std::size_t remaining = token_limit ? *token_limit - req.prepared_sample_count()
-                                                              : b.verify_rows;
-                    e.max_accepted_token_count = std::clamp<std::size_t>(remaining, 1, b.verify_rows);
-                }
+    std::size_t first_hidden_row = 1 + prior_hidden_count;
+    for (std::size_t index = 0; index < b.entries.size(); index++) {
+        batch_entry& e = b.entries[index];
+        request_state& req = get_state(e.request_id);
+        const bool verifies = b.verifies(index);
+        const std::size_t lag = req.unfinished_step_count() > 0 ? draft_count : 0;
+        const std::size_t token_count = verifies ? 1 : e.query_token_count;
+        e.is_measured = batch::measures_mass(req, e.query_token_count);
+        e.start_position = req.history_position();
+        bool drafts = false;
+        bool next_row = false;
+        if (draft_layer) {
+            std::optional<std::size_t> prior_hidden_index;
+            if (req.reads_last_hidden() && req.history_position() > 0) {
+                prior_hidden_index = b.prior_hidden_slots.size();
+                b.prior_hidden_slots.push_back(static_cast<std::int64_t>(get_slot(e.request_id)));
             }
+            const std::optional<std::size_t>& token_limit = req.token_limit();
+            const bool samples = e.first_sample_index.has_value();
+            const bool ends_request = samples ? token_limit && req.prepared_sample_count() + 1 >= *token_limit
+                                              : req.pending_token_list().size() == token_count;
+            next_row = verifies || (!e.ends_cycle && !ends_request);
+            // The next step's verifying entry then ends neither the cycle nor max_tokens, whatever this one accepts.
+            drafts = next_row && (verifies || samples) &&
+                req.cycle_tokens_left() >= e.query_token_count + lag + draft_count + 2;
+            b.plan_draft_rows(e, req, verifies, first_hidden_row, prior_hidden_index, next_row, drafts);
+            first_hidden_row += e.query_token_count;
             if (verifies) {
-                e.end_position = req.history_position();
-                e.sampled_position = req.history_position() + e.token_count;
-                req.launch_verify_step(e.token_count, drafts ? draft_count : 0);
-            } else {
-                e.end_position = req.history_position() + e.token_count;
-                e.sampled_position = req.history_position() + req.pending_token_list().size();
-                req.launch_step(e.token_count, e.is_sampling, drafts ? draft_count : 0, next_row);
+                const std::size_t remaining = token_limit ? *token_limit - req.prepared_sample_count()
+                                                          : e.query_token_count;
+                e.max_accepted_token_count = std::clamp<std::size_t>(remaining, 1, e.query_token_count);
             }
-            e.ends_request = !verifies && req.has_launched_last_step();
         }
+        if (verifies) {
+            req.launch_verify_step(token_count, drafts ? draft_count : 0);
+        } else {
+            req.launch_step(token_count, e.first_sample_index.has_value(), drafts ? draft_count : 0, next_row);
+        }
+        e.ends_request = !verifies && req.has_launched_last_step();
     }
 }
 
@@ -543,10 +527,8 @@ task<void> executor::launch(std::span<const scheduled_request> scheduled) {
     move_stale_tables(*b);
     move_stale_requests(*b);
     advance(*b);
-    for (batch::group* g : b->groups()) {
-        g->mass_by_shard.assign(shards.size(), at::Tensor());
-        g->hidden_by_shard.assign(shards.size(), at::Tensor());
-    }
+    b->mass_by_shard.assign(shards.size(), at::Tensor());
+    b->hidden_by_shard.assign(shards.size(), at::Tensor());
     b->shard_prior_hidden.assign(shards.size(), at::Tensor());
     b->verify_tokens.assign(shards.size(), at::Tensor());
     b->accepted_token_counts_by_shard.assign(shards.size(), at::Tensor());

@@ -34,7 +34,7 @@ namespace {
 // b with its own arrival counters, as many as model needs for it.
 pulsarlm::model::batch with_arrival_counters(pulsarlm::model::batch b, const pulsarlm::model& model) {
     const std::int64_t tokens = b.tokens.size(0);
-    const std::int64_t sequences = b.kind == pulsarlm::model::batch_kind::decode ? tokens : b.cu_seqlens_q.size(0) - 1;
+    const std::int64_t sequences = b.cu_seqlens_q.size(0) - 1;
     b.arrival_counters = at::zeros(
         {model.arrival_counter_count(sequences, tokens)},
         b.tokens.options().dtype(at::kInt)
@@ -635,7 +635,7 @@ pulsarlm::model::batch step(
     auto n_kv_layers = static_cast<std::int64_t>(specs.size());
     auto key_count = int32_cuda({static_cast<std::int32_t>(last)}).expand({n_kv_layers, 1}).contiguous();
     pulsarlm::model::batch g{
-        .kind = prefill ? pulsarlm::model::batch_kind::prefill : pulsarlm::model::batch_kind::decode,
+        .single_query_request_count = prefill ? 0 : 1,
         .tokens = tokens.narrow(0, first, last - first),
         .pos = at::arange(first, last, cuda(at::kLong)),
         .page_tables = int32_cuda(rows).view({n_kv_layers, 1, -1}),
@@ -648,9 +648,11 @@ pulsarlm::model::batch step(
                               .contiguous(),
     };
     g.key_counts = key_count;
-    if (prefill) {
-        g.cu_seqlens_q = int32_cuda({0, static_cast<std::int32_t>(last - first)});
-    }
+    g.cu_seqlens_q = int32_cuda({0, static_cast<std::int32_t>(last - first)});
+    g.cu_seqlens_q_from_second_run = prefill ? g.cu_seqlens_q : int32_cuda({0});
+    g.cu_seqlens_q_from_third_run = g.cu_seqlens_q_from_second_run;
+    g.kept_state_counts = prefill ? int32_cuda({}) : int32_cuda({1});
+    g.logit_tokens = at::arange(last - first, cuda(at::kLong));
     return g;
 }
 
@@ -833,7 +835,7 @@ held_rows(const at::Tensor& full, std::int64_t dim, const std::vector<std::pair<
 }
 
 // In an engine drafting draft_tokens tokens, the layers keep their states' slots and their windows' inputs too, which
-// ordinary groups leave unread.
+// steps without drafts leave unread.
 void check_against_dense(
     at::ScalarType dtype,
     double tolerance,
@@ -1184,26 +1186,30 @@ TEST_CASE("Qwen4-Exp drafts as a dense MTP layer a position after each row", "[m
     }
 }
 
-// A verify group of the tokens at [first, last), the previous step having forwarded rejected tokens it did not accept, in
-// an engine drafting draft_tokens tokens.
+// A request verifying the draft_tokens + 1 tokens at [first, first + draft_tokens + 1), the previous step having
+// forwarded rejected tokens it did not accept, in an engine drafting draft_tokens tokens.
 pulsarlm::model::batch verify_batch(
     const at::Tensor& tokens,
     std::int64_t first,
-    std::int64_t last,
     std::int64_t rejected,
     const std::vector<pulsarlm::kv_layer>& specs,
     std::int64_t draft_tokens
 ) {
-    pulsarlm::model::batch batch = step(tokens, first, last, true, specs, draft_tokens);
-    batch.kind = pulsarlm::model::batch_kind::verify;
+    pulsarlm::model::batch batch = step(tokens, first, first + draft_tokens + 1, true, specs, draft_tokens);
+    batch.per_query_state_request_count = 1;
+    batch.cu_seqlens_q_from_third_run = int32_cuda({0});
+    batch.kept_state_counts = int32_cuda({static_cast<std::int32_t>(draft_tokens + 1)});
     batch.rejected_tokens = int32_cuda({static_cast<std::int32_t>(rejected)});
     return batch;
 }
 
-// Verify groups after a prefill: one keeping all its tokens, one whose drafts are wrong and keep only its first, then
-// one continuing after that first token and a shorter one ending page 2; each row's logits are the dense forward's,
-// and the layers end with its state.
-TEST_CASE("Qwen4-Exp's verify groups match a dense forward and continue from their accepted tokens", "[model][cuda]") {
+// Verifying requests after a prefill: one keeping all its tokens, one whose drafts are wrong and keep only its first,
+// then one continuing after that first token whose last draft is wrong, and one continuing after its first two tokens
+// through page 2; each matching row's logits are the dense forward's, and the layers end with its state.
+TEST_CASE(
+    "Qwen4-Exp's verifying requests match a dense forward and continue from their accepted tokens",
+    "[model][cuda]"
+) {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
@@ -1224,26 +1230,27 @@ TEST_CASE("Qwen4-Exp's verify groups match a dense forward and continue from the
     dense_output dense = dense_forward(w, token_ids, experts_per_token, budget);
     at::Tensor wrong_drafts = tokens.clone();
     wrong_drafts.narrow(0, 44, 2).copy_(at::remainder(tokens.narrow(0, 44, 2) + 1, vocab));
+    at::Tensor wrong_last_draft = tokens.clone();
+    wrong_last_draft.narrow(0, 46, 1).copy_(at::remainder(tokens.narrow(0, 46, 1) + 1, vocab));
 
     pulsarlm::model::batch prefill = step(tokens, 0, 40, true, specs, draft_tokens);
     model.forward(with_arrival_counters(prefill, model), kv);
 
     struct verify_step {
         std::int64_t first;
-        std::int64_t last;
         std::int64_t rejected;
         const at::Tensor& tokens;
         std::int64_t matching_rows;
     };
     for (const verify_step& v : {
-             verify_step{40, 43, 0, tokens, 3},
-             verify_step{43, 46, 0, wrong_drafts, 1},
-             verify_step{44, 47, 2, tokens, 3},
-             verify_step{47, 49, 0, tokens, 2},
+             verify_step{40, 0, tokens, 3},
+             verify_step{43, 0, wrong_drafts, 1},
+             verify_step{44, 2, wrong_last_draft, 2},
+             verify_step{46, 1, tokens, 3},
          }) {
-        INFO("verify [" << v.first << ", " << v.last << ") after " << v.rejected << " rejected");
+        INFO("verify [" << v.first << ", " << v.first + draft_tokens + 1 << ") after " << v.rejected << " rejected");
         pulsarlm::model::output output = model.forward(
-            with_arrival_counters(verify_batch(v.tokens, v.first, v.last, v.rejected, specs, draft_tokens), model),
+            with_arrival_counters(verify_batch(v.tokens, v.first, v.rejected, specs, draft_tokens), model),
             kv
         );
         REQUIRE(output.logits.defined());

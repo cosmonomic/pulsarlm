@@ -130,7 +130,7 @@ qwen3_model::attention(const at::Tensor& h, std::int64_t layer, const batch& g, 
 
 model::output qwen3_model::forward(const batch& b, std::span<const kv> lines) {
     check_batch(b);
-    assert(b.kind != batch_kind::verify);
+    assert(b.per_query_state_request_count == 0);
     const double eps = config.rms_norm_eps;
     at::Tensor x = embed_tokens.index_select(0, b.tokens);
     for (std::int64_t layer = 0; layer < config.n_layers; layer++) {

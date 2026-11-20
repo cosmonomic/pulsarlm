@@ -718,23 +718,25 @@ TEST_CASE("decode graphs sample as the eager forward while steps overlap", "[run
     check_same_state(replayed.end_state, eager.end_state);
 }
 
-// Counts the decode groups it forwards of more sequences than step_graphs captures at startup.
-class wide_group_counting_model final : public pulsarlm::qwen3_5_model {
+// Counts the batches it forwards of requests with one query token each, more of them than step_graphs captures at
+// startup.
+class wide_batch_counting_model final : public pulsarlm::qwen3_5_model {
   public:
-    std::shared_ptr<std::atomic<std::size_t>> wide_decode_group_count = std::make_shared<std::atomic<std::size_t>>(0);
+    std::shared_ptr<std::atomic<std::size_t>> wide_decode_batch_count = std::make_shared<std::atomic<std::size_t>>(0);
 
     using pulsarlm::qwen3_5_model::qwen3_5_model;
 
     output forward(const batch& b, std::span<const pulsarlm::kv> lines) override {
-        if (b.kind == batch_kind::decode && b.page_tables.size(1) > pulsarlm::step_graphs::startup_sequences) {
-            (*wide_decode_group_count)++;
+        const std::int64_t requests = b.page_tables.size(1);
+        if (b.single_query_request_count == requests && requests > pulsarlm::step_graphs::startup_sequences) {
+            (*wide_decode_batch_count)++;
         }
         return pulsarlm::qwen3_5_model::forward(b, lines);
     }
 };
 
 // A graph of more sequences than the startup graphs is captured in the step that first needs it and replayed after:
-// with graphs the model forwards such a group only at a capture.
+// with graphs the model forwards such a batch only at a capture.
 TEST_CASE("decode graphs captured during a step sample as the eager forward", "[runtime][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
@@ -743,11 +745,11 @@ TEST_CASE("decode graphs captured during a step sample as the eager forward", "[
     const c10::Dict<std::string, at::Tensor> weights = full_weights(n_kv_heads);
     struct run {
         std::vector<served> all;
-        std::size_t wide_decode_group_count;
+        std::size_t wide_decode_batch_count;
     };
     const auto serve_all = [&](bool decode_graphs) {
-        auto model = std::make_unique<wide_group_counting_model>(model_config(n_kv_heads), weights);
-        std::shared_ptr<std::atomic<std::size_t>> wide_decode_group_count = model->wide_decode_group_count;
+        auto model = std::make_unique<wide_batch_counting_model>(model_config(n_kv_heads), weights);
+        std::shared_ptr<std::atomic<std::size_t>> wide_decode_batch_count = model->wide_decode_batch_count;
         auto store = std::make_unique<memory_store>();
         store->contents = std::make_shared<store_contents>();
         pulsarlm::engine e(std::move(model), vocab, engine_config(1, decode_graphs), std::move(store));
@@ -772,7 +774,7 @@ TEST_CASE("decode graphs captured during a step sample as the eager forward", "[
             REQUIRE(results->end->has_value());
             finished.all.push_back(served{.tokens = results->tokens, .end_state = std::move(**results->end)});
         }
-        finished.wide_decode_group_count = *wide_decode_group_count;
+        finished.wide_decode_batch_count = *wide_decode_batch_count;
         return finished;
     };
     const run eager = serve_all(false);
@@ -784,21 +786,21 @@ TEST_CASE("decode graphs captured during a step sample as the eager forward", "[
         CHECK(replayed.all[s].tokens == eager.all[s].tokens);
         check_same_state(replayed.all[s].end_state, eager.all[s].end_state);
     }
-    CHECK(replayed.wide_decode_group_count > 0);
-    CHECK(replayed.wide_decode_group_count < eager.wide_decode_group_count);
+    CHECK(replayed.wide_decode_batch_count > 0);
+    CHECK(replayed.wide_decode_batch_count < eager.wide_decode_batch_count);
 }
 
-// Counts the decode groups it forwards by their number of requests, below 64.
-class decode_group_counting_model final : public pulsarlm::qwen3_5_model {
+// Counts the batches of requests with one query token each it forwards, by their number of requests, below 64.
+class decode_batch_counting_model final : public pulsarlm::qwen3_5_model {
   public:
     using counts_type = std::array<std::atomic<std::size_t>, 64>;
-    std::shared_ptr<counts_type> decode_group_counts = std::make_shared<counts_type>();
+    std::shared_ptr<counts_type> decode_batch_counts = std::make_shared<counts_type>();
 
     using pulsarlm::qwen3_5_model::qwen3_5_model;
 
     output forward(const batch& b, std::span<const pulsarlm::kv> lines) override {
-        if (b.kind == batch_kind::decode) {
-            (*decode_group_counts)[static_cast<std::size_t>(b.page_tables.size(1))]++;
+        if (b.single_query_request_count == b.page_tables.size(1)) {
+            (*decode_batch_counts)[static_cast<std::size_t>(b.page_tables.size(1))]++;
         }
         return pulsarlm::qwen3_5_model::forward(b, lines);
     }
@@ -806,12 +808,12 @@ class decode_group_counting_model final : public pulsarlm::qwen3_5_model {
 
 struct counted_engine {
     std::unique_ptr<pulsarlm::engine> engine;
-    std::shared_ptr<decode_group_counting_model::counts_type> decode_group_counts;
+    std::shared_ptr<decode_batch_counting_model::counts_type> decode_batch_counts;
 };
 
 counted_engine make_counted_engine(const c10::Dict<std::string, at::Tensor>& weights, bool decode_graphs) {
-    auto model = std::make_unique<decode_group_counting_model>(model_config(n_kv_heads), weights);
-    std::shared_ptr<decode_group_counting_model::counts_type> counts = model->decode_group_counts;
+    auto model = std::make_unique<decode_batch_counting_model>(model_config(n_kv_heads), weights);
+    std::shared_ptr<decode_batch_counting_model::counts_type> counts = model->decode_batch_counts;
     auto store = std::make_unique<memory_store>();
     store->contents = std::make_shared<store_contents>();
     return counted_engine{
@@ -821,11 +823,11 @@ counted_engine make_counted_engine(const c10::Dict<std::string, at::Tensor>& wei
             engine_config(1, decode_graphs),
             std::move(store)
         ),
-        .decode_group_counts = std::move(counts),
+        .decode_batch_counts = std::move(counts),
     };
 }
 
-std::size_t total_count(const decode_group_counting_model::counts_type& counts) {
+std::size_t total_count(const decode_batch_counting_model::counts_type& counts) {
     std::size_t total = 0;
     for (const std::atomic<std::size_t>& count : counts) {
         total += count;
@@ -874,8 +876,8 @@ std::vector<pulsarlm::request> decoding_requests(std::size_t request_count, bool
 
 // A step of decode entries alone that all sample replays a whole-step graph per number of requests and per sampling
 // kind, captured at startup for the unfiltered steps of up to step_graphs::startup_sequences requests: with graphs the
-// model forwards a decode group of 3 requests only to capture the filtered step of 3, and one of 12 only to capture the
-// unfiltered step of 12 and then the filtered one. The requests measure no mass, and the steps overlap while no
+// model forwards a batch of 3 decoding requests only to capture the filtered step of 3, and one of 12 only to capture
+// the unfiltered step of 12 and then the filtered one. The requests measure no mass, and the steps overlap while no
 // request ends a cycle.
 TEST_CASE("decode steps replayed from whole-step graphs sample as the eager forward", "[runtime][cuda]") {
     if (c10::cuda::device_count() == 0) {
@@ -891,7 +893,7 @@ TEST_CASE("decode steps replayed from whole-step graphs sample as the eager forw
     };
     for (const phase p : {phase{3, true, 80}, phase{12, false, 40}, phase{12, true, 60}}) {
         INFO(p.request_count << (p.filters ? " filtered" : " unfiltered") << " requests");
-        const std::size_t captures_before = (*replayed.decode_group_counts)[p.request_count];
+        const std::size_t captures_before = (*replayed.decode_batch_counts)[p.request_count];
         const std::vector<served> replayed_runs = serve_together(
             *replayed.engine,
             decoding_requests(p.request_count, p.filters, p.seed)
@@ -906,17 +908,15 @@ TEST_CASE("decode steps replayed from whole-step graphs sample as the eager forw
             CHECK(replayed_runs[s].tokens == eager_runs[s].tokens);
             check_same_state(replayed_runs[s].end_state, eager_runs[s].end_state);
         }
-        CHECK((*replayed.decode_group_counts)[p.request_count] - captures_before == 1);
+        CHECK((*replayed.decode_batch_counts)[p.request_count] - captures_before == 1);
     }
 }
 
-// While one request prefills a long prompt over many steps, another decodes beside it, its decode group replayed from
-// a startup graph while its previous step is still launched, as no request ends a cycle: with graphs the model forwards
-// no decode group after the startup.
-TEST_CASE(
-    "decode groups replayed beside a prefill sample as the eager forward while steps overlap",
-    "[runtime][cuda]"
-) {
+// While one request prefills a long prompt over many steps, another decodes beside it in the same forward, which runs
+// without a graph, while its previous step is still launched, as no request ends a cycle. The steps of decoding
+// requests alone replay decode steps: with graphs the model forwards no batch of decoding requests alone after the
+// startup.
+TEST_CASE("decode steps beside a prefill sample as the eager forward while steps overlap", "[runtime][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
@@ -936,8 +936,8 @@ TEST_CASE(
     };
     counted_engine eager = make_counted_engine(weights, false);
     counted_engine replayed = make_counted_engine(weights, true);
-    const std::size_t eager_before = total_count(*eager.decode_group_counts);
-    const std::size_t replayed_before = total_count(*replayed.decode_group_counts);
+    const std::size_t eager_before = total_count(*eager.decode_batch_counts);
+    const std::size_t replayed_before = total_count(*replayed.decode_batch_counts);
     const std::vector<served> eager_runs = serve_together(*eager.engine, requests());
     const std::vector<served> replayed_runs = serve_together(*replayed.engine, requests());
     for (std::size_t s = 0; s < eager_runs.size(); s++) {
@@ -946,8 +946,8 @@ TEST_CASE(
         CHECK(replayed_runs[s].tokens == eager_runs[s].tokens);
         check_same_state(replayed_runs[s].end_state, eager_runs[s].end_state);
     }
-    CHECK(total_count(*eager.decode_group_counts) > eager_before);
-    CHECK(total_count(*replayed.decode_group_counts) == replayed_before);
+    CHECK(total_count(*eager.decode_batch_counts) > eager_before);
+    CHECK(total_count(*replayed.decode_batch_counts) == replayed_before);
 }
 
 // The drafting engine's layers are the other's then the MTP layer's, and its root digest differs with its layout, so

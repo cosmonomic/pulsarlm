@@ -38,13 +38,13 @@ at::Tensor spaced_pool(const std::vector<int64_t>& line_sizes, at::ScalarType dt
         .view(sizes);
 }
 
-enum class group_kind { prefill, decode, verify };
+enum class case_kind { prefill, decode, verify };
 
 struct ragged_case {
     std::vector<int32_t> counts;
     std::vector<int64_t> history_positions;
     std::vector<int32_t> rejected;
-    group_kind kind;
+    case_kind kind;
 
     int64_t total() const {
         int64_t total = 0;
@@ -66,10 +66,11 @@ struct ragged_case {
         return int32_cuda(starts);
     }
 
-    // A verify group keeps the state after each of its tokens, any other the state after its last.
+    // A batch of requests verifying drafts keeps the state after each of their tokens, any other the state after the
+    // last.
     at::Tensor kept_state_counts() const {
-        return kind == group_kind::verify ? int32_cuda(counts)
-                                          : at::ones({num_seqs()}, at::device(at::kCUDA).dtype(at::kInt));
+        return kind == case_kind::verify ? int32_cuda(counts)
+                                         : at::ones({num_seqs()}, at::device(at::kCUDA).dtype(at::kInt));
     }
 
     // The tokens of sequence s up to the newest page end among them, 0 when none ends a page.
@@ -130,7 +131,7 @@ ragged_case prefill_case() {
         .counts = {1, 2, 5, 7, 140},
         .history_positions = {15, 30, 0, 13, 0},
         .rejected = {0, 1, 2, 0, 1},
-        .kind = group_kind::prefill,
+        .kind = case_kind::prefill,
     };
 }
 
@@ -139,17 +140,18 @@ ragged_case decode_case() {
         .counts = {1, 1, 1, 1, 1},
         .history_positions = {3, 15, 4, 31, 47},
         .rejected = {0, 1, 2, 0, 1},
-        .kind = group_kind::decode,
+        .kind = case_kind::decode,
     };
 }
 
-// A verify group of fewer tokens per sequence than slot_count, as when a step drafts fewer tokens than the layout allows.
+// Requests verifying fewer tokens per sequence than slot_count, as when a step drafts fewer tokens than the layout
+// allows.
 ragged_case short_verify_case() {
     return {
         .counts = {2, 2, 2, 2, 2},
         .history_positions = {14, 30, 0, 31, 46},
         .rejected = {0, 1, 2, 0, 1},
-        .kind = group_kind::verify,
+        .kind = case_kind::verify,
     };
 }
 
@@ -159,7 +161,7 @@ ragged_case verify_case() {
         .counts = {3, 3, 3, 3, 3},
         .history_positions = {14, 29, 0, 30, 45},
         .rejected = {0, 1, 2, 0, 1},
-        .kind = group_kind::verify,
+        .kind = case_kind::verify,
     };
 }
 
@@ -169,7 +171,7 @@ ragged_case decode_and_verify_case() {
         .counts = {1, 1, 1, 3, 3, 2},
         .history_positions = {3, 15, 31, 14, 29, 46},
         .rejected = {0, 1, 2, 0, 1, 2},
-        .kind = group_kind::verify,
+        .kind = case_kind::verify,
     };
 }
 
@@ -183,7 +185,7 @@ struct conv_expected {
     std::optional<at::Tensor> boundary;
 };
 
-// old is the line's window; its first window - rejected entries are the inputs before the group's tokens, the latest
+// old is the line's window; its first window - rejected entries are the inputs before the batch's tokens, the latest
 // last, and entries before the first input read zero.
 conv_expected reference_conv(
     const at::Tensor& x_seq,
@@ -285,7 +287,7 @@ double output_tolerance(at::ScalarType dtype) {
     return dtype == at::kFloat ? 1e-4 : 2e-2;
 }
 
-// The convolution a model runs on batch: chunked for a prefill group, by step otherwise.
+// The convolution a model runs on batch: chunked for prefill chunks, by step otherwise.
 at::Tensor convolve(
     const ragged_case& batch,
     const at::Tensor& x,
@@ -294,7 +296,7 @@ at::Tensor convolve(
     const pulsarlm::state_rows& rows,
     int64_t dilation
 ) {
-    return batch.kind == group_kind::prefill
+    return batch.kind == case_kind::prefill
         ? pulsarlm::causal_conv_chunked_cuda(x, weight, pool, rows, batch.cu_seqlens_q(), dilation, std::nullopt)
         : pulsarlm::causal_conv_step_cuda(x, weight, pool, rows, batch.cu_seqlens_q(), dilation, std::nullopt);
 }
@@ -313,7 +315,7 @@ struct delta_inputs {
     pulsarlm::gate_activation activation;
 };
 
-// The delta rule a model runs on batch: chunked for a prefill group, by step otherwise, keeping the states
+// The delta rule a model runs on batch: chunked for prefill chunks, by step otherwise, keeping the states
 // batch.kept_state_counts gives.
 at::Tensor run_delta_rule(
     const ragged_case& batch,
@@ -322,7 +324,7 @@ at::Tensor run_delta_rule(
     const pulsarlm::state_rows& rows,
     const at::Tensor& counters
 ) {
-    if (batch.kind == group_kind::prefill) {
+    if (batch.kind == case_kind::prefill) {
         return pulsarlm::gated_delta_rule_chunked_cuda(
             in.x,
             in.a,
@@ -478,8 +480,8 @@ TEST_CASE(
         );
         at::Tensor gated = reference_output_gate(expected.out, z.narrow(0, first, n), norm_weight, eps, activation);
         CHECK(at::allclose(out.narrow(0, first, n), gated, tolerance, tolerance));
-        // A verify group of n tokens writes the state after token t into slot slot_count - n + t.
-        const int64_t first_written = batch.kind == group_kind::verify ? slot_count - n : slot_count - 1;
+        // A request verifying n tokens writes the state after token t into slot slot_count - n + t.
+        const int64_t first_written = batch.kind == case_kind::verify ? slot_count - n : slot_count - 1;
         for (int64_t slot = 0; slot < slot_count; slot++) {
             const int32_t slot_line = ragged_case::line(s, slot_count, slot);
             const at::Tensor& written = slot < first_written ? before.select(0, slot_line)

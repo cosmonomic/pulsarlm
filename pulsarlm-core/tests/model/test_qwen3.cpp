@@ -174,7 +174,7 @@ at::Tensor every_layer(const at::Tensor& t) {
 pulsarlm::model::batch step(const at::Tensor& tokens, std::int64_t first, std::int64_t last, bool prefill) {
     auto key_count = every_layer(int32_cuda({static_cast<std::int32_t>(last)}));
     pulsarlm::model::batch g{
-        .kind = prefill ? pulsarlm::model::batch_kind::prefill : pulsarlm::model::batch_kind::decode,
+        .single_query_request_count = prefill ? 0 : 1,
         .tokens = tokens.narrow(0, first, last - first),
         .pos = at::arange(first, last, cuda(at::kLong)),
         .page_tables = every_layer(int32_cuda(view_lines).view({1, -1})),
@@ -196,9 +196,10 @@ pulsarlm::model::batch step(const at::Tensor& tokens, std::int64_t first, std::i
         g.page_weight_sum.push_back(at::zeros({static_cast<std::int64_t>(view_lines.size())}, cuda(at::kFloat)));
     }
     g.key_counts = key_count;
-    if (prefill) {
-        g.cu_seqlens_q = int32_cuda({0, static_cast<std::int32_t>(last - first)});
-    }
+    g.cu_seqlens_q = int32_cuda({0, static_cast<std::int32_t>(last - first)});
+    g.cu_seqlens_q_from_second_run = prefill ? g.cu_seqlens_q : int32_cuda({0});
+    g.cu_seqlens_q_from_third_run = g.cu_seqlens_q_from_second_run;
+    g.logit_tokens = at::arange(last - first, cuda(at::kLong));
     return g;
 }
 
@@ -291,17 +292,28 @@ void check_against_dense(at::ScalarType dtype, double tolerance, bool graphs) {
          {chunk{0, 21, true}, chunk{21, 37, true}, chunk{37, 38, false}, chunk{38, 39, false}, chunk{39, 40, false}}) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
         pulsarlm::model::batch batch = step(tokens, c.first, c.last, c.prefill);
-        pulsarlm::model::output output;
+        const pulsarlm::model::batch& g = batch;
+        auto expected_logits = dense.logits.narrow(0, c.first, c.last - c.first);
         if (graphs && !c.prefill) {
             set_next_token(table, tokens, c.first);
-            output = decode.decode(slot, batch.cu_view_pages, batch.page_mass_sum, batch.page_weight_sum);
+            const at::Tensor sampled = decode
+                                           .decode_step(
+                                               slot,
+                                               batch.cu_view_pages,
+                                               batch.page_mass_sum,
+                                               batch.page_weight_sum,
+                                               /*filters=*/false
+                                           )
+                                           .samples;
+            // The table's temperature 0 takes the arg max, whose logit lies within the tolerance of the dense one's.
+            const at::Tensor expected_row = expected_logits.select(0, 0).to(at::kFloat);
+            const double best = expected_row.max().item<double>();
+            const double taken = expected_row[sampled.item<std::int64_t>()].item<double>();
+            CHECK(best - taken <= tolerance * expected_row.abs().max().item<double>());
         } else {
-            output = model.forward(batch, kv);
+            const pulsarlm::model::output output = model.forward(batch, kv);
+            CHECK(max_relative_error(output.logits, expected_logits) < tolerance);
         }
-        const pulsarlm::model::batch& g = batch;
-
-        auto expected_logits = dense.logits.narrow(0, c.first, c.last - c.first);
-        CHECK(max_relative_error(output.logits, expected_logits) < tolerance);
         for (std::int64_t layer = 0; layer < n_layers; layer++) {
             dense_mass expected = dense_page_mass(dense, layer, c.first, c.last);
             CHECK(max_relative_error(g.page_mass_sum[layer], expected.mass_sum) < tolerance);

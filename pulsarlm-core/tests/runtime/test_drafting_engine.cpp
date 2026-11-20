@@ -5,8 +5,10 @@
 #include "pulsarlm/engine/request_callbacks.hpp"
 
 #include <ATen/ATen.h>
+#include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 
 #undef CHECK
 #include <catch2/catch_test_macros.hpp>
@@ -27,6 +29,7 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -648,30 +651,51 @@ rank_weights(const weights& w, std::size_t rank, std::size_t gpus, bool expert_p
     return parts;
 }
 
-// Counts the verify groups it forwards and their rows.
+// Per batch, its requests with one query token, its requests verifying drafts and its prefill chunks.
+using single_query_count_type = std::int64_t;
+using verifying_count_type = std::int64_t;
+using prefill_count_type = std::int64_t;
+using batch_runs = std::tuple<single_query_count_type, verifying_count_type, prefill_count_type>;
+
+// Counts the batches it forwards with requests verifying drafts, the query tokens of those requests, and the batches
+// with such requests that a CUDA graph captures, and keeps the runs of every batch it forwards.
 class counting_model final : public pulsarlm::qwen4_exp_model {
   public:
     std::shared_ptr<std::size_t> verify_steps = std::make_shared<std::size_t>(0);
     std::shared_ptr<std::size_t> verify_rows = std::make_shared<std::size_t>(0);
+    std::shared_ptr<std::size_t> captured_verify_steps = std::make_shared<std::size_t>(0);
+    std::shared_ptr<std::vector<batch_runs>> forwarded_runs = std::make_shared<std::vector<batch_runs>>();
 
     using pulsarlm::qwen4_exp_model::qwen4_exp_model;
 
     output forward(const batch& b, std::span<const pulsarlm::kv> lines) override {
-        if (b.kind == batch_kind::verify) {
+        const std::int64_t requests = b.cu_seqlens_q.size(0) - 1;
+        forwarded_runs->emplace_back(
+            b.single_query_request_count,
+            b.per_query_state_request_count,
+            requests - b.single_query_request_count - b.per_query_state_request_count
+        );
+        if (b.per_query_state_request_count > 0) {
             (*verify_steps)++;
-            *verify_rows += static_cast<std::size_t>(b.tokens.size(0));
+            *verify_rows += static_cast<std::size_t>(b.per_query_state_request_count * b.state_slots);
+            cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+            C10_CUDA_CHECK(cudaStreamIsCapturing(c10::cuda::getCurrentCUDAStream().stream(), &capture));
+            if (capture != cudaStreamCaptureStatusNone) {
+                (*captured_verify_steps)++;
+            }
         }
         return pulsarlm::qwen4_exp_model::forward(b, lines);
     }
 };
 
-// With decode_graphs, decode and verify groups replay graphs over views of up to 1024 tokens.
+// With decode_graphs, decode steps and verify steps replay graphs over views of up to 1024 tokens.
 pulsarlm::engine_config engine_config(
     std::size_t draft_tokens,
     std::vector<std::int64_t> stop_ids,
     bool decode_graphs,
     std::size_t shard_count,
-    at::ScalarType kv_dtype
+    at::ScalarType kv_dtype,
+    std::size_t prefill_tokens_per_step = 32
 ) {
     return pulsarlm::engine_config{
         .model_name = "qwen4_exp-test",
@@ -681,7 +705,7 @@ pulsarlm::engine_config engine_config(
         .kv_cache_pool_bytes = std::size_t{64} << 20,
         .devices = std::vector<at::Device>(shard_count, at::Device(at::kCUDA, 0)),
         .stop_ids = std::move(stop_ids),
-        .prefill_tokens_per_step = 32,
+        .prefill_tokens_per_step = prefill_tokens_per_step,
         .decode_graphs = decode_graphs,
         .max_context_window = 1024,
         .draft_tokens = draft_tokens,
@@ -698,7 +722,8 @@ class recording_model final : public pulsarlm::qwen4_exp_model {
     output forward(const batch& b, std::span<const pulsarlm::kv> lines) override {
         forwarded->push_back(
             batch{
-                .kind = b.kind,
+                .single_query_request_count = b.single_query_request_count,
+                .per_query_state_request_count = b.per_query_state_request_count,
                 .tokens = b.tokens.clone(),
                 .pos = b.pos.clone(),
                 .page_tables = b.page_tables.clone(),
@@ -717,16 +742,20 @@ struct drafting_engine {
     std::unique_ptr<pulsarlm::engine> engine;
     std::shared_ptr<std::size_t> verify_steps;
     std::shared_ptr<std::size_t> verify_rows;
+    std::shared_ptr<std::size_t> captured_verify_steps;
+    std::shared_ptr<std::vector<batch_runs>> forwarded_runs;
 };
 
 // Over a store on contents, a fresh one without; split over shard_count ranks on one device, rank 0's counts kept.
+// A step prefills at most prefill_tokens_per_step tokens.
 drafting_engine make_engine(
     const weights& w,
     std::size_t draft_tokens,
     std::vector<std::int64_t> stop_ids,
     bool decode_graphs,
     std::shared_ptr<store_contents> contents = std::make_shared<store_contents>(),
-    std::size_t shard_count = 1
+    std::size_t shard_count = 1,
+    std::size_t prefill_tokens_per_step = 32
 ) {
     std::vector<std::unique_ptr<pulsarlm::model>> shards;
     drafting_engine made;
@@ -734,6 +763,8 @@ drafting_engine make_engine(
         auto model = std::make_unique<counting_model>(model_config(w.dims, 2, 8), w.named_tensors);
         made.verify_steps = model->verify_steps;
         made.verify_rows = model->verify_rows;
+        made.captured_verify_steps = model->captured_verify_steps;
+        made.forwarded_runs = model->forwarded_runs;
         shards.push_back(std::move(model));
     } else {
         std::vector<pulsarlm::communicator> comms = pulsarlm::communicator::make_on_one_device(
@@ -749,6 +780,8 @@ drafting_engine make_engine(
             if (rank == 0) {
                 made.verify_steps = model->verify_steps;
                 made.verify_rows = model->verify_rows;
+                made.captured_verify_steps = model->captured_verify_steps;
+                made.forwarded_runs = model->forwarded_runs;
             }
             shards.push_back(std::move(model));
         }
@@ -758,7 +791,7 @@ drafting_engine make_engine(
     made.engine = std::make_unique<pulsarlm::engine>(
         std::move(shards),
         vocab,
-        engine_config(draft_tokens, std::move(stop_ids), decode_graphs, shard_count, w.dtype),
+        engine_config(draft_tokens, std::move(stop_ids), decode_graphs, shard_count, w.dtype, prefill_tokens_per_step),
         std::move(store)
     );
     return made;
@@ -806,8 +839,8 @@ TEST_CASE("Qwen4-Exp drafting emits the tokens and reaches the state it does wit
     }
 }
 
-// A verify step that filters is captured at its first use, with mass and without, so the model forwards a verify
-// group once or twice during the request with graphs.
+// A verify step that filters is captured at its first use, with mass and without, so a graph captures the model's
+// forward of verifying requests once or twice during the request.
 TEST_CASE("Qwen4-Exp drafting with top_k and top_p samples from graphs as it does without graphs", "[runtime][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
@@ -827,7 +860,7 @@ TEST_CASE("Qwen4-Exp drafting with top_k and top_p samples from graphs as it doe
     };
     drafting_engine eager = make_engine(w, draft_tokens, {}, /*decode_graphs=*/false);
     drafting_engine replayed = make_engine(w, draft_tokens, {}, /*decode_graphs=*/true);
-    const std::size_t startup_verify_steps = *replayed.verify_steps;
+    const std::size_t startup_verify_steps = *replayed.captured_verify_steps;
     served expected = serve(*eager.engine, request());
     served got = serve(*replayed.engine, request());
 
@@ -835,16 +868,16 @@ TEST_CASE("Qwen4-Exp drafting with top_k and top_p samples from graphs as it doe
     CHECK(got.tokens == expected.tokens);
     check_same_state(got.end_state, expected.end_state);
     CHECK(replayed.engine->stat().accepted_draft_count == eager.engine->stat().accepted_draft_count);
-    const std::size_t captured_step_count = *replayed.verify_steps - startup_verify_steps;
+    const std::size_t captured_step_count = *replayed.captured_verify_steps - startup_verify_steps;
     CHECK(captured_step_count >= 1);
     CHECK(captured_step_count <= 2);
 }
 
-// The four prompts fit one step's prefill, so the requests verify in one group for most of their tokens, each row
+// The four prompts fit one step's prefill, so the requests verify in one step for most of their tokens, each row
 // sampled by its own request's parameters and seed. With top_k and top_p every request that draws filters, as a row's
 // draw depends on whether a row of its batch filters (sampling_inputs::filters).
 TEST_CASE(
-    "Qwen4-Exp drafting samples each sequence of a group by its own parameters with graphs as without",
+    "Qwen4-Exp drafting samples each sequence of a step by its own parameters with graphs as without",
     "[runtime][cuda]"
 ) {
     if (c10::cuda::device_count() == 0) {
@@ -893,6 +926,68 @@ TEST_CASE(
         check_same_state(got[s].end_state, expected[s].end_state);
     }
     CHECK(replayed.engine->stat().accepted_draft_count > 0);
+}
+
+// Three requests of different prompt lengths stepped together: the longer prompts prefill beside the first request's
+// verify steps, and near a cycle end a request decodes without drafts beside the others' verify steps, every step in
+// one forward of the model. The step's prefill tokens cover every prompt, so a request's prefill chunks end at its
+// cycle ends together as alone. Each request emits the tokens and reaches the state, its page mass included, that it
+// reaches served alone. Graphs are not captured over two ranks: two ranks' captures on one device would merge.
+TEST_CASE(
+    "Qwen4-Exp requests stepped together emit the tokens and reach the states they reach alone",
+    "[runtime][cuda]"
+) {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const auto [shard_count, decode_graphs] = GENERATE(table<std::size_t, bool>({{1, false}, {1, true}, {2, false}}));
+    INFO(shard_count << " ranks" << (decode_graphs ? " with" : " without") << " graphs");
+    const weights w(at::kFloat, base_dims, /*drafts=*/true);
+    const std::vector<std::size_t> prompt_lengths{9, prompt_tokens, 3 * page_size + 5};
+    const std::size_t prefill_tokens_per_step = 4 * prompt_tokens;
+    const auto make_request = [&](std::size_t r) {
+        return pulsarlm::request{
+            .tokens = random_tokens(prompt_lengths[r], 60 + static_cast<std::uint32_t>(r)),
+            .sampling = pulsarlm::sampling_params{.temperature = 0.8, .seed = 61 + r},
+            .max_tokens = decode_tokens,
+            .eviction = eviction,
+        };
+    };
+    const auto make_drafting_engine = [&] {
+        return make_engine(
+            w,
+            2,
+            {},
+            decode_graphs,
+            std::make_shared<store_contents>(),
+            shard_count,
+            prefill_tokens_per_step
+        );
+    };
+    drafting_engine joint_engine = make_drafting_engine();
+    std::vector<pulsarlm::request> requests;
+    for (std::size_t r = 0; r < prompt_lengths.size(); r++) {
+        requests.push_back(make_request(r));
+    }
+    joint_engine.forwarded_runs->clear();
+    const std::vector<served> got = serve_all(*joint_engine.engine, std::move(requests));
+
+    CHECK(std::ranges::any_of(*joint_engine.forwarded_runs, [](const batch_runs& runs) {
+        const auto [single_queries, verifying, prefills] = runs;
+        return verifying > 0 && prefills > 0;
+    }));
+    CHECK(std::ranges::any_of(*joint_engine.forwarded_runs, [](const batch_runs& runs) {
+        const auto [single_queries, verifying, prefills] = runs;
+        return single_queries > 0 && verifying > 0;
+    }));
+    for (std::size_t r = 0; r < prompt_lengths.size(); r++) {
+        INFO("request " << r);
+        drafting_engine separate_engine = make_drafting_engine();
+        const served expected = serve(*separate_engine.engine, make_request(r));
+        REQUIRE(expected.tokens.size() == decode_tokens);
+        CHECK(got[r].tokens == expected.tokens);
+        check_same_state(got[r].end_state, expected.end_state);
+    }
 }
 
 // Each engine first serves a request whose end state the resumed request resumes, and whose slot a later request takes
@@ -1235,7 +1330,8 @@ TEST_CASE("Qwen4-Exp split over two ranks gathers equal inputs from both ranks' 
         INFO("forward " << step);
         const pulsarlm::model::batch& first = (*forwarded[0])[step];
         const pulsarlm::model::batch& second = (*forwarded[1])[step];
-        REQUIRE(first.kind == second.kind);
+        REQUIRE(first.single_query_request_count == second.single_query_request_count);
+        REQUIRE(first.per_query_state_request_count == second.per_query_state_request_count);
         for (auto input : {
                  &pulsarlm::model::batch::tokens,
                  &pulsarlm::model::batch::pos,

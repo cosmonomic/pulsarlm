@@ -302,7 +302,7 @@ at::Tensor gemma4_model::head(const at::Tensor& x) const {
 
 model::output gemma4_model::forward(const batch& b, std::span<const kv> lines) {
     check_batch(b);
-    assert(b.kind != batch_kind::verify);
+    assert(b.per_query_state_request_count == 0);
     at::Tensor x = scaled(embed_tokens.index_select(0, b.tokens), std::sqrt(static_cast<double>(config.hidden_size)));
     at::Tensor per_layer;
     if (config.hidden_size_per_layer_input > 0) {

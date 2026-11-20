@@ -574,7 +574,7 @@ at::Tensor qwen4_exp_model::selected_blocks(
     const at::Tensor& queries,
     const kv& lines,
     const page_views& views,
-    const std::optional<at::Tensor>& cu_seqlens_q
+    const at::Tensor& cu_seqlens_q
 ) const {
     const qwen4_exp_config& c = config;
     const std::int64_t ratio = c.indexer_compress_ratio;
@@ -701,12 +701,8 @@ at::Tensor qwen4_exp_model::attention(
         .page_positions = g.page_positions.select(0, layer_row),
         .key_counts = g.key_counts.select(0, layer_row),
     };
-    std::optional<at::Tensor> cu_seqlens_q;
-    if (g.kind != batch_kind::decode) {
-        cu_seqlens_q = g.cu_seqlens_q;
-    }
     const kv_pools pools{.keys = line.k, .values = line.v};
-    write_kv_cuda(pools, k, v, views, cu_seqlens_q);
+    write_kv_cuda(pools, k, v, views, g.cu_seqlens_q);
 
     at::Tensor index_qk = projected.narrow(1, query_rows + 2 * key_rows, projected.size(1) - query_rows - 2 * key_rows);
     at::Tensor index_queries = index_queries_cuda(
@@ -721,13 +717,9 @@ at::Tensor qwen4_exp_model::attention(
                                 .contiguous()
                                 .view({ntok, 1, -1});
     at::Tensor index_pool = line.index_keys.unsqueeze(2);
-    write_kv_cuda({.keys = index_pool, .values = index_pool}, index_keys, index_keys, views, cu_seqlens_q);
+    write_kv_cuda({.keys = index_pool, .values = index_pool}, index_keys, index_keys, views, g.cu_seqlens_q);
     const std::int64_t block_size = c.indexer_compress_ratio;
-    const block_selection selection{
-        .selected = selected_blocks(w, index_queries, line, views, cu_seqlens_q),
-        .block_size = block_size,
-        .max_selected_blocks = c.indexer_budget / block_size + 1,
-    };
+    const at::Tensor selected = selected_blocks(w, index_queries, line, views, g.cu_seqlens_q);
 
     std::optional<page_mass> mass;
     if (!g.page_mass_sum.empty() && g.page_mass_sum[kv_index].defined()) {
@@ -739,9 +731,96 @@ at::Tensor qwen4_exp_model::attention(
         };
     }
     const double scale = 1.0 / std::sqrt(static_cast<double>(c.head_dim));
-    at::Tensor o = g.kind == batch_kind::verify && mass
-        ? attn_indexed_verify_cuda(q, pools, views, g.cu_seqlens_q, rope, scale, selection, *mass, std::nullopt)
-        : attn_indexed_cuda(q, pools, views, cu_seqlens_q, rope, scale, selection, mass, std::nullopt);
+    const std::int64_t requests = views.key_counts.size(0);
+    const std::int64_t single_queries = g.single_query_request_count;
+    const std::int64_t per_query_states = g.per_query_state_request_count;
+    const std::int64_t per_query_state_tokens = per_query_states * g.state_slots;
+    at::Tensor o = at::empty_like(q);
+    // Attends the run of the sequences [first, first + count), whose query tokens and mass views start at first_token
+    // and first_view and whose cu_seqlens_q from 0 are run_cu_seqlens_q.
+    auto attend_run = [&](std::int64_t first,
+                          std::int64_t count,
+                          std::int64_t first_token,
+                          std::int64_t token_count,
+                          std::int64_t first_view,
+                          std::int64_t view_count,
+                          const at::Tensor& run_cu_seqlens_q,
+                          bool measures_per_query) {
+        const page_views run_views{
+            .page_tables = views.page_tables.narrow(0, first, count),
+            .page_positions = views.page_positions.narrow(0, first, count),
+            .key_counts = views.key_counts.narrow(0, first, count),
+        };
+        const block_selection selection{
+            .selected = selected.narrow(0, first_token, token_count),
+            .block_size = block_size,
+            .max_selected_blocks = c.indexer_budget / block_size + 1,
+        };
+        std::optional<page_mass> run_mass;
+        if (mass) {
+            run_mass = page_mass{
+                .mass_sum = mass->mass_sum,
+                .weight_sum = mass->weight_sum,
+                .cu_view_pages = mass->cu_view_pages.narrow(0, first_view, view_count + 1),
+                .query_weights = mass->query_weights.narrow(0, first_token, token_count),
+            };
+        }
+        const at::Tensor run_q = q.narrow(0, first_token, token_count);
+        const at::Tensor run_o = o.narrow(0, first_token, token_count);
+        if (measures_per_query && run_mass) {
+            attn_indexed_verify_cuda(
+                run_q,
+                pools,
+                run_views,
+                run_cu_seqlens_q,
+                rope,
+                scale,
+                selection,
+                *run_mass,
+                run_o
+            );
+        } else {
+            attn_indexed_cuda(run_q, pools, run_views, run_cu_seqlens_q, rope, scale, selection, run_mass, run_o);
+        }
+    };
+    if (single_queries > 0) {
+        attend_run(
+            0,
+            single_queries,
+            0,
+            single_queries,
+            0,
+            single_queries,
+            g.cu_seqlens_q.narrow(0, 0, single_queries + 1),
+            false
+        );
+    }
+    if (per_query_states > 0) {
+        attend_run(
+            single_queries,
+            per_query_states,
+            single_queries,
+            per_query_state_tokens,
+            single_queries,
+            per_query_state_tokens,
+            g.cu_seqlens_q_from_second_run.narrow(0, 0, per_query_states + 1),
+            true
+        );
+    }
+    const std::int64_t step_requests = single_queries + per_query_states;
+    if (requests > step_requests) {
+        const std::int64_t step_tokens = single_queries + per_query_state_tokens;
+        attend_run(
+            step_requests,
+            requests - step_requests,
+            step_tokens,
+            ntok - step_tokens,
+            step_tokens,
+            requests - step_requests,
+            g.cu_seqlens_q_from_third_run,
+            false
+        );
+    }
     at::Tensor out = small_batch_linear_cuda(
         sigmoid_gated_cuda(o.view({ntok, heads.n_heads, c.head_dim}), gate).view({ntok, heads.n_heads * c.head_dim}),
         w.o_proj
@@ -822,13 +901,13 @@ qwen4_exp_model::ngram_ids(const ple_weights& w, std::size_t token_layer, const 
     at::Tensor rows = g.page_tables.select(0, static_cast<std::int64_t>(token_layer)).to(at::kLong);
     at::Tensor slot = rows.select(1, 0);
     const std::int64_t num_seqs = rows.size(0);
-    at::Tensor starts = g.kind != batch_kind::decode ? g.cu_seqlens_q.to(at::kLong) : at::arange(num_seqs + 1, longs);
+    at::Tensor starts = g.cu_seqlens_q.to(at::kLong);
     at::Tensor counts = starts.narrow(0, 1, num_seqs) - starts.narrow(0, 0, num_seqs);
     at::Tensor valid = window - g.rejected_tokens.to(at::kLong);
     at::Tensor sequence_of = at::repeat_interleave(counts, std::optional<std::int64_t>(ntok));
     at::Tensor local = at::arange(ntok, longs) - starts.index_select(0, sequence_of);
 
-    // Entry c of a sequence's inputs: its line's valid entries, then its tokens in the group, EOS before the first.
+    // Entry c of a sequence's inputs: its line's valid entries, then its tokens in the batch, EOS before the first.
     at::Tensor tokens = g.tokens.to(at::kLong);
     at::Tensor inputs = at::cat({at::bitwise_xor(token_lines.index_select(0, slot), eos).flatten(), tokens});
     auto input_at = [&](const at::Tensor& sequence, const at::Tensor& c) {
@@ -861,7 +940,7 @@ qwen4_exp_model::ngram_ids(const ple_weights& w, std::size_t token_layer, const 
         ids.push_back(at::remainder(mixed.unsqueeze(-1), sizes) + offsets);
     }
 
-    // The window after the group's first count tokens of each sequence.
+    // The window after the batch's first count tokens of each sequence.
     at::Tensor sequences = at::arange(num_seqs, longs).unsqueeze(1).expand({num_seqs, window});
     at::Tensor entries = at::arange(window, longs).unsqueeze(0);
     auto window_after = [&](const at::Tensor& count) {
@@ -901,21 +980,40 @@ qwen4_exp_model::ple(const at::Tensor& x, const layer_weights& layer, const batc
     gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign();
     at::Tensor gated = (at::sigmoid(gate) * at::linear(embeddings, w.value_proj).unsqueeze(1)).flatten(1);
     at::Tensor normed = stream_norm(gated, w.norm_conv);
-    const state_rows rows = window_layer_rows(g, conv_layer);
     const at::Tensor& pool = lines[conv_layer].k;
-    if (g.kind == batch_kind::prefill) {
-        return gated + causal_conv_chunked_cuda(normed, w.conv, pool, rows, g.cu_seqlens_q, c.ngram_size, std::nullopt);
+    const std::int64_t requests = g.history_positions.size(0);
+    const std::int64_t step_requests = g.single_query_request_count + g.per_query_state_request_count;
+    const std::int64_t step_tokens = count_step_tokens(g);
+    at::Tensor convolved = at::empty_like(normed);
+    if (step_requests > 0) {
+        causal_conv_step_cuda(
+            normed.narrow(0, 0, step_tokens),
+            w.conv,
+            pool,
+            window_layer_rows(g, conv_layer, 0, step_requests),
+            g.cu_seqlens_q.narrow(0, 0, step_requests + 1),
+            c.ngram_size,
+            convolved.narrow(0, 0, step_tokens)
+        );
     }
-    const at::Tensor cu_seqlens_q = g.kind == batch_kind::verify
-        ? g.cu_seqlens_q
-        : at::arange(rows.lines.size(0) + 1, rows.lines.options());
-    return gated + causal_conv_step_cuda(normed, w.conv, pool, rows, cu_seqlens_q, c.ngram_size, std::nullopt);
+    if (requests > step_requests) {
+        causal_conv_chunked_cuda(
+            normed.narrow(0, step_tokens, ntok - step_tokens),
+            w.conv,
+            pool,
+            window_layer_rows(g, conv_layer, step_requests, requests - step_requests),
+            g.cu_seqlens_q_from_third_run,
+            c.ngram_size,
+            convolved.narrow(0, step_tokens, ntok - step_tokens)
+        );
+    }
+    return gated + convolved;
 }
 
 // A block's output joins the streams in the next mix's kernel, so x lags it until then.
 model::output qwen4_exp_model::forward(const batch& b, std::span<const kv> lines) {
     check_batch(b);
-    assert(mtp || b.kind != batch_kind::verify);
+    assert(mtp || b.per_query_state_request_count == 0);
     at::Tensor x = lookup(embed_tokens, first_vocab_row, b.tokens).repeat({1, config.hc_count});
     // The last block's output and its injection weights, not yet added to x.
     std::optional<std::pair<at::Tensor, at::Tensor>> pending;

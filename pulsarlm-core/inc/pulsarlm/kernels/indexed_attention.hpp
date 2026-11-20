@@ -38,8 +38,8 @@ at::Tensor attn_indexed_cuda(
 );
 
 // attn_indexed_cuda measuring each query's mass apart: query i owns the rows [cu_view_pages[i], cu_view_pages[i + 1])
-// of mass_sum and weight_sum, its sequence's view pages; cu_view_pages is int32 [total_q + 1]. A verify group's
-// accepted rows are then added on their own.
+// of mass_sum and weight_sum, its sequence's view pages; cu_view_pages is int32 [total_q + 1]. The accepted query
+// tokens of a request verifying its drafts are then added on their own.
 at::Tensor attn_indexed_verify_cuda(
     const at::Tensor& q,
     const kv_pools& pools,

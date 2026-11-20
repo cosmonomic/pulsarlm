@@ -60,7 +60,7 @@ struct state_lines {
     const int32_t* rejected;
     int page_size;
 
-    // The slot holding the state before the group's first token.
+    // The slot holding the state before the sequence's first token in the batch.
     __device__ int64_t start(int s) const {
         return ids[s * row_stride + slots - 1 - min(rejected[s], slots - 1)];
     }
@@ -77,14 +77,15 @@ struct state_lines {
         return rejected[s];
     }
 
-    // The group's tokens up to and including the newest of its count tokens that ends a page, 0 when none does.
+    // The sequence's tokens in the batch up to and including the newest of its count tokens that ends a page, 0 when
+    // none does.
     __device__ int page_end_tokens(int s, int count) const {
         const int64_t first = history_positions[s];
         const int64_t end = (first + count) / page_size * page_size;
         return end > first ? static_cast<int>(end - first) : 0;
     }
 
-    // The boundary line of the page that the group's first page_end tokens end.
+    // The boundary line of the page that the sequence's first page_end tokens in the batch end.
     __device__ int64_t boundary(int s, int page_end) const {
         const int64_t page = (history_positions[s] + page_end) / page_size - 1;
         return ids[s * row_stride + slots + page % 2];
@@ -198,8 +199,8 @@ __global__ void causal_conv_kernel(
     out[index] = static_cast<scalar_t>(silu(rounded<scalar_t>(sum)));
 }
 
-// The window entry j of the inputs up to count tokens into the group: the line's valid inputs, then the group's,
-// zero before the first.
+// The window entry j of the inputs up to count tokens into the sequence's tokens in the batch: the line's valid
+// inputs, then the batch's, zero before the first.
 template <typename scalar_t> struct conv_inputs {
     const scalar_t* old;
     int valid;
@@ -218,8 +219,8 @@ template <typename scalar_t> struct conv_inputs {
     }
 };
 
-// One thread per (sequence, channel). Writes the window after the group's last token, and the one after the token
-// ending the newest page into that page's boundary line.
+// One thread per (sequence, channel). Writes the window after the sequence's last token in the batch, and the one
+// after the token ending the newest page into that page's boundary line.
 template <typename scalar_t>
 __global__ void conv_state_kernel(
     const scalar_t* __restrict__ x,

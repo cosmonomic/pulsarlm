@@ -50,21 +50,9 @@ class executor {
 
   private:
     friend struct executor_inspection;
+    struct batch_entry;
     class batch;
     struct batch_writes;
-
-    // Names a request state of an executor without owning it. The request state's request is not erased at an access.
-    class request_ref {
-        executor* owner;
-        request_id_type id;
-
-      public:
-        request_ref(executor& owner, request_id_type id) noexcept;
-        request_state& operator*() const;
-        request_state* operator->() const;
-        request_id_type key() const noexcept;
-        bool operator==(const request_ref& other) const noexcept = default;
-    };
 
     // Each request from the creation of its request state until its end.
     slot_map<running_request> requests;
@@ -86,7 +74,7 @@ class executor {
         cudaStream_t copy_stream;
         // The loop the shard's forward runs on, or nullptr for shard 0, whose forward runs on the executor's loop.
         event_loop* worker_loop;
-        // None when decode and verify groups forward without graphs.
+        // None when steps run without graphs.
         std::unique_ptr<step_graphs> graphs;
         // The arrival counters of the steps that run without a graph, grown to the largest step's.
         at::Tensor arrival_counters;
@@ -102,8 +90,6 @@ class executor {
     std::vector<shard> shards;
     // The columns of a shard's page_tables (request_table), the pages of the widest view a request holds.
     std::size_t view_page_capacity;
-    // The page-table width of the graphs, the pages of the longest view they cover.
-    std::optional<std::size_t> graph_pages;
     // The most requests with a record at once, which bounds their slots.
     std::size_t max_running_requests;
     // Per request, the first column of its page tables that the shards' page_tables and page_positions do not hold yet.
@@ -227,10 +213,10 @@ class executor {
     // to the store on copy_streams[s], which the caller synchronizes before freeing what the copies read; the cache holds one layer
     // per entry of each model's kv_layers(), and the shards agree on which layers are recurrent or sliding. store is the
     // cache's. root is the engine's root digest (make_root_digest). A request's view takes at most view_page_capacity
-    // pages, and one that would take more ends with context_exceeded. With graph_pages, a decode group's forward replays a step_graphs
-    // graph over tables graph_pages wide, and so does a verify group's; a step of a decode group alone whose entries
-    // all sample and that drafts nothing replays a decode step, and a step of drafting verify entries alone a verify
-    // step. A step drafts draft_tokens tokens per request
+    // pages, and one that would take more ends with context_exceeded. With graph_pages, a step_graphs graph over tables
+    // graph_pages wide replays a step of decoding entries alone that all sample and draft nothing (a decode step), and
+    // a step of verifying entries alone that all draft (a verify step); any other step runs without a graph. A step
+    // drafts draft_tokens tokens per request
     // with the shards' draft heads, which they have when draft_tokens is above 0, and the cache's recurrent layers are
     // laid out for them (recurrent_state). At most max_running_requests requests hold a record at once (start).
     executor(
@@ -279,8 +265,9 @@ class executor {
     std::size_t sampled_row_limit() const noexcept;
     // The rows of a batch's sampled tokens that the request takes when it computes token_count tokens.
     std::size_t sampled_row_count(request_id_type id, std::size_t token_count) const;
-    // Launches one step of the requests in scheduled, decoding requests first, after the launched steps: advances each request by its
-    // tokens, then queues the forward and the sampling on every shard without waiting for them. Each shard's step reads
+    // Launches one step of the requests in scheduled after the launched steps, ordered into the runs of one model call
+    // (model::batch): advances each request by its tokens, then queues the forward and the sampling on every shard
+    // without waiting for them. Each shard's step reads
     // its inputs from the shard's request_table and advances it, so a step reads the tokens and positions the launched
     // steps before it leave.
     // scheduled is not empty and names no request twice, each token count is above 0 and at most the request's pending

@@ -29,8 +29,16 @@ struct table_entries {
     std::int64_t capacity;
 };
 
-struct group_outputs {
-    // Null for a prefill group, whose tokens the host sends.
+// The runs of a step (model::batch): requests [0, single_queries) have one query token, requests [single_queries,
+// step_requests) verify their drafts, and the later ones take their tokens from prefill_tokens.
+struct step_runs {
+    const std::int32_t* query_starts;
+    std::int64_t single_queries;
+    std::int64_t step_requests;
+    const std::int64_t* prefill_tokens;
+};
+
+struct step_outputs {
     std::int64_t* tokens;
     std::int64_t* pos;
     std::int64_t* history_positions;
@@ -39,27 +47,31 @@ struct group_outputs {
     std::int32_t* page_tables;
     std::int32_t* page_positions;
     std::int64_t width;
-    // Null for a group that measures no mass.
+    std::int32_t* kept_state_counts;
+    // Null for a step that measures no mass.
     float* query_weights;
-    bool weighs_verified_rows;
 };
 
-// One CTA per request of the group. Without query_starts, request s computes token s alone.
-__global__ void gather_group_inputs_kernel(
+// One CTA per request of the step.
+__global__ void gather_step_inputs_kernel(
     const std::int64_t* __restrict__ slots,
     std::int64_t requests,
-    const std::int32_t* __restrict__ query_starts,
+    step_runs runs,
     table_entries table,
-    group_outputs out
+    step_outputs out
 ) {
     const std::int64_t s = blockIdx.x;
     const std::int64_t slot = slots[s];
-    const std::int64_t first = query_starts == nullptr ? s : query_starts[s];
-    const std::int64_t count = query_starts == nullptr ? 1 : query_starts[s + 1] - first;
+    const std::int64_t first = runs.query_starts[s];
+    const std::int64_t count = runs.query_starts[s + 1] - first;
+    const bool verifies = s >= runs.single_queries && s < runs.step_requests;
     const std::int64_t history_position = table.history_positions[slot];
     if (threadIdx.x == 0) {
         out.history_positions[s] = history_position;
         out.rejected_tokens[s] = table.rejected_tokens[slot];
+        if (s < runs.step_requests) {
+            out.kept_state_counts[s] = verifies ? static_cast<std::int32_t>(count) : 1;
+        }
     }
     for (std::int64_t layer = threadIdx.x; layer < table.layers; layer += blockDim.x) {
         out.key_counts[layer * requests + s] = table.key_counts[slot * table.layers + layer] +
@@ -67,14 +79,14 @@ __global__ void gather_group_inputs_kernel(
     }
     const std::int64_t mass_start = table.mass_start_positions[slot];
     const double decay = table.attention_mass_decays[slot];
+    const std::int64_t first_prefill_token = runs.query_starts[runs.step_requests];
     for (std::int64_t i = threadIdx.x; i < count; i += blockDim.x) {
         out.pos[first + i] = table.rope_positions[slot] + i;
-        if (out.tokens != nullptr) {
-            out.tokens[first + i] = table.tokens[slot * table.token_width + i];
-        }
+        out.tokens[first + i] = s < runs.step_requests ? table.tokens[slot * table.token_width + i]
+                                                       : runs.prefill_tokens[first - first_prefill_token + i];
         if (out.query_weights != nullptr) {
             const bool measured = history_position + i >= mass_start;
-            if (out.weighs_verified_rows) {
+            if (verifies) {
                 out.query_weights[first + i] = measured ? 1.0f : 0.0f;
             } else {
                 const auto age = static_cast<double>(count - 1 - i);
@@ -133,37 +145,34 @@ __global__ void advance_requests_kernel(
 
 }  // namespace
 
-void gather_group_inputs(
+void gather_step_inputs(
     const request_table& table,
     const at::Tensor& request_slots,
     std::size_t table_width,
+    std::int64_t token_count,
+    const at::Tensor& prefill_tokens,
     model::batch& inputs
 ) {
     const at::TensorOptions options = table.history_positions.options();
     const std::int64_t requests = request_slots.size(0);
     const std::int64_t layers = table.key_counts.size(1);
     const auto width = static_cast<std::int64_t>(table_width);
-    const bool verifies = inputs.kind == model::batch_kind::verify;
-    std::int64_t tokens = requests;
-    if (verifies) {
-        tokens = requests * inputs.state_slots;
-    } else if (inputs.kind == model::batch_kind::prefill) {
-        tokens = inputs.tokens.size(0);
-    }
+    const std::int64_t step_requests = inputs.single_query_request_count + inputs.per_query_state_request_count;
     assert(request_slots.scalar_type() == at::kLong && request_slots.is_contiguous());
-    assert(inputs.cu_seqlens_q.defined() == (inputs.kind != model::batch_kind::decode));
-    assert(width <= table.page_tables.size(2) && (!verifies || inputs.state_slots <= table.tokens.size(1)));
-    if (inputs.kind != model::batch_kind::prefill) {
-        inputs.tokens = at::empty({tokens}, options.dtype(at::kLong));
-    }
-    inputs.pos = at::empty({tokens}, options.dtype(at::kLong));
+    assert(inputs.cu_seqlens_q.defined() && inputs.cu_seqlens_q.size(0) == requests + 1);
+    assert(prefill_tokens.scalar_type() == at::kLong && prefill_tokens.is_contiguous());
+    assert(step_requests <= requests && width <= table.page_tables.size(2));
+    assert(inputs.per_query_state_request_count == 0 || inputs.state_slots <= table.tokens.size(1));
+    inputs.tokens = at::empty({token_count}, options.dtype(at::kLong));
+    inputs.pos = at::empty({token_count}, options.dtype(at::kLong));
     inputs.history_positions = at::empty({requests}, options.dtype(at::kLong));
     inputs.rejected_tokens = at::empty({requests}, options.dtype(at::kInt));
+    inputs.kept_state_counts = at::empty({step_requests}, options.dtype(at::kInt));
     inputs.key_counts = at::empty({layers, requests}, options.dtype(at::kInt));
     inputs.page_tables = at::empty({layers, requests, width}, options.dtype(at::kInt));
     inputs.page_positions = at::empty({layers, requests, width}, options.dtype(at::kInt));
     if (inputs.cu_view_pages.defined()) {
-        inputs.query_weights = at::empty({tokens}, options.dtype(at::kFloat));
+        inputs.query_weights = at::empty({token_count}, options.dtype(at::kFloat));
     }
     if (requests == 0) {
         return;
@@ -182,8 +191,14 @@ void gather_group_inputs(
         .layers = layers,
         .capacity = table.page_tables.size(2),
     };
-    const group_outputs outputs{
-        .tokens = inputs.kind == model::batch_kind::prefill ? nullptr : inputs.tokens.mutable_data_ptr<std::int64_t>(),
+    const step_runs runs{
+        .query_starts = inputs.cu_seqlens_q.const_data_ptr<std::int32_t>(),
+        .single_queries = inputs.single_query_request_count,
+        .step_requests = step_requests,
+        .prefill_tokens = prefill_tokens.const_data_ptr<std::int64_t>(),
+    };
+    const step_outputs outputs{
+        .tokens = inputs.tokens.mutable_data_ptr<std::int64_t>(),
         .pos = inputs.pos.mutable_data_ptr<std::int64_t>(),
         .history_positions = inputs.history_positions.mutable_data_ptr<std::int64_t>(),
         .rejected_tokens = inputs.rejected_tokens.mutable_data_ptr<std::int32_t>(),
@@ -191,13 +206,13 @@ void gather_group_inputs(
         .page_tables = inputs.page_tables.mutable_data_ptr<std::int32_t>(),
         .page_positions = inputs.page_positions.mutable_data_ptr<std::int32_t>(),
         .width = width,
+        .kept_state_counts = inputs.kept_state_counts.mutable_data_ptr<std::int32_t>(),
         .query_weights = inputs.query_weights.defined() ? inputs.query_weights.mutable_data_ptr<float>() : nullptr,
-        .weighs_verified_rows = verifies,
     };
-    gather_group_inputs_kernel<<<static_cast<unsigned>(requests), cta_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+    gather_step_inputs_kernel<<<static_cast<unsigned>(requests), cta_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         request_slots.const_data_ptr<std::int64_t>(),
         requests,
-        inputs.cu_seqlens_q.defined() ? inputs.cu_seqlens_q.const_data_ptr<std::int32_t>() : nullptr,
+        runs,
         entries,
         outputs
     );

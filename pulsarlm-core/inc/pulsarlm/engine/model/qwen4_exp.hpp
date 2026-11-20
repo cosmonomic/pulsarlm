@@ -172,7 +172,7 @@ class qwen4_exp_model : public model, public draft_head {
         const at::Tensor& queries,
         const kv& lines,
         const page_views& views,
-        const std::optional<at::Tensor>& cu_seqlens_q
+        const at::Tensor& cu_seqlens_q
     ) const;
     at::Tensor stream_norm(const at::Tensor& x, const at::Tensor& weight) const;
     // The mix of the normed streams [ntok, hc_count * hidden] the head reads.

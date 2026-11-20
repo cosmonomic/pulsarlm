@@ -27,6 +27,38 @@ at::Tensor rope_q(
     return rope_cuda(by_head, pos, rope).transpose(0, 1).contiguous();
 }
 
+namespace {
+
+page_views narrow_views(const page_views& views, std::int64_t first, std::int64_t count) {
+    return page_views{
+        .page_tables = views.page_tables.narrow(0, first, count),
+        .page_positions = views.page_positions.narrow(0, first, count),
+        .key_counts = views.key_counts.narrow(0, first, count),
+    };
+}
+
+// The page mass of the query tokens [first_token, first_token + token_count), whose mass views are [first_view,
+// first_view + view_count).
+std::optional<page_mass> narrow_mass(
+    const std::optional<page_mass>& mass,
+    std::int64_t first_token,
+    std::int64_t token_count,
+    std::int64_t first_view,
+    std::int64_t view_count
+) {
+    if (!mass) {
+        return std::nullopt;
+    }
+    return page_mass{
+        .mass_sum = mass->mass_sum,
+        .weight_sum = mass->weight_sum,
+        .cu_view_pages = mass->cu_view_pages.narrow(0, first_view, view_count + 1),
+        .query_weights = mass->query_weights.narrow(0, first_token, token_count),
+    };
+}
+
+}  // namespace
+
 at::Tensor paged_attention(
     const at::Tensor& q,
     const at::Tensor& k,
@@ -48,13 +80,7 @@ at::Tensor paged_attention(
         .key_counts = g.key_counts.select(0, layer_row),
     };
     if (k.defined()) {
-        write_kv_cuda(
-            pools,
-            k,
-            v,
-            views,
-            g.kind != model::batch_kind::decode ? std::optional<at::Tensor>(g.cu_seqlens_q) : std::nullopt
-        );
+        write_kv_cuda(pools, k, v, views, g.cu_seqlens_q);
     }
     const attention_layer layer{
         .rope = rope,
@@ -75,14 +101,34 @@ at::Tensor paged_attention(
             .query_weights = g.query_weights,
         };
     }
-    at::Tensor o;
-    if (g.kind == model::batch_kind::decode) {
-        o = attn_decode_cuda(q, pools, views, layer, mass);
-    } else {
-        const std::int64_t per_query_mass_request_count = g.kind == model::batch_kind::verify && mass
-            ? views.key_counts.size(0)
-            : 0;
-        o = attn_prefill_cuda(q, pools, views, g.cu_seqlens_q, layer, mass, per_query_mass_request_count);
+    const std::int64_t ntok = q.size(0);
+    const std::int64_t requests = views.key_counts.size(0);
+    const std::int64_t single_queries = g.single_query_request_count;
+    at::Tensor o = at::empty_like(q);
+    if (single_queries > 0) {
+        attn_decode_cuda(
+            q.narrow(0, 0, single_queries),
+            pools,
+            narrow_views(views, 0, single_queries),
+            layer,
+            narrow_mass(mass, 0, single_queries, 0, single_queries),
+            0,
+            o.narrow(0, 0, single_queries)
+        );
+    }
+    if (requests > single_queries) {
+        const std::int64_t later_tokens = ntok - single_queries;
+        const std::int64_t later_views = mass ? mass->cu_view_pages.size(0) - 1 - single_queries : 0;
+        attn_prefill_cuda(
+            q.narrow(0, single_queries, later_tokens),
+            pools,
+            narrow_views(views, single_queries, requests - single_queries),
+            g.cu_seqlens_q_from_second_run,
+            layer,
+            narrow_mass(mass, single_queries, later_tokens, single_queries, later_views),
+            mass ? g.per_query_state_request_count : 0,
+            o.narrow(0, single_queries, later_tokens)
+        );
     }
     if (mass && !mass->mass_sum.is_same(reader_columns)) {
         reader_columns.copy_(mass->mass_sum);
@@ -99,11 +145,6 @@ void keep_last_hidden(const model::batch& g, const at::Tensor& hidden, const kv&
     at::Tensor key_counts = g.key_counts.select(0, layer_row).to(at::kLong);
     at::Tensor page_tables = g.page_tables.select(0, layer_row).to(at::kLong);
     const std::int64_t num_seqs = key_counts.size(0);
-    if (g.kind == model::batch_kind::decode) {
-        at::Tensor lines = page_tables.gather(1, at::floor_divide(key_counts - 1, page_size).unsqueeze(1)).squeeze(1);
-        line.last_hidden.index_copy_(0, lines, hidden);
-        return;
-    }
     at::Tensor starts = g.cu_seqlens_q.to(at::kLong);
     at::Tensor counts = starts.narrow(0, 1, num_seqs) - starts.narrow(0, 0, num_seqs);
     at::Tensor sequence_of = at::repeat_interleave(counts, std::optional<std::int64_t>(ntok));
@@ -120,24 +161,34 @@ void keep_last_hidden(const model::batch& g, const at::Tensor& hidden, const kv&
 
 namespace {
 
-state_rows recurrent_rows(const model::batch& g, std::size_t kv_layer, std::int64_t slots) {
+state_rows recurrent_rows(
+    const model::batch& g,
+    std::size_t kv_layer,
+    std::int64_t slots,
+    std::int64_t first,
+    std::int64_t count
+) {
     return state_rows{
-        .lines = g.page_tables.select(0, static_cast<std::int64_t>(kv_layer)),
+        .lines = g.page_tables.select(0, static_cast<std::int64_t>(kv_layer)).narrow(0, first, count),
         .slots = slots,
-        .history_positions = g.history_positions,
-        .rejected_tokens = g.rejected_tokens,
+        .history_positions = g.history_positions.narrow(0, first, count),
+        .rejected_tokens = g.rejected_tokens.narrow(0, first, count),
         .page_size = g.page_size,
     };
 }
 
 }  // namespace
 
-state_rows state_layer_rows(const model::batch& g, std::size_t kv_layer) {
-    return recurrent_rows(g, kv_layer, g.state_slots);
+state_rows state_layer_rows(const model::batch& g, std::size_t kv_layer, std::int64_t first, std::int64_t count) {
+    return recurrent_rows(g, kv_layer, g.state_slots, first, count);
 }
 
-state_rows window_layer_rows(const model::batch& g, std::size_t kv_layer) {
-    return recurrent_rows(g, kv_layer, 1);
+state_rows window_layer_rows(const model::batch& g, std::size_t kv_layer, std::int64_t first, std::int64_t count) {
+    return recurrent_rows(g, kv_layer, 1, first, count);
+}
+
+std::int64_t count_step_tokens(const model::batch& g) {
+    return g.single_query_request_count + g.per_query_state_request_count * g.state_slots;
 }
 
 at::Tensor gated_deltanet(
@@ -152,84 +203,86 @@ at::Tensor gated_deltanet(
     double rms_norm_eps,
     gate_activation activation
 ) {
-    const state_rows window_rows = window_layer_rows(b, conv_kv_layer);
-    const state_rows state_rows = state_layer_rows(b, state_kv_layer);
-    if (b.kind == model::batch_kind::prefill) {
-        at::Tensor convolved = causal_conv_chunked_cuda(
-            projected.qkv,
+    const std::int64_t ntok = projected.qkv.size(0);
+    const std::int64_t requests = b.history_positions.size(0);
+    const std::int64_t step_requests = b.single_query_request_count + b.per_query_state_request_count;
+    const std::int64_t step_tokens = count_step_tokens(b);
+    at::Tensor convolved = at::empty({ntok, projected.qkv.size(1)}, projected.qkv.options());
+    at::Tensor gated = at::empty({ntok, projected.z.size(1)}, projected.qkv.options());
+    if (step_requests > 0) {
+        const at::Tensor cu_seqlens_q = b.cu_seqlens_q.narrow(0, 0, step_requests + 1);
+        causal_conv_step_cuda(
+            projected.qkv.narrow(0, 0, step_tokens),
             weights.conv,
             conv_lines.k,
-            window_rows,
-            b.cu_seqlens_q,
+            window_layer_rows(b, conv_kv_layer, 0, step_requests),
+            cu_seqlens_q,
             1,
-            std::nullopt
+            convolved.narrow(0, 0, step_tokens)
         );
-        return gated_delta_rule_chunked_cuda(
-            convolved,
-            projected.a,
-            projected.b,
+        gated_delta_rule_step_cuda(
+            convolved.narrow(0, 0, step_tokens),
+            projected.a.narrow(0, 0, step_tokens),
+            projected.b.narrow(0, 0, step_tokens),
             weights.dt_bias,
             weights.neg_a,
             state_lines.k,
-            state_rows,
-            b.cu_seqlens_q,
+            state_layer_rows(b, state_kv_layer, 0, step_requests),
+            cu_seqlens_q,
+            b.kept_state_counts,
             key_heads,
-            projected.z,
+            projected.z.narrow(0, 0, step_tokens),
             weights.norm,
             rms_norm_eps,
             activation,
             b.arrival_counters,
-            std::nullopt
+            gated.narrow(0, 0, step_tokens)
         );
     }
-    const std::int64_t sequences = window_rows.lines.size(0);
-    const auto int32 = window_rows.lines.options();
-    at::Tensor cu_seqlens_q;
-    at::Tensor kept_state_counts;
-    if (b.kind == model::batch_kind::verify) {
-        const std::int64_t ntok = projected.qkv.size(0);
-        assert(sequences > 0 && ntok > 0 && ntok % sequences == 0);
-        cu_seqlens_q = b.cu_seqlens_q;
-        kept_state_counts = at::full({sequences}, ntok / sequences, int32);
-    } else {
-        cu_seqlens_q = at::arange(sequences + 1, int32);
-        kept_state_counts = at::ones({sequences}, int32);
+    if (requests > step_requests) {
+        const std::int64_t chunk_tokens = ntok - step_tokens;
+        const std::int64_t chunks = requests - step_requests;
+        causal_conv_chunked_cuda(
+            projected.qkv.narrow(0, step_tokens, chunk_tokens),
+            weights.conv,
+            conv_lines.k,
+            window_layer_rows(b, conv_kv_layer, step_requests, chunks),
+            b.cu_seqlens_q_from_third_run,
+            1,
+            convolved.narrow(0, step_tokens, chunk_tokens)
+        );
+        gated_delta_rule_chunked_cuda(
+            convolved.narrow(0, step_tokens, chunk_tokens),
+            projected.a.narrow(0, step_tokens, chunk_tokens),
+            projected.b.narrow(0, step_tokens, chunk_tokens),
+            weights.dt_bias,
+            weights.neg_a,
+            state_lines.k,
+            state_layer_rows(b, state_kv_layer, step_requests, chunks),
+            b.cu_seqlens_q_from_third_run,
+            key_heads,
+            projected.z.narrow(0, step_tokens, chunk_tokens),
+            weights.norm,
+            rms_norm_eps,
+            activation,
+            b.arrival_counters,
+            gated.narrow(0, step_tokens, chunk_tokens)
+        );
     }
-    at::Tensor convolved = causal_conv_step_cuda(
-        projected.qkv,
-        weights.conv,
-        conv_lines.k,
-        window_rows,
-        cu_seqlens_q,
-        1,
-        std::nullopt
-    );
-    return gated_delta_rule_step_cuda(
-        convolved,
-        projected.a,
-        projected.b,
-        weights.dt_bias,
-        weights.neg_a,
-        state_lines.k,
-        state_rows,
-        cu_seqlens_q,
-        kept_state_counts,
-        key_heads,
-        projected.z,
-        weights.norm,
-        rms_norm_eps,
-        activation,
-        b.arrival_counters,
-        std::nullopt
-    );
+    return gated;
 }
 
 at::Tensor logit_inputs(const at::Tensor& x, const model::batch& g) {
-    return g.logit_rows.defined() ? x.index_select(0, g.logit_rows) : x;
+    return x.index_select(0, g.logit_tokens);
 }
 
 void check_batch(const model::batch& b) {
-    assert(b.cu_seqlens_q.defined() == (b.kind != model::batch_kind::decode));
+    const std::int64_t requests = b.cu_seqlens_q.defined() ? b.cu_seqlens_q.size(0) - 1 : -1;
+    assert(
+        requests >= 0 && b.single_query_request_count >= 0 && b.per_query_state_request_count >= 0 &&
+        b.single_query_request_count + b.per_query_state_request_count <= requests &&
+        b.cu_seqlens_q_from_second_run.defined() && b.cu_seqlens_q_from_third_run.defined() && b.logit_tokens.defined()
+    );
 }
 
 }  // namespace pulsarlm

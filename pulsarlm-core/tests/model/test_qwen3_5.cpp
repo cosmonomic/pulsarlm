@@ -27,7 +27,7 @@ namespace {
 // b with its own arrival counters, as many as model needs for it.
 pulsarlm::model::batch with_arrival_counters(pulsarlm::model::batch b, const pulsarlm::model& model) {
     const std::int64_t tokens = b.tokens.size(0);
-    const std::int64_t sequences = b.kind == pulsarlm::model::batch_kind::decode ? tokens : b.cu_seqlens_q.size(0) - 1;
+    const std::int64_t sequences = b.cu_seqlens_q.size(0) - 1;
     b.arrival_counters = at::zeros(
         {model.arrival_counter_count(sequences, tokens)},
         b.tokens.options().dtype(at::kInt)
@@ -343,7 +343,7 @@ pulsarlm::model::batch step(
     auto n_kv_layers = static_cast<std::int64_t>(specs.size());
     auto key_count = int32_cuda({static_cast<std::int32_t>(last)}).expand({n_kv_layers, 1}).contiguous();
     pulsarlm::model::batch g{
-        .kind = prefill ? pulsarlm::model::batch_kind::prefill : pulsarlm::model::batch_kind::decode,
+        .single_query_request_count = prefill ? 0 : 1,
         .tokens = tokens.narrow(0, first, last - first),
         .pos = at::arange(first, last, cuda(at::kLong)),
         .page_tables = int32_cuda(rows).view({n_kv_layers, 1, -1}),
@@ -355,9 +355,11 @@ pulsarlm::model::batch step(
                               .contiguous(),
     };
     g.key_counts = key_count;
-    if (prefill) {
-        g.cu_seqlens_q = int32_cuda({0, static_cast<std::int32_t>(last - first)});
-    }
+    g.cu_seqlens_q = int32_cuda({0, static_cast<std::int32_t>(last - first)});
+    g.cu_seqlens_q_from_second_run = prefill ? g.cu_seqlens_q : int32_cuda({0});
+    g.cu_seqlens_q_from_third_run = g.cu_seqlens_q_from_second_run;
+    g.kept_state_counts = prefill ? int32_cuda({}) : int32_cuda({1});
+    g.logit_tokens = at::arange(last - first, cuda(at::kLong));
     return g;
 }
 

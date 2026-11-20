@@ -51,7 +51,7 @@ at::Tensor sample(const at::Tensor& logits, const sampling_inputs& inputs);
 at::Tensor
 sample(const at::Tensor& logits, std::span<const sampling_params> params, std::span<const sampling_draw> draws);
 
-// The tokens each sequence of a verify group accepts: its pending token's sample and the samples of the drafts
+// The tokens each request verifying its drafts accepts: its pending token's sample and the samples of the drafts
 // that match, through the first stop token, at most max_accepted_token_counts. verified [sequences, rows] holds
 // each row's sample and drafted [sequences, rows - 1] the drafts, both int64; stop_tokens is int64 and may be
 // empty. Returns int64 [sequences], each at least 1. Reads nothing back to the host, so a CUDA graph can capture it.

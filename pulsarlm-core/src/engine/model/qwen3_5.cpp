@@ -481,7 +481,7 @@ at::Tensor qwen3_5_model::logits(const at::Tensor& rows) const {
 // Normed row by row, the logit rows' hidden rows equal the normed hidden rows' logit rows.
 model::output qwen3_5_model::forward(const batch& b, std::span<const kv> lines) {
     check_batch(b);
-    assert(mtp || b.kind != batch_kind::verify);
+    assert(mtp || b.per_query_state_request_count == 0);
     at::Tensor x = embed(b.tokens);
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
         x = decoder_layer(x, layers[layer], b, lines);

@@ -6,19 +6,23 @@
 #include <ATen/core/Tensor.h>
 
 #include <cstddef>
+#include <cstdint>
 
 namespace pulsarlm {
 
-// Fills inputs, a group of the requests at request_slots (int64 on table's device), from their entries of table on the
-// current stream: a decode or verify group's tokens, pos, history_positions, rejected_tokens, key_counts with the
-// group's tokens of each request, page_tables and page_positions table_width columns wide, and query_weights when
-// inputs.cu_view_pages is defined. A verify group's queries weigh 1 from mass_start_positions on, a decode or prefill
-// group's from there as query_weights weighs them. inputs holds its kind, its cu_seqlens_q unless it decodes, and a
-// prefill group's tokens.
-void gather_group_inputs(
+// Fills inputs, a step of the requests at request_slots (int64 on table's device) that computes token_count query
+// tokens, from their entries of table on the current stream: tokens, pos, history_positions, rejected_tokens,
+// kept_state_counts, key_counts with the step's tokens of each request, page_tables and page_positions table_width
+// columns wide, and query_weights when inputs.cu_view_pages is defined. The tokens of the first two runs come from
+// table, those of the third from prefill_tokens (int64 on table's device). The queries of the second run weigh 1 from
+// mass_start_positions on, the others from there as query_weights weighs them. inputs holds its run counts, its
+// state_slots and its cu_seqlens_q on table's device.
+void gather_step_inputs(
     const request_table& table,
     const at::Tensor& request_slots,
     std::size_t table_width,
+    std::int64_t token_count,
+    const at::Tensor& prefill_tokens,
     model::batch& inputs
 );
 
