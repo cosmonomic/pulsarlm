@@ -26,13 +26,14 @@ inline void require(bool condition, const char* message) {
     }
 }
 
-// Sets on_device's page mass_sum and weight_sum for the KV layers that measure mass, those with mass_heads above 0, to
-// zeroed parts of one tensor, which it returns: per such layer in turn, its mass_sum, then its weight_sum.
+// Sets g's page mass_sum and weight_sum for the KV layers that measure mass, those with mass_heads above 0, to zeroed
+// parts of one tensor on device, which it returns: per such layer in turn, its mass_sum, then its weight_sum.
 // host_cu_view_pages is on the host.
 at::Tensor zero_page_mass(
-    model::batch& on_device,
+    model::batch& g,
     const at::Tensor& host_cu_view_pages,
-    const std::vector<std::size_t>& mass_heads
+    const std::vector<std::size_t>& mass_heads,
+    at::Device device
 );
 
 // The tokens each running request forwards in one step, the model inputs for them, and the tokens sampled from the
@@ -218,12 +219,23 @@ class executor::batch {
         std::size_t shard,
         const request_table& table
     );
+    // Queues on device, shard's, the replay of g, the decode or verify group, from graphs, which gathers its inputs
+    // from the shard's request table. Returns its output and its page mass, undefined for a group that measures none;
+    // a verify group's gathered tokens go into verify_tokens. mass_heads is the shard's part of the executor's.
+    std::pair<model::output, at::Tensor> replay_group(
+        const group& g,
+        const std::vector<std::size_t>& mass_heads,
+        std::size_t shard,
+        at::Device device,
+        step_graphs& graphs
+    );
     // Queues on stream shard's writes of the step's table cells and stale entries into table (write_tables), then
-    // the gather of the prior hidden vectors from draft_layer's lines, then per group its inputs (upload_inputs), its
-    // forward and the copy of its page mass to the host, then the sampling, the drafts, the advance of table's draw
-    // counts (advance_draw_counts) and last the advance of its requests (advance_table); shard 0 also queues the copy
-    // of the sampled tokens to the host. mass_heads is the shard's part of the executor's. graphs is the shard's when a
-    // group is replayed. Every shard's call may run at once, each on its own thread.
+    // the gather of the prior hidden vectors from draft_layer's lines, then a replayed verify step or decode step, or
+    // else per group its inputs (upload_inputs) and its forward, or its replay (replay_group), and the copy of its page
+    // mass to the host, then the sampling, the drafts, the advance of table's draw counts (advance_draw_counts) and
+    // last the advance of its requests (advance_table); shard 0 also queues the copy of the sampled tokens to the
+    // host. mass_heads is the shard's part of the executor's. graphs is the shard's when a group is replayed. Every
+    // shard's call may run at once, each on its own thread.
     void enqueue(
         model& shard_model,
         std::span<const kv> lines,
@@ -291,18 +303,25 @@ class executor::batch {
     );
     // Whether the step replays a step_graphs verify step: every entry verifies and drafts, and the verify group
     // replays.
-    bool steps_replay() const noexcept;
-    // Queues on device, shard's, the replay of its verify step from graphs, on_device being the verify group and
-    // verify_mass its page mass, sampled by inputs gathered from table and drafting at the positions of table's
-    // entries in draft_layer, then the copies of its outputs to the host on shard 0. Returns the step's samples.
-    at::Tensor enqueue_step(
-        const model::batch& on_device,
-        const at::Tensor& verify_mass,
+    bool verify_step_replays() const noexcept;
+    // Whether the step replays a step_graphs decode step when it drafts nothing: every entry decodes and samples, and
+    // the decode group replays.
+    bool decode_step_replays() const noexcept;
+    // Queues on device, shard's, the replay of the step's verify step from graphs, which gathers its inputs from the
+    // shard's request table and advances it, then the copies of its page mass to the host and, on shard 0, of its
+    // outputs. mass_heads is the shard's part of the executor's.
+    void enqueue_verify_step(
+        const std::vector<std::size_t>& mass_heads,
         std::size_t shard,
         at::Device device,
-        step_graphs* graphs,
-        const request_table& table,
-        std::size_t draft_layer
+        step_graphs& graphs
+    );
+    // enqueue_verify_step for the step's decode step.
+    void enqueue_decode_step(
+        const std::vector<std::size_t>& mass_heads,
+        std::size_t shard,
+        at::Device device,
+        step_graphs& graphs
     );
     // Queues on device, shard's, after everything of the step that reads table, the advance of each entry's request
     // in table (advance_requests) by its computed tokens, its next token from samples or the host, and the drafts of

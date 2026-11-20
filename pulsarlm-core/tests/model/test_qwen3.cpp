@@ -1,5 +1,6 @@
 #include "pulsarlm/engine/model/qwen3.hpp"
 
+#include "pulsarlm/engine/request_table.hpp"
 #include "pulsarlm/engine/step_graphs.hpp"
 
 #include <ATen/ATen.h>
@@ -16,7 +17,7 @@
 
 // qwen3_model's paged forward against a dense ATen Qwen3: chunked prefill then decode over pages scattered across the
 // lines, checking the logits, the unrotated K the lines hold, and the per-page attention mass. The decode steps forward
-// through the model or through step_graphs.
+// through the model or through step_graphs, which gathers them from a request table.
 
 namespace {
 
@@ -201,6 +202,39 @@ pulsarlm::model::batch step(const at::Tensor& tokens, std::int64_t first, std::i
     return g;
 }
 
+// The request table of one request at slot 0, its view's pages those of step, its decode queries weighing as
+// query_weight weighs a step's last query.
+pulsarlm::request_table make_table() {
+    const auto pages = static_cast<std::int64_t>(view_lines.size());
+    return pulsarlm::request_table{
+        .page_tables = every_layer(int32_cuda(view_lines)).unsqueeze(0).contiguous(),
+        .page_positions = every_layer(at::arange(pages, cuda(at::kInt)) * page_size).unsqueeze(0).contiguous(),
+        .history_positions = at::zeros({1}, cuda(at::kLong)),
+        .rope_positions = at::zeros({1}, cuda(at::kLong)),
+        .key_counts = at::zeros({1, n_layers}, cuda(at::kInt)),
+        .recurrent_layers = at::zeros({n_layers}, cuda(at::kBool)),
+        .page_size = page_size,
+        .rejected_tokens = at::zeros({1}, cuda(at::kInt)),
+        .tokens = at::zeros({1, 1}, cuda(at::kLong)),
+        .cycle_end_positions = at::zeros({1}, cuda(at::kLong)),
+        .mass_start_positions = at::zeros({1}, cuda(at::kLong)),
+        .attention_mass_decays = at::full({1}, 0.25, cuda(at::kDouble)),
+        .seeds = at::zeros({1}, cuda(at::kLong)),
+        .draw_counts = at::zeros({1}, cuda(at::kLong)),
+        .temperatures = at::zeros({1}, cuda(at::kFloat)),
+        .top_k = at::zeros({1}, cuda(at::kLong)),
+        .top_p = at::zeros({1}, cuda(at::kFloat)),
+    };
+}
+
+// Sets table's request to the one whose next token is tokens[position].
+void set_next_token(const pulsarlm::request_table& table, const at::Tensor& tokens, std::int64_t position) {
+    table.history_positions.fill_(position);
+    table.rope_positions.fill_(position);
+    table.key_counts.fill_(position);
+    table.tokens.copy_(tokens.narrow(0, position, 1).view({1, 1}));
+}
+
 double max_relative_error(const at::Tensor& got, const at::Tensor& expected) {
     return ((got.to(at::kFloat) - expected).abs().max() / expected.abs().max()).item<double>();
 }
@@ -231,6 +265,7 @@ void check_against_dense(at::ScalarType dtype, double tolerance, bool graphs) {
         );
     }
 
+    const pulsarlm::request_table table = make_table();
     pulsarlm::step_graphs decode(
         model,
         kv,
@@ -238,8 +273,10 @@ void check_against_dense(at::ScalarType dtype, double tolerance, bool graphs) {
         page_size,
         /*state_slots=*/1,
         std::vector<std::size_t>(n_layers, static_cast<std::size_t>(n_heads)),
-        at::empty({0}, cuda(at::kLong))
+        at::empty({0}, cuda(at::kLong)),
+        table
     );
+    const at::Tensor slot = at::zeros({1}, cuda(at::kLong));
 
     const std::int64_t n_tokens = 40;
     auto tokens = at::randint(vocab, {n_tokens}, cuda(at::kLong));
@@ -256,7 +293,8 @@ void check_against_dense(at::ScalarType dtype, double tolerance, bool graphs) {
         pulsarlm::model::batch batch = step(tokens, c.first, c.last, c.prefill);
         pulsarlm::model::output output;
         if (graphs && !c.prefill) {
-            output = decode.decode(batch);
+            set_next_token(table, tokens, c.first);
+            output = decode.decode(slot, batch.cu_view_pages, batch.page_mass_sum, batch.page_weight_sum);
         } else {
             output = model.forward(batch, kv);
         }

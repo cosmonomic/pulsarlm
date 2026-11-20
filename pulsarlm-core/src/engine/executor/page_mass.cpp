@@ -13,9 +13,10 @@
 namespace pulsarlm {
 
 at::Tensor zero_page_mass(
-    model::batch& on_device,
+    model::batch& g,
     const at::Tensor& host_cu_view_pages,
-    const std::vector<std::size_t>& mass_heads
+    const std::vector<std::size_t>& mass_heads,
+    at::Device device
 ) {
     std::int64_t row_size = host_cu_view_pages.size(1);
     const auto* cu_view_pages = host_cu_view_pages.const_data_ptr<std::int32_t>();
@@ -28,17 +29,17 @@ at::Tensor zero_page_mass(
             total += layer_pages(layer) * static_cast<std::int64_t>(mass_heads[layer] + 1);
         }
     }
-    at::Tensor mass = at::zeros({total}, on_device.tokens.options().dtype(at::kFloat));
-    on_device.page_mass_sum.resize(mass_heads.size());
-    on_device.page_weight_sum.resize(mass_heads.size());
+    at::Tensor mass = at::zeros({total}, at::device(device).dtype(at::kFloat));
+    g.page_mass_sum.resize(mass_heads.size());
+    g.page_weight_sum.resize(mass_heads.size());
     std::int64_t first = 0;
     for (std::size_t layer = 0; layer < mass_heads.size(); layer++) {
         if (mass_heads[layer] > 0) {
             auto heads = static_cast<std::int64_t>(mass_heads[layer]);
             std::int64_t pages = layer_pages(layer);
-            on_device.page_mass_sum[layer] = mass.narrow(0, first, pages * heads).view({pages, heads});
+            g.page_mass_sum[layer] = mass.narrow(0, first, pages * heads).view({pages, heads});
             first += pages * heads;
-            on_device.page_weight_sum[layer] = mass.narrow(0, first, pages);
+            g.page_weight_sum[layer] = mass.narrow(0, first, pages);
             first += pages;
         }
     }

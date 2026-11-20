@@ -89,7 +89,8 @@ class executor {
         std::unique_ptr<step_graphs> graphs;
         // The arrival counters of the steps that run without a graph, grown to the largest step's.
         at::Tensor arrival_counters;
-        // Indexed by slot_of. Every shard's steps advance it alike.
+        // Indexed by slot_of. Every shard's steps advance it alike. Its tensors are allocated once, as graphs reads and
+        // writes them where they are.
         request_table table;
     };
 
@@ -225,7 +226,9 @@ class executor {
     // per entry of each model's kv_layers(), and the shards agree on which layers are recurrent or sliding. store is the
     // cache's. root is the engine's root digest (make_root_digest). A request's view takes at most view_page_capacity
     // pages, and one that would take more ends with context_exceeded. With graph_pages, a decode group's forward replays a step_graphs
-    // graph over tables graph_pages wide, and so does a verify group's. A step drafts draft_tokens tokens per request
+    // graph over tables graph_pages wide, and so does a verify group's; a step of a decode group alone whose entries
+    // all sample and that drafts nothing replays a decode step, and a step of drafting verify entries alone a verify
+    // step. A step drafts draft_tokens tokens per request
     // with the shards' draft heads, which they have when draft_tokens is above 0, and the cache's recurrent layers are
     // laid out for them (recurrent_state). At most max_running_requests requests hold a record at once (start).
     executor(

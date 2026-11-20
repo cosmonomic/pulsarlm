@@ -44,6 +44,7 @@ executor::batch::batch(executor& owner, std::span<const scheduled_request> sched
         g->table_width = table_width(g->entries);
         assert(g->table_width <= owner.view_page_capacity);
         if (g != &prefill_group && owner.graph_pages) {
+            assert(g != &verify_group || verify_rows == owner.draft_state_slots);
             g->is_replayed = true;
             g->table_width = *owner.graph_pages;
         }

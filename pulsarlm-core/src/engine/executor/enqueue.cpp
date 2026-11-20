@@ -9,10 +9,12 @@
 #include <c10/cuda/CUDAStream.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -88,9 +90,39 @@ std::pair<model::batch, at::Tensor> executor::batch::upload_inputs(
     }
     at::Tensor mass;
     if (g.inputs.cu_view_pages.defined()) {
-        mass = zero_page_mass(on_device, g.inputs.cu_view_pages, mass_heads);
+        mass = zero_page_mass(on_device, g.inputs.cu_view_pages, mass_heads, device);
     }
     return {std::move(on_device), std::move(mass)};
+}
+
+std::pair<model::output, at::Tensor> executor::batch::replay_group(
+    const group& g,
+    const std::vector<std::size_t>& mass_heads,
+    std::size_t shard,
+    at::Device device,
+    step_graphs& graphs
+) {
+    model::batch page_mass_rows{.kind = g.inputs.kind};
+    at::Tensor mass;
+    if (g.inputs.cu_view_pages.defined()) {
+        mass = zero_page_mass(page_mass_rows, g.inputs.cu_view_pages, mass_heads, device);
+    }
+    if (&g == &decode_group) {
+        return {
+            graphs
+                .decode(g.slots, g.inputs.cu_view_pages, page_mass_rows.page_mass_sum, page_mass_rows.page_weight_sum),
+            std::move(mass),
+        };
+    }
+    assert(&g == &verify_group);
+    step_graphs::verify_outputs outputs = graphs.verify(
+        g.slots,
+        g.inputs.cu_view_pages,
+        page_mass_rows.page_mass_sum,
+        page_mass_rows.page_weight_sum
+    );
+    verify_tokens[shard] = outputs.tokens;
+    return {model::output{.logits = outputs.logits, .hidden = outputs.hidden}, std::move(mass)};
 }
 
 void executor::batch::enqueue(
@@ -111,11 +143,12 @@ void executor::batch::enqueue(
     if (draft_layer && !prior_hidden_slots.empty()) {
         gather_prior_hidden(table, lines, *draft_layer, shard, device);
     }
-    if (steps_replay()) {
-        auto [on_device, mass] = upload_inputs(verify_group, lines, mass_heads, shard, table);
-        const at::Tensor samples = enqueue_step(on_device, mass, shard, device, graphs, table, *draft_layer);
-        advance_draw_counts(table, shard, device);
-        advance_table(table, samples, shard, device);
+    if (verify_step_replays()) {
+        enqueue_verify_step(mass_heads, shard, device, *graphs);
+        return;
+    }
+    if (!draft_layer && decode_step_replays()) {
+        enqueue_decode_step(mass_heads, shard, device, *graphs);
         return;
     }
     // A replayed group reads its graph's own counters.
@@ -139,15 +172,15 @@ void executor::batch::enqueue(
         if (g->entries.empty()) {
             continue;
         }
-        auto [on_device, mass] = upload_inputs(*g, lines, mass_heads, shard, table);
-        on_device.arrival_counters = counters;
         model::output output;
-        if (!g->is_replayed) {
-            output = shard_model.forward(on_device, lines);
-        } else if (g == &decode_group) {
-            output = graphs->decode(on_device);
+        at::Tensor mass;
+        if (g->is_replayed) {
+            std::tie(output, mass) = replay_group(*g, mass_heads, shard, device, *graphs);
         } else {
-            output = graphs->verify(on_device);
+            auto [on_device, group_mass] = upload_inputs(*g, lines, mass_heads, shard, table);
+            on_device.arrival_counters = counters;
+            output = shard_model.forward(on_device, lines);
+            mass = std::move(group_mass);
         }
         g->hidden_by_shard[shard] = output.hidden;
         if (mass.defined()) {
@@ -299,46 +332,42 @@ void executor::batch::advance_table(
     }
 }
 
-bool executor::batch::steps_replay() const noexcept {
+bool executor::batch::verify_step_replays() const noexcept {
     return verify_group.is_replayed && decode_group.entries.empty() && prefill_group.entries.empty() &&
         std::ranges::all_of(verify_group.entries, [](const entry& e) { return e.draft && e.draft->is_drafting; });
 }
 
-at::Tensor executor::batch::enqueue_step(
-    const model::batch& on_device,
-    const at::Tensor& verify_mass,
+bool executor::batch::decode_step_replays() const noexcept {
+    return decode_group.is_replayed && verify_group.entries.empty() && prefill_group.entries.empty() &&
+        std::ranges::all_of(decode_group.entries, [](const entry& e) { return e.is_sampling; });
+}
+
+void executor::batch::enqueue_verify_step(
+    const std::vector<std::size_t>& mass_heads,
     std::size_t shard,
     at::Device device,
-    step_graphs* graphs,
-    const request_table& table,
-    std::size_t draft_layer
+    step_graphs& graphs
 ) {
-    const auto longs = at::TensorOptions().dtype(at::kLong);
-    const auto rows = static_cast<std::int64_t>(verify_rows);
-    const at::Tensor slots = verify_group.slots.to(device, /*non_blocking=*/true);
-    const at::Tensor positions = table.rope_positions.index_select(0, slots);
-    const at::Tensor keys = layer_keys(table, slots, draft_layer);
-    const at::Tensor later = at::arange(1, static_cast<std::int64_t>(draft_count), positions.options()).unsqueeze(1);
+    model::batch page_mass_rows{.kind = model::batch_kind::verify};
+    at::Tensor mass;
+    if (verify_group.inputs.cu_view_pages.defined()) {
+        mass = zero_page_mass(page_mass_rows, verify_group.inputs.cu_view_pages, mass_heads, device);
+    }
     std::vector<std::int64_t> max_accepted_token_counts;
-    std::vector<std::int64_t> key_count_offsets;
     for (const entry& e : verify_group.entries) {
         max_accepted_token_counts.push_back(static_cast<std::int64_t>(e.max_accepted_token_count));
-        key_count_offsets.push_back(static_cast<std::int64_t>(e.draft->key_count_offset));
     }
-    const step_graphs::verify_step_outputs outputs = graphs->verify_step(
-        on_device,
-        gather_sampling_inputs(table, device),
-        tensor_on_device(max_accepted_token_counts, longs, device),
-        at::repeat_interleave(positions, rows) + tensor_on_device(draft_position_offsets, longs, device),
-        keys + tensor_on_device(key_count_offsets, longs, device),
-        positions.unsqueeze(0) + later,
-        keys.unsqueeze(0) + later + 1
+    const step_graphs::verify_step_outputs outputs = graphs.verify_step(
+        verify_group.slots,
+        verify_group.inputs.cu_view_pages,
+        page_mass_rows.page_mass_sum,
+        page_mass_rows.page_weight_sum,
+        filters,
+        pinned_values(max_accepted_token_counts)
     );
-    accepted_token_counts_by_shard[shard] = outputs.accepted_token_counts;
-    shard_next_tokens[shard] = outputs.next_tokens;
-    if (verify_mass.defined()) {
-        verify_group.mass_by_shard[shard] = pinned(verify_mass.sizes(), at::kFloat);
-        verify_group.mass_by_shard[shard].copy_(verify_mass, /*non_blocking=*/true);
+    if (mass.defined()) {
+        verify_group.mass_by_shard[shard] = pinned(mass.sizes(), at::kFloat);
+        verify_group.mass_by_shard[shard].copy_(mass, /*non_blocking=*/true);
     }
     if (shard == 0) {
         sampled_tokens = pinned(outputs.samples.sizes(), at::kLong);
@@ -347,8 +376,39 @@ at::Tensor executor::batch::enqueue_step(
         accepted_token_counts.copy_(outputs.accepted_token_counts, /*non_blocking=*/true);
         next_tokens = pinned(outputs.next_tokens.sizes(), at::kLong);
         next_tokens.copy_(outputs.next_tokens, /*non_blocking=*/true);
+        cycle_end_flags = pinned(outputs.ends_cycle.sizes(), at::kBool);
+        cycle_end_flags.copy_(outputs.ends_cycle, /*non_blocking=*/true);
     }
-    return outputs.samples;
+}
+
+void executor::batch::enqueue_decode_step(
+    const std::vector<std::size_t>& mass_heads,
+    std::size_t shard,
+    at::Device device,
+    step_graphs& graphs
+) {
+    model::batch page_mass_rows{.kind = model::batch_kind::decode};
+    at::Tensor mass;
+    if (decode_group.inputs.cu_view_pages.defined()) {
+        mass = zero_page_mass(page_mass_rows, decode_group.inputs.cu_view_pages, mass_heads, device);
+    }
+    const step_graphs::decode_step_outputs outputs = graphs.decode_step(
+        decode_group.slots,
+        decode_group.inputs.cu_view_pages,
+        page_mass_rows.page_mass_sum,
+        page_mass_rows.page_weight_sum,
+        filters
+    );
+    if (mass.defined()) {
+        decode_group.mass_by_shard[shard] = pinned(mass.sizes(), at::kFloat);
+        decode_group.mass_by_shard[shard].copy_(mass, /*non_blocking=*/true);
+    }
+    if (shard == 0) {
+        sampled_tokens = pinned(outputs.samples.sizes(), at::kLong);
+        sampled_tokens.copy_(outputs.samples, /*non_blocking=*/true);
+        cycle_end_flags = pinned(outputs.ends_cycle.sizes(), at::kBool);
+        cycle_end_flags.copy_(outputs.ends_cycle, /*non_blocking=*/true);
+    }
 }
 
 void executor::batch::enqueue_drafts(

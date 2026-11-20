@@ -173,7 +173,8 @@ executor::executor(
                 layout.page_size,
                 draft_state_slots,
                 s.mass_heads,
-                s.stop_tokens
+                s.stop_tokens,
+                s.table
             );
         }
         capture_step_graphs();
