@@ -27,22 +27,21 @@ class EvictionLog:
     tokens a cycle's end with the state's tail keeps, None without a
     max_context_capacity above 0."""
 
-    def __init__(
-        self, path: Path, engine: AsyncEngine, eviction: EvictionPolicy
-    ) -> None:
+    def __init__(self, path: Path, engine: AsyncEngine) -> None:
         self._path = path
         self._engine = engine
-        self._eviction = eviction
 
     async def record(
         self,
         completion_id: str,
         prompt: list[int],
+        eviction: EvictionPolicy,
         tokens: AsyncGenerator[int],
         states: list[State],
     ) -> AsyncGenerator[int]:
-        """Yields tokens, then writes the request's line once they end; states
-        holds the states the request reached by then."""
+        """Yields tokens, then writes the request's line once they end, scoring
+        pages by eviction, the request's policy; states holds the states the
+        request reached by then."""
         async with aclosing(tokens):
             async for token in tokens:
                 yield token
@@ -50,12 +49,12 @@ class EvictionLog:
             "id": completion_id,
             "prompt_tokens": len(prompt),
             "prompt_sha256": prompt_sha256(prompt),
-            "states": [self._view(state) for state in states],
+            "states": [self._view(state, eviction) for state in states],
         }
         with self._path.open("a") as f:
             f.write(json.dumps(line) + "\n")
 
-    def _view(self, state: State) -> dict[str, Any]:
+    def _view(self, state: State, eviction: EvictionPolicy) -> dict[str, Any]:
         full_pages = max(
             (
                 sequence.pages[-1].index + 1
@@ -64,7 +63,7 @@ class EvictionLog:
             ),
             default=0,
         )
-        report = self._engine.eviction_report_of(state, self._eviction)
+        report = self._engine.eviction_report_of(state, eviction)
         return {
             "tokens": full_pages * PAGE_SIZE + len(state.tail),
             "cap_tokens": report.cap_tokens,

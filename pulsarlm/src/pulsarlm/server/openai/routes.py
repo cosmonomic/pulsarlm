@@ -27,6 +27,7 @@ from pulsarlm.server.openai.schema import (
     ChatCompletionResponse,
     ChatMessage,
     DeltaToolCall,
+    EvictionOptions,
     FinishReason,
     FunctionCall,
     MessageToolCall,
@@ -51,22 +52,43 @@ class ServerState:
     tool_call_syntax: ToolCallSyntax | None
     think_syntax: ThinkSyntax | None
     eviction: EvictionPolicy
+    max_context_window: int
     eviction_log: EvictionLog | None
     telemetry: Telemetry
 
-    def eviction_for(self, system_tokens: int) -> EvictionPolicy:
-        """The default policy, sinking the system message's tokens, or the first
-        token without one."""
+    def eviction_for(
+        self, system_tokens: int, options: EvictionOptions | None
+    ) -> EvictionPolicy:
+        """The default policy with the fields options sets, sinking the system
+        message's tokens, or the first token without one; a negative
+        max_context_capacity is taken as max_context_window."""
+        if options is None:
+            options = EvictionOptions()
+        max_context_capacity = _or_default(
+            options.max_context_capacity, self.eviction.max_context_capacity
+        )
+        if max_context_capacity < 0:
+            max_context_capacity = self.max_context_window
         return EvictionPolicy(
             n_sink=sink_tokens(system_tokens),
-            n_working=self.eviction.n_working,
-            cycle_tokens=self.eviction.cycle_tokens,
-            mass_tokens=self.eviction.mass_tokens,
-            max_context_capacity=self.eviction.max_context_capacity,
-            eviction_threshold=self.eviction.eviction_threshold,
-            eviction_warmup=self.eviction.eviction_warmup,
-            attention_mass_decay=self.eviction.attention_mass_decay,
+            n_working=_or_default(options.n_working, self.eviction.n_working),
+            cycle_tokens=_or_default(options.cycle_tokens, self.eviction.cycle_tokens),
+            mass_tokens=_or_default(options.mass_tokens, self.eviction.mass_tokens),
+            max_context_capacity=max_context_capacity,
+            eviction_threshold=_or_default(
+                options.eviction_threshold, self.eviction.eviction_threshold
+            ),
+            eviction_warmup=_or_default(
+                options.eviction_warmup, self.eviction.eviction_warmup
+            ),
+            attention_mass_decay=_or_default(
+                options.attention_mass_decay, self.eviction.attention_mass_decay
+            ),
         )
+
+
+def _or_default[T](value: T | None, default: T) -> T:
+    return default if value is None else value
 
 
 def get_server_state(request: Request) -> ServerState:
@@ -113,6 +135,7 @@ async def create_chat_completion(body: ChatCompletionRequest, state: State):
     except ChatTemplateError as error:
         raise HTTPException(400, f"chat template: {error}") from error
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+    eviction = state.eviction_for(system_tokens, body.eviction)
     states: list[EngineState] = []
     request_attributes: dict[str, AttributeValue] = {
         "gen_ai.response.id": completion_id,
@@ -140,12 +163,14 @@ async def create_chat_completion(body: ChatCompletionRequest, state: State):
             seed=body.seed,
         ),
         max_tokens=body.max_tokens,
-        eviction=state.eviction_for(system_tokens),
+        eviction=eviction,
         on_state=None if state.eviction_log is None else states.append,
         on_completed=reply.record_usage,
     )
     if state.eviction_log is not None:
-        tokens = state.eviction_log.record(completion_id, prompt, tokens, states)
+        tokens = state.eviction_log.record(
+            completion_id, prompt, eviction, tokens, states
+        )
     if body.stream:
         return _stream_completion(body, completion_id, reply, tokens)
     return await _full_completion(body, completion_id, reply, tokens)
@@ -275,9 +300,11 @@ async def _texts(
             yield reply.step(token)
 
 
-def _http_error(error: EngineStopped | CompletionError) -> HTTPException:
+def _http_error(error: EngineStopped | CompletionError | ValueError) -> HTTPException:
     if isinstance(error, EngineStopped):
         return HTTPException(503, f"engine stopped: {error}")
+    if isinstance(error, ValueError):
+        return HTTPException(400, str(error))
     if isinstance(error, CompletionError) and error.error == RequestError.OOM:
         return HTTPException(400, "out of device memory")
     if (
@@ -298,7 +325,7 @@ async def _full_completion(
     try:
         async for part, text in _texts(reply, tokens):
             texts[part].append(text)
-    except (EngineStopped, CompletionError) as error:
+    except (EngineStopped, CompletionError, ValueError) as error:
         failure = _http_error(error)
         reply.record_failure(failure)
         raise failure from error
@@ -354,7 +381,7 @@ def _stream_completion(
                     yield chunk(ChatCompletionChunkDelta(reasoning=text))
                 elif text:
                     yield chunk(ChatCompletionChunkDelta(content=text))
-        except (EngineStopped, CompletionError) as error:
+        except (EngineStopped, CompletionError, ValueError) as error:
             failure = _http_error(error)
             reply.record_failure(failure)
             yield f"data: {json.dumps({'error': {'message': failure.detail, 'code': failure.status_code}})}\n\n"

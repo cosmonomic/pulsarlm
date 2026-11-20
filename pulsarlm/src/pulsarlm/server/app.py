@@ -29,9 +29,10 @@ def load_server_state(
         tool_call_syntax=served.tool_call_syntax,
         think_syntax=served.think_syntax,
         eviction=served.eviction,
+        max_context_window=served.max_context_window,
         eviction_log=None
         if eviction_log is None
-        else EvictionLog(eviction_log, engine, served.eviction),
+        else EvictionLog(eviction_log, engine),
         telemetry=start_telemetry(engine.stat, served.store.stat, settings.model),
     )
 

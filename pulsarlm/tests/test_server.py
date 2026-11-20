@@ -26,10 +26,11 @@ from pulsarlm.core.engine import (
     State,
 )
 from pulsarlm.eviction_log import EvictionLog, prompt_sha256
+from pulsarlm.paging import sink_tokens
 from pulsarlm.server import create_app
 from pulsarlm.server.openai import ServerState
 from pulsarlm.server.openai.routes import template_messages
-from pulsarlm.server.openai.schema import ChatMessage
+from pulsarlm.server.openai.schema import ChatMessage, EvictionOptions
 from pulsarlm.server.telemetry import start_telemetry
 from pulsarlm.store import LocalStore
 
@@ -44,6 +45,7 @@ PAGE_SIZE = 16
 DEVICE = torch.device("cuda", 0)
 DTYPE = torch.bfloat16
 LINE_BYTES = 2 * N_LAYERS * PAGE_SIZE * N_KV_HEADS * HEAD_DIM * DTYPE.itemsize
+MAX_CONTEXT_WINDOW = 4096
 MODEL_ID = "random-qwen3"
 BASE_URL = "http://testserver/api/openai/v1"
 SPECIAL_TOKENS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>"]
@@ -158,7 +160,7 @@ def load(
         stop_ids=stop_ids,
         prefill_tokens_per_step=64,
         decode_graphs=True,
-        max_context_window=4096,
+        max_context_window=MAX_CONTEXT_WINDOW,
         draft_tokens=0,
     )
     return ServerState(
@@ -170,6 +172,7 @@ def load(
         tool_call_syntax=None,
         think_syntax=None,
         eviction=EvictionPolicy(cycle_tokens=PAGE_SIZE),
+        max_context_window=MAX_CONTEXT_WINDOW,
         eviction_log=None,
         telemetry=start_telemetry(engine.stat, store.stat, MODEL_ID),
     )
@@ -191,6 +194,14 @@ def encode(state: ServerState, messages: list[dict[str, str]]) -> list[int]:
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+
+
+@pytest.fixture(autouse=True)
+def release_cached_device_memory():
+    yield
+    # A destroyed engine's CUDA graph pools stay in PyTorch's cache, which later
+    # engines of the suite cannot reuse.
+    torch.cuda.empty_cache()
 
 
 def api_client(load_state: Callable[[], ServerState]) -> TestClient:
@@ -339,8 +350,189 @@ def test_a_chat_template_error_is_a_bad_request():
 
 def test_without_a_system_message_only_the_first_token_is_sunk(client):
     state = client.app.state.server_state
-    assert state.eviction_for(0).n_sink == 1
-    assert state.eviction_for(PAGE_SIZE + 1).n_sink == PAGE_SIZE + 1
+    assert state.eviction_for(0, None).n_sink == 1
+    assert state.eviction_for(PAGE_SIZE + 1, None).n_sink == PAGE_SIZE + 1
+
+
+def policy_fields(policy: EvictionPolicy) -> dict[str, Any]:
+    return {
+        "n_sink": policy.n_sink,
+        "n_working": policy.n_working,
+        "cycle_tokens": policy.cycle_tokens,
+        "mass_tokens": policy.mass_tokens,
+        "max_context_capacity": policy.max_context_capacity,
+        "eviction_threshold": policy.eviction_threshold,
+        "eviction_warmup": policy.eviction_warmup,
+        "attention_mass_decay": policy.attention_mass_decay,
+    }
+
+
+def default_policy() -> EvictionPolicy:
+    return EvictionPolicy(
+        n_working=2 * PAGE_SIZE,
+        cycle_tokens=PAGE_SIZE,
+        mass_tokens=PAGE_SIZE // 2,
+        max_context_capacity=64 * PAGE_SIZE,
+        eviction_threshold=0.25,
+        eviction_warmup=2,
+        attention_mass_decay=0.5,
+    )
+
+
+def messages_sink(state: ServerState) -> int:
+    parsed = [ChatMessage.model_validate(m) for m in MESSAGES]
+    _, system_tokens = encode_prompt(
+        state.tokenizer, state.chat_template, template_messages(parsed)
+    )
+    return sink_tokens(system_tokens)
+
+
+@pytest.fixture(scope="module")
+def eviction_client():
+    """A server whose default policy is default_policy, with the policies its
+    engine was submitted, in order."""
+    submitted: list[EvictionPolicy] = []
+
+    def load_state() -> ServerState:
+        state = load()
+        state.eviction = default_policy()
+        submit = state.engine.submit
+
+        def recording_submit(*args, eviction: EvictionPolicy, **kwargs):
+            submitted.append(eviction)
+            return submit(*args, eviction=eviction, **kwargs)
+
+        patch.setattr(state.engine, "submit", recording_submit)
+        return state
+
+    with pytest.MonkeyPatch.context() as patch, api_client(load_state) as client:
+        yield client, submitted
+
+
+def server_state(client: TestClient) -> ServerState:
+    return cast(Any, client.app).state.server_state
+
+
+def test_a_request_without_eviction_options_takes_the_default_policy(
+    eviction_client,
+):
+    client, submitted = eviction_client
+    response = post(client, messages=MESSAGES, max_tokens=4)
+
+    assert response.status_code == 200
+    assert policy_fields(submitted[-1]) == policy_fields(default_policy()) | {
+        "n_sink": messages_sink(server_state(client))
+    }
+
+
+def test_eviction_options_replace_only_the_fields_they_set(eviction_client):
+    client, submitted = eviction_client
+    options = {"n_working": 3 * PAGE_SIZE, "eviction_threshold": 0.5}
+    response = post(client, messages=MESSAGES, max_tokens=4, eviction=options)
+
+    assert response.status_code == 200
+    assert policy_fields(submitted[-1]) == policy_fields(default_policy()) | {
+        "n_sink": messages_sink(server_state(client)),
+        "n_working": 3 * PAGE_SIZE,
+        "eviction_threshold": 0.5,
+    }
+
+
+def test_an_eviction_option_set_to_null_takes_the_default(eviction_client):
+    client, _ = eviction_client
+    options = EvictionOptions.model_validate({"mass_tokens": None})
+
+    policy = server_state(client).eviction_for(PAGE_SIZE + 1, options)
+
+    assert policy_fields(policy) == policy_fields(default_policy()) | {
+        "n_sink": PAGE_SIZE + 1
+    }
+
+
+def test_a_max_context_capacity_of_0_turns_capacity_eviction_off_for_one_request(
+    eviction_client,
+):
+    client, submitted = eviction_client
+    off = post(
+        client, messages=MESSAGES, max_tokens=4, eviction={"max_context_capacity": 0}
+    )
+    default = post(client, messages=MESSAGES, max_tokens=4)
+
+    assert off.status_code == default.status_code == 200
+    assert [policy.max_context_capacity for policy in submitted[-2:]] == [
+        0,
+        64 * PAGE_SIZE,
+    ]
+
+
+def test_a_negative_max_context_capacity_takes_the_window(eviction_client):
+    client, submitted = eviction_client
+    response = post(
+        client, messages=MESSAGES, max_tokens=4, eviction={"max_context_capacity": -1}
+    )
+
+    assert response.status_code == 200
+    assert submitted[-1].max_context_capacity == MAX_CONTEXT_WINDOW
+
+
+@pytest.mark.parametrize(
+    "options, message",
+    [
+        ({"eviction_threshold": 1.5}, "eviction.eviction_threshold 1.5 is outside"),
+        (
+            {"max_context_capacity": MAX_CONTEXT_WINDOW + 1},
+            "exceeds the engine's max_context_window",
+        ),
+        ({"max_context_capacity": 2 * PAGE_SIZE}, "cannot hold the pages"),
+    ],
+)
+def test_eviction_options_the_engine_rejects_are_a_bad_request(
+    eviction_client, options, message
+):
+    client, _ = eviction_client
+    response = post(client, messages=MESSAGES, max_tokens=4, eviction=options)
+
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+
+
+def test_eviction_options_the_engine_rejects_end_a_stream_with_a_bad_request(
+    eviction_client,
+):
+    client, _ = eviction_client
+    response = post(
+        client,
+        messages=MESSAGES,
+        max_tokens=4,
+        stream=True,
+        eviction={"eviction_threshold": 1.5},
+    )
+
+    events = [line for line in response.text.split("\n\n") if line]
+    assert events[-1] == "data: [DONE]"
+    error = json.loads(events[-2].removeprefix("data: "))["error"]
+    assert error["code"] == 400
+    assert "eviction_threshold" in error["message"]
+
+
+@pytest.mark.parametrize(
+    "options", [{"n_working": "many"}, {"cycle_tokens": -1}, {"n_working": 1.5}]
+)
+def test_eviction_options_of_the_wrong_type_are_rejected(eviction_client, options):
+    client, _ = eviction_client
+    response = post(client, messages=MESSAGES, max_tokens=4, eviction=options)
+
+    assert response.status_code == 422
+
+
+def test_an_unknown_eviction_option_is_ignored(eviction_client):
+    client, submitted = eviction_client
+    response = post(client, messages=MESSAGES, max_tokens=4, eviction={"n_sinks": 7})
+
+    assert response.status_code == 200
+    assert policy_fields(submitted[-1]) == policy_fields(default_policy()) | {
+        "n_sink": messages_sink(server_state(client))
+    }
 
 
 def test_an_unknown_model_is_not_found(client):
@@ -355,7 +547,7 @@ def logging_eviction(log: Path, eviction: EvictionPolicy) -> Callable[[], Server
     def load_state() -> ServerState:
         state = load(stop_ids=[])
         state.eviction = eviction
-        state.eviction_log = EvictionLog(log, state.engine, eviction)
+        state.eviction_log = EvictionLog(log, state.engine)
         return state
 
     return load_state

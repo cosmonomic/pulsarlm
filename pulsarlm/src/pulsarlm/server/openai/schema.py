@@ -43,6 +43,45 @@ class StreamOptions(BaseModel):
     include_usage: bool = False
 
 
+class EvictionOptions(BaseModel):
+    n_working: int | None = Field(
+        default=None,
+        ge=0,
+        description="The last tokens a cycle's end never evicts; at least 1.",
+    )
+    cycle_tokens: int | None = Field(
+        default=None,
+        ge=0,
+        description="The tokens between two cycle ends; at least 1.",
+    )
+    mass_tokens: int | None = Field(
+        default=None,
+        ge=0,
+        description="The last tokens of each cycle whose queries accumulate page "
+        "masses, in [1, cycle_tokens]; cycle_tokens takes all of the cycle's.",
+    )
+    max_context_capacity: int | None = Field(
+        default=None,
+        description="The view's cap, in tokens: 0 evicts nothing by capacity, and "
+        "a negative value takes the server's max_context_window.",
+    )
+    eviction_threshold: float | None = Field(
+        default=None,
+        description="The quantile of each layer's page scores below which a "
+        "cycle's end evicts a page, in [0, 1]; 0 evicts nothing by score.",
+    )
+    eviction_warmup: int | None = Field(
+        default=None,
+        ge=0,
+        description="The cycles whose pages a layer samples twice over before it "
+        "evicts by score.",
+    )
+    attention_mass_decay: float | None = Field(
+        default=None,
+        description="The page density EMA's rate per token, in (0, 1].",
+    )
+
+
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[ChatMessage]
@@ -56,6 +95,11 @@ class ChatCompletionRequest(BaseModel):
     reasoning_effort: ReasoningEffort | None = None
     tools: list[Tool] | None = None
     tool_choice: Literal["auto", "none"] = "auto"
+    eviction: EvictionOptions | None = Field(
+        default=None,
+        description="The request's eviction policy; a field it leaves out or sets "
+        "to null takes the server's default.",
+    )
 
 
 class PromptTokensDetails(BaseModel):

@@ -28,6 +28,7 @@ class ServedModel:
     tool_call_syntax: ToolCallSyntax | None
     think_syntax: ThinkSyntax | None
     eviction: EvictionPolicy
+    max_context_window: int
 
 
 def load_served_model(
@@ -109,6 +110,7 @@ def load_served_model(
         tool_call_syntax=cfg.tool_call_syntax,
         think_syntax=cfg.think_syntax,
         eviction=eviction,
+        max_context_window=max_context_window,
     )
 
 
