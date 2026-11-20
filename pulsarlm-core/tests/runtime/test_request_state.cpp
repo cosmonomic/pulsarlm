@@ -92,12 +92,13 @@ TEST_CASE("a prefill step and a decode step move their tokens to the tail and ap
     REQUIRE(req.awaited_sample_row() == 0);
     REQUIRE(req.history_position() == 6);
     REQUIRE(req.prepared_sample_count() == 1);
-    REQUIRE(req.next_draw().count == 1);
+    REQUIRE(req.next_draw().count == 0);
     REQUIRE(req.unfinished_step_count() == 1);
     REQUIRE_FALSE(req.has_launched_last_step());
 
     req.apply_sample(6, 20);
     req.finish_step();
+    REQUIRE(req.next_draw().count == 1);
     REQUIRE(to_list(req.pending_token_list()) == token_list{20});
     REQUIRE(req.unfinished_step_count() == 0);
 

@@ -37,6 +37,22 @@ std::uint64_t sampling_seed(std::optional<std::uint64_t> seed) {
     return (static_cast<std::uint64_t>(device()) << 32) | device();
 }
 
+float input_temperature(const sampling_params& params) noexcept {
+    return params.temperature > 0.0 ? static_cast<float>(params.temperature) : 0.0f;
+}
+
+std::int64_t input_top_k(const sampling_params& params) noexcept {
+    return params.top_k > 0 ? static_cast<std::int64_t>(params.top_k) : std::numeric_limits<std::int64_t>::max();
+}
+
+float input_top_p(const sampling_params& params) noexcept {
+    return params.top_p > 0.0 && params.top_p < 1.0 ? static_cast<float>(params.top_p) : 2.0f;
+}
+
+bool filters(const sampling_params& params) noexcept {
+    return params.temperature > 0.0 && (params.top_k > 0 || (params.top_p > 0.0 && params.top_p < 1.0));
+}
+
 sampling_inputs
 sampling_inputs_of(std::span<const sampling_params> params, std::span<const sampling_draw> draws, at::Device device) {
     assert(draws.size() == params.size());
@@ -44,16 +60,12 @@ sampling_inputs_of(std::span<const sampling_params> params, std::span<const samp
     std::vector<std::int64_t> top_k;
     std::vector<float> top_p;
     std::vector<std::int64_t> seeds_then_counts(2 * params.size());
-    bool filters = false;
+    bool any_filters = false;
     for (std::size_t row = 0; row < params.size(); row++) {
-        const sampling_params& p = params[row];
-        const bool draws_row = p.temperature > 0.0;
-        const bool keeps_top_k = p.top_k > 0;
-        const bool keeps_top_p = p.top_p > 0.0 && p.top_p < 1.0;
-        filters |= draws_row && (keeps_top_k || keeps_top_p);
-        temperature.push_back(draws_row ? static_cast<float>(p.temperature) : 0.0f);
-        top_k.push_back(keeps_top_k ? static_cast<std::int64_t>(p.top_k) : std::numeric_limits<std::int64_t>::max());
-        top_p.push_back(keeps_top_p ? static_cast<float>(p.top_p) : 2.0f);
+        any_filters |= filters(params[row]);
+        temperature.push_back(input_temperature(params[row]));
+        top_k.push_back(input_top_k(params[row]));
+        top_p.push_back(input_top_p(params[row]));
         seeds_then_counts[row] = static_cast<std::int64_t>(draws[row].seed);
         seeds_then_counts[params.size() + row] = static_cast<std::int64_t>(draws[row].count);
     }
@@ -63,7 +75,7 @@ sampling_inputs_of(std::span<const sampling_params> params, std::span<const samp
         .top_k = rows_on_device(top_k, at::kLong, device),
         .top_p = rows_on_device(top_p, at::kFloat, device),
         .draws = rows_on_device(seeds_then_counts, at::kLong, device).view({2, rows}),
-        .filters = filters,
+        .filters = any_filters,
     };
 }
 
@@ -84,23 +96,10 @@ at::Tensor sample(const at::Tensor& logits, const sampling_inputs& inputs) {
     return order.gather(1, rank.unsqueeze(1)).squeeze(1);
 }
 
-at::Tensor sample(
-    const at::Tensor& logits,
-    std::span<const sampling_params> params,
-    std::span<const sampling_draw> draws,
-    const at::Tensor& draw_shifts
-) {
-    assert(params.size() == static_cast<std::size_t>(logits.size(0)));
-    sampling_inputs inputs = sampling_inputs_of(params, draws, logits.device());
-    if (draw_shifts.defined()) {
-        inputs.draws.select(0, 1).add_(draw_shifts);
-    }
-    return sample(logits, inputs);
-}
-
 at::Tensor
 sample(const at::Tensor& logits, std::span<const sampling_params> params, std::span<const sampling_draw> draws) {
-    return sample(logits, params, draws, at::Tensor());
+    assert(params.size() == static_cast<std::size_t>(logits.size(0)));
+    return sample(logits, sampling_inputs_of(params, draws, logits.device()));
 }
 
 // A sequence accepts while sample t equals draft t + 1, then the sample after them.

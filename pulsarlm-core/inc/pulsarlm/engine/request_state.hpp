@@ -64,8 +64,6 @@ class request_state {
     state::lease_id_type held_lease_id;
     sampling_params sampling;
     std::uint64_t seed;
-    // Tokens sampled so far, each with its own draw of the seed's noise.
-    std::uint64_t draw_count = 0;
     std::optional<std::size_t> max_tokens;
     // The tokens the launched steps sampled. A verify step's are counted at its write-back, as the tokens it accepted.
     std::size_t prepared_samples = 0;
@@ -174,7 +172,8 @@ class request_state {
     std::span<const std::int64_t> pending_token_list() const noexcept;
     std::span<const std::int64_t> draft_tokens() const noexcept;
     const sampling_params& sampling_parameters() const noexcept;
-    // The draw of the next token sampled.
+    // The draw of the next token sampled after the steps written back, each token sampled before it having taken its
+    // own draw of the seed's noise.
     sampling_draw next_draw() const noexcept;
     const std::optional<std::size_t>& token_limit() const noexcept;
     std::size_t prepared_sample_count() const noexcept;

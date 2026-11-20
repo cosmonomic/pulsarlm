@@ -67,6 +67,21 @@ class executor {
     // Each request from the creation of its request state until its end.
     slot_map<running_request> requests;
 
+    // Per running request, at the slot of its id (slot_of), the state its next step reads, on one GPU.
+    struct request_table {
+        // int32 [max_running_requests, n_kv_layers, view_page_capacity]: per view page its line and the RoPE position
+        // of its first key.
+        at::Tensor page_tables;
+        at::Tensor page_positions;
+        // int64 [max_running_requests]: the seed, and the tokens sampled so far.
+        at::Tensor seeds;
+        at::Tensor draw_counts;
+        // [max_running_requests]: the sampling parameters as sampling_inputs holds them.
+        at::Tensor temperatures;
+        at::Tensor top_k;
+        at::Tensor top_p;
+    };
+
     // Everything the executor keeps on one GPU across steps.
     class shard {
       public:
@@ -91,10 +106,7 @@ class executor {
         at::Tensor samples;
         // The arrival counters of the steps that run without a graph, grown to the largest step's.
         at::Tensor arrival_counters;
-        // int32 [max_running_requests, n_kv_layers, view_page_capacity]: per running request, slot-indexed, per view page
-        // its line and the RoPE position of its first key.
-        at::Tensor page_tables;
-        at::Tensor page_positions;
+        request_table table;
     };
 
     // One layer per KV layer, in the models' KV layer order.
@@ -102,7 +114,7 @@ class executor {
     page_store& store;
     // One per shard of the cache.
     std::vector<shard> shards;
-    // The columns of a shard's page_tables, the pages of the widest view a request holds.
+    // The columns of a shard's page_tables (request_table), the pages of the widest view a request holds.
     std::size_t view_page_capacity;
     // The page-table width of the graphs, the pages of the longest view they cover.
     std::optional<std::size_t> graph_pages;
@@ -110,6 +122,8 @@ class executor {
     std::size_t max_running_requests;
     // Per request, the first column of its page tables that the shards' page_tables and page_positions do not hold yet.
     std::unordered_map<request_id_type, std::size_t> stale_tables;
+    // The requests whose seeds, draw counts and sampling parameters the shards' request tables do not hold yet.
+    std::vector<request_id_type> stale_sampling;
     // A recurrent layer's state_slots are draft_state_slots for a state and 1 for a window. A layer's mass_heads are
     // the query heads it measures mass and evicts pages in, those of every attention layer reading a full-attention
     // layer, and 0 for other layers.
@@ -133,7 +147,7 @@ class executor {
     // The most rows of sampled tokens a batch has.
     std::size_t sampled_row_capacity;
 
-    // The slot of id's request, its row of a shard's page_tables.
+    // The slot of id's request, its index into a shard's request_table.
     static std::size_t slot_of(request_id_type id) noexcept;
     // Marks the columns of id's page tables from first_column on as stale (stale_tables).
     void mark_stale_tables(request_id_type id, std::size_t first_column);
@@ -143,6 +157,9 @@ class executor {
     std::vector<std::size_t> start_line_counts(const request_state& req) const;
     // Moves stale_tables into b: the cells of each request's stale columns, from its view, that b's enqueue sets.
     void move_stale_tables(batch& b);
+    // Moves stale_sampling into b: the seed, draw count and sampling parameters of each request, which b's enqueue
+    // sets.
+    void move_stale_sampling(batch& b);
     // The tokens of req's full history pages that every KV layer reading the page holds resident.
     std::size_t device_cached_tokens(const request_state& req) const;
     // Per KV layer with pages, lines for its pages, then line_count empty lines; per recurrent layer, a copy of the

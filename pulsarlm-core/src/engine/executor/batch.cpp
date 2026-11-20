@@ -51,20 +51,32 @@ executor::batch::batch(executor& owner, std::span<const scheduled_request> sched
     awaits_tokens = std::ranges::any_of(decode_group.entries, [](const entry& e) {
         return e.req->pending_token_list().front() == request_state::awaited_token;
     });
-    // A verify entry's draws advance by the tokens its write-back accepts.
+    std::vector<std::int64_t> slots;
+    std::vector<std::int64_t> offsets;
+    std::vector<std::int64_t> single_draws;
     for (group* g : groups()) {
         for (entry& e : g->entries) {
-            e.first_sample_row = sample_params.size();
+            e.first_sample_row = slots.size();
             if (!e.is_sampling) {
                 continue;
             }
-            const sampling_draw next_draw = e.req->next_draw();
-            for (std::size_t row = 0; row < (g == &verify_group ? verify_rows : 1); row++) {
-                sample_params.push_back(e.req->sampling_parameters());
-                sample_draws.push_back(sampling_draw{.seed = next_draw.seed, .count = next_draw.count + row});
+            const auto slot = static_cast<std::int64_t>(slot_of(e.req.key()));
+            filters |= pulsarlm::filters(e.req->sampling_parameters());
+            for (std::size_t offset = 0; offset < (g == &verify_group ? verify_rows : 1); offset++) {
+                slots.push_back(slot);
+                offsets.push_back(static_cast<std::int64_t>(offset));
+            }
+            if (g != &verify_group) {
+                single_draws.push_back(slot);
             }
         }
     }
+    sample_slots = pinned({static_cast<std::int64_t>(slots.size())}, at::kLong);
+    sample_offsets = pinned({static_cast<std::int64_t>(offsets.size())}, at::kLong);
+    single_draw_slots = pinned({static_cast<std::int64_t>(single_draws.size())}, at::kLong);
+    std::ranges::copy(slots, sample_slots.mutable_data_ptr<std::int64_t>());
+    std::ranges::copy(offsets, sample_offsets.mutable_data_ptr<std::int64_t>());
+    std::ranges::copy(single_draws, single_draw_slots.mutable_data_ptr<std::int64_t>());
 }
 
 std::array<executor::batch::group*, 3> executor::batch::groups() noexcept {

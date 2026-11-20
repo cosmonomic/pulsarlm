@@ -26,6 +26,7 @@
 #include <random>
 #include <span>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -445,9 +446,8 @@ struct served {
     pulsarlm::request_statistics statistics;
 };
 
-served serve(pulsarlm::engine& e, pulsarlm::request&& r) {
-    auto recorded_results = std::make_shared<request_results>();
-    e.submit(std::move(r), std::make_unique<recording_callbacks>(recorded_results));
+// Waits for the end of the request on e whose callbacks record into recorded_results.
+served await_end(pulsarlm::engine& e, const std::shared_ptr<request_results>& recorded_results) {
     std::unique_lock lock(recorded_results->mutex);
     REQUIRE(recorded_results->end_condition.wait_for(lock, end_timeout, [&] {
         return recorded_results->end.has_value();
@@ -466,6 +466,12 @@ served serve(pulsarlm::engine& e, pulsarlm::request&& r) {
         .decodes = recorded_results->decodes,
         .statistics = recorded_results->statistics,
     };
+}
+
+served serve(pulsarlm::engine& e, pulsarlm::request&& r) {
+    auto recorded_results = std::make_shared<request_results>();
+    e.submit(std::move(r), std::make_unique<recording_callbacks>(recorded_results));
+    return await_end(e, recorded_results);
 }
 
 // Serves requests on e at once; the results are in request order.
@@ -862,6 +868,78 @@ TEST_CASE(
         check_same_state(got[s].end_state, expected[s].end_state);
     }
     CHECK(replayed.engine->stat().accepted_draft_count > 0);
+}
+
+// Each engine first serves a request whose end state the resumed request resumes, and whose slot a later request takes
+// with an earlier request's draw count left in it. The resumed request is submitted once the other has sampled tokens,
+// so its seed and draw count are written while the other's draw count is above 0.
+TEST_CASE("Qwen4-Exp samples a resumed request beside a sampling one as it samples each alone", "[runtime][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const std::size_t draft_tokens = GENERATE(0, 2);
+    const bool decode_graphs = GENERATE(false, true);
+    INFO(draft_tokens << " drafts" << (decode_graphs ? " with" : " without") << " graphs");
+    const weights w(at::kFloat, base_dims, /*drafts=*/true);
+    const token_list prompt = random_tokens(prompt_tokens, 30);
+    const token_list continuation = random_tokens(20, 31);
+    const auto first_request = [&] {
+        return pulsarlm::request{
+            .tokens = prompt,
+            .sampling = pulsarlm::sampling_params{.temperature = 1.2, .seed = 32},
+            .max_tokens = decode_tokens,
+            .eviction = eviction,
+        };
+    };
+    const auto resumed_request = [&](const served& first) {
+        token_list history = prompt;
+        history.insert(history.end(), first.tokens.begin(), first.tokens.end() - 1);
+        history.insert(history.end(), continuation.begin(), continuation.end());
+        return pulsarlm::request{
+            .tokens = history,
+            .sampling = pulsarlm::sampling_params{.temperature = 2.0, .seed = 33},
+            .max_tokens = 32,
+            .eviction = eviction,
+        };
+    };
+    const auto sampling_request = [&] {
+        return pulsarlm::request{
+            .tokens = random_tokens(prompt_tokens, 34),
+            .sampling = pulsarlm::sampling_params{.temperature = 0.9, .seed = 35},
+            .max_tokens = decode_tokens,
+            .eviction = eviction,
+        };
+    };
+    const std::size_t tokens_before_resume = 4;
+
+    drafting_engine alone = make_engine(w, draft_tokens, {}, decode_graphs);
+    served alone_first = serve(*alone.engine, first_request());
+    served expected_resumed = serve(*alone.engine, resumed_request(alone_first));
+    served expected_sampled = serve(*alone.engine, sampling_request());
+
+    drafting_engine together = make_engine(w, draft_tokens, {}, decode_graphs);
+    served together_first = serve(*together.engine, first_request());
+    REQUIRE(together_first.tokens == alone_first.tokens);
+    auto sampled_results = std::make_shared<request_results>();
+    together.engine->submit(sampling_request(), std::make_unique<recording_callbacks>(sampled_results));
+    const auto deadline = std::chrono::steady_clock::now() + end_timeout;
+    for (;;) {
+        {
+            std::lock_guard lock(sampled_results->mutex);
+            if (sampled_results->tokens.size() >= tokens_before_resume || sampled_results->end) {
+                break;
+            }
+        }
+        REQUIRE(std::chrono::steady_clock::now() < deadline);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    served got_resumed = serve(*together.engine, resumed_request(together_first));
+    served got_sampled = await_end(*together.engine, sampled_results);
+
+    REQUIRE(expected_resumed.tokens.size() == 32);
+    REQUIRE(expected_sampled.tokens.size() == decode_tokens);
+    CHECK(got_resumed.tokens == expected_resumed.tokens);
+    CHECK(got_sampled.tokens == expected_sampled.tokens);
 }
 
 TEST_CASE("Qwen4-Exp drafting reports per token the drafts that sum to the request's", "[runtime][cuda]") {

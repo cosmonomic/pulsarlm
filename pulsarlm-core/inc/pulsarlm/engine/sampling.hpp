@@ -32,6 +32,13 @@ struct sampling_inputs {
     bool filters;
 };
 
+// params' temperature, top_k and top_p as sampling_inputs holds them.
+float input_temperature(const sampling_params& params) noexcept;
+std::int64_t input_top_k(const sampling_params& params) noexcept;
+float input_top_p(const sampling_params& params) noexcept;
+// Whether a row sampled by params draws and keeps fewer tokens than the vocabulary.
+bool filters(const sampling_params& params) noexcept;
+
 // The sampling inputs of params and draws on device, copied there on the current stream.
 sampling_inputs
 sampling_inputs_of(std::span<const sampling_params> params, std::span<const sampling_draw> draws, at::Device device);
@@ -43,13 +50,6 @@ at::Tensor sample(const at::Tensor& logits, const sampling_inputs& inputs);
 // sample by the inputs of params and draws. Queues its work on the current stream and does not wait for it.
 at::Tensor
 sample(const at::Tensor& logits, std::span<const sampling_params> params, std::span<const sampling_draw> draws);
-// sample, each row's draw count moved by draw_shifts[row], int64 [rows] on the logits' device.
-at::Tensor sample(
-    const at::Tensor& logits,
-    std::span<const sampling_params> params,
-    std::span<const sampling_draw> draws,
-    const at::Tensor& draw_shifts
-);
 
 // The tokens each sequence of a verify group accepts: its pending token's sample and the samples of the drafts
 // that match, through the first stop token, at most max_accepted_token_counts. verified [sequences, rows] holds

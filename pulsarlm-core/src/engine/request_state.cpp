@@ -245,7 +245,6 @@ void request_state::withdraw_latest_step() {
     assert(!tail.empty() && pending_tokens.size() <= 1);
     if (!pending_tokens.empty()) {
         prepared_samples--;
-        draw_count--;
     }
     pending_tokens.assign(1, tail.back());
     tail.pop_back();
@@ -367,7 +366,7 @@ const sampling_params& request_state::sampling_parameters() const noexcept {
 }
 
 sampling_draw request_state::next_draw() const noexcept {
-    return sampling_draw{.seed = seed, .count = draw_count};
+    return sampling_draw{.seed = seed, .count = delivered_tokens};
 }
 
 const std::optional<std::size_t>& request_state::token_limit() const noexcept {
@@ -520,7 +519,6 @@ void request_state::launch_step(
         pending_tokens.push_back(awaited_token);
         awaited_row = *sample_row;
         prepared_samples++;
-        draw_count++;
     }
     last_step_launched = sample_row ? !may_sample() : pending_tokens.empty();
     draft_rows_end += draft_row_count;
@@ -549,7 +547,6 @@ void request_state::apply_accepted_tokens(
     const bool has_later_step = unfinished_step_count() > 1;
     const std::size_t accepted_count = accepted_tokens.size();
     accept_tokens(start, accepted_tokens);
-    draw_count += accepted_count;
     prepared_samples += accepted_count;
     delivered_tokens += accepted_count;
     drafted_tokens += verified_count - 1;

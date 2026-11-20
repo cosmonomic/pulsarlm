@@ -84,8 +84,7 @@ executor::executor(
                 .graphs = nullptr,
                 .samples = {},
                 .arrival_counters = {},
-                .page_tables = {},
-                .page_positions = {},
+                .table = {},
             }
         );
     }
@@ -136,13 +135,18 @@ executor::executor(
             s.lines.front().k.options().dtype(at::kLong)
         );
         s.stop_tokens = at::tensor(this->stop_ids, at::TensorOptions().dtype(at::kLong)).to(s.lines.front().k.device());
-        s.page_tables = at::zeros(
-            {static_cast<std::int64_t>(max_running_requests),
-             static_cast<std::int64_t>(layout.layers.size()),
-             static_cast<std::int64_t>(view_page_capacity)},
-            s.lines.front().k.options().dtype(at::kInt)
+        const at::TensorOptions options = s.lines.front().k.options();
+        const auto slots = static_cast<std::int64_t>(max_running_requests);
+        s.table.page_tables = at::zeros(
+            {slots, static_cast<std::int64_t>(layout.layers.size()), static_cast<std::int64_t>(view_page_capacity)},
+            options.dtype(at::kInt)
         );
-        s.page_positions = at::zeros_like(s.page_tables);
+        s.table.page_positions = at::zeros_like(s.table.page_tables);
+        s.table.seeds = at::zeros({slots}, options.dtype(at::kLong));
+        s.table.draw_counts = at::zeros({slots}, options.dtype(at::kLong));
+        s.table.temperatures = at::zeros({slots}, options.dtype(at::kFloat));
+        s.table.top_k = at::zeros({slots}, options.dtype(at::kLong));
+        s.table.top_p = at::zeros({slots}, options.dtype(at::kFloat));
     }
     if (this->graph_pages) {
         for (shard& s : shards) {
@@ -268,6 +272,47 @@ void executor::move_stale_tables(batch& b) {
     std::ranges::copy(cells, b.table_cells.mutable_data_ptr<std::int64_t>());
     std::ranges::copy(lines, b.table_lines.mutable_data_ptr<std::int32_t>());
     std::ranges::copy(positions, b.table_positions.mutable_data_ptr<std::int32_t>());
+}
+
+// The requests erased since they were marked are passed over.
+void executor::move_stale_sampling(batch& b) {
+    std::vector<std::int64_t> slots;
+    std::vector<std::int64_t> seeds;
+    std::vector<std::int64_t> draw_counts;
+    std::vector<float> temperatures;
+    std::vector<std::int64_t> top_k;
+    std::vector<float> top_p;
+    for (const request_id_type id : stale_sampling) {
+        const running_request* running = requests.find(id);
+        if (running == nullptr) {
+            continue;
+        }
+        const sampling_draw draw = running->state.next_draw();
+        const sampling_params& params = running->state.sampling_parameters();
+        slots.push_back(static_cast<std::int64_t>(slot_of(id)));
+        seeds.push_back(static_cast<std::int64_t>(draw.seed));
+        draw_counts.push_back(static_cast<std::int64_t>(draw.count));
+        temperatures.push_back(input_temperature(params));
+        top_k.push_back(input_top_k(params));
+        top_p.push_back(input_top_p(params));
+    }
+    stale_sampling.clear();
+    if (slots.empty()) {
+        return;
+    }
+    const auto count = static_cast<std::int64_t>(slots.size());
+    b.sampling_slots = pinned({count}, at::kLong);
+    b.seeds = pinned({count}, at::kLong);
+    b.draw_counts = pinned({count}, at::kLong);
+    b.temperatures = pinned({count}, at::kFloat);
+    b.top_k = pinned({count}, at::kLong);
+    b.top_p = pinned({count}, at::kFloat);
+    std::ranges::copy(slots, b.sampling_slots.mutable_data_ptr<std::int64_t>());
+    std::ranges::copy(seeds, b.seeds.mutable_data_ptr<std::int64_t>());
+    std::ranges::copy(draw_counts, b.draw_counts.mutable_data_ptr<std::int64_t>());
+    std::ranges::copy(temperatures, b.temperatures.mutable_data_ptr<float>());
+    std::ranges::copy(top_k, b.top_k.mutable_data_ptr<std::int64_t>());
+    std::ranges::copy(top_p, b.top_p.mutable_data_ptr<float>());
 }
 
 bool executor::is_steppable(request_id_type id) const {
@@ -440,9 +485,10 @@ task<void> executor::launch(std::span<const scheduled_request> scheduled) {
     assert(is_launchable(scheduled));
     std::unique_ptr<batch> b(new batch(*this, scheduled));
     b->launch_time = launch_time;
-    assert(b->sample_params.size() <= sampled_row_capacity);
+    assert(static_cast<std::size_t>(b->sample_slots.size(0)) <= sampled_row_capacity);
     b->allows_overlap = entries_allow_overlap(scheduled);
     move_stale_tables(*b);
+    move_stale_sampling(*b);
     link_previous(*b);
     advance(*b);
     for (batch::group* g : b->groups()) {
@@ -508,8 +554,7 @@ task<void> executor::enqueue_on_shard(batch& b, std::size_t shard) {
         shards[shard].graphs.get(),
         shards[shard].samples,
         shards[shard].arrival_counters,
-        shards[shard].page_tables,
-        shards[shard].page_positions
+        shards[shard].table
     );
     co_return;
 }
