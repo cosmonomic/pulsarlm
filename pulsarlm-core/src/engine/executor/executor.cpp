@@ -24,14 +24,14 @@
 
 namespace pulsarlm {
 
-std::size_t executor::slots_of(const kv_layer& layer) const noexcept {
+std::size_t executor::count_slots(const kv_layer& layer) const noexcept {
     if (!layer.state) {
         return 0;
     }
     return layer.state->input_window ? 1 : draft_state_slots;
 }
 
-std::vector<cudaStream_t> executor::streams_of(cudaStream_t shard::* stream) const {
+std::vector<cudaStream_t> executor::collect_streams(cudaStream_t shard::* stream) const {
     std::vector<cudaStream_t> streams;
     for (const shard& s : shards) {
         streams.push_back(s.*stream);
@@ -106,7 +106,7 @@ executor::executor(
                         .is_recurrent = layer_recurrent,
                         .mirrors_held_pages = layers[layer].mirrors_held_pages,
                         .sliding_window = layers[layer].sliding_window,
-                        .state_slots = slots_of(layers[layer]),
+                        .state_slots = count_slots(layers[layer]),
                         .mass_heads = 0,
                     }
                 );
@@ -119,7 +119,7 @@ executor::executor(
                 layer_layout.sliding_window == layers[layer].sliding_window &&
                     layer_layout.is_recurrent == layer_recurrent &&
                     layer_layout.mirrors_held_pages == layers[layer].mirrors_held_pages &&
-                    layer_layout.state_slots == slots_of(layers[layer]),
+                    layer_layout.state_slots == count_slots(layers[layer]),
                 "executor: the model shards must agree on the kind of each KV layer"
             );
             layer_layout.mass_heads += shards[shard].mass_heads.back();
@@ -195,7 +195,7 @@ executor::request_ref::request_ref(executor& owner, request_id_type id) noexcept
   id(id) {}
 
 request_state& executor::request_ref::operator*() const {
-    return owner->state_of(id);
+    return owner->get_state(id);
 }
 
 request_state* executor::request_ref::operator->() const {
@@ -206,23 +206,19 @@ executor::request_id_type executor::request_ref::key() const noexcept {
     return id;
 }
 
-request_state& executor::state_of(request_id_type id) {
+request_state& executor::get_state(request_id_type id) {
     return requests[id].state;
 }
 
-const request_state& executor::state_of(request_id_type id) const {
+const request_state& executor::get_state(request_id_type id) const {
     return requests[id].state;
 }
 
-std::size_t executor::slot_of(request_id_type id) noexcept {
+std::size_t executor::get_slot(request_id_type id) noexcept {
     return static_cast<std::uint32_t>(id);
 }
 
-const request_state& executor::request_state_of(request_id_type id) const {
-    return state_of(id);
-}
-
-const request_table& executor::request_table_of(std::size_t shard) const {
+const request_table& executor::get_table(std::size_t shard) const {
     return shards[shard].table;
 }
 
@@ -276,7 +272,7 @@ void executor::move_stale_tables(batch& b) {
         const std::size_t width = req.table_width();
         for (std::size_t layer = 0; layer < n_layers; layer++) {
             const layer_view& view = req.views()[layer];
-            const std::size_t row_start = (slot_of(id) * n_layers + layer) * view_page_capacity;
+            const std::size_t row_start = (get_slot(id) * n_layers + layer) * view_page_capacity;
             for (std::size_t column = first_column; column < width; column++) {
                 const bool used = column < view.lines.size();
                 cells.push_back(static_cast<std::int64_t>(row_start + column));
@@ -327,7 +323,7 @@ void executor::move_stale_requests(batch& b) {
         }
         const request_state& req = running->state;
         assert(req.unfinished_step_count() == 0);
-        slots.push_back(static_cast<std::int64_t>(slot_of(id)));
+        slots.push_back(static_cast<std::int64_t>(get_slot(id)));
         history_positions.push_back(static_cast<std::int64_t>(req.history_position()));
         rope_positions.push_back(static_cast<std::int64_t>(req.next_position()));
         for (std::size_t layer = 0; layer < n_layers; layer++) {
@@ -376,24 +372,24 @@ void executor::move_stale_requests(batch& b) {
 }
 
 bool executor::is_steppable(request_id_type id) const {
-    const request_state& req = state_of(id);
+    const request_state& req = get_state(id);
     return !req.has_launched_last_step() && !req.has_exit_cause();
 }
 
 std::size_t executor::pending_token_count(request_id_type id) const {
-    return state_of(id).pending_token_list().size();
+    return get_state(id).pending_token_list().size();
 }
 
 std::size_t executor::cycle_tokens_left(request_id_type id) const {
-    return state_of(id).cycle_tokens_left();
+    return get_state(id).cycle_tokens_left();
 }
 
 bool executor::has_exited(request_id_type id) const {
-    return state_of(id).has_exited();
+    return get_state(id).has_exited();
 }
 
 bool executor::is_in_launched_batch(request_id_type id) const {
-    return state_of(id).unfinished_step_count() > 0;
+    return get_state(id).unfinished_step_count() > 0;
 }
 
 bool executor::is_cancelled(request_id_type id) const {
@@ -401,7 +397,7 @@ bool executor::is_cancelled(request_id_type id) const {
 }
 
 void executor::cancel(request_id_type id) {
-    request_state& req = state_of(id);
+    request_state& req = get_state(id);
     if (req.has_exited()) {
         return;
     }
@@ -432,7 +428,7 @@ bool executor::completes_page(const request_state& req, std::size_t token_count)
 bool executor::entries_allow_overlap(std::span<const scheduled_request> scheduled) const {
     if (draft_layer) {
         return std::ranges::all_of(scheduled, [&](const scheduled_request& e) {
-            return !state_of(e.request_id).draft_tokens().empty();
+            return !get_state(e.request_id).draft_tokens().empty();
         });
     }
     const bool sliding = std::ranges::any_of(layout.layers, [](const view_layout::layer& layer) {
@@ -440,7 +436,7 @@ bool executor::entries_allow_overlap(std::span<const scheduled_request> schedule
     });
     return std::ranges::none_of(scheduled, [&](const scheduled_request& e) {
         const auto& [id, token_count] = e;
-        const request_state& req = state_of(id);
+        const request_state& req = get_state(id);
         return req.ends_cycle(token_count) || (sliding && completes_page(req, token_count));
     });
 }
@@ -458,7 +454,7 @@ std::size_t executor::sampled_row_limit() const noexcept {
 }
 
 std::size_t executor::sampled_row_count(request_id_type id, std::size_t token_count) const {
-    const request_state& req = state_of(id);
+    const request_state& req = get_state(id);
     if (token_count != req.pending_token_list().size() || !req.may_sample()) {
         return 0;
     }
@@ -490,7 +486,7 @@ void executor::advance(batch& b) {
             for (batch::entry& e : g->entries) {
                 if (e.req->reads_last_hidden() && e.req->history_position() > 0) {
                     e.prior_hidden_index = b.prior_hidden_slots.size();
-                    b.prior_hidden_slots.push_back(static_cast<std::int64_t>(slot_of(e.req.key())));
+                    b.prior_hidden_slots.push_back(static_cast<std::int64_t>(get_slot(e.req.key())));
                 }
             }
         }
@@ -567,7 +563,7 @@ task<void> executor::launch(std::span<const scheduled_request> scheduled) {
         at::Device device = shards[shard].lines.front().k.device();
         c10::cuda::CUDAGuard device_guard(device);
         b->ends.emplace_back().record(c10::cuda::getStreamFromExternal(shards[shard].compute_stream, device.index()));
-        b->completions.push_back(completion_of(shards[shard].compute_stream));
+        b->completions.push_back(await_stream(shards[shard].compute_stream));
     }
     launched_batches.push_back(std::move(b));
 }

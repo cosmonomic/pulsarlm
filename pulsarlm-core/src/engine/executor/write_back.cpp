@@ -251,7 +251,7 @@ task<void> executor::write_pages_and_states(batch& b, batch_writes&& writes) {
                 writes.spawned_hashes,
                 writes.spawned_owners,
                 writes.spawned_lines,
-                streams_of(&shard::copy_stream)
+                collect_streams(&shard::copy_stream)
             ),
             std::move(writes.spawned_writers)
         ));
@@ -267,7 +267,7 @@ task<void> executor::write_pages_and_states(batch& b, batch_writes&& writes) {
         writes.new_hashes,
         writes.new_owners,
         writes.new_lines,
-        streams_of(&shard::copy_stream)
+        collect_streams(&shard::copy_stream)
     );
     if (!sync_result) {
         for (request_state* req : writes.page_writers) {

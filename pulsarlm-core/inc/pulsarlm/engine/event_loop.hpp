@@ -162,7 +162,7 @@ task<void> synchronize(cudaStream_t stream);
 
 // Completes once the work queued on stream before the call has finished, whatever is queued after it, with the
 // stream's status. Uses cudaStreamAddCallback, as synchronize does.
-external_task<cudaError_t> completion_of(cudaStream_t stream);
+external_task<cudaError_t> await_stream(cudaStream_t stream);
 
 // Runs root_task as a root task of target and completes with its result once it does. Safe to call from any thread. A
 // panic in root_task panics target, and the returned task then never completes.

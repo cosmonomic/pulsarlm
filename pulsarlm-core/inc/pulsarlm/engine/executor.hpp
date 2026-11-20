@@ -49,6 +49,7 @@ class executor {
     };
 
   private:
+    friend struct executor_inspection;
     class batch;
     struct batch_writes;
 
@@ -89,7 +90,7 @@ class executor {
         std::unique_ptr<step_graphs> graphs;
         // The arrival counters of the steps that run without a graph, grown to the largest step's.
         at::Tensor arrival_counters;
-        // Indexed by slot_of. Every shard's steps advance it alike. Its tensors are allocated once, as graphs reads and
+        // Indexed by get_slot. Every shard's steps advance it alike. Its tensors are allocated once, as graphs reads and
         // writes them where they are.
         request_table table;
     };
@@ -120,9 +121,9 @@ class executor {
     std::optional<std::size_t> draft_layer;
     std::atomic<std::uint64_t> drafted_tokens{0};
     std::atomic<std::uint64_t> accepted_drafts{0};
-    std::size_t slots_of(const kv_layer& layer) const noexcept;
+    std::size_t count_slots(const kv_layer& layer) const noexcept;
     // stream of every shard, in shard order.
-    std::vector<cudaStream_t> streams_of(cudaStream_t shard::* stream) const;
+    std::vector<cudaStream_t> collect_streams(cudaStream_t shard::* stream) const;
     digest root;
     std::vector<std::int64_t> stop_ids;
     // The steps queued on the GPUs and not written back yet, in launch order.
@@ -134,7 +135,7 @@ class executor {
     std::size_t sampled_row_capacity;
 
     // The slot of id's request, its index into a shard's request_table.
-    static std::size_t slot_of(request_id_type id) noexcept;
+    static std::size_t get_slot(request_id_type id) noexcept;
     // Marks the columns of id's page tables from first_column on as stale (stale_tables).
     void mark_stale_tables(request_id_type id, std::size_t first_column);
     // The columns of req's page tables once each KV layer holds line_counts[layer] more lines.
@@ -175,8 +176,9 @@ class executor {
     // Whether token_count more tokens fill a page of req.
     bool completes_page(const request_state& req, std::size_t token_count) const noexcept;
     // The request state of id's request, which is not erased.
-    request_state& state_of(request_id_type id);
-    const request_state& state_of(request_id_type id) const;
+    request_state& get_state(request_id_type id);
+    const request_state& get_state(request_id_type id) const;
+    const request_table& get_table(std::size_t shard) const;
     // Calls on_end of running's callbacks with result and statistics and destroys the callbacks.
     void deliver_end(
         running_request& running,
@@ -265,9 +267,6 @@ class executor {
     // more than view_page_capacity pages. The lease of a request that fails is released before on_end. Fewer than max_running_request_count() requests hold a record at the call.
     task<std::optional<request_id_type>> start(request&& r, unstarted_callbacks callbacks);
     std::size_t max_running_request_count() const noexcept;
-    // For tests: the request state of id's request, and shard's request table.
-    const request_state& request_state_of(request_id_type id) const;
-    const request_table& request_table_of(std::size_t shard) const;
     // The requests with a record, from the creation of their request state until their end.
     std::size_t request_count() const noexcept;
     // Whether a step of the requests in scheduled can be launched now, before any write-back: no step is launched or the last launched

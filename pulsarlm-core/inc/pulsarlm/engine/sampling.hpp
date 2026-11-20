@@ -41,7 +41,7 @@ bool filters(const sampling_params& params) noexcept;
 
 // The sampling inputs of params and draws on device, copied there on the current stream.
 sampling_inputs
-sampling_inputs_of(std::span<const sampling_params> params, std::span<const sampling_draw> draws, at::Device device);
+make_sampling_inputs(std::span<const sampling_params> params, std::span<const sampling_draw> draws, at::Device device);
 
 // One token per row of logits [rows, vocab], drawn by inputs: int64 [rows] on the logits' device. Reads nothing back to
 // the host, so a CUDA graph can capture it.

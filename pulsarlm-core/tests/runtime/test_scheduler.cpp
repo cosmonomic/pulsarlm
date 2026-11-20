@@ -33,6 +33,20 @@
 #include <utility>
 #include <vector>
 
+namespace pulsarlm {
+
+struct executor_inspection {
+    static const request_state& get_state(const executor& exec, executor::request_id_type id) {
+        return exec.get_state(id);
+    }
+
+    static const request_table& get_table(const executor& exec, std::size_t shard) {
+        return exec.get_table(shard);
+    }
+};
+
+}  // namespace pulsarlm
+
 namespace {
 
 using pulsarlm::digest;
@@ -2731,8 +2745,8 @@ task<void> compare_key_counts_between_steps(
         }
         co_await exec.write_back();
         if (exec.launched_batch_count() == 0 && !exec.has_exited(id)) {
-            const pulsarlm::request_state& req = exec.request_state_of(id);
-            const at::Tensor key_counts = exec.request_table_of(0).key_counts[slot].cpu();
+            const pulsarlm::request_state& req = pulsarlm::executor_inspection::get_state(exec, id);
+            const at::Tensor key_counts = pulsarlm::executor_inspection::get_table(exec, 0).key_counts[slot].cpu();
             for (std::size_t layer = 0; layer < req.views().size(); layer++) {
                 INFO("KV layer " << layer << " at history position " << req.history_position());
                 REQUIRE(

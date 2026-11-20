@@ -758,7 +758,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "on_cycle"_a = py::none(),
             "on_end"_a = py::none()
         )
-        .def("eviction_report_of", &python_engine::eviction_report_of, "state"_a, "eviction"_a)
+        .def("eviction_report_of", &python_engine::make_eviction_report, "state"_a, "eviction"_a)
         .def("stat", &python_engine::stat)
         .def("fileno", &python_engine::fileno)
         .def("clear_wake", &python_engine::clear_wake)

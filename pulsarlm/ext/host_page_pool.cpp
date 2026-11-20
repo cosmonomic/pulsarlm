@@ -12,7 +12,7 @@ namespace pulsarlm {
 
 namespace {
 
-std::size_t order_of(std::size_t bytes, std::size_t min_block_bytes) {
+std::size_t compute_order(std::size_t bytes, std::size_t min_block_bytes) {
     return static_cast<std::size_t>(
         std::countr_zero(std::bit_ceil(std::max(bytes, min_block_bytes)) / min_block_bytes)
     );
@@ -55,7 +55,7 @@ void host_page_pool::shared_state::give_back(std::size_t offset, std::size_t ord
 
 host_page_pool::host_page_pool(std::size_t capacity_bytes, std::size_t largest_bytes)
 : state(std::make_shared<shared_state>()) {
-    const std::size_t top_order = order_of(largest_bytes, min_block_bytes);
+    const std::size_t top_order = compute_order(largest_bytes, min_block_bytes);
     const std::size_t top_bytes = min_block_bytes << top_order;
     state->free_blocks.resize(top_order + 1);
     state->bytes = capacity_bytes / top_bytes * top_bytes;
@@ -84,7 +84,7 @@ host_page_pool::host_page_pool(std::size_t capacity_bytes, std::size_t largest_b
 }
 
 std::optional<at::Tensor> host_page_pool::allocate(std::size_t bytes) {
-    const std::size_t order = order_of(bytes, min_block_bytes);
+    const std::size_t order = compute_order(bytes, min_block_bytes);
     if (order >= state->free_blocks.size()) {
         return std::nullopt;
     }
@@ -107,7 +107,7 @@ std::optional<at::Tensor> host_page_pool::allocate(std::size_t bytes) {
     );
 }
 
-std::optional<std::size_t> host_page_pool::offset_of(const void* data, std::size_t bytes) const noexcept {
+std::optional<std::size_t> host_page_pool::get_offset(const void* data, std::size_t bytes) const noexcept {
     const auto* start = static_cast<const std::byte*>(data);
     if (state->data == nullptr || start < state->data || start + bytes > state->data + state->bytes) {
         return std::nullopt;

@@ -541,8 +541,8 @@ engine_stat engine::stat() const {
     };
 }
 
-eviction_report engine::eviction_report_of(const state& s, const eviction_policy& policy) const {
-    return make_eviction_report(s, resolved(policy, max_context_window), page_size);
+eviction_report engine::make_eviction_report(const state& s, const eviction_policy& policy) const {
+    return pulsarlm::make_eviction_report(s, resolved(policy, max_context_window), page_size);
 }
 
 }  // namespace pulsarlm

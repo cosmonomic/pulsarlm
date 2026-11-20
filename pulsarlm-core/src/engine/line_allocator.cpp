@@ -84,17 +84,17 @@ line_allocator::lines_of_region(std::size_t block_class, std::uint32_t r) const 
     return {r * per_region, (r + 1) * per_region};
 }
 
-std::span<std::uint64_t> line_allocator::units_of(std::uint32_t r) noexcept {
+std::span<std::uint64_t> line_allocator::get_units(std::uint32_t r) noexcept {
     return std::span(taken_units).subspan(r * region_words, region_words);
 }
 
-std::span<const std::uint64_t> line_allocator::units_of(std::uint32_t r) const noexcept {
+std::span<const std::uint64_t> line_allocator::get_units(std::uint32_t r) const noexcept {
     return std::span(taken_units).subspan(r * region_words, region_words);
 }
 
 // Blocks are aligned to their size, a power of two, so one shorter than a word lies within one word.
 void line_allocator::set_units(std::uint32_t r, std::size_t first, std::size_t count, bool taken) noexcept {
-    std::span<std::uint64_t> units = units_of(r);
+    std::span<std::uint64_t> units = get_units(r);
     if (count >= 64) {
         std::fill_n(units.begin() + static_cast<std::ptrdiff_t>(first / 64), count / 64, taken ? ~std::uint64_t{0} : 0);
         return;
@@ -104,7 +104,7 @@ void line_allocator::set_units(std::uint32_t r, std::size_t first, std::size_t c
 }
 
 std::optional<std::size_t> line_allocator::free_block(std::uint32_t r, std::size_t order) const noexcept {
-    std::span<const std::uint64_t> units = units_of(r);
+    std::span<const std::uint64_t> units = get_units(r);
     if (order >= word_order) {
         std::size_t block_words = std::size_t{1} << (order - word_order);
         for (std::size_t first = 0; first < units.size(); first += block_words) {
@@ -130,7 +130,7 @@ std::optional<std::size_t> line_allocator::free_block(std::uint32_t r, std::size
 // A run of free words ending at word w holds an aligned free block of 2^j words when 2^j divides w + 1 and the run is
 // at least 2^j long.
 std::optional<std::size_t> line_allocator::largest_free_order(std::uint32_t r) const noexcept {
-    std::span<const std::uint64_t> units = units_of(r);
+    std::span<const std::uint64_t> units = get_units(r);
     if (region_units >= 64) {
         std::optional<std::size_t> largest_words_order;
         std::size_t run = 0;
@@ -160,7 +160,7 @@ std::optional<std::size_t> line_allocator::largest_free_order(std::uint32_t r) c
 void line_allocator::index(std::uint32_t r) {
     const region& indexed = regions[r];
     if (indexed.held_count == 0 && indexed.cached_count == 0) {
-        assert(std::ranges::all_of(units_of(r), [](std::uint64_t word) { return word == 0; }));
+        assert(std::ranges::all_of(get_units(r), [](std::uint64_t word) { return word == 0; }));
         free_regions.insert(r);
     } else if (indexed.held_count == 0) {
         reclaimable_regions.emplace(indexed.newest_cache, r);
@@ -215,13 +215,13 @@ line_allocator::transaction::~transaction() {
     for (auto& [r, before] : saved_regions) {
         lines.unindex(r);
         lines.regions[r] = before.first;
-        std::ranges::copy(before.second, lines.units_of(r).begin());
+        std::ranges::copy(before.second, lines.get_units(r).begin());
         lines.index(r);
     }
 }
 
 void line_allocator::transaction::save(std::uint32_t r) {
-    std::span<const std::uint64_t> units = lines.units_of(r);
+    std::span<const std::uint64_t> units = lines.get_units(r);
     saved_regions.try_emplace(r, lines.regions[r], std::vector<std::uint64_t>(units.begin(), units.end()));
 }
 
@@ -237,7 +237,7 @@ std::optional<std::uint32_t> line_allocator::transaction::take(std::size_t block
         save(r);
         lines.unindex(r);
         lines.regions[r].cached_count = 0;
-        std::ranges::fill(lines.units_of(r), 0);
+        std::ranges::fill(lines.get_units(r), 0);
         lines.index(r);
         reclaimed_regions.push_back(r);
     } else {

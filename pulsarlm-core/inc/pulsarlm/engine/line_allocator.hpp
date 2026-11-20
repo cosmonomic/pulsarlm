@@ -40,8 +40,8 @@ class line_allocator {
     std::set<std::pair<std::uint64_t, std::uint32_t>> reclaimable_regions;
     std::uint64_t cache_count = 0;
 
-    std::span<std::uint64_t> units_of(std::uint32_t r) noexcept;
-    std::span<const std::uint64_t> units_of(std::uint32_t r) const noexcept;
+    std::span<std::uint64_t> get_units(std::uint32_t r) noexcept;
+    std::span<const std::uint64_t> get_units(std::uint32_t r) const noexcept;
     void set_units(std::uint32_t r, std::size_t first, std::size_t count, bool taken) noexcept;
     // The first unit of a free block of order in region r.
     std::optional<std::size_t> free_block(std::uint32_t r, std::size_t order) const noexcept;

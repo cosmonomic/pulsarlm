@@ -133,7 +133,10 @@ copy_to_host(host_page_pool& pool, std::span<const sharded_page> sources, std::s
     std::vector<shard_segments> by_shard(streams.size());
     for (std::size_t i = 0; i < sources.size(); i++) {
         at::Tensor& target = (*pages)[i].bytes;
-        std::optional<std::size_t> offset = pool.offset_of(target.data_ptr(), static_cast<std::size_t>(target.numel()));
+        std::optional<std::size_t> offset = pool.get_offset(
+            target.data_ptr(),
+            static_cast<std::size_t>(target.numel())
+        );
         for (const page_shard& shard : sources[i].shards) {
             auto bytes = static_cast<std::size_t>(shard.bytes.numel());
             if (offset && by_shard[shard.cache_shard].batches(shard.bytes)) {
@@ -173,12 +176,12 @@ task<void> copy_from_host(
         check_page(targets[i], pages[i]);
         const at::Tensor& source = pages[i].bytes;
         auto bytes = static_cast<std::size_t>(source.numel());
-        std::optional<std::size_t> offset = pool.offset_of(source.data_ptr(), bytes);
+        std::optional<std::size_t> offset = pool.get_offset(source.data_ptr(), bytes);
         if (!offset) {
             if (std::optional<at::Tensor> block = pool.allocate(bytes)) {
                 block->copy_(source);
                 staged.push_back(*block);
-                offset = pool.offset_of(block->data_ptr(), bytes);
+                offset = pool.get_offset(block->data_ptr(), bytes);
             }
         }
         for (const page_shard& shard : targets[i].shards) {

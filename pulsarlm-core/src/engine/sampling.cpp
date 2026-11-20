@@ -54,7 +54,7 @@ bool filters(const sampling_params& params) noexcept {
 }
 
 sampling_inputs
-sampling_inputs_of(std::span<const sampling_params> params, std::span<const sampling_draw> draws, at::Device device) {
+make_sampling_inputs(std::span<const sampling_params> params, std::span<const sampling_draw> draws, at::Device device) {
     assert(draws.size() == params.size());
     std::vector<float> temperature;
     std::vector<std::int64_t> top_k;
@@ -99,7 +99,7 @@ at::Tensor sample(const at::Tensor& logits, const sampling_inputs& inputs) {
 at::Tensor
 sample(const at::Tensor& logits, std::span<const sampling_params> params, std::span<const sampling_draw> draws) {
     assert(params.size() == static_cast<std::size_t>(logits.size(0)));
-    return sample(logits, sampling_inputs_of(params, draws, logits.device()));
+    return sample(logits, make_sampling_inputs(params, draws, logits.device()));
 }
 
 // A sequence accepts while sample t equals draft t + 1, then the sample after them.

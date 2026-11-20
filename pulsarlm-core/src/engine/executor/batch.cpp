@@ -16,7 +16,7 @@ namespace pulsarlm {
 
 executor::batch::batch(executor& owner, std::span<const scheduled_request> scheduled) {
     for (const auto& [id, token_count] : scheduled) {
-        request_state& req = owner.state_of(id);
+        request_state& req = owner.get_state(id);
         group& g = req.pending_token_list().size() > 1 ? prefill_group
             : !req.draft_tokens().empty()              ? verify_group
                                                        : decode_group;
@@ -58,7 +58,7 @@ executor::batch::batch(executor& owner, std::span<const scheduled_request> sched
             if (!e.is_sampling) {
                 continue;
             }
-            const auto slot = static_cast<std::int64_t>(slot_of(e.req.key()));
+            const auto slot = static_cast<std::int64_t>(get_slot(e.req.key()));
             filters |= pulsarlm::filters(e.req->sampling_parameters());
             for (std::size_t offset = 0; offset < (g == &verify_group ? verify_rows : 1); offset++) {
                 slots.push_back(slot);
@@ -78,7 +78,7 @@ executor::batch::batch(executor& owner, std::span<const scheduled_request> sched
     for (const group* g : groups()) {
         for (const entry& e : g->entries) {
             const std::span<const std::int64_t> pending = e.req->pending_token_list();
-            entry_request_slots.push_back(static_cast<std::int64_t>(slot_of(e.req.key())));
+            entry_request_slots.push_back(static_cast<std::int64_t>(get_slot(e.req.key())));
             computed_counts.push_back(g == &verify_group ? 0 : static_cast<std::int64_t>(e.token_count));
             if (e.is_sampling) {
                 next_sources.push_back(-static_cast<std::int64_t>(e.first_sample_row) - 1);
@@ -195,7 +195,7 @@ bool executor::batch::measures_mass(const entry& e) noexcept {
 at::Tensor executor::batch::request_slots(std::span<const entry> group) {
     std::vector<std::int64_t> slots;
     for (const entry& e : group) {
-        slots.push_back(static_cast<std::int64_t>(slot_of(e.req.key())));
+        slots.push_back(static_cast<std::int64_t>(get_slot(e.req.key())));
     }
     return pinned_values(slots);
 }

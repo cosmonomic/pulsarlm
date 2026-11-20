@@ -117,8 +117,8 @@ request_handle python_engine::submit(
     return request_handle(std::move(buffer), std::move(on_prefill), std::move(on_cycle), std::move(on_end));
 }
 
-eviction_report python_engine::eviction_report_of(const state& s, const eviction_policy& policy) const {
-    return core_engine->eviction_report_of(s, policy);
+eviction_report python_engine::make_eviction_report(const state& s, const eviction_policy& policy) const {
+    return core_engine->make_eviction_report(s, policy);
 }
 
 engine_stat python_engine::stat() const {

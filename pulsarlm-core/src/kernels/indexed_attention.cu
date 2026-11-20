@@ -46,7 +46,7 @@ struct selection_words {
 };
 
 // The sequence of query token qtok, by binary search over cu_seqlens_q, or qtok without it.
-template <typename scalar_t> __device__ int sequence_of(const attn::paged_attn_params<scalar_t>& p, int qtok) {
+template <typename scalar_t> __device__ int find_sequence(const attn::paged_attn_params<scalar_t>& p, int qtok) {
     if (p.cu_seqlens_q == nullptr) {
         return qtok;
     }
@@ -75,7 +75,7 @@ __global__ void attn_indexed_scalar_kernel(const attn::paged_attn_params<scalar_
     const int head_dim = p.head_dim;
     const int half = head_dim / 2;
 
-    const int s = sequence_of(p, qtok);
+    const int s = find_sequence(p, qtok);
     const int q0 = p.cu_seqlens_q ? p.cu_seqlens_q[s] : s;
     const int seq_q = p.cu_seqlens_q ? p.cu_seqlens_q[s + 1] - q0 : 1;
     const int key_count = p.key_counts[s];
@@ -183,7 +183,7 @@ __global__ void mark_selected_pages_kernel(
     }
     const int row = static_cast<int>(index / selection.words);
     const int w = static_cast<int>(index % selection.words);
-    const int s = sequence_of(p, row);
+    const int s = find_sequence(p, row);
     for (uint32_t bits = selection.word(row, w); bits != 0; bits &= bits - 1) {
         const int page = (w * 32 + __ffs(bits) - 1) * selection.block_size / page_size;
         if (page < p.max_pages) {
@@ -362,7 +362,7 @@ __global__ void __launch_bounds__(nwarps * 32, ctas_per_sm) attn_indexed_tc_kern
     const int g = group_cta % p.n_kv_heads;
     const int rows = p.group;
     const int first_head = g * p.group;
-    const int s = sequence_of(p, qtok);
+    const int s = find_sequence(p, qtok);
     const int q0 = p.cu_seqlens_q ? p.cu_seqlens_q[s] : s;
     const int seq_q = p.cu_seqlens_q ? p.cu_seqlens_q[s + 1] - q0 : 1;
     const int key_count = p.key_counts[s];
@@ -725,7 +725,7 @@ __global__ void __launch_bounds__(decode_warps * 32) attn_indexed_decode_kernel(
     const int g = group_cta % p.n_kv_heads;
     const int rows = p.group;
     const int first_head = g * p.group;
-    const int s = sequence_of(p, qtok);
+    const int s = find_sequence(p, qtok);
     const int q0 = p.cu_seqlens_q ? p.cu_seqlens_q[s] : s;
     const int seq_q = p.cu_seqlens_q ? p.cu_seqlens_q[s + 1] - q0 : 1;
     const int query_pos = p.key_counts[s] - seq_q + (qtok - q0);

@@ -598,7 +598,7 @@ unsigned element_blocks(int64_t elements) {
     return static_cast<unsigned>((elements + element_threads - 1) / element_threads);
 }
 
-int64_t max_tiles_of(int64_t assignments, int64_t experts) {
+int64_t count_max_tiles(int64_t assignments, int64_t experts) {
     return std::min(assignments, assignments / max_tile_rows + std::min(experts, assignments));
 }
 
@@ -756,7 +756,7 @@ at::Tensor run_experts(
         "routed_experts: too many assignments"
     );
 
-    const int64_t max_tiles = max_tiles_of(assignments, experts);
+    const int64_t max_tiles = count_max_tiles(assignments, experts);
     at::Tensor indices = at::empty({3 * assignments + 3 * max_tiles}, h.options().dtype(at::kInt));
     int32_t* position_of = indices.mutable_data_ptr<int32_t>();
     int32_t* sorted_token = position_of + assignments;
@@ -881,7 +881,7 @@ routed_experts_counters(int64_t tokens, int64_t top_k, int64_t held_experts, int
     if (assignments == 0) {
         return 0;
     }
-    const int64_t max_tiles = max_tiles_of(assignments, held_experts);
+    const int64_t max_tiles = count_max_tiles(assignments, held_experts);
     const bool split = gate_up_splits(max_tiles, intermediate, hidden).first > 1;
     return std::max<int64_t>(1, split ? max_tiles * gate_up_column_blocks(intermediate) : 0);
 }

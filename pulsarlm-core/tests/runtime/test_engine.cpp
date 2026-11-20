@@ -489,8 +489,8 @@ TEST_CASE("a negative context capacity evicts as a capacity of the engine's wind
     window.max_context_capacity = 16;
     pulsarlm::eviction_policy uncapped = negative;
     uncapped.max_context_capacity = 0;
-    REQUIRE(e.eviction_report_of(pulsarlm::state{}, negative).cap_tokens == std::optional<std::size_t>(12));
-    REQUIRE(e.eviction_report_of(pulsarlm::state{}, window).cap_tokens == std::optional<std::size_t>(12));
+    REQUIRE(e.make_eviction_report(pulsarlm::state{}, negative).cap_tokens == std::optional<std::size_t>(12));
+    REQUIRE(e.make_eviction_report(pulsarlm::state{}, window).cap_tokens == std::optional<std::size_t>(12));
 
     std::vector<std::shared_ptr<request_results>> recorded;
     for (const pulsarlm::eviction_policy& policy : {negative, window, uncapped}) {

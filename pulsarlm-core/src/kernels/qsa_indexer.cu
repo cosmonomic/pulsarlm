@@ -469,7 +469,7 @@ __global__ void __launch_bounds__(score_warps * 32) index_scores_tc_kernel(
     }
 }
 // The layout of rows of a batch whose views hold key_counts keys, checked.
-query_rows rows_of(
+query_rows make_query_rows(
     const char* op,
     const at::Tensor& key_counts,
     const std::optional<at::Tensor>& cu_seqlens_q,
@@ -526,7 +526,7 @@ at::Tensor index_scores_cuda(
         "index_scores: blocks must be contiguous CUDA [sequences, max_blocks, dim] in the queries' dtype"
     );
     const int64_t rows = queries.size(0);
-    const query_rows layout = rows_of("index_scores", key_counts, cu_seqlens_q, first_row, ratio);
+    const query_rows layout = make_query_rows("index_scores", key_counts, cu_seqlens_q, first_row, ratio);
     check_on_current_device("index_scores", {queries, blocks});
     TORCH_CHECK(
         blocks.size(0) == key_counts.size(0),
@@ -781,7 +781,7 @@ at::Tensor select_blocks_cuda(
         "select_blocks: scores must be contiguous fp32 CUDA [rows, max_blocks]"
     );
     const int64_t rows = scores.size(0);
-    const query_rows layout = rows_of("select_blocks", key_counts, cu_seqlens_q, first_row, ratio);
+    const query_rows layout = make_query_rows("select_blocks", key_counts, cu_seqlens_q, first_row, ratio);
     assert(cu_seqlens_q || first_row + rows <= key_counts.size(0));
     TORCH_CHECK(
         top >= 1 && words * 32 > scores.size(1),

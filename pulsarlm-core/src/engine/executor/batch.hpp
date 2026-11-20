@@ -77,7 +77,7 @@ class executor::batch {
         // Pinned host tensors: a prefill group's tokens, cu_seqlens_q unless the group decodes, and cu_view_pages when
         // it measures mass. The other inputs are gathered on each shard from its request_table.
         model::batch inputs;
-        // Pinned host int64, the slot of each entry's request (executor::slot_of).
+        // Pinned host int64, the slot of each entry's request (executor::get_slot).
         at::Tensor slots;
         // The page-table width, and whether the group's forward replays a graph.
         std::size_t table_width = 0;

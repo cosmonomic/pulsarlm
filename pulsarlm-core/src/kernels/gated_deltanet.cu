@@ -37,7 +37,7 @@ struct ragged_tokens {
         return cu_seqlens_q != nullptr ? cu_seqlens_q[s + 1] - cu_seqlens_q[s] : per_sequence;
     }
 
-    __device__ int sequence_of(int token) const {
+    __device__ int find_sequence(int token) const {
         if (cu_seqlens_q == nullptr) {
             return token / per_sequence;
         }
@@ -188,7 +188,7 @@ __global__ void causal_conv_kernel(
     }
     const int token = static_cast<int>(index / channels);
     const int channel = static_cast<int>(index % channels);
-    const int s = tokens.sequence_of(token);
+    const int s = tokens.find_sequence(token);
     const int first = tokens.first_token(s);
     const int history = (kernel - 1) * dilation;
     const int valid = window - lines.rejected_tokens(s);
@@ -374,12 +374,12 @@ struct delta_rule_block {
 };
 
 // log(gain) = neg_a * softplus(a + dt_bias), Hugging Face's softplus threshold 20 included.
-__device__ __forceinline__ float log_decay_of(float a, const delta_rule_params& p, int head) {
+__device__ __forceinline__ float compute_log_decay(float a, const delta_rule_params& p, int head) {
     const float shifted = a + p.dt_bias[head];
     return (shifted > 20.0f ? shifted : log1pf(expf(shifted))) * p.neg_a[head];
 }
 
-template <typename scalar_t> __device__ __forceinline__ float beta_of(scalar_t b) {
+template <typename scalar_t> __device__ __forceinline__ float compute_beta(scalar_t b) {
     return rounded<scalar_t>(sigmoid(static_cast<float>(b)));
 }
 
@@ -420,7 +420,7 @@ __global__ void __launch_bounds__(step_threads) delta_rule_step_kernel(
     const int column = block.first_column + block_column;
     const int first = p.tokens.first_token(block.s);
     const int count = p.tokens.count(block.s);
-    auto row_of = [&](int quad, int e) { return 32 * quad + 4 * row_lane + e; };
+    auto compute_row = [&](int quad, int e) { return 32 * quad + 4 * row_lane + e; };
     auto head_out = [&](int t) {
         return out + (static_cast<int64_t>(first + t) * p.value_heads + block.head) * p.value_dim;
     };
@@ -429,7 +429,7 @@ __global__ void __launch_bounds__(step_threads) delta_rule_step_kernel(
         for (int quad = 0; quad < quads; quad++) {
 #pragma unroll
             for (int e = 0; e < 4; e++) {
-                line[static_cast<int64_t>(row_of(quad, e)) * p.value_dim] = values[quad][e];
+                line[static_cast<int64_t>(compute_row(quad, e)) * p.value_dim] = values[quad][e];
             }
         }
     };
@@ -440,7 +440,7 @@ __global__ void __launch_bounds__(step_threads) delta_rule_step_kernel(
     for (int quad = 0; quad < quads; quad++) {
 #pragma unroll
         for (int e = 0; e < 4; e++) {
-            state[quad][e] = start[static_cast<int64_t>(row_of(quad, e)) * p.value_dim];
+            state[quad][e] = start[static_cast<int64_t>(compute_row(quad, e)) * p.value_dim];
         }
     }
     for (int t = 0; t < count; t++) {
@@ -455,7 +455,7 @@ __global__ void __launch_bounds__(step_threads) delta_rule_step_kernel(
         for (int quad = 0; quad < quads; quad++) {
 #pragma unroll
             for (int e = 0; e < 4; e++) {
-                const int dim = block.key_head * key_dim + row_of(quad, e);
+                const int dim = block.key_head * key_dim + compute_row(quad, e);
                 q[quad][e] = static_cast<float>(row[dim]);
                 k[quad][e] = static_cast<float>(row[block.key_dim + dim]);
                 qq += q[quad][e] * q[quad][e];
@@ -465,8 +465,8 @@ __global__ void __launch_bounds__(step_threads) delta_rule_step_kernel(
         }
         const float v = static_cast<float>(row[2 * block.key_dim + block.head * p.value_dim + column]);
         const int64_t gate = token * p.gate_row_stride + block.head;
-        const float gain = expf(log_decay_of(static_cast<float>(a[gate]), p, block.head));
-        const float beta = beta_of(b[gate]);
+        const float gain = expf(compute_log_decay(static_cast<float>(a[gate]), p, block.head));
+        const float beta = compute_beta(b[gate]);
         const float q_scale = rsqrtf(lane_sum<step_lanes>(qq) + 1e-6f) / p.key_dim_sqrt;
         const float k_scale = rsqrtf(lane_sum<step_lanes>(kk) + 1e-6f);
         qk = lane_sum<step_lanes>(qk) * q_scale * k_scale;
@@ -665,8 +665,8 @@ __global__ void __launch_bounds__(chunk_threads) delta_rule_chunk_kernel(
         if (threadIdx.x < chunk) {
             const int t = threadIdx.x;
             const int64_t gate = static_cast<int64_t>(first + chunk_first + t) * p.gate_row_stride + block.head;
-            decay[t] = t < tokens ? log_decay_of(static_cast<float>(a[gate]), p, block.head) : 0.0f;
-            beta[t] = t < tokens ? beta_of(b[gate]) : 0.0f;
+            decay[t] = t < tokens ? compute_log_decay(static_cast<float>(a[gate]), p, block.head) : 0.0f;
+            beta[t] = t < tokens ? compute_beta(b[gate]) : 0.0f;
         }
         __syncthreads();
 
@@ -928,7 +928,7 @@ ragged_tokens ragged(const state_rows& rows, const std::optional<at::Tensor>& cu
     };
 }
 
-state_lines lines_of(const state_rows& rows) {
+state_lines make_state_lines(const state_rows& rows) {
     return state_lines{
         rows.lines.const_data_ptr<int32_t>(),
         rows.lines.stride(0),
@@ -1025,7 +1025,7 @@ at::Tensor causal_conv(
                 weight.const_data_ptr<scalar_t>(),
                 conv_pool.mutable_data_ptr<scalar_t>(),
                 conv_pool.stride(0),
-                lines_of(rows),
+                make_state_lines(rows),
                 static_cast<int>(num_seqs),
                 static_cast<int>(channels),
                 static_cast<int>(kernel),
@@ -1048,7 +1048,7 @@ at::Tensor causal_conv(
                 weight.const_data_ptr<scalar_t>(),
                 conv_pool.const_data_ptr<scalar_t>(),
                 conv_pool.stride(0),
-                lines_of(rows),
+                make_state_lines(rows),
                 ragged(rows, cu_seqlens_q, per_sequence),
                 total,
                 static_cast<int>(channels),
@@ -1069,7 +1069,7 @@ at::Tensor causal_conv(
             x.stride(0),
             conv_pool.mutable_data_ptr<scalar_t>(),
             conv_pool.stride(0),
-            lines_of(rows),
+            make_state_lines(rows),
             ragged(rows, cu_seqlens_q, per_sequence),
             static_cast<int>(channels),
             static_cast<int>(window)
@@ -1188,7 +1188,7 @@ at::Tensor gated_delta_rule(
         neg_a.const_data_ptr<float>(),
         state_pool.mutable_data_ptr<float>(),
         state_pool.stride(0),
-        lines_of(rows),
+        make_state_lines(rows),
         ragged(rows, cu_seqlens_q, per_sequence),
         static_cast<int>(key_heads),
         static_cast<int>(value_heads),

@@ -32,7 +32,7 @@ bool quantized(const c10::Dict<std::string, at::Tensor>& weights, const std::str
     return weights.contains(name + ".weight_scale_inv");
 }
 
-const fp8_block& block_of(const std::optional<fp8_block>& block, const std::string& name) {
+const fp8_block& require_block(const std::optional<fp8_block>& block, const std::string& name) {
     if (!block) {
         throw std::invalid_argument(std::format("qwen3_5_model: {:?} has fp8 scales but no fp8_weight_block", name));
     }
@@ -51,7 +51,7 @@ linear need_linear(
     if (!quantized(weights, name)) {
         return linear::dense(std::move(weight));
     }
-    const fp8_block& b = block_of(block, name);
+    const fp8_block& b = require_block(block, name);
     return linear::fp8(
         weight.to(device),
         required_weight(weights, model_name, name + ".weight_scale_inv").to(device),
@@ -74,7 +74,7 @@ linear need_permuted_linear(
     if (!quantized(weights, name)) {
         return linear::dense(permute(weight));
     }
-    const fp8_block& b = block_of(block, name);
+    const fp8_block& b = require_block(block, name);
     const at::Tensor row_scale = required_weight(weights, model_name, name + ".weight_scale_inv")
                                      .to(device)
                                      .repeat_interleave(b.n, 0)

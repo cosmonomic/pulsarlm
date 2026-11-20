@@ -123,7 +123,7 @@ class engine {
     std::exception_ptr exception() const;
     // The scores a cycle's end under policy would evict s's pages by, a negative max_context_capacity taken as the
     // engine's max_context_window. Safe to call from any thread.
-    eviction_report eviction_report_of(const state& s, const eviction_policy& policy) const;
+    eviction_report make_eviction_report(const state& s, const eviction_policy& policy) const;
     // Safe to call from any thread.
     engine_stat stat() const;
     // The bytes of the largest page the engine fetches or puts. Safe to call from any thread.

@@ -79,7 +79,7 @@ class python_engine {
         pybind11::object on_cycle,
         pybind11::object on_end
     );
-    eviction_report eviction_report_of(const state& s, const eviction_policy& policy) const;
+    eviction_report make_eviction_report(const state& s, const eviction_policy& policy) const;
     engine_stat stat() const;
     int fileno() const noexcept;
     void clear_wake() noexcept;

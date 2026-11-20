@@ -163,10 +163,10 @@ void event_loop::stop() noexcept {
 }
 
 task<void> synchronize(cudaStream_t stream) {
-    check_cuda(co_await completion_of(stream));
+    check_cuda(co_await await_stream(stream));
 }
 
-external_task<cudaError_t> completion_of(cudaStream_t stream) {
+external_task<cudaError_t> await_stream(cudaStream_t stream) {
     auto [done, resolver] = external_task<cudaError_t>::make();
     auto owned = std::make_unique<cuda_resolver>(std::move(resolver));
     check_cuda(cudaStreamAddCallback(stream, resolve_synchronized, owned.get(), 0));

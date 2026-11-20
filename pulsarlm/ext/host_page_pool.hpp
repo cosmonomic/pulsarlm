@@ -40,7 +40,7 @@ class host_page_pool {
     // A pinned uint8 tensor of bytes in the pool; nullopt when no free block holds it.
     std::optional<at::Tensor> allocate(std::size_t bytes);
     // The byte offset of [data, data + bytes) in buffer(); nullopt when the range is not inside it.
-    std::optional<std::size_t> offset_of(const void* data, std::size_t bytes) const noexcept;
+    std::optional<std::size_t> get_offset(const void* data, std::size_t bytes) const noexcept;
     // The whole buffer as a pinned byte tensor, empty when the pool has no block.
     const at::Tensor& buffer() const noexcept;
 };

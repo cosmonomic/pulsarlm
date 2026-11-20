@@ -28,7 +28,7 @@ bool lists_page_twice(const layer_sequence& layer) {
     return !std::ranges::all_of(layer.pages, [&](const active_page& page) { return hashes.insert(page.hash).second; });
 }
 
-request_statistics statistics_of(const request_state& req) {
+request_statistics make_statistics(const request_state& req) {
     return request_statistics{
         .total_token_count = req.prompt_token_count() + req.delivered_token_count(),
         .cached_token_count = req.cached_token_count(),
@@ -89,7 +89,7 @@ task<std::optional<executor::request_id_type>> executor::start(request&& r, unst
         co_return std::nullopt;
     }
     const request_id_type id = requests.emplace(callbacks.release(), std::move(started));
-    assert(slot_of(id) < max_running_requests);
+    assert(get_slot(id) < max_running_requests);
     request_state& req = requests[id].state;
     // take_lines holds the resident pages before it first suspends, so they are the ones counted here.
     req.record_device_cached_tokens(device_cached_tokens(req));
@@ -141,7 +141,7 @@ void executor::end_requests(request_error error) noexcept {
     for (running_request& running : requests) {
         release_lines(running.state);
         store.release(running.state.lease_id());
-        deliver_end(running, std::unexpected(error), statistics_of(running.state));
+        deliver_end(running, std::unexpected(error), make_statistics(running.state));
     }
     requests.clear();
 }
@@ -211,11 +211,11 @@ task<std::expected<void, page_error>> executor::own_pages_from(request_state& re
             }
         }
     }
-    co_return co_await cache.sync(hashes, owners, line_ids, streams_of(&shard::compute_stream));
+    co_return co_await cache.sync(hashes, owners, line_ids, collect_streams(&shard::compute_stream));
 }
 
 task<void> executor::stop(request_id_type id) {
-    request_state& req = state_of(id);
+    request_state& req = get_state(id);
     assert(req.has_exited() && req.unfinished_step_count() == 0);
     release_lines(req);
     std::expected<std::shared_ptr<const state>, request_error> result = std::unexpected(request_error::cancelled);
@@ -237,7 +237,7 @@ task<void> executor::stop(request_id_type id) {
         break;
     }
     store.release(req.lease_id());
-    end_request(id, std::move(result), statistics_of(req));
+    end_request(id, std::move(result), make_statistics(req));
 }
 
 std::size_t executor::device_cached_tokens(const request_state& req) const {
@@ -272,7 +272,7 @@ task<std::expected<void, page_error>> executor::take_lines(request_state& req, s
     // A get failing with miss releases the lines it held_hashes while it fetched.
     std::expected<std::vector<std::vector<std::uint32_t>>, page_error> page_lines = co_await cache.get(
         held_hashes,
-        streams_of(&shard::compute_stream)
+        collect_streams(&shard::compute_stream)
     );
     if (!page_lines) {
         co_return std::unexpected(page_lines.error());
@@ -289,8 +289,12 @@ task<std::expected<void, page_error>> executor::take_lines(request_state& req, s
     bool copied = allocation.has_value();
     for (std::size_t layer = 0; layer < cache.layer_count() && copied; layer++) {
         if (layout.layers[layer].is_recurrent && !(*page_lines)[layer].empty()) {
-            std::expected<std::vector<std::uint32_t>, page_error>
-                state_copy = cache.clone(layer, (*page_lines)[layer].front(), 1, streams_of(&shard::compute_stream));
+            std::expected<std::vector<std::uint32_t>, page_error> state_copy = cache.clone(
+                layer,
+                (*page_lines)[layer].front(),
+                1,
+                collect_streams(&shard::compute_stream)
+            );
             copied = state_copy.has_value();
             if (copied) {
                 states[layer] = std::move(*state_copy);
