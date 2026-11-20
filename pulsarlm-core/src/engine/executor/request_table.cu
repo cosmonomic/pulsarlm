@@ -39,8 +39,11 @@ struct step_runs {
 };
 
 struct step_outputs {
+    // tokens and pos hold token_count entries and then padding, padded_token_count entries in all.
     std::int64_t* tokens;
     std::int64_t* pos;
+    std::int64_t token_count;
+    std::int64_t padded_token_count;
     std::int64_t* history_positions;
     std::int32_t* rejected_tokens;
     std::int32_t* key_counts;
@@ -52,7 +55,7 @@ struct step_outputs {
     float* query_weights;
 };
 
-// One CTA per request of the step.
+// One CTA per request of the step, and a last one that zeroes the padding.
 __global__ void gather_step_inputs_kernel(
     const std::int64_t* __restrict__ slots,
     std::int64_t requests,
@@ -61,6 +64,13 @@ __global__ void gather_step_inputs_kernel(
     step_outputs out
 ) {
     const std::int64_t s = blockIdx.x;
+    if (s == requests) {
+        for (std::int64_t i = out.token_count + threadIdx.x; i < out.padded_token_count; i += blockDim.x) {
+            out.tokens[i] = 0;
+            out.pos[i] = 0;
+        }
+        return;
+    }
     const std::int64_t slot = slots[s];
     const std::int64_t first = runs.query_starts[s];
     const std::int64_t count = runs.query_starts[s + 1] - first;
@@ -150,6 +160,7 @@ void gather_step_inputs(
     const at::Tensor& request_slots,
     std::size_t table_width,
     std::int64_t token_count,
+    std::int64_t padded_token_count,
     const at::Tensor& prefill_tokens,
     model::batch& inputs
 ) {
@@ -163,8 +174,9 @@ void gather_step_inputs(
     assert(prefill_tokens.scalar_type() == at::kLong && prefill_tokens.is_contiguous());
     assert(step_requests <= requests && width <= table.page_tables.size(2));
     assert(inputs.per_query_state_request_count == 0 || inputs.state_slots <= table.tokens.size(1));
-    inputs.tokens = at::empty({token_count}, options.dtype(at::kLong));
-    inputs.pos = at::empty({token_count}, options.dtype(at::kLong));
+    assert(padded_token_count >= token_count);
+    inputs.tokens = at::empty({padded_token_count}, options.dtype(at::kLong));
+    inputs.pos = at::empty({padded_token_count}, options.dtype(at::kLong));
     inputs.history_positions = at::empty({requests}, options.dtype(at::kLong));
     inputs.rejected_tokens = at::empty({requests}, options.dtype(at::kInt));
     inputs.kept_state_counts = at::empty({step_requests}, options.dtype(at::kInt));
@@ -200,6 +212,8 @@ void gather_step_inputs(
     const step_outputs outputs{
         .tokens = inputs.tokens.mutable_data_ptr<std::int64_t>(),
         .pos = inputs.pos.mutable_data_ptr<std::int64_t>(),
+        .token_count = token_count,
+        .padded_token_count = padded_token_count,
         .history_positions = inputs.history_positions.mutable_data_ptr<std::int64_t>(),
         .rejected_tokens = inputs.rejected_tokens.mutable_data_ptr<std::int32_t>(),
         .key_counts = inputs.key_counts.mutable_data_ptr<std::int32_t>(),
@@ -209,7 +223,8 @@ void gather_step_inputs(
         .kept_state_counts = inputs.kept_state_counts.mutable_data_ptr<std::int32_t>(),
         .query_weights = inputs.query_weights.defined() ? inputs.query_weights.mutable_data_ptr<float>() : nullptr,
     };
-    gather_step_inputs_kernel<<<static_cast<unsigned>(requests), cta_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+    const std::int64_t ctas = padded_token_count > token_count ? requests + 1 : requests;
+    gather_step_inputs_kernel<<<static_cast<unsigned>(ctas), cta_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         request_slots.const_data_ptr<std::int64_t>(),
         requests,
         runs,

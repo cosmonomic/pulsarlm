@@ -2,11 +2,13 @@
 
 #include "pulsarlm/kernels/p2p_all_reduce.hpp"
 
+#include <ATen/ATen.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime_api.h>
 
 #include <cstdint>
+#include <vector>
 
 namespace pulsarlm {
 
@@ -95,15 +97,32 @@ p2p_all_reduce::~p2p_all_reduce() {
     }
 }
 
+bool p2p_all_reduce::fits_size(std::size_t byte_count) const noexcept {
+    return byte_count <= max_bytes && byte_count % 16 == 0;
+}
+
 bool p2p_all_reduce::fits(const at::Tensor& x) const noexcept {
     const at::ScalarType dtype = x.scalar_type();
-    return x.is_cuda() && x.is_contiguous() && x.nbytes() <= max_bytes && x.nbytes() % 16 == 0 &&
+    return x.is_cuda() && x.is_contiguous() && fits_size(x.nbytes()) &&
         reinterpret_cast<std::uintptr_t>(x.data_ptr()) % 16 == 0 &&
         (dtype == at::kFloat || dtype == at::kHalf || dtype == at::kBFloat16);
 }
 
 void p2p_all_reduce::all_reduce(std::size_t rank, at::Tensor& x) {
     p2p_all_reduce_cuda(x, rank, buffers, flags, counters);
+}
+
+bool p2p_all_reduce::fits_gather(const at::Tensor& x) const noexcept {
+    return x.is_cuda() && x.is_contiguous() && x.nbytes() % 16 == 0 &&
+        reinterpret_cast<std::uintptr_t>(x.data_ptr()) % 16 == 0 && x.nbytes() * devices.size() <= max_bytes;
+}
+
+at::Tensor p2p_all_reduce::all_gather(std::size_t rank, const at::Tensor& x) {
+    std::vector<std::int64_t> sizes = x.sizes().vec();
+    sizes.front() *= static_cast<std::int64_t>(devices.size());
+    at::Tensor gathered = at::empty(sizes, x.options());
+    p2p_all_gather_cuda(x, gathered, rank, buffers, flags, counters);
+    return gathered;
 }
 
 }  // namespace pulsarlm

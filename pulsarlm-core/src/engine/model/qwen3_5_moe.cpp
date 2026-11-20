@@ -209,8 +209,13 @@ std::vector<kv_layer> qwen3_5_moe_model::kv_layers() const {
     return kv_specs;
 }
 
-at::Tensor
-qwen3_5_moe_model::attention(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const {
+at::Tensor qwen3_5_moe_model::attention(
+    const at::Tensor& h,
+    std::int64_t layer,
+    const batch& g,
+    std::span<const kv> lines,
+    graph_segments& segments
+) const {
     const attention_weights& w = *layers[layer].attention;
     const qwen3_5_moe_config& c = config;
     const std::int64_t ntok = h.size(0);
@@ -226,41 +231,77 @@ qwen3_5_moe_model::attention(const at::Tensor& h, std::int64_t layer, const batc
         c.rms_norm_eps
     );
     at::Tensor v = at::linear(h, w.v_proj).view({ntok, c.n_kv_heads, c.head_dim}).contiguous();
-    at::Tensor o = paged_attention(
+    at::Tensor o = at::empty_like(q);
+    segments.run_between_segments(
+        [this, &g, lines, kv_index](
+            const at::Tensor& queries,
+            const at::Tensor& keys,
+            const at::Tensor& values,
+            const at::Tensor& attended
+        ) {
+            paged_attention(
+                queries,
+                keys,
+                values,
+                attended,
+                lines[kv_index],
+                kv_index,
+                0,
+                g,
+                1.0 / std::sqrt(static_cast<double>(config.head_dim)),
+                rope
+            );
+        },
         q,
         k,
         v,
-        lines[kv_index],
-        kv_index,
-        0,
-        g,
-        1.0 / std::sqrt(static_cast<double>(c.head_dim)),
-        rope
+        o
     );
     return at::linear(o.reshape({ntok, c.n_heads * c.head_dim}) * at::sigmoid(gate), w.o_proj);
 }
 
-at::Tensor
-qwen3_5_moe_model::deltanet(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const {
+at::Tensor qwen3_5_moe_model::deltanet(
+    const at::Tensor& h,
+    std::int64_t layer,
+    const batch& g,
+    std::span<const kv> lines,
+    graph_segments& segments
+) const {
     const deltanet_weights& w = *layers[layer].deltanet;
     const std::size_t state_layer = layers[layer].state_kv_layer;
     const std::size_t conv_layer = layers[layer].conv_kv_layer;
-    at::Tensor gated = gated_deltanet(
-        g,
-        gated_deltanet_inputs{
-            .qkv = at::linear(h, w.in_proj_qkv),
-            .a = at::linear(h, w.in_proj_a),
-            .b = at::linear(h, w.in_proj_b),
-            .z = at::linear(h, w.in_proj_z),
+    const at::Tensor qkv = at::linear(h, w.in_proj_qkv);
+    const at::Tensor a = at::linear(h, w.in_proj_a);
+    const at::Tensor b = at::linear(h, w.in_proj_b);
+    const at::Tensor z = at::linear(h, w.in_proj_z);
+    at::Tensor gated = at::empty_like(z);
+    segments.run_between_segments(
+        [this, &g, lines, &w, state_layer, conv_layer](
+            const at::Tensor& mixed,
+            const at::Tensor& decay_inputs,
+            const at::Tensor& beta_inputs,
+            const at::Tensor& gates,
+            const at::Tensor& out
+        ) {
+            gated_deltanet(
+                g,
+                gated_deltanet_inputs{.qkv = mixed, .a = decay_inputs, .b = beta_inputs, .z = gates},
+                gated_deltanet_weights{.conv = w.conv, .dt_bias = w.dt_bias, .neg_a = w.neg_a, .norm = w.norm},
+                lines[state_layer],
+                lines[conv_layer],
+                state_layer,
+                conv_layer,
+                config.linear_n_key_heads,
+                config.rms_norm_eps,
+                gate_activation::silu,
+                out
+            );
         },
-        gated_deltanet_weights{.conv = w.conv, .dt_bias = w.dt_bias, .neg_a = w.neg_a, .norm = w.norm},
-        lines[state_layer],
-        lines[conv_layer],
-        state_layer,
-        conv_layer,
-        config.linear_n_key_heads,
-        config.rms_norm_eps,
-        gate_activation::silu
+        qkv,
+        a,
+        b,
+        z,
+        gated
     );
     return at::linear(gated, w.out_proj);
 }
@@ -284,7 +325,7 @@ at::Tensor qwen3_5_moe_model::moe(const at::Tensor& h, std::int64_t layer, const
     return sigmoid_gated_add_cuda(routed, at::linear(h, m.shared_expert_gate), shared);
 }
 
-model::output qwen3_5_moe_model::forward(const batch& b, std::span<const kv> lines) {
+model::output qwen3_5_moe_model::forward(const batch& b, std::span<const kv> lines, graph_segments& segments) {
     check_batch(b);
     assert(b.per_query_state_request_count == 0);
     const double eps = config.rms_norm_eps;
@@ -292,10 +333,24 @@ model::output qwen3_5_moe_model::forward(const batch& b, std::span<const kv> lin
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
         const layer_weights& w = layers[layer];
         at::Tensor h = rmsnorm_cuda(x, w.input_layernorm, eps);
-        x = x + (full_attention(layer) ? attention(h, layer, b, lines) : deltanet(h, layer, b, lines));
+        x = x +
+            (full_attention(layer) ? attention(h, layer, b, lines, segments) : deltanet(h, layer, b, lines, segments));
         x = x + moe(rmsnorm_cuda(x, w.post_attention_layernorm, eps), layer, b.arrival_counters);
     }
-    return output{.logits = at::matmul(rmsnorm_cuda(logit_inputs(x, b), norm, eps), lm_head.t())};
+    at::Tensor logits = at::empty({b.logit_tokens.size(0), lm_head.size(0)}, x.options());
+    segments.run_between_segments(
+        [this, &b](const at::Tensor& hidden_states, const at::Tensor& out) {
+            at::Tensor written = out.narrow(0, 0, b.logit_tokens.size(0));
+            at::matmul_out(
+                written,
+                rmsnorm_cuda(logit_inputs(hidden_states, b), norm, config.rms_norm_eps),
+                lm_head.t()
+            );
+        },
+        x,
+        logits
+    );
+    return output{.logits = logits};
 }
 
 std::int64_t qwen3_5_moe_model::arrival_counter_count(std::int64_t sequences, std::int64_t tokens) const {

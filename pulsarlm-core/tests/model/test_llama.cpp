@@ -16,6 +16,13 @@
 
 namespace {
 
+// The model's forward of b, its calls between segments run at once.
+pulsarlm::model::output
+forward_eagerly(pulsarlm::model& forwarded, const pulsarlm::model::batch& b, std::span<const pulsarlm::kv> lines) {
+    pulsarlm::graph_segments segments(b.tokens.size(0));
+    return forwarded.forward(b, lines, segments);
+}
+
 constexpr std::int64_t n_layers = 2;
 constexpr std::int64_t n_heads = 4;
 constexpr std::int64_t n_kv_heads = 2;
@@ -255,7 +262,7 @@ void check_against_dense(at::ScalarType dtype, double tolerance) {
          {chunk{0, 21, true}, chunk{21, 37, true}, chunk{37, 38, false}, chunk{38, 39, false}, chunk{39, 40, false}}) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
         pulsarlm::model::batch batch = step(tokens, c.first, c.last, c.prefill);
-        pulsarlm::model::output output = model.forward(batch, kv);
+        pulsarlm::model::output output = forward_eagerly(model, batch, kv);
         const pulsarlm::model::batch& g = batch;
 
         auto expected_logits = dense.logits.narrow(0, c.first, c.last - c.first);

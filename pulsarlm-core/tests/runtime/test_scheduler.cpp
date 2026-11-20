@@ -368,7 +368,8 @@ class sum_model final : public pulsarlm::model {
         return layers;
     }
 
-    output forward(const batch& b, std::span<const pulsarlm::kv> lines) override {
+    output forward(const batch& padded, std::span<const pulsarlm::kv> lines, pulsarlm::graph_segments&) override {
+        const batch b = query_tokens_of(padded);
         forward_count++;
         if (on_forward) {
             on_forward();
@@ -399,6 +400,15 @@ class sum_model final : public pulsarlm::model {
     }
 
   private:
+    // padded with its tokens and positions those of its query tokens.
+    static batch query_tokens_of(const batch& padded) {
+        batch b = padded;
+        const std::int64_t token_count = padded.cu_seqlens_q[-1].item<std::int64_t>();
+        b.tokens = padded.tokens.narrow(0, 0, token_count);
+        b.pos = padded.pos.narrow(0, 0, token_count);
+        return b;
+    }
+
     at::Tensor predict(const batch& g, std::span<const pulsarlm::kv> lines) const {
         std::int64_t n_tokens = g.tokens.size(0);
         at::Tensor positions = g.pos.cpu();
@@ -669,7 +679,8 @@ struct fixture {
           std::nullopt,
           draft_tokens,
           sampled_row_limit,
-          max_running_requests
+          max_running_requests,
+          prefill_tokens_per_step
       ),
       sched(exec, prefill_tokens_per_step) {}
 

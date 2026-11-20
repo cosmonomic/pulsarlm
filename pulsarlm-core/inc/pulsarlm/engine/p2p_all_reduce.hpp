@@ -11,10 +11,11 @@
 
 namespace pulsarlm {
 
-// Sums small tensors over GPUs of one process through a buffer on each GPU that the others read: every rank copies its
-// tensor into its buffer, waits until every rank's copy is there, then sums all copies in rank order, so every rank
-// computes the same result. A call can be captured in a CUDA graph. Every rank makes the same calls in the same order,
-// each on its own thread.
+// Sums or gathers small tensors over GPUs of one process through a buffer on each GPU that the others reach. To sum,
+// every rank copies its tensor into its buffer, waits until every rank's copy is there, then sums all copies in rank
+// order, so every rank computes the same result. To gather, every rank copies its tensor into every rank's buffer,
+// waits until every rank's copies are there, then copies its buffer out. A call can be captured in a CUDA graph. Every
+// rank makes the same calls in the same order, each on its own thread.
 class p2p_all_reduce {
     std::vector<at::Device> devices;
     std::size_t max_bytes;
@@ -36,8 +37,15 @@ class p2p_all_reduce {
     // Whether x is a contiguous fp32, fp16 or bf16 tensor of at most max_bytes, 16-byte aligned, of a multiple of 16
     // bytes.
     bool fits(const at::Tensor& x) const noexcept;
+    // Whether byte_count is at most max_bytes and a multiple of 16.
+    bool fits_size(std::size_t byte_count) const noexcept;
     // Sums x over the ranks in place on rank's current stream; x fits.
     void all_reduce(std::size_t rank, at::Tensor& x);
+    // Whether every rank's x, gathered, fits: x is contiguous, 16-byte aligned, of a multiple of 16 bytes, and of at
+    // most max_bytes over the ranks together.
+    bool fits_gather(const at::Tensor& x) const noexcept;
+    // Every rank's x concatenated along dim 0 in rank order, on rank's current stream; x fits a gather.
+    at::Tensor all_gather(std::size_t rank, const at::Tensor& x);
 };
 
 }  // namespace pulsarlm

@@ -85,6 +85,9 @@ class executor::batch {
     at::Tensor prefill_tokens;
     // The page-table width of the inputs gathered without a graph, the widest table among the entries' requests.
     std::size_t table_width = 0;
+    // The entries of the model's tokens: the query tokens of a uniform step (is_uniform), else their bucket
+    // (executor::find_token_bucket), set at the launch.
+    std::size_t padded_token_count = 0;
     // Pinned host fp32, defined for a step that measures mass: the page mass of each KV layer that measures it in
     // turn, laid out as the layer's row of the step's cu_view_pages, its heads innermost; per shard, its heads, then
     // joined over the shards.
@@ -126,6 +129,11 @@ class executor::batch {
     at::Tensor computed_token_counts;
     at::Tensor next_token_sources;
     at::Tensor cycle_end_flags;
+    // Pinned host bytes that the pinned host tensors above are views into, except the table cells and stale entries,
+    // so that one copy moves them to a shard's device (pack_host_inputs), and per shard that copy, made by the eager
+    // path of enqueue.
+    at::Tensor host_input_bytes;
+    std::vector<at::Tensor> device_input_bytes;
     // Per shard, completing once the step's work on its stream has, and an event recorded after that work.
     std::vector<external_task<cudaError_t>> completions;
     std::vector<at::cuda::CUDAEvent> ends;
@@ -158,6 +166,11 @@ class executor::batch {
     // tokens and whether they end its eviction cycle.
     batch(executor& owner, std::span<const scheduled_request> scheduled);
 
+    // Moves the pinned host inputs of the step into host_input_bytes, each at an offset aligned to 16 bytes, and makes
+    // each a view of its bytes there.
+    void pack_host_inputs();
+    // The view of host, a tensor packed into host_input_bytes, in shard's device_input_bytes.
+    at::Tensor get_on_device(const at::Tensor& host, std::size_t shard) const;
     // Whether the entry at index belongs to the second run, verifying its drafts.
     bool verifies(std::size_t index) const noexcept;
     // The mass views (model::batch::cu_view_pages) of the entries before index.
@@ -183,12 +196,12 @@ class executor::batch {
     // Queues on the current stream the copies of the step's table cells and stale entries to the device of table, a
     // shard's, and their writes.
     void write_tables(request_table& table) const;
-    // On device, table's, the inputs of the step's sampling: per sample, its request's columns of table, its draw count
-    // moved by the sample's offset.
-    sampling_inputs gather_sampling_inputs(const request_table& table, at::Device device) const;
+    // On shard's device, table's, the inputs of the step's sampling: per sample, its request's columns of table, its
+    // draw count moved by the sample's offset.
+    sampling_inputs gather_sampling_inputs(const request_table& table, std::size_t shard) const;
     // Queues on the current stream the addition to table's draw_counts of the draws the step took: one per entry that
     // samples outside the second run, and a second-run entry's accepted count.
-    void advance_draw_counts(request_table& table, std::size_t shard, at::Device device) const;
+    void advance_draw_counts(request_table& table, std::size_t shard) const;
     // Queues on the current stream, shard's, the gather into shard_prior_hidden of the last_hidden that the entries at
     // prior_hidden_slots read: of the line of draft_layer's view page holding the key before the request's next token
     // in table.
@@ -199,10 +212,10 @@ class executor::batch {
         std::size_t shard,
         at::Device device
     );
-    // Queues on the current stream, shard's, the copies of the step's host inputs to its device and the gather of the
-    // others from table (gather_step_inputs). Returns the inputs on the device and their zeroed page mass, undefined
-    // for a step that measures none; the second run's tokens go into verify_tokens. mass_heads is the shard's part of
-    // the executor's.
+    // Queues on the current stream, shard's, the copy of the step's host inputs to its device (device_input_bytes) and
+    // the gather of the others from table (gather_step_inputs), the tokens padded to padded_token_count. Returns the
+    // inputs on the device and their zeroed page mass, undefined for a step that measures none; the second run's
+    // tokens go into verify_tokens. mass_heads is the shard's part of the executor's.
     std::pair<model::batch, at::Tensor> upload_inputs(
         std::span<const kv> lines,
         const std::vector<std::size_t>& mass_heads,
@@ -211,7 +224,8 @@ class executor::batch {
     );
     // Queues on stream shard's writes of the step's table cells and stale entries into table (write_tables), then
     // the gather of the prior hidden vectors from draft_layer's lines, then a replayed verify step or decode step from
-    // graphs, or else the step's inputs (upload_inputs), its forward and the copy of its page mass to the host, then
+    // graphs, or else the step's inputs (upload_inputs), its forward, replayed from graphs' segment graphs when graphs
+    // holds those of its bucket, and the copy of its page mass to the host, then
     // the sampling, the drafts, the advance of table's draw counts (advance_draw_counts) and last the advance of its
     // requests (advance_table); shard 0 also queues the copy of the sampled tokens to the host. mass_heads is the
     // shard's part of the executor's. graphs is the shard's, null when steps run without graphs. Every shard's call may
@@ -292,6 +306,9 @@ class executor::batch {
     );
     // Whether the step replays a step_graphs verify step: every entry belongs to the second run and drafts.
     bool verify_step_replays() const noexcept;
+    // Whether the step is uniform, run unpadded and with graphs from a step_graphs verify step or, in an executor
+    // whose steps do not draft (drafts false), decode step.
+    bool is_uniform(bool drafts) const noexcept;
     // Whether the step replays a step_graphs decode step when it drafts nothing: every entry belongs to the first run
     // and samples.
     bool decode_step_replays() const noexcept;

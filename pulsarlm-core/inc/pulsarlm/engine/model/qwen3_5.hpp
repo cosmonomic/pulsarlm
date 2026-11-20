@@ -91,16 +91,34 @@ class qwen3_5_model : public model, public draft_head {
     std::optional<mtp_weights> mtp;
 
     bool full_attention(std::int64_t layer) const;
-    at::Tensor
-    attention(const at::Tensor& h, const layer_weights& layer, const batch& g, std::span<const kv> lines) const;
-    at::Tensor
-    deltanet(const at::Tensor& h, const layer_weights& layer, const batch& g, std::span<const kv> lines) const;
+    at::Tensor attention(
+        const at::Tensor& h,
+        const layer_weights& layer,
+        const batch& g,
+        std::span<const kv> lines,
+        graph_segments& segments
+    ) const;
+    at::Tensor deltanet(
+        const at::Tensor& h,
+        const layer_weights& layer,
+        const batch& g,
+        std::span<const kv> lines,
+        graph_segments& segments
+    ) const;
     at::Tensor embed(const at::Tensor& tokens) const;
     // The decoder layer of weights w over x, its attention or delta rule then its MLP, each with its residual.
-    at::Tensor
-    decoder_layer(const at::Tensor& x, const layer_weights& w, const batch& g, std::span<const kv> lines) const;
-    // The logits [rows, vocab_size] of the normed hidden rows, from every rank's part of lm_head.
-    at::Tensor logits(const at::Tensor& rows) const;
+    at::Tensor decoder_layer(
+        const at::Tensor& x,
+        const layer_weights& w,
+        const batch& g,
+        std::span<const kv> lines,
+        graph_segments& segments
+    ) const;
+    // Uninitialized logits [logit_count, columns] in like's dtype, a column per row of every rank's part of lm_head.
+    at::Tensor make_logits(std::int64_t logit_count, const at::Tensor& like) const;
+    // Writes into the first rows of logits (make_logits) the logits of the normed hidden states [logits, hidden],
+    // from every rank's part of lm_head.
+    void write_logits(const at::Tensor& hidden_states, const at::Tensor& logits) const;
 
   public:
     // weights are on the lines' device, in the attention lines' dtype, except that fp8 linears and their scales may
@@ -111,11 +129,13 @@ class qwen3_5_model : public model, public draft_head {
 
     std::vector<kv_layer> kv_layers() const override;
     std::vector<kv_layer_shard> kv_layer_shards() const override;
-    output forward(const batch& b, std::span<const kv> lines) override;
+    output forward(const batch& b, std::span<const kv> lines, graph_segments& segments) override;
+    bool allows_segment_capture(std::int64_t token_count) const override;
     std::int64_t arrival_counter_count(std::int64_t sequences, std::int64_t tokens) const override;
     draft_head* drafter() override;
     std::int64_t hidden_dim() const override;
-    output draft(const batch& b, const at::Tensor& hidden, std::span<const kv> lines) override;
+    output
+    draft(const batch& b, const at::Tensor& hidden, std::span<const kv> lines, graph_segments& segments) override;
 };
 
 }  // namespace pulsarlm

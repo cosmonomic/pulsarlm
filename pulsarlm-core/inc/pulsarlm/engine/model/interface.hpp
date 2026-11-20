@@ -1,5 +1,7 @@
 #pragma once
 
+#include "pulsarlm/engine/graph_segments.hpp"
+
 #include <ATen/core/Tensor.h>
 
 #include <cstddef>
@@ -76,8 +78,10 @@ class model {
         // The next per_query_state_request_count requests keep a recurrent state and a mass view per query token, and
         // each has state_slots query tokens. Only a model with a draft head receives such requests.
         std::int64_t per_query_state_request_count = 0;
+        // int64 [ntok], each query token's token, then, in a batch padded to a step bucket, padding tokens of no
+        // request, which the forward computes and nothing reads.
         at::Tensor tokens;
-        // int64 [ntok]: each token's RoPE position.
+        // int64, laid out as tokens: each token's RoPE position.
         at::Tensor pos;
         // int32 [n_kv_layers, num_seqs, max_pages]: the lines of sequence s's view pages in KV layer l. A recurrent
         // layer's row holds the sequence's state lines, its slots then its boundary lines (state_rows).
@@ -118,7 +122,7 @@ class model {
         // (r + 1) * n_q_heads). Every reader attends the same pages, so weight_sum is the same for all of them.
         std::vector<at::Tensor> page_mass_sum;
         std::vector<at::Tensor> page_weight_sum;
-        // fp32 [ntok], defined with cu_view_pages: each token's query weight.
+        // fp32 [query tokens], defined with cu_view_pages: each query token's query weight.
         at::Tensor query_weights;
         // int64 [logit tokens]: the query tokens whose logits the forward returns, in order.
         at::Tensor logit_tokens;
@@ -130,7 +134,7 @@ class model {
     // The logits [logit tokens, vocab] in the model's dtype of the batch's logit tokens.
     struct output {
         at::Tensor logits;
-        // The hidden rows of every query token; undefined for a model without a draft head.
+        // The hidden rows of every entry of the batch's tokens; undefined for a model without a draft head.
         at::Tensor hidden;
     };
 
@@ -148,8 +152,15 @@ class model {
         }
         return shards;
     }
-    // lines holds one kv per entry of kv_layers().
-    virtual output forward(const batch& b, std::span<const kv> lines) = 0;
+    // lines holds one kv per entry of kv_layers(). Every call that depends on the batch's runs or its requests goes
+    // through segments.run_between_segments, which receives the query tokens' rows of its tensors. hidden holds a row
+    // per entry of b.tokens, padding included.
+    virtual output forward(const batch& b, std::span<const kv> lines, graph_segments& segments) = 0;
+    // Whether the collectives of a forward of token_count entries of tokens can be captured in a CUDA graph outside
+    // its calls between segments.
+    virtual bool allows_segment_capture(std::int64_t token_count) const {
+        return true;
+    }
     // The model's draft head, null for a model without one.
     virtual draft_head* drafter() {
         return nullptr;
@@ -173,7 +184,9 @@ class draft_head {
     // position before it, zeros before a sequence's first position. Writes the rows' KV into the head's KV layer of
     // lines. The model's forward keeps the hidden row at the latest position written into each of that layer's lines
     // in its last_hidden, which a row reads when the position before it was forwarded by an earlier step.
-    virtual model::output draft(const model::batch& b, const at::Tensor& hidden, std::span<const kv> lines) = 0;
+    // Its calls that depend on the batch go through segments, as model::forward's.
+    virtual model::output
+    draft(const model::batch& b, const at::Tensor& hidden, std::span<const kv> lines, graph_segments& segments) = 0;
 };
 
 // b's runs lie within its sequences, and its query starts are defined.

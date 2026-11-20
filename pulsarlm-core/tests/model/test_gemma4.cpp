@@ -16,6 +16,13 @@
 
 namespace {
 
+// The model's forward of b, its calls between segments run at once.
+pulsarlm::model::output
+forward_eagerly(pulsarlm::model& forwarded, const pulsarlm::model::batch& b, std::span<const pulsarlm::kv> lines) {
+    pulsarlm::graph_segments segments(b.tokens.size(0));
+    return forwarded.forward(b, lines, segments);
+}
+
 // b with its own arrival counters, as many as model needs for it.
 pulsarlm::model::batch with_arrival_counters(pulsarlm::model::batch b, const pulsarlm::model& model) {
     const std::int64_t tokens = b.tokens.size(0);
@@ -392,7 +399,7 @@ void check_against_dense(const gemma4_config& c, at::ScalarType dtype, double to
         INFO("tokens [" << ch.first << ", " << ch.last << ")" << (ch.prefill ? " prefill" : " decode"));
         pulsarlm::model::batch
             batch = step(tokens, static_cast<std::int64_t>(layers.size()), ch.first, ch.last, ch.prefill);
-        pulsarlm::model::output output = model.forward(with_arrival_counters(batch, model), lines);
+        pulsarlm::model::output output = forward_eagerly(model, with_arrival_counters(batch, model), lines);
         auto expected = dense.logits.narrow(0, ch.first, ch.last - ch.first);
         CHECK(max_relative_error(output.logits, expected) < tolerance);
     }

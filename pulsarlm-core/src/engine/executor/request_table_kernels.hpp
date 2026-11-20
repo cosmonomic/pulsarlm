@@ -11,7 +11,8 @@
 namespace pulsarlm {
 
 // Fills inputs, a step of the requests at request_slots (int64 on table's device) that computes token_count query
-// tokens, from their entries of table on the current stream: tokens, pos, history_positions, rejected_tokens,
+// tokens padded to padded_token_count, from their entries of table on the current stream: tokens and pos, zero in the
+// padding, history_positions, rejected_tokens,
 // kept_state_counts, key_counts with the step's tokens of each request, page_tables and page_positions table_width
 // columns wide, and query_weights when inputs.cu_view_pages is defined. The tokens of the first two runs come from
 // table, those of the third from prefill_tokens (int64 on table's device). The queries of the second run weigh 1 from
@@ -22,6 +23,7 @@ void gather_step_inputs(
     const at::Tensor& request_slots,
     std::size_t table_width,
     std::int64_t token_count,
+    std::int64_t padded_token_count,
     const at::Tensor& prefill_tokens,
     model::batch& inputs
 );

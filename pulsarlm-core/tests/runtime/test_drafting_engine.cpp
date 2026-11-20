@@ -19,6 +19,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdlib>
 #include <cstdint>
 #include <expected>
 #include <format>
@@ -39,6 +40,11 @@
 // verify steps accept some drafts and reject others.
 
 namespace {
+
+// Graph replays of the ranks of a communicator on one device queue their spinning p2p_all_reduce kernels without the
+// communicator's wait for every rank, so the process loads its CUDA modules before it runs any
+// (communicator::make_on_one_device).
+const bool loads_modules_eagerly = setenv("CUDA_MODULE_LOADING", "EAGER", 1) == 0;
 
 using pulsarlm::digest;
 using pulsarlm::page;
@@ -658,7 +664,8 @@ using prefill_count_type = std::int64_t;
 using batch_runs = std::tuple<single_query_count_type, verifying_count_type, prefill_count_type>;
 
 // Counts the batches it forwards with requests verifying drafts, the query tokens of those requests, and the batches
-// with such requests that a CUDA graph captures, and keeps the runs of every batch it forwards.
+// with such requests that a CUDA graph captures, and keeps the runs of every step it computes, replayed from segment
+// graphs or not, from a call between segments.
 class counting_model final : public pulsarlm::qwen4_exp_model {
   public:
     std::shared_ptr<std::size_t> verify_steps = std::make_shared<std::size_t>(0);
@@ -668,13 +675,15 @@ class counting_model final : public pulsarlm::qwen4_exp_model {
 
     using pulsarlm::qwen4_exp_model::qwen4_exp_model;
 
-    output forward(const batch& b, std::span<const pulsarlm::kv> lines) override {
-        const std::int64_t requests = b.cu_seqlens_q.size(0) - 1;
-        forwarded_runs->emplace_back(
-            b.single_query_request_count,
-            b.per_query_state_request_count,
-            requests - b.single_query_request_count - b.per_query_state_request_count
-        );
+    output forward(const batch& b, std::span<const pulsarlm::kv> lines, pulsarlm::graph_segments& segments) override {
+        segments.run_between_segments([runs = forwarded_runs, &b] {
+            const std::int64_t requests = b.cu_seqlens_q.size(0) - 1;
+            runs->emplace_back(
+                b.single_query_request_count,
+                b.per_query_state_request_count,
+                requests - b.single_query_request_count - b.per_query_state_request_count
+            );
+        });
         if (b.per_query_state_request_count > 0) {
             (*verify_steps)++;
             *verify_rows += static_cast<std::size_t>(b.per_query_state_request_count * b.state_slots);
@@ -684,7 +693,7 @@ class counting_model final : public pulsarlm::qwen4_exp_model {
                 (*captured_verify_steps)++;
             }
         }
-        return pulsarlm::qwen4_exp_model::forward(b, lines);
+        return pulsarlm::qwen4_exp_model::forward(b, lines, segments);
     }
 };
 
@@ -719,7 +728,7 @@ class recording_model final : public pulsarlm::qwen4_exp_model {
 
     using pulsarlm::qwen4_exp_model::qwen4_exp_model;
 
-    output forward(const batch& b, std::span<const pulsarlm::kv> lines) override {
+    output forward(const batch& b, std::span<const pulsarlm::kv> lines, pulsarlm::graph_segments& segments) override {
         forwarded->push_back(
             batch{
                 .single_query_request_count = b.single_query_request_count,
@@ -734,7 +743,7 @@ class recording_model final : public pulsarlm::qwen4_exp_model {
                 .query_weights = b.query_weights.defined() ? b.query_weights.clone() : at::Tensor(),
             }
         );
-        return pulsarlm::qwen4_exp_model::forward(b, lines);
+        return pulsarlm::qwen4_exp_model::forward(b, lines, segments);
     }
 };
 
@@ -932,7 +941,7 @@ TEST_CASE(
 // verify steps, and near a cycle end a request decodes without drafts beside the others' verify steps, every step in
 // one forward of the model. The step's prefill tokens cover every prompt, so a request's prefill chunks end at its
 // cycle ends together as alone. Each request emits the tokens and reaches the state, its page mass included, that it
-// reaches served alone. Graphs are not captured over two ranks: two ranks' captures on one device would merge.
+// reaches served alone.
 TEST_CASE(
     "Qwen4-Exp requests stepped together emit the tokens and reach the states they reach alone",
     "[runtime][cuda]"
@@ -940,7 +949,9 @@ TEST_CASE(
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
-    const auto [shard_count, decode_graphs] = GENERATE(table<std::size_t, bool>({{1, false}, {1, true}, {2, false}}));
+    const auto [shard_count, decode_graphs] = GENERATE(
+        table<std::size_t, bool>({{1, false}, {1, true}, {2, false}, {2, true}})
+    );
     INFO(shard_count << " ranks" << (decode_graphs ? " with" : " without") << " graphs");
     const weights w(at::kFloat, base_dims, /*drafts=*/true);
     const std::vector<std::size_t> prompt_lengths{9, prompt_tokens, 3 * page_size + 5};

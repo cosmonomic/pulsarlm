@@ -90,6 +90,61 @@ executor::batch::batch(executor& owner, std::span<const scheduled_request> sched
     }
     computed_token_counts = pinned_values(computed_counts);
     next_token_sources = pinned_values(next_sources);
+    pack_host_inputs();
+}
+
+void executor::batch::pack_host_inputs() {
+    constexpr std::size_t alignment = 16;
+    const std::vector<at::Tensor*> packed{
+        &inputs.cu_seqlens_q,
+        &inputs.cu_seqlens_q_from_second_run,
+        &inputs.cu_seqlens_q_from_third_run,
+        &inputs.cu_view_pages,
+        &inputs.logit_tokens,
+        &request_slots,
+        &prefill_tokens,
+        &sample_slots,
+        &sample_offsets,
+        &sample_logit_indices,
+        &single_draw_slots,
+        &computed_token_counts,
+        &next_token_sources,
+    };
+    std::vector<std::size_t> offsets;
+    std::size_t byte_count = 0;
+    for (const at::Tensor* host : packed) {
+        offsets.push_back(byte_count);
+        if (host->defined()) {
+            byte_count += (host->nbytes() + alignment - 1) / alignment * alignment;
+        }
+    }
+    host_input_bytes = pinned({static_cast<std::int64_t>(byte_count)}, at::kByte);
+    for (std::size_t index = 0; index < packed.size(); index++) {
+        at::Tensor& host = *packed[index];
+        if (!host.defined()) {
+            continue;
+        }
+        at::Tensor view = host_input_bytes.narrow(0, static_cast<std::int64_t>(offsets[index]), host.nbytes())
+                              .view(host.scalar_type())
+                              .view(host.sizes());
+        view.copy_(host);
+        host = view;
+    }
+}
+
+at::Tensor executor::batch::get_on_device(const at::Tensor& host, std::size_t shard) const {
+    const at::Tensor& device_bytes = device_input_bytes[shard];
+    if (host.numel() == 0) {
+        return at::empty(host.sizes(), host.options().device(device_bytes.device()).pinned_memory(false));
+    }
+    const auto offset = static_cast<std::int64_t>(
+        static_cast<const std::byte*>(host.const_data_ptr()) -
+        static_cast<const std::byte*>(host_input_bytes.const_data_ptr())
+    );
+    assert(offset >= 0 && offset + static_cast<std::int64_t>(host.nbytes()) <= host_input_bytes.numel());
+    return device_bytes.narrow(0, offset, static_cast<std::int64_t>(host.nbytes()))
+        .view(host.scalar_type())
+        .view(host.sizes());
 }
 
 bool executor::batch::verifies(std::size_t index) const noexcept {

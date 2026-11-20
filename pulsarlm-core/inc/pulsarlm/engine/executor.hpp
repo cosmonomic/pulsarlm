@@ -119,9 +119,14 @@ class executor {
     static constexpr std::size_t max_store_writes = 8;
     // The most rows of sampled tokens a batch has.
     std::size_t sampled_row_capacity;
+    // The query token counts that a step which is not uniform (batch::is_uniform) pads to, ascending: 1, 2, 3, then
+    // each 4 * 2^k and 6 * 2^k below the most query tokens of a step, then that most (make_token_buckets).
+    std::vector<std::int64_t> token_buckets;
 
     // The slot of id's request, its index into a shard's request_table.
     static std::size_t get_slot(request_id_type id) noexcept;
+    // The smallest of token_buckets that holds token_count query tokens.
+    std::size_t find_token_bucket(std::size_t token_count) const;
     // Marks the columns of id's page tables from first_column on as stale (stale_tables).
     void mark_stale_tables(request_id_type id, std::size_t first_column);
     // The columns of req's page tables once each KV layer holds line_counts[layer] more lines.
@@ -215,10 +220,12 @@ class executor {
     // cache's. root is the engine's root digest (make_root_digest). A request's view takes at most view_page_capacity
     // pages, and one that would take more ends with context_exceeded. With graph_pages, a step_graphs graph over tables
     // graph_pages wide replays a step of decoding entries alone that all sample and draft nothing (a decode step), and
-    // a step of verifying entries alone that all draft (a verify step); any other step runs without a graph. A step
-    // drafts draft_tokens tokens per request
-    // with the shards' draft heads, which they have when draft_tokens is above 0, and the cache's recurrent layers are
-    // laid out for them (recurrent_state). At most max_running_requests requests hold a record at once (start).
+    // a step of verifying entries alone that all draft (a verify step). Any other step pads its query tokens to their
+    // bucket (token_buckets), with graphs or without, and with graph_pages replays the bucket's segment graphs when the
+    // model allows their capture (model::allows_segment_capture). A step drafts draft_tokens tokens per request with
+    // the shards' draft heads, which they have when draft_tokens is above 0, and the cache's recurrent layers are
+    // laid out for them (recurrent_state). At most max_running_requests requests hold a record at once (start), and a
+    // step takes at most prefill_tokens_per_step query tokens of prefill chunks (scheduler).
     executor(
         std::vector<model*>&& models,
         kv_cache cache,
@@ -232,7 +239,8 @@ class executor {
         std::optional<std::size_t> graph_pages,
         std::size_t draft_tokens,
         std::size_t sampled_row_limit,
-        std::size_t max_running_requests
+        std::size_t max_running_requests,
+        std::size_t prefill_tokens_per_step
     );
     ~executor();
 

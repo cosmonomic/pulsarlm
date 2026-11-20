@@ -5,6 +5,7 @@
 #include <ATen/ATen.h>
 
 #include <algorithm>
+#include <ranges>
 #include <cassert>
 #include <cstddef>
 #include <utility>
@@ -67,7 +68,8 @@ step_graphs::step_graphs(
     std::size_t state_slots,
     std::vector<std::size_t> mass_heads,
     at::Tensor stop_tokens,
-    request_table table
+    request_table table,
+    std::vector<std::int64_t> bucket_token_counts
 )
 : shard_model(shard_model),
   lines(lines.begin(), lines.end()),
@@ -77,7 +79,10 @@ step_graphs::step_graphs(
   mass_heads(std::move(mass_heads)),
   stop_tokens(std::move(stop_tokens)),
   table(std::move(table)),
-  no_prefill_tokens(at::empty({0}, lines.front().k.options().dtype(at::kLong))) {
+  no_prefill_tokens(at::empty({0}, lines.front().k.options().dtype(at::kLong))),
+  bucket_token_counts(std::move(bucket_token_counts)),
+  segment_pool(at::cuda::graph_pool_handle()) {
+    assert(std::ranges::is_sorted(this->bucket_token_counts));
     assert(this->table.tokens.size(1) == this->state_slots && this->width <= this->table.page_tables.size(2));
     auto floats = this->lines.front().k.options().dtype(at::kFloat);
     const std::int64_t rows = startup_sequences * this->width;
@@ -197,7 +202,7 @@ step_graphs::gather_sampling_inputs(const at::Tensor& sample_slots, const at::Te
 void step_graphs::gather_inputs(const at::Tensor& request_slots, model::batch& inputs) const {
     const std::int64_t token_count = inputs.single_query_request_count +
         inputs.per_query_state_request_count * inputs.state_slots;
-    gather_step_inputs(table, request_slots, page_width(), token_count, no_prefill_tokens, inputs);
+    gather_step_inputs(table, request_slots, page_width(), token_count, token_count, no_prefill_tokens, inputs);
 }
 
 std::unique_ptr<step_graphs::captured_decode_step>
@@ -210,7 +215,8 @@ step_graphs::capture_decode_step(std::int64_t sequences, bool measures_mass, boo
     captured->graph.capture_begin({0, 0}, cudaStreamCaptureModeThreadLocal);
     gather_inputs(slots, captured->inputs);
     const sampling_inputs sampling = gather_sampling_inputs(slots, table.draw_counts.index_select(0, slots), filters);
-    model::output output = shard_model.forward(captured->inputs, lines);
+    graph_segments segments(sequences);
+    model::output output = shard_model.forward(captured->inputs, lines, segments);
     at::Tensor samples = sample(output.logits, sampling);
     const at::Tensor ones = at::ones_like(slots);
     table.draw_counts.index_add_(0, slots, ones);
@@ -253,7 +259,8 @@ step_graphs::capture_verify_step(std::int64_t sequences, bool measures_mass, boo
         table.draw_counts.index_select(0, sample_slots) + draw_offsets,
         filters
     );
-    model::output verified_rows = shard_model.forward(inputs, lines);
+    graph_segments verified_segments(tokens);
+    model::output verified_rows = shard_model.forward(inputs, lines, verified_segments);
     at::Tensor samples = sample(verified_rows.logits, sampling);
     at::Tensor accepted_counts = count_accepted_tokens(
         samples.view({sequences, rows}),
@@ -272,7 +279,8 @@ step_graphs::capture_verify_step(std::int64_t sequences, bool measures_mass, boo
     first.page_positions.copy_(inputs.page_positions);
     first.key_counts.copy_(every_layer(keys + (rows + 1)));
     first.logit_tokens.copy_(drafting_rows);
-    model::output drafted_rows = head.draft(first, verified_rows.hidden, lines);
+    graph_segments first_segments(tokens);
+    model::output drafted_rows = head.draft(first, verified_rows.hidden, lines, first_segments);
     at::Tensor token = drafted_rows.logits.argmax(-1);
     at::Tensor previous_hidden = drafted_rows.hidden.index_select(0, drafting_rows);
     std::vector<at::Tensor> next{samples.index_select(0, drafting_rows), token};
@@ -283,7 +291,8 @@ step_graphs::capture_verify_step(std::int64_t sequences, bool measures_mass, boo
         one_row.page_tables.copy_(inputs.page_tables);
         one_row.page_positions.copy_(inputs.page_positions);
         one_row.key_counts.copy_(every_layer(keys + accepted_counts + (j + 2)));
-        model::output following = head.draft(one_row, previous_hidden, lines);
+        graph_segments later_segments(sequences);
+        model::output following = head.draft(one_row, previous_hidden, lines, later_segments);
         token = following.logits.argmax(-1);
         previous_hidden = following.hidden;
         next.push_back(token);
@@ -320,11 +329,15 @@ void step_graphs::capture_startup() {
     for (bool measures_mass : mass_options) {
         model::batch inputs = make_step_inputs(1, measures_mass, drafts);
         gather_inputs(make_request_slots(1), inputs);
-        shard_model.forward(inputs, lines);
+        graph_segments segments(inputs.tokens.size(0));
+        shard_model.forward(inputs, lines, segments);
     }
     if (drafts) {
-        shard_model.drafter()->draft(make_first_pass_inputs(1), make_draft_hidden_rows(state_slots), lines);
-        shard_model.drafter()->draft(make_later_pass_inputs(1), make_draft_hidden_rows(1), lines);
+        graph_segments first_segments(state_slots);
+        shard_model.drafter()
+            ->draft(make_first_pass_inputs(1), make_draft_hidden_rows(state_slots), lines, first_segments);
+        graph_segments later_segments(1);
+        shard_model.drafter()->draft(make_later_pass_inputs(1), make_draft_hidden_rows(1), lines, later_segments);
     }
     for (std::int64_t sequences = 1; sequences <= startup_sequences; sequences++) {
         for (bool measures_mass : mass_options) {
@@ -337,6 +350,109 @@ void step_graphs::capture_startup() {
             }
         }
     }
+    for (std::int64_t token_count : std::views::reverse(bucket_token_counts)) {
+        if (shard_model.allows_segment_capture(token_count) && !segment_steps.contains(token_count)) {
+            warm_up_bucket(token_count);
+            segment_steps.emplace(token_count, capture_segments(token_count));
+        }
+    }
+}
+
+std::int64_t step_graphs::count_most_logit_tokens(std::int64_t token_count) const {
+    return std::min(token_count, table.history_positions.size(0) * state_slots);
+}
+
+void step_graphs::warm_up_bucket(std::int64_t token_count) {
+    const auto device = lines.front().k.options();
+    const auto ints = device.dtype(at::kInt);
+    const auto longs = device.dtype(at::kLong);
+    const std::int64_t requests = (token_count + page_size - 1) / page_size;
+    const at::Tensor query_starts = at::minimum(
+        at::arange(requests + 1, ints) * page_size,
+        at::scalar_tensor(token_count, ints)
+    );
+    model::batch inputs{
+        .page_size = page_size,
+        .state_slots = state_slots,
+        .cu_seqlens_q = query_starts,
+        .cu_seqlens_q_from_second_run = query_starts,
+        .cu_seqlens_q_from_third_run = query_starts,
+        .logit_tokens = query_starts.narrow(0, 1, requests).to(at::kLong) - 1,
+        .arrival_counters = at::zeros({shard_model.arrival_counter_count(requests, token_count)}, ints),
+    };
+    gather_step_inputs(
+        table,
+        make_request_slots(requests),
+        page_width(),
+        token_count,
+        token_count,
+        at::zeros({token_count}, longs),
+        inputs
+    );
+    graph_segments segments(token_count);
+    shard_model.forward(inputs, lines, segments);
+}
+
+// The calls between segments do not run during the capture, so it writes into no line.
+std::unique_ptr<step_graphs::captured_segments> step_graphs::capture_segments(std::int64_t token_count) {
+    const auto device = lines.front().k.options();
+    const auto ints = device.dtype(at::kInt);
+    const auto longs = device.dtype(at::kLong);
+    auto captured = std::make_unique<captured_segments>();
+    const at::Tensor query_starts = at::tensor({0, static_cast<std::int32_t>(token_count)}, at::kInt)
+                                        .to(device.device());
+    const std::int64_t max_requests = table.history_positions.size(0);
+    captured->inputs = model::batch{
+        .tokens = at::zeros({token_count}, longs),
+        .pos = at::zeros({token_count}, longs),
+        .page_size = page_size,
+        .state_slots = state_slots,
+        .cu_seqlens_q = query_starts,
+        .cu_seqlens_q_from_second_run = query_starts,
+        .cu_seqlens_q_from_third_run = query_starts,
+        .logit_tokens = at::zeros({count_most_logit_tokens(token_count)}, longs),
+        .arrival_counters = at::zeros({shard_model.arrival_counter_count(max_requests, token_count)}, ints),
+    };
+    graph_segments segments(token_count, captured->capture, segment_pool);
+    model::output output = shard_model.forward(captured->inputs, lines, segments);
+    segments.finish_capture();
+    captured->logits = graph_segments::make_unowned_view(output.logits);
+    captured->hidden = graph_segments::make_unowned_view(output.hidden);
+    return captured;
+}
+
+bool step_graphs::has_segments(std::int64_t bucket_token_count) const {
+    return segment_steps.contains(bucket_token_count);
+}
+
+model::output step_graphs::replay_segments(const model::batch& inputs, std::int64_t token_count) {
+    captured_segments& captured = *segment_steps.at(inputs.tokens.size(0));
+    model::batch& replayed = captured.inputs;
+    copy_input(replayed.tokens, inputs.tokens);
+    copy_input(replayed.pos, inputs.pos);
+    replayed.single_query_request_count = inputs.single_query_request_count;
+    replayed.per_query_state_request_count = inputs.per_query_state_request_count;
+    replayed.page_tables = inputs.page_tables;
+    replayed.history_positions = inputs.history_positions;
+    replayed.rejected_tokens = inputs.rejected_tokens;
+    replayed.page_size = inputs.page_size;
+    replayed.state_slots = inputs.state_slots;
+    replayed.cu_seqlens_q = inputs.cu_seqlens_q;
+    replayed.cu_seqlens_q_from_second_run = inputs.cu_seqlens_q_from_second_run;
+    replayed.cu_seqlens_q_from_third_run = inputs.cu_seqlens_q_from_third_run;
+    replayed.kept_state_counts = inputs.kept_state_counts;
+    replayed.key_counts = inputs.key_counts;
+    replayed.page_positions = inputs.page_positions;
+    replayed.cu_view_pages = inputs.cu_view_pages;
+    replayed.page_mass_sum = inputs.page_mass_sum;
+    replayed.page_weight_sum = inputs.page_weight_sum;
+    replayed.query_weights = inputs.query_weights;
+    replayed.logit_tokens = inputs.logit_tokens;
+    graph_segments::replay(captured.capture, token_count);
+    return model::output{
+        .logits = captured.logits.narrow(0, 0, inputs.logit_tokens.size(0)),
+        .hidden = captured.hidden,
+    };
 }
 
 step_graphs::decode_step_outputs step_graphs::decode_step(

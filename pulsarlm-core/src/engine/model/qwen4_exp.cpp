@@ -553,14 +553,21 @@ at::Tensor qwen4_exp_model::lookup(const at::Tensor& table, std::int64_t first_r
     return summed;
 }
 
-at::Tensor qwen4_exp_model::logits(const at::Tensor& x) const {
+at::Tensor qwen4_exp_model::make_logits(std::int64_t logit_count, const at::Tensor& like) const {
+    return at::empty({logit_count, static_cast<std::int64_t>(comm.size()) * lm_head.size(0)}, like.options());
+}
+
+void qwen4_exp_model::write_logits(const at::Tensor& x, const at::Tensor& logits) const {
+    const std::int64_t logit_count = x.size(0);
+    at::Tensor written = logits.narrow(0, 0, logit_count);
+    if (comm.size() == 1) {
+        at::matmul_out(written, x, lm_head.t());
+        return;
+    }
     at::Tensor part = at::matmul(x, lm_head.t()).contiguous();
     const auto gpus = static_cast<std::int64_t>(comm.size());
-    return comm.all_gather(part)
-        .view({gpus, part.size(0), part.size(1)})
-        .permute({1, 0, 2})
-        .reshape({part.size(0), gpus * part.size(1)})
-        .narrow(1, 0, config.vocab_size);
+    written.view({logit_count, gpus, part.size(1)})
+        .copy_(comm.all_gather(part).view({gpus, logit_count, part.size(1)}).permute({1, 0, 2}));
 }
 
 bool qwen4_exp_model::indexed_attention(std::int64_t layer) const {
@@ -671,7 +678,8 @@ at::Tensor qwen4_exp_model::attention(
     const at::Tensor& h,
     const layer_weights& layer,
     const batch& g,
-    std::span<const kv> lines
+    std::span<const kv> lines,
+    graph_segments& segments
 ) const {
     const attention_weights& w = *layer.attention;
     const qwen4_exp_config& c = config;
@@ -694,16 +702,6 @@ at::Tensor qwen4_exp_model::attention(
                        .view({ntok, heads.n_kv_heads, c.head_dim})
                        .contiguous();
 
-    const kv& line = lines[kv_index];
-    const auto layer_row = static_cast<std::int64_t>(kv_index);
-    const page_views views{
-        .page_tables = g.page_tables.select(0, layer_row),
-        .page_positions = g.page_positions.select(0, layer_row),
-        .key_counts = g.key_counts.select(0, layer_row),
-    };
-    const kv_pools pools{.keys = line.k, .values = line.v};
-    write_kv_cuda(pools, k, v, views, g.cu_seqlens_q);
-
     at::Tensor index_qk = projected.narrow(1, query_rows + 2 * key_rows, projected.size(1) - query_rows - 2 * key_rows);
     at::Tensor index_queries = index_queries_cuda(
         index_qk,
@@ -716,6 +714,54 @@ at::Tensor qwen4_exp_model::attention(
     at::Tensor index_keys = index_qk.narrow(1, c.indexer_n_heads * c.indexer_head_dim, c.indexer_head_dim)
                                 .contiguous()
                                 .view({ntok, 1, -1});
+    at::Tensor o = at::empty_like(q);
+    segments.run_between_segments(
+        [this, &g, lines, &w, kv_index](
+            const at::Tensor& queries,
+            const at::Tensor& keys,
+            const at::Tensor& values,
+            const at::Tensor& indexer_queries,
+            const at::Tensor& indexer_keys,
+            const at::Tensor& attended
+        ) { attend_indexed(w, kv_index, g, lines, queries, keys, values, indexer_queries, indexer_keys, attended); },
+        q,
+        k,
+        v,
+        index_queries,
+        index_keys,
+        o
+    );
+    at::Tensor out = small_batch_linear_cuda(
+        sigmoid_gated_cuda(o.view({ntok, heads.n_heads, c.head_dim}), gate).view({ntok, heads.n_heads * c.head_dim}),
+        w.o_proj
+    );
+    comm.all_reduce(out);
+    return out;
+}
+
+void qwen4_exp_model::attend_indexed(
+    const attention_weights& w,
+    std::size_t kv_index,
+    const batch& g,
+    std::span<const kv> lines,
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& index_queries,
+    const at::Tensor& index_keys,
+    const at::Tensor& o
+) const {
+    const qwen4_exp_config& c = config;
+    const std::int64_t ntok = q.size(0);
+    const kv& line = lines[kv_index];
+    const auto layer_row = static_cast<std::int64_t>(kv_index);
+    const page_views views{
+        .page_tables = g.page_tables.select(0, layer_row),
+        .page_positions = g.page_positions.select(0, layer_row),
+        .key_counts = g.key_counts.select(0, layer_row),
+    };
+    const kv_pools pools{.keys = line.k, .values = line.v};
+    write_kv_cuda(pools, k, v, views, g.cu_seqlens_q);
     at::Tensor index_pool = line.index_keys.unsqueeze(2);
     write_kv_cuda({.keys = index_pool, .values = index_pool}, index_keys, index_keys, views, g.cu_seqlens_q);
     const std::int64_t block_size = c.indexer_compress_ratio;
@@ -735,7 +781,6 @@ at::Tensor qwen4_exp_model::attention(
     const std::int64_t single_queries = g.single_query_request_count;
     const std::int64_t per_query_states = g.per_query_state_request_count;
     const std::int64_t per_query_state_tokens = per_query_states * g.state_slots;
-    at::Tensor o = at::empty_like(q);
     // Attends the run of the sequences [first, first + count), whose query tokens and mass views start at first_token
     // and first_view and whose cu_seqlens_q from 0 are run_cu_seqlens_q.
     auto attend_run = [&](std::int64_t first,
@@ -821,41 +866,55 @@ at::Tensor qwen4_exp_model::attention(
             false
         );
     }
-    at::Tensor out = small_batch_linear_cuda(
-        sigmoid_gated_cuda(o.view({ntok, heads.n_heads, c.head_dim}), gate).view({ntok, heads.n_heads * c.head_dim}),
-        w.o_proj
-    );
-    comm.all_reduce(out);
-    return out;
 }
 
 at::Tensor qwen4_exp_model::deltanet(
     const at::Tensor& h,
     const layer_weights& layer,
     const batch& g,
-    std::span<const kv> lines
+    std::span<const kv> lines,
+    graph_segments& segments
 ) const {
     const deltanet_weights& w = *layer.deltanet;
     const qwen4_exp_config& c = config;
     const std::int64_t channels = w.conv.size(0);
     const std::int64_t value_heads = heads.linear_n_value_heads;
     at::Tensor projected = small_batch_linear_cuda(h, w.in_proj);
-    at::Tensor gated = gated_deltanet(
-        g,
-        gated_deltanet_inputs{
-            .qkv = projected.narrow(1, 0, channels),
-            .a = projected.narrow(1, channels, value_heads),
-            .b = projected.narrow(1, channels + value_heads, value_heads),
-            .z = projected.narrow(1, channels + 2 * value_heads, value_heads * c.linear_value_head_dim),
+    const at::Tensor z = projected.narrow(1, channels + 2 * value_heads, value_heads * c.linear_value_head_dim);
+    at::Tensor gated = at::empty({projected.size(0), z.size(1)}, projected.options());
+    segments.run_between_segments(
+        [this, &g, lines, &layer](
+            const at::Tensor& mixed,
+            const at::Tensor& decay_inputs,
+            const at::Tensor& beta_inputs,
+            const at::Tensor& gates,
+            const at::Tensor& out
+        ) {
+            const deltanet_weights& weights = *layer.deltanet;
+            gated_deltanet(
+                g,
+                gated_deltanet_inputs{.qkv = mixed, .a = decay_inputs, .b = beta_inputs, .z = gates},
+                gated_deltanet_weights{
+                    .conv = weights.conv,
+                    .dt_bias = weights.dt_bias,
+                    .neg_a = weights.neg_a,
+                    .norm = weights.norm,
+                },
+                lines[layer.state_kv_layer],
+                lines[layer.conv_kv_layer],
+                layer.state_kv_layer,
+                layer.conv_kv_layer,
+                heads.linear_n_key_heads,
+                config.rms_norm_eps,
+                config.linear_output_gate,
+                out
+            );
         },
-        gated_deltanet_weights{.conv = w.conv, .dt_bias = w.dt_bias, .neg_a = w.neg_a, .norm = w.norm},
-        lines[layer.state_kv_layer],
-        lines[layer.conv_kv_layer],
-        layer.state_kv_layer,
-        layer.conv_kv_layer,
-        heads.linear_n_key_heads,
-        c.rms_norm_eps,
-        c.linear_output_gate
+        projected.narrow(1, 0, channels),
+        projected.narrow(1, channels, value_heads),
+        projected.narrow(1, channels + value_heads, value_heads),
+        z,
+        gated
     );
     at::Tensor out = small_batch_linear_cuda(gated, w.out_proj);
     comm.all_reduce(out);
@@ -889,15 +948,21 @@ at::Tensor qwen4_exp_model::moe(const at::Tensor& h, const moe_weights& m, const
 // A token line keeps the last window tokens before a sequence's next one, each XOR eos_token_id: the n-gram context, and
 // in an engine that drafts, the tokens a step may not accept; after a step that did not accept its last rejected tokens,
 // the valid ones end window - rejected entries in.
-at::Tensor
-qwen4_exp_model::ngram_ids(const ple_weights& w, std::size_t token_layer, const batch& g, const kv& lines) const {
-    const std::int64_t ntok = g.tokens.size(0);
+void qwen4_exp_model::write_ngram_ids(
+    const ple_weights& w,
+    std::size_t token_layer,
+    const batch& g,
+    const kv& lines,
+    const at::Tensor& query_tokens,
+    const at::Tensor& ids_out
+) const {
+    const std::int64_t ntok = query_tokens.size(0);
     const std::int64_t context = config.ngram_size - 1;
     const std::int64_t eos = config.eos_token_id;
     // [lines, window]: each token line's one row.
     at::Tensor token_lines = lines.k.select(1, 0);
     const std::int64_t window = token_lines.size(1);
-    const auto longs = g.tokens.options().dtype(at::kLong);
+    const auto longs = query_tokens.options().dtype(at::kLong);
     at::Tensor rows = g.page_tables.select(0, static_cast<std::int64_t>(token_layer)).to(at::kLong);
     at::Tensor slot = rows.select(1, 0);
     const std::int64_t num_seqs = rows.size(0);
@@ -908,7 +973,7 @@ qwen4_exp_model::ngram_ids(const ple_weights& w, std::size_t token_layer, const 
     at::Tensor local = at::arange(ntok, longs) - starts.index_select(0, sequence_of);
 
     // Entry c of a sequence's inputs: its line's valid entries, then its tokens in the batch, EOS before the first.
-    at::Tensor tokens = g.tokens.to(at::kLong);
+    at::Tensor tokens = query_tokens.to(at::kLong);
     at::Tensor inputs = at::cat({at::bitwise_xor(token_lines.index_select(0, slot), eos).flatten(), tokens});
     auto input_at = [&](const at::Tensor& sequence, const at::Tensor& c) {
         at::Tensor flat_sequence = sequence.flatten();
@@ -961,18 +1026,31 @@ qwen4_exp_model::ngram_ids(const ple_weights& w, std::size_t token_layer, const 
     );
     token_lines.index_copy_(0, boundary, at_page_end);
     token_lines.index_copy_(0, slot, window_after(counts));
-    return at::cat(ids, -1);
+    at::Tensor written = ids_out;
+    at::cat_out(written, ids, -1);
 }
 
-at::Tensor
-qwen4_exp_model::ple(const at::Tensor& x, const layer_weights& layer, const batch& g, std::span<const kv> lines) const {
+at::Tensor qwen4_exp_model::ple(
+    const at::Tensor& x,
+    const layer_weights& layer,
+    const batch& g,
+    std::span<const kv> lines,
+    graph_segments& segments
+) const {
     const ple_weights& w = *layer.ple;
     const qwen4_exp_config& c = config;
     const std::int64_t ntok = x.size(0);
     const std::size_t conv_layer = layer.ple_conv_kv_layer;
     const std::size_t token_layer = layer.ple_token_kv_layer;
 
-    at::Tensor ids = ngram_ids(w, token_layer, g, lines[token_layer]);
+    at::Tensor ids = at::empty({ntok, w.head_vocab_sizes.size(0)}, g.tokens.options().dtype(at::kLong));
+    segments.run_between_segments(
+        [this, &w, token_layer, &g, lines](const at::Tensor& query_tokens, const at::Tensor& ids_out) {
+            write_ngram_ids(w, token_layer, g, lines[token_layer], query_tokens, ids_out);
+        },
+        g.tokens,
+        ids
+    );
     at::Tensor embeddings = lookup(w.ngram_embedding, w.first_row, ids).view({ntok, -1});
     at::Tensor keys = stream_norm(at::linear(embeddings, w.key_proj), w.norm_key).view({ntok, c.hc_count, -1});
     at::Tensor queries = stream_norm(x, w.norm_query).view({ntok, c.hc_count, -1});
@@ -980,11 +1058,30 @@ qwen4_exp_model::ple(const at::Tensor& x, const layer_weights& layer, const batc
     gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign();
     at::Tensor gated = (at::sigmoid(gate) * at::linear(embeddings, w.value_proj).unsqueeze(1)).flatten(1);
     at::Tensor normed = stream_norm(gated, w.norm_conv);
+    at::Tensor convolved = at::empty_like(normed);
+    segments.run_between_segments(
+        [this, &w, conv_layer, &g, lines](const at::Tensor& inputs, const at::Tensor& out) {
+            convolve_ple(w, conv_layer, g, lines, inputs, out);
+        },
+        normed,
+        convolved
+    );
+    return gated + convolved;
+}
+
+void qwen4_exp_model::convolve_ple(
+    const ple_weights& w,
+    std::size_t conv_layer,
+    const batch& g,
+    std::span<const kv> lines,
+    const at::Tensor& normed,
+    const at::Tensor& convolved
+) const {
+    const std::int64_t ntok = normed.size(0);
     const at::Tensor& pool = lines[conv_layer].k;
     const std::int64_t requests = g.history_positions.size(0);
     const std::int64_t step_requests = g.single_query_request_count + g.per_query_state_request_count;
     const std::int64_t step_tokens = count_step_tokens(g);
-    at::Tensor convolved = at::empty_like(normed);
     if (step_requests > 0) {
         causal_conv_step_cuda(
             normed.narrow(0, 0, step_tokens),
@@ -992,7 +1089,7 @@ qwen4_exp_model::ple(const at::Tensor& x, const layer_weights& layer, const batc
             pool,
             window_layer_rows(g, conv_layer, 0, step_requests),
             g.cu_seqlens_q.narrow(0, 0, step_requests + 1),
-            c.ngram_size,
+            config.ngram_size,
             convolved.narrow(0, 0, step_tokens)
         );
     }
@@ -1003,15 +1100,14 @@ qwen4_exp_model::ple(const at::Tensor& x, const layer_weights& layer, const batc
             pool,
             window_layer_rows(g, conv_layer, step_requests, requests - step_requests),
             g.cu_seqlens_q_from_third_run,
-            c.ngram_size,
+            config.ngram_size,
             convolved.narrow(0, step_tokens, ntok - step_tokens)
         );
     }
-    return gated + convolved;
 }
 
 // A block's output joins the streams in the next mix's kernel, so x lags it until then.
-model::output qwen4_exp_model::forward(const batch& b, std::span<const kv> lines) {
+model::output qwen4_exp_model::forward(const batch& b, std::span<const kv> lines, graph_segments& segments) {
     check_batch(b);
     assert(mtp || b.per_query_state_request_count == 0);
     at::Tensor x = lookup(embed_tokens, first_vocab_row, b.tokens).repeat({1, config.hc_count});
@@ -1036,19 +1132,44 @@ model::output qwen4_exp_model::forward(const batch& b, std::span<const kv> lines
         const layer_weights& w = layers[layer];
         if (w.ple) {
             inject_pending();
-            x = x + ple(x, w, b, lines);
+            x = x + ple(x, w, b, lines, segments);
         }
         mixed_input mixed = mix_pending(w.attn_hyper_connection);
-        at::Tensor out = w.attention ? attention(mixed.input, w, b, lines) : deltanet(mixed.input, w, b, lines);
+        at::Tensor out = w.attention ? attention(mixed.input, w, b, lines, segments)
+                                     : deltanet(mixed.input, w, b, lines, segments);
         pending.emplace(out, mixed.injection_weights);
         mixed = mix_pending(w.mlp_hyper_connection);
         pending.emplace(moe(mixed.input, w.moe, b.arrival_counters), mixed.injection_weights);
     }
     inject_pending();
-    if (mtp) {
-        keep_last_hidden(b, x, lines[mtp->layer.kv_layer], mtp->layer.kv_layer);
+    at::Tensor logits = make_logits(b.logit_tokens.size(0), x);
+    segments.run_between_segments(
+        [this, &b, lines](const at::Tensor& streams, const at::Tensor& out) {
+            if (mtp) {
+                keep_last_hidden(b, streams, lines[mtp->layer.kv_layer], mtp->layer.kv_layer);
+            }
+            write_logits(final_mix(logit_inputs(streams, b)), out);
+        },
+        x,
+        logits
+    );
+    return output{.logits = logits.narrow(1, 0, config.vocab_size), .hidden = mtp ? x : at::Tensor()};
+}
+
+bool qwen4_exp_model::allows_segment_capture(std::int64_t token_count) const {
+    const auto element_bytes = static_cast<std::size_t>(embed_tokens.element_size());
+    bool fits = comm.captures_all_reduce(static_cast<std::size_t>(token_count * config.hidden_size) * element_bytes);
+    for (const layer_weights& layer : layers) {
+        if (layer.ple) {
+            const std::int64_t lookup_elements = layer.ple->head_vocab_sizes.size(0) *
+                layer.ple->ngram_embedding.size(1);
+            fits = fits &&
+                comm.captures_all_reduce(
+                    static_cast<std::size_t>(token_count * lookup_elements) * layer.ple->ngram_embedding.element_size()
+                );
+        }
     }
-    return output{.logits = logits(final_mix(logit_inputs(x, b))), .hidden = mtp ? x : at::Tensor()};
+    return fits;
 }
 
 std::int64_t qwen4_exp_model::arrival_counter_count(std::int64_t sequences, std::int64_t tokens) const {
@@ -1073,7 +1194,8 @@ std::int64_t qwen4_exp_model::hidden_dim() const {
     return config.hc_count * config.hidden_size;
 }
 
-model::output qwen4_exp_model::draft(const batch& b, const at::Tensor& hidden, std::span<const kv> lines) {
+model::output
+qwen4_exp_model::draft(const batch& b, const at::Tensor& hidden, std::span<const kv> lines, graph_segments& segments) {
     const mtp_weights& m = *mtp;
     const qwen4_exp_config& c = config;
     const layer_weights& w = m.layer;
@@ -1090,18 +1212,24 @@ model::output qwen4_exp_model::draft(const batch& b, const at::Tensor& hidden, s
                              .view({ntok, c.hc_count * c.hidden_size});
     at::Tensor whole = at::ones({ntok, c.hc_count}, embedded.options());
     auto [x, mixed] = injected_mix(streams, embedded, whole, w.attn_hyper_connection);
-    at::Tensor attended = attention(mixed.input, w, b, lines);
+    at::Tensor attended = attention(mixed.input, w, b, lines, segments);
     auto [summed, mlp_mixed] = injected_mix(x, attended, mixed.injection_weights, w.mlp_hyper_connection);
     x = hyper_connection_inject_cuda(
         summed,
         moe(mlp_mixed.input, w.moe, b.arrival_counters),
         mlp_mixed.injection_weights
     );
-    at::Tensor rows = logit_inputs(x, b);
-    return output{
-        .logits = logits(mixed_streams(stream_norm(rows, m.mixer.hc_norm), m.mixer)),
-        .hidden = x,
-    };
+    at::Tensor logits = make_logits(b.logit_tokens.size(0), x);
+    segments.run_between_segments(
+        [this, &b](const at::Tensor& streams, const at::Tensor& out) {
+            const mtp_weights& weights = *mtp;
+            const at::Tensor logit_streams = logit_inputs(streams, b);
+            write_logits(mixed_streams(stream_norm(logit_streams, weights.mixer.hc_norm), weights.mixer), out);
+        },
+        x,
+        logits
+    );
+    return output{.logits = logits.narrow(1, 0, config.vocab_size), .hidden = x};
 }
 
 }  // namespace pulsarlm

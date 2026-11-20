@@ -19,17 +19,18 @@ at::Tensor
 rope_q(const at::Tensor& q, const at::Tensor& pos, int64_t n_q_heads, int64_t head_dim, const rope_parameters& rope);
 
 // Writes the batch's new keys k and values v, [ntok, n_kv_heads, head_dim] with k unrotated, into KV layer kv_layer's
-// lines, then attends them with the rotated queries q [ntok, n_q_heads, head_dim] and returns o [ntok, n_q_heads,
-// head_dim]. Undefined k and v leave the lines as they are, for a layer reading another layer's KV. sliding_window and
-// k_norm_weight are as attention_layer holds them. When g.page_mass_sum[kv_layer] is defined, the layer writes the
-// mass_sum attn_prefill_cuda measures into reader's columns of it, reader being the layer's index among those reading
-// kv_layer, and reader 0 writes the weight_sum into g.page_weight_sum[kv_layer]. The first run attends by
-// attn_decode_cuda, the later runs together by attn_prefill_cuda, each query token of the second run measuring its mass
-// in a view of its own (per_query_mass_request_count).
-at::Tensor paged_attention(
+// lines, then attends them with the rotated queries q [ntok, n_q_heads, head_dim] into o [ntok, n_q_heads, head_dim],
+// ntok the query tokens of g. Undefined k and v leave the lines as they are, for a layer reading another layer's KV.
+// sliding_window and k_norm_weight are as attention_layer holds them. When g.page_mass_sum[kv_layer] is defined, the
+// layer writes the mass_sum attn_prefill_cuda measures into reader's columns of it, reader being the layer's index
+// among those reading kv_layer, and reader 0 writes the weight_sum into g.page_weight_sum[kv_layer]. The first run
+// attends by attn_decode_cuda, the later runs together by attn_prefill_cuda, each query token of the second run
+// measuring its mass in a view of its own (per_query_mass_request_count).
+void paged_attention(
     const at::Tensor& q,
     const at::Tensor& k,
     const at::Tensor& v,
+    const at::Tensor& o,
     const kv& lines,
     std::size_t kv_layer,
     std::size_t reader,
@@ -70,10 +71,10 @@ struct gated_deltanet_weights {
     at::Tensor norm;
 };
 
-// The gated outputs of a Gated DeltaNet sublayer for the projected rows of b. Writes the layer's state and
-// convolution window into their lines. The first two runs go through the step ops, keeping b.kept_state_counts states,
-// and the third run through the chunked ops.
-at::Tensor gated_deltanet(
+// Writes into gated [query tokens, z columns] the gated outputs of a Gated DeltaNet sublayer for the projected rows
+// of b's query tokens, and the layer's state and convolution window into their lines. The first two runs go through
+// the step ops, keeping b.kept_state_counts states, and the third run through the chunked ops.
+void gated_deltanet(
     const model::batch& b,
     const gated_deltanet_inputs& projected,
     const gated_deltanet_weights& weights,
@@ -83,7 +84,8 @@ at::Tensor gated_deltanet(
     std::size_t conv_kv_layer,
     std::int64_t key_heads,
     double rms_norm_eps,
-    gate_activation activation
+    gate_activation activation,
+    const at::Tensor& gated
 );
 
 // The rows of x at g's logit tokens.

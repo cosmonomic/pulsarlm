@@ -427,7 +427,8 @@ engine::engine(
       graph_pages(config),
       checked_draft_tokens(config, this->shards),
       sampled_row_limit,
-      checked_max_running_requests(config)
+      checked_max_running_requests(config),
+      checked_prefill_tokens_per_step(config)
   ),
   sched(exec, checked_prefill_tokens_per_step(config)) {
     for (std::size_t shard = 1; shard < devices.size(); shard++) {

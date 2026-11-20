@@ -22,10 +22,6 @@ namespace pulsarlm {
 
 namespace {
 
-at::Tensor to_device(const at::Tensor& host, at::Device device) {
-    return host.defined() ? host.to(host.options().device(device), /*non_blocking=*/true) : host;
-}
-
 template <typename values_type>
 at::Tensor tensor_on_device(const values_type& values, at::TensorOptions options, at::Device device) {
     return at::tensor(values, options).to(device, /*non_blocking=*/true);
@@ -77,18 +73,19 @@ std::pair<model::batch, at::Tensor> executor::batch::upload_inputs(
         .per_query_state_request_count = inputs.per_query_state_request_count,
         .page_size = inputs.page_size,
         .state_slots = inputs.state_slots,
-        .cu_seqlens_q = to_device(inputs.cu_seqlens_q, device),
-        .cu_seqlens_q_from_second_run = to_device(inputs.cu_seqlens_q_from_second_run, device),
-        .cu_seqlens_q_from_third_run = to_device(inputs.cu_seqlens_q_from_third_run, device),
-        .cu_view_pages = to_device(inputs.cu_view_pages, device),
-        .logit_tokens = to_device(inputs.logit_tokens, device),
+        .cu_seqlens_q = get_on_device(inputs.cu_seqlens_q, shard),
+        .cu_seqlens_q_from_second_run = get_on_device(inputs.cu_seqlens_q_from_second_run, shard),
+        .cu_seqlens_q_from_third_run = get_on_device(inputs.cu_seqlens_q_from_third_run, shard),
+        .cu_view_pages = inputs.cu_view_pages.defined() ? get_on_device(inputs.cu_view_pages, shard) : at::Tensor(),
+        .logit_tokens = get_on_device(inputs.logit_tokens, shard),
     };
     gather_step_inputs(
         table,
-        request_slots.to(device, /*non_blocking=*/true),
+        get_on_device(request_slots, shard),
         table_width,
         static_cast<std::int64_t>(count_tokens()),
-        to_device(prefill_tokens, device),
+        static_cast<std::int64_t>(padded_token_count),
+        get_on_device(prefill_tokens, shard),
         on_device
     );
     if (per_query_state_request_count > 0) {
@@ -133,14 +130,20 @@ void executor::batch::enqueue(
     }
     const std::int64_t needed = shard_model.arrival_counter_count(
         static_cast<std::int64_t>(entries.size()),
-        static_cast<std::int64_t>(count_tokens())
+        static_cast<std::int64_t>(padded_token_count)
     );
     if (!counters.defined() || counters.numel() < needed) {
         counters = at::zeros({needed}, at::device(device).dtype(at::kInt));
     }
+    device_input_bytes[shard] = host_input_bytes.to(device, /*non_blocking=*/true);
     auto [on_device, step_mass] = upload_inputs(lines, mass_heads, shard, table);
     on_device.arrival_counters = counters;
-    const model::output output = shard_model.forward(on_device, lines);
+    const auto token_count = static_cast<std::int64_t>(count_tokens());
+    graph_segments segments(token_count);
+    const bool replays_segments = graphs != nullptr && !is_uniform(draft_layer.has_value()) &&
+        graphs->has_segments(static_cast<std::int64_t>(padded_token_count));
+    const model::output output = replays_segments ? graphs->replay_segments(on_device, token_count)
+                                                  : shard_model.forward(on_device, lines, segments);
     hidden_by_shard[shard] = output.hidden;
     if (step_mass.defined()) {
         mass_by_shard[shard] = pinned(step_mass.sizes(), at::kFloat);
@@ -149,8 +152,8 @@ void executor::batch::enqueue(
     at::Tensor samples;
     if (sample_slots.numel() > 0) {
         samples = sample(
-            output.logits.index_select(0, sample_logit_indices.to(device, /*non_blocking=*/true)),
-            gather_sampling_inputs(table, device)
+            output.logits.index_select(0, get_on_device(sample_logit_indices, shard)),
+            gather_sampling_inputs(table, shard)
         );
         if (shard == 0) {
             sampled_tokens = pinned({samples.size(0)}, at::kLong);
@@ -160,7 +163,7 @@ void executor::batch::enqueue(
     if (draft_layer && !draft_tokens.empty()) {
         enqueue_drafts(shard_model, lines, samples, stop_tokens, shard, counters, table, *draft_layer);
     }
-    advance_draw_counts(table, shard, device);
+    advance_draw_counts(table, shard);
     advance_table(table, samples, shard, device);
 }
 
@@ -193,9 +196,9 @@ void executor::batch::write_tables(request_table& table) const {
     }
 }
 
-sampling_inputs executor::batch::gather_sampling_inputs(const request_table& table, at::Device device) const {
-    const at::Tensor slots = sample_slots.to(device, /*non_blocking=*/true);
-    const at::Tensor offsets = sample_offsets.to(device, /*non_blocking=*/true);
+sampling_inputs executor::batch::gather_sampling_inputs(const request_table& table, std::size_t shard) const {
+    const at::Tensor slots = get_on_device(sample_slots, shard);
+    const at::Tensor offsets = get_on_device(sample_offsets, shard);
     return sampling_inputs{
         .temperatures = table.temperatures.index_select(0, slots),
         .top_k = table.top_k.index_select(0, slots),
@@ -205,19 +208,19 @@ sampling_inputs executor::batch::gather_sampling_inputs(const request_table& tab
     };
 }
 
-void executor::batch::advance_draw_counts(request_table& table, std::size_t shard, at::Device device) const {
+void executor::batch::advance_draw_counts(request_table& table, std::size_t shard) const {
     if (single_draw_slots.numel() > 0) {
-        const at::Tensor slots = single_draw_slots.to(device, /*non_blocking=*/true);
+        const at::Tensor slots = get_on_device(single_draw_slots, shard);
         table.draw_counts.index_add_(0, slots, at::ones_like(slots));
     }
     if (per_query_state_request_count > 0) {
-        const at::Tensor verifying_slots = request_slots.narrow(
-            0,
-            static_cast<std::int64_t>(single_query_request_count),
-            static_cast<std::int64_t>(per_query_state_request_count)
-        );
-        table.draw_counts
-            .index_add_(0, verifying_slots.to(device, /*non_blocking=*/true), accepted_token_counts_by_shard[shard]);
+        const at::Tensor verifying_slots = get_on_device(request_slots, shard)
+                                               .narrow(
+                                                   0,
+                                                   static_cast<std::int64_t>(single_query_request_count),
+                                                   static_cast<std::int64_t>(per_query_state_request_count)
+                                               );
+        table.draw_counts.index_add_(0, verifying_slots, accepted_token_counts_by_shard[shard]);
     }
 }
 
@@ -248,9 +251,9 @@ void executor::batch::advance_table(
     const auto entry_count = static_cast<std::int64_t>(entries.size());
     const auto first_verify = static_cast<std::int64_t>(single_query_request_count);
     const auto verifying = static_cast<std::int64_t>(per_query_state_request_count);
-    at::Tensor computed_counts = computed_token_counts.to(device, /*non_blocking=*/true);
+    at::Tensor computed_counts = get_on_device(computed_token_counts, shard);
     at::Tensor rejected_counts = at::zeros({entry_count}, computed_counts.options());
-    at::Tensor next_sources = next_token_sources.to(device, /*non_blocking=*/true);
+    at::Tensor next_sources = get_on_device(next_token_sources, shard);
     if (verifying > 0) {
         const at::Tensor& accepted_counts = accepted_token_counts_by_shard[shard];
         computed_counts.narrow(0, first_verify, verifying).copy_(accepted_counts);
@@ -273,14 +276,7 @@ void executor::batch::advance_table(
         );
     }
     at::Tensor ends_cycle = at::empty({entry_count}, computed_counts.options().dtype(at::kBool));
-    advance_requests(
-        table,
-        request_slots.to(device, /*non_blocking=*/true),
-        computed_counts,
-        rejected_counts,
-        next,
-        ends_cycle
-    );
+    advance_requests(table, get_on_device(request_slots, shard), computed_counts, rejected_counts, next, ends_cycle);
     if (shard == 0) {
         cycle_end_flags = pinned({entry_count}, at::kBool);
         cycle_end_flags.copy_(ends_cycle, /*non_blocking=*/true);
@@ -290,6 +286,10 @@ void executor::batch::advance_table(
 bool executor::batch::verify_step_replays() const noexcept {
     return per_query_state_request_count == entries.size() &&
         std::ranges::all_of(entries, [](const batch_entry& e) { return e.draft && e.draft->is_drafting; });
+}
+
+bool executor::batch::is_uniform(bool drafts) const noexcept {
+    return verify_step_replays() || (!drafts && decode_step_replays());
 }
 
 bool executor::batch::decode_step_replays() const noexcept {
@@ -528,7 +528,8 @@ std::optional<executor::batch::first_draft> executor::batch::enqueue_first_draft
     set_page_tables(draft_entries, rows, table);
     at::Tensor hidden = at::cat(sources).index_select(0, tensor_on_device(draft_sources, longs, device));
     set_arrival_counters(shard_model, counters, device, rows, draft_count_of_entries);
-    model::output drafted_rows = head.draft(rows, hidden, lines);
+    graph_segments first_segments(rows.tokens.size(0));
+    model::output drafted_rows = head.draft(rows, hidden, lines, first_segments);
     if (drafting_indices.empty()) {
         return std::nullopt;
     }
@@ -578,7 +579,8 @@ void executor::batch::enqueue_later_draft_passes(
         };
         set_page_tables(drafting, one_row, table);
         set_arrival_counters(shard_model, counters, device, one_row, static_cast<std::int64_t>(drafting.size()));
-        model::output next = head.draft(one_row, previous_hidden, lines);
+        graph_segments later_segments(drafting_count);
+        model::output next = head.draft(one_row, previous_hidden, lines, later_segments);
         token = next.logits.argmax(-1);
         previous_hidden = next.hidden;
         tokens.push_back(token);

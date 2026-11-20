@@ -103,7 +103,7 @@ class successor_model final : public pulsarlm::model {
         return one_layer;
     }
 
-    output forward(const batch& b, std::span<const pulsarlm::kv>) override {
+    output forward(const batch& b, std::span<const pulsarlm::kv>, pulsarlm::graph_segments&) override {
         return output{
             .logits = pulsarlm::logit_inputs(
                 at::one_hot((b.tokens + 1) % static_cast<std::int64_t>(vocab), vocab).to(at::kFloat),
@@ -119,8 +119,12 @@ class unused_draft_head final : public pulsarlm::draft_head {
         return 1;
     }
 
-    pulsarlm::model::output
-    draft(const pulsarlm::model::batch&, const at::Tensor&, std::span<const pulsarlm::kv>) override {
+    pulsarlm::model::output draft(
+        const pulsarlm::model::batch&,
+        const at::Tensor&,
+        std::span<const pulsarlm::kv>,
+        pulsarlm::graph_segments&
+    ) override {
         return {};
     }
 };
@@ -133,7 +137,7 @@ class drafting_model final : public pulsarlm::model {
         return one_layer;
     }
 
-    output forward(const batch&, std::span<const pulsarlm::kv>) override {
+    output forward(const batch&, std::span<const pulsarlm::kv>, pulsarlm::graph_segments&) override {
         return {};
     }
 
@@ -148,7 +152,7 @@ class failing_model final : public pulsarlm::model {
         return one_layer;
     }
 
-    output forward(const batch&, std::span<const pulsarlm::kv>) override {
+    output forward(const batch&, std::span<const pulsarlm::kv>, pulsarlm::graph_segments&) override {
         throw std::runtime_error("forward failed");
     }
 };

@@ -59,10 +59,11 @@ std::optional<page_mass> narrow_mass(
 
 }  // namespace
 
-at::Tensor paged_attention(
+void paged_attention(
     const at::Tensor& q,
     const at::Tensor& k,
     const at::Tensor& v,
+    const at::Tensor& o,
     const kv& lines,
     std::size_t kv_layer,
     std::size_t reader,
@@ -104,7 +105,6 @@ at::Tensor paged_attention(
     const std::int64_t ntok = q.size(0);
     const std::int64_t requests = views.key_counts.size(0);
     const std::int64_t single_queries = g.single_query_request_count;
-    at::Tensor o = at::empty_like(q);
     if (single_queries > 0) {
         attn_decode_cuda(
             q.narrow(0, 0, single_queries),
@@ -133,7 +133,6 @@ at::Tensor paged_attention(
     if (mass && !mass->mass_sum.is_same(reader_columns)) {
         reader_columns.copy_(mass->mass_sum);
     }
-    return o;
 }
 
 // The rows that write nothing write their sequence's last row into its line, as that row does, so the writes need no
@@ -191,7 +190,7 @@ std::int64_t count_step_tokens(const model::batch& g) {
     return g.single_query_request_count + g.per_query_state_request_count * g.state_slots;
 }
 
-at::Tensor gated_deltanet(
+void gated_deltanet(
     const model::batch& b,
     const gated_deltanet_inputs& projected,
     const gated_deltanet_weights& weights,
@@ -201,14 +200,14 @@ at::Tensor gated_deltanet(
     std::size_t conv_kv_layer,
     std::int64_t key_heads,
     double rms_norm_eps,
-    gate_activation activation
+    gate_activation activation,
+    const at::Tensor& gated
 ) {
     const std::int64_t ntok = projected.qkv.size(0);
     const std::int64_t requests = b.history_positions.size(0);
     const std::int64_t step_requests = b.single_query_request_count + b.per_query_state_request_count;
     const std::int64_t step_tokens = count_step_tokens(b);
     at::Tensor convolved = at::empty({ntok, projected.qkv.size(1)}, projected.qkv.options());
-    at::Tensor gated = at::empty({ntok, projected.z.size(1)}, projected.qkv.options());
     if (step_requests > 0) {
         const at::Tensor cu_seqlens_q = b.cu_seqlens_q.narrow(0, 0, step_requests + 1);
         causal_conv_step_cuda(
@@ -269,7 +268,6 @@ at::Tensor gated_deltanet(
             gated.narrow(0, step_tokens, chunk_tokens)
         );
     }
-    return gated;
 }
 
 at::Tensor logit_inputs(const at::Tensor& x, const model::batch& g) {

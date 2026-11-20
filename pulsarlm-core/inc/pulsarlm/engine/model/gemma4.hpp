@@ -79,19 +79,27 @@ class gemma4_model : public model {
         std::int64_t layer,
         const at::Tensor& per_layer_input,
         const batch& g,
-        std::span<const kv> lines
+        std::span<const kv> lines,
+        graph_segments& segments
     ) const;
-    at::Tensor attention(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const;
+    at::Tensor attention(
+        const at::Tensor& h,
+        std::int64_t layer,
+        const batch& g,
+        std::span<const kv> lines,
+        graph_segments& segments
+    ) const;
     // The experts' output for the hidden states x a layer's MLP block starts from.
     at::Tensor experts(const at::Tensor& x, std::int64_t layer, const at::Tensor& counters) const;
-    at::Tensor head(const at::Tensor& x) const;
+    // Writes into logits the logits of the final hidden rows x.
+    void write_logits(const at::Tensor& x, at::Tensor logits) const;
 
   public:
     // weights are on the lines' device and dtype.
     gemma4_model(gemma4_config config, const c10::Dict<std::string, at::Tensor>& weights);
 
     std::vector<kv_layer> kv_layers() const override;
-    output forward(const batch& b, std::span<const kv> lines) override;
+    output forward(const batch& b, std::span<const kv> lines, graph_segments& segments) override;
     std::int64_t arrival_counter_count(std::int64_t sequences, std::int64_t tokens) const override;
 };
 

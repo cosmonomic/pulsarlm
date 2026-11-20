@@ -21,6 +21,13 @@
 
 namespace {
 
+// The model's forward of b, its calls between segments run at once.
+pulsarlm::model::output
+forward_eagerly(pulsarlm::model& forwarded, const pulsarlm::model::batch& b, std::span<const pulsarlm::kv> lines) {
+    pulsarlm::graph_segments segments(b.tokens.size(0));
+    return forwarded.forward(b, lines, segments);
+}
+
 constexpr std::int64_t n_layers = 2;
 constexpr std::int64_t n_heads = 4;
 constexpr std::int64_t n_kv_heads = 2;
@@ -275,7 +282,8 @@ void check_against_dense(at::ScalarType dtype, double tolerance, bool graphs) {
         /*state_slots=*/1,
         std::vector<std::size_t>(n_layers, static_cast<std::size_t>(n_heads)),
         at::empty({0}, cuda(at::kLong)),
-        table
+        table,
+        /*bucket_token_counts=*/{}
     );
     const at::Tensor slot = at::zeros({1}, cuda(at::kLong));
 
@@ -311,7 +319,7 @@ void check_against_dense(at::ScalarType dtype, double tolerance, bool graphs) {
             const double taken = expected_row[sampled.item<std::int64_t>()].item<double>();
             CHECK(best - taken <= tolerance * expected_row.abs().max().item<double>());
         } else {
-            const pulsarlm::model::output output = model.forward(batch, kv);
+            const pulsarlm::model::output output = forward_eagerly(model, batch, kv);
             CHECK(max_relative_error(output.logits, expected_logits) < tolerance);
         }
         for (std::int64_t layer = 0; layer < n_layers; layer++) {

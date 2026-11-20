@@ -24,6 +24,33 @@
 
 namespace pulsarlm {
 
+namespace {
+
+// A step's requests decode one token or verify state_slots tokens each, except one or more prefill chunks of at most
+// prefill_tokens_per_step tokens together, each in place of a request's decode.
+std::vector<std::int64_t>
+make_token_buckets(std::size_t max_running_requests, std::size_t state_slots, std::size_t prefill_tokens_per_step) {
+    const auto most = static_cast<std::int64_t>(
+        (max_running_requests - 1) * state_slots + std::max(state_slots, prefill_tokens_per_step)
+    );
+    std::vector<std::int64_t> buckets;
+    for (std::int64_t count : {1, 2, 3}) {
+        if (count < most) {
+            buckets.push_back(count);
+        }
+    }
+    for (std::int64_t power = 1; 4 * power < most; power *= 2) {
+        buckets.push_back(4 * power);
+        if (6 * power < most) {
+            buckets.push_back(6 * power);
+        }
+    }
+    buckets.push_back(most);
+    return buckets;
+}
+
+}  // namespace
+
 std::size_t executor::count_slots(const kv_layer& layer) const noexcept {
     if (!layer.state) {
         return 0;
@@ -52,7 +79,8 @@ executor::executor(
     std::optional<std::size_t> graph_pages,
     std::size_t draft_tokens,
     std::size_t sampled_row_limit,
-    std::size_t max_running_requests
+    std::size_t max_running_requests,
+    std::size_t prefill_tokens_per_step
 )
 : cache(std::move(cache)),
   store(store),
@@ -62,7 +90,9 @@ executor::executor(
   view_page_capacity(view_page_capacity),
   max_running_requests(max_running_requests),
   draft_state_slots(draft_tokens + 1),
-  sampled_row_capacity(sampled_row_limit) {
+  sampled_row_capacity(sampled_row_limit),
+  token_buckets(make_token_buckets(max_running_requests, draft_tokens + 1, prefill_tokens_per_step)) {
+    assert(prefill_tokens_per_step >= 1);
     assert(sampled_row_limit >= 1);
     assert(sampled_row_limit >= draft_tokens + 1);
     assert(max_running_requests >= 1 && view_page_capacity >= 1);
@@ -173,7 +203,8 @@ executor::executor(
                 draft_state_slots,
                 s.mass_heads,
                 s.stop_tokens,
-                s.table
+                s.table,
+                token_buckets
             );
         }
         capture_step_graphs();
@@ -199,6 +230,12 @@ const request_state& executor::get_state(request_id_type id) const {
 
 std::size_t executor::get_slot(request_id_type id) noexcept {
     return static_cast<std::uint32_t>(id);
+}
+
+std::size_t executor::find_token_bucket(std::size_t token_count) const {
+    auto bucket = std::ranges::lower_bound(token_buckets, static_cast<std::int64_t>(token_count));
+    assert(bucket != token_buckets.end());
+    return static_cast<std::size_t>(*bucket);
 }
 
 const request_table& executor::get_table(std::size_t shard) const {
@@ -527,12 +564,15 @@ task<void> executor::launch(std::span<const scheduled_request> scheduled) {
     move_stale_tables(*b);
     move_stale_requests(*b);
     advance(*b);
+    b->padded_token_count = b->is_uniform(draft_layer.has_value()) ? b->count_tokens()
+                                                                   : find_token_bucket(b->count_tokens());
     b->mass_by_shard.assign(shards.size(), at::Tensor());
     b->hidden_by_shard.assign(shards.size(), at::Tensor());
     b->shard_prior_hidden.assign(shards.size(), at::Tensor());
     b->verify_tokens.assign(shards.size(), at::Tensor());
     b->accepted_token_counts_by_shard.assign(shards.size(), at::Tensor());
     b->shard_next_tokens.assign(shards.size(), at::Tensor());
+    b->device_input_bytes.assign(shards.size(), at::Tensor());
     std::vector<external_task<>> other_shards;
     for (std::size_t shard = 1; shard < shards.size(); shard++) {
         other_shards.push_back(run_on(*shards[shard].worker_loop, enqueue_on_shard(*b, shard)));

@@ -23,6 +23,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdlib>
 #include <cstdint>
 #include <expected>
 #include <memory>
@@ -41,6 +42,11 @@
 // both ranks, and the same pages in the store.
 
 namespace {
+
+// Graph replays of the ranks of a communicator on one device queue their spinning p2p_all_reduce kernels without the
+// communicator's wait for every rank, so the process loads its CUDA modules before it runs any
+// (communicator::make_on_one_device).
+const bool loads_modules_eagerly = setenv("CUDA_MODULE_LOADING", "EAGER", 1) == 0;
 
 using pulsarlm::digest;
 using pulsarlm::page;
@@ -695,8 +701,7 @@ TEST_CASE("an engine split over two ranks samples as the whole model while its s
     check_same_state(split.end_state, whole.end_state);
 }
 
-// The ranks of a communicator on one device cannot capture graphs at once, so the graphs run on one rank: each replay
-// copies the tokens gathered from the request table that the previous step advanced.
+// Each replay copies the tokens gathered from the request table that the previous step advanced.
 TEST_CASE("decode graphs sample as the eager forward while steps overlap", "[runtime][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
@@ -726,12 +731,12 @@ class wide_batch_counting_model final : public pulsarlm::qwen3_5_model {
 
     using pulsarlm::qwen3_5_model::qwen3_5_model;
 
-    output forward(const batch& b, std::span<const pulsarlm::kv> lines) override {
-        const std::int64_t requests = b.page_tables.size(1);
+    output forward(const batch& b, std::span<const pulsarlm::kv> lines, pulsarlm::graph_segments& segments) override {
+        const std::int64_t requests = b.cu_seqlens_q.size(0) - 1;
         if (b.single_query_request_count == requests && requests > pulsarlm::step_graphs::startup_sequences) {
             (*wide_decode_batch_count)++;
         }
-        return pulsarlm::qwen3_5_model::forward(b, lines);
+        return pulsarlm::qwen3_5_model::forward(b, lines, segments);
     }
 };
 
@@ -798,11 +803,12 @@ class decode_batch_counting_model final : public pulsarlm::qwen3_5_model {
 
     using pulsarlm::qwen3_5_model::qwen3_5_model;
 
-    output forward(const batch& b, std::span<const pulsarlm::kv> lines) override {
-        if (b.single_query_request_count == b.page_tables.size(1)) {
-            (*decode_batch_counts)[static_cast<std::size_t>(b.page_tables.size(1))]++;
+    output forward(const batch& b, std::span<const pulsarlm::kv> lines, pulsarlm::graph_segments& segments) override {
+        const std::int64_t requests = b.cu_seqlens_q.size(0) - 1;
+        if (b.single_query_request_count == requests) {
+            (*decode_batch_counts)[static_cast<std::size_t>(requests)]++;
         }
-        return pulsarlm::qwen3_5_model::forward(b, lines);
+        return pulsarlm::qwen3_5_model::forward(b, lines, segments);
     }
 };
 
@@ -872,6 +878,33 @@ std::vector<pulsarlm::request> decoding_requests(std::size_t request_count, bool
         );
     }
     return requests;
+}
+
+// The prompt's chunks are steps of prefill chunks alone, padded to their buckets and replayed from segment graphs, and
+// the decode steps replay whole-step graphs; both ranks capture at once on the one device. With graphs, the tokens and
+// every page written equal byte for byte those without; the page mass, which the attention kernels add by atomic adds
+// of varying order, is close.
+TEST_CASE("an engine split over two ranks with graphs computes what it computes without graphs", "[runtime][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const c10::Dict<std::string, at::Tensor> weights = full_weights(n_kv_heads);
+    auto eager_contents = std::make_shared<store_contents>();
+    auto replayed_contents = std::make_shared<store_contents>();
+    served eager;
+    served replayed;
+    {
+        std::unique_ptr<pulsarlm::engine> eager_engine = make_engine(weights, n_kv_heads, ranks, eager_contents);
+        std::unique_ptr<pulsarlm::engine>
+            replayed_engine = make_engine(weights, n_kv_heads, ranks, replayed_contents, /*decode_graphs=*/true);
+        eager = serve(*eager_engine, sampled_request());
+        replayed = serve(*replayed_engine, sampled_request());
+    }
+    REQUIRE(eager.tokens.size() == decode_tokens);
+    CHECK(replayed.tokens == eager.tokens);
+    check_same_state(replayed.end_state, eager.end_state);
+    const store_comparison stores = compare_stores(*replayed_contents, *eager_contents);
+    CHECK(stores.identical_pages == eager_contents->pages.size());
 }
 
 // A step of decode entries alone that all sample replays a whole-step graph per number of requests and per sampling
@@ -969,13 +1002,12 @@ void check_same_history(const pulsarlm::state& got, const pulsarlm::state& expec
     }
 }
 
-// Two ranks on one device capture no graphs, as their captures would merge.
 TEST_CASE("Qwen3.5 drafting with its MTP layer emits the tokens it emits without drafts", "[runtime][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
     const std::size_t shard_count = GENERATE(1, 2);
-    const bool decode_graphs = shard_count == 1 ? GENERATE(false, true) : false;
+    const bool decode_graphs = GENERATE(false, true);
     const std::size_t draft_tokens = GENERATE(1, 2);
     const double temperature = GENERATE(0.0, 0.8);
     INFO(

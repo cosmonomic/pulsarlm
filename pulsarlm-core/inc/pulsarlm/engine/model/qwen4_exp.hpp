@@ -164,8 +164,11 @@ class qwen4_exp_model : public model, public draft_head {
     // The rows of a table split across the GPUs at ids, [ids..., table columns], summed across the GPUs; this GPU's
     // part of the table starts at first_row.
     at::Tensor lookup(const at::Tensor& table, std::int64_t first_row, const at::Tensor& ids) const;
-    // The logits [rows, vocab_size] of the final mix x [rows, hidden], from every GPU's part of lm_head.
-    at::Tensor logits(const at::Tensor& x) const;
+    // Uninitialized logits [logit_count, columns] in like's dtype, a column per row of every GPU's part of lm_head.
+    at::Tensor make_logits(std::int64_t logit_count, const at::Tensor& like) const;
+    // Writes into the first rows of logits (make_logits) the logits of the final mix x [logits, hidden], from every
+    // GPU's part of lm_head.
+    void write_logits(const at::Tensor& x, const at::Tensor& logits) const;
     // int32 [ntok, words]: each query's selected blocks, as attn_indexed_cuda reads them.
     at::Tensor selected_blocks(
         const attention_weights& w,
@@ -188,14 +191,61 @@ class qwen4_exp_model : public model, public draft_head {
     mixed_input
     mix_normed(const at::Tensor& normed, const at::Tensor& projected, const hyper_connection_weights& w) const;
     at::Tensor final_mix(const at::Tensor& x) const;
-    at::Tensor
-    attention(const at::Tensor& h, const layer_weights& layer, const batch& g, std::span<const kv> lines) const;
-    at::Tensor
-    deltanet(const at::Tensor& h, const layer_weights& layer, const batch& g, std::span<const kv> lines) const;
+    at::Tensor attention(
+        const at::Tensor& h,
+        const layer_weights& layer,
+        const batch& g,
+        std::span<const kv> lines,
+        graph_segments& segments
+    ) const;
+    // Writes the query tokens' keys k, values v and index keys into the lines of KV layer kv_index, and attends the
+    // rotated queries q with their index queries into o.
+    void attend_indexed(
+        const attention_weights& w,
+        std::size_t kv_index,
+        const batch& g,
+        std::span<const kv> lines,
+        const at::Tensor& q,
+        const at::Tensor& k,
+        const at::Tensor& v,
+        const at::Tensor& index_queries,
+        const at::Tensor& index_keys,
+        const at::Tensor& o
+    ) const;
+    at::Tensor deltanet(
+        const at::Tensor& h,
+        const layer_weights& layer,
+        const batch& g,
+        std::span<const kv> lines,
+        graph_segments& segments
+    ) const;
     at::Tensor moe(const at::Tensor& h, const moe_weights& m, const at::Tensor& counters) const;
-    // Each token's n-gram ids into the layer's table, [ntok, n-gram heads], updating its token lines.
-    at::Tensor ngram_ids(const ple_weights& w, std::size_t token_layer, const batch& g, const kv& lines) const;
-    at::Tensor ple(const at::Tensor& x, const layer_weights& layer, const batch& g, std::span<const kv> lines) const;
+    // Writes into ids_out [query tokens, n-gram heads] each query token's n-gram ids into the layer's table, the query
+    // tokens being query_tokens, and updates its token lines.
+    void write_ngram_ids(
+        const ple_weights& w,
+        std::size_t token_layer,
+        const batch& g,
+        const kv& lines,
+        const at::Tensor& query_tokens,
+        const at::Tensor& ids_out
+    ) const;
+    at::Tensor
+    ple(const at::Tensor& x,
+        const layer_weights& layer,
+        const batch& g,
+        std::span<const kv> lines,
+        graph_segments& segments) const;
+    // Writes into convolved the PLE convolution of the query tokens' normed rows, and the convolution window into
+    // the lines of KV layer conv_layer.
+    void convolve_ple(
+        const ple_weights& w,
+        std::size_t conv_layer,
+        const batch& g,
+        std::span<const kv> lines,
+        const at::Tensor& normed,
+        const at::Tensor& convolved
+    ) const;
 
   public:
     // weights are this GPU's parts, on the lines' device, in the attention lines' dtype; the PLE buffers are int64.
@@ -204,11 +254,13 @@ class qwen4_exp_model : public model, public draft_head {
 
     std::vector<kv_layer> kv_layers() const override;
     std::vector<kv_layer_shard> kv_layer_shards() const override;
-    output forward(const batch& b, std::span<const kv> lines) override;
+    output forward(const batch& b, std::span<const kv> lines, graph_segments& segments) override;
+    bool allows_segment_capture(std::int64_t token_count) const override;
     std::int64_t arrival_counter_count(std::int64_t sequences, std::int64_t tokens) const override;
     draft_head* drafter() override;
     std::int64_t hidden_dim() const override;
-    output draft(const batch& b, const at::Tensor& hidden, std::span<const kv> lines) override;
+    output
+    draft(const batch& b, const at::Tensor& hidden, std::span<const kv> lines, graph_segments& segments) override;
 };
 
 }  // namespace pulsarlm

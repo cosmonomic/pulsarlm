@@ -10,6 +10,7 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <utility>
 
 namespace pulsarlm {
 namespace {
@@ -117,7 +118,123 @@ __global__ void __launch_bounds__(cta_threads) p2p_all_reduce_kernel(
     meet(ranks, rank_count, rank, 1, epoch);
 }
 
+// Block b takes the 16-byte vectors [b * per_block, (b + 1) * per_block) of each rank's part: it copies them of x into
+// every rank's buffer at its rank's part, meets the other ranks' block b, copies every rank's part from its own
+// buffer into out, and meets them again so that no rank's next call replaces a buffer while its owner still reads it.
+__global__ void __launch_bounds__(cta_threads) p2p_all_gather_kernel(
+    const uint4* __restrict__ x,
+    uint4* __restrict__ out,
+    int64_t vectors,
+    int64_t per_block,
+    rank_pointers ranks,
+    int rank_count,
+    int rank,
+    std::uint64_t* __restrict__ counters
+) {
+    __shared__ std::uint64_t epoch;
+    if (threadIdx.x == 0) {
+        epoch = ++counters[blockIdx.x];
+    }
+    __syncthreads();
+    const int64_t first = blockIdx.x * per_block;
+    const int64_t last = min(first + per_block, vectors);
+    for (int64_t v = first + threadIdx.x; v < last; v += cta_threads) {
+        const uint4 value = x[v];
+        for (int p = 0; p < rank_count; p++) {
+            reinterpret_cast<uint4*>(ranks.buffers[p])[rank * vectors + v] = value;
+        }
+    }
+    meet(ranks, rank_count, rank, 0, epoch);
+    const auto* own = reinterpret_cast<const uint4*>(ranks.buffers[rank]);
+    for (int p = 0; p < rank_count; p++) {
+        for (int64_t v = first + threadIdx.x; v < last; v += cta_threads) {
+            out[p * vectors + v] = __ldcg(own + p * vectors + v);
+        }
+    }
+    meet(ranks, rank_count, rank, 1, epoch);
+}
+
+void check_ranks(
+    const char* op,
+    std::size_t rank,
+    std::span<std::byte* const> buffers,
+    std::span<std::uint64_t* const> flags,
+    std::span<std::uint64_t* const> counters
+) {
+    const std::size_t rank_count = buffers.size();
+    TORCH_CHECK(
+        rank_count >= 1 && rank_count <= p2p_all_reduce_max_ranks && flags.size() == rank_count &&
+            counters.size() == rank_count && rank < rank_count,
+        op,
+        ": a rank's buffer, flags and counters for each of at most ",
+        p2p_all_reduce_max_ranks,
+        " ranks"
+    );
+}
+
+bool is_aligned_contiguous(const at::Tensor& x) {
+    return x.is_cuda() && x.is_contiguous() && x.nbytes() % 16 == 0 &&
+        reinterpret_cast<std::uintptr_t>(x.data_ptr()) % 16 == 0;
+}
+
+rank_pointers collect_pointers(std::span<std::byte* const> buffers, std::span<std::uint64_t* const> flags) {
+    rank_pointers ranks{};
+    for (std::size_t r = 0; r < buffers.size(); r++) {
+        ranks.buffers[r] = buffers[r];
+        ranks.flags[r] = flags[r];
+    }
+    return ranks;
+}
+
+// The blocks of a call over vectors 16-byte vectors per rank, and the vectors of each block.
+std::pair<int64_t, int64_t> split_blocks(int64_t vectors) {
+    const int64_t blocks = std::min<int64_t>(p2p_all_reduce_max_blocks, (vectors + cta_threads - 1) / cta_threads);
+    return {blocks, (vectors + blocks - 1) / blocks};
+}
+
 }  // namespace
+
+void p2p_all_gather_cuda(
+    const at::Tensor& x,
+    const at::Tensor& out,
+    std::size_t rank,
+    std::span<std::byte* const> buffers,
+    std::span<std::uint64_t* const> flags,
+    std::span<std::uint64_t* const> counters
+) {
+    check_on_current_device("p2p_all_gather", {x, out});
+    check_ranks("p2p_all_gather", rank, buffers, flags, counters);
+    TORCH_CHECK(
+        is_aligned_contiguous(x) && is_aligned_contiguous(out),
+        "p2p_all_gather: x and out must be contiguous CUDA tensors, 16-byte aligned, of a multiple of 16 bytes"
+    );
+    TORCH_CHECK(
+        out.scalar_type() == x.scalar_type() && out.nbytes() == x.nbytes() * buffers.size(),
+        "p2p_all_gather: out must hold every rank's x in x's dtype"
+    );
+    const auto vectors = static_cast<int64_t>(x.nbytes() / 16);
+    if (vectors == 0) {
+        return;
+    }
+    const std::pair<int64_t, int64_t> split = split_blocks(vectors);
+    const int64_t blocks = split.first;
+    const int64_t per_block = split.second;
+    p2p_all_gather_kernel<<<
+        static_cast<unsigned>(blocks),
+        cta_threads,
+        0,
+        at::cuda::getCurrentCUDAStream(x.device().index())>>>(
+        static_cast<const uint4*>(x.const_data_ptr()),
+        static_cast<uint4*>(out.data_ptr()),
+        vectors,
+        per_block,
+        collect_pointers(buffers, flags),
+        static_cast<int>(buffers.size()),
+        static_cast<int>(rank),
+        counters[rank]
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 
 void p2p_all_reduce_cuda(
     at::Tensor& x,
@@ -127,30 +244,20 @@ void p2p_all_reduce_cuda(
     std::span<std::uint64_t* const> counters
 ) {
     check_on_current_device("p2p_all_reduce", {x});
+    check_ranks("p2p_all_reduce", rank, buffers, flags, counters);
     const std::size_t rank_count = buffers.size();
     TORCH_CHECK(
-        rank_count >= 1 && rank_count <= p2p_all_reduce_max_ranks && flags.size() == rank_count &&
-            counters.size() == rank_count && rank < rank_count,
-        "p2p_all_reduce: a rank's buffer, flags and counters for each of at most ",
-        p2p_all_reduce_max_ranks,
-        " ranks"
-    );
-    TORCH_CHECK(
-        x.is_cuda() && x.is_contiguous() && x.nbytes() % 16 == 0 &&
-            reinterpret_cast<std::uintptr_t>(x.data_ptr()) % 16 == 0,
+        is_aligned_contiguous(x),
         "p2p_all_reduce: x must be a contiguous CUDA tensor, 16-byte aligned, of a multiple of 16 bytes"
     );
     const auto vectors = static_cast<int64_t>(x.nbytes() / 16);
     if (vectors == 0) {
         return;
     }
-    rank_pointers ranks{};
-    for (std::size_t r = 0; r < rank_count; r++) {
-        ranks.buffers[r] = buffers[r];
-        ranks.flags[r] = flags[r];
-    }
-    const int64_t blocks = std::min<int64_t>(p2p_all_reduce_max_blocks, (vectors + cta_threads - 1) / cta_threads);
-    const int64_t per_block = (vectors + blocks - 1) / blocks;
+    const rank_pointers ranks = collect_pointers(buffers, flags);
+    const std::pair<int64_t, int64_t> split = split_blocks(vectors);
+    const int64_t blocks = split.first;
+    const int64_t per_block = split.second;
     auto stream = at::cuda::getCurrentCUDAStream(x.device().index());
     auto launch = [&](auto* data) {
         using scalar_t = std::remove_pointer_t<decltype(data)>;

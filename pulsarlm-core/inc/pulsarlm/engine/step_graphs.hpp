@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 
+#include "pulsarlm/engine/graph_segments.hpp"
 #include "pulsarlm/engine/model/interface.hpp"
 #include "pulsarlm/engine/request_table.hpp"
 #include "pulsarlm/engine/sampling.hpp"
@@ -25,7 +26,8 @@ namespace pulsarlm {
 // requests with state_slots query tokens each that keep a recurrent state and a mass view per query token, its
 // sampling, its acceptance of the drafts, the draft head's passes after it, and the advance of its requests' draw
 // counts and entries. The model's forwards of such steps read nothing back to the host and launch the same kernels for
-// every step of one shape.
+// every step of one shape. Any other step's forward, padded to a bucket of query tokens, replays the bucket's segment
+// graphs (graph_segments), which share one memory pool, and runs the calls between them eagerly.
 class step_graphs {
     struct captured_decode_step {
         at::cuda::CUDAGraph graph;
@@ -47,6 +49,15 @@ class step_graphs {
         at::Tensor accepted_token_counts;
         at::Tensor next_tokens;
         at::Tensor ends_cycle;
+    };
+    // A bucket's segments and the inputs they read, the tokens and positions of bucket_token_count entries and the
+    // arrival counters; its other inputs are set to each replayed step's before its calls run. The outputs are views
+    // of the capture's outputs that do not own their memory, which every replay of the pool's graphs writes.
+    struct captured_segments {
+        graph_segments::segment_capture capture;
+        model::batch inputs;
+        at::Tensor logits;
+        at::Tensor hidden;
     };
     using sequence_count_type = std::int64_t;
     using measures_mass_type = bool;
@@ -74,6 +85,11 @@ class step_graphs {
     request_table table;
     // int64 [0], the tokens of a step without prefill chunks.
     at::Tensor no_prefill_tokens;
+    // The query token counts a padded step takes, ascending.
+    std::vector<std::int64_t> bucket_token_counts;
+    // Keyed by bucket_token_counts, the buckets whose segments are captured, all from segment_pool.
+    std::map<std::int64_t, std::unique_ptr<captured_segments>> segment_steps;
+    at::cuda::MempoolId_t segment_pool;
 
     // The index among the lines of the draft head's KV layer, the one that keeps last hidden vectors.
     std::size_t find_draft_layer() const;
@@ -101,6 +117,13 @@ class step_graphs {
     void gather_inputs(const at::Tensor& request_slots, model::batch& inputs) const;
     std::unique_ptr<captured_decode_step> capture_decode_step(std::int64_t sequences, bool measures_mass, bool filters);
     std::unique_ptr<captured_verify_step> capture_verify_step(std::int64_t sequences, bool measures_mass, bool filters);
+    // The most logit tokens of a step of token_count query tokens: one per request, state_slots per verifying request.
+    std::int64_t count_most_logit_tokens(std::int64_t token_count) const;
+    // Runs an eager forward of a step of prefill chunks of token_count tokens in all, each at most a page, every
+    // request reading slot 0 of the table, so that the forward's first run at that size precedes its capture.
+    void warm_up_bucket(std::int64_t token_count);
+    // The captured segments of a forward of token_count entries of tokens, on the current stream.
+    std::unique_ptr<captured_segments> capture_segments(std::int64_t token_count);
 
   public:
     // The decoding sequences whose graphs capture_startup records.
@@ -129,7 +152,7 @@ class step_graphs {
     // (model::batch::state_slots). mass_heads holds, per entry of the model's kv_layers(), the query heads
     // whose mass this GPU measures. lines and table are on the current device; the graphs read and write table's
     // tensors where they are at construction, so these are never reallocated, and table.tokens has state_slots
-    // columns.
+    // columns. bucket_token_counts, ascending, are the query token counts that a padded step takes.
     step_graphs(
         model& shard_model,
         std::span<const kv> lines,
@@ -138,16 +161,25 @@ class step_graphs {
         std::size_t state_slots,
         std::vector<std::size_t> mass_heads,
         at::Tensor stop_tokens,
-        request_table table
+        request_table table,
+        std::vector<std::int64_t> bucket_token_counts
     );
 
     std::size_t page_width() const noexcept;
     // Captures the graphs of 1 to startup_sequences sequences, with mass when a layer measures it and without: with a
     // draft head and state_slots above 1 the verify steps that do not filter, and otherwise the decode steps that do
-    // not filter. It runs on the current stream, which is not the default stream, after an eager forward of the
-    // captured kind, its inputs gathered from slot 0 of the table, that zeroes line 0 of each layer and writes into it.
-    // Every GPU of the model runs it at once, before any request holds a line or a slot.
+    // not filter. Then captures the segments of every bucket whose forward allows it (model::allows_segment_capture),
+    // the largest first, each after an eager forward of its size (warm_up_bucket). It runs on the current stream,
+    // which is not the default stream, after an eager forward of the captured kind, its inputs gathered from slot 0 of
+    // the table, that zeroes line 0 of each layer and writes into it. Every GPU of the model runs it at once, before
+    // any request holds a line or a slot.
     void capture_startup();
+    // Whether the segments of the bucket of bucket_token_count query tokens are captured.
+    bool has_segments(std::int64_t bucket_token_count) const;
+    // The model's output of the step inputs (on the lines' device), padded to a bucket whose segments are captured,
+    // replayed from them, its calls between segments receiving inputs and its token_count query tokens. The logits
+    // and hidden rows are valid until the next replay of any bucket.
+    model::output replay_segments(const model::batch& inputs, std::int64_t token_count);
     // The decode step of the requests at request_slots (int64), which all sample, sampled as filters says
     // (pulsarlm::filters). cu_view_pages (int32) is the step's model::batch::cu_view_pages, undefined when it measures
     // no mass; page_mass_sum and page_weight_sum are its model::batch::page_mass_sum and page_weight_sum, into which

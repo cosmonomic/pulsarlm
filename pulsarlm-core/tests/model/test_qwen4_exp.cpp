@@ -31,6 +31,24 @@
 
 namespace {
 
+// The model's forward of b, its calls between segments run at once.
+pulsarlm::model::output
+forward_eagerly(pulsarlm::model& forwarded, const pulsarlm::model::batch& b, std::span<const pulsarlm::kv> lines) {
+    pulsarlm::graph_segments segments(b.tokens.size(0));
+    return forwarded.forward(b, lines, segments);
+}
+
+// The draft head's pass over b, its calls between segments run at once.
+pulsarlm::model::output draft_eagerly(
+    pulsarlm::draft_head& head,
+    const pulsarlm::model::batch& b,
+    const at::Tensor& hidden,
+    std::span<const pulsarlm::kv> lines
+) {
+    pulsarlm::graph_segments segments(b.tokens.size(0));
+    return head.draft(b, hidden, lines, segments);
+}
+
 // b with its own arrival counters, as many as model needs for it.
 pulsarlm::model::batch with_arrival_counters(pulsarlm::model::batch b, const pulsarlm::model& model) {
     const std::int64_t tokens = b.tokens.size(0);
@@ -854,7 +872,8 @@ void check_against_dense(
 
     for (chunk c : chunks) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
-        pulsarlm::model::output output = model.forward(
+        pulsarlm::model::output output = forward_eagerly(
+            model,
             with_arrival_counters(chunk_batch(tokens, c, specs, draft_tokens), model),
             kv
         );
@@ -926,7 +945,7 @@ std::vector<pulsarlm::model::output> sharded_forward(
     for (std::size_t rank = 0; rank < shards.size(); rank++) {
         threads.emplace_back([&, rank] {
             c10::cuda::CUDAStreamGuard guard(streams[rank]);
-            outputs[rank] = shards[rank]->forward(with_arrival_counters(batch, *shards[rank]), lines[rank]);
+            outputs[rank] = forward_eagerly(*shards[rank], with_arrival_counters(batch, *shards[rank]), lines[rank]);
             streams[rank].synchronize();
         });
     }
@@ -978,7 +997,7 @@ void check_sharded(
     for (chunk c : chunks) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
         pulsarlm::model::batch batch = chunk_batch(tokens, c, specs, 0);
-        single.forward(with_arrival_counters(batch, single), single_lines);
+        forward_eagerly(single, with_arrival_counters(batch, single), single_lines);
         std::vector<pulsarlm::model::output> outputs = sharded_forward(shards, lines, streams, batch);
         const at::Tensor& rank_0 = outputs.front().logits;
         CHECK(max_relative_error(rank_0, dense.logits.narrow(0, c.first, c.last - c.first)) < tolerance);
@@ -1165,7 +1184,8 @@ TEST_CASE("Qwen4-Exp drafts as a dense MTP layer a position after each row", "[m
                                              .last_hidden[view_lines[static_cast<std::size_t>((first - 1) / page_size)]]
                                              .unsqueeze(0)
                                              .clone();
-        pulsarlm::model::output output = model.forward(
+        pulsarlm::model::output output = forward_eagerly(
+            model,
             with_arrival_counters(chunk_batch(tokens, c, specs, 0), model),
             kv
         );
@@ -1174,7 +1194,7 @@ TEST_CASE("Qwen4-Exp drafts as a dense MTP layer a position after each row", "[m
 
         at::Tensor hidden_rows = at::cat({before, streams.narrow(0, 0, last - first - 1)});
         pulsarlm::model::batch drafting = with_arrival_counters(step(tokens, first, last, true, specs, 0), model);
-        pulsarlm::model::output drafted = drafter->draft(drafting, hidden_rows, kv);
+        pulsarlm::model::output drafted = draft_eagerly(*drafter, drafting, hidden_rows, kv);
         CHECK(max_relative_error(drafted.logits, expected.logits.narrow(0, first, last - first)) < 1e-4);
         CHECK(max_relative_error(drafted.hidden, expected.streams.narrow(0, first, last - first)) < 1e-4);
     }
@@ -1234,7 +1254,7 @@ TEST_CASE(
     wrong_last_draft.narrow(0, 46, 1).copy_(at::remainder(tokens.narrow(0, 46, 1) + 1, vocab));
 
     pulsarlm::model::batch prefill = step(tokens, 0, 40, true, specs, draft_tokens);
-    model.forward(with_arrival_counters(prefill, model), kv);
+    forward_eagerly(model, with_arrival_counters(prefill, model), kv);
 
     struct verify_step {
         std::int64_t first;
@@ -1249,7 +1269,8 @@ TEST_CASE(
              verify_step{46, 1, tokens, 3},
          }) {
         INFO("verify [" << v.first << ", " << v.first + draft_tokens + 1 << ") after " << v.rejected << " rejected");
-        pulsarlm::model::output output = model.forward(
+        pulsarlm::model::output output = forward_eagerly(
+            model,
             with_arrival_counters(verify_batch(v.tokens, v.first, v.rejected, specs, draft_tokens), model),
             kv
         );
@@ -1335,7 +1356,8 @@ void check_sharded_draft(const split_dims& dims, std::size_t gpus) {
                     step(tokens, first, last, true, specs, 0),
                     *shards[rank]
                 );
-                drafted[rank] = shards[rank]->draft(
+                drafted[rank] = draft_eagerly(
+                    *shards[rank],
                     drafting,
                     at::cat({before[rank], streams_out.narrow(0, 0, last - first - 1)}),
                     lines[rank]

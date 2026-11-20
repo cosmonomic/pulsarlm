@@ -116,8 +116,13 @@ std::vector<kv_layer> qwen2_model::kv_layers() const {
     );
 }
 
-at::Tensor
-qwen2_model::attention(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const {
+at::Tensor qwen2_model::attention(
+    const at::Tensor& h,
+    std::int64_t layer,
+    const batch& g,
+    std::span<const kv> lines,
+    graph_segments& segments
+) const {
     const layer_weights& w = layers[layer];
     const dense_config& c = config;
     const std::int64_t ntok = h.size(0);
@@ -125,32 +130,60 @@ qwen2_model::attention(const at::Tensor& h, std::int64_t layer, const batch& g, 
     at::Tensor q = rope_q(at::linear(h, w.q_proj, w.q_proj_bias), g.pos, c.n_heads, c.head_dim, c.rope);
     at::Tensor k = at::linear(h, w.k_proj, w.k_proj_bias).view({ntok, c.n_kv_heads, c.head_dim}).contiguous();
     at::Tensor v = at::linear(h, w.v_proj, w.v_proj_bias).view({ntok, c.n_kv_heads, c.head_dim}).contiguous();
-    at::Tensor o = paged_attention(
+    at::Tensor o = at::empty_like(q);
+    segments.run_between_segments(
+        [this, &g, lines, layer](
+            const at::Tensor& queries,
+            const at::Tensor& keys,
+            const at::Tensor& values,
+            const at::Tensor& attended
+        ) {
+            paged_attention(
+                queries,
+                keys,
+                values,
+                attended,
+                lines[layer],
+                static_cast<std::size_t>(layer),
+                0,
+                g,
+                1.0 / std::sqrt(static_cast<double>(config.head_dim)),
+                config.rope
+            );
+        },
         q,
         k,
         v,
-        lines[layer],
-        static_cast<std::size_t>(layer),
-        0,
-        g,
-        1.0 / std::sqrt(static_cast<double>(c.head_dim)),
-        c.rope
+        o
     );
     return at::linear(o.reshape({ntok, c.n_heads * c.head_dim}), w.o_proj);
 }
 
-model::output qwen2_model::forward(const batch& b, std::span<const kv> lines) {
+model::output qwen2_model::forward(const batch& b, std::span<const kv> lines, graph_segments& segments) {
     check_batch(b);
     assert(b.per_query_state_request_count == 0);
     const double eps = config.rms_norm_eps;
     at::Tensor x = embed_tokens.index_select(0, b.tokens);
     for (std::int64_t layer = 0; layer < config.n_layers; layer++) {
         const layer_weights& w = layers[layer];
-        x = x + attention(rmsnorm_cuda(x, w.input_layernorm, eps), layer, b, lines);
+        x = x + attention(rmsnorm_cuda(x, w.input_layernorm, eps), layer, b, lines, segments);
         at::Tensor h = rmsnorm_cuda(x, w.post_attention_layernorm, eps);
         x = x + at::linear(at::silu(at::linear(h, w.gate_proj)) * at::linear(h, w.up_proj), w.down_proj);
     }
-    return output{.logits = at::matmul(rmsnorm_cuda(logit_inputs(x, b), norm, eps), embed_tokens.t())};
+    at::Tensor logits = at::empty({b.logit_tokens.size(0), embed_tokens.size(0)}, x.options());
+    segments.run_between_segments(
+        [this, &b](const at::Tensor& hidden_states, const at::Tensor& out) {
+            at::Tensor written = out.narrow(0, 0, b.logit_tokens.size(0));
+            at::matmul_out(
+                written,
+                rmsnorm_cuda(logit_inputs(hidden_states, b), norm, config.rms_norm_eps),
+                embed_tokens.t()
+            );
+        },
+        x,
+        logits
+    );
+    return output{.logits = logits};
 }
 
 }  // namespace pulsarlm

@@ -200,8 +200,13 @@ at::Tensor gemma4_model::per_layer_inputs(const at::Tensor& tokens, const at::Te
     return (projected + by_token) * std::pow(2.0, -0.5);
 }
 
-at::Tensor
-gemma4_model::attention(const at::Tensor& h, std::int64_t layer, const batch& g, std::span<const kv> lines) const {
+at::Tensor gemma4_model::attention(
+    const at::Tensor& h,
+    std::int64_t layer,
+    const batch& g,
+    std::span<const kv> lines,
+    graph_segments& segments
+) const {
     const layer_weights& w = layers[layer];
     const std::int64_t ntok = h.size(0);
     const std::size_t kv_index = kv_layer_of[layer];
@@ -238,8 +243,34 @@ gemma4_model::attention(const at::Tensor& h, std::int64_t layer, const batch& g,
     if (spec.sliding_window) {
         window = static_cast<std::int64_t>(*spec.sliding_window);
     }
-    at::Tensor
-        o = paged_attention(q, k, v, lines[kv_index], kv_index, reader_of[layer], g, 1.0, rope, window, k_norm_weight);
+    at::Tensor o = at::empty_like(q);
+    segments.run_between_segments(
+        [&g, lines, kv_index, reader = reader_of[layer], rope, window, k_norm_weight](
+            const at::Tensor& queries,
+            const at::Tensor& keys,
+            const at::Tensor& values,
+            const at::Tensor& attended
+        ) {
+            paged_attention(
+                queries,
+                keys,
+                values,
+                attended,
+                lines[kv_index],
+                kv_index,
+                reader,
+                g,
+                1.0,
+                rope,
+                window,
+                k_norm_weight
+            );
+        },
+        q,
+        k,
+        v,
+        o
+    );
     return at::linear(o.reshape({ntok, config.n_heads * head_dim}), w.o_proj);
 }
 
@@ -270,11 +301,12 @@ at::Tensor gemma4_model::block(
     std::int64_t layer,
     const at::Tensor& per_layer_input,
     const batch& g,
-    std::span<const kv> lines
+    std::span<const kv> lines,
+    graph_segments& segments
 ) const {
     const layer_weights& w = layers[layer];
     const double eps = config.rms_norm_eps;
-    at::Tensor attended = attention(rmsnorm_cuda(x, w.input_layernorm, eps), layer, g, lines);
+    at::Tensor attended = attention(rmsnorm_cuda(x, w.input_layernorm, eps), layer, g, lines, segments);
     x = x + rmsnorm_cuda(attended, w.post_attention_layernorm, eps);
 
     at::Tensor h = rmsnorm_cuda(x, w.pre_feedforward_layernorm, eps);
@@ -292,15 +324,14 @@ at::Tensor gemma4_model::block(
     return x * w.layer_scalar;
 }
 
-at::Tensor gemma4_model::head(const at::Tensor& x) const {
-    at::Tensor logits = at::matmul(rmsnorm_cuda(x, norm, config.rms_norm_eps), embed_tokens.t());
+void gemma4_model::write_logits(const at::Tensor& x, at::Tensor logits) const {
+    at::matmul_out(logits, rmsnorm_cuda(x, norm, config.rms_norm_eps), embed_tokens.t());
     if (config.final_logit_softcapping) {
-        logits = at::tanh(logits / *config.final_logit_softcapping) * *config.final_logit_softcapping;
+        logits.div_(*config.final_logit_softcapping).tanh_().mul_(*config.final_logit_softcapping);
     }
-    return logits;
 }
 
-model::output gemma4_model::forward(const batch& b, std::span<const kv> lines) {
+model::output gemma4_model::forward(const batch& b, std::span<const kv> lines, graph_segments& segments) {
     check_batch(b);
     assert(b.per_query_state_request_count == 0);
     at::Tensor x = scaled(embed_tokens.index_select(0, b.tokens), std::sqrt(static_cast<double>(config.hidden_size)));
@@ -309,9 +340,17 @@ model::output gemma4_model::forward(const batch& b, std::span<const kv> lines) {
         per_layer = per_layer_inputs(b.tokens, x);
     }
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
-        x = block(x, layer, per_layer.defined() ? per_layer.select(1, layer) : at::Tensor(), b, lines);
+        x = block(x, layer, per_layer.defined() ? per_layer.select(1, layer) : at::Tensor(), b, lines, segments);
     }
-    return output{.logits = head(logit_inputs(x, b))};
+    at::Tensor logits = at::empty({b.logit_tokens.size(0), embed_tokens.size(0)}, x.options());
+    segments.run_between_segments(
+        [this, &b](const at::Tensor& hidden_states, const at::Tensor& out) {
+            write_logits(logit_inputs(hidden_states, b), out.narrow(0, 0, b.logit_tokens.size(0)));
+        },
+        x,
+        logits
+    );
+    return output{.logits = logits};
 }
 
 std::int64_t gemma4_model::arrival_counter_count(std::int64_t, std::int64_t tokens) const {

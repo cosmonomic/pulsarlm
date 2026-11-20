@@ -24,6 +24,24 @@
 
 namespace {
 
+// The model's forward of b, its calls between segments run at once.
+pulsarlm::model::output
+forward_eagerly(pulsarlm::model& forwarded, const pulsarlm::model::batch& b, std::span<const pulsarlm::kv> lines) {
+    pulsarlm::graph_segments segments(b.tokens.size(0));
+    return forwarded.forward(b, lines, segments);
+}
+
+// The draft head's pass over b, its calls between segments run at once.
+pulsarlm::model::output draft_eagerly(
+    pulsarlm::draft_head& head,
+    const pulsarlm::model::batch& b,
+    const at::Tensor& hidden,
+    std::span<const pulsarlm::kv> lines
+) {
+    pulsarlm::graph_segments segments(b.tokens.size(0));
+    return head.draft(b, hidden, lines, segments);
+}
+
 // b with its own arrival counters, as many as model needs for it.
 pulsarlm::model::batch with_arrival_counters(pulsarlm::model::batch b, const pulsarlm::model& model) {
     const std::int64_t tokens = b.tokens.size(0);
@@ -479,7 +497,7 @@ void check_against_dense(at::ScalarType dtype, double tolerance, std::optional<p
          {chunk{0, 21, true}, chunk{21, 37, true}, chunk{37, 47, true}, chunk{47, 48, false}, chunk{48, 49, false}}) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
         pulsarlm::model::batch batch = step(tokens, c.first, c.last, c.prefill, specs);
-        pulsarlm::model::output output = model.forward(with_arrival_counters(batch, model), kv);
+        pulsarlm::model::output output = forward_eagerly(model, with_arrival_counters(batch, model), kv);
         auto expected_logits = dense.logits.narrow(0, c.first, c.last - c.first);
         CHECK(max_relative_error(output.logits, expected_logits) < tolerance);
     }
@@ -625,7 +643,7 @@ std::vector<pulsarlm::model::output> forward_on_ranks(
         threads.emplace_back([&, rank] {
             c10::cuda::CUDAGuard device(0);
             c10::cuda::CUDAStreamGuard stream(c10::cuda::getStreamFromPool());
-            outputs[rank] = models[rank].forward(with_arrival_counters(batch, models[rank]), lines[rank]);
+            outputs[rank] = forward_eagerly(models[rank], with_arrival_counters(batch, models[rank]), lines[rank]);
         });
     }
     for (std::thread& thread : threads) {
@@ -717,7 +735,7 @@ void check_split_over_ranks(
          {chunk{0, 21, true}, chunk{21, 37, true}, chunk{37, 47, true}, chunk{47, 48, false}, chunk{48, 49, false}}) {
         INFO("tokens [" << c.first << ", " << c.last << ")" << (c.prefill ? " prefill" : " decode"));
         pulsarlm::model::batch batch = step(tokens, c.first, c.last, c.prefill, specs);
-        single.forward(with_arrival_counters(batch, single), single_lines);
+        forward_eagerly(single, with_arrival_counters(batch, single), single_lines);
         std::vector<pulsarlm::model::output> outputs = forward_on_ranks(models, batch, lines);
         const at::Tensor first_rank = outputs.front().logits;
         CHECK(max_relative_error(first_rank, dense.logits.narrow(0, c.first, c.last - c.first)) < tolerance);
@@ -807,7 +825,7 @@ TEST_CASE("Qwen3.5 drafts as vLLM's MTP layer a position after each row", "[mode
     auto [expected_logits, expected_hidden] = dense_mtp(w, tokens, dense.hidden);
 
     pulsarlm::model::batch prefill = step(tokens, 0, n_tokens, true, specs);
-    pulsarlm::model::output output = model.forward(with_arrival_counters(prefill, model), kv);
+    pulsarlm::model::output output = forward_eagerly(model, with_arrival_counters(prefill, model), kv);
     REQUIRE(output.hidden.defined());
     CHECK(max_relative_error(output.hidden, dense.hidden) < 1e-4);
     for (std::int64_t page = 0; page < 3; page++) {
@@ -820,7 +838,7 @@ TEST_CASE("Qwen3.5 drafts as vLLM's MTP layer a position after each row", "[mode
     at::Tensor hidden_rows = at::cat(
         {at::zeros({1, hidden}, cuda(at::kFloat)), dense.hidden.narrow(0, 0, n_tokens - 1)}
     );
-    pulsarlm::model::output drafted = drafter->draft(drafting, hidden_rows, kv);
+    pulsarlm::model::output drafted = draft_eagerly(*drafter, drafting, hidden_rows, kv);
     CHECK(max_relative_error(drafted.logits, expected_logits) < 1e-4);
     CHECK(max_relative_error(drafted.hidden, expected_hidden) < 1e-4);
 }
