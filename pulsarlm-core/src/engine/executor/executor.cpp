@@ -3,6 +3,7 @@
 #include "pulsarlm/engine/executor.hpp"
 
 #include <ATen/ATen.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 
@@ -168,6 +169,11 @@ executor::executor(
 
 executor::~executor() {
     end_requests(request_error::loop_exited);
+    for (shard& s : shards) {
+        s.graphs.reset();
+    }
+    // The memory pools of destroyed graphs stay reserved by the caching allocator until its cache is emptied.
+    c10::cuda::CUDACachingAllocator::emptyCache();
 }
 
 executor::request_ref::request_ref(executor& owner, request_id_type id) noexcept

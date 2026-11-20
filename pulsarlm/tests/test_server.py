@@ -196,14 +196,6 @@ def encode(state: ServerState, messages: list[dict[str, str]]) -> list[int]:
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
-@pytest.fixture(autouse=True)
-def release_cached_device_memory():
-    yield
-    # A destroyed engine's CUDA graph pools stay in PyTorch's cache, which later
-    # engines of the suite cannot reuse.
-    torch.cuda.empty_cache()
-
-
 def api_client(load_state: Callable[[], ServerState]) -> TestClient:
     return TestClient(create_app(load_state), base_url=BASE_URL)
 
