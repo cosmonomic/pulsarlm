@@ -19,12 +19,13 @@ def prompt_sha256(prompt: list[int]) -> str:
 
 class EvictionLog:
     """Appends one JSON line per finished request to path: its completion id, its
-    prompt's length and prompt_sha256, cap_tokens, and each state it reached, in
-    order, with the tokens the state covers and, per layer eviction measures, the
-    layer's score_threshold and the [start, end, score] of each full page in view,
-    score being the engine's page score (None without one). The tokens after the last page are in
-    view too. cap_tokens is the most full-page tokens a view keeps at a cycle's end,
-    None without max_context_window."""
+    prompt's length and prompt_sha256, and each state it reached, in order, with
+    the tokens the state covers, its cap_tokens and, per layer eviction measures,
+    the layer's score_threshold and the [start, end, score] of each full page in
+    view, score being the engine's page score (None without one). The tokens after
+    the last page are in view too. A state's cap_tokens is the most full-page
+    tokens a cycle's end with the state's tail keeps, None without a
+    max_context_capacity above 0."""
 
     def __init__(
         self, path: Path, engine: AsyncEngine, eviction: EvictionPolicy
@@ -49,9 +50,6 @@ class EvictionLog:
             "id": completion_id,
             "prompt_tokens": len(prompt),
             "prompt_sha256": prompt_sha256(prompt),
-            "cap_tokens": self._engine.eviction_report_of(
-                State(), self._eviction
-            ).cap_tokens,
             "states": [self._view(state) for state in states],
         }
         with self._path.open("a") as f:
@@ -69,6 +67,7 @@ class EvictionLog:
         report = self._engine.eviction_report_of(state, self._eviction)
         return {
             "tokens": full_pages * PAGE_SIZE + len(state.tail),
+            "cap_tokens": report.cap_tokens,
             "layers": [
                 {
                     "layer": scores.layer,

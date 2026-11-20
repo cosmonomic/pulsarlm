@@ -114,12 +114,15 @@ class engine {
     ~engine();
 
     // Serves r, passing its results to callbacks. Safe to call from any thread. Throws std::invalid_argument, without
-    // calling callbacks, when r breaks a precondition of scheduler::submit, holds a token outside [0, vocab_size) or
-    // its eviction.max_context_window exceeds the engine's.
+    // calling callbacks, when r breaks a precondition of scheduler::submit, holds a token outside [0, vocab_size), or
+    // its eviction.max_context_capacity, a negative one taken as the engine's max_context_window, exceeds the engine's
+    // max_context_window or cannot hold, at a cycle's end with any tail, the full pages of its n_sink and n_working
+    // tokens and the next cycle's tokens.
     void submit(request&& r, std::unique_ptr<request_callbacks> callbacks);
     // The exception that panicked the loop; null while the loop runs or when it was stopped.
     std::exception_ptr exception() const;
-    // The scores a cycle's end under policy would evict s's pages by. Safe to call from any thread.
+    // The scores a cycle's end under policy would evict s's pages by, a negative max_context_capacity taken as the
+    // engine's max_context_window. Safe to call from any thread.
     eviction_report eviction_report_of(const state& s, const eviction_policy& policy) const;
     // Safe to call from any thread.
     engine_stat stat() const;

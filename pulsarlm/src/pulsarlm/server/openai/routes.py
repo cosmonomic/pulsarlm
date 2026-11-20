@@ -62,7 +62,7 @@ class ServerState:
             n_working=self.eviction.n_working,
             cycle_tokens=self.eviction.cycle_tokens,
             mass_tokens=self.eviction.mass_tokens,
-            max_context_window=self.eviction.max_context_window,
+            max_context_capacity=self.eviction.max_context_capacity,
             eviction_threshold=self.eviction.eviction_threshold,
             eviction_warmup=self.eviction.eviction_warmup,
             attention_mass_decay=self.eviction.attention_mass_decay,

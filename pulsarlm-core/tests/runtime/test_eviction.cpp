@@ -29,11 +29,25 @@ moments two_samples(double mean, double deviation) {
 }
 
 // One query head with standard normal densities and scores, and each page's weight sum 1, so a page's score is its
-// mass sum.
-page_list evicted(const std::vector<float>& mass_sum, const page_eviction_policy& policy) {
+// mass sum. The view holds tail_tokens tokens after its full pages.
+page_list
+evicted_with_tail(const std::vector<float>& mass_sum, std::size_t tail_tokens, const page_eviction_policy& policy) {
     std::vector<float> weight_sum(mass_sum.size(), 1.0f);
     std::vector<moments> density_moments{two_samples(0.0, 1.0)};
-    return pages_to_evict(mass_sum, weight_sum, 1, density_moments, two_samples(0.0, 1.0), page_size, policy);
+    return pages_to_evict(
+        mass_sum,
+        weight_sum,
+        1,
+        density_moments,
+        two_samples(0.0, 1.0),
+        page_size,
+        tail_tokens,
+        policy
+    );
+}
+
+page_list evicted(const std::vector<float>& mass_sum, const page_eviction_policy& policy) {
+    return evicted_with_tail(mass_sum, 0, policy);
 }
 
 TEST_CASE("the defaults evict nothing") {
@@ -42,14 +56,15 @@ TEST_CASE("the defaults evict nothing") {
     REQUIRE(evicted(std::vector<float>(8, -5.0f), defaults).empty());
 }
 
-TEST_CASE("the sink and working tokens round up to pages and the context window down") {
+TEST_CASE("the sink and working tokens and the context capacity round up to pages") {
     page_eviction_policy policy = pulsarlm::to_pages(
-        eviction_policy{.n_sink = 5, .n_working = 8, .max_context_window = 23},
+        eviction_policy{.n_sink = 5, .n_working = 8, .max_context_capacity = 23},
         page_size
     );
     REQUIRE(policy.n_sink == 2);
     REQUIRE(policy.n_working == 2);
-    REQUIRE(policy.max_pages == 5);
+    REQUIRE(policy.max_pages == 6);
+    REQUIRE(pulsarlm::to_pages(eviction_policy{.max_context_capacity = 24}, page_size).max_pages == 6);
     REQUIRE(pulsarlm::to_pages(eviction_policy{.attention_mass_decay = 0.5}, page_size).attention_mass_decay == 0.5);
     REQUIRE(!pulsarlm::to_pages(eviction_policy{}, page_size).max_pages);
     REQUIRE(pulsarlm::to_pages(eviction_policy{.eviction_threshold = 0.2}, page_size).can_evict());
@@ -162,7 +177,7 @@ TEST_CASE("a page without a score stays, and one no query token attended goes") 
     std::vector<float> weight_sum{1.0f, 0.0f, 1.0f};
     std::vector<moments> unsampled_head{moments{}};
     REQUIRE(
-        pages_to_evict(mass_sum, weight_sum, 1, unsampled_head, two_samples(0.0, 1.0), page_size, policy) ==
+        pages_to_evict(mass_sum, weight_sum, 1, unsampled_head, two_samples(0.0, 1.0), page_size, 0, policy) ==
         page_list{1}
     );
 }
@@ -173,7 +188,7 @@ TEST_CASE("fewer than two scores evict nothing by score") {
     std::vector<float> weight_sum{1.0f, 1.0f};
     std::vector<moments> density_moments{two_samples(0.0, 1.0)};
     moments one_score{.count = 1};
-    REQUIRE(pages_to_evict(mass_sum, weight_sum, 1, density_moments, one_score, page_size, policy).empty());
+    REQUIRE(pages_to_evict(mass_sum, weight_sum, 1, density_moments, one_score, page_size, 0, policy).empty());
 }
 
 TEST_CASE("a layer evicts nothing by score before its score moments hold the warm-up's samples") {
@@ -186,7 +201,7 @@ TEST_CASE("a view no longer than the protected pages evicts nothing") {
     REQUIRE(evicted(std::vector<float>(5, -9.0f), policy).empty());
 }
 
-TEST_CASE("the cap evicts the oldest unprotected pages, leaving room for a partial tail page and the next cycle") {
+TEST_CASE("the cap evicts the oldest unprotected pages, leaving room for the tail and the next cycle") {
     page_eviction_policy policy{.n_sink = 1, .n_working = 1, .cycle_tokens = 5, .max_pages = 6};
     REQUIRE(evicted({0.3f, 0.1f, 0.2f, 0.1f, 0.5f, 0.4f, 0.0f, 0.0f}, policy) == page_list{1, 2, 3, 4});
 }
@@ -205,6 +220,43 @@ TEST_CASE("the cap counts the pages the threshold evicted") {
         .eviction_threshold = 0.5,
     };
     REQUIRE(evicted({0.3f, 0.1f, -0.2f, -0.1f, 0.5f, 0.4f, 0.25f, 0.0f}, policy) == page_list{0, 2, 3});
+}
+
+TEST_CASE("the cap keeps the full pages that leave the tail and the next cycle within max_pages pages of tokens") {
+    page_eviction_policy policy = pulsarlm::to_pages(
+        eviction_policy{.n_sink = 0, .n_working = 1, .cycle_tokens = 5, .max_context_capacity = 33},
+        page_size
+    );
+    REQUIRE(policy.max_pages == 9);
+    std::vector<float> mass_sum(12, 0.5f);
+    REQUIRE(pulsarlm::full_page_cap(policy, page_size, 0) == 7);
+    REQUIRE(evicted_with_tail(mass_sum, 0, policy) == page_list{0, 1, 2, 3, 4});
+    REQUIRE(pulsarlm::full_page_cap(policy, page_size, 3) == 7);
+    REQUIRE(evicted_with_tail(mass_sum, 3, policy) == page_list{0, 1, 2, 3, 4});
+    REQUIRE(pulsarlm::full_page_cap(policy, page_size, 1) == 7);
+    page_eviction_policy longer_cycle = policy;
+    longer_cycle.cycle_tokens = 6;
+    REQUIRE(pulsarlm::full_page_cap(longer_cycle, page_size, 2) == 7);
+    REQUIRE(pulsarlm::full_page_cap(longer_cycle, page_size, 3) == 6);
+    REQUIRE(evicted_with_tail(mass_sum, 3, longer_cycle) == page_list{0, 1, 2, 3, 4, 5});
+}
+
+TEST_CASE("a cap below the tail and the next cycle keeps no full page") {
+    page_eviction_policy policy{.n_sink = 0, .n_working = 1, .cycle_tokens = 6, .max_pages = 2};
+    REQUIRE(pulsarlm::full_page_cap(policy, page_size, 3) == 0);
+    REQUIRE(!pulsarlm::full_page_cap(page_eviction_policy{.n_working = 1, .cycle_tokens = 6}, page_size, 3));
+}
+
+TEST_CASE("the cap evicts nothing when the threshold already evicted down to it") {
+    page_eviction_policy policy{
+        .n_sink = 0,
+        .n_working = 1,
+        .cycle_tokens = 4,
+        .max_pages = 6,
+        .eviction_threshold = 0.5,
+    };
+    REQUIRE(pulsarlm::full_page_cap(policy, page_size, 0) == 5);
+    REQUIRE(evicted({0.3f, -0.1f, -0.2f, 0.1f, -0.3f, 0.4f, 0.0f}, policy) == page_list{1, 2, 4});
 }
 
 }  // namespace

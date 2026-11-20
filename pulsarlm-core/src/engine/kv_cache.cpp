@@ -35,6 +35,9 @@ static_assert(std::endian::native == std::endian::little);
 
 namespace {
 
+// The version of the rule by which a cycle's end keeps full pages under max_pages (full_page_cap).
+constexpr std::uint64_t capacity_fill_rule_version = 1;
+
 void append_u64(std::vector<std::byte>& seed, std::uint64_t value) {
     auto bytes = std::bit_cast<std::array<std::byte, sizeof(value)>>(value);
     seed.insert(seed.end(), bytes.begin(), bytes.end());
@@ -327,6 +330,9 @@ digest make_request_root_digest(const digest& engine_root, const page_eviction_p
     append_u64(seed, std::bit_cast<std::uint64_t>(policy.eviction_threshold));
     append_u64(seed, policy.eviction_warmup);
     append_u64(seed, std::bit_cast<std::uint64_t>(policy.attention_mass_decay));
+    if (policy.max_pages) {
+        append_u64(seed, capacity_fill_rule_version);
+    }
     return make_digest(seed);
 }
 

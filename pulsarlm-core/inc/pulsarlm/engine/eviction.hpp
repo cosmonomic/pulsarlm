@@ -12,9 +12,10 @@
 
 namespace pulsarlm {
 
-// An eviction_policy with its sink, working set, warm-up and context window in pages: n_sink and n_working round up,
-// eviction_warmup is its cycles times the pages a cycle's tokens fill, rounded up, and max_pages rounds down. A cycle's end keeps the full pages and the pages a partial tail page and the next cycle's
-// tokens fill within max_pages.
+// An eviction_policy with its sink, working set, warm-up and context capacity in pages: n_sink and n_working round up,
+// eviction_warmup is its cycles times the pages a cycle's tokens fill, rounded up, and max_pages, set when
+// max_context_capacity is above 0, rounds up. A cycle's end keeps as many full pages as leave the view at most
+// max_pages pages of tokens at the next cycle's end (full_page_cap).
 struct page_eviction_policy {
     std::size_t n_sink;
     std::size_t n_working;
@@ -28,11 +29,14 @@ struct page_eviction_policy {
     bool can_evict() const noexcept;
 };
 
+// policy's max_context_capacity is not negative.
 page_eviction_policy to_pages(const eviction_policy& policy, std::size_t page_size) noexcept;
 
-// The most full pages a view keeps at a cycle's end: max_pages less the pages a partial tail page and the next cycle's
-// tokens fill, nullopt without max_pages.
-std::optional<std::size_t> full_page_cap(const page_eviction_policy& policy, std::size_t page_size) noexcept;
+// The most full pages a view keeps at a cycle's end with tail_tokens tokens after its full pages, so that the view holds
+// at most max_pages * page_size tokens at the next cycle's end: floor((max_pages * page_size - tail_tokens -
+// cycle_tokens) / page_size), 0 when that is negative, nullopt without max_pages.
+std::optional<std::size_t>
+full_page_cap(const page_eviction_policy& policy, std::size_t page_size, std::size_t tail_tokens) noexcept;
 
 void add_sample(moments& m, double x) noexcept;
 
@@ -77,9 +81,10 @@ void add_sampled_page(
 // threshold 0 or below max(2, min_samples) samples, +inf at threshold 1.
 double score_threshold(const moments& score_moments, double threshold, std::size_t min_samples) noexcept;
 
-// The view indices of the full pages a cycle's end evicts from a KV layer, ascending. mass_sum holds n_q_heads values
-// per full page and weight_sum one; density_moments holds one per head. A page without a score is kept. The policy's
-// eviction_warmup is the min_samples of page_score and score_threshold.
+// The view indices of the full pages a cycle's end evicts from a KV layer, ascending, the view holding tail_tokens tokens
+// after its full pages. mass_sum holds n_q_heads values per full page and weight_sum one; density_moments holds one per
+// head. A page without a score is kept. The policy's eviction_warmup is the min_samples of page_score and
+// score_threshold.
 std::vector<std::size_t> pages_to_evict(
     std::span<const float> mass_sum,
     std::span<const float> weight_sum,
@@ -87,10 +92,11 @@ std::vector<std::size_t> pages_to_evict(
     std::span<const moments> density_moments,
     const moments& score_moments,
     std::size_t page_size,
+    std::size_t tail_tokens,
     const page_eviction_policy& policy
 );
 
-// The scores of s's KV layers whose pages hold a mass_sum, under policy.
+// The scores of s's KV layers whose pages hold a mass_sum, under policy, whose max_context_capacity is not negative.
 eviction_report make_eviction_report(const state& s, const eviction_policy& policy, std::size_t page_size);
 
 }  // namespace pulsarlm

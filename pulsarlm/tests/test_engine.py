@@ -510,7 +510,10 @@ def test_the_eviction_report_scores_every_page_of_a_layer_measuring_mass():
     async def main():
         engine = make_engine(MemoryStore(asyncio.get_running_loop()))
         eviction = EvictionPolicy(
-            cycle_tokens=PAGE_SIZE, max_context_window=8 * PAGE_SIZE
+            n_sink=PAGE_SIZE,
+            n_working=PAGE_SIZE,
+            cycle_tokens=PAGE_SIZE,
+            max_context_capacity=8 * PAGE_SIZE,
         )
         _, _, end = await run(
             engine, *submit(engine, PROMPT, max_tokens=8, eviction=eviction)

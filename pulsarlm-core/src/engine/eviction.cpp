@@ -77,9 +77,10 @@ double normal_quantile(double p) noexcept {
 }  // namespace
 
 page_eviction_policy to_pages(const eviction_policy& policy, std::size_t page_size) noexcept {
+    assert(policy.max_context_capacity >= 0);
     std::optional<std::size_t> max_pages;
-    if (policy.max_context_window) {
-        max_pages = *policy.max_context_window / page_size;
+    if (policy.max_context_capacity > 0) {
+        max_pages = ceil_div(static_cast<std::size_t>(policy.max_context_capacity), page_size);
     }
     return page_eviction_policy{
         .n_sink = ceil_div(policy.n_sink, page_size),
@@ -93,12 +94,14 @@ page_eviction_policy to_pages(const eviction_policy& policy, std::size_t page_si
     };
 }
 
-std::optional<std::size_t> full_page_cap(const page_eviction_policy& policy, std::size_t page_size) noexcept {
+std::optional<std::size_t>
+full_page_cap(const page_eviction_policy& policy, std::size_t page_size, std::size_t tail_tokens) noexcept {
     if (!policy.max_pages) {
         return std::nullopt;
     }
-    std::size_t next_cycle_pages = ceil_div(policy.cycle_tokens + page_size - 1, page_size);
-    return *policy.max_pages > next_cycle_pages ? *policy.max_pages - next_cycle_pages : 0;
+    std::size_t capacity_tokens = *policy.max_pages * page_size;
+    std::size_t reserved_tokens = tail_tokens + policy.cycle_tokens;
+    return capacity_tokens > reserved_tokens ? (capacity_tokens - reserved_tokens) / page_size : 0;
 }
 
 bool page_eviction_policy::can_evict() const noexcept {
@@ -198,6 +201,7 @@ std::vector<std::size_t> pages_to_evict(
     std::span<const moments> density_moments,
     const moments& score_moments,
     std::size_t page_size,
+    std::size_t tail_tokens,
     const page_eviction_policy& policy
 ) {
     assert(policy.n_working >= 1 && n_q_heads >= 1 && mass_sum.size() == weight_sum.size() * n_q_heads);
@@ -223,7 +227,7 @@ std::vector<std::size_t> pages_to_evict(
         }
     }
 
-    if (std::optional<std::size_t> cap = full_page_cap(policy, page_size)) {
+    if (std::optional<std::size_t> cap = full_page_cap(policy, page_size, tail_tokens)) {
         for (std::size_t page = policy.n_sink; page < first_protected && page_count - evicted_count > *cap; page++) {
             if (!evicted[page]) {
                 evicted[page] = true;
@@ -243,7 +247,7 @@ std::vector<std::size_t> pages_to_evict(
 
 eviction_report make_eviction_report(const state& s, const eviction_policy& policy, std::size_t page_size) {
     page_eviction_policy pages = to_pages(policy, page_size);
-    std::optional<std::size_t> cap = full_page_cap(pages, page_size);
+    std::optional<std::size_t> cap = full_page_cap(pages, page_size, s.tail.size());
     eviction_report report{.cap_tokens = cap ? std::optional(*cap * page_size) : std::nullopt, .layers = {}};
     for (std::size_t layer = 0; layer < s.layers.size(); layer++) {
         const layer_sequence& sequence = s.layers[layer];

@@ -291,7 +291,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
                         std::size_t n_working,
                         std::size_t cycle_tokens,
                         std::optional<std::size_t> mass_tokens,
-                        std::optional<std::size_t> max_context_window,
+                        std::int64_t max_context_capacity,
                         double eviction_threshold,
                         std::size_t eviction_warmup,
                         double attention_mass_decay) {
@@ -300,7 +300,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
                     n_working,
                     cycle_tokens,
                     mass_tokens,
-                    max_context_window,
+                    max_context_capacity,
                     eviction_threshold,
                     eviction_warmup,
                     attention_mass_decay
@@ -311,7 +311,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "n_working"_a = eviction_policy{}.n_working,
             "cycle_tokens"_a = eviction_policy{}.cycle_tokens,
             "mass_tokens"_a = eviction_policy{}.mass_tokens,
-            "max_context_window"_a = eviction_policy{}.max_context_window,
+            "max_context_capacity"_a = eviction_policy{}.max_context_capacity,
             "eviction_threshold"_a = eviction_policy{}.eviction_threshold,
             "eviction_warmup"_a = eviction_policy{}.eviction_warmup,
             "attention_mass_decay"_a = eviction_policy{}.attention_mass_decay
@@ -320,7 +320,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
         .def_readwrite("n_working", &eviction_policy::n_working)
         .def_readwrite("cycle_tokens", &eviction_policy::cycle_tokens)
         .def_readwrite("mass_tokens", &eviction_policy::mass_tokens)
-        .def_readwrite("max_context_window", &eviction_policy::max_context_window)
+        .def_readwrite("max_context_capacity", &eviction_policy::max_context_capacity)
         .def_readwrite("eviction_threshold", &eviction_policy::eviction_threshold)
         .def_readwrite("eviction_warmup", &eviction_policy::eviction_warmup)
         .def_readwrite("attention_mass_decay", &eviction_policy::attention_mass_decay);

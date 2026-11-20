@@ -503,6 +503,7 @@ std::vector<std::size_t> request_state::pages_to_evict(std::size_t layer) const 
         view.density_moments,
         view.score_moments,
         layout.page_size,
+        tail.size(),
         eviction
     );
 }

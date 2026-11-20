@@ -21,6 +21,7 @@
 #include <latch>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -405,29 +406,107 @@ TEST_CASE("submit rejects an invalid request without calling its callbacks") {
     REQUIRE(!recorded_results->end);
 }
 
-TEST_CASE("submit rejects a request whose context window exceeds the engine's without calling its callbacks") {
+TEST_CASE("submit rejects a request whose context capacity exceeds the engine's window without calling its callbacks") {
     pulsarlm::engine e(std::make_unique<successor_model>(), vocab, config(16), std::make_unique<stalling_store>());
     auto recorded_results = std::make_shared<request_results>();
 
     REQUIRE_THROWS_AS(
-        e.submit(request{.tokens = {1}, .eviction = {.max_context_window = 4097}}, record_into(recorded_results)),
+        e.submit(
+            request{.tokens = {1}, .eviction = {.n_sink = 0, .n_working = 4, .max_context_capacity = 4097}},
+            record_into(recorded_results)
+        ),
         std::invalid_argument
     );
     REQUIRE(recorded_results->tokens.empty());
     REQUIRE(!recorded_results->end);
 }
 
-TEST_CASE("a request whose context window is the engine's is served") {
+TEST_CASE("a request whose context capacity is the engine's window is served") {
     pulsarlm::engine e(std::make_unique<successor_model>(), vocab, config(16), std::make_unique<stalling_store>());
     auto recorded_results = std::make_shared<request_results>();
     e.submit(
-        request{.tokens = {1, 2, 3}, .max_tokens = 4, .eviction = {.max_context_window = 4096}},
+        request{
+            .tokens = {1, 2, 3},
+            .max_tokens = 4,
+            .eviction = {.n_sink = 0, .n_working = 4, .max_context_capacity = 4096}
+        },
         record_into(recorded_results)
     );
     wait_for_end(*recorded_results);
 
     REQUIRE(recorded_results->tokens == token_list{4, 5, 6, 7});
     REQUIRE(recorded_results->end->has_value());
+    REQUIRE(e.exception() == nullptr);
+}
+
+// The full pages of 4 sink and 4 working tokens, a tail of 3 tokens and a cycle of 5 take 16 tokens, more than the 3
+// pages of 12 tokens.
+TEST_CASE("submit rejects a request whose context capacity cannot hold its protected pages, a tail and a cycle") {
+    pulsarlm::engine e(std::make_unique<successor_model>(), vocab, config(16), std::make_unique<stalling_store>());
+    auto recorded_results = std::make_shared<request_results>();
+
+    REQUIRE_THROWS_AS(
+        e.submit(
+            request{
+                .tokens = {1},
+                .eviction = {.n_sink = 4, .n_working = 4, .cycle_tokens = 5, .max_context_capacity = 12}
+            },
+            record_into(recorded_results)
+        ),
+        std::invalid_argument
+    );
+    REQUIRE(recorded_results->tokens.empty());
+    REQUIRE(!recorded_results->end);
+}
+
+// 13 tokens round up to the 4 pages that hold 4 sink and 4 working tokens, a tail of 3 tokens and a cycle of 5.
+TEST_CASE("a request whose context capacity just holds its protected pages, a tail and a cycle is served") {
+    pulsarlm::engine e(std::make_unique<successor_model>(), vocab, config(16), std::make_unique<stalling_store>());
+    auto recorded_results = std::make_shared<request_results>();
+    e.submit(
+        request{
+            .tokens = {1, 2, 3},
+            .max_tokens = 30,
+            .eviction = {.n_sink = 4, .n_working = 4, .cycle_tokens = 5, .max_context_capacity = 13}
+        },
+        record_into(recorded_results)
+    );
+    wait_for_end(*recorded_results);
+
+    token_list expected(30);
+    std::iota(expected.begin(), expected.end(), 4);
+    REQUIRE(recorded_results->tokens == expected);
+    REQUIRE(recorded_results->end->has_value());
+    REQUIRE(e.exception() == nullptr);
+}
+
+TEST_CASE("a negative context capacity evicts as a capacity of the engine's window") {
+    pulsarlm::engine_config windowed = config(16);
+    windowed.max_context_window = 16;
+    pulsarlm::engine e(std::make_unique<successor_model>(), vocab, windowed, std::make_unique<stalling_store>());
+    pulsarlm::eviction_policy negative{.n_sink = 0, .n_working = 4, .cycle_tokens = 4, .max_context_capacity = -1};
+    pulsarlm::eviction_policy window = negative;
+    window.max_context_capacity = 16;
+    pulsarlm::eviction_policy uncapped = negative;
+    uncapped.max_context_capacity = 0;
+    REQUIRE(e.eviction_report_of(pulsarlm::state{}, negative).cap_tokens == std::optional<std::size_t>(12));
+    REQUIRE(e.eviction_report_of(pulsarlm::state{}, window).cap_tokens == std::optional<std::size_t>(12));
+
+    std::vector<std::shared_ptr<request_results>> recorded;
+    for (const pulsarlm::eviction_policy& policy : {negative, window, uncapped}) {
+        recorded.push_back(std::make_shared<request_results>());
+        e.submit(request{.tokens = {1, 2, 3}, .max_tokens = 40, .eviction = policy}, record_into(recorded.back()));
+        wait_for_end(*recorded.back());
+    }
+
+    token_list expected(40);
+    std::iota(expected.begin(), expected.end(), 4);
+    REQUIRE(recorded[0]->tokens == expected);
+    REQUIRE(recorded[0]->end->has_value());
+    REQUIRE(recorded[1]->end->has_value());
+    REQUIRE((recorded[0]->end->value().head == recorded[1]->end->value().head));
+    REQUIRE((recorded[0]->end->value().layers == recorded[1]->end->value().layers));
+    REQUIRE(ended_with(*recorded[2], request_error::context_exceeded));
     REQUIRE(e.exception() == nullptr);
 }
 

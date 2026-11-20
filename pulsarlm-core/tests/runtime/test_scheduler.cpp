@@ -1830,17 +1830,17 @@ TEST_CASE("a request resumes with the mass sums and moments of its initial state
 TEST_CASE("a cycle's end evicts the oldest pages down to max_pages") {
     fixture f(16);
     token_list prompt{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
-    pulsarlm::eviction_policy policy{.n_sink = 0, .n_working = 4, .cycle_tokens = 16, .max_context_window = 28};
+    pulsarlm::eviction_policy policy{.n_sink = 0, .n_working = 4, .cycle_tokens = 16, .max_context_capacity = 28};
     std::vector<request_results> results = serve_all(
         f.sched,
         {request{.tokens = prompt, .max_tokens = 2, .eviction = policy}}
     );
 
     std::vector<digest> chain = pulsarlm::make_page_digests(request_root(policy), prompt, page_size);
-    token_list kept_tokens(prompt.begin() + 8, prompt.end());
+    token_list kept_tokens(prompt.begin() + 4, prompt.end());
     std::int64_t first = continuation(prompt, 1)[0];
     REQUIRE(results[0].tokens == token_list{first, continuation(concat(kept_tokens, {first}), 1)[0]});
-    REQUIRE((hashes_of(*results[0].cycle_ends[0].state) == std::vector{chain[2], chain[3]}));
+    REQUIRE((hashes_of(*results[0].cycle_ends[0].state) == std::vector{chain[1], chain[2], chain[3]}));
 }
 
 TEST_CASE("a prompt longer than the cache fits when each cycle evicts down to max_pages") {
@@ -1852,7 +1852,7 @@ TEST_CASE("a prompt longer than the cache fits when each cycle evicts down to ma
         {request{
             .tokens = prompt,
             .max_tokens = 2,
-            .eviction = {.n_sink = 0, .n_working = 4, .cycle_tokens = 8, .max_context_window = 20}
+            .eviction = {.n_sink = 0, .n_working = 4, .cycle_tokens = 8, .max_context_capacity = 16}
         }}
     );
 
@@ -1873,7 +1873,7 @@ TEST_CASE("a request that needs every line of the pool peaks at the whole pool")
         {request{
             .tokens = prompt,
             .max_tokens = 2,
-            .eviction = {.n_sink = 0, .n_working = 4, .cycle_tokens = 8, .max_context_window = 20}
+            .eviction = {.n_sink = 0, .n_working = 4, .cycle_tokens = 8, .max_context_capacity = 16}
         }}
     );
 
@@ -2060,24 +2060,24 @@ TEST_CASE("a request resumed on another cache fetches only the window's pages of
 TEST_CASE("a sliding layer keeps the pages its window reaches whatever the full-attention layer evicts") {
     std::vector<pulsarlm::kv_layer> layers{
         pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .n_q_heads = 1},
-        pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .sliding_window = 9},
+        pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .sliding_window = 13},
     };
     fixture f(16, 64, {}, {}, layers);
     token_list prompt(16);
     std::iota(prompt.begin(), prompt.end(), 1);
-    pulsarlm::eviction_policy policy{.n_sink = 0, .n_working = 4, .cycle_tokens = 16, .max_context_window = 24};
+    pulsarlm::eviction_policy policy{.n_sink = 0, .n_working = 4, .cycle_tokens = 16, .max_context_capacity = 24};
     std::vector<request_results> results = serve_all(
         f.sched,
         {request{.tokens = prompt, .max_tokens = 2, .eviction = policy}}
     );
 
     std::vector<digest> chain = pulsarlm::make_page_digests(request_root(policy), prompt, page_size);
-    token_list kept_tokens(prompt.begin() + 12, prompt.end());
+    token_list kept_tokens(prompt.begin() + 8, prompt.end());
     std::int64_t first = continuation(prompt, 1)[0];
     REQUIRE(results[0].tokens == token_list{first, continuation(concat(kept_tokens, {first}), 1)[0]});
     const pulsarlm::state& reached = *results[0].cycle_ends[0].state;
-    REQUIRE((hashes_of(reached, 0) == std::vector{chain[3]}));
-    REQUIRE((hashes_of(reached, 1) == std::vector{chain[2], chain[3]}));
+    REQUIRE((hashes_of(reached, 0) == std::vector{chain[2], chain[3]}));
+    REQUIRE((hashes_of(reached, 1) == std::vector{chain[1], chain[2], chain[3]}));
 }
 
 TEST_CASE("each full-attention layer evicts by its own attention mass") {
@@ -2281,7 +2281,7 @@ TEST_CASE("a recurrent layer's state covers the pages eviction drops") {
     fixture f(16, 64, {}, {}, recurrent_and_full);
     token_list prompt(16);
     std::iota(prompt.begin(), prompt.end(), 1);
-    pulsarlm::eviction_policy policy{.n_sink = 0, .n_working = 4, .cycle_tokens = 16, .max_context_window = 28};
+    pulsarlm::eviction_policy policy{.n_sink = 0, .n_working = 4, .cycle_tokens = 16, .max_context_capacity = 28};
     std::vector<request_results> results = serve_all(
         f.sched,
         {request{.tokens = prompt, .max_tokens = 2, .eviction = policy}}
@@ -2290,7 +2290,7 @@ TEST_CASE("a recurrent layer's state covers the pages eviction drops") {
     REQUIRE(results[0].tokens == continuation(prompt, 2));
     std::vector<digest> chain = pulsarlm::make_page_digests(request_root(policy), prompt, page_size);
     const pulsarlm::state& reached = *results[0].cycle_ends[0].state;
-    REQUIRE((hashes_of(reached, 1) == std::vector{chain[2], chain[3]}));
+    REQUIRE((hashes_of(reached, 1) == std::vector{chain[1], chain[2], chain[3]}));
     REQUIRE((hashes_of(reached, 0) == std::vector{chain[3]}));
     REQUIRE(stored_state(f, chain[3]) == sum_of_first(prompt, 16));
 }
@@ -2585,6 +2585,27 @@ TEST_CASE("a stored state whose view is wider than the page tables ends the requ
     REQUIRE(f.model.forward_count == 0);
     REQUIRE(f.store->fetches.empty());
     REQUIRE(f.store->releases == f.store->leases);
+}
+
+// A capacity of 13 tokens gives 4 pages, which the views never outgrow: the page tables hold 4 columns, one fewer
+// than an engine with max_context_window 13 gives them. The cycles end at tails of 1, 2, 3 and 0 tokens.
+TEST_CASE("a request evicting by capacity generates far past it without outgrowing its page tables") {
+    fixture f(16, 64, {}, {}, two_full_layers, std::nullopt, 4096, 64, 4);
+    token_list prompt{1, 2, 3};
+    pulsarlm::eviction_policy policy{.n_sink = 0, .n_working = 1, .cycle_tokens = 5, .max_context_capacity = 13};
+    std::vector<request_results> results = serve_all(
+        f.sched,
+        {request{.tokens = prompt, .max_tokens = 60, .eviction = policy}}
+    );
+
+    REQUIRE(results[0].tokens.size() == 60);
+    REQUIRE(results[0].end->has_value());
+    REQUIRE(results[0].cycle_ends.size() == 12);
+    for (const pulsarlm::cycle_end& ended : results[0].cycle_ends) {
+        for (std::size_t layer = 0; layer < 2; layer++) {
+            REQUIRE(hashes_of(*ended.state, layer).size() * page_size + ended.state->tail.size() + 5 <= 4 * page_size);
+        }
+    }
 }
 
 }  // namespace

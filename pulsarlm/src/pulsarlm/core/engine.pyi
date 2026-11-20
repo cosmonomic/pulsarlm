@@ -218,11 +218,14 @@ class SamplingParams:
     ) -> None: ...
 
 class EvictionPolicy:
+    """max_context_capacity caps the view, in tokens: 0 evicts nothing by
+    capacity, and a negative value uses the engine's max_context_window."""
+
     n_sink: int
     n_working: int
     cycle_tokens: int
     mass_tokens: int | None
-    max_context_window: int | None
+    max_context_capacity: int
     eviction_threshold: float
     eviction_warmup: int
     attention_mass_decay: float
@@ -233,7 +236,7 @@ class EvictionPolicy:
         n_working: int = 8192,
         cycle_tokens: int = 512,
         mass_tokens: int | None = None,
-        max_context_window: int | None = None,
+        max_context_capacity: int = 0,
         eviction_threshold: float = 0.0,
         eviction_warmup: int = 1,
         attention_mass_decay: float = 1.0 / 256,
@@ -257,8 +260,8 @@ class LayerScores:
 class EvictionReport:
     @property
     def cap_tokens(self) -> int | None:
-        """The most full-page tokens a view keeps at a cycle's end; None without
-        max_context_window."""
+        """The most full-page tokens a view with the state's tail keeps at a
+        cycle's end; None without a max_context_capacity above 0."""
     @property
     def layers(self) -> list[LayerScores]:
         """The layers whose pages hold attention mass."""
@@ -477,12 +480,15 @@ class Engine:
         root without it, from the newest state the store holds for a prefix of
         them, and writes every state the request reaches to the store. Raises
         ValueError for a request the engine cannot serve, such as one whose
-        eviction.max_context_window exceeds the engine's. Request.take calls
-        on_prefill, on_cycle and on_end on its caller's thread."""
+        eviction.max_context_capacity exceeds the engine's max_context_window or
+        cannot hold the pages of its n_sink and n_working tokens and a cycle.
+        Request.take calls on_prefill, on_cycle and on_end on its caller's
+        thread."""
     def eviction_report_of(
         self, state: State, eviction: EvictionPolicy
     ) -> EvictionReport:
-        """The scores a cycle's end under eviction would evict state's pages by."""
+        """The scores a cycle's end under eviction would evict state's pages by,
+        a negative max_context_capacity taken as the engine's max_context_window."""
     def stat(self) -> EngineStat: ...
     def fileno(self) -> int:
         """An eventfd that becomes readable when a request has results to take."""

@@ -60,8 +60,8 @@ digest make_root_digest(std::string_view model_name, std::string_view model_hash
 // The digest a request's page chain starts from. Under a policy that can evict, a page's KV also depends on when and
 // what the policy evicts, so the root is the digest of engine_root's bytes followed by the policy's n_sink, n_working,
 // cycle_tokens, mass_tokens, whether it has max_pages and max_pages (0 without), eviction_threshold, eviction_warmup and
-// attention_mass_decay, each as 8 little-endian bytes, the doubles by their bit patterns. A policy that cannot evict
-// keeps every page, so its root is engine_root.
+// attention_mass_decay, then, with max_pages, the version of full_page_cap's fill rule, 1, each as 8 little-endian
+// bytes, the doubles by their bit patterns. A policy that cannot evict keeps every page, so its root is engine_root.
 digest make_request_root_digest(const digest& engine_root, const page_eviction_policy& policy);
 
 // The key of KV layer layer's page in the store: the digest of the page's digest bytes followed by layer as 8

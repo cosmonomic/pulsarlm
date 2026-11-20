@@ -330,6 +330,11 @@ class EvictionLog:
                 f.seek(self._offset)
                 while (raw := f.readline()).endswith("\n"):
                     line = json.loads(raw)
+                    if any("cap_tokens" not in state for state in line["states"]):
+                        raise RuntimeError(
+                            f"{self._path} was written before eviction logs recorded"
+                            " a cap per state; regenerate it"
+                        )
                     self._lines[line["id"]] = line
                     self._offset = f.tell()
         return self._lines.pop(completion_id)
@@ -362,16 +367,11 @@ def eviction_view(
         "in_view": sum(b - a for view in views for a, b in view)
         / (len(views) * end["tokens"]),
         "needles_kept": [kept_fraction(spans) for spans in prompt.needle_spans],
-        "needle_evictions": [
-            evictions(states, spans, line["cap_tokens"])
-            for spans in prompt.needle_spans
-        ],
+        "needle_evictions": [evictions(states, spans) for spans in prompt.needle_spans],
     }
 
 
-def evictions(
-    states: list[dict[str, Any]], spans: list[Span], cap_tokens: int | None
-) -> list[dict[str, Any]]:
+def evictions(states: list[dict[str, Any]], spans: list[Span]) -> list[dict[str, Any]]:
     """Each layer's eviction of a needle occurrence between consecutive states:
     the tokens of the state after it, the highest score the occurrence's evicted
     pages had in the state before it (None when none had one), the layer's
@@ -405,7 +405,7 @@ def evictions(
                         "tokens": after["tokens"],
                         "score": max(scores, default=None),
                         "threshold": layer["threshold"],
-                        "cap_acted": full_tokens == cap_tokens,
+                        "cap_acted": full_tokens == after["cap_tokens"],
                     }
                 )
     return found

@@ -56,7 +56,17 @@ void check_attention(const engine_config& config, std::span<const kv_layer> laye
     }
 }
 
-void validate(const request& r, std::size_t vocab_size, std::size_t max_context_window) {
+eviction_policy resolved(const eviction_policy& policy, std::size_t max_context_window) {
+    eviction_policy resolved_policy = policy;
+    if (resolved_policy.max_context_capacity < 0) {
+        resolved_policy.max_context_capacity = static_cast<std::int64_t>(max_context_window);
+    }
+    return resolved_policy;
+}
+
+// r's eviction policy is resolved. A capacity above 0 must leave room for the protected full pages at a cycle's end
+// whatever its tail, full_page_cap being least at a tail of page_size - 1 tokens.
+void validate(const request& r, std::size_t vocab_size, std::size_t max_context_window, std::size_t page_size) {
     if (r.tokens.empty()) {
         throw std::invalid_argument("the request has no token to forward");
     }
@@ -86,12 +96,26 @@ void validate(const request& r, std::size_t vocab_size, std::size_t max_context_
             std::format("eviction.eviction_threshold {} is outside [0, 1]", r.eviction.eviction_threshold)
         );
     }
-    if (r.eviction.max_context_window && *r.eviction.max_context_window > max_context_window) {
+    if (r.eviction.max_context_capacity > static_cast<std::int64_t>(max_context_window)) {
         throw std::invalid_argument(
             std::format(
-                "eviction.max_context_window {} exceeds the engine's max_context_window {}",
-                *r.eviction.max_context_window,
+                "eviction.max_context_capacity {} exceeds the engine's max_context_window {}",
+                r.eviction.max_context_capacity,
                 max_context_window
+            )
+        );
+    }
+    page_eviction_policy pages = to_pages(r.eviction, page_size);
+    std::optional<std::size_t> least_cap = full_page_cap(pages, page_size, page_size - 1);
+    if (least_cap && *least_cap < pages.n_sink + pages.n_working) {
+        throw std::invalid_argument(
+            std::format(
+                "eviction.max_context_capacity {} cannot hold the pages of n_sink {} and n_working {} tokens and a "
+                "cycle of cycle_tokens {}",
+                r.eviction.max_context_capacity,
+                r.eviction.n_sink,
+                r.eviction.n_working,
+                r.eviction.cycle_tokens
             )
         );
     }
@@ -491,7 +515,8 @@ void engine::run_worker_loop(std::size_t shard) {
 // A submit racing the loop's exit finds loop null; the task is then destroyed without running, and the
 // executor::unstarted_callbacks in its frame ends the callbacks with loop_exited.
 void engine::submit(request&& r, std::unique_ptr<request_callbacks> callbacks) {
-    validate(r, vocab_size, max_context_window);
+    r.eviction = resolved(r.eviction, max_context_window);
+    validate(r, vocab_size, max_context_window, page_size);
     task<void> serving = sched.submit(std::move(r), std::move(callbacks));
     std::lock_guard lock(mutex);
     if (loop != nullptr) {
@@ -517,7 +542,7 @@ engine_stat engine::stat() const {
 }
 
 eviction_report engine::eviction_report_of(const state& s, const eviction_policy& policy) const {
-    return make_eviction_report(s, policy, page_size);
+    return make_eviction_report(s, resolved(policy, max_context_window), page_size);
 }
 
 }  // namespace pulsarlm

@@ -377,7 +377,7 @@ def test_the_eviction_log_without_eviction_views_every_full_page(tmp_path):
     assert line["id"] == body["id"]
     assert line["prompt_tokens"] == len(prompt)
     assert line["prompt_sha256"] == prompt_sha256(prompt)
-    assert line["cap_tokens"] is None
+    assert all(state["cap_tokens"] is None for state in line["states"])
     end = line["states"][-1]
     assert [layer["layer"] for layer in end["layers"]] == list(range(N_LAYERS))
     full = end["tokens"] // PAGE_SIZE * PAGE_SIZE
@@ -393,18 +393,18 @@ def test_the_eviction_log_leaves_out_evicted_pages(tmp_path):
     eviction = EvictionPolicy(
         n_working=PAGE_SIZE,
         cycle_tokens=PAGE_SIZE,
-        max_context_window=7 * PAGE_SIZE,
+        max_context_capacity=7 * PAGE_SIZE,
     )
     with api_client(logging_eviction(log, eviction)) as client:
         post(client, messages=MESSAGES, max_tokens=120)
 
     [line] = read_log(log)
-    assert line["cap_tokens"] == 5 * PAGE_SIZE
     *cycle_ends, end = line["states"]
     for state in cycle_ends:
+        assert state["cap_tokens"] == 6 * PAGE_SIZE
         for layer in state["layers"]:
             in_view = sum(stop - start for start, stop, _ in layer["pages"])
-            assert in_view <= line["cap_tokens"]
+            assert in_view <= state["cap_tokens"]
     full = end["tokens"] // PAGE_SIZE * PAGE_SIZE
     assert [layer["layer"] for layer in end["layers"]] == list(range(N_LAYERS))
     for layer in end["layers"]:

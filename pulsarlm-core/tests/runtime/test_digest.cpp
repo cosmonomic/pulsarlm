@@ -6,6 +6,9 @@
 #undef CHECK
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
+#include <bit>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -19,6 +22,28 @@ using pulsarlm::digest;
 constexpr pulsarlm::page_shape shape{.n_layers = 2, .page_size = 4, .n_kv_heads = 2, .head_dim = 8, .dtype = at::kHalf};
 
 const digest parent{.hi = 1, .lo = 2};
+
+void append_u64(std::vector<std::byte>& seed, std::uint64_t value) {
+    auto bytes = std::bit_cast<std::array<std::byte, sizeof(value)>>(value);
+    seed.insert(seed.end(), bytes.begin(), bytes.end());
+}
+
+// The bytes make_request_root_digest hashed before the fill rule's version joined them.
+std::vector<std::byte> unversioned_seed(const digest& engine_root, const pulsarlm::page_eviction_policy& policy) {
+    std::vector<std::byte> seed;
+    append_u64(seed, engine_root.hi);
+    append_u64(seed, engine_root.lo);
+    append_u64(seed, policy.n_sink);
+    append_u64(seed, policy.n_working);
+    append_u64(seed, policy.cycle_tokens);
+    append_u64(seed, policy.mass_tokens);
+    append_u64(seed, policy.max_pages.has_value());
+    append_u64(seed, policy.max_pages.value_or(0));
+    append_u64(seed, std::bit_cast<std::uint64_t>(policy.eviction_threshold));
+    append_u64(seed, policy.eviction_warmup);
+    append_u64(seed, std::bit_cast<std::uint64_t>(policy.attention_mass_decay));
+    return seed;
+}
 
 }  // namespace
 
@@ -115,4 +140,28 @@ TEST_CASE("a request's root digest changes with the engine's root and every fiel
         REQUIRE(pulsarlm::make_request_root_digest(parent, other) != root);
     }
     REQUIRE(pulsarlm::make_request_root_digest(digest{.hi = 1, .lo = 3}, policy) != root);
+}
+
+TEST_CASE("a request's root digest covers the fill rule's version only under a policy with max_pages") {
+    pulsarlm::page_eviction_policy by_score{
+        .n_sink = 64,
+        .n_working = 512,
+        .cycle_tokens = 512,
+        .mass_tokens = 512,
+        .max_pages = std::nullopt,
+        .eviction_threshold = 0.5,
+        .eviction_warmup = 32,
+        .attention_mass_decay = 1.0 / 256,
+    };
+    REQUIRE(
+        pulsarlm::make_request_root_digest(parent, by_score) ==
+        pulsarlm::make_digest(unversioned_seed(parent, by_score))
+    );
+
+    pulsarlm::page_eviction_policy by_capacity = by_score;
+    by_capacity.max_pages = 4096;
+    std::vector<std::byte> unversioned = unversioned_seed(parent, by_capacity);
+    REQUIRE(pulsarlm::make_request_root_digest(parent, by_capacity) != pulsarlm::make_digest(unversioned));
+    append_u64(unversioned, 1);
+    REQUIRE(pulsarlm::make_request_root_digest(parent, by_capacity) == pulsarlm::make_digest(unversioned));
 }
