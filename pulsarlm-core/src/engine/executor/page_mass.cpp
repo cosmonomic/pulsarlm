@@ -115,8 +115,8 @@ void executor::batch::join_mass(std::span<const shard> shards, const view_layout
 void executor::batch::add_measured_mass(
     std::size_t index,
     request_state& req,
+    std::size_t start_position,
     std::size_t accepted_count,
-    std::size_t end_position,
     const view_layout& layout
 ) const {
     const batch_entry& e = entries[index];
@@ -127,7 +127,7 @@ void executor::batch::add_measured_mass(
     std::vector<std::vector<float>> verified_weight(n_layers);
     if (verifies(index)) {
         std::vector<float> weights(accepted_count);
-        req.fill_query_weights(e.start_position, weights);
+        req.fill_query_weights(start_position, weights);
         step_mass.resize(n_layers);
         for (std::size_t token = 0; token < accepted_count; token++) {
             std::vector<layer_step_mass> token_mass = view_mass(first_view + token, layout);
@@ -158,7 +158,7 @@ void executor::batch::add_measured_mass(
         step_mass_sums.push_back(layer_mass.mass_sum);
         step_weight_sums.push_back(layer_mass.weight_sum);
     }
-    req.add_step_mass(step_mass_sums, step_weight_sums, end_position);
+    req.add_step_mass(step_mass_sums, step_weight_sums, start_position + accepted_count);
 }
 
 }  // namespace pulsarlm

@@ -1448,6 +1448,7 @@ TEST_CASE("a request whose loop exits while its start reads the stored state end
     REQUIRE(store->leases.empty());
 }
 
+// The second request finds one free line for the 2 pages of its prefill step and ends with oom at that step's prologue.
 TEST_CASE("a request that finds too few free lines ends with oom without waiting") {
     fixture f(3);
     token_list first{1, 2, 3, 4, 5};
@@ -1487,7 +1488,9 @@ TEST_CASE("a request that outgrows the cache alone ends with oom") {
     REQUIRE(ended_error(results[0]) == request_error::oom);
 }
 
-TEST_CASE("a running request that finds too few free lines for its next cycle ends with oom") {
+// Each request takes a line at the step that first writes into a page. The second request finds none for its step
+// forwarding position 8 and ends with oom after the 5 tokens of the steps before, while the first produces all of its.
+TEST_CASE("a running request whose step finds too few free lines ends with oom after the tokens before it") {
     fixture f(5);
     token_list first{1, 2, 3, 4};
     token_list second{5, 6, 7, 8};
@@ -2111,8 +2114,10 @@ const std::vector<pulsarlm::kv_layer> full_and_wide_sliding{
     pulsarlm::kv_layer{.n_kv_heads = 2, .head_dim = 2, .sliding_window = 5},
 };
 
-// The request peaks at 8 full-attention lines of 64 bytes and 5 sliding lines of 128 bytes: the window's page and a
-// 16-token cycle's 4 pages. A split sizing the sliding layer for ceil(5 / 4) + 1 lines per request would not serve it.
+// The request peaks at 768 bytes: its prefill step writes 4 full-attention lines of 64 bytes and 4 sliding lines of 128
+// bytes, and its last step holds 8 full-attention lines and the window's 2 sliding lines. A split sizing the sliding
+// layer for ceil(5 / 4) + 1 lines per request would not serve it. A pool one full-attention line smaller ends the
+// request with oom at the prologue of its prefill step, before any token.
 TEST_CASE("the pool gives each line size the lines its layers need") {
     token_list prompt(16);
     std::iota(prompt.begin(), prompt.end(), 1);
@@ -2121,10 +2126,12 @@ TEST_CASE("the pool gives each line size the lines its layers need") {
         return serve_all(f.sched, {request{.tokens = prompt, .max_tokens = 16, .eviction = {.cycle_tokens = 16}}})[0];
     };
 
-    request_results served = serve_in(8 * 64 + 5 * 128);
+    request_results served = serve_in(4 * 64 + 4 * 128);
     REQUIRE(served.tokens == continuation(prompt, 16));
     REQUIRE(hashes_of(ended_state(served)).size() == 7);
-    REQUIRE(ended_error(serve_in(7 * 64 + 5 * 128)) == request_error::oom);
+    request_results starved = serve_in(3 * 64 + 4 * 128);
+    REQUIRE(starved.tokens.empty());
+    REQUIRE(ended_error(starved) == request_error::oom);
 }
 
 TEST_CASE("a state's sliding layer holds the pages its window reaches from the tail") {
@@ -2654,8 +2661,8 @@ TEST_CASE("a waiting request whose callbacks are cancelled ends with cancelled a
     REQUIRE(f.store->releases == f.store->leases);
 }
 
-// Each cycle of 8 tokens adds 2 lines to the views, which hold at most 5 pages: the lines for the cycle ending at 24
-// would make 6, so the request ends at the write-back of the step that reaches 16, having sampled 14 tokens.
+// The views hold at most 5 pages, positions 0 to 19: the step forwarding position 20 would take a sixth line, so the
+// request ends at its prologue, having sampled the 18 tokens of the steps before.
 TEST_CASE("a request whose view would grow past the page tables ends with context_exceeded and its tokens") {
     fixture f(64, 64, {}, {}, two_full_layers, std::nullopt, 4096, 64, 5);
     token_list prompt{1, 2, 3};
@@ -2664,13 +2671,13 @@ TEST_CASE("a request whose view would grow past the page tables ends with contex
         {request{.tokens = prompt, .max_tokens = 100, .eviction = {.cycle_tokens = 8}}}
     );
 
-    REQUIRE(results[0].tokens == continuation(prompt, 14));
+    REQUIRE(results[0].tokens == continuation(prompt, 18));
     REQUIRE(ended_error(results[0]) == request_error::context_exceeded);
     REQUIRE(f.store->releases == f.store->leases);
     REQUIRE(f.exec.kv_cache_bytes() == 0);
 }
 
-// The stored state's 5 pages and the cycle's line make 6 columns, more than the 3 of the page tables.
+// The stored state's 5 pages take 5 columns, more than the 3 of the page tables.
 TEST_CASE("a stored state whose view is wider than the page tables ends the request with context_exceeded") {
     fixture f(16, 64, {}, {}, two_full_layers, std::nullopt, 4096, 64, 3);
     token_list prompt(21);
@@ -2744,7 +2751,8 @@ task<void> run_request_steps(
 }
 
 // The queries' weights come from the GPUs' request tables, which a step launched before the previous step's write-back
-// reads as that step left them.
+// reads as that step left them. A resumed request first serves 14 tokens of eight_pages and 3 samples; its state ends
+// at 16 with no tail, inside the mass window of its cycle ending at 24, so its masses start there.
 TEST_CASE("a request reaches the same page mass at each cycle end whether its steps overlap or not") {
     pulsarlm::eviction_policy policy{
         .n_sink = 4,
@@ -2756,19 +2764,37 @@ TEST_CASE("a request reaches the same page mass at each cycle end whether its st
         .attention_mass_decay = 0.25,
     };
     const std::size_t prefill_tokens_per_step = 5;
+    const bool resumes = GENERATE(false, true);
+    INFO((resumes ? "resumed" : "fresh") << " request");
     auto run = [&](bool overlaps, std::size_t& overlapped_steps) {
         fixture f(64, prefill_tokens_per_step);
         f.model.is_important = [](std::size_t layer, std::int64_t token) { return token % (layer + 3) == 0; };
+        token_list tokens = eight_pages;
+        if (resumes) {
+            const token_list first_prompt(eight_pages.begin(), eight_pages.begin() + 14);
+            const request_results first = serve_all(
+                f.sched,
+                {request{.tokens = first_prompt, .max_tokens = 3, .eviction = policy}}
+            )[0];
+            REQUIRE(ended_state(first).tail.empty());
+            tokens = concat(
+                concat(first_prompt, first.tokens),
+                token_list(eight_pages.begin() + 17, eight_pages.end())
+            );
+        }
         auto recorded_results = std::make_shared<request_results>();
         std::optional<pulsarlm::executor::request_id_type> id = start_request(
             f.exec,
-            request{.tokens = eight_pages, .max_tokens = 40, .eviction = policy},
+            request{.tokens = tokens, .max_tokens = 40, .eviction = policy},
             recorded_results
         );
         REQUIRE(id.has_value());
         event_loop loop;
         loop.spawn(run_request_steps(f.exec, *id, overlaps, prefill_tokens_per_step, overlapped_steps));
         REQUIRE(loop.run() == nullptr);
+        if (resumes) {
+            REQUIRE(recorded_results->statistics.cached_token_count == 16);
+        }
         return *recorded_results;
     };
     std::size_t overlapped_steps = 0;

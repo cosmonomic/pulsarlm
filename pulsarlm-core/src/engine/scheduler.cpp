@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -86,6 +87,11 @@ task<void> scheduler::run() {
             continue;
         }
         co_await exec.launch(scheduled);
+        std::vector<executor::request_id_type> scheduled_ids;
+        for (const executor::scheduled_request& s : scheduled) {
+            scheduled_ids.push_back(s.request_id);
+        }
+        release_exited(scheduled_ids);
         sampled_row_scan_start = next_scan_start;
         if (exec.launched_batch_count() > 1) {
             co_await retire();
@@ -100,8 +106,12 @@ task<void> scheduler::retire() {
             exec.cancel(id);
         }
     }
+    release_exited(stepped);
+}
+
+void scheduler::release_exited(std::span<const executor::request_id_type> ids) {
     std::erase_if(running_requests, [&](executor::request_id_type id) { return exec.has_exited(id); });
-    for (executor::request_id_type id : stepped) {
+    for (executor::request_id_type id : ids) {
         if (exec.has_exited(id) && !exec.is_in_launched_batch(id)) {
             exit_events.at(id).set();
         }

@@ -93,7 +93,7 @@ task<std::optional<executor::request_id_type>> executor::start(request&& r, unst
     request_state& req = requests[id].state;
     // take_lines holds the resident pages before it first suspends, so they are the ones counted here.
     req.record_device_cached_tokens(device_cached_tokens(req));
-    std::expected<void, page_error> line_allocation = co_await take_lines(req, req.cycle_lines());
+    std::expected<void, page_error> line_allocation = co_await take_lines(req);
     if (!line_allocation) {
         release_lines(req);
         store.release(req.lease_id());
@@ -260,7 +260,7 @@ std::size_t executor::device_cached_tokens(const request_state& req) const {
         layout.page_size;
 }
 
-task<std::expected<void, page_error>> executor::take_lines(request_state& req, std::size_t line_count) {
+task<std::expected<void, page_error>> executor::take_lines(request_state& req) {
     std::vector<std::span<const digest>> held_hashes(cache.layer_count());
     for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
         if (!layout.layers[layer].is_recurrent) {
@@ -277,7 +277,7 @@ task<std::expected<void, page_error>> executor::take_lines(request_state& req, s
     if (!page_lines) {
         co_return std::unexpected(page_lines.error());
     }
-    std::vector<std::size_t> counts(cache.layer_count(), line_count);
+    std::vector<std::size_t> counts(cache.layer_count(), 0);
     for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
         if (layout.layers[layer].is_recurrent) {
             // The stored state's copy takes the last slot.
@@ -351,7 +351,7 @@ task<std::expected<void, page_error>> executor::take_lines(request_state& req, s
 std::size_t executor::device_memory(const request_state& req) const noexcept {
     std::size_t bytes = 0;
     for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
-        bytes += req.views()[layer].lines.size() * cache.line_block_bytes(layer);
+        bytes += req.views()[layer].count_held_lines() * cache.line_block_bytes(layer);
     }
     return bytes;
 }

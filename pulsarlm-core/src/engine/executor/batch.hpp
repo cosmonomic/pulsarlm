@@ -42,13 +42,16 @@ struct executor::batch_entry {
     std::size_t query_token_count;
     // The index of the entry's first sample among the step's samples, for an entry that samples.
     std::optional<std::size_t> first_sample_index;
+    // Whether the entry may end its request's cycle (request_state::ends_cycle of its query tokens); the write-back
+    // takes whether it did from the GPU (cycle_end_flags).
     bool ends_cycle;
-    // Whether the step launches the request's last tokens.
+    // Whether the step forwards the request's last tokens.
     bool ends_request = false;
     bool is_measured = false;
     // Whether the write-back stores the request's head state.
     bool stores_head_state = false;
-    // The request's history position and page-table width (request_state::table_width) at the launch.
+    // The request's prepared position bound (request_state::prepared_position_bound) and page-table width
+    // (request_state::table_width) at the step's preparation.
     std::size_t start_position = 0;
     std::size_t table_width = 0;
 
@@ -343,14 +346,16 @@ class executor::batch {
     // The page mass of the mass view view of the step from mass, laid out as join_mass leaves it.
     std::vector<layer_step_mass> view_mass(std::size_t view, const view_layout& layout) const;
     // Adds the page mass of the entry at index, which measures mass and whose request req accepted accepted_count
-    // tokens ending at end_position, to req's layers. layout is the executor's.
+    // tokens from history position start_position, to req's layers. layout is the executor's.
     void add_measured_mass(
         std::size_t index,
         request_state& req,
+        std::size_t start_position,
         std::size_t accepted_count,
-        std::size_t end_position,
         const view_layout& layout
     ) const;
+    // Whether the entry at index reached its request's cycle end, as the GPU reported in cycle_end_flags.
+    bool reaches_cycle_end(std::size_t index) const noexcept;
 
     friend class executor;
 };

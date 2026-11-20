@@ -1013,12 +1013,13 @@ void qwen4_exp_model::write_ngram_ids(
     };
     at::Tensor history = g.history_positions;
     at::Tensor page_ends = at::floor_divide(history + counts, g.page_size) * g.page_size - history;
-    at::Tensor boundary = rows.gather(
-                                  1,
-                                  (1 + at::remainder(at::floor_divide(history + page_ends, g.page_size) - 1, 2))
-                                      .unsqueeze(1)
-    )
-                              .squeeze(1);
+    // A sequence that fills no page rewrites its slot line in place of a boundary line, which may hold no line.
+    at::Tensor boundary = at::where(
+        page_ends > 0,
+        rows.gather(1, (1 + at::remainder(at::floor_divide(history + page_ends, g.page_size) - 1, 2)).unsqueeze(1))
+            .squeeze(1),
+        slot
+    );
     at::Tensor at_page_end = at::where(
         (page_ends > 0).unsqueeze(1),
         window_after(page_ends.clamp_min(0)),

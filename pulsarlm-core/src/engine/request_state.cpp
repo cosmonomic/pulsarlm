@@ -56,6 +56,10 @@ void layer_view::append_lines(std::span<const std::uint32_t> added) {
     weight_sum.resize(lines.size(), 0.0f);
 }
 
+std::size_t layer_view::count_held_lines() const noexcept {
+    return lines.size() - static_cast<std::size_t>(std::ranges::count(lines, no_line));
+}
+
 request_state::request_state(
     request&& r,
     std::shared_ptr<const state>&& initial_state,
@@ -68,6 +72,7 @@ request_state::request_state(
   sampling(r.sampling),
   seed(sampling_seed(r.sampling.seed)),
   max_tokens(r.max_tokens),
+  prompt(std::move(r.tokens)),
   root(root),
   head(initial_state->head),
   prompt_digests(std::move(digests)),
@@ -81,9 +86,11 @@ request_state::request_state(
         resumed_page_count = static_cast<std::size_t>(head_digest - prompt_digests.begin()) + 1;
     }
     prompt_digests.erase(prompt_digests.begin(), prompt_digests.begin() + resumed_page_count);
-    pending_tokens.assign(r.tokens.begin() + resumed_page_count * layout.page_size, r.tokens.end());
-    assert(initial_state->tail.size() < pending_tokens.size());
-    assert(std::ranges::equal(initial_state->tail, std::span(pending_tokens).first(initial_state->tail.size())));
+    const std::span<const std::int64_t> unstored_tokens = std::span(prompt).subspan(
+        resumed_page_count * layout.page_size
+    );
+    assert(initial_state->tail.size() < unstored_tokens.size());
+    assert(std::ranges::equal(initial_state->tail, unstored_tokens.first(initial_state->tail.size())));
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
         layers[layer].mass_heads = layout.layers[layer].mass_heads;
         layers[layer].density_moments.resize(layout.layers[layer].mass_heads);
@@ -114,12 +121,15 @@ request_state::request_state(
             history_pages = sequence.pages.back().index + 1;
         }
     }
+    assert(history_pages == resumed_page_count);
     cached_count = history_pages * layout.page_size;
+    position_bound = cached_count;
+    prepared_prompt_tokens = cached_count;
     std::size_t resumed_end = cached_count + initial_state->tail.size();
     next_cycle_end = (resumed_end / eviction.cycle_tokens + 1) * eviction.cycle_tokens;
     std::size_t window_start = next_cycle_end - eviction.mass_tokens;
     mass_end_position = resumed_end > window_start ? resumed_end : next_cycle_end - eviction.cycle_tokens;
-    prompt_count = r.tokens.size();
+    resumed_mass_end_position = mass_end_position;
     update_held();
 }
 
@@ -152,17 +162,11 @@ void request_state::update_held() {
 }
 
 bool request_state::may_sample() const noexcept {
-    return !max_tokens || prepared_samples < *max_tokens;
+    return !max_tokens || prepared_sample_count() < *max_tokens;
 }
 
-void request_state::advance(std::size_t count) {
-    assert(count <= pending_tokens.size());
-    tail.insert(tail.end(), pending_tokens.begin(), pending_tokens.begin() + count);
-    pending_tokens.erase(pending_tokens.begin(), pending_tokens.begin() + count);
-}
-
-std::size_t request_state::complete_pages(std::size_t end) {
-    std::size_t full_page_count = std::min(tail.size(), end - history_pages * layout.page_size) / layout.page_size;
+std::size_t request_state::complete_pages() {
+    std::size_t full_page_count = tail.size() / layout.page_size;
     if (full_page_count == 0) {
         return 0;
     }
@@ -172,7 +176,6 @@ std::size_t request_state::complete_pages(std::size_t end) {
             full_page_digests.push_back(prompt_digests[next_prompt_digest++]);
         } else {
             std::span<const std::int64_t> tokens = std::span(tail).subspan(page * layout.page_size, layout.page_size);
-            assert(!std::ranges::contains(tokens, awaited_token));
             const digest& parent = full_page_digests.empty() ? head.value_or(root) : full_page_digests.back();
             full_page_digests.push_back(make_digest(parent, tokens));
         }
@@ -206,47 +209,25 @@ std::size_t request_state::head_state_line_index(std::size_t layer) const {
 }
 
 std::uint32_t request_state::head_state_line(std::size_t layer) const {
-    return layers[layer].lines[head_state_line_index(layer)];
+    const std::uint32_t line = layers[layer].lines[head_state_line_index(layer)];
+    assert(line != layer_view::no_line);
+    return line;
 }
 
-std::uint32_t request_state::replace_head_state_line(std::size_t layer, std::uint32_t line) {
-    return std::exchange(layers[layer].lines[head_state_line_index(layer)], line);
+std::uint32_t request_state::release_head_state_line(std::size_t layer) {
+    const std::size_t parity = (history_pages - 1) % 2;
+    for (std::size_t page = history_position() / layout.page_size;
+         (page + 1) * layout.page_size <= prepared_position_bound();
+         page++) {
+        assert(page % 2 != parity);
+    }
+    const std::uint32_t line = std::exchange(layers[layer].lines[head_state_line_index(layer)], layer_view::no_line);
+    assert(line != layer_view::no_line);
+    return line;
 }
 
 void request_state::store_head_state() noexcept {
     state_pending = false;
-}
-
-void request_state::accept_tokens(std::size_t start, std::span<const std::int64_t> accepted_tokens) {
-    assert(!accepted_tokens.empty() && start >= history_pages * layout.page_size);
-    auto after = tail.begin() + static_cast<std::ptrdiff_t>(start - history_pages * layout.page_size) + 1;
-    tail.insert(after, accepted_tokens.begin(), accepted_tokens.end() - 1);
-    resolve_token(start + accepted_tokens.size(), accepted_tokens.back());
-}
-
-void request_state::withdraw_latest_verify_step() {
-    assert(!tail.empty());
-    pending_tokens.assign(1, tail.back());
-    tail.pop_back();
-    drafts.clear();
-    last_step_launched = false;
-}
-
-void request_state::resolve_token(std::size_t index, std::int64_t token) {
-    std::size_t offset = index - history_pages * layout.page_size;
-    std::int64_t& awaited = offset < tail.size() ? tail[offset] : pending_tokens[offset - tail.size()];
-    assert(awaited == awaited_token);
-    awaited = token;
-}
-
-void request_state::withdraw_latest_step() {
-    assert(!tail.empty() && pending_tokens.size() <= 1);
-    if (!pending_tokens.empty()) {
-        prepared_samples--;
-    }
-    pending_tokens.assign(1, tail.back());
-    tail.pop_back();
-    last_step_launched = false;
 }
 
 std::size_t request_state::passed_pages(std::size_t layer, std::size_t query) const noexcept {
@@ -299,7 +280,7 @@ void request_state::start_next_cycle() noexcept {
 }
 
 std::size_t request_state::mass_start_position() const noexcept {
-    return std::max(next_cycle_end - eviction.mass_tokens, mass_end_position);
+    return std::max(next_cycle_end - eviction.mass_tokens, resumed_mass_end_position);
 }
 
 void request_state::fill_query_weights(std::size_t first, std::span<float> weights) const noexcept {
@@ -309,15 +290,16 @@ void request_state::fill_query_weights(std::size_t first, std::span<float> weigh
 }
 
 bool request_state::ends_cycle(std::size_t token_count) const noexcept {
-    return history_position() + token_count >= next_cycle_end;
+    return prepared_position_bound() + token_count >= next_cycle_end;
 }
 
 std::size_t request_state::cycle_tokens_left() const noexcept {
-    std::size_t left = next_cycle_end - history_position();
+    assert(prepared_position_bound() <= next_cycle_end);
+    std::size_t left = next_cycle_end - prepared_position_bound();
     if (max_tokens) {
         // Every token sampled from here is forwarded but the last.
-        std::size_t samples_left = *max_tokens - prepared_samples;
-        left = std::min(left, pending_tokens.size() + (samples_left > 0 ? samples_left - 1 : 0));
+        std::size_t samples_left = may_sample() ? *max_tokens - prepared_sample_count() : 0;
+        left = std::min(left, unprepared_token_count() + (samples_left > 0 ? samples_left - 1 : 0));
     }
     return left;
 }
@@ -330,19 +312,39 @@ std::size_t request_state::table_width() const noexcept {
     return width;
 }
 
-std::size_t request_state::cycle_lines() const noexcept {
-    assert(tail.empty());
-    return ceil_div(cycle_tokens_left(), layout.page_size);
+// The pages an unfinished verify step fills are known only at its write-back.
+std::vector<std::size_t> request_state::find_unheld_state_lines(std::size_t layer, std::size_t key_count) const {
+    const std::vector<std::uint32_t>& lines = layers[layer].lines;
+    const std::size_t state_slots = layout.layers[layer].state_slots;
+    assert(
+        lines.size() == state_slots + 2 &&
+        !std::ranges::contains(std::span(lines).first(state_slots), layer_view::no_line)
+    );
+    const std::size_t end = prepared_position_bound() + key_count;
+    std::vector<std::size_t> view_indices;
+    for (std::size_t page = history_position() / layout.page_size; (page + 1) * layout.page_size <= end; page++) {
+        const std::size_t view_index = state_slots + page % 2;
+        if (lines[view_index] == layer_view::no_line && !std::ranges::contains(view_indices, view_index)) {
+            view_indices.push_back(view_index);
+        }
+    }
+    return view_indices;
 }
 
-std::vector<std::size_t> request_state::missing_lines() const {
-    std::size_t left = cycle_tokens_left();
+std::vector<std::size_t> request_state::missing_lines(std::span<const std::size_t> key_counts) const {
+    const std::size_t unwritten_back_tokens = prepared_position_bound() - history_position();
     std::vector<std::size_t> counts;
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
-        std::size_t held_count = layers[layer].lines.size();
-        std::size_t needed = layout.layers[layer].is_recurrent ? layout.layers[layer].state_slots + 2
-                                                               : ceil_div(next_index(layer) + left, layout.page_size);
-        counts.push_back(needed > held_count ? needed - held_count : 0);
+        const std::vector<std::uint32_t>& lines = layers[layer].lines;
+        if (!layout.layers[layer].is_recurrent) {
+            std::size_t needed = ceil_div(
+                next_index(layer) + unwritten_back_tokens + key_counts[layer],
+                layout.page_size
+            );
+            counts.push_back(needed > lines.size() ? needed - lines.size() : 0);
+            continue;
+        }
+        counts.push_back(find_unheld_state_lines(layer, key_counts[layer]).size());
     }
     return counts;
 }
@@ -351,16 +353,25 @@ std::span<const layer_view> request_state::views() const noexcept {
     return layers;
 }
 
+std::span<const std::int64_t> request_state::prompt_tokens() const noexcept {
+    return prompt;
+}
+
 std::span<const std::int64_t> request_state::tail_tokens() const noexcept {
     return tail;
 }
 
-std::span<const std::int64_t> request_state::pending_token_list() const noexcept {
-    return pending_tokens;
+std::optional<std::int64_t> request_state::pending_token() const noexcept {
+    const std::size_t position = history_position();
+    return position < prompt.size() ? std::optional(prompt[position]) : pending_sample;
 }
 
 std::span<const std::int64_t> request_state::draft_tokens() const noexcept {
     return drafts;
+}
+
+std::size_t request_state::prepared_draft_count() const noexcept {
+    return prepared_drafts;
 }
 
 const sampling_params& request_state::sampling_parameters() const noexcept {
@@ -375,16 +386,29 @@ const std::optional<std::size_t>& request_state::token_limit() const noexcept {
     return max_tokens;
 }
 
+// Once every prepared step is written back, the steps' counts are exact.
 std::size_t request_state::prepared_sample_count() const noexcept {
-    return prepared_samples;
+    return unfinished_step_count() == 0 ? delivered_tokens : prepared_samples;
 }
 
 std::size_t request_state::delivered_token_count() const noexcept {
     return delivered_tokens;
 }
 
+std::size_t request_state::prepared_position_bound() const noexcept {
+    return unfinished_step_count() == 0 ? history_position() : position_bound;
+}
+
+std::size_t request_state::prepared_prompt_token_count() const noexcept {
+    return prepared_prompt_tokens;
+}
+
+std::size_t request_state::unprepared_token_count() const noexcept {
+    return prepared_prompt_tokens < prompt.size() ? prompt.size() - prepared_prompt_tokens : 1;
+}
+
 std::size_t request_state::prompt_token_count() const noexcept {
-    return prompt_count;
+    return prompt.size();
 }
 
 std::size_t request_state::cached_token_count() const noexcept {
@@ -467,8 +491,8 @@ std::size_t request_state::unfinished_step_count() const noexcept {
     return prepared_step_count - written_back_step_count;
 }
 
-bool request_state::has_launched_last_step() const noexcept {
-    return last_step_launched;
+bool request_state::has_prepared_last_step() const noexcept {
+    return last_step_prepared;
 }
 
 std::size_t request_state::rejected_token_count() const noexcept {
@@ -501,53 +525,74 @@ std::vector<std::size_t> request_state::pages_to_evict(std::size_t layer) const 
     );
 }
 
-void request_state::launch_step(
+void request_state::prepare_step(
     std::size_t token_count,
     bool samples,
     std::size_t draft_count,
     bool continues_drafting
 ) {
-    rejected_tokens = 0;
-    advance(token_count);
-    if (samples) {
-        pending_tokens.push_back(awaited_token);
-        prepared_samples++;
+    assert(!last_step_prepared && prepared_drafts == 0 && token_count > 0 && token_count <= unprepared_token_count());
+    assert(
+        unfinished_step_count() > 0 || (position_bound >= history_position() && prepared_samples >= delivered_tokens)
+    );
+    const std::size_t start = prepared_position_bound();
+    const std::size_t samples_before = prepared_sample_count();
+    if (prepared_prompt_tokens < prompt.size()) {
+        prepared_prompt_tokens += token_count;
     }
-    last_step_launched = samples ? !may_sample() : pending_tokens.empty();
+    position_bound = start + token_count;
+    prepared_samples = samples_before + (samples ? 1 : 0);
+    prepared_step_count++;
+    last_step_prepared = samples ? !may_sample() : prepared_prompt_tokens == prompt.size();
     next_step_reads_last_hidden = !continues_drafting;
-    drafts.assign(draft_count, awaited_token);
-    prepared_step_count++;
+    prepared_drafts = draft_count;
 }
 
-void request_state::launch_verify_step(std::size_t token_count, std::size_t draft_count) {
-    advance(token_count);
-    pending_tokens.push_back(awaited_token);
-    rejected_tokens = drafts.size();
+void request_state::prepare_verify_step(std::size_t draft_count) {
+    assert(!last_step_prepared && prepared_drafts > 0 && prepared_prompt_tokens == prompt.size());
+    assert(
+        unfinished_step_count() > 0 || (position_bound >= history_position() && prepared_samples >= delivered_tokens)
+    );
+    const std::size_t verified_count = prepared_drafts + 1;
+    position_bound = prepared_position_bound() + verified_count;
+    prepared_samples = prepared_sample_count() + verified_count;
+    prepared_step_count++;
     next_step_reads_last_hidden = false;
-    drafts.assign(draft_count, awaited_token);
-    prepared_step_count++;
+    prepared_drafts = draft_count;
 }
 
-void request_state::apply_sample(std::size_t position, std::int64_t token) {
-    resolve_token(position, token);
-    delivered_tokens++;
-}
-
-void request_state::apply_accepted_tokens(
-    std::size_t start,
-    std::span<const std::int64_t> accepted_tokens,
-    std::size_t verified_count
+void request_state::apply_step(
+    std::size_t forwarded_count,
+    std::span<const std::int64_t> emitted,
+    std::span<const std::int64_t> step_drafts,
+    std::size_t rejected_count
 ) {
-    const bool has_later_step = unfinished_step_count() > 1;
-    const std::size_t accepted_count = accepted_tokens.size();
-    accept_tokens(start, accepted_tokens);
-    prepared_samples += accepted_count;
-    delivered_tokens += accepted_count;
-    drafted_tokens += verified_count - 1;
-    accepted_drafts += accepted_count - 1;
-    if (!has_later_step) {
-        rejected_tokens = verified_count - accepted_count;
+    std::size_t forwarded_emitted = 0;
+    for (std::size_t i = 0; i < forwarded_count; i++) {
+        const std::size_t position = history_position();
+        if (position < prompt.size()) {
+            tail.push_back(prompt[position]);
+        } else if (pending_sample) {
+            tail.push_back(*pending_sample);
+            pending_sample.reset();
+        } else {
+            assert(forwarded_emitted < emitted.size());
+            tail.push_back(emitted[forwarded_emitted++]);
+        }
     }
+    assert(emitted.size() - forwarded_emitted <= 1);
+    if (forwarded_emitted < emitted.size()) {
+        assert(!pending_sample);
+        pending_sample = emitted.back();
+    }
+    delivered_tokens += emitted.size();
+    drafts.assign(step_drafts.begin(), step_drafts.end());
+    rejected_tokens = rejected_count;
+}
+
+void request_state::record_verified_drafts(std::size_t drafted_count, std::size_t accepted_count) noexcept {
+    drafted_tokens += drafted_count;
+    accepted_drafts += accepted_count;
 }
 
 void request_state::finish_step() noexcept {
@@ -587,12 +632,25 @@ void request_state::end_prefill() noexcept {
     has_prefill_ended = true;
 }
 
-void request_state::set_drafts(std::span<const std::int64_t> tokens) {
-    drafts.assign(tokens.begin(), tokens.end());
-}
-
 void request_state::add_lines(std::size_t layer, std::span<const std::uint32_t> added) {
     layers[layer].append_lines(added);
+}
+
+void request_state::add_step_lines(
+    std::span<const std::size_t> key_counts,
+    std::span<const std::vector<std::uint32_t>> added
+) {
+    for (std::size_t layer = 0; layer < layers.size(); layer++) {
+        if (!layout.layers[layer].is_recurrent) {
+            layers[layer].append_lines(added[layer]);
+            continue;
+        }
+        const std::vector<std::size_t> view_indices = find_unheld_state_lines(layer, key_counts[layer]);
+        assert(view_indices.size() == added[layer].size());
+        for (std::size_t i = 0; i < view_indices.size(); i++) {
+            layers[layer].lines[view_indices[i]] = added[layer][i];
+        }
+    }
 }
 
 std::vector<std::uint32_t> request_state::remove_pages(std::size_t layer, std::span<const std::size_t> view_indices) {
@@ -604,7 +662,8 @@ std::vector<std::uint32_t> request_state::remove_pages(std::size_t layer, std::s
 std::vector<std::vector<std::uint32_t>> request_state::take_lines() {
     std::vector<std::vector<std::uint32_t>> taken_lines;
     for (layer_view& view : layers) {
-        taken_lines.push_back(std::exchange(view.lines, {}));
+        std::vector<std::uint32_t>& lines = taken_lines.emplace_back(std::exchange(view.lines, {}));
+        std::erase(lines, layer_view::no_line);
     }
     return taken_lines;
 }
@@ -617,11 +676,12 @@ void request_state::add_step_mass(
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
         layer_view& view = layers[layer];
         if (view.mass_heads > 0) {
+            const std::size_t measured_lines = std::min(view.weight_sum.size(), step_weight_sums[layer].size());
             pulsarlm::add_step_mass(
-                view.mass_sum,
-                view.weight_sum,
-                step_mass_sums[layer].first(view.mass_sum.size()),
-                step_weight_sums[layer].first(view.weight_sum.size()),
+                std::span(view.mass_sum).first(measured_lines * view.mass_heads),
+                std::span(view.weight_sum).first(measured_lines),
+                step_mass_sums[layer].first(measured_lines * view.mass_heads),
+                step_weight_sums[layer].first(measured_lines),
                 end - mass_end_position,
                 eviction.attention_mass_decay
             );

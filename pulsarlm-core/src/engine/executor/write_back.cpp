@@ -15,7 +15,6 @@
 #include <memory>
 #include <numeric>
 #include <optional>
-#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -80,12 +79,6 @@ executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clo
             std::span(b.next_tokens.const_data_ptr<std::int64_t>() + d * row, row)
         );
     }
-    assert(
-        std::ranges::equal(
-            std::span(b.cycle_end_flags.const_data_ptr<bool>(), static_cast<std::size_t>(b.cycle_end_flags.numel())),
-            b.entries | std::views::transform(&batch_entry::ends_cycle)
-        )
-    );
     for (std::size_t index = 0; index < b.entries.size(); index++) {
         batch_entry& e = b.entries[index];
         const bool verifies = b.verifies(index);
@@ -103,29 +96,33 @@ executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clo
             req.fail_store_write();
             continue;
         }
-        // The tokens the step accepts, and of its samples those it emits. Each later unfinished step of a request
-        // whose verify step is written back is a verify step, which moved its history position by one token at
-        // its launch.
-        const bool next_launched = req.unfinished_step_count() > 1;
+        // The tokens the step accepts, and of its samples those it emits.
+        const std::size_t start = req.history_position();
         std::size_t accepted_count = e.query_token_count;
-        std::size_t end_position = e.start_position + e.query_token_count;
         std::span<const std::int64_t> emitted = samples;
         if (verifies) {
             accepted_count = static_cast<std::size_t>(
                 b.accepted_token_counts.const_data_ptr<std::int64_t>()[index - b.single_query_request_count]
             );
             emitted = samples.first(accepted_count);
-            const std::size_t start = req.history_position() - req.unfinished_step_count();
-            assert(start >= e.start_position);
-            req.apply_accepted_tokens(start, emitted, e.query_token_count);
+            req.record_verified_drafts(e.query_token_count - 1, accepted_count - 1);
             drafted_tokens.fetch_add(e.query_token_count - 1, std::memory_order_relaxed);
             accepted_drafts.fetch_add(accepted_count - 1, std::memory_order_relaxed);
-            e.start_position = start;
-            end_position = start + accepted_count;
         }
-        std::size_t completed_count = req.complete_pages(end_position);
+        const std::size_t end_position = start + accepted_count;
+        const bool ends_cycle = b.reaches_cycle_end(index);
+        assert(e.start_position >= start && (!ends_cycle || e.ends_cycle));
+        assert(ends_cycle == (end_position >= req.cycle_end_position()));
+        assert(verifies || e.start_position != start || ends_cycle == e.ends_cycle);
+        std::span<const std::int64_t> step_drafts;
+        if (auto found = drafted.find(&req); found != drafted.end()) {
+            step_drafts = found->second.subspan(1);
+        }
+        req.apply_step(accepted_count, emitted, step_drafts, verifies ? e.query_token_count - accepted_count : 0);
+        std::size_t completed_count = req.complete_pages();
+        record_device_memory(req);
         if (e.is_measured) {
-            b.add_measured_mass(index, req, accepted_count, end_position, layout);
+            b.add_measured_mass(index, req, start, accepted_count, layout);
         }
         const bool is_prefill_step = !req.has_ended_prefill();
         req.record_step(step_duration);
@@ -150,38 +147,20 @@ executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clo
             .accepted_draft_count = verifies ? accepted_count - 1 : 0,
             .step_duration = is_prefill_step ? std::chrono::steady_clock::duration::zero() : step_duration,
         };
-        bool reaches_end = e.ends_request;
-        if (verifies) {
-            for (std::int64_t token : emitted) {
-                callbacks.on_decode(token, token_statistics);
-                token_statistics.drafted_token_count = 0;
-                token_statistics.accepted_draft_count = 0;
-                token_statistics.step_duration = std::chrono::steady_clock::duration::zero();
-            }
-            if (std::ranges::contains(stop_ids, emitted.back()) || !req.may_sample()) {
-                reaches_end = true;
-                if (next_launched) {
-                    req.withdraw_latest_verify_step();
-                }
-            }
-        } else if (!samples.empty()) {
-            const std::int64_t token = samples.front();
-            req.apply_sample(end_position, token);
+        for (std::int64_t token : emitted) {
             callbacks.on_decode(token, token_statistics);
-            if (std::ranges::contains(stop_ids, token)) {
-                reaches_end = true;
-                if (next_launched) {
-                    req.withdraw_latest_step();
-                }
-            }
+            token_statistics.drafted_token_count = 0;
+            token_statistics.accepted_draft_count = 0;
+            token_statistics.step_duration = std::chrono::steady_clock::duration::zero();
         }
+        const std::optional<std::size_t>& token_limit = req.token_limit();
+        const bool reaches_end = e.ends_request ||
+            (!emitted.empty() && std::ranges::contains(stop_ids, emitted.back())) ||
+            (token_limit && req.delivered_token_count() >= *token_limit);
         if (reaches_end) {
             req.reach_end();
-            req.set_drafts({});
-        } else if (auto found = drafted.find(&req); found != drafted.end() && !next_launched) {
-            req.set_drafts(found->second.subspan(1));
         }
-        const bool reaches_state = e.ends_cycle || reaches_end;
+        const bool reaches_state = ends_cycle || reaches_end;
         if (reaches_state) {
             writes.state_reachers.push_back(&req);
             if (req.has_pending_state()) {
@@ -279,22 +258,11 @@ task<void> executor::write_pages_and_states(batch& b, batch_writes&& writes) {
                 continue;
             }
             req->store_head_state();
-            // The synced line keeps the stored state as a cached page; a new line takes its place.
-            std::vector<std::size_t> counts(n_layers, 0);
-            for (std::size_t layer = 0; layer < n_layers; layer++) {
-                counts[layer] = layout.layers[layer].is_recurrent ? 1 : 0;
-            }
-            std::expected<std::vector<std::vector<std::uint32_t>>, page_error> replacements = cache.allocate(counts);
-            if (!replacements) {
-                req->run_out_of_lines();
-                continue;
-            }
+            // The synced line keeps the stored state as a cached page; the prologue of a step that writes the state at
+            // the end of a page of its parity gives the view another.
             for (std::size_t layer = 0; layer < n_layers; layer++) {
                 if (layout.layers[layer].is_recurrent) {
-                    const std::uint32_t stored_line = req->replace_head_state_line(
-                        layer,
-                        (*replacements)[layer].front()
-                    );
+                    const std::uint32_t stored_line = req->release_head_state_line(layer);
                     cache.release(layer, std::span(&stored_line, 1));
                 }
             }
@@ -303,57 +271,32 @@ task<void> executor::write_pages_and_states(batch& b, batch_writes&& writes) {
 }
 
 task<void> executor::refresh_views(batch& b) {
-    std::size_t n_layers = cache.layer_count();
-    for (const batch_entry& e : b.entries) {
+    for (std::size_t index = 0; index < b.entries.size(); index++) {
+        const batch_entry& e = b.entries[index];
         request_state& req = get_state(e.request_id);
         req.finish_step();
         if (req.has_exit_cause()) {
             continue;
         }
+        const bool ends_cycle = b.reaches_cycle_end(index);
         bool views_changed = release_passed_pages(req);
-        if (e.ends_cycle) {
+        if (ends_cycle) {
             req.sample_pages();
             views_changed = evict(req) || views_changed;
         }
         if (views_changed) {
             update_views(req);
         }
-        if (e.ends_cycle) {
+        if (ends_cycle) {
             co_await write_cycle_end(req, *requests[e.request_id].callbacks);
             req.start_next_cycle();
         }
-        if (views_changed || e.ends_cycle) {
+        if (views_changed || ends_cycle) {
             assert(req.unfinished_step_count() == 0);
             stale_requests.push_back(e.request_id);
         }
-        std::optional<std::size_t> first_stale_page;
         if (views_changed || e.stores_head_state) {
-            first_stale_page = 0;
-        }
-        std::vector<std::size_t> missing_counts = req.missing_lines();
-        if (table_width_after(req, missing_counts) > view_page_capacity) {
-            req.exceed_context();
-            continue;
-        }
-        if (std::ranges::any_of(missing_counts, [](std::size_t count) { return count > 0; })) {
-            std::expected<std::vector<std::vector<std::uint32_t>>, page_error> allocation = cache.allocate(
-                missing_counts
-            );
-            if (!allocation) {
-                req.run_out_of_lines();
-                continue;
-            }
-            for (std::size_t layer = 0; layer < n_layers; layer++) {
-                const std::size_t line_count = req.views()[layer].lines.size();
-                if (missing_counts[layer] > 0) {
-                    first_stale_page = std::min(first_stale_page.value_or(line_count), line_count);
-                }
-                req.add_lines(layer, (*allocation)[layer]);
-            }
-            record_device_memory(req);
-        }
-        if (first_stale_page) {
-            mark_stale_tables(e.request_id, *first_stale_page);
+            mark_stale_tables(e.request_id, 0);
         }
     }
 }

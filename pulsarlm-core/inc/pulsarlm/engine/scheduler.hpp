@@ -4,6 +4,7 @@
 #include <deque>
 #include <memory>
 #include <optional>
+#include <span>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -44,6 +45,9 @@ class scheduler {
     // Writes the oldest launched step back, ends the requests in it whose callbacks are cancelled, and lets each request
     // that exited leave once no launched step holds it.
     task<void> retire();
+    // Lets each of the requests at ids that exited leave the running requests, and sets the exit event of each that no
+    // launched step holds.
+    void release_exited(std::span<const executor::request_id_type> ids);
     // Waits, behind the requests that arrived before, until fewer than executor::max_running_request_count() requests
     // are admitted, and admits the request.
     task<void> admit();
@@ -60,9 +64,9 @@ class scheduler {
     // cycle to the store, then passes it to the callbacks, and likewise the end state, and releases the state's lease
     // before it ends them. Waits, in arrival order, while executor::max_running_request_count() requests run, and ends
     // with cancelled when the callbacks are cancelled once it stops waiting. Ends with missing_state when the store's
-    // lookup fails. Ends with oom, never waiting, when the free
-    // lines do not cover the state's pages and one cycle's tokens at the start, or the next cycle's tokens while
-    // running; the caller resubmits.
+    // lookup fails. Ends with oom, never waiting, when the free lines do not cover the state's pages and recurrent
+    // states at the start, or the keys a step writes at its launch, after the tokens of the steps before; the caller
+    // resubmits.
     task<void> submit(request&& r, std::unique_ptr<request_callbacks>&& callbacks);
     // Steps the running requests until the loop stops, launching each step before the previous one is written back
     // when executor::allows_overlap. A request whose callbacks are cancelled leaves after the

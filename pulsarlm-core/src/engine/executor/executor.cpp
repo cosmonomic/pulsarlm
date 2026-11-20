@@ -14,10 +14,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <expected>
 #include <memory>
 #include <optional>
 #include <span>
 #include <thread>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -269,8 +271,7 @@ std::vector<std::size_t> executor::start_line_counts(const request_state& req) c
     std::vector<std::size_t> counts;
     for (std::size_t layer = 0; layer < layout.layers.size(); layer++) {
         counts.push_back(
-            layout.layers[layer].is_recurrent ? layout.layers[layer].state_slots + 2
-                                              : req.views()[layer].pages.size() + req.cycle_lines()
+            layout.layers[layer].is_recurrent ? layout.layers[layer].state_slots + 2 : req.views()[layer].pages.size()
         );
     }
     return counts;
@@ -296,7 +297,13 @@ void executor::move_stale_tables(batch& b) {
             for (std::size_t column = first_column; column < width; column++) {
                 const bool used = column < view.lines.size();
                 cells.push_back(static_cast<std::int64_t>(row_start + column));
-                lines.push_back(used ? static_cast<std::int32_t>(view.lines[column]) : 0);
+                if (!used) {
+                    lines.push_back(0);
+                } else if (view.lines[column] == layer_view::no_line) {
+                    lines.push_back(-1);
+                } else {
+                    lines.push_back(static_cast<std::int32_t>(view.lines[column]));
+                }
                 positions.push_back(
                     used && !layout.layers[layer].is_recurrent
                         ? static_cast<std::int32_t>(req.page_position(layer, column))
@@ -350,11 +357,9 @@ void executor::move_stale_requests(batch& b) {
             key_counts.push_back(static_cast<std::int32_t>(req.next_index(layer)));
         }
         rejected_tokens.push_back(static_cast<std::int32_t>(req.rejected_token_count()));
-        const std::span<const std::int64_t> pending = req.pending_token_list();
         const std::span<const std::int64_t> drafts = req.draft_tokens();
-        assert(pending.empty() || pending.front() != request_state::awaited_token);
-        assert(drafts.size() < token_width);
-        tokens.push_back(pending.empty() ? 0 : pending.front());
+        assert(drafts.size() == req.prepared_draft_count() && drafts.size() < token_width);
+        tokens.push_back(req.pending_token().value_or(0));
         tokens.insert(tokens.end(), drafts.begin(), drafts.end());
         tokens.resize(slots.size() * token_width, 0);
         cycle_end_positions.push_back(static_cast<std::int64_t>(req.cycle_end_position()));
@@ -393,11 +398,11 @@ void executor::move_stale_requests(batch& b) {
 
 bool executor::is_steppable(request_id_type id) const {
     const request_state& req = get_state(id);
-    return !req.has_launched_last_step() && !req.has_exit_cause();
+    return !req.has_prepared_last_step() && !req.has_exit_cause();
 }
 
 std::size_t executor::pending_token_count(request_id_type id) const {
-    return get_state(id).pending_token_list().size();
+    return get_state(id).unprepared_token_count();
 }
 
 std::size_t executor::cycle_tokens_left(request_id_type id) const {
@@ -440,15 +445,15 @@ std::uint64_t executor::accepted_draft_count() const noexcept {
 }
 
 bool executor::completes_page(const request_state& req, std::size_t token_count) const noexcept {
-    std::size_t start = req.tail_tokens().size();
-    return (start + token_count) / layout.page_size * layout.page_size > start;
+    std::size_t start = req.prepared_position_bound() % layout.page_size;
+    return start + token_count >= layout.page_size;
 }
 
 // A drafting request's verify step ends neither its cycle nor max_tokens (executor::advance).
 bool executor::entries_allow_overlap(std::span<const scheduled_request> scheduled) const {
     if (draft_layer) {
         return std::ranges::all_of(scheduled, [&](const scheduled_request& e) {
-            return !get_state(e.request_id).draft_tokens().empty();
+            return get_state(e.request_id).prepared_draft_count() > 0;
         });
     }
     const bool sliding = std::ranges::any_of(layout.layers, [](const view_layout::layer& layer) {
@@ -475,10 +480,10 @@ std::size_t executor::sampled_row_limit() const noexcept {
 
 std::size_t executor::sampled_row_count(request_id_type id, std::size_t token_count) const {
     const request_state& req = get_state(id);
-    if (token_count != req.pending_token_list().size() || !req.may_sample()) {
+    if (token_count != req.unprepared_token_count() || !req.may_sample()) {
         return 0;
     }
-    return req.draft_tokens().empty() ? 1 : token_count + req.draft_tokens().size();
+    return req.prepared_draft_count() == 0 ? 1 : token_count + req.prepared_draft_count();
 }
 
 bool executor::is_launchable(std::span<const scheduled_request> scheduled) const {
@@ -495,9 +500,8 @@ bool executor::is_launchable(std::span<const scheduled_request> scheduled) const
     return launched_batches.empty() || allows_overlap(scheduled);
 }
 
-// The tokens of an entry of the second run are accepted, and its samples taken, at its write-back. Its pending token
-// and drafts are awaited_token until then, and a request whose previous step is launched lags it by up to that step's
-// drafts. An entry whose request reads its last hidden vector is outside the second run and lags no step.
+// The tokens of an entry of the second run are accepted, and its samples taken, at its write-back. A prepared step's
+// draft rows are relative to the request's history position at its start, which the GPU's request table holds.
 void executor::advance(batch& b) {
     const std::size_t draft_count = draft_state_slots - 1;
     std::size_t prior_hidden_count = 0;
@@ -505,7 +509,7 @@ void executor::advance(batch& b) {
         b.draft_count = draft_count;
         for (const batch_entry& e : b.entries) {
             const request_state& req = get_state(e.request_id);
-            if (req.reads_last_hidden() && req.history_position() > 0) {
+            if (req.reads_last_hidden() && req.prepared_position_bound() > 0) {
                 prior_hidden_count++;
             }
         }
@@ -515,28 +519,21 @@ void executor::advance(batch& b) {
         batch_entry& e = b.entries[index];
         request_state& req = get_state(e.request_id);
         const bool verifies = b.verifies(index);
-        const std::size_t lag = req.unfinished_step_count() > 0 ? draft_count : 0;
         const std::size_t token_count = verifies ? 1 : e.query_token_count;
         e.is_measured = batch::measures_mass(req, e.query_token_count);
-        e.start_position = req.history_position();
+        e.start_position = req.prepared_position_bound();
         bool drafts = false;
         bool next_row = false;
         if (draft_layer) {
             std::optional<std::size_t> prior_hidden_index;
-            if (req.reads_last_hidden() && req.history_position() > 0) {
+            if (req.reads_last_hidden() && req.prepared_position_bound() > 0) {
                 prior_hidden_index = b.prior_hidden_slots.size();
                 b.prior_hidden_slots.push_back(static_cast<std::int64_t>(get_slot(e.request_id)));
             }
-            const std::optional<std::size_t>& token_limit = req.token_limit();
-            const bool samples = e.first_sample_index.has_value();
-            const bool ends_request = samples ? token_limit && req.prepared_sample_count() + 1 >= *token_limit
-                                              : req.pending_token_list().size() == token_count;
-            next_row = verifies || (!e.ends_cycle && !ends_request);
-            // The next step's verifying entry then ends neither the cycle nor max_tokens, whatever this one accepts.
-            drafts = next_row && (verifies || samples) &&
-                req.cycle_tokens_left() >= e.query_token_count + lag + draft_count + 2;
+            std::tie(next_row, drafts) = plan_drafting(req, token_count);
             b.plan_draft_rows(e, req, verifies, first_hidden_row, prior_hidden_index, next_row, drafts);
             first_hidden_row += e.query_token_count;
+            const std::optional<std::size_t>& token_limit = req.token_limit();
             if (verifies) {
                 const std::size_t remaining = token_limit ? *token_limit - req.prepared_sample_count()
                                                           : e.query_token_count;
@@ -544,12 +541,66 @@ void executor::advance(batch& b) {
             }
         }
         if (verifies) {
-            req.launch_verify_step(token_count, drafts ? draft_count : 0);
+            req.prepare_verify_step(drafts ? draft_count : 0);
         } else {
-            req.launch_step(token_count, e.first_sample_index.has_value(), drafts ? draft_count : 0, next_row);
+            req.prepare_step(token_count, e.first_sample_index.has_value(), drafts ? draft_count : 0, next_row);
         }
-        e.ends_request = !verifies && req.has_launched_last_step();
+        e.ends_request = !verifies && req.has_prepared_last_step();
     }
+}
+
+// The step verifying drafts then ends neither the cycle nor max_tokens, whatever the step drafting them accepts.
+std::pair<bool, bool> executor::plan_drafting(const request_state& req, std::size_t token_count) const {
+    const std::size_t draft_count = draft_state_slots - 1;
+    const bool verifies = req.unprepared_token_count() == 1 && req.prepared_draft_count() > 0;
+    const std::size_t query_token_count = token_count + req.prepared_draft_count();
+    const bool samples = token_count == req.unprepared_token_count() && req.may_sample();
+    const std::optional<std::size_t>& token_limit = req.token_limit();
+    const bool ends_request = samples ? token_limit && req.prepared_sample_count() + 1 >= *token_limit
+                                      : req.unprepared_token_count() == token_count;
+    const bool next_key = verifies || (!req.ends_cycle(query_token_count) && !ends_request);
+    const bool drafts = next_key && (verifies || samples) &&
+        req.cycle_tokens_left() >= query_token_count + draft_count + 2;
+    return {next_key, drafts};
+}
+
+// The draft head's KV layer takes the key of the token after the step's tokens, and the keys of the drafts after it
+// but the last.
+bool executor::add_step_lines(const scheduled_request& scheduled) {
+    request_state& req = get_state(scheduled.request_id);
+    const std::size_t query_token_count = scheduled.token_count + req.prepared_draft_count();
+    std::vector<std::size_t> key_counts(layout.layers.size(), query_token_count);
+    if (draft_layer) {
+        const auto [next_key, drafts] = plan_drafting(req, scheduled.token_count);
+        key_counts[*draft_layer] += drafts ? draft_state_slots - 1 : next_key ? 1 : 0;
+    }
+    const std::vector<std::size_t> missing_counts = req.missing_lines(key_counts);
+    if (std::ranges::all_of(missing_counts, [](std::size_t count) { return count == 0; })) {
+        return true;
+    }
+    if (table_width_after(req, missing_counts) > view_page_capacity) {
+        req.exceed_context();
+        return false;
+    }
+    std::expected<std::vector<std::vector<std::uint32_t>>, page_error> allocation = cache.allocate(missing_counts);
+    if (!allocation) {
+        req.run_out_of_lines();
+        return false;
+    }
+    std::optional<std::size_t> first_stale_column;
+    for (std::size_t layer = 0; layer < layout.layers.size(); layer++) {
+        const std::vector<std::uint32_t>& lines = req.views()[layer].lines;
+        if (missing_counts[layer] > 0) {
+            const auto first_added = static_cast<std::size_t>(
+                std::ranges::find(lines, layer_view::no_line) - lines.begin()
+            );
+            first_stale_column = std::min(first_stale_column.value_or(first_added), first_added);
+        }
+    }
+    req.add_step_lines(key_counts, *allocation);
+    assert(std::ranges::all_of(req.missing_lines(key_counts), [](std::size_t count) { return count == 0; }));
+    mark_stale_tables(scheduled.request_id, *first_stale_column);
+    return true;
 }
 
 // Shard 0 queues on the executor's thread while the others queue on their own, so every shard's kernels launch at
@@ -557,10 +608,21 @@ void executor::advance(batch& b) {
 task<void> executor::launch(std::span<const scheduled_request> scheduled) {
     const std::chrono::steady_clock::time_point launch_time = std::chrono::steady_clock::now();
     assert(is_launchable(scheduled));
-    std::unique_ptr<batch> b(new batch(*this, scheduled));
+    std::vector<scheduled_request> lined;
+    for (const scheduled_request& s : scheduled) {
+        if (add_step_lines(s)) {
+            lined.push_back(s);
+        } else if (get_state(s.request_id).unfinished_step_count() == 0) {
+            get_state(s.request_id).exit();
+        }
+    }
+    if (lined.empty()) {
+        co_return;
+    }
+    std::unique_ptr<batch> b(new batch(*this, lined));
     b->launch_time = launch_time;
     assert(static_cast<std::size_t>(b->sample_slots.size(0)) <= sampled_row_capacity);
-    b->allows_overlap = entries_allow_overlap(scheduled);
+    b->allows_overlap = entries_allow_overlap(lined);
     move_stale_tables(*b);
     move_stale_requests(*b);
     advance(*b);

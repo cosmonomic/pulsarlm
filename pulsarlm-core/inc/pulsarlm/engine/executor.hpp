@@ -131,7 +131,7 @@ class executor {
     void mark_stale_tables(request_id_type id, std::size_t first_column);
     // The columns of req's page tables once each KV layer holds line_counts[layer] more lines.
     std::size_t table_width_after(const request_state& req, std::span<const std::size_t> line_counts) const;
-    // Per KV layer, the lines take_lines gives req for its first cycle.
+    // Per KV layer, the lines take_lines gives req.
     std::vector<std::size_t> start_line_counts(const request_state& req) const;
     // Moves stale_tables into b: the cells of each request's stale columns, from its view, that b's enqueue sets.
     void move_stale_tables(batch& b);
@@ -140,9 +140,9 @@ class executor {
     void move_stale_requests(batch& b);
     // The tokens of req's full history pages that every KV layer reading the page holds resident.
     std::size_t device_cached_tokens(const request_state& req) const;
-    // Per KV layer with pages, lines for its pages, then line_count empty lines; per recurrent layer, a copy of the
-    // state at head, or zeros without head, and two empty lines. Holds nothing on failure.
-    task<std::expected<void, page_error>> take_lines(request_state& req, std::size_t line_count);
+    // Per KV layer with pages, lines for its pages; per recurrent layer, a copy of the state at head, or zeros without
+    // head, and two empty lines. Holds nothing on failure.
+    task<std::expected<void, page_error>> take_lines(request_state& req);
     // s, the state the store returned for r, extended by the full pages of r's tokens after its head that every layer
     // with pages caches, up to its cycle's mass window and leaving a token to forward: no query between them adds mass,
     // so it is the state the request reaches there. s itself when it ends inside the window or the model has recurrent
@@ -182,9 +182,17 @@ class executor {
         std::expected<std::shared_ptr<const state>, request_error>&& result,
         const request_statistics& statistics
     ) noexcept;
-    // Moves each entry's tokens to its request's tail (request_state::launch_step, request_state::launch_verify_step),
-    // appends each token the step samples to pending as awaited_token, and plans the draft head's pass.
+    // Prepares each entry's step in its request (request_state::prepare_step, request_state::prepare_verify_step) and
+    // plans the draft head's pass.
     void advance(batch& b);
+    // Of a step of req computing token_count of its tokens, in an executor whose steps draft: whether it adds the key
+    // of the token after them to the draft head's KV layer, and whether it drafts.
+    std::pair<bool, bool> plan_drafting(const request_state& req, std::size_t token_count) const;
+    // Gives the request of scheduled the lines it lacks for the keys its step writes, after its prepared steps, and
+    // marks their columns stale. Returns false, holding none, when its view would grow past view_page_capacity pages
+    // or the lines run out, which the request records (request_state::exceed_context,
+    // request_state::run_out_of_lines).
+    bool add_step_lines(const scheduled_request& scheduled);
     task<void> enqueue_on_shard(batch& b, std::size_t shard);
     // Whether a step of the requests in scheduled ends no cycle and, in a model with sliding layers, completes no page, or in an executor
     // whose steps draft, whether every entry verifies drafts: its write-back then changes no view or table that the
@@ -252,13 +260,15 @@ class executor {
 
     // Serves r with callbacks, which stay in the guard until r's request state exists, so a start destroyed while it
     // is suspended before then ends them with loop_exited. Returns the request id of r, resuming the newest state the
-    // store holds for a prefix of its tokens, with lines for its first cycle. Returns std::nullopt after it ended the
+    // store holds for a prefix of its tokens, with lines for its pages and recurrent states; each step takes the lines
+    // for its tokens when it is launched. Returns std::nullopt after it ended the
     // request through on_end, with value-initialized statistics: with cancelled when the callbacks are cancelled at the
     // start, before the store is read, with missing_state when the lookup or a page read fails, with invalid_state when
     // the stored state's head is not a digest of r's full pages, its tail is not a proper prefix of r's tokens after
     // its head, or one of its layers lists a page hash twice, and with oom when the free lines do not cover the state's
-    // pages and one cycle's tokens, and with context_exceeded, before it takes lines, when its view with them would take
-    // more than view_page_capacity pages. The lease of a request that fails is released before on_end. Fewer than max_running_request_count() requests hold a record at the call.
+    // pages and recurrent states, and with context_exceeded, before it takes lines, when its view with them would take
+    // more than view_page_capacity pages. The lease of a request that fails is released before on_end. Fewer than
+    // max_running_request_count() requests hold a record at the call.
     task<std::optional<request_id_type>> start(request&& r, unstarted_callbacks callbacks);
     std::size_t max_running_request_count() const noexcept;
     // The requests with a record, from the creation of their request state until their end.
@@ -274,23 +284,24 @@ class executor {
     // The rows of a batch's sampled tokens that the request takes when it computes token_count tokens.
     std::size_t sampled_row_count(request_id_type id, std::size_t token_count) const;
     // Launches one step of the requests in scheduled after the launched steps, ordered into the runs of one model call
-    // (model::batch): advances each request by its tokens, then queues the forward and the sampling on every shard
-    // without waiting for them. Each shard's step reads
-    // its inputs from the shard's request_table and advances it, so a step reads the tokens and positions the launched
-    // steps before it leave.
+    // (model::batch): gives each request the lines its step writes (add_step_lines) and prepares its step,
+    // then queues the forward and the sampling on every shard without waiting for them. A request that gets no lines
+    // leaves the step, and exits right away when no launched step holds it; a step of no request is not launched.
+    // Each shard's step reads its inputs from the shard's request_table and advances it, so a step reads the tokens and
+    // positions the launched steps before it leave.
     // scheduled is not empty and names no request twice, each token count is above 0 and at most the request's pending
     // tokens, each request is steppable (is_steppable), fewer than two steps are launched, no step is launched or
     // allows_overlap(scheduled), and the step samples at most sampled_row_limit() rows.
     task<void> launch(std::span<const scheduled_request> scheduled);
-    // Writes back the oldest launched step: waits for it, then completes the pages its tokens filled, sets each awaited token it sampled, writes the
-    // completed pages, evicts and writes the state at a cycle end, and takes lines for the next tokens. The pages of a
-    // request writing no state are written by a spawned task; a request writing its state waits for its pages' writes
-    // first, and a failed write is found at a later write-back. Records on each request a stop token or max_tokens it
-    // reached, a failed store write, or a line allocation that failed or a view that would grow past view_page_capacity pages, and sets the exit reason (request_state::exit) of
-    // each request with an exit cause that the step leaves in no launched step. A request stopped by a token while in a
-    // later launched step withdraws that step's token (request_state::withdraw_latest_step); entries of requests that
-    // reached the end or whose store write failed before are skipped. Returns the requests of the step's entries, in
-    // entry order. A step is launched.
+    // Writes back the oldest launched step: waits for it, then applies the tokens it forwarded and sampled, delivers
+    // them, completes the pages its tokens filled, writes the completed pages, and evicts and writes the state at a
+    // cycle end, which the GPU reports. The pages of a request writing no state are written by a spawned task; a
+    // request writing its state waits for its pages' writes first, and a failed write is found at a later write-back.
+    // Records on each request a stop token or max_tokens it reached or a failed store write, and sets the exit reason
+    // (request_state::exit) of each request with an exit cause that the step leaves in no launched step. The entry of
+    // a request that reached the end or whose store write failed at an earlier write-back applies nothing, so a step
+    // launched after the one that reached the end changes no state the request stores. Returns the requests of the
+    // step's entries, in entry order. A step is launched.
     task<std::vector<request_id_type>> write_back();
     // Ends the request of id, whose request state exited and is in no launched step: releases its lines, writes its end state
     // when it finished, releases its lease, delivers the state or the error and the statistics through on_end, and

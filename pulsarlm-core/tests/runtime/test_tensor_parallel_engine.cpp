@@ -2,6 +2,7 @@
 #include "pulsarlm/digest.hpp"
 #include "pulsarlm/engine/engine.hpp"
 #include "pulsarlm/engine/event_loop.hpp"
+#include "pulsarlm/engine/executor.hpp"
 #include "pulsarlm/engine/kv_cache.hpp"
 #include "pulsarlm/engine/model/qwen3_5.hpp"
 #include "pulsarlm/engine/request_callbacks.hpp"
@@ -11,6 +12,7 @@
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 
 #undef CHECK
 #include <catch2/catch_test_macros.hpp>
@@ -1047,4 +1049,308 @@ TEST_CASE("Qwen3.5 drafting with its MTP layer emits the tokens it emits without
     const pulsarlm::engine_stat drafted = drafting->stat();
     CHECK(drafted.accepted_draft_count > 0);
     CHECK(drafted.accepted_draft_count < drafted.drafted_token_count);
+}
+
+// Counts the forwards of its model.
+class forward_counting_model final : public pulsarlm::qwen3_5_model {
+  public:
+    std::shared_ptr<std::atomic<std::size_t>> forward_count = std::make_shared<std::atomic<std::size_t>>(0);
+
+    using pulsarlm::qwen3_5_model::qwen3_5_model;
+
+    output forward(const batch& b, std::span<const pulsarlm::kv> lines, pulsarlm::graph_segments& segments) override {
+        (*forward_count)++;
+        return pulsarlm::qwen3_5_model::forward(b, lines, segments);
+    }
+};
+
+struct counted_run {
+    served result;
+    std::size_t forward_count;
+};
+
+// Serves r on a fresh engine of the whole model over contents, which ends a request at stop_ids and drafts
+// draft_tokens tokens per step.
+counted_run serve_counted(
+    const c10::Dict<std::string, at::Tensor>& weights,
+    const std::shared_ptr<store_contents>& contents,
+    std::vector<std::int64_t> stop_ids,
+    std::size_t draft_tokens,
+    pulsarlm::request&& r
+) {
+    auto model = std::make_unique<forward_counting_model>(model_config(n_kv_heads), weights);
+    std::shared_ptr<std::atomic<std::size_t>> forward_count = model->forward_count;
+    auto store = std::make_unique<memory_store>();
+    store->contents = contents;
+    pulsarlm::engine_config config = engine_config(1, false, draft_tokens);
+    config.stop_ids = std::move(stop_ids);
+    pulsarlm::engine e(std::move(model), vocab, config, std::move(store));
+    served result = serve(e, std::move(r));
+    return counted_run{.result = std::move(result), .forward_count = *forward_count};
+}
+
+// The stop token is the first sample equal to the stop_index-th of a run without stop tokens. The step sampling it is
+// written back after the step forwarding it is launched, and with cycles of 64 tokens that step ends no cycle; with
+// stop_index 11 or 43 and no drafts it completes a page and writes the recurrent layers' state at that page's end.
+// Its write-back applies nothing, so the run stopped by the token reaches the state, and the store, of a run whose
+// max_tokens ends it there, and a request resumed from either continues alike.
+TEST_CASE(
+    "Qwen3.5 stopped by a token while its next step runs reaches the state of a run that ends there",
+    "[runtime][cuda]"
+) {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const std::size_t draft_tokens = GENERATE(0, 2);
+    const std::size_t stop_index = GENERATE(11, 20, 43);
+    INFO(draft_tokens << " drafts, stop at sample " << stop_index);
+    const c10::Dict<std::string, at::Tensor> weights = draft_tokens > 0 ? drafting_weights(n_kv_heads)
+                                                                        : full_weights(n_kv_heads);
+    pulsarlm::eviction_policy policy = eviction;
+    policy.cycle_tokens = 4 * page_size;
+    const token_list prompt = random_tokens(prompt_tokens, 5);
+    const auto request = [&](token_list tokens, std::size_t max_tokens) {
+        return pulsarlm::request{.tokens = std::move(tokens), .max_tokens = max_tokens, .eviction = policy};
+    };
+    const counted_run unstopped = serve_counted(
+        weights,
+        std::make_shared<store_contents>(),
+        {},
+        draft_tokens,
+        request(prompt, decode_tokens)
+    );
+    REQUIRE(unstopped.result.tokens.size() == decode_tokens);
+    const std::int64_t stop = unstopped.result.tokens[stop_index];
+    const std::size_t sample_count = static_cast<std::size_t>(
+                                         std::ranges::find(unstopped.result.tokens, stop) -
+                                         unstopped.result.tokens.begin()
+                                     ) +
+        1;
+    const token_list samples(unstopped.result.tokens.begin(), unstopped.result.tokens.begin() + sample_count);
+
+    auto stopped_contents = std::make_shared<store_contents>();
+    auto ended_contents = std::make_shared<store_contents>();
+    const counted_run
+        stopped = serve_counted(weights, stopped_contents, {stop}, draft_tokens, request(prompt, decode_tokens));
+    const counted_run ended = serve_counted(weights, ended_contents, {}, draft_tokens, request(prompt, sample_count));
+    REQUIRE(stopped.result.tokens == samples);
+    REQUIRE(ended.result.tokens == samples);
+    check_same_state(stopped.result.end_state, ended.result.end_state);
+    const store_comparison stores = compare_stores(*stopped_contents, *ended_contents);
+    if (draft_tokens == 0) {
+        REQUIRE(stopped.forward_count == ended.forward_count + 1);
+        CHECK(stores.identical_pages == ended_contents->pages.size());
+    } else {
+        CHECK(stores.largest_error < tolerance);
+    }
+
+    token_list history = prompt;
+    history.insert(history.end(), samples.begin(), samples.end() - 1);
+    const token_list continuation = random_tokens(resume_tokens, 6);
+    history.insert(history.end(), continuation.begin(), continuation.end());
+    const counted_run stopped_resumed = serve_counted(
+        weights,
+        stopped_contents,
+        {},
+        draft_tokens,
+        request(history, resume_decode_tokens)
+    );
+    const counted_run ended_resumed = serve_counted(
+        weights,
+        ended_contents,
+        {},
+        draft_tokens,
+        request(history, resume_decode_tokens)
+    );
+    REQUIRE(ended_resumed.result.tokens.size() == resume_decode_tokens);
+    CHECK(stopped_resumed.result.tokens == ended_resumed.result.tokens);
+    check_same_state(stopped_resumed.result.end_state, ended_resumed.result.end_state);
+}
+
+namespace {
+
+// What a request served on an executor directly delivers, on its loop's thread.
+struct stepped_results {
+    token_list tokens;
+    std::vector<std::shared_ptr<const pulsarlm::state>> cycle_states;
+    std::optional<std::expected<std::shared_ptr<const pulsarlm::state>, pulsarlm::request_error>> end;
+};
+
+class stepped_callbacks final : public pulsarlm::request_callbacks {
+    std::shared_ptr<stepped_results> recorded_results;
+
+  public:
+    explicit stepped_callbacks(std::shared_ptr<stepped_results> recorded_results)
+    : recorded_results(std::move(recorded_results)) {}
+
+    void on_prefill(const pulsarlm::prefill_statistics&) noexcept override {}
+
+    void on_decode(std::int64_t token, const pulsarlm::decode_statistics&) noexcept override {
+        recorded_results->tokens.push_back(token);
+    }
+
+    void on_cycle(pulsarlm::cycle_end&& ended) noexcept override {
+        recorded_results->cycle_states.push_back(std::move(ended.state));
+    }
+
+    void on_end(
+        std::expected<std::shared_ptr<const pulsarlm::state>, pulsarlm::request_error>&& result,
+        const pulsarlm::request_statistics&
+    ) noexcept override {
+        recorded_results->end.emplace(std::move(result));
+    }
+
+    bool cancelled() const noexcept override {
+        return false;
+    }
+};
+
+// Starts r on exec, then launches its steps as the scheduler does, each before the previous step's write-back when
+// overlaps and the executor allow it, else after it, counting the steps launched over an unfinished one; then ends it.
+task<void> run_stepped(
+    pulsarlm::executor& exec,
+    pulsarlm::request r,
+    std::shared_ptr<stepped_results> recorded_results,
+    bool overlaps,
+    std::size_t& overlapped_steps
+) {
+    const std::optional<pulsarlm::executor::request_id_type> started = co_await exec.start(
+        std::move(r),
+        pulsarlm::executor::unstarted_callbacks(
+            std::make_unique<stepped_callbacks>(recorded_results),
+            pulsarlm::end_with_loop_exited
+        )
+    );
+    if (started) {
+        const pulsarlm::executor::request_id_type id = *started;
+        while (!exec.has_exited(id)) {
+            if (exec.is_steppable(id) && (exec.launched_batch_count() == 0 || overlaps)) {
+                const std::size_t pending_count = exec.pending_token_count(id);
+                const std::size_t token_count = pending_count == 1
+                    ? 1
+                    : std::min<std::size_t>({pending_count, 32, exec.cycle_tokens_left(id)});
+                const std::vector<pulsarlm::executor::scheduled_request> scheduled{{id, token_count}};
+                if (exec.launched_batch_count() == 0 ||
+                    (exec.launched_batch_count() == 1 && exec.allows_overlap(scheduled))) {
+                    overlapped_steps += exec.launched_batch_count();
+                    co_await exec.launch(scheduled);
+                    continue;
+                }
+            }
+            co_await exec.write_back();
+        }
+        co_await exec.stop(id);
+    }
+    pulsarlm::event_loop::current()->stop();
+}
+
+struct stepped_run {
+    stepped_results results;
+    std::shared_ptr<store_contents> contents;
+    std::size_t overlapped_steps = 0;
+};
+
+// Serves r on an executor of the whole model on cuda:0 over a fresh store, which ends a request at stop_ids and drafts
+// draft_tokens tokens per step, its steps overlapping when overlaps.
+stepped_run serve_stepped(
+    const c10::Dict<std::string, at::Tensor>& weights,
+    std::vector<std::int64_t> stop_ids,
+    std::size_t draft_tokens,
+    bool overlaps,
+    pulsarlm::request&& r
+) {
+    stepped_run run{.results = {}, .contents = std::make_shared<store_contents>(), .overlapped_steps = 0};
+    pulsarlm::qwen3_5_model model(model_config(n_kv_heads), weights);
+    memory_store store;
+    store.contents = run.contents;
+    const pulsarlm::engine_config config = engine_config(1, false, draft_tokens);
+    const std::vector<pulsarlm::page_shape> shapes = pulsarlm::page_shapes(config, model.kv_layers());
+    auto recorded_results = std::make_shared<stepped_results>();
+    {
+        pulsarlm::executor exec(
+            {&model},
+            pulsarlm::kv_cache(shapes, config.kv_cache_pool_bytes, at::Device(at::kCUDA, 0), store),
+            store,
+            {c10::cuda::getCurrentCUDAStream().stream()},
+            {c10::cuda::getStreamFromPool(true).stream()},
+            {},
+            pulsarlm::make_root_digest(config.model_name, config.model_hash, shapes),
+            std::move(stop_ids),
+            config.max_context_window / page_size + 1,
+            std::nullopt,
+            draft_tokens,
+            4096,
+            1,
+            config.prefill_tokens_per_step
+        );
+        pulsarlm::event_loop loop;
+        loop.spawn(run_stepped(exec, std::move(r), recorded_results, overlaps, run.overlapped_steps));
+        REQUIRE(loop.run() == nullptr);
+    }
+    run.results = *recorded_results;
+    return run;
+}
+
+}  // namespace
+
+// Cycles of 2 pages end with the recurrent layers' state at head in the store, which gives up its line; the steps
+// after them overlap, and the step completing the second page after a stored head takes a line for its state again.
+// With a stop token sampled while the next step runs, the end state is also written beside a launched step; the drafts
+// predict tokens 0 and 1, so a drafting run stops at its first samples. Overlap
+// changes no token and no stored state: without drafts the stored pages are equal byte for byte, as each run computes
+// the same steps.
+TEST_CASE("Qwen3.5 reaches the same tokens and stored states whether its steps overlap or not", "[runtime][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const std::size_t draft_tokens = GENERATE(0, 2);
+    const bool stops = GENERATE(false, true);
+    INFO(draft_tokens << " drafts, " << (stops ? "stopped by a token" : "ended by max_tokens"));
+    const c10::Dict<std::string, at::Tensor> weights = draft_tokens > 0 ? drafting_weights(n_kv_heads)
+                                                                        : full_weights(n_kv_heads);
+    pulsarlm::eviction_policy policy = eviction;
+    policy.cycle_tokens = 2 * page_size;
+    const auto request = [&] {
+        return pulsarlm::request{
+            .tokens = random_tokens(prompt_tokens, 5),
+            .max_tokens = decode_tokens,
+            .eviction = policy
+        };
+    };
+    std::vector<std::int64_t> stop_ids;
+    if (stops) {
+        const stepped_run unstopped = serve_stepped(weights, {}, draft_tokens, false, request());
+        REQUIRE(unstopped.results.tokens.size() == decode_tokens);
+        const token_list& tokens = unstopped.results.tokens;
+        std::size_t stop_index = 20;
+        while (stop_index < tokens.size() &&
+               std::ranges::contains(std::span(tokens).first(stop_index), tokens[stop_index])) {
+            stop_index++;
+        }
+        REQUIRE(stop_index < tokens.size());
+        stop_ids.push_back(tokens[stop_index]);
+    }
+    const stepped_run sequential = serve_stepped(weights, stop_ids, draft_tokens, false, request());
+    const stepped_run overlapped = serve_stepped(weights, stop_ids, draft_tokens, true, request());
+
+    REQUIRE(sequential.overlapped_steps == 0);
+    REQUIRE(overlapped.overlapped_steps > 10);
+    REQUIRE(sequential.results.end.has_value());
+    REQUIRE(sequential.results.end->has_value());
+    REQUIRE(overlapped.results.end.has_value());
+    REQUIRE(overlapped.results.end->has_value());
+    REQUIRE(overlapped.results.tokens == sequential.results.tokens);
+    REQUIRE(sequential.results.cycle_states.size() >= 3);
+    REQUIRE(overlapped.results.cycle_states.size() == sequential.results.cycle_states.size());
+    for (std::size_t cycle = 0; cycle < sequential.results.cycle_states.size(); cycle++) {
+        INFO("cycle " << cycle);
+        check_same_state(*overlapped.results.cycle_states[cycle], *sequential.results.cycle_states[cycle]);
+    }
+    check_same_state(***overlapped.results.end, ***sequential.results.end);
+    const store_comparison stores = compare_stores(*overlapped.contents, *sequential.contents);
+    if (draft_tokens == 0) {
+        CHECK(stores.identical_pages == sequential.contents->pages.size());
+    } else {
+        CHECK(stores.largest_error < tolerance);
+    }
 }
