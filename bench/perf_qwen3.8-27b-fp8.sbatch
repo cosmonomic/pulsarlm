@@ -5,7 +5,7 @@
 #SBATCH --requeue
 #SBATCH --open-mode=append
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=128G
+#SBATCH --mem=192G
 #SBATCH --time=2-00:00:00
 #SBATCH -o %x-%j.out
 set -euo pipefail
@@ -19,7 +19,8 @@ settings=(full_kv cap_128k cap_128k_mass_0.5)
 tensor_parallel_sizes=(2)
 concurrencies=(1 4)
 runs=5
-kv_cache_gib=18
+kv_cache_gib=64
+store_gib=96
 max_context=262144
 
 work=${WORK_DIR:-${SLURM_SUBMIT_DIR:-$PWD}/perf-$model}
@@ -89,7 +90,8 @@ for setting in "${settings[@]}"; do
                 --tensor-parallel-size "$tensor_parallel_size" \
                 --runs "$runs" \
                 --max-context "$max_context" \
-                --kv-cache-gib "$kv_cache_gib"
+                --kv-cache-gib "$kv_cache_gib" \
+                --store-gib "$store_gib"
         done
     done
 done
