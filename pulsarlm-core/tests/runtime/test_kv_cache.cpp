@@ -51,7 +51,7 @@ struct store_state {
     // Whether read_pages, or write_pages, waits for its gate to open before copying.
     bool gated = false;
     bool puts_gated = false;
-    std::vector<external_task<>::resolver> gates;
+    std::vector<external_task<void>::resolver> gates;
 };
 
 std::size_t page_bytes_of(const sharded_page& p) {
@@ -121,7 +121,7 @@ struct memory_store final : pulsarlm::page_store {
             }
         }
         if (shared->gated) {
-            auto [gate, opener] = external_task<>::make();
+            auto [gate, opener] = external_task<void>::make();
             shared->gates.push_back(opener);
             co_await std::move(gate);
         }
@@ -143,7 +143,7 @@ struct memory_store final : pulsarlm::page_store {
             shared->owners.emplace_back(lease_id, put_keys[index]);
         }
         if (shared->puts_gated) {
-            auto [gate, opener] = external_task<>::make();
+            auto [gate, opener] = external_task<void>::make();
             shared->gates.push_back(opener);
             co_await std::move(gate);
         }

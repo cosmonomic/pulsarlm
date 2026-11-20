@@ -63,7 +63,7 @@ struct stalling_store final : pulsarlm::page_store {
 
     task<std::vector<bool>>
     read_pages(std::span<const digest>, std::vector<sharded_page>&&, std::span<const cudaStream_t>) override {
-        auto [never, resolver] = pulsarlm::external_task<>::make();
+        auto [never, resolver] = pulsarlm::external_task<void>::make();
         fetch_start_latch->count_down();
         co_await std::move(never);
         co_return {};

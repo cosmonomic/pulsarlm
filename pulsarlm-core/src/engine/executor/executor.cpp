@@ -635,12 +635,12 @@ task<void> executor::launch(std::span<const scheduled_request> scheduled) {
     b->accepted_token_counts_by_shard.assign(shards.size(), at::Tensor());
     b->shard_next_tokens.assign(shards.size(), at::Tensor());
     b->device_input_bytes.assign(shards.size(), at::Tensor());
-    std::vector<external_task<>> other_shards;
+    std::vector<external_task<void>> other_shards;
     for (std::size_t shard = 1; shard < shards.size(); shard++) {
         other_shards.push_back(run_on(*shards[shard].worker_loop, enqueue_on_shard(*b, shard)));
     }
     co_await enqueue_on_shard(*b, 0);
-    for (external_task<>& other : other_shards) {
+    for (external_task<void>& other : other_shards) {
         co_await std::move(other);
     }
     for (std::size_t shard = 0; shard < shards.size(); shard++) {

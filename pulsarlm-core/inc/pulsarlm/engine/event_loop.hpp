@@ -6,9 +6,11 @@
 
 #include <cuda_runtime_api.h>
 
+#include <atomic>
 #include <cassert>
 #include <condition_variable>
 #include <coroutine>
+#include <cstddef>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -21,6 +23,10 @@
 namespace pulsarlm {
 
 class event_loop;
+class shared_task_state;
+template <typename value_type> class shared_task;
+
+shared_task<void> make_ready_task();
 
 // Starts when awaited and resumes its awaiter when it completes. Awaiting consumes the task: await a prvalue or
 // std::move(t). An exception escaping the coroutine panics event_loop::current().
@@ -50,6 +56,39 @@ template <typename t> class [[nodiscard]] task {
     awaiter operator co_await() & = delete;
 };
 
+// Starts when first awaited or spawned, and once it completes resumes each awaiter with a reference to its one result.
+// Copies refer to one coroutine frame, which the last copy destroys; copies may be made and destroyed on any thread,
+// but the task is awaited on the loop thread only. A shared_task<void> also refers to the frame of a shared_task of
+// any value type. An exception escaping the coroutine panics event_loop::current().
+template <typename value_type> class shared_task {
+  public:
+    class promise_type;
+
+  private:
+    class value_result;
+    class void_result;
+    class awaiter;
+
+    shared_task_state* state;
+
+    explicit shared_task(shared_task_state* state) noexcept;
+
+    template <typename> friend class shared_task;
+    friend class event_loop;
+    friend shared_task<void> make_ready_task();
+
+  public:
+    shared_task(const shared_task& other) noexcept;
+    template <typename other_value_type>
+        requires std::is_void_v<value_type>
+    shared_task(const shared_task<other_value_type>& other) noexcept;
+    shared_task(shared_task&& other) noexcept;
+    shared_task& operator=(shared_task other) noexcept;
+    ~shared_task();
+
+    awaiter operator co_await() const noexcept;
+};
+
 // Once set, schedules every coroutine awaiting it on event_loop::current(); awaiting it after does not suspend. Set and
 // await it on the loop thread. Awaiters link into the event, so it does not move, and it must not be destroyed while
 // awaited during run.
@@ -70,7 +109,8 @@ class event {
 };
 
 // task with a resolve callback that can set the result outside the event loop.
-template <typename value_type = std::monostate> class [[nodiscard]] external_task {
+template <typename value_type> class [[nodiscard]] external_task {
+    using stored_type = std::conditional_t<std::is_void_v<value_type>, std::monostate, value_type>;
     struct state;
     using shared_state = std::shared_ptr<state>;
     class awaiter;
@@ -104,7 +144,10 @@ template <typename value_type> class external_task<value_type>::resolver {
     friend class external_task;
 
   public:
-    void resolve(value_type&& value = {}) const;
+    void resolve(stored_type&& value) const
+        requires(!std::is_void_v<value_type>);
+    void resolve() const
+        requires std::is_void_v<value_type>;
 };
 
 class event_loop {
@@ -115,7 +158,7 @@ class event_loop {
     };
 
     struct spawned_task {
-        task<void> root_task;
+        shared_task<void> root_task;
         ready_node queue_node;
     };
 
@@ -135,20 +178,26 @@ class event_loop {
     void push_ready(ready_node& node) noexcept;
     // Safe to call from any thread. node stays linked until its coroutine is resumed or the loop is destroyed.
     void schedule(ready_node& node) noexcept;
+    // Safe to call from any thread.
+    void schedule_root_task(shared_task<void> root_task);
 
     template <typename> friend class task;
+    template <typename> friend class shared_task;
     template <typename> friend class external_task;
     friend class event;
+    friend class shared_task_state;
 
   public:
     // The loop running on the calling thread, null outside run.
     static event_loop* current() noexcept;
 
-    // Destroys the remaining root tasks without resuming them.
+    // Drops the loop's copies of the remaining root tasks without resuming them.
     ~event_loop();
 
-    // Safe to call from any thread.
-    void spawn(task<void> root_task);
+    // Schedules root_task on the loop unless it has started, and returns it. Safe to call from any thread.
+    template <typename value_type> shared_task<value_type> spawn(shared_task<value_type> root_task);
+    // Schedules a shared_task that awaits root_task on the loop, and returns it. Safe to call from any thread.
+    template <typename value_type> shared_task<value_type> spawn(task<value_type> root_task);
     // Resumes scheduled coroutines on the calling thread until stop, or until a task panics. Returns the panic's
     // exception, or null after stop.
     std::exception_ptr run();
@@ -167,7 +216,6 @@ external_task<cudaError_t> await_stream(cudaStream_t stream);
 // Runs root_task as a root task of target and completes with its result once it does. Safe to call from any thread. A
 // panic in root_task panics target, and the returned task then never completes.
 template <typename value_type> external_task<value_type> run_on(event_loop& target, task<value_type> root_task);
-external_task<> run_on(event_loop& target, task<void> root_task);
 
 template <typename t> class task<t>::value_result {
     std::optional<t> value;
@@ -217,7 +265,7 @@ class task<t>::promise_type : public std::conditional_t<std::is_void_v<t>, void_
     }
 };
 
-// A panicked task resumes nothing. A task without continuation is a root task.
+// A panicked task resumes nothing.
 template <typename t> struct task<t>::promise_type::final_awaiter {
     bool await_ready() const noexcept {
         return false;
@@ -228,11 +276,8 @@ template <typename t> struct task<t>::promise_type::final_awaiter {
         if (promise.panicked) {
             return std::noop_coroutine();
         }
-        if (promise.continuation) {
-            return promise.continuation;
-        }
-        event_loop::current()->completed_root_task = handle;
-        return std::noop_coroutine();
+        assert(promise.continuation);
+        return promise.continuation;
     }
 
     void await_resume() const noexcept {}
@@ -298,6 +343,202 @@ template <typename t> typename task<t>::awaiter task<t>::operator co_await() && 
     return awaiter(std::exchange(handle, {}));
 }
 
+// The part of a shared_task's promise that does not depend on its value type.
+class shared_task_state {
+    class waiter;
+
+    std::coroutine_handle<> handle;
+    std::atomic<std::size_t> reference_count = 1;
+    std::atomic<bool> started = false;
+    bool spawned = false;
+    bool panicked = false;
+    bool ended = false;
+    waiter* waiters = nullptr;
+
+    void add_reference() noexcept;
+    void remove_reference() noexcept;
+    // Schedules every awaiter on event_loop::current(), which may be null when nothing awaits.
+    void end() noexcept;
+
+    template <typename> friend class shared_task;
+    friend class event_loop;
+    friend shared_task<void> make_ready_task();
+};
+
+class shared_task_state::waiter {
+    shared_task_state& target;
+    event_loop::ready_node queue_node;
+    waiter* next = nullptr;
+    bool linked = false;
+
+    friend class shared_task_state;
+
+  public:
+    explicit waiter(shared_task_state& target) noexcept
+    : target(target) {}
+
+    waiter(const waiter&) = delete;
+    waiter& operator=(const waiter&) = delete;
+    ~waiter();
+
+    void link(std::coroutine_handle<> awaiting) noexcept;
+};
+
+inline void shared_task_state::add_reference() noexcept {
+    reference_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+template <typename value_type> class shared_task<value_type>::value_result {
+    std::optional<value_type> value;
+
+  public:
+    void return_value(value_type&& returned) {
+        value.emplace(std::move(returned));
+    }
+
+    value_type& get_value() noexcept {
+        return *value;
+    }
+};
+
+template <typename value_type> class shared_task<value_type>::void_result {
+  public:
+    void return_void() noexcept {}
+};
+
+template <typename value_type>
+class shared_task<value_type>::promise_type
+: public shared_task_state,
+  public std::conditional_t<std::is_void_v<value_type>, void_result, value_result> {
+    struct final_awaiter;
+
+  public:
+    shared_task get_return_object() noexcept {
+        handle = std::coroutine_handle<promise_type>::from_promise(*this);
+        return shared_task(this);
+    }
+
+    std::suspend_always initial_suspend() noexcept {
+        return {};
+    }
+
+    final_awaiter final_suspend() noexcept {
+        return {};
+    }
+
+    void unhandled_exception() noexcept {
+        panicked = true;
+        event_loop::current()->panic(std::current_exception());
+    }
+};
+
+// A panicked task resumes nothing. The frame stays suspended at its end until the last copy destroys it.
+template <typename value_type> struct shared_task<value_type>::promise_type::final_awaiter {
+    bool await_ready() const noexcept {
+        return false;
+    }
+
+    void await_suspend(std::coroutine_handle<promise_type> handle) const noexcept {
+        promise_type& promise = handle.promise();
+        if (promise.panicked) {
+            return;
+        }
+        promise.end();
+        if (promise.spawned) {
+            event_loop::current()->completed_root_task = handle;
+        }
+    }
+
+    void await_resume() const noexcept {}
+};
+
+// Holds a copy of the awaited task, so its frame outlives the await.
+template <typename value_type> class shared_task<value_type>::awaiter {
+    shared_task awaited;
+    shared_task_state::waiter waiting;
+
+  public:
+    explicit awaiter(const shared_task& target) noexcept
+    : awaited(target),
+      waiting(*target.state) {}
+
+    bool await_ready() const noexcept {
+        return awaited.state->ended;
+    }
+
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiting) noexcept {
+        waiting.link(awaiting);
+        if (awaited.state->started.exchange(true)) {
+            return std::noop_coroutine();
+        }
+        return awaited.state->handle;
+    }
+
+    std::add_lvalue_reference_t<value_type> await_resume() const noexcept {
+        if constexpr (!std::is_void_v<value_type>) {
+            return static_cast<promise_type&>(*awaited.state).get_value();
+        }
+    }
+};
+
+template <typename value_type>
+shared_task<value_type>::shared_task(shared_task_state* state) noexcept
+: state(state) {}
+
+template <typename value_type>
+shared_task<value_type>::shared_task(const shared_task& other) noexcept
+: state(other.state) {
+    if (state != nullptr) {
+        state->add_reference();
+    }
+}
+
+template <typename value_type>
+template <typename other_value_type>
+    requires std::is_void_v<value_type>
+shared_task<value_type>::shared_task(const shared_task<other_value_type>& other) noexcept
+: state(other.state) {
+    if (state != nullptr) {
+        state->add_reference();
+    }
+}
+
+template <typename value_type>
+shared_task<value_type>::shared_task(shared_task&& other) noexcept
+: state(std::exchange(other.state, nullptr)) {}
+
+template <typename value_type> shared_task<value_type>& shared_task<value_type>::operator=(shared_task other) noexcept {
+    std::swap(state, other.state);
+    return *this;
+}
+
+template <typename value_type> shared_task<value_type>::~shared_task() {
+    if (state != nullptr) {
+        state->remove_reference();
+    }
+}
+
+template <typename value_type>
+typename shared_task<value_type>::awaiter shared_task<value_type>::operator co_await() const noexcept {
+    assert(state != nullptr);
+    return awaiter(*this);
+}
+
+template <typename value_type> shared_task<value_type> event_loop::spawn(shared_task<value_type> root_task) {
+    assert(root_task.state != nullptr);
+    if (!root_task.state->started.exchange(true)) {
+        root_task.state->spawned = true;
+        schedule_root_task(root_task);
+    }
+    return root_task;
+}
+
+template <typename value_type> shared_task<value_type> event_loop::spawn(task<value_type> root_task) {
+    return spawn([](task<value_type> awaited) -> shared_task<value_type> {
+        co_return co_await std::move(awaited);
+    }(std::move(root_task)));
+}
+
 class event::awaiter {
     event& target;
     event_loop::ready_node queue_node;
@@ -329,7 +570,7 @@ inline event::awaiter event::operator co_await() noexcept {
 
 template <typename value_type> struct external_task<value_type>::state {
     std::mutex mutex;
-    std::optional<value_type> value;
+    std::optional<stored_type> value;
     // Its handle is null until awaited.
     event_loop::ready_node waiter;
     event_loop* loop = nullptr;
@@ -337,7 +578,7 @@ template <typename value_type> struct external_task<value_type>::state {
 
     // A dropped value is destroyed by the caller after the lock is released, so its destructor never runs under the
     // lock.
-    void set_value(value_type&& resolved) {
+    void set_value(stored_type&& resolved) {
         std::lock_guard lock(mutex);
         if (!alive) {
             return;
@@ -379,7 +620,9 @@ template <typename value_type> class external_task<value_type>::awaiter {
     // The value was written under the state's lock, then the handle scheduled under the loop's lock, so it is visible
     // here without locking.
     value_type await_resume() {
-        return std::move(*external_task.task_state->value);
+        if constexpr (!std::is_void_v<value_type>) {
+            return std::move(*external_task.task_state->value);
+        }
     }
 };
 
@@ -426,15 +669,30 @@ template <typename value_type>
 external_task<value_type>::resolver::resolver(shared_state task_state) noexcept
 : task_state(std::move(task_state)) {}
 
-template <typename value_type> void external_task<value_type>::resolver::resolve(value_type&& value) const {
-    task_state->set_value(value_type(std::move(value)));
+template <typename value_type>
+void external_task<value_type>::resolver::resolve(stored_type&& value) const
+    requires(!std::is_void_v<value_type>)
+{
+    task_state->set_value(stored_type(std::move(value)));
+}
+
+template <typename value_type>
+void external_task<value_type>::resolver::resolve() const
+    requires std::is_void_v<value_type>
+{
+    task_state->set_value(std::monostate());
 }
 
 // The coroutine lambda captures nothing: its frame owns the task and the resolver as parameters.
 template <typename value_type> external_task<value_type> run_on(event_loop& target, task<value_type> root_task) {
     auto [result, resolver] = external_task<value_type>::make();
     target.spawn([](task<value_type> awaited, typename external_task<value_type>::resolver resolving) -> task<void> {
-        resolving.resolve(co_await std::move(awaited));
+        if constexpr (std::is_void_v<value_type>) {
+            co_await std::move(awaited);
+            resolving.resolve();
+        } else {
+            resolving.resolve(co_await std::move(awaited));
+        }
     }(std::move(root_task), std::move(resolver)));
     return std::move(result);
 }

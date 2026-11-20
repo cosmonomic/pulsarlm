@@ -14,17 +14,20 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace {
 
 using pulsarlm::event;
 using pulsarlm::event_loop;
 using pulsarlm::external_task;
+using pulsarlm::shared_task;
 using pulsarlm::task;
 
 constexpr std::size_t root_count = 1000;
 constexpr std::size_t chain_depth = 1000;
 constexpr std::size_t event_waiter_count = 4;
+constexpr std::size_t shared_waiter_count = 4;
 constexpr std::chrono::milliseconds other_thread_delay(50);
 
 void stop_current() {
@@ -79,7 +82,7 @@ task<void> set_then_wait(event* target, std::size_t* woken) {
     co_await wait_and_count(target, woken);
 }
 
-task<void> external_root(external_task<int> value, external_task<> signal, int* received) {
+task<void> external_root(external_task<int> value, external_task<void> signal, int* received) {
     co_await std::move(signal);
     *received = co_await std::move(value);
     stop_current();
@@ -101,7 +104,7 @@ task<void> resolve_from_thread(external_task<int>::resolver resolver, std::threa
 task<void> own_event(event** published) {
     event owned;
     *published = &owned;
-    auto [never, unused_resolver] = external_task<>::make();
+    auto [never, unused_resolver] = external_task<void>::make();
     co_await std::move(never);
 }
 
@@ -148,6 +151,88 @@ task<void> synchronize_twice(cudaStream_t stream, bool* synchronized) {
     stop_current();
 }
 
+shared_task<std::string> run_counted_after(event* gate, std::size_t* runs) {
+    ++*runs;
+    co_await *gate;
+    co_return std::string("shared");
+}
+
+task<void> record_result(shared_task<std::string> shared, std::vector<const std::string*>* seen) {
+    const std::string& result = co_await shared;
+    seen->push_back(&result);
+    if (seen->size() == shared_waiter_count) {
+        stop_current();
+    }
+}
+
+task<void> open_then_record_twice(event* gate, shared_task<std::string> shared, std::vector<const std::string*>* seen) {
+    gate->set();
+    co_await shared;
+    co_await record_result(shared, seen);
+}
+
+task<int> forty_two() {
+    co_return 42;
+}
+
+shared_task<int> counted_forty_two(std::size_t* runs) {
+    ++*runs;
+    co_return 42;
+}
+
+task<void> add_spawned(shared_task<int> from_task, shared_task<int> from_shared, int* sum) {
+    int first = co_await from_task;
+    int second = co_await from_shared;
+    *sum = first + second;
+    stop_current();
+}
+
+shared_task<void> hold_until(event* gate, [[maybe_unused]] std::shared_ptr<int> frame_alive) {
+    co_await *gate;
+}
+
+shared_task<void> keep_frame_alive([[maybe_unused]] std::shared_ptr<int> frame_alive) {
+    co_return;
+}
+
+task<void> observe_then_open(event* gate, std::weak_ptr<int> observed, bool* alive_before_open) {
+    *alive_before_open = !observed.expired();
+    gate->set();
+    event_loop::current()->spawn(stopper());
+    co_return;
+}
+
+task<void> await_then_stop(shared_task<void> awaited) {
+    co_await awaited;
+    stop_current();
+}
+
+task<void> count_and_stop_last(std::size_t* finished, std::thread::id* last_thread) {
+    *last_thread = std::this_thread::get_id();
+    if (++*finished == root_count) {
+        stop_current();
+    }
+    co_return;
+}
+
+task<void> await_erased_then_typed(shared_task<void> erased, shared_task<int> typed, int* value) {
+    co_await erased;
+    *value = co_await typed;
+    stop_current();
+}
+
+shared_task<void> shared_thrower() {
+    co_await nothing();
+    throw std::runtime_error("shared boom");
+}
+
+task<void> await_ready_tasks(shared_task<void> made_outside, bool* resumed) {
+    co_await made_outside;
+    co_await pulsarlm::make_ready_task();
+    *resumed = true;
+    stop_current();
+}
+
 }  // namespace
 
 TEST_CASE("values chain through task<int>, task<std::string> and task<void> across many roots") {
@@ -186,7 +271,7 @@ TEST_CASE("external tasks resolve from another thread after awaiting and before 
     event_loop loop;
     int received = 0;
     auto [value, value_resolver] = external_task<int>::make();
-    auto [signal, signal_resolver] = external_task<>::make();
+    auto [signal, signal_resolver] = external_task<void>::make();
     signal_resolver.resolve();
     std::thread resolving;
     loop.spawn(external_root(std::move(value), std::move(signal), &received));
@@ -297,4 +382,114 @@ TEST_CASE("run_on runs a task on another loop's thread and resumes the awaiter w
     CHECK(valued_on == worker_id);
     CHECK(void_on == worker_id);
     CHECK(valued_on != std::this_thread::get_id());
+}
+
+TEST_CASE("a shared task runs once and gives every awaiter, before and after its end, a reference to one result") {
+    event gate;
+    event_loop loop;
+    std::size_t runs = 0;
+    std::vector<const std::string*> seen;
+    shared_task<std::string> shared = run_counted_after(&gate, &runs);
+    CHECK(runs == 0);
+    for (std::size_t i = 0; i + 1 < shared_waiter_count; i++) {
+        loop.spawn(record_result(shared, &seen));
+    }
+    loop.spawn(open_then_record_twice(&gate, shared, &seen));
+    CHECK(loop.run() == nullptr);
+    CHECK(runs == 1);
+    REQUIRE(seen.size() == shared_waiter_count);
+    for (const std::string* result : seen) {
+        CHECK(result == seen.front());
+        CHECK(*result == "shared");
+    }
+}
+
+TEST_CASE("spawn runs a task or a shared task on the loop once and returns a shared task with its result") {
+    event_loop loop;
+    std::size_t runs = 0;
+    int sum = 0;
+    shared_task<int> from_task = loop.spawn(forty_two());
+    shared_task<int> from_shared = loop.spawn(counted_forty_two(&runs));
+    shared_task<int> spawned_again = loop.spawn(from_shared);
+    loop.spawn(add_spawned(from_task, spawned_again, &sum));
+    CHECK(loop.run() == nullptr);
+    CHECK(sum == 84);
+    CHECK(runs == 1);
+}
+
+TEST_CASE("a spawned shared task runs to its end after its handles are dropped, and then its frame is destroyed") {
+    event gate;
+    event_loop loop;
+    auto frame_alive = std::make_shared<int>(0);
+    std::weak_ptr<int> observed = frame_alive;
+    bool alive_before_open = false;
+    loop.spawn(hold_until(&gate, std::move(frame_alive)));
+    loop.spawn(observe_then_open(&gate, observed, &alive_before_open));
+    CHECK(loop.run() == nullptr);
+    CHECK(alive_before_open);
+    CHECK(observed.expired());
+}
+
+TEST_CASE("an ended shared task that was not spawned keeps its frame until the last copy is destroyed") {
+    auto frame_alive = std::make_shared<int>(0);
+    std::weak_ptr<int> observed = frame_alive;
+    std::optional<shared_task<void>> last_copy;
+    {
+        event_loop loop;
+        shared_task<void> held = keep_frame_alive(std::move(frame_alive));
+        last_copy = held;
+        loop.spawn(await_then_stop(held));
+        CHECK(loop.run() == nullptr);
+    }
+    CHECK(!observed.expired());
+    last_copy.reset();
+    CHECK(observed.expired());
+}
+
+TEST_CASE("tasks spawned from another thread, which drops their handles, run on the loop's thread") {
+    event_loop loop;
+    std::size_t finished = 0;
+    std::thread::id last_thread;
+    std::thread spawning([&] {
+        for (std::size_t i = 0; i < root_count; i++) {
+            loop.spawn(count_and_stop_last(&finished, &last_thread));
+        }
+    });
+    CHECK(loop.run() == nullptr);
+    spawning.join();
+    CHECK(finished == root_count);
+    CHECK(last_thread == std::this_thread::get_id());
+}
+
+TEST_CASE("a shared_task<void> converted from a shared task of a value type awaits the same run") {
+    event_loop loop;
+    std::size_t runs = 0;
+    int value = 0;
+    shared_task<int> typed = counted_forty_two(&runs);
+    shared_task<void> erased = typed;
+    loop.spawn(await_erased_then_typed(erased, typed, &value));
+    CHECK(loop.run() == nullptr);
+    CHECK(runs == 1);
+    CHECK(value == 42);
+}
+
+TEST_CASE("ready tasks made outside and inside the loop resume their awaiter") {
+    shared_task<void> made_outside = pulsarlm::make_ready_task();
+    event_loop loop;
+    bool resumed = false;
+    loop.spawn(await_ready_tasks(made_outside, &resumed));
+    CHECK(loop.run() == nullptr);
+    CHECK(resumed);
+}
+
+TEST_CASE("a panic in a shared task ends run with the thrown exception") {
+    event_loop loop;
+    loop.spawn(shared_thrower());
+    std::exception_ptr thrown = loop.run();
+    REQUIRE(thrown != nullptr);
+    try {
+        std::rethrow_exception(thrown);
+    } catch (const std::runtime_error& error) {
+        CHECK(std::string(error.what()) == "shared boom");
+    }
 }

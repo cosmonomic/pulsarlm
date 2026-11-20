@@ -72,11 +72,55 @@ void event::awaiter::await_suspend(std::coroutine_handle<> awaiting) noexcept {
     next = std::exchange(target.waiters, this);
 }
 
+void shared_task_state::remove_reference() noexcept {
+    if (reference_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        std::coroutine_handle<> frame = handle;
+        frame.destroy();
+    }
+}
+
+void shared_task_state::end() noexcept {
+    ended = true;
+    waiter* awaiting = std::exchange(waiters, nullptr);
+    assert(awaiting == nullptr || event_loop::current() != nullptr);
+    while (awaiting != nullptr) {
+        waiter* following = awaiting->next;
+        awaiting->linked = false;
+        event_loop::current()->schedule(awaiting->queue_node);
+        awaiting = following;
+    }
+}
+
+// A frame destroyed while awaiting, after a panic or with its loop, unlinks its waiter.
+shared_task_state::waiter::~waiter() {
+    if (!linked) {
+        return;
+    }
+    waiter** link = &target.waiters;
+    while (*link != this) {
+        link = &(*link)->next;
+    }
+    *link = next;
+}
+
+void shared_task_state::waiter::link(std::coroutine_handle<> awaiting) noexcept {
+    queue_node.handle = awaiting;
+    linked = true;
+    next = std::exchange(target.waiters, this);
+}
+
+shared_task<void> make_ready_task() {
+    shared_task<void> ready = []() -> shared_task<void> { co_return; }();
+    ready.state->started = true;
+    ready.state->handle.resume();
+    return ready;
+}
+
 event_loop* event_loop::current() noexcept {
     return running;
 }
 
-// Root tasks are destroyed after unlocking: destroying a frame can lock an external_task's shared state, and resolve
+// Root tasks are dropped after unlocking: destroying a frame can lock an external_task's shared state, and resolve
 // locks the shared state before the loop.
 event_loop::~event_loop() {
     decltype(root_tasks) remaining;
@@ -94,7 +138,7 @@ void event_loop::panic(std::exception_ptr thrown) noexcept {
     }
 }
 
-// The root task is destroyed after unlocking, as in ~event_loop.
+// The root task is dropped after unlocking, as in ~event_loop.
 void event_loop::destroy_completed_root_task() noexcept {
     decltype(root_tasks)::node_type completed;
     {
@@ -119,11 +163,11 @@ void event_loop::schedule(ready_node& node) noexcept {
     wake_condition.notify_one();
 }
 
-void event_loop::spawn(task<void> root_task) {
-    assert(root_task.handle);
-    std::coroutine_handle<> handle = root_task.handle;
+void event_loop::schedule_root_task(shared_task<void> root_task) {
+    std::coroutine_handle<> handle = root_task.state->handle;
     std::lock_guard lock(mutex);
     auto [it, inserted] = root_tasks.try_emplace(handle, spawned_task{std::move(root_task), {.handle = handle}});
+    assert(inserted);
     push_ready(it->second.queue_node);
     wake_condition.notify_one();
 }
@@ -172,15 +216,6 @@ external_task<cudaError_t> await_stream(cudaStream_t stream) {
     check_cuda(cudaStreamAddCallback(stream, resolve_synchronized, owned.get(), 0));
     owned.release();
     return std::move(done);
-}
-
-external_task<> run_on(event_loop& target, task<void> root_task) {
-    auto [result, resolver] = external_task<>::make();
-    target.spawn([](task<void> awaited, external_task<>::resolver resolving) -> task<void> {
-        co_await std::move(awaited);
-        resolving.resolve();
-    }(std::move(root_task), std::move(resolver)));
-    return std::move(result);
 }
 
 }  // namespace pulsarlm
