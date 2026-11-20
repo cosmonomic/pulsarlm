@@ -22,7 +22,7 @@ namespace attn {
 
 // One validated call of a paged attention op. cu_seqlens_q is undefined for decode,
 // where sequence s has the one query row s. mass_sum, weight_sum, cu_view_pages and
-// query_weights are all defined, with a page_mass, or all undefined.
+// query_weights are all defined, with a page_mass, or all undefined. o is contiguous.
 struct paged_attn_batch {
     at::Tensor q;
     at::Tensor k_pool;
@@ -38,7 +38,7 @@ struct paged_attn_batch {
     at::Tensor cu_view_pages;
     at::Tensor query_weights;
     at::Tensor o;
-    bool mass_per_query = false;
+    int64_t per_query_mass_request_count = 0;
     double scale;
     int64_t sliding_window;
     int64_t num_seqs;
@@ -68,7 +68,7 @@ struct paged_attn_batch {
             static_cast<float*>(data(this->weight_sum)),
             static_cast<const int32_t*>(data(this->cu_view_pages)),
             static_cast<const float*>(data(this->query_weights)),
-            this->mass_per_query,
+            static_cast<int>(this->per_query_mass_request_count),
             static_cast<scalar_t*>(data(this->o)),
             static_cast<int>(this->num_seqs),
             static_cast<int>(this->n_q_heads),
@@ -91,11 +91,9 @@ bool prefill_fits(int64_t page_size, int64_t head_dim);
 // page, token and head starting 16-byte aligned.
 void check_pools(const char* op, const at::Tensor& k_pool, const at::Tensor& v_pool);
 
-// Checks the mass of b's op, with views mass views (cu_view_pages [views + 1]), and sets it on b.
-void attach_mass(paged_attn_batch& b, const char* op, const page_mass& mass, int64_t views);
-
-// Checks the argument contract the attention ops share (pulsarlm/kernels/paged_attention.hpp) and allocates o, one mass
-// view per sequence. op names the caller in every error.
+// Checks the argument contract the attention ops share (pulsarlm/kernels/paged_attention.hpp), with the first
+// per_query_mass_request_count sequences measuring a mass view per query row (see attn_prefill_cuda), and sets o to out
+// or allocates it. op names the caller in every error.
 paged_attn_batch make_paged_attn_batch(
     const char* op,
     const at::Tensor& q,
@@ -103,7 +101,9 @@ paged_attn_batch make_paged_attn_batch(
     const page_views& views,
     const std::optional<at::Tensor>& cu_seqlens_q,
     const attention_layer& layer,
-    const std::optional<page_mass>& mass
+    const std::optional<page_mass>& mass,
+    int64_t per_query_mass_request_count,
+    const std::optional<at::Tensor>& out
 );
 
 // The scalar kernel over the whole batch: the fallback for shapes the tensor-core

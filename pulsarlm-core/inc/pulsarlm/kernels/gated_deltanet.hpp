@@ -9,12 +9,13 @@
 
 namespace pulsarlm {
 
-// The Gated DeltaNet ops run a ragged batch: sequence s holds tokens [cu_seqlens_q[s], cu_seqlens_q[s + 1]) of x, or
-// token s alone without cu_seqlens_q; a verify op's batch holds tokens_per_sequence tokens of each sequence in turn. The
-// state after the batch's last token of a sequence goes to its last slot, the state after its newest page end to that
-// page's boundary line; a verify op of n tokens per sequence also writes the state after each token t into slot slots - n
-// + t. A pool's
-// lines lie any number of elements apart, a state pool's lines 16-byte aligned.
+// The Gated DeltaNet ops run a ragged batch: sequence s holds tokens [cu_seqlens_q[s], cu_seqlens_q[s + 1]) of x. The
+// step ops run each sequence's tokens one after another, for sequences of few tokens; the chunked ops run them in
+// chunks, for prefill chunks. The state after the batch's last token of a sequence goes to its last slot, the state
+// after its newest page end to that page's boundary line; gated_delta_rule_step_cuda also writes the state after each
+// of the last kept_state_counts[s] tokens t of a sequence of count tokens into slot slots - count + t. A pool's
+// lines lie any number of elements apart, a state pool's lines 16-byte aligned. Each op returns its result written
+// into out when given, which must then be contiguous, of the result's shape and of x's dtype and device.
 
 // Where a ragged batch's sequences keep their recurrent state. Per sequence, lines [num_seqs, >= slots + 2] int32 holds
 // slots lines holding states, then the boundary lines of its even and odd pages. history_positions (int64 [num_seqs])
@@ -37,23 +38,25 @@ struct state_rows {
 // holds the last window inputs before a sequence's next token, window at least (kernel - 1) * dilation and the extra
 // ones the inputs of up to slots - 1 tokens a step does not accept: the convolution reads those that end window -
 // rejected_tokens[s] entries in. rows.slots is 1.
-at::Tensor causal_conv_cuda(
+at::Tensor causal_conv_step_cuda(
     const at::Tensor& x,
     const at::Tensor& weight,
     const at::Tensor& conv_pool,
     const state_rows& rows,
-    const std::optional<at::Tensor>& cu_seqlens_q,
-    std::int64_t dilation
+    const at::Tensor& cu_seqlens_q,
+    std::int64_t dilation,
+    const std::optional<at::Tensor>& out
 );
 
-// causal_conv_cuda over tokens_per_sequence tokens of each sequence; the line keeps the inputs after the last.
-at::Tensor causal_conv_verify_cuda(
+// causal_conv_step_cuda's result, computed by token instead of by sequence.
+at::Tensor causal_conv_chunked_cuda(
     const at::Tensor& x,
     const at::Tensor& weight,
     const at::Tensor& conv_pool,
     const state_rows& rows,
-    std::int64_t tokens_per_sequence,
-    std::int64_t dilation
+    const at::Tensor& cu_seqlens_q,
+    std::int64_t dilation,
+    const std::optional<at::Tensor>& out
 );
 
 // The gated delta rule's gated outputs [tokens, value heads * value dim] in x's dtype. Each row of x [tokens, 2 *
@@ -65,7 +68,8 @@ at::Tensor causal_conv_verify_cuda(
 // dim, value dim], holds a sequence's state. Each value head's output o, rounded to x's dtype, leaves as norm_weight *
 // RMSNorm(o) * activation(z), the normalized o and its product with norm_weight each rounded to x's dtype; z is
 // [tokens, value heads * value dim] and norm_weight [value dim], both in x's dtype, each row of z contiguous.
-at::Tensor gated_delta_rule_cuda(
+// kept_state_counts is int32 [num_seqs], each between 1 and the smaller of rows.slots and the sequence's tokens.
+at::Tensor gated_delta_rule_step_cuda(
     const at::Tensor& x,
     const at::Tensor& a,
     const at::Tensor& b,
@@ -73,18 +77,19 @@ at::Tensor gated_delta_rule_cuda(
     const at::Tensor& neg_a,
     const at::Tensor& state_pool,
     const state_rows& rows,
-    const std::optional<at::Tensor>& cu_seqlens_q,
+    const at::Tensor& cu_seqlens_q,
+    const at::Tensor& kept_state_counts,
     int64_t key_heads,
     const at::Tensor& z,
     const at::Tensor& norm_weight,
     double eps,
     gate_activation activation,
-    const at::Tensor& counters
+    const at::Tensor& counters,
+    const std::optional<at::Tensor>& out
 );
 
-// gated_delta_rule_cuda over tokens_per_sequence tokens of each sequence, at most rows.slots, writing the state after
-// each token t into slot rows.slots - tokens_per_sequence + t.
-at::Tensor gated_delta_rule_verify_cuda(
+// gated_delta_rule_step_cuda keeping the state after each sequence's last token alone.
+at::Tensor gated_delta_rule_chunked_cuda(
     const at::Tensor& x,
     const at::Tensor& a,
     const at::Tensor& b,
@@ -92,17 +97,18 @@ at::Tensor gated_delta_rule_verify_cuda(
     const at::Tensor& neg_a,
     const at::Tensor& state_pool,
     const state_rows& rows,
-    int64_t tokens_per_sequence,
+    const at::Tensor& cu_seqlens_q,
     int64_t key_heads,
     const at::Tensor& z,
     const at::Tensor& norm_weight,
     double eps,
     gate_activation activation,
-    const at::Tensor& counters
+    const at::Tensor& counters,
+    const std::optional<at::Tensor>& out
 );
 
-// The arrival counters (arrival_counters.cuh) gated_delta_rule_cuda and gated_delta_rule_verify_cuda need for num_seqs
-// sequences.
+// The arrival counters (arrival_counters.cuh) gated_delta_rule_step_cuda and gated_delta_rule_chunked_cuda need for
+// num_seqs sequences.
 int64_t gated_delta_rule_counters(int64_t num_seqs, int64_t value_heads);
 
 }  // namespace pulsarlm

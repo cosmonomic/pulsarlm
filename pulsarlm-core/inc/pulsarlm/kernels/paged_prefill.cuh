@@ -264,11 +264,11 @@ __global__ void __launch_bounds__(nwarps * 32, ctas_per_sm) attn_prefill_tc_kern
         __syncthreads();
 
         // A query measuring its mass apart adds its own rows; otherwise the tile's queries add to their sequence's.
-        if (p.mass_sum && p.mass_per_query && tid < key_pages) {
+        if (p.mass_sum && s < p.per_query_mass_request_count && tid < key_pages) {
             for (int m = 0; m < tile_rows; ++m) {
                 const float page_max = page_max_rows[m * key_pages + tid];
                 if (page_max > -CUDART_INF_F && row_weight[m] > 0.0f) {
-                    const int64_t row = mass_row(p, q_global_base + m, t * key_pages + tid);
+                    const int64_t row = mass_row(p, mass_view(p, s, q_global_base + m), t * key_pages + tid);
                     atomicAdd(&p.mass_sum[row * p.n_q_heads + h], row_weight[m] * page_max);
                     if (h == 0) {
                         atomicAdd(&p.weight_sum[row], row_weight[m]);
@@ -286,7 +286,7 @@ __global__ void __launch_bounds__(nwarps * 32, ctas_per_sm) attn_prefill_tc_kern
                 }
             }
             if (page_weight > 0.0f) {
-                const int64_t row = mass_row(p, s, t * key_pages + tid);
+                const int64_t row = mass_row(p, mass_view(p, s, q_global_base), t * key_pages + tid);
                 atomicAdd(&p.mass_sum[row * p.n_q_heads + h], page_sum);
                 if (h == 0) {
                     atomicAdd(&p.weight_sum[row], page_weight);

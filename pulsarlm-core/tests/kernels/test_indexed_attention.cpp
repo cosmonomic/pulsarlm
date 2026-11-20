@@ -216,7 +216,8 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
             .weight_sum = weights,
             .cu_view_pages = b.cu_view_pages,
             .query_weights = b.query_weights
-        }
+        },
+        std::nullopt
     );
     at::Tensor expected_o = at::zeros({b.total_q, n_q, head_dim}, opts.dtype(at::kFloat));
     at::Tensor expected_mass = mass_of();
@@ -259,7 +260,8 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
             .weight_sum = all_weights,
             .cu_view_pages = b.cu_view_pages,
             .query_weights = b.query_weights
-        }
+        },
+        std::nullopt
     );
     // The scalar kernel sums each output across threads with atomicAdd, and both ops add the mass with atomicAdd, in no
     // fixed order. Joined splits round differently from one pass over the keys.
@@ -310,7 +312,8 @@ TEST_CASE("verify indexed attention measures each query's mass in its own view",
             .weight_sum = weights,
             .cu_view_pages = cu_query_pages,
             .query_weights = b.query_weights
-        }
+        },
+        std::nullopt
     );
 
     at::Tensor expected_o = at::zeros({b.total_q, n_q, head_dim}, opts.dtype(at::kFloat));
@@ -321,4 +324,79 @@ TEST_CASE("verify indexed attention measures each query's mass in its own view",
     CHECK(at::allclose(o.to(at::kFloat), expected_o, tolerance, tolerance));
     CHECK(at::allclose(mass, expected_mass, tolerance, tolerance));
     CHECK(at::allclose(weights, expected_weights, 1e-5, 1e-6));
+}
+
+TEST_CASE("the indexed attention ops write into a given out, a slice of a larger tensor included", "[ops][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const auto dtype = GENERATE(at::kFloat, at::kBFloat16);
+    const bool verify = GENERATE(false, true);
+    const int64_t head_dim = 64;
+    // Each view spans two pages and holds at most two queries, so every output and mass sum adds at most two nonzero
+    // terms, which round alike in either order.
+    const int64_t page_size = 32;
+    const int64_t n_q = 4, n_kv = 2, num_lines = 6;
+    const pulsarlm::rope_parameters rope{.theta = 1e4, .partial_rotary_factor = 0.25};
+    const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
+    at::manual_seed(13);
+    view_batch b = make_batch(page_size, page_size + 20, 2);
+    auto opts = at::device(at::kCUDA).dtype(dtype);
+    auto k_pool = at::randn({num_lines, page_size, n_kv, head_dim}, opts);
+    auto v_pool = at::randn({num_lines, page_size, n_kv, head_dim}, opts);
+    auto q = at::randn({b.total_q, n_q, head_dim}, opts);
+    const int64_t words = (max_pages * page_size / block_size + 31) / 32;
+    const pulsarlm::block_selection selection{
+        .selected = random_selection(b, page_size, words),
+        .block_size = block_size,
+        .max_selected_blocks = max_pages * page_size / block_size,
+    };
+    const int64_t views = verify ? b.total_q : static_cast<int64_t>(b.views.size());
+    at::Tensor cu_view_pages = at::arange(views + 1, b.cu_view_pages.options()) * max_pages;
+    auto attend = [&](const std::optional<at::Tensor>& out, at::Tensor& mass, at::Tensor& weights) {
+        mass = at::zeros({views * max_pages, n_q}, opts.dtype(at::kFloat));
+        weights = at::zeros({views * max_pages}, opts.dtype(at::kFloat));
+        const pulsarlm::page_mass page_mass{
+            .mass_sum = mass,
+            .weight_sum = weights,
+            .cu_view_pages = cu_view_pages,
+            .query_weights = b.query_weights,
+        };
+        const pulsarlm::kv_pools pools{.keys = k_pool, .values = v_pool};
+        const pulsarlm::page_views page_views{
+            .page_tables = b.page_tables,
+            .page_positions = b.page_positions,
+            .key_counts = b.key_counts,
+        };
+        return verify
+            ? pulsarlm::attn_indexed_verify_cuda(
+                  q,
+                  pools,
+                  page_views,
+                  b.cu_seqlens_q,
+                  rope,
+                  scale,
+                  selection,
+                  page_mass,
+                  out
+              )
+            : pulsarlm::attn_indexed_cuda(q, pools, page_views, b.cu_seqlens_q, rope, scale, selection, page_mass, out);
+    };
+
+    at::Tensor alone_mass, alone_weights;
+    at::Tensor alone = attend(std::nullopt, alone_mass, alone_weights);
+    at::Tensor larger = at::randn({b.total_q + 5, n_q, head_dim}, opts);
+    at::Tensor larger_before = larger.clone();
+    at::Tensor slice = larger.narrow(0, 2, b.total_q);
+    at::Tensor into_mass, into_weights;
+    at::Tensor into = attend(slice, into_mass, into_weights);
+
+    CHECK(into.data_ptr() == slice.data_ptr());
+    CHECK(at::equal(slice, alone));
+    CHECK(at::equal(larger.narrow(0, 0, 2), larger_before.narrow(0, 0, 2)));
+    CHECK(at::equal(larger.narrow(0, 2 + b.total_q, 3), larger_before.narrow(0, 2 + b.total_q, 3)));
+    CHECK(at::equal(into_mass, alone_mass));
+    CHECK(at::equal(into_weights, alone_weights));
+    at::Tensor unused_mass, unused_weights;
+    CHECK_THROWS(attend(larger.narrow(0, 0, b.total_q + 1), unused_mass, unused_weights));
 }

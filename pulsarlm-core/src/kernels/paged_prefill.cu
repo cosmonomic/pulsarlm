@@ -157,23 +157,21 @@ at::Tensor attn_prefill_cuda(
     const page_views& views,
     const at::Tensor& cu_seqlens_q,
     const attention_layer& layer,
-    const std::optional<page_mass>& mass
+    const std::optional<page_mass>& mass,
+    std::int64_t per_query_mass_request_count,
+    const std::optional<at::Tensor>& out
 ) {
-    const auto batch = attn::make_paged_attn_batch("attn_prefill", q, pools, views, cu_seqlens_q, layer, mass);
-    return paged_prefill(batch);
-}
-
-at::Tensor attn_prefill_verify_cuda(
-    const at::Tensor& q,
-    const kv_pools& pools,
-    const page_views& views,
-    const at::Tensor& cu_seqlens_q,
-    const attention_layer& layer,
-    const page_mass& mass
-) {
-    auto batch = attn::make_paged_attn_batch("attn_prefill_verify", q, pools, views, cu_seqlens_q, layer, std::nullopt);
-    attn::attach_mass(batch, "attn_prefill_verify", mass, batch.total_q);
-    batch.mass_per_query = true;
+    const auto batch = attn::make_paged_attn_batch(
+        "attn_prefill",
+        q,
+        pools,
+        views,
+        cu_seqlens_q,
+        layer,
+        mass,
+        per_query_mass_request_count,
+        out
+    );
     return paged_prefill(batch);
 }
 

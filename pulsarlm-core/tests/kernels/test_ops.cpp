@@ -717,7 +717,7 @@ TEST_CASE(
                                 }
                                 auto query_mass = at::zeros({total_q * max_pages, n_q}, mass.options());
                                 auto query_weights_sum = at::zeros({total_q * max_pages}, mass.options());
-                                auto verified = pulsarlm::attn_prefill_verify_cuda(
+                                auto verified = pulsarlm::attn_prefill_cuda(
                                     q_pre,
                                     {.keys = k_pool, .values = v_pool},
                                     {.page_tables = page_tables,
@@ -733,7 +733,8 @@ TEST_CASE(
                                         .weight_sum = query_weights_sum,
                                         .cu_view_pages = int32_cuda(cu_query_view),
                                         .query_weights = prefill_weights
-                                    }
+                                    },
+                                    static_cast<int64_t>(views.size())
                                 );
                                 CHECK(at::equal(verified, o));
                                 at::Tensor per_page = query_mass.view({total_q, max_pages, n_q});
@@ -814,6 +815,229 @@ TEST_CASE(
                 }
             }
         }
+    }
+}
+
+namespace {
+
+// Four sequences of {3, 2, 2, 1} queries over two 16-key pages of lines of their own, with random query weights. A
+// sequence's view spans at most two pages and the last two sequences hold at most two queries each, so every output
+// and mass sum adds at most two nonzero terms, which round alike in either order.
+struct split_attention_case {
+    std::vector<int32_t> query_counts{3, 2, 2, 1};
+    std::vector<int32_t> key_counts{20, 31, 18, 7};
+    int64_t max_pages = 2;
+    int64_t n_q = 4;
+    int64_t n_kv = 2;
+    at::Tensor k_pool;
+    at::Tensor v_pool;
+    at::Tensor q;
+    at::Tensor query_weights;
+
+    explicit split_attention_case(at::ScalarType dtype) {
+        auto opts = at::device(at::kCUDA).dtype(dtype);
+        const auto lines = static_cast<int64_t>(this->query_counts.size()) * this->max_pages;
+        this->k_pool = at::randn({lines, pool_page_size, this->n_kv, pool_head_dim}, opts);
+        this->v_pool = at::randn({lines, pool_page_size, this->n_kv, pool_head_dim}, opts);
+        this->q = at::randn({this->query_total(0, 4), this->n_q, pool_head_dim}, opts);
+        this->query_weights = at::rand({this->query_total(0, 4)}, opts.dtype(at::kFloat)) + 0.1;
+    }
+
+    int64_t query_total(size_t first, size_t end) const {
+        int64_t total = 0;
+        for (size_t s = first; s < end; ++s) {
+            total += this->query_counts[s];
+        }
+        return total;
+    }
+
+    // The views of sequences [first, end), sequence s over lines 2 s and 2 s + 1.
+    pulsarlm::page_views views(size_t first, size_t end) const {
+        std::vector<int32_t> tables;
+        std::vector<int32_t> counts;
+        for (size_t s = first; s < end; ++s) {
+            tables.push_back(static_cast<int32_t>(2 * s));
+            tables.push_back(static_cast<int32_t>(2 * s + 1));
+            counts.push_back(this->key_counts[s]);
+        }
+        at::Tensor page_tables = int32_cuda(tables).view({static_cast<int64_t>(end - first), this->max_pages});
+        return {
+            .page_tables = page_tables,
+            .page_positions = identity_positions(page_tables),
+            .key_counts = int32_cuda(counts),
+        };
+    }
+
+    at::Tensor cu_seqlens_q(size_t first, size_t end) const {
+        std::vector<int32_t> starts{0};
+        for (size_t s = first; s < end; ++s) {
+            starts.push_back(starts.back() + this->query_counts[s]);
+        }
+        return int32_cuda(starts);
+    }
+
+    at::Tensor queries(size_t first, size_t end) const {
+        return this->q.narrow(0, this->query_total(0, first), this->query_total(first, end));
+    }
+
+    // A zeroed mass of mass_views views of max_pages pages each, weighing the queries of sequences [first, end).
+    pulsarlm::page_mass mass(int64_t mass_views, size_t first, size_t end) const {
+        auto f32 = at::device(at::kCUDA).dtype(at::kFloat);
+        return {
+            .mass_sum = at::zeros({mass_views * this->max_pages, this->n_q}, f32),
+            .weight_sum = at::zeros({mass_views * this->max_pages}, f32),
+            .cu_view_pages = at::arange(mass_views + 1, f32.dtype(at::kInt)) * this->max_pages,
+            .query_weights = this->query_weights.narrow(0, this->query_total(0, first), this->query_total(first, end)),
+        };
+    }
+
+    pulsarlm::kv_pools pools() const {
+        return {.keys = this->k_pool, .values = this->v_pool};
+    }
+};
+
+pulsarlm::attention_layer plain_layer() {
+    return {
+        .rope = pulsarlm::rope_parameters{.theta = rope_theta},
+        .scale = attention_scale,
+        .sliding_window = std::nullopt,
+        .k_norm_weight = std::nullopt,
+    };
+}
+
+}  // namespace
+
+TEST_CASE(
+    "prefill measures the first sequences' mass per query and the others' per sequence, as a call on each part does",
+    "[ops][cuda]"
+) {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    for (auto dt : {at::kFloat, at::kBFloat16}) {
+        INFO("dtype " << dt);
+        at::manual_seed(17);
+        const split_attention_case c(dt);
+        // The first two sequences' 5 queries measure a view each, the last two sequences one view each.
+        const pulsarlm::page_mass together_mass = c.mass(7, 0, 4);
+        at::Tensor together = pulsarlm::attn_prefill_cuda(
+            c.q,
+            c.pools(),
+            c.views(0, 4),
+            c.cu_seqlens_q(0, 4),
+            plain_layer(),
+            together_mass,
+            2
+        );
+        const pulsarlm::page_mass per_query_mass = c.mass(5, 0, 2);
+        at::Tensor per_query = pulsarlm::attn_prefill_cuda(
+            c.queries(0, 2),
+            c.pools(),
+            c.views(0, 2),
+            c.cu_seqlens_q(0, 2),
+            plain_layer(),
+            per_query_mass,
+            2
+        );
+        const pulsarlm::page_mass per_sequence_mass = c.mass(2, 2, 4);
+        at::Tensor per_sequence = pulsarlm::attn_prefill_cuda(
+            c.queries(2, 4),
+            c.pools(),
+            c.views(2, 4),
+            c.cu_seqlens_q(2, 4),
+            plain_layer(),
+            per_sequence_mass,
+            0
+        );
+
+        CHECK(at::equal(together, at::cat({per_query, per_sequence})));
+        CHECK(at::equal(together_mass.mass_sum, at::cat({per_query_mass.mass_sum, per_sequence_mass.mass_sum})));
+        CHECK(at::equal(together_mass.weight_sum, at::cat({per_query_mass.weight_sum, per_sequence_mass.weight_sum})));
+        CHECK_THROWS(
+            pulsarlm::attn_prefill_cuda(
+                c.q,
+                c.pools(),
+                c.views(0, 4),
+                c.cu_seqlens_q(0, 4),
+                plain_layer(),
+                std::nullopt,
+                2
+            )
+        );
+        CHECK_THROWS(
+            pulsarlm::attn_prefill_cuda(
+                c.q,
+                c.pools(),
+                c.views(0, 4),
+                c.cu_seqlens_q(0, 4),
+                plain_layer(),
+                c.mass(7, 0, 4),
+                4
+            )
+        );
+    }
+}
+
+TEST_CASE("decode and prefill attention write into a given out, a slice of a larger tensor included", "[ops][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    for (auto dt : {at::kFloat, at::kBFloat16}) {
+        INFO("dtype " << dt);
+        at::manual_seed(19);
+        const split_attention_case c(dt);
+        auto check_out = [&](const auto& attend, int64_t tokens) {
+            at::Tensor alone = attend(std::nullopt);
+            at::Tensor larger = at::randn({tokens + 5, c.n_q, pool_head_dim}, c.q.options());
+            at::Tensor larger_before = larger.clone();
+            at::Tensor slice = larger.narrow(0, 2, tokens);
+            at::Tensor into = attend(slice);
+            CHECK(into.data_ptr() == slice.data_ptr());
+            CHECK(at::equal(slice, alone));
+            CHECK(at::equal(larger.narrow(0, 0, 2), larger_before.narrow(0, 0, 2)));
+            CHECK(at::equal(larger.narrow(0, 2 + tokens, 3), larger_before.narrow(0, 2 + tokens, 3)));
+            CHECK_THROWS(attend(larger.narrow(0, 0, tokens + 1)));
+            CHECK_THROWS(attend(at::empty({tokens, c.n_q, pool_head_dim}, c.q.options().dtype(at::kHalf))));
+        };
+        at::Tensor decode_q = c.q.narrow(0, 0, 4).contiguous();
+        for (int64_t num_splits : {0, 2}) {
+            INFO("num_splits " << num_splits);
+            check_out(
+                [&](const std::optional<at::Tensor>& out) {
+                    return pulsarlm::attn_decode_cuda(
+                        decode_q,
+                        c.pools(),
+                        c.views(0, 4),
+                        plain_layer(),
+                        std::nullopt,
+                        num_splits,
+                        out
+                    );
+                },
+                4
+            );
+        }
+        at::Tensor alone_mass;
+        at::Tensor into_mass;
+        check_out(
+            [&](const std::optional<at::Tensor>& out) {
+                const pulsarlm::page_mass mass = c.mass(7, 0, 4);
+                at::Tensor o = pulsarlm::attn_prefill_cuda(
+                    c.q,
+                    c.pools(),
+                    c.views(0, 4),
+                    c.cu_seqlens_q(0, 4),
+                    plain_layer(),
+                    mass,
+                    2,
+                    out
+                );
+                (out ? into_mass : alone_mass) = at::cat({mass.mass_sum.flatten(), mass.weight_sum});
+                return o;
+            },
+            c.query_total(0, 4)
+        );
+        CHECK(at::equal(into_mass, alone_mass));
     }
 }
 

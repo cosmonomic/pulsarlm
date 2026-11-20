@@ -24,7 +24,7 @@ rope_q(const at::Tensor& q, const at::Tensor& pos, int64_t n_q_heads, int64_t he
 // k_norm_weight are as attention_layer holds them. When g.page_mass_sum[kv_layer] is defined, the layer writes the
 // mass_sum attn_prefill_cuda measures into reader's columns of it, reader being the layer's index among those reading
 // kv_layer, and reader 0 writes the weight_sum into g.page_weight_sum[kv_layer]. In a verify batch each query measures
-// its mass in a view of its own (attn_prefill_verify_cuda).
+// its mass in a view of its own (attn_prefill_cuda's per_query_mass_request_count).
 at::Tensor paged_attention(
     const at::Tensor& q,
     const at::Tensor& k,

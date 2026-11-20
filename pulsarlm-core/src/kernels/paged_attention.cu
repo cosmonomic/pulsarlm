@@ -868,9 +868,10 @@ at::Tensor attn_decode_cuda(
     const page_views& views,
     const attention_layer& layer,
     const std::optional<page_mass>& mass,
-    int64_t num_splits
+    int64_t num_splits,
+    const std::optional<at::Tensor>& out
 ) {
-    const auto batch = attn::make_paged_attn_batch("attn_decode", q, pools, views, std::nullopt, layer, mass);
+    const auto batch = attn::make_paged_attn_batch("attn_decode", q, pools, views, std::nullopt, layer, mass, 0, out);
     return paged_decode(batch, num_splits);
 }
 

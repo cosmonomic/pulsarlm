@@ -740,8 +740,8 @@ at::Tensor qwen4_exp_model::attention(
     }
     const double scale = 1.0 / std::sqrt(static_cast<double>(c.head_dim));
     at::Tensor o = g.kind == batch_kind::verify && mass
-        ? attn_indexed_verify_cuda(q, pools, views, g.cu_seqlens_q, rope, scale, selection, *mass)
-        : attn_indexed_cuda(q, pools, views, cu_seqlens_q, rope, scale, selection, mass);
+        ? attn_indexed_verify_cuda(q, pools, views, g.cu_seqlens_q, rope, scale, selection, *mass, std::nullopt)
+        : attn_indexed_cuda(q, pools, views, cu_seqlens_q, rope, scale, selection, mass, std::nullopt);
     at::Tensor out = small_batch_linear_cuda(
         sigmoid_gated_cuda(o.view({ntok, heads.n_heads, c.head_dim}), gate).view({ntok, heads.n_heads * c.head_dim}),
         w.o_proj
@@ -892,10 +892,6 @@ qwen4_exp_model::ple(const at::Tensor& x, const layer_weights& layer, const batc
     const std::int64_t ntok = x.size(0);
     const std::size_t conv_layer = layer.ple_conv_kv_layer;
     const std::size_t token_layer = layer.ple_token_kv_layer;
-    std::optional<at::Tensor> cu_seqlens_q;
-    if (g.kind != batch_kind::decode) {
-        cu_seqlens_q = g.cu_seqlens_q;
-    }
 
     at::Tensor ids = ngram_ids(w, token_layer, g, lines[token_layer]);
     at::Tensor embeddings = lookup(w.ngram_embedding, w.first_row, ids).view({ntok, -1});
@@ -906,12 +902,14 @@ qwen4_exp_model::ple(const at::Tensor& x, const layer_weights& layer, const batc
     at::Tensor gated = (at::sigmoid(gate) * at::linear(embeddings, w.value_proj).unsqueeze(1)).flatten(1);
     at::Tensor normed = stream_norm(gated, w.norm_conv);
     const state_rows rows = window_layer_rows(g, conv_layer);
-    const std::int64_t sequences = rows.lines.size(0);
-    assert(g.kind != batch_kind::verify || (sequences > 0 && ntok > 0 && ntok % sequences == 0));
-    at::Tensor convolved = g.kind == batch_kind::verify
-        ? causal_conv_verify_cuda(normed, w.conv, lines[conv_layer].k, rows, ntok / sequences, c.ngram_size)
-        : causal_conv_cuda(normed, w.conv, lines[conv_layer].k, rows, cu_seqlens_q, c.ngram_size);
-    return gated + convolved;
+    const at::Tensor& pool = lines[conv_layer].k;
+    if (g.kind == batch_kind::prefill) {
+        return gated + causal_conv_chunked_cuda(normed, w.conv, pool, rows, g.cu_seqlens_q, c.ngram_size, std::nullopt);
+    }
+    const at::Tensor cu_seqlens_q = g.kind == batch_kind::verify
+        ? g.cu_seqlens_q
+        : at::arange(rows.lines.size(0) + 1, rows.lines.options());
+    return gated + causal_conv_step_cuda(normed, w.conv, pool, rows, cu_seqlens_q, c.ngram_size, std::nullopt);
 }
 
 // A block's output joins the streams in the next mix's kernel, so x lags it until then.

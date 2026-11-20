@@ -22,25 +22,20 @@ constexpr int max_conv_window = 16;
 // Value columns per delta rule CTA.
 constexpr int columns = 16;
 
-// Sequence s holds tokens [first(s), first(s) + count(s)); without cu_seqlens_q, the per_sequence tokens from
-// s * per_sequence.
+// Sequence s holds tokens [cu_seqlens_q[s], cu_seqlens_q[s + 1]).
 struct ragged_tokens {
     const int32_t* cu_seqlens_q;
     int num_seqs;
-    int per_sequence;
 
     __device__ int first_token(int s) const {
-        return cu_seqlens_q != nullptr ? cu_seqlens_q[s] : s * per_sequence;
+        return cu_seqlens_q[s];
     }
 
     __device__ int count(int s) const {
-        return cu_seqlens_q != nullptr ? cu_seqlens_q[s + 1] - cu_seqlens_q[s] : per_sequence;
+        return cu_seqlens_q[s + 1] - cu_seqlens_q[s];
     }
 
     __device__ int find_sequence(int token) const {
-        if (cu_seqlens_q == nullptr) {
-            return token / per_sequence;
-        }
         int lo = 0;
         int hi = num_seqs - 1;
         while (lo < hi) {
@@ -273,17 +268,17 @@ __global__ void conv_state_kernel(
     }
 }
 
-// One thread per (sequence, channel) of a batch of one token per sequence: causal_conv_kernel's output for the token,
-// then conv_state_kernel's update of the sequence's lines.
+// One thread per (sequence, channel): causal_conv_kernel's output for each of the sequence's tokens in turn, then
+// conv_state_kernel's update of the sequence's lines.
 template <typename scalar_t>
-__global__ void single_token_conv_kernel(
+__global__ void conv_step_kernel(
     const scalar_t* __restrict__ x,
     int64_t x_row_stride,
     const scalar_t* __restrict__ weight,
     scalar_t* __restrict__ conv_pool,
     int64_t line_stride,
     state_lines lines,
-    int num_seqs,
+    ragged_tokens tokens,
     int channels,
     int kernel,
     int dilation,
@@ -293,7 +288,7 @@ __global__ void single_token_conv_kernel(
     wait_for_prior_kernels();
     allow_next_kernel();
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index >= static_cast<int64_t>(num_seqs) * channels) {
+    if (index >= static_cast<int64_t>(tokens.num_seqs) * channels) {
         return;
     }
     const int s = static_cast<int>(index / channels);
@@ -305,30 +300,35 @@ __global__ void single_token_conv_kernel(
     for (int i = 0; i < window; i++) {
         old[i] = start[i];
     }
+    const int first = tokens.first_token(s);
     const conv_inputs<scalar_t> inputs{
         .old = old,
         .valid = window - lines.rejected_tokens(s),
         .x = x,
         .x_row_stride = x_row_stride,
-        .first = s,
+        .first = first,
         .channel = channel,
         .window = window,
     };
-    float sum = 0.0f;
-    for (int j = 0; j < kernel; j++) {
-        sum += static_cast<float>(weight[channel * kernel + j]) *
-            static_cast<float>(inputs.entry(1, window - 1 - history + j * dilation));
+    const int n = tokens.count(s);
+    for (int t = 0; t < n; t++) {
+        float sum = 0.0f;
+        for (int j = 0; j < kernel; j++) {
+            sum += static_cast<float>(weight[channel * kernel + j]) *
+                static_cast<float>(inputs.entry(t + 1, window - 1 - history + j * dilation));
+        }
+        out[static_cast<int64_t>(first + t) * channels + channel] = static_cast<scalar_t>(silu(rounded<scalar_t>(sum)));
     }
-    out[index] = static_cast<scalar_t>(silu(rounded<scalar_t>(sum)));
-    if (lines.page_end_tokens(s, 1) > 0) {
-        scalar_t* boundary = conv_pool + lines.boundary(s, 1) * line_stride + channel_offset;
+    const int page_end = lines.page_end_tokens(s, n);
+    if (page_end > 0) {
+        scalar_t* boundary = conv_pool + lines.boundary(s, page_end) * line_stride + channel_offset;
         for (int j = 0; j < window; j++) {
-            boundary[j] = inputs.entry(1, j);
+            boundary[j] = inputs.entry(page_end, j);
         }
     }
     scalar_t* last = conv_pool + lines.last_slot(s) * line_stride + channel_offset;
     for (int j = 0; j < window; j++) {
-        last[j] = inputs.entry(1, j);
+        last[j] = inputs.entry(n, j);
     }
 }
 
@@ -397,16 +397,16 @@ template <int count, int threads, typename Fn> __device__ __forceinline__ void f
 constexpr int step_lanes = 8;
 constexpr int step_threads = columns * step_lanes;
 
-// tokens.count(s) tokens per sequence, one after another: one, or with verify the tokens of a verify group, the
-// state after each token written into its slot. One CTA per (sequence, value head, run of value columns);
-// step_lanes lanes keep a column, lane l of them its rows 32 i + 4 l + e, e < 4. The last CTA of a (sequence, value
-// head) to finish gates the head's outputs.
-template <typename scalar_t, int key_dim, bool verify>
+// tokens.count(s) tokens per sequence, one after another, the state after each of the last kept_state_counts[s] tokens
+// written into its slot. One CTA per (sequence, value head, run of value columns); step_lanes lanes keep a column, lane
+// l of them its rows 32 i + 4 l + e, e < 4. The last CTA of a (sequence, value head) to finish gates the head's outputs.
+template <typename scalar_t, int key_dim>
 __global__ void __launch_bounds__(step_threads) delta_rule_step_kernel(
     const scalar_t* __restrict__ x,
     const scalar_t* __restrict__ a,
     const scalar_t* __restrict__ b,
     delta_rule_params p,
+    const int32_t* __restrict__ kept_state_counts,
     output_gate<scalar_t> output,
     int32_t* __restrict__ head_counters,
     scalar_t* out
@@ -420,6 +420,8 @@ __global__ void __launch_bounds__(step_threads) delta_rule_step_kernel(
     const int column = block.first_column + block_column;
     const int first = p.tokens.first_token(block.s);
     const int count = p.tokens.count(block.s);
+    const int kept = kept_state_counts[block.s];
+    CUDA_KERNEL_ASSERT(kept >= 1 && kept <= count && kept <= p.lines.slots);
     auto compute_row = [&](int quad, int e) { return 32 * quad + 4 * row_lane + e; };
     auto head_out = [&](int t) {
         return out + (static_cast<int64_t>(first + t) * p.value_heads + block.head) * p.value_dim;
@@ -492,7 +494,7 @@ __global__ void __launch_bounds__(step_threads) delta_rule_step_kernel(
                 state[quad][e] = state[quad][e] * gain + k[quad][e] * delta;
             }
         }
-        if (verify) {
+        if (t >= count - kept) {
             store(block.state(p, p.lines.slot(block.s, p.lines.slots - count + t)) + block_column, state);
         }
         if (p.lines.page_end_tokens(block.s, t + 1) == t + 1) {
@@ -501,9 +503,6 @@ __global__ void __launch_bounds__(step_threads) delta_rule_step_kernel(
         if (row_lane == 0) {
             head_out(t)[column] = static_cast<scalar_t>(gain * q_state + qk * delta);
         }
-    }
-    if (!verify) {
-        store(block.state(p, p.lines.last_slot(block.s)) + block_column, state);
     }
     const int64_t head_row = static_cast<int64_t>(block.s) * p.value_heads + block.head;
     if (last_to_arrive(head_counters + head_row, p.value_dim / columns)) {
@@ -894,37 +893,43 @@ void check_rows(const char* op, const state_rows& rows) {
     );
 }
 
-// x's tokens split into rows' sequences by cu_seqlens_q, or per_sequence tokens each without it.
-void check_tokens(
-    const char* op,
-    const at::Tensor& x,
-    const state_rows& rows,
-    const std::optional<at::Tensor>& cu_seqlens_q,
-    int64_t per_sequence
-) {
+// x's tokens split into rows' sequences by cu_seqlens_q.
+void check_tokens(const char* op, const at::Tensor& x, const state_rows& rows, const at::Tensor& cu_seqlens_q) {
     TORCH_CHECK(
         x.is_cuda() && x.dim() == 2 && x.stride(1) == 1,
         op,
         ": x must be CUDA [tokens, dim], each row contiguous"
     );
     const int64_t num_seqs = rows.lines.size(0);
-    if (cu_seqlens_q.has_value()) {
-        TORCH_CHECK(
-            cu_seqlens_q->is_cuda() && cu_seqlens_q->scalar_type() == at::kInt && cu_seqlens_q->dim() == 1 &&
-                cu_seqlens_q->size(0) == num_seqs + 1 && cu_seqlens_q->is_contiguous(),
-            op,
-            ": cu_seqlens_q must be contiguous CUDA int32 [num_seqs + 1]"
-        );
-    } else {
-        TORCH_CHECK(x.size(0) == num_seqs * per_sequence, op, ": x must hold ", per_sequence, " tokens per sequence");
-    }
+    TORCH_CHECK(
+        cu_seqlens_q.is_cuda() && cu_seqlens_q.scalar_type() == at::kInt && cu_seqlens_q.dim() == 1 &&
+            cu_seqlens_q.size(0) == num_seqs + 1 && cu_seqlens_q.is_contiguous(),
+        op,
+        ": cu_seqlens_q must be contiguous CUDA int32 [num_seqs + 1]"
+    );
 }
 
-ragged_tokens ragged(const state_rows& rows, const std::optional<at::Tensor>& cu_seqlens_q, int64_t per_sequence) {
+// out when given, checked to be contiguous of sizes in x's dtype on x's device, or a new such tensor.
+at::Tensor
+make_output(const char* op, const std::optional<at::Tensor>& out, at::IntArrayRef sizes, const at::Tensor& x) {
+    if (!out.has_value()) {
+        return at::empty(sizes, x.options());
+    }
+    TORCH_CHECK(
+        out->sizes() == sizes && out->scalar_type() == x.scalar_type() && out->device() == x.device() &&
+            out->is_contiguous(),
+        op,
+        ": out must be contiguous ",
+        sizes,
+        " in x's dtype on x's device"
+    );
+    return *out;
+}
+
+ragged_tokens ragged(const state_rows& rows, const at::Tensor& cu_seqlens_q) {
     return ragged_tokens{
-        cu_seqlens_q.has_value() ? cu_seqlens_q->const_data_ptr<int32_t>() : nullptr,
+        cu_seqlens_q.const_data_ptr<int32_t>(),
         static_cast<int>(rows.lines.size(0)),
-        static_cast<int>(per_sequence),
     };
 }
 
@@ -957,16 +962,19 @@ template <typename Fn> void dispatch_key_dim(int64_t key_dim, Fn&& fn) {
 
 namespace {
 
-// The convolution of x's tokens, cu_seqlens_q splitting them into sequences, or per_sequence tokens each without it;
-// one token per sequence runs as one kernel.
+enum class recurrence_algorithm { step, chunked };
+
+// The convolution of x's tokens, cu_seqlens_q splitting them into sequences, by conv_step_kernel or by
+// causal_conv_kernel and conv_state_kernel.
 at::Tensor causal_conv(
+    recurrence_algorithm algorithm,
     const at::Tensor& x,
     const at::Tensor& weight,
     const at::Tensor& conv_pool,
     const state_rows& rows,
-    const std::optional<at::Tensor>& cu_seqlens_q,
-    int64_t per_sequence,
-    int64_t dilation
+    const at::Tensor& cu_seqlens_q,
+    int64_t dilation,
+    const std::optional<at::Tensor>& out
 ) {
     check_on_current_device(
         "causal_conv",
@@ -976,11 +984,12 @@ at::Tensor causal_conv(
          rows.lines,
          rows.history_positions,
          rows.rejected_tokens,
-         cu_seqlens_q.value_or(at::Tensor())}
+         cu_seqlens_q,
+         out.value_or(at::Tensor())}
     );
     check_rows("causal_conv", rows);
     TORCH_CHECK(rows.slots == 1, "causal_conv: rows.slots must be 1");
-    check_tokens("causal_conv", x, rows, cu_seqlens_q, per_sequence);
+    check_tokens("causal_conv", x, rows, cu_seqlens_q);
     const int64_t channels = x.size(1);
     TORCH_CHECK(
         weight.scalar_type() == x.scalar_type() && weight.dim() == 3 && weight.size(0) == channels &&
@@ -1007,15 +1016,15 @@ at::Tensor causal_conv(
             (std::max(total, num_seqs) * channels + conv_threads - 1) / conv_threads <= int32_max,
         "causal_conv: too many tokens, sequences or channels"
     );
-    at::Tensor out = at::empty(x.sizes(), x.options());
+    at::Tensor convolved = make_output("causal_conv", out, x.sizes(), x);
     if (num_seqs == 0) {
-        return out;
+        return convolved;
     }
     auto stream = at::cuda::getCurrentCUDAStream();
-    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "causal_conv_cuda", [&] {
-        if (!cu_seqlens_q && per_sequence == 1) {
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "causal_conv", [&] {
+        if (algorithm == recurrence_algorithm::step) {
             launch_dependent(
-                single_token_conv_kernel<scalar_t>,
+                conv_step_kernel<scalar_t>,
                 blocks_for(num_seqs * channels),
                 conv_threads,
                 0,
@@ -1026,12 +1035,12 @@ at::Tensor causal_conv(
                 conv_pool.mutable_data_ptr<scalar_t>(),
                 conv_pool.stride(0),
                 make_state_lines(rows),
-                static_cast<int>(num_seqs),
+                ragged(rows, cu_seqlens_q),
                 static_cast<int>(channels),
                 static_cast<int>(kernel),
                 static_cast<int>(dilation),
                 static_cast<int>(window),
-                out.mutable_data_ptr<scalar_t>()
+                convolved.mutable_data_ptr<scalar_t>()
             );
             C10_CUDA_KERNEL_LAUNCH_CHECK();
             return;
@@ -1049,13 +1058,13 @@ at::Tensor causal_conv(
                 conv_pool.const_data_ptr<scalar_t>(),
                 conv_pool.stride(0),
                 make_state_lines(rows),
-                ragged(rows, cu_seqlens_q, per_sequence),
+                ragged(rows, cu_seqlens_q),
                 total,
                 static_cast<int>(channels),
                 static_cast<int>(kernel),
                 static_cast<int>(dilation),
                 static_cast<int>(window),
-                out.mutable_data_ptr<scalar_t>()
+                convolved.mutable_data_ptr<scalar_t>()
             );
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
@@ -1070,18 +1079,19 @@ at::Tensor causal_conv(
             conv_pool.mutable_data_ptr<scalar_t>(),
             conv_pool.stride(0),
             make_state_lines(rows),
-            ragged(rows, cu_seqlens_q, per_sequence),
+            ragged(rows, cu_seqlens_q),
             static_cast<int>(channels),
             static_cast<int>(window)
         );
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     });
-    return out;
+    return convolved;
 }
 
-// The gated delta rule over x's tokens: with cu_seqlens_q, chunked; without, per_sequence tokens per sequence one
-// after another, verify writing the state after each into its slot.
+// The gated delta rule over x's tokens, cu_seqlens_q splitting them into sequences: by delta_rule_step_kernel, which
+// reads kept_state_counts, or by delta_rule_chunk_kernel and output_gate_kernel, which do not.
 at::Tensor gated_delta_rule(
+    recurrence_algorithm algorithm,
     const at::Tensor& x,
     const at::Tensor& a,
     const at::Tensor& b,
@@ -1089,15 +1099,15 @@ at::Tensor gated_delta_rule(
     const at::Tensor& neg_a,
     const at::Tensor& state_pool,
     const state_rows& rows,
-    const std::optional<at::Tensor>& cu_seqlens_q,
-    int64_t per_sequence,
-    bool verify,
+    const at::Tensor& cu_seqlens_q,
+    const at::Tensor& kept_state_counts,
     int64_t key_heads,
     const at::Tensor& z,
     const at::Tensor& norm_weight,
     double eps,
     gate_activation activation,
-    const at::Tensor& counters
+    const at::Tensor& counters,
+    const std::optional<at::Tensor>& out
 ) {
     check_on_current_device(
         "gated_delta_rule",
@@ -1110,18 +1120,24 @@ at::Tensor gated_delta_rule(
          rows.lines,
          rows.history_positions,
          rows.rejected_tokens,
-         cu_seqlens_q.value_or(at::Tensor()),
+         cu_seqlens_q,
+         kept_state_counts,
          z,
          norm_weight,
-         counters}
+         counters,
+         out.value_or(at::Tensor())}
     );
     check_rows("gated_delta_rule", rows);
-    check_tokens("gated_delta_rule", x, rows, cu_seqlens_q, per_sequence);
+    check_tokens("gated_delta_rule", x, rows, cu_seqlens_q);
     TORCH_CHECK(x.is_contiguous(), "gated_delta_rule: x must be contiguous");
-    TORCH_CHECK(
-        !verify || per_sequence <= rows.slots,
-        "gated_delta_rule: a verify group holds at most rows.slots tokens per sequence"
-    );
+    if (algorithm == recurrence_algorithm::step) {
+        TORCH_CHECK(
+            kept_state_counts.is_cuda() && kept_state_counts.scalar_type() == at::kInt &&
+                kept_state_counts.dim() == 1 && kept_state_counts.size(0) == rows.lines.size(0) &&
+                kept_state_counts.is_contiguous(),
+            "gated_delta_rule: kept_state_counts must be contiguous CUDA int32 [num_seqs]"
+        );
+    }
     TORCH_CHECK(
         state_pool.is_cuda() && state_pool.scalar_type() == at::kFloat && state_pool.dim() == 4 &&
             state_pool.stride(3) == 1 && state_pool.stride(2) == state_pool.size(3) &&
@@ -1174,14 +1190,14 @@ at::Tensor gated_delta_rule(
             num_seqs * value_heads * (value_dim / columns) <= int32_max,
         "gated_delta_rule: too many tokens, sequences, heads or channels"
     );
-    at::Tensor out = at::empty({total, value_heads * value_dim}, x.options());
+    at::Tensor gated = make_output("gated_delta_rule", out, {total, value_heads * value_dim}, x);
     TORCH_CHECK(
         counters.is_cuda() && counters.device() == x.device() && counters.scalar_type() == at::kInt &&
             counters.is_contiguous() && counters.numel() >= gated_delta_rule_counters(num_seqs, value_heads),
         "gated_delta_rule: counters must be contiguous int32 on x's device, at least gated_delta_rule_counters of them"
     );
     if (num_seqs == 0) {
-        return out;
+        return gated;
     }
     const delta_rule_params params{
         dt_bias.const_data_ptr<float>(),
@@ -1189,7 +1205,7 @@ at::Tensor gated_delta_rule(
         state_pool.mutable_data_ptr<float>(),
         state_pool.stride(0),
         make_state_lines(rows),
-        ragged(rows, cu_seqlens_q, per_sequence),
+        ragged(rows, cu_seqlens_q),
         static_cast<int>(key_heads),
         static_cast<int>(value_heads),
         static_cast<int>(value_dim),
@@ -1202,13 +1218,13 @@ at::Tensor gated_delta_rule(
         gate_threads <<= 1;
     }
     auto stream = at::cuda::getCurrentCUDAStream();
-    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "gated_delta_rule_cuda", [&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "gated_delta_rule", [&] {
         dispatch_key_dim(key_dim, [&](auto key_dim_tag) {
             constexpr int key_dim = decltype(key_dim_tag)::value;
             const scalar_t* x_data = x.const_data_ptr<scalar_t>();
             const scalar_t* a_data = a.const_data_ptr<scalar_t>();
             const scalar_t* b_data = b.const_data_ptr<scalar_t>();
-            scalar_t* out_data = out.mutable_data_ptr<scalar_t>();
+            scalar_t* out_data = gated.mutable_data_ptr<scalar_t>();
             const output_gate<scalar_t> gate{
                 z.const_data_ptr<scalar_t>(),
                 z.stride(0),
@@ -1216,10 +1232,9 @@ at::Tensor gated_delta_rule(
                 static_cast<float>(eps),
                 activation,
             };
-            if (!cu_seqlens_q.has_value()) {
+            if (algorithm == recurrence_algorithm::step) {
                 launch_dependent(
-                    verify ? delta_rule_step_kernel<scalar_t, key_dim, true>
-                           : delta_rule_step_kernel<scalar_t, key_dim, false>,
+                    delta_rule_step_kernel<scalar_t, key_dim>,
                     blocks,
                     step_threads,
                     0,
@@ -1228,6 +1243,7 @@ at::Tensor gated_delta_rule(
                     a_data,
                     b_data,
                     params,
+                    kept_state_counts.const_data_ptr<int32_t>(),
                     gate,
                     counters.mutable_data_ptr<int32_t>(),
                     out_data
@@ -1266,39 +1282,41 @@ at::Tensor gated_delta_rule(
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         });
     });
-    return out;
+    return gated;
 }
 
 }  // namespace
 
-at::Tensor causal_conv_cuda(
+at::Tensor causal_conv_step_cuda(
     const at::Tensor& x,
     const at::Tensor& weight,
     const at::Tensor& conv_pool,
     const state_rows& rows,
-    const std::optional<at::Tensor>& cu_seqlens_q,
-    int64_t dilation
+    const at::Tensor& cu_seqlens_q,
+    std::int64_t dilation,
+    const std::optional<at::Tensor>& out
 ) {
-    return causal_conv(x, weight, conv_pool, rows, cu_seqlens_q, 1, dilation);
+    return causal_conv(recurrence_algorithm::step, x, weight, conv_pool, rows, cu_seqlens_q, dilation, out);
 }
 
-at::Tensor causal_conv_verify_cuda(
+at::Tensor causal_conv_chunked_cuda(
     const at::Tensor& x,
     const at::Tensor& weight,
     const at::Tensor& conv_pool,
     const state_rows& rows,
-    int64_t tokens_per_sequence,
-    int64_t dilation
+    const at::Tensor& cu_seqlens_q,
+    std::int64_t dilation,
+    const std::optional<at::Tensor>& out
 ) {
-    return causal_conv(x, weight, conv_pool, rows, std::nullopt, tokens_per_sequence, dilation);
+    return causal_conv(recurrence_algorithm::chunked, x, weight, conv_pool, rows, cu_seqlens_q, dilation, out);
 }
 
-// One per (sequence, value head) of a step that runs without cu_seqlens_q.
+// One per (sequence, value head) of a gated_delta_rule_step_cuda call.
 int64_t gated_delta_rule_counters(int64_t num_seqs, int64_t value_heads) {
     return num_seqs * value_heads;
 }
 
-at::Tensor gated_delta_rule_cuda(
+at::Tensor gated_delta_rule_step_cuda(
     const at::Tensor& x,
     const at::Tensor& a,
     const at::Tensor& b,
@@ -1306,15 +1324,18 @@ at::Tensor gated_delta_rule_cuda(
     const at::Tensor& neg_a,
     const at::Tensor& state_pool,
     const state_rows& rows,
-    const std::optional<at::Tensor>& cu_seqlens_q,
+    const at::Tensor& cu_seqlens_q,
+    const at::Tensor& kept_state_counts,
     int64_t key_heads,
     const at::Tensor& z,
     const at::Tensor& norm_weight,
     double eps,
     gate_activation activation,
-    const at::Tensor& counters
+    const at::Tensor& counters,
+    const std::optional<at::Tensor>& out
 ) {
     return gated_delta_rule(
+        recurrence_algorithm::step,
         x,
         a,
         b,
@@ -1323,18 +1344,18 @@ at::Tensor gated_delta_rule_cuda(
         state_pool,
         rows,
         cu_seqlens_q,
-        1,
-        false,
+        kept_state_counts,
         key_heads,
         z,
         norm_weight,
         eps,
         activation,
-        counters
+        counters,
+        out
     );
 }
 
-at::Tensor gated_delta_rule_verify_cuda(
+at::Tensor gated_delta_rule_chunked_cuda(
     const at::Tensor& x,
     const at::Tensor& a,
     const at::Tensor& b,
@@ -1342,15 +1363,17 @@ at::Tensor gated_delta_rule_verify_cuda(
     const at::Tensor& neg_a,
     const at::Tensor& state_pool,
     const state_rows& rows,
-    int64_t tokens_per_sequence,
+    const at::Tensor& cu_seqlens_q,
     int64_t key_heads,
     const at::Tensor& z,
     const at::Tensor& norm_weight,
     double eps,
     gate_activation activation,
-    const at::Tensor& counters
+    const at::Tensor& counters,
+    const std::optional<at::Tensor>& out
 ) {
     return gated_delta_rule(
+        recurrence_algorithm::chunked,
         x,
         a,
         b,
@@ -1358,15 +1381,15 @@ at::Tensor gated_delta_rule_verify_cuda(
         neg_a,
         state_pool,
         rows,
-        std::nullopt,
-        tokens_per_sequence,
-        true,
+        cu_seqlens_q,
+        at::Tensor(),
         key_heads,
         z,
         norm_weight,
         eps,
         activation,
-        counters
+        counters,
+        out
     );
 }
 

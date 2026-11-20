@@ -24,7 +24,7 @@ struct block_selection {
 // Indexed attention: attn_prefill_cuda's ragged batch, decode included as one query per sequence, in which the query
 // at view index p attends only the keys j <= p of its selected blocks. A query selects at least one key and at most
 // selection.max_selected_blocks blocks, and attends only the pages of its selected keys. Returns o [total_q, n_q_heads,
-// head_dim].
+// head_dim], written into out as attn_decode_cuda writes it.
 at::Tensor attn_indexed_cuda(
     const at::Tensor& q,
     const kv_pools& pools,
@@ -33,7 +33,8 @@ at::Tensor attn_indexed_cuda(
     const rope_parameters& rope,
     double scale,
     const block_selection& selection,
-    const std::optional<page_mass>& mass
+    const std::optional<page_mass>& mass,
+    const std::optional<at::Tensor>& out
 );
 
 // attn_indexed_cuda measuring each query's mass apart: query i owns the rows [cu_view_pages[i], cu_view_pages[i + 1])
@@ -47,7 +48,8 @@ at::Tensor attn_indexed_verify_cuda(
     const rope_parameters& rope,
     double scale,
     const block_selection& selection,
-    const page_mass& mass
+    const page_mass& mass,
+    const std::optional<at::Tensor>& out
 );
 
 // QSA's index queries [tokens, n_heads, dim] from the first n_heads * dim columns of index_qk [tokens, >= n_heads *

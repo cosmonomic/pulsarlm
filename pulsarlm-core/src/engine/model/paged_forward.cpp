@@ -76,12 +76,13 @@ at::Tensor paged_attention(
         };
     }
     at::Tensor o;
-    if (g.kind == model::batch_kind::verify && mass) {
-        o = attn_prefill_verify_cuda(q, pools, views, g.cu_seqlens_q, layer, *mass);
-    } else if (g.kind != model::batch_kind::decode) {
-        o = attn_prefill_cuda(q, pools, views, g.cu_seqlens_q, layer, mass);
-    } else {
+    if (g.kind == model::batch_kind::decode) {
         o = attn_decode_cuda(q, pools, views, layer, mass);
+    } else {
+        const std::int64_t per_query_mass_request_count = g.kind == model::batch_kind::verify && mass
+            ? views.key_counts.size(0)
+            : 0;
+        o = attn_prefill_cuda(q, pools, views, g.cu_seqlens_q, layer, mass, per_query_mass_request_count);
     }
     if (mass && !mass->mass_sum.is_same(reader_columns)) {
         reader_columns.copy_(mass->mass_sum);
@@ -153,20 +154,17 @@ at::Tensor gated_deltanet(
 ) {
     const state_rows window_rows = window_layer_rows(b, conv_kv_layer);
     const state_rows state_rows = state_layer_rows(b, state_kv_layer);
-    if (b.kind == model::batch_kind::verify) {
-        const std::int64_t ntok = projected.qkv.size(0);
-        const std::int64_t sequences = window_rows.lines.size(0);
-        assert(sequences > 0 && ntok > 0 && ntok % sequences == 0);
-        const std::int64_t per_sequence = ntok / sequences;
-        at::Tensor convolved = causal_conv_verify_cuda(
+    if (b.kind == model::batch_kind::prefill) {
+        at::Tensor convolved = causal_conv_chunked_cuda(
             projected.qkv,
             weights.conv,
             conv_lines.k,
             window_rows,
-            per_sequence,
-            1
+            b.cu_seqlens_q,
+            1,
+            std::nullopt
         );
-        return gated_delta_rule_verify_cuda(
+        return gated_delta_rule_chunked_cuda(
             convolved,
             projected.a,
             projected.b,
@@ -174,21 +172,39 @@ at::Tensor gated_deltanet(
             weights.neg_a,
             state_lines.k,
             state_rows,
-            per_sequence,
+            b.cu_seqlens_q,
             key_heads,
             projected.z,
             weights.norm,
             rms_norm_eps,
             activation,
-            b.arrival_counters
+            b.arrival_counters,
+            std::nullopt
         );
     }
-    std::optional<at::Tensor> cu_seqlens_q;
-    if (b.kind != model::batch_kind::decode) {
+    const std::int64_t sequences = window_rows.lines.size(0);
+    const auto int32 = window_rows.lines.options();
+    at::Tensor cu_seqlens_q;
+    at::Tensor kept_state_counts;
+    if (b.kind == model::batch_kind::verify) {
+        const std::int64_t ntok = projected.qkv.size(0);
+        assert(sequences > 0 && ntok > 0 && ntok % sequences == 0);
         cu_seqlens_q = b.cu_seqlens_q;
+        kept_state_counts = at::full({sequences}, ntok / sequences, int32);
+    } else {
+        cu_seqlens_q = at::arange(sequences + 1, int32);
+        kept_state_counts = at::ones({sequences}, int32);
     }
-    at::Tensor convolved = causal_conv_cuda(projected.qkv, weights.conv, conv_lines.k, window_rows, cu_seqlens_q, 1);
-    return gated_delta_rule_cuda(
+    at::Tensor convolved = causal_conv_step_cuda(
+        projected.qkv,
+        weights.conv,
+        conv_lines.k,
+        window_rows,
+        cu_seqlens_q,
+        1,
+        std::nullopt
+    );
+    return gated_delta_rule_step_cuda(
         convolved,
         projected.a,
         projected.b,
@@ -197,12 +213,14 @@ at::Tensor gated_deltanet(
         state_lines.k,
         state_rows,
         cu_seqlens_q,
+        kept_state_counts,
         key_heads,
         projected.z,
         weights.norm,
         rms_norm_eps,
         activation,
-        b.arrival_counters
+        b.arrival_counters,
+        std::nullopt
     );
 }
 

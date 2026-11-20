@@ -51,17 +51,19 @@ struct attention_layer {
 
 // The page mass a step measures; the ops add to mass_sum and weight_sum, which the caller zeroed. Without it the ops
 // measure no mass. Query token i attends view page b of its sequence when it attends one of b's key tokens; its mass on
-// b in query head h is the max over b's key tokens it attends of the scaled score. Views never share mass, whatever
-// lines they share.
+// b in query head h is the max over b's key tokens it attends of the scaled score. The query tokens of a sequence
+// measure their mass into one mass view v of the sequence's view pages, v = s unless an op states otherwise. Views
+// never share mass, whatever lines they share.
 struct page_mass {
     // fp32 [total_view_pages, n_q_heads], zeroed by the caller. Over the query tokens attending b,
-    // mass_sum[cu_view_pages[s] + b, h] is set to the sum of query_weights[i] times the mass; it stays 0 for a page no
+    // mass_sum[cu_view_pages[v] + b, h] is set to the sum of query_weights[i] times the mass; it stays 0 for a page no
     // query token attends.
     at::Tensor mass_sum;
-    // fp32 [total_view_pages], zeroed by the caller. weight_sum[cu_view_pages[s] + b] is set to the sum of
+    // fp32 [total_view_pages], zeroed by the caller. weight_sum[cu_view_pages[v] + b] is set to the sum of
     // query_weights[i] over the query tokens attending b; it stays 0 for a page no query token attends.
     at::Tensor weight_sum;
-    // int32 [num_seqs + 1]; sequence s owns view pages [cu_view_pages[s], cu_view_pages[s + 1]), at least its keys'.
+    // int32 [mass views + 1]; mass view v owns view pages [cu_view_pages[v], cu_view_pages[v + 1]), at least its
+    // sequence's keys'.
     at::Tensor cu_view_pages;
     // fp32 [total_q], non-negative.
     at::Tensor query_weights;
@@ -92,39 +94,35 @@ void write_kv_cuda(
 
 // Decode: one query per sequence, q [num_seqs, n_q_heads, head_dim], at view index key_counts[s] - 1, attending the
 // keys [0, key_counts[s]) or its window of them. num_splits above 0 forces the split (flash-decode) path with that
-// many splits, 1 included; 0 picks the split count from occupancy. Returns o [num_seqs, n_q_heads, head_dim].
+// many splits, 1 included; 0 picks the split count from occupancy. Returns o [num_seqs, n_q_heads, head_dim], written
+// into out when given, which must then be contiguous, of that shape and of q's dtype and device; out may be a slice of
+// a larger tensor.
 at::Tensor attn_decode_cuda(
     const at::Tensor& q,
     const kv_pools& pools,
     const page_views& views,
     const attention_layer& layer,
     const std::optional<page_mass>& mass = std::nullopt,
-    int64_t num_splits = 0
+    int64_t num_splits = 0,
+    const std::optional<at::Tensor>& out = std::nullopt
 );
 
 // Prefill: a ragged batch of query chunks, causal over each view. Sequence i's queries are
 // q[cu_seqlens_q[i] : cu_seqlens_q[i + 1]] (q [total_q, n_q_heads, head_dim]) at view indices
 // [key_counts[i] - seq_q_i, key_counts[i]), and the query at view index p attends the keys [0, p] or its window of
-// them. Returns o [total_q, n_q_heads, head_dim].
+// them. Each query i of the first per_query_mass_request_count sequences measures its mass into mass view i of its own,
+// and each later sequence s into mass view cu_seqlens_q[per_query_mass_request_count] + s -
+// per_query_mass_request_count; a positive count needs a mass. Returns o [total_q, n_q_heads, head_dim], written into
+// out as attn_decode_cuda writes it.
 at::Tensor attn_prefill_cuda(
     const at::Tensor& q,
     const kv_pools& pools,
     const page_views& views,
     const at::Tensor& cu_seqlens_q,
     const attention_layer& layer,
-    const std::optional<page_mass>& mass = std::nullopt
-);
-
-// attn_prefill_cuda measuring each query's mass apart: query i owns the rows [cu_view_pages[i], cu_view_pages[i + 1])
-// of mass_sum and weight_sum, its sequence's view pages; cu_view_pages is int32 [total_q + 1]. A verify group's
-// accepted rows are then added on their own.
-at::Tensor attn_prefill_verify_cuda(
-    const at::Tensor& q,
-    const kv_pools& pools,
-    const page_views& views,
-    const at::Tensor& cu_seqlens_q,
-    const attention_layer& layer,
-    const page_mass& mass
+    const std::optional<page_mass>& mass = std::nullopt,
+    std::int64_t per_query_mass_request_count = 0,
+    const std::optional<at::Tensor>& out = std::nullopt
 );
 
 }  // namespace pulsarlm

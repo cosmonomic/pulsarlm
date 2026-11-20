@@ -1291,7 +1291,8 @@ at::Tensor attn_indexed_cuda(
     const rope_parameters& rope,
     double scale,
     const block_selection& selection,
-    const std::optional<page_mass>& mass
+    const std::optional<page_mass>& mass,
+    const std::optional<at::Tensor>& out
 ) {
     const attention_layer layer{
         .rope = rope,
@@ -1299,7 +1300,7 @@ at::Tensor attn_indexed_cuda(
         .sliding_window = std::nullopt,
         .k_norm_weight = std::nullopt,
     };
-    const auto b = attn::make_paged_attn_batch("attn_indexed", q, pools, views, cu_seqlens_q, layer, mass);
+    const auto b = attn::make_paged_attn_batch("attn_indexed", q, pools, views, cu_seqlens_q, layer, mass, 0, out);
     return attn_indexed(b, selection);
 }
 
@@ -1311,7 +1312,8 @@ at::Tensor attn_indexed_verify_cuda(
     const rope_parameters& rope,
     double scale,
     const block_selection& selection,
-    const page_mass& mass
+    const page_mass& mass,
+    const std::optional<at::Tensor>& out
 ) {
     const attention_layer layer{
         .rope = rope,
@@ -1319,9 +1321,17 @@ at::Tensor attn_indexed_verify_cuda(
         .sliding_window = std::nullopt,
         .k_norm_weight = std::nullopt,
     };
-    auto b = attn::make_paged_attn_batch("attn_indexed_verify", q, pools, views, cu_seqlens_q, layer, std::nullopt);
-    attn::attach_mass(b, "attn_indexed_verify", mass, b.total_q);
-    b.mass_per_query = true;
+    const auto b = attn::make_paged_attn_batch(
+        "attn_indexed_verify",
+        q,
+        pools,
+        views,
+        cu_seqlens_q,
+        layer,
+        mass,
+        views.key_counts.size(0),
+        out
+    );
     return attn_indexed(b, selection);
 }
 
