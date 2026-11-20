@@ -1,4 +1,4 @@
-#include "batch.hpp"
+#include "step.hpp"
 
 #include "pulsarlm/engine/executor.hpp"
 
@@ -46,8 +46,8 @@ at::Tensor zero_page_mass(
     return mass;
 }
 
-std::vector<executor::batch::layer_step_mass>
-executor::batch::view_mass(std::size_t view, const view_layout& layout) const {
+std::vector<executor::step::layer_step_mass>
+executor::step::view_mass(std::size_t view, const at::Tensor& mass, const view_layout& layout) const {
     const float* values = mass.const_data_ptr<float>();
     auto row_size = static_cast<std::size_t>(inputs.cu_view_pages.size(1));
     const auto* cu_view_pages = inputs.cu_view_pages.const_data_ptr<std::int32_t>();
@@ -71,9 +71,14 @@ executor::batch::view_mass(std::size_t view, const view_layout& layout) const {
     return by_layer;
 }
 
-void executor::batch::join_mass(std::span<const shard> shards, const view_layout& layout) {
+void executor::step::join_mass(
+    launch_result& launched,
+    std::span<const shard> shards,
+    const view_layout& layout
+) const {
+    const std::vector<at::Tensor>& mass_by_shard = launched.mass_by_shard;
     if (!mass_by_shard.front().defined() || mass_by_shard.size() == 1) {
-        mass = mass_by_shard.front();
+        launched.mass = mass_by_shard.front();
         return;
     }
     std::int64_t total = 0;
@@ -85,8 +90,8 @@ void executor::batch::join_mass(std::span<const shard> shards, const view_layout
             total += pages * static_cast<std::int64_t>(layout.layers[layer].mass_heads + 1);
         }
     }
-    mass = pinned({total}, at::kFloat);
-    float* out = mass.mutable_data_ptr<float>();
+    launched.mass = pinned({total}, at::kFloat);
+    float* out = launched.mass.mutable_data_ptr<float>();
     std::vector<const float*> in;
     for (const at::Tensor& shard_mass : mass_by_shard) {
         in.push_back(shard_mass.const_data_ptr<float>());
@@ -112,14 +117,15 @@ void executor::batch::join_mass(std::span<const shard> shards, const view_layout
 
 // An entry of the second run measured each query token's mass with weight 1; its accepted query tokens are weighed as
 // one step of accepted tokens.
-void executor::batch::add_measured_mass(
+void executor::step::add_measured_mass(
     std::size_t index,
     request_state& req,
     std::size_t start_position,
     std::size_t accepted_count,
+    const at::Tensor& mass,
     const view_layout& layout
 ) const {
-    const batch_entry& e = entries[index];
+    const step_entry& e = entries[index];
     const std::size_t n_layers = layout.layers.size();
     const std::size_t first_view = count_views_before(index);
     std::vector<layer_step_mass> step_mass;
@@ -130,7 +136,7 @@ void executor::batch::add_measured_mass(
         req.fill_query_weights(start_position, weights);
         step_mass.resize(n_layers);
         for (std::size_t token = 0; token < accepted_count; token++) {
-            std::vector<layer_step_mass> token_mass = view_mass(first_view + token, layout);
+            std::vector<layer_step_mass> token_mass = view_mass(first_view + token, mass, layout);
             for (std::size_t layer = 0; layer < n_layers; layer++) {
                 if (layout.layers[layer].mass_heads == 0) {
                     continue;
@@ -150,7 +156,7 @@ void executor::batch::add_measured_mass(
             }
         }
     } else {
-        step_mass = view_mass(first_view, layout);
+        step_mass = view_mass(first_view, mass, layout);
     }
     std::vector<std::span<const float>> step_mass_sums;
     std::vector<std::span<const float>> step_weight_sums;

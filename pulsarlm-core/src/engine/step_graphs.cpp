@@ -223,7 +223,7 @@ step_graphs::capture_decode_step(std::int64_t sequences, bool measures_mass, boo
     at::Tensor next = at::zeros({sequences, table.tokens.size(1)}, samples.options());
     next.select(1, 0).copy_(samples);
     at::Tensor ends_cycle = at::empty({sequences}, slots.options().dtype(at::kBool));
-    advance_requests(table, slots, ones, at::zeros_like(slots), next, ends_cycle);
+    advance_requests(table, slots, ones, at::zeros_like(slots), ones, next, ends_cycle);
     captured->graph.capture_end();
     captured->samples = samples;
     captured->ends_cycle = ends_cycle;
@@ -238,7 +238,6 @@ step_graphs::capture_verify_step(std::int64_t sequences, bool measures_mass, boo
     const std::int64_t tokens = sequences * rows;
     const std::int64_t later = state_slots - 2;
     captured->request_slots = make_request_slots(sequences);
-    captured->max_accepted_token_counts = at::full({sequences}, rows, longs);
     captured->inputs = make_step_inputs(sequences, measures_mass, true);
     captured->first_pass = make_first_pass_inputs(sequences);
     captured->later_pass = make_later_pass_inputs(sequences);
@@ -266,7 +265,7 @@ step_graphs::capture_verify_step(std::int64_t sequences, bool measures_mass, boo
         samples.view({sequences, rows}),
         inputs.tokens.view({sequences, rows}).narrow(1, 1, rows - 1),
         stop_tokens,
-        captured->max_accepted_token_counts
+        table.remaining_tokens.index_select(0, slots).clamp_min(1)
     );
     // The RoPE position of each request's pending token, and its keys in the draft head's KV layer before it.
     const at::Tensor positions = table.rope_positions.index_select(0, slots);
@@ -300,7 +299,7 @@ step_graphs::capture_verify_step(std::int64_t sequences, bool measures_mass, boo
     at::Tensor next_tokens = at::stack(next, 1);
     table.draw_counts.index_add_(0, slots, accepted_counts);
     at::Tensor ends_cycle = at::empty({sequences}, slots.options().dtype(at::kBool));
-    advance_requests(table, slots, accepted_counts, rows - accepted_counts, next_tokens, ends_cycle);
+    advance_requests(table, slots, accepted_counts, rows - accepted_counts, accepted_counts, next_tokens, ends_cycle);
     captured->graph.capture_end();
     captured->samples = samples;
     captured->accepted_token_counts = accepted_counts;
@@ -487,8 +486,7 @@ step_graphs::verify_step_outputs step_graphs::verify_step(
     const at::Tensor& cu_view_pages,
     std::span<const at::Tensor> page_mass_sum,
     std::span<const at::Tensor> page_weight_sum,
-    bool filters,
-    const at::Tensor& max_accepted_token_counts
+    bool filters
 ) {
     assert(shard_model.drafter() != nullptr);
     const step_shape shape{request_slots.size(0), cu_view_pages.defined()};
@@ -506,7 +504,6 @@ step_graphs::verify_step_outputs step_graphs::verify_step(
         page_mass_sum,
         page_weight_sum
     );
-    copy_input(captured.max_accepted_token_counts, max_accepted_token_counts);
     captured.graph.replay();
     copy_page_mass(page_mass_sum, page_weight_sum, captured.inputs);
     return verify_step_outputs{

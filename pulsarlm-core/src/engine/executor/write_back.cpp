@@ -1,4 +1,4 @@
-#include "batch.hpp"
+#include "step.hpp"
 
 #include "pulsarlm/engine/executor.hpp"
 
@@ -27,39 +27,45 @@ namespace pulsarlm {
 // A request ends with oom when the sync of its new pages fails, as a state names only pages the store has. The step
 // that last read the lines of pages that left a view has completed, so they are released right after the sync. A
 // recurrent layer's state at head reaches the store at the resume points, cycle ends and the end, that find it pending.
-task<std::vector<executor::request_id_type>> executor::write_back() {
-    assert(!launched_batches.empty());
-    std::unique_ptr<batch> written = std::move(launched_batches.front());
-    launched_batches.pop_front();
-    batch& b = *written;
-    co_await join(b);
-    batch_writes writes = apply_entries(b, std::chrono::steady_clock::now() - b.launch_time);
-    co_await write_pages_and_states(b, std::move(writes));
-    co_await refresh_views(b);
-    std::vector<request_id_type> written_requests;
-    for (const batch_entry& e : b.entries) {
-        request_state& req = get_state(e.request_id);
-        if (req.has_exit_cause() && req.unfinished_step_count() == 0) {
-            req.exit();
-        }
-        written_requests.push_back(e.request_id);
+task<void> executor::write_back(const step& s, launch_result& launched) {
+    if (s.entries.empty()) {
+        co_return;
     }
-    co_return written_requests;
+    co_await join(s, launched);
+    step_writes writes = apply_entries(s, launched, std::chrono::steady_clock::now() - s.prepare_time);
+    co_await write_pages_and_states(launched, writes);
+    co_await refresh_views(s, launched, writes);
+    for (const step_entry& e : s.entries) {
+        running_request& running = requests[e.request_id];
+        if (e.awaits_write_back) {
+            running.awaits_write_back = false;
+        }
+        if (running.state.has_exit_cause() && running.state.unfinished_step_count() == 0) {
+            exit_request(e.request_id);
+        }
+        if (!running.state.has_exited() && is_cancelled(e.request_id)) {
+            cancel(e.request_id);
+        }
+    }
 }
 
-task<void> executor::join(batch& b) {
-    for (external_task<cudaError_t>& completion : b.completions) {
+task<void> executor::join(const step& s, launch_result& launched) {
+    for (external_task<cudaError_t>& completion : launched.completions) {
         cudaError_t status = co_await std::move(completion);
         if (status != cudaSuccess) {
             throw std::runtime_error(std::string("write_back: ") + cudaGetErrorString(status));
         }
     }
-    b.join_mass(shards, layout);
+    s.join_mass(launched, shards, layout);
 }
 
-executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clock::duration step_duration) {
+executor::step_writes executor::apply_entries(
+    const step& s,
+    const launch_result& launched,
+    std::chrono::steady_clock::duration step_duration
+) {
     std::size_t n_layers = cache.layer_count();
-    batch_writes writes{
+    step_writes writes{
         .new_hashes = std::vector<std::vector<digest>>(n_layers),
         .new_owners = std::vector<std::vector<state::lease_id_type>>(n_layers),
         .new_lines = std::vector<std::vector<std::uint32_t>>(n_layers),
@@ -67,21 +73,22 @@ executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clo
         .spawned_owners = std::vector<std::vector<state::lease_id_type>>(n_layers),
         .spawned_lines = std::vector<std::vector<std::uint32_t>>(n_layers),
     };
-    const std::int64_t* next_sampled = b.sampled_tokens.defined() ? b.sampled_tokens.const_data_ptr<std::int64_t>()
-                                                                  : nullptr;
+    const std::int64_t* next_sampled = launched.sampled_tokens.defined()
+        ? launched.sampled_tokens.const_data_ptr<std::int64_t>()
+        : nullptr;
     // Each drafting request's next token then its drafts.
     std::unordered_map<const request_state*, std::span<const std::int64_t>> drafted;
-    const std::vector<batch_entry> drafting_entries = b.drafting_entries();
+    const std::vector<step_entry> drafting_entries = s.drafting_entries();
     for (std::size_t d = 0; d < drafting_entries.size(); d++) {
-        const auto row = static_cast<std::size_t>(b.next_tokens.size(1));
+        const auto row = static_cast<std::size_t>(launched.next_tokens.size(1));
         drafted.emplace(
             &get_state(drafting_entries[d].request_id),
-            std::span(b.next_tokens.const_data_ptr<std::int64_t>() + d * row, row)
+            std::span(launched.next_tokens.const_data_ptr<std::int64_t>() + d * row, row)
         );
     }
-    for (std::size_t index = 0; index < b.entries.size(); index++) {
-        batch_entry& e = b.entries[index];
-        const bool verifies = b.verifies(index);
+    for (std::size_t index = 0; index < s.entries.size(); index++) {
+        const step_entry& e = s.entries[index];
+        const bool verifies = s.verifies(index);
         request_state& req = get_state(e.request_id);
         request_callbacks& callbacks = *requests[e.request_id].callbacks;
         std::span<const std::int64_t> samples;
@@ -102,7 +109,7 @@ executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clo
         std::span<const std::int64_t> emitted = samples;
         if (verifies) {
             accepted_count = static_cast<std::size_t>(
-                b.accepted_token_counts.const_data_ptr<std::int64_t>()[index - b.single_query_request_count]
+                launched.accepted_token_counts.const_data_ptr<std::int64_t>()[index - s.single_query_request_count]
             );
             emitted = samples.first(accepted_count);
             req.record_verified_drafts(e.query_token_count - 1, accepted_count - 1);
@@ -110,7 +117,7 @@ executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clo
             accepted_drafts.fetch_add(accepted_count - 1, std::memory_order_relaxed);
         }
         const std::size_t end_position = start + accepted_count;
-        const bool ends_cycle = b.reaches_cycle_end(index);
+        const bool ends_cycle = launched.reaches_cycle_end(index);
         assert(e.start_position >= start && (!ends_cycle || e.ends_cycle));
         assert(ends_cycle == (end_position >= req.cycle_end_position()));
         assert(verifies || e.start_position != start || ends_cycle == e.ends_cycle);
@@ -122,7 +129,7 @@ executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clo
         std::size_t completed_count = req.complete_pages();
         record_device_memory(req);
         if (e.is_measured) {
-            b.add_measured_mass(index, req, start, accepted_count, layout);
+            s.add_measured_mass(index, req, start, accepted_count, launched.mass, layout);
         }
         const bool is_prefill_step = !req.has_ended_prefill();
         req.record_step(step_duration);
@@ -165,7 +172,6 @@ executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clo
             writes.state_reachers.push_back(&req);
             if (req.has_pending_state()) {
                 writes.state_writers.push_back(&req);
-                e.stores_head_state = true;
             }
         }
         if (completed_count > 0) {
@@ -205,13 +211,13 @@ executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clo
     return writes;
 }
 
-task<void> executor::write_pages_and_states(batch& b, batch_writes&& writes) {
+task<void> executor::write_pages_and_states(launch_result& launched, step_writes& writes) {
     std::size_t n_layers = cache.layer_count();
-    // The copies wait for this step only, its draft pass included, not for the step launched after it, which writes none
-    // of the copied lines.
+    // The copies wait for this step only, its draft pass included, not for the steps launched after it, which write
+    // none of the copied lines.
     for (std::size_t shard = 0; shard < shards.size(); shard++) {
         at::Device device = shards[shard].lines.front().k.device();
-        b.ends[shard].block(c10::cuda::getStreamFromExternal(shards[shard].copy_stream, device.index()));
+        launched.ends[shard].block(c10::cuda::getStreamFromExternal(shards[shard].copy_stream, device.index()));
     }
     if (!writes.spawned_writers.empty()) {
         while (store_writes.size() >= max_store_writes) {
@@ -270,15 +276,15 @@ task<void> executor::write_pages_and_states(batch& b, batch_writes&& writes) {
     }
 }
 
-task<void> executor::refresh_views(batch& b) {
-    for (std::size_t index = 0; index < b.entries.size(); index++) {
-        const batch_entry& e = b.entries[index];
+task<void> executor::refresh_views(const step& s, const launch_result& launched, const step_writes& writes) {
+    for (std::size_t index = 0; index < s.entries.size(); index++) {
+        const step_entry& e = s.entries[index];
         request_state& req = get_state(e.request_id);
         req.finish_step();
         if (req.has_exit_cause()) {
             continue;
         }
-        const bool ends_cycle = b.reaches_cycle_end(index);
+        const bool ends_cycle = launched.reaches_cycle_end(index);
         bool views_changed = release_passed_pages(req);
         if (ends_cycle) {
             req.sample_pages();
@@ -295,7 +301,7 @@ task<void> executor::refresh_views(batch& b) {
             assert(req.unfinished_step_count() == 0);
             stale_requests.push_back(e.request_id);
         }
-        if (views_changed || e.stores_head_state) {
+        if (views_changed || std::ranges::contains(writes.state_writers, &req)) {
             mark_stale_tables(e.request_id, 0);
         }
     }

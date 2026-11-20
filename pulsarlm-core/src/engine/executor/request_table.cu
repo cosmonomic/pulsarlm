@@ -119,6 +119,7 @@ __global__ void advance_requests_kernel(
     std::int64_t entries,
     const std::int64_t* __restrict__ computed_token_counts,
     const std::int64_t* __restrict__ rejected_token_counts,
+    const std::int64_t* __restrict__ sample_counts,
     const std::int64_t* __restrict__ next_tokens,
     std::int64_t* history_positions,
     std::int64_t* rope_positions,
@@ -129,6 +130,7 @@ __global__ void advance_requests_kernel(
     std::int32_t* rejected_tokens,
     std::int64_t* tokens,
     std::int64_t token_width,
+    std::int64_t* remaining_tokens,
     const std::int64_t* __restrict__ cycle_end_positions,
     bool* __restrict__ ends_cycle
 ) {
@@ -150,6 +152,7 @@ __global__ void advance_requests_kernel(
     for (std::int64_t column = 0; column < token_width; column++) {
         tokens[slot * token_width + column] = next_tokens[e * token_width + column];
     }
+    remaining_tokens[slot] -= sample_counts[e];
     ends_cycle[e] = history_position >= cycle_end_positions[slot];
 }
 
@@ -239,22 +242,25 @@ void advance_requests(
     const at::Tensor& request_slots,
     const at::Tensor& computed_token_counts,
     const at::Tensor& rejected_token_counts,
+    const at::Tensor& sample_counts,
     const at::Tensor& next_tokens,
     at::Tensor& ends_cycle
 ) {
     const std::int64_t entries = request_slots.size(0);
     assert(
         request_slots.scalar_type() == at::kLong && computed_token_counts.scalar_type() == at::kLong &&
-        rejected_token_counts.scalar_type() == at::kLong && next_tokens.scalar_type() == at::kLong &&
-        ends_cycle.scalar_type() == at::kBool
+        rejected_token_counts.scalar_type() == at::kLong && sample_counts.scalar_type() == at::kLong &&
+        next_tokens.scalar_type() == at::kLong && ends_cycle.scalar_type() == at::kBool
     );
     assert(
         computed_token_counts.size(0) == entries && rejected_token_counts.size(0) == entries &&
-        next_tokens.size(0) == entries && next_tokens.size(1) == table.tokens.size(1) && ends_cycle.size(0) == entries
+        sample_counts.size(0) == entries && next_tokens.size(0) == entries &&
+        next_tokens.size(1) == table.tokens.size(1) && ends_cycle.size(0) == entries
     );
     assert(
         request_slots.is_contiguous() && computed_token_counts.is_contiguous() &&
-        rejected_token_counts.is_contiguous() && next_tokens.is_contiguous() && ends_cycle.is_contiguous()
+        rejected_token_counts.is_contiguous() && sample_counts.is_contiguous() && next_tokens.is_contiguous() &&
+        ends_cycle.is_contiguous()
     );
     if (entries == 0) {
         return;
@@ -264,6 +270,7 @@ void advance_requests(
         entries,
         computed_token_counts.const_data_ptr<std::int64_t>(),
         rejected_token_counts.const_data_ptr<std::int64_t>(),
+        sample_counts.const_data_ptr<std::int64_t>(),
         next_tokens.const_data_ptr<std::int64_t>(),
         table.history_positions.mutable_data_ptr<std::int64_t>(),
         table.rope_positions.mutable_data_ptr<std::int64_t>(),
@@ -274,6 +281,7 @@ void advance_requests(
         table.rejected_tokens.mutable_data_ptr<std::int32_t>(),
         table.tokens.mutable_data_ptr<std::int64_t>(),
         table.tokens.size(1),
+        table.remaining_tokens.mutable_data_ptr<std::int64_t>(),
         table.cycle_end_positions.const_data_ptr<std::int64_t>(),
         ends_cycle.mutable_data_ptr<bool>()
     );

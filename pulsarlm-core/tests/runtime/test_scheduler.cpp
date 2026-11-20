@@ -4,7 +4,10 @@
 #include "pulsarlm/engine/model/interface.hpp"
 #include "pulsarlm/engine/model/paged_forward.hpp"
 #include "pulsarlm/engine/request_callbacks.hpp"
+#include "pulsarlm/engine/request_queue.hpp"
 #include "pulsarlm/engine/scheduler.hpp"
+
+#include "../../src/engine/executor/step.hpp"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -21,6 +24,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <expected>
 #include <functional>
 #include <limits>
@@ -343,12 +347,12 @@ struct memory_store final : pulsarlm::page_store {
 };
 
 // Writes each token's id as its K and its RoPE position as its V in every attention KV layer, and requires each query's
-// position to be the one its view index takes under every layer's page positions. The token after a query is
-// the sum of the K of every key the query attends in the first full-attention layer, mod vocab; with a recurrent layer,
-// whose state is the sum of every token forwarded, evicted or not, it is that sum mod vocab instead. In a full-attention
-// layer, every query token attends every view page holding a key, with mass 1 in its one query head when the page
-// holds a key important accepts for that layer, else 0. While the first full-attention layer has evicted nothing, every key a sliding layer reads must equal that layer's key at the same
-// distance from the query.
+// position to be the one its view index takes under every layer's page positions. The token after a query is the sum of
+// the K of every key the query attends in the first full-attention layer, mod vocab; with a recurrent layer, whose
+// state is the sum of every token forwarded, evicted or not, it is that sum mod vocab instead. In a full-attention
+// layer, every query token attends every view page holding a key, with mass 1 in its one query head when the page holds
+// a key important accepts for that layer, else 0. While the first full-attention layer has evicted nothing, every key a
+// sliding layer reads must equal that layer's key at the same distance from the query.
 class sum_model final : public pulsarlm::model {
   public:
     std::vector<pulsarlm::kv_layer> layers = two_full_layers;
@@ -2063,8 +2067,9 @@ const std::vector<pulsarlm::kv_layer> full_and_sliding{
 };
 
 // With a sliding layer, a step completing a page releases the pages that leave the window at its write-back, so the
-// next step waits for it: the prefill and the decode at tail position 3 complete pages; the decode steps at tail
-// positions 1 and 2 overlap.
+// next step of its request waits for it: the decode at tail position 1 waits for the prefill, which completes a page.
+// The decode steps at tail positions 1, 2 and 3 overlap, the last completing a page; it is prepared over the step
+// before it, so the request holds one more line until that step's write-back.
 TEST_CASE("with a sliding layer, a step after one completing a page waits for its write-back") {
     fixture f(16, 64, {}, {}, full_and_sliding);
     token_list prompt{1, 2, 3, 4, 5};
@@ -2078,7 +2083,7 @@ TEST_CASE("with a sliding layer, a step after one completing a page waits for it
     std::vector<request_results> results = serve_submissions(f.sched, std::move(submissions));
 
     REQUIRE(results[0].tokens == continuation(prompt, 4));
-    REQUIRE(tokens_at_forward == std::vector<std::size_t>{0, 1, 1, 3});
+    REQUIRE(tokens_at_forward == std::vector<std::size_t>{0, 1, 1, 2});
 }
 
 // Each request holds at most 7 full-attention lines and 3 sliding lines at a time: the window's page and a cycle's 2
@@ -2203,7 +2208,8 @@ TEST_CASE("each full-attention layer evicts by its own attention mass") {
         {request{.tokens = eight_pages, .max_tokens = 3, .eviction = policy}}
     );
 
-    // Layer 0, which predicts, evicts as in the single-layer case: its last prefill step attends pages 0, 1, 4, 6 and 7.
+    // Layer 0, which predicts, evicts as in the single-layer case: its last prefill step attends pages 0, 1, 4, 6 and
+    // 7.
     std::vector<digest> chain = pulsarlm::make_page_digests(request_root(policy), eight_pages, page_size);
     std::int64_t first = continuation(pages_of(eight_pages, {0, 1, 4, 6, 7}), 1)[0];
     token_list kept_tokens = pages_of(eight_pages, {0, 1, 4, 7});
@@ -2721,8 +2727,23 @@ TEST_CASE("a request evicting by capacity generates far past it without outgrowi
     }
 }
 
-// Launches the steps of the request at id as the scheduler does, each before the previous step's write-back when
-// overlaps and the executor allow it, else after it, counting the steps launched over an unfinished one; then ends it.
+// A step prepared and launched, not written back yet.
+using unfinished_step = std::pair<pulsarlm::executor::step, pulsarlm::executor::launch_result>;
+
+// The token count a step gives the request at id: its pending token when it decodes, else the prefill tokens a step
+// takes, up to its cycle's end.
+std::size_t step_token_count(
+    const pulsarlm::executor& exec,
+    pulsarlm::executor::request_id_type id,
+    std::size_t prefill_tokens_per_step
+) {
+    const std::size_t pending_count = exec.pending_token_count(id);
+    return pending_count == 1 ? 1 : std::min({pending_count, prefill_tokens_per_step, exec.cycle_tokens_left(id)});
+}
+
+// Prepares and launches the steps of the request at id as the scheduler does, each before the previous step's
+// write-back when overlaps and the executor allow it, else after it, counting the steps prepared over an unfinished
+// one; then ends it.
 task<void> run_request_steps(
     pulsarlm::executor& exec,
     pulsarlm::executor::request_id_type id,
@@ -2730,21 +2751,20 @@ task<void> run_request_steps(
     std::size_t prefill_tokens_per_step,
     std::size_t& overlapped_steps
 ) {
+    std::deque<unfinished_step> unfinished;
     while (!exec.has_exited(id)) {
-        if (exec.is_steppable(id) && (exec.launched_batch_count() == 0 || overlaps)) {
-            const std::size_t pending_count = exec.pending_token_count(id);
-            const std::size_t token_count = pending_count == 1
-                ? 1
-                : std::min({pending_count, prefill_tokens_per_step, exec.cycle_tokens_left(id)});
-            const std::vector<pulsarlm::executor::scheduled_request> scheduled{{id, token_count}};
-            if (exec.launched_batch_count() == 0 ||
-                (exec.launched_batch_count() == 1 && exec.allows_overlap(scheduled))) {
-                overlapped_steps += exec.launched_batch_count();
-                co_await exec.launch(scheduled);
-                continue;
-            }
+        if ((unfinished.empty() || (overlaps && unfinished.size() == 1)) && exec.is_schedulable(id)) {
+            overlapped_steps += unfinished.size();
+            const std::vector<pulsarlm::executor::scheduled_request> scheduled{
+                {id, step_token_count(exec, id, prefill_tokens_per_step)}
+            };
+            pulsarlm::executor::step prepared = exec.prepare(scheduled);
+            pulsarlm::executor::launch_result launched = co_await exec.launch(prepared);
+            unfinished.emplace_back(std::move(prepared), std::move(launched));
+            continue;
         }
-        co_await exec.write_back();
+        co_await exec.write_back(unfinished.front().first, unfinished.front().second);
+        unfinished.pop_front();
     }
     co_await exec.stop(id);
     event_loop::current()->stop();
@@ -2835,10 +2855,10 @@ TEST_CASE("a request reaches the same page mass at each cycle end whether its st
     REQUIRE(sequential_states.back()->layers[0].pages.front().weight_sum > 0.0f);
 }
 
-// Launches the steps of the request at id as the scheduler does, each but every third before the previous step's
-// write-back when the executor allows it, and after each write-back that leaves no step launched compares the GPU's key counts of every KV
-// layer with the request state's; then ends the request. A request's entry of the request table is at the slot in its
-// id's low 32 bits.
+// Prepares and launches the steps of the request at id as the scheduler does, each but every third before the previous
+// step's write-back when the executor allows it, and after each write-back that leaves no step unfinished compares the
+// GPU's key counts of every KV layer with the request state's; then ends the request. A request's entry of the request
+// table is at the slot in its id's low 32 bits.
 task<void> compare_key_counts_between_steps(
     pulsarlm::executor& exec,
     pulsarlm::executor::request_id_type id,
@@ -2847,22 +2867,21 @@ task<void> compare_key_counts_between_steps(
 ) {
     const auto slot = static_cast<std::int64_t>(static_cast<std::uint32_t>(id));
     std::size_t launches = 0;
+    std::deque<unfinished_step> unfinished;
     while (!exec.has_exited(id)) {
-        if (exec.is_steppable(id) && (exec.launched_batch_count() == 0 || launches % 3 != 0)) {
-            const std::size_t pending_count = exec.pending_token_count(id);
-            const std::size_t token_count = pending_count == 1
-                ? 1
-                : std::min({pending_count, prefill_tokens_per_step, exec.cycle_tokens_left(id)});
-            const std::vector<pulsarlm::executor::scheduled_request> scheduled{{id, token_count}};
-            if (exec.launched_batch_count() == 0 ||
-                (exec.launched_batch_count() == 1 && exec.allows_overlap(scheduled))) {
-                co_await exec.launch(scheduled);
-                launches++;
-                continue;
-            }
+        if ((unfinished.empty() || (unfinished.size() == 1 && launches % 3 != 0)) && exec.is_schedulable(id)) {
+            const std::vector<pulsarlm::executor::scheduled_request> scheduled{
+                {id, step_token_count(exec, id, prefill_tokens_per_step)}
+            };
+            pulsarlm::executor::step prepared = exec.prepare(scheduled);
+            pulsarlm::executor::launch_result launched = co_await exec.launch(prepared);
+            unfinished.emplace_back(std::move(prepared), std::move(launched));
+            launches++;
+            continue;
         }
-        co_await exec.write_back();
-        if (exec.launched_batch_count() == 0 && !exec.has_exited(id)) {
+        co_await exec.write_back(unfinished.front().first, unfinished.front().second);
+        unfinished.pop_front();
+        if (unfinished.empty() && !exec.has_exited(id)) {
             const pulsarlm::request_state& req = pulsarlm::executor_inspection::get_state(exec, id);
             const at::Tensor key_counts = pulsarlm::executor_inspection::get_table(exec, 0).key_counts[slot].cpu();
             for (std::size_t layer = 0; layer < req.views().size(); layer++) {
@@ -2893,6 +2912,322 @@ TEST_CASE("the GPU's key counts of every KV layer equal the request state's betw
     loop.spawn(compare_key_counts_between_steps(f.exec, *id, prefill_tokens_per_step, comparisons));
     REQUIRE(loop.run() == nullptr);
     REQUIRE(comparisons > 4);
+}
+
+// Lets the loop run the coroutines it has scheduled before the caller resumes.
+task<void> yield_to_loop() {
+    co_await pulsarlm::synchronize(c10::cuda::getCurrentCUDAStream().stream());
+}
+
+task<void> wait_for_push(pulsarlm::request_queue& queue, bool& pushed) {
+    co_await queue.wait_for_push();
+    pushed = true;
+}
+
+// Whether scheduled holds the one scheduled request of id and token_count.
+bool schedules_one(
+    const std::vector<pulsarlm::executor::scheduled_request>& scheduled,
+    pulsarlm::executor::request_id_type id,
+    std::size_t token_count
+) {
+    return scheduled.size() == 1 && scheduled.front().request_id == id && scheduled.front().token_count == token_count;
+}
+
+// Takes the next scheduled requests of queue before any request is pushed, after the push of id, while the step of id
+// that ends its cycle is unfinished, and after that step's write-back; records whether each take holds the request's
+// expected tokens or none, and whether a wait for a push had ended before and after the push.
+task<void> take_around_steps(
+    pulsarlm::executor& exec,
+    pulsarlm::request_queue& queue,
+    pulsarlm::executor::request_id_type id,
+    std::vector<bool>& observations
+) {
+    observations.push_back(queue.next().empty());
+    bool pushed = false;
+    event_loop::current()->spawn(wait_for_push(queue, pushed));
+    co_await yield_to_loop();
+    observations.push_back(pushed);
+    queue.push(id);
+    co_await yield_to_loop();
+    observations.push_back(pushed);
+    const std::vector<pulsarlm::executor::scheduled_request> prefill_requests = queue.next();
+    observations.push_back(schedules_one(prefill_requests, id, 4));
+    pulsarlm::executor::step prefill = exec.prepare(prefill_requests);
+    pulsarlm::executor::launch_result prefill_launched = co_await exec.launch(prefill);
+    observations.push_back(queue.next().empty());
+    co_await exec.write_back(prefill, prefill_launched);
+    observations.push_back(schedules_one(queue.next(), id, 1));
+    event_loop::current()->stop();
+}
+
+// The request's prefill ends its 4-token cycle, so the request is not schedulable until that step's write-back.
+TEST_CASE("a request queue schedules a request once pushed and while it awaits no write-back") {
+    fixture f(16);
+    pulsarlm::request_queue queue(f.exec, 64);
+    std::optional<pulsarlm::executor::request_id_type> id = start_request(
+        f.exec,
+        request{.tokens = {1, 2, 3, 4}, .max_tokens = 4, .eviction = {.cycle_tokens = 4}},
+        std::make_shared<request_results>()
+    );
+    REQUIRE(id.has_value());
+    std::vector<bool> observations;
+    event_loop loop;
+    loop.spawn(take_around_steps(f.exec, queue, *id, observations));
+    REQUIRE(loop.run() == nullptr);
+
+    REQUIRE(observations == std::vector<bool>{true, false, true, true, true, true});
+}
+
+// Prepares, launches and writes back one step of the requests at scheduled, recording the requests that exited at its
+// preparation and whether each request exited after its write-back; then ends the requests.
+task<void> run_one_step(
+    pulsarlm::executor& exec,
+    std::vector<pulsarlm::executor::scheduled_request> scheduled,
+    std::vector<pulsarlm::executor::request_id_type>& exited_at_prepare,
+    std::vector<bool>& exited
+) {
+    pulsarlm::executor::step prepared = exec.prepare(scheduled);
+    exited_at_prepare = exec.take_exited_requests();
+    pulsarlm::executor::launch_result launched = co_await exec.launch(prepared);
+    co_await exec.write_back(prepared, launched);
+    for (const pulsarlm::executor::scheduled_request& s : scheduled) {
+        exited.push_back(exec.has_exited(s.request_id));
+    }
+    for (const pulsarlm::executor::scheduled_request& s : scheduled) {
+        co_await exec.stop(s.request_id);
+    }
+    event_loop::current()->stop();
+}
+
+// The page tables hold 3 columns, and each request's prefill of 16 tokens would take 4 pages.
+TEST_CASE("a step whose requests all leave at its preparation runs nothing and its requests end") {
+    fixture f(64, 64, {}, {}, two_full_layers, std::nullopt, 4096, 64, 3);
+    token_list first(16);
+    std::iota(first.begin(), first.end(), 1);
+    token_list second(16);
+    std::iota(second.begin(), second.end(), 17);
+    auto first_results = std::make_shared<request_results>();
+    auto second_results = std::make_shared<request_results>();
+    std::optional<pulsarlm::executor::request_id_type> first_id = start_request(
+        f.exec,
+        request{.tokens = first, .max_tokens = 1, .eviction = {.cycle_tokens = 64}},
+        first_results
+    );
+    std::optional<pulsarlm::executor::request_id_type> second_id = start_request(
+        f.exec,
+        request{.tokens = second, .max_tokens = 1, .eviction = {.cycle_tokens = 64}},
+        second_results
+    );
+    REQUIRE(first_id.has_value());
+    REQUIRE(second_id.has_value());
+    std::vector<pulsarlm::executor::request_id_type> exited_at_prepare;
+    std::vector<bool> exited;
+    event_loop loop;
+    loop.spawn(run_one_step(f.exec, {{*first_id, 16}, {*second_id, 16}}, exited_at_prepare, exited));
+    REQUIRE(loop.run() == nullptr);
+
+    REQUIRE((exited_at_prepare == std::vector<pulsarlm::executor::request_id_type>{*first_id, *second_id}));
+    REQUIRE(exited == std::vector<bool>{true, true});
+    REQUIRE(f.model.forward_count == 0);
+    REQUIRE(first_results->tokens.empty());
+    REQUIRE(second_results->tokens.empty());
+    REQUIRE(ended_error(*first_results) == request_error::context_exceeded);
+    REQUIRE(ended_error(*second_results) == request_error::context_exceeded);
+    REQUIRE(f.store->releases == f.store->leases);
+    REQUIRE(f.exec.kv_cache_bytes() == 0);
+}
+
+// Steps the requests at ids as the scheduler does until each exits, all their schedulable requests in each step:
+// prepares and launches a step before the previous step's write-back when overlaps, else after it, adding the steps
+// prepared over an unfinished one to overlapped_steps. unfinished holds the steps not written back, oldest first.
+task<void> step_requests(
+    pulsarlm::executor& exec,
+    std::span<const pulsarlm::executor::request_id_type> ids,
+    bool overlaps,
+    std::size_t prefill_tokens_per_step,
+    std::deque<unfinished_step>& unfinished,
+    std::size_t& overlapped_steps
+) {
+    while (!std::ranges::all_of(ids, [&](pulsarlm::executor::request_id_type id) { return exec.has_exited(id); })) {
+        std::vector<pulsarlm::executor::scheduled_request> scheduled;
+        std::size_t budget = prefill_tokens_per_step;
+        for (pulsarlm::executor::request_id_type id : ids) {
+            if (unfinished.size() == 2 || exec.has_exited(id) || !exec.is_schedulable(id)) {
+                continue;
+            }
+            const std::size_t token_count = step_token_count(exec, id, budget);
+            if (token_count > 0) {
+                scheduled.push_back({id, token_count});
+            }
+            if (exec.pending_token_count(id) > 1) {
+                budget -= token_count;
+            }
+        }
+        if (!scheduled.empty() && (unfinished.empty() || (overlaps && unfinished.size() == 1))) {
+            overlapped_steps += unfinished.size();
+            pulsarlm::executor::step prepared = exec.prepare(scheduled);
+            pulsarlm::executor::launch_result launched = co_await exec.launch(prepared);
+            unfinished.emplace_back(std::move(prepared), std::move(launched));
+            continue;
+        }
+        co_await exec.write_back(unfinished.front().first, unfinished.front().second);
+        unfinished.pop_front();
+    }
+    for (pulsarlm::executor::request_id_type id : ids) {
+        co_await exec.stop(id);
+    }
+}
+
+// Steps the requests at ids (step_requests) after a first step of both, then a step of the second while the first
+// awaits the first step's write-back, recording whether the first request is schedulable after each of these steps'
+// preparation and after the first step's write-back.
+task<void> step_requests_over_a_cycle_end(
+    pulsarlm::executor& exec,
+    std::vector<pulsarlm::executor::request_id_type> ids,
+    std::size_t prefill_tokens_per_step,
+    std::size_t& overlapped_steps,
+    std::vector<bool>& first_schedulable
+) {
+    std::deque<unfinished_step> unfinished;
+    std::vector<pulsarlm::executor::scheduled_request> both{
+        {ids[0], step_token_count(exec, ids[0], prefill_tokens_per_step)},
+        {ids[1], step_token_count(exec, ids[1], prefill_tokens_per_step)},
+    };
+    pulsarlm::executor::step both_prepared = exec.prepare(both);
+    first_schedulable.push_back(exec.is_schedulable(ids[0]));
+    pulsarlm::executor::launch_result both_launched = co_await exec.launch(both_prepared);
+    unfinished.emplace_back(std::move(both_prepared), std::move(both_launched));
+    const std::vector<pulsarlm::executor::scheduled_request> second{{ids[1], 1}};
+    pulsarlm::executor::step second_prepared = exec.prepare(second);
+    first_schedulable.push_back(exec.is_schedulable(ids[0]));
+    pulsarlm::executor::launch_result second_launched = co_await exec.launch(second_prepared);
+    unfinished.emplace_back(std::move(second_prepared), std::move(second_launched));
+    overlapped_steps++;
+    co_await exec.write_back(unfinished.front().first, unfinished.front().second);
+    unfinished.pop_front();
+    first_schedulable.push_back(exec.is_schedulable(ids[0]));
+    co_await step_requests(exec, ids, true, prefill_tokens_per_step, unfinished, overlapped_steps);
+    event_loop::current()->stop();
+}
+
+task<void> step_requests_in_turn(
+    pulsarlm::executor& exec,
+    std::vector<pulsarlm::executor::request_id_type> ids,
+    std::size_t prefill_tokens_per_step,
+    std::size_t& overlapped_steps
+) {
+    std::deque<unfinished_step> unfinished;
+    co_await step_requests(exec, ids, false, prefill_tokens_per_step, unfinished, overlapped_steps);
+    event_loop::current()->stop();
+}
+
+// The first request's prefill fills its 4-token cycle, so it waits for that step's write-back while the second
+// request's steps overlap; both produce the tokens and states of steps that never overlap.
+TEST_CASE("a request awaits the write-back of a step that may end its cycle while another request's steps overlap") {
+    const std::size_t prefill_tokens_per_step = 64;
+    const token_list first{1, 2, 3, 4};
+    const token_list second{5, 6, 7};
+    auto run = [&](bool overlaps, std::size_t& overlapped_steps, std::vector<bool>& first_schedulable) {
+        fixture f(64, prefill_tokens_per_step);
+        auto first_results = std::make_shared<request_results>();
+        auto second_results = std::make_shared<request_results>();
+        std::optional<pulsarlm::executor::request_id_type> first_id = start_request(
+            f.exec,
+            request{.tokens = first, .max_tokens = 12, .eviction = {.cycle_tokens = 4}},
+            first_results
+        );
+        std::optional<pulsarlm::executor::request_id_type> second_id = start_request(
+            f.exec,
+            request{.tokens = second, .max_tokens = 12, .eviction = {.cycle_tokens = 64}},
+            second_results
+        );
+        REQUIRE(first_id.has_value());
+        REQUIRE(second_id.has_value());
+        event_loop loop;
+        if (overlaps) {
+            loop.spawn(step_requests_over_a_cycle_end(
+                f.exec,
+                {*first_id, *second_id},
+                prefill_tokens_per_step,
+                overlapped_steps,
+                first_schedulable
+            ));
+        } else {
+            loop.spawn(
+                step_requests_in_turn(f.exec, {*first_id, *second_id}, prefill_tokens_per_step, overlapped_steps)
+            );
+        }
+        REQUIRE(loop.run() == nullptr);
+        return std::pair{*first_results, *second_results};
+    };
+    std::size_t overlapped_steps = 0;
+    std::size_t sequential_overlapped_steps = 0;
+    std::vector<bool> first_schedulable;
+    std::vector<bool> unused_schedulable;
+    const auto [first_overlapped, second_overlapped] = run(true, overlapped_steps, first_schedulable);
+    const auto [first_sequential, second_sequential] = run(false, sequential_overlapped_steps, unused_schedulable);
+
+    REQUIRE(first_schedulable == std::vector<bool>{false, false, true});
+    REQUIRE(overlapped_steps > 1);
+    REQUIRE(sequential_overlapped_steps == 0);
+    REQUIRE(first_sequential.tokens == continuation(first, 12));
+    REQUIRE(second_sequential.tokens == continuation(second, 12));
+    REQUIRE(first_overlapped.tokens == first_sequential.tokens);
+    REQUIRE(second_overlapped.tokens == second_sequential.tokens);
+    REQUIRE(first_sequential.cycle_ends.size() >= 3);
+    for (const auto& [overlapped, sequential] :
+         {std::pair{&first_overlapped, &first_sequential}, std::pair{&second_overlapped, &second_sequential}}) {
+        REQUIRE(overlapped->cycle_ends.size() == sequential->cycle_ends.size());
+        std::vector<state_pointer> overlapped_states;
+        std::vector<state_pointer> sequential_states;
+        for (std::size_t c = 0; c < sequential->cycle_ends.size(); c++) {
+            overlapped_states.push_back(overlapped->cycle_ends[c].state);
+            sequential_states.push_back(sequential->cycle_ends[c].state);
+        }
+        overlapped_states.push_back(overlapped->end_state);
+        sequential_states.push_back(sequential->end_state);
+        for (std::size_t c = 0; c < sequential_states.size(); c++) {
+            INFO("state " << c);
+            const pulsarlm::state& got = *overlapped_states[c];
+            const pulsarlm::state& expected = *sequential_states[c];
+            REQUIRE(got.tail == expected.tail);
+            REQUIRE(got.layers.size() == expected.layers.size());
+            for (std::size_t layer = 0; layer < expected.layers.size(); layer++) {
+                INFO("KV layer " << layer);
+                REQUIRE((hashes_of(got, layer) == hashes_of(expected, layer)));
+                for (std::size_t page = 0; page < expected.layers[layer].pages.size(); page++) {
+                    REQUIRE((got.layers[layer].pages[page].mass_sum == expected.layers[layer].pages[page].mass_sum));
+                    REQUIRE(got.layers[layer].pages[page].weight_sum == expected.layers[layer].pages[page].weight_sum);
+                }
+            }
+        }
+    }
+}
+
+// The second request starts at the first one's third forward, while two steps of the first are unfinished; from its
+// first step on, each step that decodes holds both requests until the second ends.
+TEST_CASE("a request started while another's steps overlap decodes in the same steps as it") {
+    fixture f(16);
+    const token_list first{1};
+    const token_list second{7};
+    auto first_results = std::make_shared<request_results>();
+    auto second_results = std::make_shared<request_results>();
+    std::size_t remaining = 2;
+    event_loop loop;
+    f.model.on_forward = [&] {
+        if (f.model.forward_count == 3) {
+            loop.spawn(
+                serve(f.sched, request{.tokens = second, .max_tokens = 8}, make_callbacks(second_results), remaining)
+            );
+        }
+    };
+    loop.spawn(f.sched.run());
+    loop.spawn(serve(f.sched, request{.tokens = first, .max_tokens = 24}, make_callbacks(first_results), remaining));
+    REQUIRE(loop.run() == nullptr);
+
+    REQUIRE(first_results->tokens == continuation(first, 24));
+    REQUIRE(second_results->tokens == continuation(second, 8));
+    REQUIRE(std::ranges::count(f.model.decode_sizes, 2) >= 7);
 }
 
 }  // namespace

@@ -9,6 +9,8 @@
 #include "pulsarlm/engine/scheduler.hpp"
 #include "pulsarlm/engine/step_graphs.hpp"
 
+#include "../../src/engine/executor/step.hpp"
+
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -27,6 +29,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstdint>
+#include <deque>
 #include <expected>
 #include <memory>
 #include <mutex>
@@ -1205,8 +1208,9 @@ class stepped_callbacks final : public pulsarlm::request_callbacks {
     }
 };
 
-// Starts r on exec, then launches its steps as the scheduler does, each before the previous step's write-back when
-// overlaps and the executor allow it, else after it, counting the steps launched over an unfinished one; then ends it.
+// Starts r on exec, then prepares and launches its steps as the scheduler does, each before the previous step's
+// write-back when overlaps and the executor allow it, else after it, counting the steps prepared over an unfinished
+// one; then ends it.
 task<void> run_stepped(
     pulsarlm::executor& exec,
     pulsarlm::request r,
@@ -1223,21 +1227,22 @@ task<void> run_stepped(
     );
     if (started) {
         const pulsarlm::executor::request_id_type id = *started;
+        std::deque<std::pair<pulsarlm::executor::step, pulsarlm::executor::launch_result>> unfinished;
         while (!exec.has_exited(id)) {
-            if (exec.is_steppable(id) && (exec.launched_batch_count() == 0 || overlaps)) {
+            if ((unfinished.empty() || (overlaps && unfinished.size() == 1)) && exec.is_schedulable(id)) {
                 const std::size_t pending_count = exec.pending_token_count(id);
                 const std::size_t token_count = pending_count == 1
                     ? 1
                     : std::min<std::size_t>({pending_count, 32, exec.cycle_tokens_left(id)});
                 const std::vector<pulsarlm::executor::scheduled_request> scheduled{{id, token_count}};
-                if (exec.launched_batch_count() == 0 ||
-                    (exec.launched_batch_count() == 1 && exec.allows_overlap(scheduled))) {
-                    overlapped_steps += exec.launched_batch_count();
-                    co_await exec.launch(scheduled);
-                    continue;
-                }
+                overlapped_steps += unfinished.size();
+                pulsarlm::executor::step prepared = exec.prepare(scheduled);
+                pulsarlm::executor::launch_result launched = co_await exec.launch(prepared);
+                unfinished.emplace_back(std::move(prepared), std::move(launched));
+                continue;
             }
-            co_await exec.write_back();
+            co_await exec.write_back(unfinished.front().first, unfinished.front().second);
+            unfinished.pop_front();
         }
         co_await exec.stop(id);
     }
@@ -1292,6 +1297,26 @@ stepped_run serve_stepped(
 }
 
 }  // namespace
+
+// The drafts' acceptance is known only at each verify step's write-back, after the next step is prepared; the request
+// still emits exactly max_tokens tokens.
+TEST_CASE("Qwen3.5 drafting with overlapping steps emits exactly max_tokens tokens", "[runtime][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const std::size_t max_tokens = GENERATE(5, 17, 64);
+    INFO("max_tokens " << max_tokens);
+    const stepped_run overlapped = serve_stepped(
+        drafting_weights(n_kv_heads),
+        {},
+        2,
+        true,
+        pulsarlm::request{.tokens = random_tokens(prompt_tokens, 9), .max_tokens = max_tokens, .eviction = eviction}
+    );
+
+    REQUIRE(overlapped.results.tokens.size() == max_tokens);
+    REQUIRE(overlapped.overlapped_steps > 0);
+}
 
 // Cycles of 2 pages end with the recurrent layers' state at head in the store, which gives up its line; the steps
 // after them overlap, and the step completing the second page after a stored head takes a line for its state again.

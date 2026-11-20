@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -227,6 +228,7 @@ pulsarlm::request_table make_table() {
         .cycle_end_positions = at::zeros({1}, cuda(at::kLong)),
         .mass_start_positions = at::zeros({1}, cuda(at::kLong)),
         .attention_mass_decays = at::full({1}, 0.25, cuda(at::kDouble)),
+        .remaining_tokens = at::full({1}, std::numeric_limits<std::int64_t>::max(), cuda(at::kLong)),
         .seeds = at::zeros({1}, cuda(at::kLong)),
         .draw_counts = at::zeros({1}, cuda(at::kLong)),
         .temperatures = at::zeros({1}, cuda(at::kFloat)),

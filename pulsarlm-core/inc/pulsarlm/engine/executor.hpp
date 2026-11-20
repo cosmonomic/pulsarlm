@@ -6,7 +6,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <expected>
 #include <memory>
 #include <optional>
@@ -38,6 +37,10 @@ class executor {
     struct running_request {
         std::unique_ptr<request_callbacks> callbacks;
         request_state state;
+        // Whether a step of the request that is not written back may end its cycle or, in a model with sliding layers,
+        // completes a page (step_entry::awaits_write_back), so that no later step of it is prepared before that
+        // step's write-back.
+        bool awaits_write_back = false;
     };
 
   public:
@@ -47,15 +50,18 @@ class executor {
         request_id_type request_id;
         std::size_t token_count;
     };
+    class step;
+    class launch_result;
 
   private:
     friend struct executor_inspection;
-    struct batch_entry;
-    class batch;
-    struct batch_writes;
+    struct step_entry;
+    struct step_writes;
 
     // Each request from the creation of its request state until its end.
     slot_map<running_request> requests;
+    // The requests that exited since the last take_exited_requests, in exit order.
+    std::vector<request_id_type> exited_requests;
 
     // Everything the executor keeps on one GPU across steps.
     class shard {
@@ -78,8 +84,8 @@ class executor {
         std::unique_ptr<step_graphs> graphs;
         // The arrival counters of the steps that run without a graph, grown to the largest step's.
         at::Tensor arrival_counters;
-        // Indexed by get_slot. Every shard's steps advance it alike. Its tensors are allocated once, as graphs reads and
-        // writes them where they are.
+        // Indexed by get_slot. Every shard's steps advance it alike. Its tensors are allocated once, as graphs reads
+        // and writes them where they are.
         request_table table;
     };
 
@@ -112,14 +118,12 @@ class executor {
     std::vector<cudaStream_t> collect_streams(cudaStream_t shard::* stream) const;
     digest root;
     std::vector<std::int64_t> stop_ids;
-    // The steps queued on the GPUs and not written back yet, in launch order.
-    std::deque<std::unique_ptr<batch>> launched_batches;
     // The page writes write-backs spawned, at most max_store_writes at once.
     pending_writes store_writes;
     static constexpr std::size_t max_store_writes = 8;
-    // The most rows of sampled tokens a batch has.
+    // The most rows of sampled tokens a step has.
     std::size_t sampled_row_capacity;
-    // The query token counts that a step which is not uniform (batch::is_uniform) pads to, ascending: 1, 2, 3, then
+    // The query token counts that a step which is not uniform (step::is_uniform) pads to, ascending: 1, 2, 3, then
     // each 4 * 2^k and 6 * 2^k below the most query tokens of a step, then that most (make_token_buckets).
     std::vector<std::int64_t> token_buckets;
 
@@ -133,11 +137,11 @@ class executor {
     std::size_t table_width_after(const request_state& req, std::span<const std::size_t> line_counts) const;
     // Per KV layer, the lines take_lines gives req.
     std::vector<std::size_t> start_line_counts(const request_state& req) const;
-    // Moves stale_tables into b: the cells of each request's stale columns, from its view, that b's enqueue sets.
-    void move_stale_tables(batch& b);
-    // Moves stale_requests into b: each request's request_table entries from its request state, which b's enqueue
+    // Moves stale_tables into s: the cells of each request's stale columns, from its view, that s's enqueue sets.
+    void move_stale_tables(step& s);
+    // Moves stale_requests into s: each request's request_table entries from its request state, which s's enqueue
     // sets.
-    void move_stale_requests(batch& b);
+    void move_stale_requests(step& s);
     // The tokens of req's full history pages that every KV layer reading the page holds resident.
     std::size_t device_cached_tokens(const request_state& req) const;
     // Per KV layer with pages, lines for its pages; per recurrent layer, a copy of the state at head, or zeros without
@@ -184,7 +188,7 @@ class executor {
     ) noexcept;
     // Prepares each entry's step in its request (request_state::prepare_step, request_state::prepare_verify_step) and
     // plans the draft head's pass.
-    void advance(batch& b);
+    void advance(step& s);
     // Of a step of req computing token_count of its tokens, in an executor whose steps draft: whether it adds the key
     // of the token after them to the draft head's KV layer, and whether it drafts.
     std::pair<bool, bool> plan_drafting(const request_state& req, std::size_t token_count) const;
@@ -193,21 +197,24 @@ class executor {
     // or the lines run out, which the request records (request_state::exceed_context,
     // request_state::run_out_of_lines).
     bool add_step_lines(const scheduled_request& scheduled);
-    task<void> enqueue_on_shard(batch& b, std::size_t shard);
-    // Whether a step of the requests in scheduled ends no cycle and, in a model with sliding layers, completes no page, or in an executor
-    // whose steps draft, whether every entry verifies drafts: its write-back then changes no view or table that the
-    // next step reads, and copies to the store only lines the next step does not write.
-    bool entries_allow_overlap(std::span<const scheduled_request> scheduled) const;
-    // Whether launch can launch a step of the requests in scheduled now, the limit sampled_row_limit() aside: scheduled is not empty and
-    // names no request twice, each token count is above 0 and at most the request's pending tokens, each request is
-    // steppable (is_steppable), fewer than two steps are launched, and no step is launched or allows_overlap(scheduled).
-    bool is_launchable(std::span<const scheduled_request> scheduled) const;
+    task<void> enqueue_on_shard(const step& s, launch_result& launched, std::size_t shard);
+    // Whether prepare can prepare a step of the requests in scheduled, the limit sampled_row_limit() aside: scheduled
+    // names no request twice, each token count is above 0 and at most the request's pending tokens, and each request
+    // is schedulable (is_schedulable).
+    bool is_preparable(std::span<const scheduled_request> scheduled) const;
 
-    task<void> join(batch& b);
-    // step_duration is the time from b's launch to its write-back.
-    batch_writes apply_entries(batch& b, std::chrono::steady_clock::duration step_duration);
-    task<void> write_pages_and_states(batch& b, batch_writes&& writes);
-    task<void> refresh_views(batch& b);
+    task<void> join(const step& s, launch_result& launched);
+    // step_duration is the time from s's preparation to its write-back.
+    step_writes
+    apply_entries(const step& s, const launch_result& launched, std::chrono::steady_clock::duration step_duration);
+    task<void> write_pages_and_states(launch_result& launched, step_writes& writes);
+    task<void> refresh_views(const step& s, const launch_result& launched, const step_writes& writes);
+    // Whether the request's callbacks are cancelled.
+    bool is_cancelled(request_id_type id) const;
+    // Cancels a request that has not exited, which exits right away when no step of it is unfinished.
+    void cancel(request_id_type id);
+    // Sets the exit reason of id's request (request_state::exit) and adds it to exited_requests.
+    void exit_request(request_id_type id);
 
     // Awaits syncing, the task of a kv_cache::sync on the copy streams, then ends the write in store_writes and in each
     // of writers.
@@ -222,18 +229,19 @@ class executor {
     task<void> write_cycle_end(request_state& req, request_callbacks& callbacks);
 
   public:
-    // models[s] runs on cache shard s with streams[s], for s above 0 on worker_loops[s - 1], and its write-backs' copies
-    // to the store on copy_streams[s], which the caller synchronizes before freeing what the copies read; the cache holds one layer
-    // per entry of each model's kv_layers(), and the shards agree on which layers are recurrent or sliding. store is the
-    // cache's. root is the engine's root digest (make_root_digest). A request's view takes at most view_page_capacity
-    // pages, and one that would take more ends with context_exceeded. With graph_pages, a step_graphs graph over tables
-    // graph_pages wide replays a step of decoding entries alone that all sample and draft nothing (a decode step), and
-    // a step of verifying entries alone that all draft (a verify step). Any other step pads its query tokens to their
-    // bucket (token_buckets), with graphs or without, and with graph_pages replays the bucket's segment graphs when the
-    // model allows their capture (model::allows_segment_capture). A step drafts draft_tokens tokens per request with
-    // the shards' draft heads, which they have when draft_tokens is above 0, and the cache's recurrent layers are
-    // laid out for them (recurrent_state). At most max_running_requests requests hold a record at once (start), and a
-    // step takes at most prefill_tokens_per_step query tokens of prefill chunks (scheduler).
+    // models[s] runs on cache shard s with streams[s], for s above 0 on worker_loops[s - 1], and its write-backs'
+    // copies to the store on copy_streams[s], which the caller synchronizes before freeing what the copies read; the
+    // cache holds one layer per entry of each model's kv_layers(), and the shards agree on which layers are recurrent
+    // or sliding. store is the cache's. root is the engine's root digest (make_root_digest). A request's view takes at
+    // most view_page_capacity pages, and one that would take more ends with context_exceeded. With graph_pages, a
+    // step_graphs graph over tables graph_pages wide replays a step of decoding entries alone that all sample and draft
+    // nothing (a decode step), and a step of verifying entries alone that all draft (a verify step). Any other step
+    // pads its query tokens to their bucket (token_buckets), with graphs or without, and with graph_pages replays the
+    // bucket's segment graphs when the model allows their capture (model::allows_segment_capture). A step drafts
+    // draft_tokens tokens per request with the shards' draft heads, which they have when draft_tokens is above 0, and
+    // the cache's recurrent layers are laid out for them (recurrent_state). At most max_running_requests requests hold
+    // a record at once (start), and a step takes at most prefill_tokens_per_step query tokens of prefill chunks
+    // (scheduler).
     executor(
         std::vector<model*>&& models,
         kv_cache cache,
@@ -261,7 +269,7 @@ class executor {
     // Serves r with callbacks, which stay in the guard until r's request state exists, so a start destroyed while it
     // is suspended before then ends them with loop_exited. Returns the request id of r, resuming the newest state the
     // store holds for a prefix of its tokens, with lines for its pages and recurrent states; each step takes the lines
-    // for its tokens when it is launched. Returns std::nullopt after it ended the
+    // for its tokens when it is prepared. Returns std::nullopt after it ended the
     // request through on_end, with value-initialized statistics: with cancelled when the callbacks are cancelled at the
     // start, before the store is read, with missing_state when the lookup or a page read fails, with invalid_state when
     // the stored state's head is not a digest of r's full pages, its tail is not a proper prefix of r's tokens after
@@ -273,58 +281,57 @@ class executor {
     std::size_t max_running_request_count() const noexcept;
     // The requests with a record, from the creation of their request state until their end.
     std::size_t request_count() const noexcept;
-    // Whether a step of the requests in scheduled can be launched now, before any write-back: no step is launched or the last launched
-    // step allows overlap, and so does a step of the requests in scheduled. A step allows overlap when it ends no cycle and, in a model
-    // with sliding layers, completes no page, or in an executor whose steps draft, when every entry verifies drafts.
-    bool allows_overlap(std::span<const scheduled_request> scheduled) const;
-    // The launched steps not written back yet, at most 2.
-    std::size_t launched_batch_count() const noexcept;
-    // The most rows of sampled tokens a batch has.
+    // The most rows of sampled tokens a step has.
     std::size_t sampled_row_limit() const noexcept;
-    // The rows of a batch's sampled tokens that the request takes when it computes token_count tokens.
+    // The rows of a step's sampled tokens that the request takes when it computes token_count tokens.
     std::size_t sampled_row_count(request_id_type id, std::size_t token_count) const;
-    // Launches one step of the requests in scheduled after the launched steps, ordered into the runs of one model call
-    // (model::batch): gives each request the lines its step writes (add_step_lines) and prepares its step,
-    // then queues the forward and the sampling on every shard without waiting for them. A request that gets no lines
-    // leaves the step, and exits right away when no launched step holds it; a step of no request is not launched.
+    // Prepares a step of the requests in scheduled after the prepared steps, ordered into the runs of one model call
+    // (model::batch): gives each request the lines its step writes (add_step_lines) and prepares its step in its
+    // request state. A request that gets no lines leaves the step, and exits right away when no step of it is
+    // unfinished; a step that every request leaves is empty. A request whose step may end its cycle or, in a model with
+    // sliding layers, completes a page is not schedulable until the step's write-back. scheduled names no request
+    // twice, each token count is above 0 and at most the request's pending tokens, each request is schedulable
+    // (is_schedulable), the step samples at most sampled_row_limit() rows, and at most one prepared step is not written
+    // back.
+    step prepare(std::span<const scheduled_request> scheduled);
+    // Queues s on every shard, after the steps prepared before it, without waiting for it, and returns its outputs.
     // Each shard's step reads its inputs from the shard's request_table and advances it, so a step reads the tokens and
-    // positions the launched steps before it leave.
-    // scheduled is not empty and names no request twice, each token count is above 0 and at most the request's pending
-    // tokens, each request is steppable (is_steppable), fewer than two steps are launched, no step is launched or
-    // allows_overlap(scheduled), and the step samples at most sampled_row_limit() rows.
-    task<void> launch(std::span<const scheduled_request> scheduled);
-    // Writes back the oldest launched step: waits for it, then applies the tokens it forwarded and sampled, delivers
-    // them, completes the pages its tokens filled, writes the completed pages, and evicts and writes the state at a
-    // cycle end, which the GPU reports. The pages of a request writing no state are written by a spawned task; a
-    // request writing its state waits for its pages' writes first, and a failed write is found at a later write-back.
-    // Records on each request a stop token or max_tokens it reached or a failed store write, and sets the exit reason
-    // (request_state::exit) of each request with an exit cause that the step leaves in no launched step. The entry of
-    // a request that reached the end or whose store write failed at an earlier write-back applies nothing, so a step
-    // launched after the one that reached the end changes no state the request stores. Returns the requests of the
-    // step's entries, in entry order. A step is launched.
-    task<std::vector<request_id_type>> write_back();
-    // Ends the request of id, whose request state exited and is in no launched step: releases its lines, writes its end state
-    // when it finished, releases its lease, delivers the state or the error and the statistics through on_end, and
-    // erases it.
+    // positions the steps launched before it leave. An empty step queues nothing.
+    task<launch_result> launch(const step& s);
+    // Writes back s, after the steps prepared before it, from launched, its launch's result: waits for it, then applies
+    // the tokens it forwarded and sampled, delivers them, completes the pages its tokens filled, writes the completed
+    // pages, and evicts and writes the state at a cycle end, which the GPU reports. The pages of a request writing no
+    // state are written by a spawned task; a request writing its state waits for its pages' writes first, and a failed
+    // write is found at a later write-back. Records on each request a stop token or max_tokens it reached or a failed
+    // store write, and sets the exit reason (request_state::exit) of each request with an exit cause that has no
+    // unfinished step left. The entry of a request that reached the end or whose store write failed at an earlier
+    // write-back applies nothing, so a step prepared after the one that reached the end changes no state the request
+    // stores. Then cancels each request of the step that has not exited and whose callbacks are cancelled (cancel).
+    // An empty step writes back nothing.
+    task<void> write_back(const step& s, launch_result& launched);
+    // Ends the request of id, whose request state exited and has no unfinished step: releases its lines, writes its end
+    // state when it finished, releases its lease, delivers the state or the error and the statistics through on_end,
+    // and erases it.
     task<void> stop(request_id_type id);
     // Releases the lines and the lease of every request, delivers error and the request's statistics so far through
     // on_end, and erases the request. Called when the loop has exited.
     void end_requests(request_error error) noexcept;
-    // Whether the request has no exit cause (request_state::has_exit_cause) and no launched step forwards its last
-    // tokens.
-    bool is_steppable(request_id_type id) const;
+    // Whether a step of the request can be prepared now: it has no exit cause (request_state::has_exit_cause), no
+    // prepared step forwards its last tokens, and it awaits the write-back of none
+    // (running_request::awaits_write_back). At most one step of the request is unfinished, as at most two steps are
+    // unfinished when one is prepared.
+    bool is_schedulable(request_id_type id) const;
     std::size_t pending_token_count(request_id_type id) const;
     // The tokens the request's eviction cycle can still forward.
     std::size_t cycle_tokens_left(request_id_type id) const;
+    // Whether the request exited (request_state::exit), which leaves it no unfinished step.
     bool has_exited(request_id_type id) const;
-    bool is_in_launched_batch(request_id_type id) const;
-    // Whether the request's callbacks are cancelled.
-    bool is_cancelled(request_id_type id) const;
-    // Cancels a request that has not exited, which exits right away when it is in no launched step.
-    void cancel(request_id_type id);
+    // The requests that exited since the last call, in exit order.
+    std::vector<request_id_type> take_exited_requests();
     // kv_cache::used_bytes of the executor's cache. Safe to call from any thread.
     std::size_t kv_cache_bytes() const noexcept;
-    // The drafts the verify steps written back forwarded, and those of them they accepted. Safe to call from any thread.
+    // The drafts the verify steps written back forwarded, and those of them they accepted. Safe to call from any
+    // thread.
     std::uint64_t drafted_token_count() const noexcept;
     std::uint64_t accepted_draft_count() const noexcept;
 };

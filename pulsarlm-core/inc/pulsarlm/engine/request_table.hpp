@@ -31,6 +31,9 @@ struct request_table {
     at::Tensor mass_start_positions;
     // fp64 [slots]: the request's attention_mass_decay.
     at::Tensor attention_mass_decays;
+    // int64 [slots]: the tokens the request may still emit, below 0 once steps past its end were advanced, and the
+    // largest int64 without max_tokens.
+    at::Tensor remaining_tokens;
     // int64 [slots]: the seed, and the tokens sampled so far.
     at::Tensor seeds;
     at::Tensor draw_counts;

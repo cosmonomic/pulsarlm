@@ -161,8 +161,12 @@ void request_state::update_held() {
     held_pages.erase(std::ranges::unique(held_pages).begin(), held_pages.end());
 }
 
+bool request_state::has_exact_prepared_counts() const noexcept {
+    return written_back_step_count >= bounded_count_steps;
+}
+
 bool request_state::may_sample() const noexcept {
-    return !max_tokens || prepared_sample_count() < *max_tokens;
+    return !max_tokens || !has_exact_prepared_counts() || prepared_sample_count() < *max_tokens;
 }
 
 std::size_t request_state::complete_pages() {
@@ -298,7 +302,7 @@ std::size_t request_state::cycle_tokens_left() const noexcept {
     std::size_t left = next_cycle_end - prepared_position_bound();
     if (max_tokens) {
         // Every token sampled from here is forwarded but the last.
-        std::size_t samples_left = may_sample() ? *max_tokens - prepared_sample_count() : 0;
+        const std::size_t samples_left = *max_tokens - std::min(prepared_sample_count(), *max_tokens);
         left = std::min(left, unprepared_token_count() + (samples_left > 0 ? samples_left - 1 : 0));
     }
     return left;
@@ -537,13 +541,17 @@ void request_state::prepare_step(
     );
     const std::size_t start = prepared_position_bound();
     const std::size_t samples_before = prepared_sample_count();
+    const bool exact = has_exact_prepared_counts();
     if (prepared_prompt_tokens < prompt.size()) {
         prepared_prompt_tokens += token_count;
     }
     position_bound = start + token_count;
     prepared_samples = samples_before + (samples ? 1 : 0);
     prepared_step_count++;
-    last_step_prepared = samples ? !may_sample() : prepared_prompt_tokens == prompt.size();
+    if (!exact) {
+        bounded_count_steps = prepared_step_count;
+    }
+    last_step_prepared = samples ? exact && !may_sample() : prepared_prompt_tokens == prompt.size();
     next_step_reads_last_hidden = !continues_drafting;
     prepared_drafts = draft_count;
 }
@@ -557,6 +565,7 @@ void request_state::prepare_verify_step(std::size_t draft_count) {
     position_bound = prepared_position_bound() + verified_count;
     prepared_samples = prepared_sample_count() + verified_count;
     prepared_step_count++;
+    bounded_count_steps = prepared_step_count;
     next_step_reads_last_hidden = false;
     prepared_drafts = draft_count;
 }

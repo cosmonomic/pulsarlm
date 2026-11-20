@@ -37,11 +37,10 @@ class step_graphs {
         at::Tensor samples;
         at::Tensor ends_cycle;
     };
-    // The inputs of a verify step are its requests' slots and each request's most tokens accepted.
+    // The input of a verify step is its requests' slots.
     struct captured_verify_step {
         at::cuda::CUDAGraph graph;
         at::Tensor request_slots;
-        at::Tensor max_accepted_token_counts;
         model::batch inputs;
         model::batch first_pass;
         model::batch later_pass;
@@ -186,7 +185,7 @@ class step_graphs {
     // the step's page mass is written as model::forward writes it. request_slots and cu_view_pages are in pinned host
     // memory or on the lines' device. A shape not captured yet is captured first. After the step each request's draw
     // count in the table is one more, and its entry is advanced (advance_requests) by its one computed token, no
-    // rejected tokens and its sample as its next token. The outputs are valid until the next call.
+    // rejected tokens, one kept sample and its sample as its next token. The outputs are valid until the next call.
     decode_step_outputs decode_step(
         const at::Tensor& request_slots,
         const at::Tensor& cu_view_pages,
@@ -195,19 +194,18 @@ class step_graphs {
         bool filters
     );
     // The verify step of the requests at request_slots, state_slots query tokens per request, whose requests all draft,
-    // sampled as filters says, each request accepting at most max_accepted_token_counts (int64 [sequences], in pinned
-    // host memory or on the lines' device) tokens, its page mass written as decode_step writes it. A
-    // request accepts its pending token and its drafts while sample t equals draft t + 1, then the sample after them,
-    // through a stop token. After the step each request's draw count in the table is more by its accepted count, and
-    // its entry is advanced by its accepted count, state_slots less that count rejected, and its next token and drafts.
+    // sampled as filters says, its page mass written as decode_step writes it. A request accepts its pending token and
+    // its drafts while sample t equals draft t + 1, then the sample after them, through a stop token, and at most its
+    // remaining tokens in the table, and at least 1. After the step each request's draw count in the table is more by
+    // its accepted count, and its entry is advanced by its accepted count, state_slots less that count rejected, its
+    // accepted count of kept samples, and its next token and drafts.
     // The outputs are valid until the next call. The model has a draft head.
     verify_step_outputs verify_step(
         const at::Tensor& request_slots,
         const at::Tensor& cu_view_pages,
         std::span<const at::Tensor> page_mass_sum,
         std::span<const at::Tensor> page_weight_sum,
-        bool filters,
-        const at::Tensor& max_accepted_token_counts
+        bool filters
     );
 };
 

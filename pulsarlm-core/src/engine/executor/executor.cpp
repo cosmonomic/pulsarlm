@@ -1,4 +1,4 @@
-#include "batch.hpp"
+#include "step.hpp"
 
 #include "pulsarlm/engine/executor.hpp"
 
@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <limits>
 #include <expected>
 #include <memory>
 #include <optional>
@@ -189,6 +190,7 @@ executor::executor(
                                        .to(at::kBool);
         s.table.page_size = static_cast<std::int64_t>(layout.page_size);
         s.table.seeds = at::zeros({slots}, options.dtype(at::kLong));
+        s.table.remaining_tokens = at::zeros({slots}, options.dtype(at::kLong));
         s.table.draw_counts = at::zeros({slots}, options.dtype(at::kLong));
         s.table.temperatures = at::zeros({slots}, options.dtype(at::kFloat));
         s.table.top_k = at::zeros({slots}, options.dtype(at::kLong));
@@ -279,7 +281,7 @@ std::vector<std::size_t> executor::start_line_counts(const request_state& req) c
 
 // The requests erased since they were marked are passed over; a request in a reused slot was marked from column 0 at
 // its start.
-void executor::move_stale_tables(batch& b) {
+void executor::move_stale_tables(step& s) {
     const std::size_t n_layers = layout.layers.size();
     std::vector<std::int64_t> cells;
     std::vector<std::int32_t> lines;
@@ -317,16 +319,16 @@ void executor::move_stale_tables(batch& b) {
         return;
     }
     const auto count = static_cast<std::int64_t>(cells.size());
-    b.table_cells = pinned({count}, at::kLong);
-    b.table_lines = pinned({count}, at::kInt);
-    b.table_positions = pinned({count}, at::kInt);
-    std::ranges::copy(cells, b.table_cells.mutable_data_ptr<std::int64_t>());
-    std::ranges::copy(lines, b.table_lines.mutable_data_ptr<std::int32_t>());
-    std::ranges::copy(positions, b.table_positions.mutable_data_ptr<std::int32_t>());
+    s.table_cells = pinned({count}, at::kLong);
+    s.table_lines = pinned({count}, at::kInt);
+    s.table_positions = pinned({count}, at::kInt);
+    std::ranges::copy(cells, s.table_cells.mutable_data_ptr<std::int64_t>());
+    std::ranges::copy(lines, s.table_lines.mutable_data_ptr<std::int32_t>());
+    std::ranges::copy(positions, s.table_positions.mutable_data_ptr<std::int32_t>());
 }
 
 // The requests erased since they were marked are passed over.
-void executor::move_stale_requests(batch& b) {
+void executor::move_stale_requests(step& s) {
     const std::size_t n_layers = layout.layers.size();
     const std::size_t token_width = draft_state_slots;
     std::vector<std::int64_t> slots;
@@ -338,6 +340,7 @@ void executor::move_stale_requests(batch& b) {
     std::vector<std::int64_t> cycle_end_positions;
     std::vector<std::int64_t> mass_start_positions;
     std::vector<double> attention_mass_decays;
+    std::vector<std::int64_t> remaining_tokens;
     std::vector<std::int64_t> seeds;
     std::vector<std::int64_t> draw_counts;
     std::vector<float> temperatures;
@@ -365,6 +368,11 @@ void executor::move_stale_requests(batch& b) {
         cycle_end_positions.push_back(static_cast<std::int64_t>(req.cycle_end_position()));
         mass_start_positions.push_back(static_cast<std::int64_t>(req.mass_start_position()));
         attention_mass_decays.push_back(req.eviction_policy_in_pages().attention_mass_decay);
+        const std::optional<std::size_t>& token_limit = req.token_limit();
+        remaining_tokens.push_back(
+            token_limit ? static_cast<std::int64_t>(*token_limit - req.delivered_token_count())
+                        : std::numeric_limits<std::int64_t>::max()
+        );
         const sampling_draw draw = req.next_draw();
         const sampling_params& params = req.sampling_parameters();
         seeds.push_back(static_cast<std::int64_t>(draw.seed));
@@ -378,8 +386,8 @@ void executor::move_stale_requests(batch& b) {
         return;
     }
     const auto count = static_cast<std::int64_t>(slots.size());
-    b.stale_slots = pinned_values(slots);
-    b.stale_entries = request_table{
+    s.stale_slots = pinned_values(slots);
+    s.stale_entries = request_table{
         .history_positions = pinned_values(history_positions),
         .rope_positions = pinned_values(rope_positions),
         .key_counts = pinned_values(key_counts).view({count, static_cast<std::int64_t>(n_layers)}),
@@ -388,6 +396,7 @@ void executor::move_stale_requests(batch& b) {
         .cycle_end_positions = pinned_values(cycle_end_positions),
         .mass_start_positions = pinned_values(mass_start_positions),
         .attention_mass_decays = pinned_values(attention_mass_decays),
+        .remaining_tokens = pinned_values(remaining_tokens),
         .seeds = pinned_values(seeds),
         .draw_counts = pinned_values(draw_counts),
         .temperatures = pinned_values(temperatures),
@@ -396,9 +405,11 @@ void executor::move_stale_requests(batch& b) {
     };
 }
 
-bool executor::is_steppable(request_id_type id) const {
-    const request_state& req = get_state(id);
-    return !req.has_prepared_last_step() && !req.has_exit_cause();
+bool executor::is_schedulable(request_id_type id) const {
+    const running_request& running = requests[id];
+    const request_state& req = running.state;
+    assert(req.unfinished_step_count() <= 1);
+    return !req.has_exit_cause() && !req.has_prepared_last_step() && !running.awaits_write_back;
 }
 
 std::size_t executor::pending_token_count(request_id_type id) const {
@@ -413,10 +424,6 @@ bool executor::has_exited(request_id_type id) const {
     return get_state(id).has_exited();
 }
 
-bool executor::is_in_launched_batch(request_id_type id) const {
-    return get_state(id).unfinished_step_count() > 0;
-}
-
 bool executor::is_cancelled(request_id_type id) const {
     return requests[id].callbacks->cancelled();
 }
@@ -428,8 +435,17 @@ void executor::cancel(request_id_type id) {
     }
     req.cancel();
     if (req.unfinished_step_count() == 0) {
-        req.exit();
+        exit_request(id);
     }
+}
+
+void executor::exit_request(request_id_type id) {
+    get_state(id).exit();
+    exited_requests.push_back(id);
+}
+
+std::vector<executor::request_id_type> executor::take_exited_requests() {
+    return std::exchange(exited_requests, {});
 }
 
 std::size_t executor::kv_cache_bytes() const noexcept {
@@ -449,31 +465,6 @@ bool executor::completes_page(const request_state& req, std::size_t token_count)
     return start + token_count >= layout.page_size;
 }
 
-// A drafting request's verify step ends neither its cycle nor max_tokens (executor::advance).
-bool executor::entries_allow_overlap(std::span<const scheduled_request> scheduled) const {
-    if (draft_layer) {
-        return std::ranges::all_of(scheduled, [&](const scheduled_request& e) {
-            return get_state(e.request_id).prepared_draft_count() > 0;
-        });
-    }
-    const bool sliding = std::ranges::any_of(layout.layers, [](const view_layout::layer& layer) {
-        return layer.sliding_window.has_value();
-    });
-    return std::ranges::none_of(scheduled, [&](const scheduled_request& e) {
-        const auto& [id, token_count] = e;
-        const request_state& req = get_state(id);
-        return req.ends_cycle(token_count) || (sliding && completes_page(req, token_count));
-    });
-}
-
-bool executor::allows_overlap(std::span<const scheduled_request> scheduled) const {
-    return (launched_batches.empty() || launched_batches.back()->allows_overlap) && entries_allow_overlap(scheduled);
-}
-
-std::size_t executor::launched_batch_count() const noexcept {
-    return launched_batches.size();
-}
-
 std::size_t executor::sampled_row_limit() const noexcept {
     return sampled_row_capacity;
 }
@@ -486,28 +477,23 @@ std::size_t executor::sampled_row_count(request_id_type id, std::size_t token_co
     return req.prepared_draft_count() == 0 ? 1 : token_count + req.prepared_draft_count();
 }
 
-bool executor::is_launchable(std::span<const scheduled_request> scheduled) const {
-    if (scheduled.empty() || launched_batches.size() >= 2) {
-        return false;
-    }
+bool executor::is_preparable(std::span<const scheduled_request> scheduled) const {
     std::unordered_set<request_id_type> entered;
-    for (const auto& [id, token_count] : scheduled) {
-        if (!entered.insert(id).second || token_count == 0 || token_count > pending_token_count(id) ||
-            !is_steppable(id)) {
-            return false;
-        }
-    }
-    return launched_batches.empty() || allows_overlap(scheduled);
+    return std::ranges::all_of(scheduled, [&](const scheduled_request& requested) {
+        const auto& [id, token_count] = requested;
+        return entered.insert(id).second && token_count > 0 && token_count <= pending_token_count(id) &&
+            is_schedulable(id);
+    });
 }
 
 // The tokens of an entry of the second run are accepted, and its samples taken, at its write-back. A prepared step's
 // draft rows are relative to the request's history position at its start, which the GPU's request table holds.
-void executor::advance(batch& b) {
+void executor::advance(step& s) {
     const std::size_t draft_count = draft_state_slots - 1;
     std::size_t prior_hidden_count = 0;
     if (draft_layer) {
-        b.draft_count = draft_count;
-        for (const batch_entry& e : b.entries) {
+        s.draft_count = draft_count;
+        for (const step_entry& e : s.entries) {
             const request_state& req = get_state(e.request_id);
             if (req.reads_last_hidden() && req.prepared_position_bound() > 0) {
                 prior_hidden_count++;
@@ -515,30 +501,24 @@ void executor::advance(batch& b) {
         }
     }
     std::size_t first_hidden_row = 1 + prior_hidden_count;
-    for (std::size_t index = 0; index < b.entries.size(); index++) {
-        batch_entry& e = b.entries[index];
+    for (std::size_t index = 0; index < s.entries.size(); index++) {
+        step_entry& e = s.entries[index];
         request_state& req = get_state(e.request_id);
-        const bool verifies = b.verifies(index);
+        const bool verifies = s.verifies(index);
         const std::size_t token_count = verifies ? 1 : e.query_token_count;
-        e.is_measured = batch::measures_mass(req, e.query_token_count);
+        e.is_measured = step::measures_mass(req, e.query_token_count);
         e.start_position = req.prepared_position_bound();
         bool drafts = false;
         bool next_row = false;
         if (draft_layer) {
             std::optional<std::size_t> prior_hidden_index;
             if (req.reads_last_hidden() && req.prepared_position_bound() > 0) {
-                prior_hidden_index = b.prior_hidden_slots.size();
-                b.prior_hidden_slots.push_back(static_cast<std::int64_t>(get_slot(e.request_id)));
+                prior_hidden_index = s.prior_hidden_slots.size();
+                s.prior_hidden_slots.push_back(static_cast<std::int64_t>(get_slot(e.request_id)));
             }
             std::tie(next_row, drafts) = plan_drafting(req, token_count);
-            b.plan_draft_rows(e, req, verifies, first_hidden_row, prior_hidden_index, next_row, drafts);
+            s.plan_draft_rows(e, req, verifies, first_hidden_row, prior_hidden_index, next_row, drafts);
             first_hidden_row += e.query_token_count;
-            const std::optional<std::size_t>& token_limit = req.token_limit();
-            if (verifies) {
-                const std::size_t remaining = token_limit ? *token_limit - req.prepared_sample_count()
-                                                          : e.query_token_count;
-                e.max_accepted_token_count = std::clamp<std::size_t>(remaining, 1, e.query_token_count);
-            }
         }
         if (verifies) {
             req.prepare_verify_step(drafts ? draft_count : 0);
@@ -556,8 +536,9 @@ std::pair<bool, bool> executor::plan_drafting(const request_state& req, std::siz
     const std::size_t query_token_count = token_count + req.prepared_draft_count();
     const bool samples = token_count == req.unprepared_token_count() && req.may_sample();
     const std::optional<std::size_t>& token_limit = req.token_limit();
-    const bool ends_request = samples ? token_limit && req.prepared_sample_count() + 1 >= *token_limit
-                                      : req.unprepared_token_count() == token_count;
+    const bool ends_request = samples
+        ? token_limit && req.has_exact_prepared_counts() && req.prepared_sample_count() + 1 >= *token_limit
+        : req.unprepared_token_count() == token_count;
     const bool next_key = verifies || (!req.ends_cycle(query_token_count) && !ends_request);
     const bool drafts = next_key && (verifies || samples) &&
         req.cycle_tokens_left() >= query_token_count + draft_count + 2;
@@ -603,58 +584,66 @@ bool executor::add_step_lines(const scheduled_request& scheduled) {
     return true;
 }
 
-// Shard 0 queues on the executor's thread while the others queue on their own, so every shard's kernels launch at
-// once. Each shard's completion is taken once every shard has queued, before any later step queues.
-task<void> executor::launch(std::span<const scheduled_request> scheduled) {
-    const std::chrono::steady_clock::time_point launch_time = std::chrono::steady_clock::now();
-    assert(is_launchable(scheduled));
+executor::step executor::prepare(std::span<const scheduled_request> scheduled) {
+    const std::chrono::steady_clock::time_point prepare_time = std::chrono::steady_clock::now();
+    assert(is_preparable(scheduled));
     std::vector<scheduled_request> lined;
-    for (const scheduled_request& s : scheduled) {
-        if (add_step_lines(s)) {
-            lined.push_back(s);
-        } else if (get_state(s.request_id).unfinished_step_count() == 0) {
-            get_state(s.request_id).exit();
+    for (const scheduled_request& requested : scheduled) {
+        if (add_step_lines(requested)) {
+            lined.push_back(requested);
+        } else if (get_state(requested.request_id).unfinished_step_count() == 0) {
+            exit_request(requested.request_id);
         }
     }
     if (lined.empty()) {
-        co_return;
+        return step();
     }
-    std::unique_ptr<batch> b(new batch(*this, lined));
-    b->launch_time = launch_time;
-    assert(static_cast<std::size_t>(b->sample_slots.size(0)) <= sampled_row_capacity);
-    b->allows_overlap = entries_allow_overlap(lined);
-    move_stale_tables(*b);
-    move_stale_requests(*b);
-    advance(*b);
-    b->padded_token_count = b->is_uniform(draft_layer.has_value()) ? b->count_tokens()
-                                                                   : find_token_bucket(b->count_tokens());
-    b->mass_by_shard.assign(shards.size(), at::Tensor());
-    b->hidden_by_shard.assign(shards.size(), at::Tensor());
-    b->shard_prior_hidden.assign(shards.size(), at::Tensor());
-    b->verify_tokens.assign(shards.size(), at::Tensor());
-    b->accepted_token_counts_by_shard.assign(shards.size(), at::Tensor());
-    b->shard_next_tokens.assign(shards.size(), at::Tensor());
-    b->device_input_bytes.assign(shards.size(), at::Tensor());
+    step prepared(*this, lined);
+    prepared.prepare_time = prepare_time;
+    assert(static_cast<std::size_t>(prepared.sample_slots.size(0)) <= sampled_row_capacity);
+    move_stale_tables(prepared);
+    move_stale_requests(prepared);
+    advance(prepared);
+    prepared.padded_token_count = prepared.is_uniform(draft_layer.has_value())
+        ? prepared.count_tokens()
+        : find_token_bucket(prepared.count_tokens());
+    for (const step_entry& e : prepared.entries) {
+        if (e.awaits_write_back) {
+            requests[e.request_id].awaits_write_back = true;
+        }
+    }
+    return prepared;
+}
+
+// Shard 0 queues on the executor's thread while the others queue on their own, so every shard's kernels launch at
+// once. Each shard's completion is taken once every shard has queued.
+task<executor::launch_result> executor::launch(const step& s) {
+    if (s.entries.empty()) {
+        co_return launch_result();
+    }
+    launch_result launched(shards.size());
     std::vector<external_task<void>> other_shards;
     for (std::size_t shard = 1; shard < shards.size(); shard++) {
-        other_shards.push_back(run_on(*shards[shard].worker_loop, enqueue_on_shard(*b, shard)));
+        other_shards.push_back(run_on(*shards[shard].worker_loop, enqueue_on_shard(s, launched, shard)));
     }
-    co_await enqueue_on_shard(*b, 0);
+    co_await enqueue_on_shard(s, launched, 0);
     for (external_task<void>& other : other_shards) {
         co_await std::move(other);
     }
     for (std::size_t shard = 0; shard < shards.size(); shard++) {
         at::Device device = shards[shard].lines.front().k.device();
         c10::cuda::CUDAGuard device_guard(device);
-        b->ends.emplace_back().record(c10::cuda::getStreamFromExternal(shards[shard].compute_stream, device.index()));
-        b->completions.push_back(await_stream(shards[shard].compute_stream));
+        launched.ends.emplace_back().record(
+            c10::cuda::getStreamFromExternal(shards[shard].compute_stream, device.index())
+        );
+        launched.completions.push_back(await_stream(shards[shard].compute_stream));
     }
-    launched_batches.push_back(std::move(b));
+    co_return launched;
 }
 
-task<void> executor::enqueue_on_shard(batch& b, std::size_t shard) {
+task<void> executor::enqueue_on_shard(const step& s, launch_result& launched, std::size_t shard) {
     c10::cuda::CUDAGuard device_guard(shards[shard].lines.front().k.device());
-    b.enqueue(
+    s.enqueue(
         *shards[shard].model,
         shards[shard].lines,
         shards[shard].mass_heads,
@@ -664,7 +653,8 @@ task<void> executor::enqueue_on_shard(batch& b, std::size_t shard) {
         shard,
         shards[shard].graphs.get(),
         shards[shard].arrival_counters,
-        shards[shard].table
+        shards[shard].table,
+        launched
     );
     co_return;
 }

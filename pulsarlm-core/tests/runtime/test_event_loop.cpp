@@ -226,6 +226,18 @@ shared_task<void> shared_thrower() {
     throw std::runtime_error("shared boom");
 }
 
+task<void> record_around_yield(std::vector<std::string>* order) {
+    order->push_back("before yield");
+    co_await pulsarlm::yield();
+    order->push_back("after yield");
+    stop_current();
+}
+
+task<void> record_once(std::vector<std::string>* order) {
+    order->push_back("scheduled earlier");
+    co_return;
+}
+
 task<void> await_ready_tasks(shared_task<void> made_outside, bool* resumed) {
     co_await made_outside;
     co_await pulsarlm::make_ready_task();
@@ -402,6 +414,15 @@ TEST_CASE("a shared task runs once and gives every awaiter, before and after its
         CHECK(result == seen.front());
         CHECK(*result == "shared");
     }
+}
+
+TEST_CASE("a coroutine awaiting yield continues after the coroutines scheduled before it") {
+    event_loop loop;
+    std::vector<std::string> order;
+    loop.spawn(record_around_yield(&order));
+    loop.spawn(record_once(&order));
+    CHECK(loop.run() == nullptr);
+    CHECK(order == std::vector<std::string>{"before yield", "scheduled earlier", "after yield"});
 }
 
 TEST_CASE("spawn runs a task or a shared task on the loop once and returns a shared task with its result") {

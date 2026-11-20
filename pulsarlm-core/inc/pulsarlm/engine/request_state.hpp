@@ -119,9 +119,14 @@ class request_state {
     // The steps of the request prepared, and those of them written back.
     std::size_t prepared_step_count = 0;
     std::size_t written_back_step_count = 0;
-    // Whether a prepared step forwards the request's last tokens: it samples the last token max_tokens allows, or it
-    // forwards the last prompt tokens and does not sample.
+    // Whether a prepared step forwards the request's last tokens: it samples the last token max_tokens allows, known
+    // from exact prepared counts (has_exact_prepared_counts), or it forwards the last prompt tokens and does not
+    // sample.
     bool last_step_prepared = false;
+    // The prepared steps through the latest that is a verify step or was prepared while a verify step was unfinished.
+    // Until these are written back, the prepared counts take each such verify step as accepting every token it
+    // verifies.
+    std::size_t bounded_count_steps = 0;
     // The tokens the latest prepared step drafts, which the next step verifies.
     std::size_t prepared_drafts = 0;
     // The tokens the latest step written back drafted; empty when it drafted none.
@@ -132,8 +137,8 @@ class request_state {
     // last_hidden of the position before it.
     bool next_step_reads_last_hidden = true;
     page_eviction_policy eviction;
-    // The history position, in tokens, at which the eviction cycle ends: a multiple of cycle_tokens, and past the end of
-    // the resumed state, so that forwarding its tail again never reaches a cycle end that state already passed.
+    // The history position, in tokens, at which the eviction cycle ends: a multiple of cycle_tokens, and past the end
+    // of the resumed state, so that forwarding its tail again never reaches a cycle end that state already passed.
     std::size_t next_cycle_end = 0;
     // The history position up to which the layers' mass_sum and weight_sum hold the queries' mass, and its value at
     // the start, which no step starts before.
@@ -240,7 +245,11 @@ class request_state {
     std::size_t passed_pages(std::size_t layer, std::size_t query) const noexcept;
     // The state the request reached: per KV layer, its view's full pages within the window of the next token.
     state to_state() const;
-    // Whether a prepared step may sample another token under max_tokens.
+    // Whether the prepared sample count and position bound are exact: every step prepared while a verify step was
+    // unfinished, and every verify step, is written back.
+    bool has_exact_prepared_counts() const noexcept;
+    // Whether a prepared step may sample another token under max_tokens: the prepared counts are not exact, or they
+    // leave a token.
     bool may_sample() const noexcept;
     // The tokens of the history up to the next token: its full pages, then tail.
     std::size_t history_position() const noexcept;

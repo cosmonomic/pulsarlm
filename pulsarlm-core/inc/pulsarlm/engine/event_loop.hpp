@@ -186,6 +186,7 @@ class event_loop {
     template <typename> friend class external_task;
     friend class event;
     friend class shared_task_state;
+    friend task<void> yield();
 
   public:
     // The loop running on the calling thread, null outside run.
@@ -204,6 +205,9 @@ class event_loop {
     // Safe to call from any thread.
     void stop() noexcept;
 };
+
+// Resumes the calling coroutine after the coroutines scheduled before the call. Await it on the loop thread.
+task<void> yield();
 
 // Completes once the work queued on stream so far has finished. Uses cudaStreamAddCallback, which unlike
 // cudaLaunchHostFunc also runs after a CUDA error; an error panics.

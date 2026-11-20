@@ -30,15 +30,16 @@ void gather_step_inputs(
 
 // After a step, on the current stream: adds each request's computed_token_counts (int64 [entries]) to its history
 // position, RoPE position and the key counts of its KV layers with pages, sets a recurrent layer's key count to the new
-// history position's offset in its page, sets its rejected tokens to rejected_token_counts (int64 [entries]), its
-// next token and drafts to its row of next_tokens (int64 [entries, table.tokens.size(1)]), and writes into ends_cycle
-// (bool [entries]) whether its history position reached its cycle end. The requests at request_slots (int64) are
-// distinct.
+// history position's offset in its page, sets its rejected tokens to rejected_token_counts (int64 [entries]), its next
+// token and drafts to its row of next_tokens (int64 [entries, table.tokens.size(1)]), subtracts the samples it keeps,
+// sample_counts (int64 [entries]), from its remaining tokens, and writes into ends_cycle (bool [entries]) whether its
+// history position reached its cycle end. The requests at request_slots (int64) are distinct.
 void advance_requests(
     request_table& table,
     const at::Tensor& request_slots,
     const at::Tensor& computed_token_counts,
     const at::Tensor& rejected_token_counts,
+    const at::Tensor& sample_counts,
     const at::Tensor& next_tokens,
     at::Tensor& ends_cycle
 );

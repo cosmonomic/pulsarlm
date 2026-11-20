@@ -206,6 +206,24 @@ void event_loop::stop() noexcept {
     wake_condition.notify_one();
 }
 
+task<void> yield() {
+    struct awaiter {
+        event_loop::ready_node queue_node;
+
+        bool await_ready() const noexcept {
+            return false;
+        }
+
+        void await_suspend(std::coroutine_handle<> awaiting) noexcept {
+            queue_node.handle = awaiting;
+            event_loop::current()->schedule(queue_node);
+        }
+
+        void await_resume() const noexcept {}
+    };
+    co_await awaiter{};
+}
+
 task<void> synchronize(cudaStream_t stream) {
     check_cuda(co_await await_stream(stream));
 }

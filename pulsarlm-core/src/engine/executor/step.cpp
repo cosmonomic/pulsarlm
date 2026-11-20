@@ -1,4 +1,4 @@
-#include "batch.hpp"
+#include "step.hpp"
 
 #include "pulsarlm/engine/executor.hpp"
 
@@ -15,22 +15,27 @@
 namespace pulsarlm {
 
 // A request with more than one pending token prefills; any other verifies its drafts or decodes its pending token.
-executor::batch::batch(executor& owner, std::span<const scheduled_request> scheduled) {
-    std::vector<batch_entry> verifying_entries;
-    std::vector<batch_entry> prefilling_entries;
+executor::step::step(executor& owner, std::span<const scheduled_request> scheduled) {
+    const bool slides = std::ranges::any_of(owner.layout.layers, [](const view_layout::layer& layer) {
+        return layer.sliding_window.has_value();
+    });
+    std::vector<step_entry> verifying_entries;
+    std::vector<step_entry> prefilling_entries;
     for (const auto& [id, token_count] : scheduled) {
         const request_state& req = owner.get_state(id);
         const bool prefills = req.unprepared_token_count() > 1;
         const bool verifies = !prefills && req.prepared_draft_count() > 0;
         assert(!prefills || req.prepared_draft_count() == 0);
         const std::size_t query_token_count = token_count + req.prepared_draft_count();
-        std::vector<batch_entry>& run = prefills ? prefilling_entries : verifies ? verifying_entries : entries;
+        std::vector<step_entry>& run = prefills ? prefilling_entries : verifies ? verifying_entries : entries;
+        const bool ends_cycle = req.ends_cycle(query_token_count);
         run.push_back(
-            batch_entry{
+            step_entry{
                 .request_id = id,
                 .query_token_count = query_token_count,
                 .first_sample_index = std::nullopt,
-                .ends_cycle = req.ends_cycle(query_token_count),
+                .ends_cycle = ends_cycle,
+                .awaits_write_back = ends_cycle || (slides && owner.completes_page(req, query_token_count)),
                 .table_width = req.table_width(),
             }
         );
@@ -39,7 +44,7 @@ executor::batch::batch(executor& owner, std::span<const scheduled_request> sched
     per_query_state_request_count = verifying_entries.size();
     entries.insert(entries.end(), verifying_entries.begin(), verifying_entries.end());
     entries.insert(entries.end(), prefilling_entries.begin(), prefilling_entries.end());
-    for (const batch_entry& e : entries) {
+    for (const step_entry& e : entries) {
         table_width = std::max(table_width, e.table_width);
     }
     assert(table_width <= owner.view_page_capacity);
@@ -51,7 +56,7 @@ executor::batch::batch(executor& owner, std::span<const scheduled_request> sched
     std::vector<std::int64_t> single_draws;
     std::int64_t first_logit_index = 0;
     for (std::size_t index = 0; index < entries.size(); index++) {
-        batch_entry& e = entries[index];
+        step_entry& e = entries[index];
         const request_state& req = owner.get_state(e.request_id);
         const bool verifying_entry = verifies(index);
         const std::size_t token_count = verifying_entry ? 1 : e.query_token_count;
@@ -78,12 +83,14 @@ executor::batch::batch(executor& owner, std::span<const scheduled_request> sched
     sample_logit_indices = pinned_values(logit_indices);
     single_draw_slots = pinned_values(single_draws);
     std::vector<std::int64_t> computed_counts;
+    std::vector<std::int64_t> kept_sample_counts;
     std::vector<std::int64_t> next_sources;
     for (std::size_t index = 0; index < entries.size(); index++) {
-        const batch_entry& e = entries[index];
+        const step_entry& e = entries[index];
         const request_state& req = owner.get_state(e.request_id);
         const std::size_t next_prompt_token = req.prepared_prompt_token_count() + e.query_token_count;
         computed_counts.push_back(verifies(index) ? 0 : static_cast<std::int64_t>(e.query_token_count));
+        kept_sample_counts.push_back(!verifies(index) && e.first_sample_index ? 1 : 0);
         if (e.first_sample_index) {
             next_sources.push_back(-static_cast<std::int64_t>(*e.first_sample_index) - 1);
         } else {
@@ -93,11 +100,12 @@ executor::batch::batch(executor& owner, std::span<const scheduled_request> sched
         }
     }
     computed_token_counts = pinned_values(computed_counts);
+    sample_counts = pinned_values(kept_sample_counts);
     next_token_sources = pinned_values(next_sources);
     pack_host_inputs();
 }
 
-void executor::batch::pack_host_inputs() {
+void executor::step::pack_host_inputs() {
     constexpr std::size_t alignment = 16;
     const std::vector<at::Tensor*> packed{
         &inputs.cu_seqlens_q,
@@ -112,6 +120,7 @@ void executor::batch::pack_host_inputs() {
         &sample_logit_indices,
         &single_draw_slots,
         &computed_token_counts,
+        &sample_counts,
         &next_token_sources,
     };
     std::vector<std::size_t> offsets;
@@ -136,8 +145,9 @@ void executor::batch::pack_host_inputs() {
     }
 }
 
-at::Tensor executor::batch::get_on_device(const at::Tensor& host, std::size_t shard) const {
-    const at::Tensor& device_bytes = device_input_bytes[shard];
+at::Tensor
+executor::step::get_on_device(const at::Tensor& host, const launch_result& launched, std::size_t shard) const {
+    const at::Tensor& device_bytes = launched.device_input_bytes[shard];
     if (host.numel() == 0) {
         return at::empty(host.sizes(), host.options().device(device_bytes.device()).pinned_memory(false));
     }
@@ -151,16 +161,25 @@ at::Tensor executor::batch::get_on_device(const at::Tensor& host, std::size_t sh
         .view(host.sizes());
 }
 
-bool executor::batch::reaches_cycle_end(std::size_t index) const noexcept {
+executor::launch_result::launch_result(std::size_t shard_count)
+: device_input_bytes(shard_count),
+  mass_by_shard(shard_count),
+  hidden_by_shard(shard_count),
+  shard_prior_hidden(shard_count),
+  verify_tokens(shard_count),
+  accepted_token_counts_by_shard(shard_count),
+  shard_next_tokens(shard_count) {}
+
+bool executor::launch_result::reaches_cycle_end(std::size_t index) const noexcept {
     assert(index < static_cast<std::size_t>(cycle_end_flags.numel()));
     return cycle_end_flags.const_data_ptr<bool>()[index];
 }
 
-bool executor::batch::verifies(std::size_t index) const noexcept {
+bool executor::step::verifies(std::size_t index) const noexcept {
     return index >= single_query_request_count && index < single_query_request_count + per_query_state_request_count;
 }
 
-std::size_t executor::batch::count_views_before(std::size_t index) const noexcept {
+std::size_t executor::step::count_views_before(std::size_t index) const noexcept {
     const std::size_t step_requests = single_query_request_count + per_query_state_request_count;
     if (index <= single_query_request_count) {
         return index;
@@ -172,17 +191,17 @@ std::size_t executor::batch::count_views_before(std::size_t index) const noexcep
     return single_query_request_count + per_query_state_request_count * state_slots + index - step_requests;
 }
 
-std::size_t executor::batch::count_tokens() const noexcept {
+std::size_t executor::step::count_tokens() const noexcept {
     std::size_t token_count = 0;
-    for (const batch_entry& e : entries) {
+    for (const step_entry& e : entries) {
         token_count += e.query_token_count;
     }
     return token_count;
 }
 
-std::vector<executor::batch_entry> executor::batch::drafting_entries() const {
-    std::vector<batch_entry> drafting;
-    for (const batch_entry& e : entries) {
+std::vector<executor::step_entry> executor::step::drafting_entries() const {
+    std::vector<step_entry> drafting;
+    for (const step_entry& e : entries) {
         if (e.draft && e.draft->is_drafting) {
             drafting.push_back(e);
         }
@@ -190,7 +209,7 @@ std::vector<executor::batch_entry> executor::batch::drafting_entries() const {
     return drafting;
 }
 
-void executor::batch::compose_inputs(const executor& owner) {
+void executor::step::compose_inputs(const executor& owner) {
     const std::size_t n_layers = owner.layout.layers.size();
     const auto n_seqs = static_cast<std::int64_t>(entries.size());
     const auto n_kv_layers = static_cast<std::int64_t>(n_layers);
@@ -203,7 +222,7 @@ void executor::batch::compose_inputs(const executor& owner) {
         .state_slots = static_cast<std::int64_t>(owner.draft_state_slots),
     };
     std::vector<std::int64_t> tokens;
-    for (const batch_entry& e : std::span(entries).subspan(step_requests)) {
+    for (const step_entry& e : std::span(entries).subspan(step_requests)) {
         const request_state& req = owner.get_state(e.request_id);
         const std::span<const std::int64_t> chunk = req.prompt_tokens().subspan(
             req.prepared_prompt_token_count(),
@@ -240,7 +259,7 @@ void executor::batch::compose_inputs(const executor& owner) {
     }
     inputs.logit_tokens = pinned_values(logit_tokens);
 
-    const bool step_measures_mass = std::ranges::any_of(entries, [&](const batch_entry& e) {
+    const bool step_measures_mass = std::ranges::any_of(entries, [&](const step_entry& e) {
         return measures_mass(owner.get_state(e.request_id), e.query_token_count);
     });
     if (step_measures_mass) {
@@ -263,25 +282,25 @@ void executor::batch::compose_inputs(const executor& owner) {
     }
 }
 
-bool executor::batch::measures_mass(const request_state& req, std::size_t query_token_count) noexcept {
+bool executor::step::measures_mass(const request_state& req, std::size_t query_token_count) noexcept {
     return req.eviction_policy_in_pages().can_evict() &&
         req.prepared_position_bound() + query_token_count > req.mass_start_position();
 }
 
-at::Tensor executor::batch::collect_slots(std::span<const batch_entry> entries) {
+at::Tensor executor::step::collect_slots(std::span<const step_entry> entries) {
     std::vector<std::int64_t> slots;
-    for (const batch_entry& e : entries) {
+    for (const step_entry& e : entries) {
         slots.push_back(static_cast<std::int64_t>(get_slot(e.request_id)));
     }
     return pinned_values(slots);
 }
 
-at::Tensor executor::batch::select_tables(const at::Tensor& slots, const at::Tensor& tables, std::size_t width) {
+at::Tensor executor::step::select_tables(const at::Tensor& slots, const at::Tensor& tables, std::size_t width) {
     return tables.narrow(2, 0, static_cast<std::int64_t>(width)).index_select(0, slots).transpose(0, 1).contiguous();
 }
 
-void executor::batch::plan_draft_rows(
-    batch_entry& e,
+void executor::step::plan_draft_rows(
+    step_entry& e,
     const request_state& req,
     bool verifies,
     std::size_t first_hidden_row,
@@ -298,7 +317,7 @@ void executor::batch::plan_draft_rows(
             draft_position_offsets.push_back(static_cast<std::int64_t>(j + 1));
             draft_sources.push_back(static_cast<std::int64_t>(first_hidden_row + j));
         }
-        e.draft = batch_entry::draft_rows{
+        e.draft = step_entry::draft_rows{
             .row_count = e.query_token_count,
             .logit_row = first_draft_row,
             .key_count_offset = e.query_token_count + 1,
@@ -339,7 +358,7 @@ void executor::batch::plan_draft_rows(
     if (end == first) {
         return;
     }
-    e.draft = batch_entry::draft_rows{
+    e.draft = step_entry::draft_rows{
         .row_count = end - first,
         .logit_row = first_draft_row + end - first - 1,
         .key_count_offset = end - start,
