@@ -34,10 +34,38 @@ task<void> executor::write_back(const step& s, launch_result& launched) {
     co_await join(s, launched);
     step_writes writes = apply_entries(s, launched, std::chrono::steady_clock::now() - s.prepare_time);
     co_await write_pages_and_states(launched, writes);
-    co_await refresh_views(s, launched, writes);
+    refresh_views(s, writes);
     for (const step_entry& e : s.entries) {
         running_request& running = requests[e.request_id];
-        if (e.awaits_write_back) {
+        if (e.awaits_write_back && !waits_for_eviction(e)) {
+            running.awaits_write_back = false;
+        }
+    }
+}
+
+// The step's write-back came before, so every page it completed is in the views and its pages and states are written.
+task<void> executor::evict(const step& s, const launch_result& launched) {
+    for (std::size_t index = 0; index < s.entries.size(); index++) {
+        const step_entry& e = s.entries[index];
+        request_state& req = get_state(e.request_id);
+        if (req.has_exit_cause() || !launched.reaches_cycle_end(index)) {
+            continue;
+        }
+        req.sample_pages();
+        const bool views_changed = evict_request(req);
+        if (views_changed) {
+            update_views(req);
+        }
+        co_await write_cycle_end(req, *requests[e.request_id].callbacks);
+        if (views_changed) {
+            assert(req.unfinished_step_count() == 0);
+            stale_requests.push_back(e.request_id);
+            mark_stale_tables(e.request_id, 0);
+        }
+    }
+    for (const step_entry& e : s.entries) {
+        running_request& running = requests[e.request_id];
+        if (e.awaits_write_back && waits_for_eviction(e)) {
             running.awaits_write_back = false;
         }
         if (running.state.has_exit_cause() && running.state.unfinished_step_count() == 0) {
@@ -47,6 +75,10 @@ task<void> executor::write_back(const step& s, launch_result& launched) {
             cancel(e.request_id);
         }
     }
+}
+
+bool executor::waits_for_eviction(const step_entry& e) const {
+    return e.ends_cycle && get_state(e.request_id).eviction_policy_in_pages().can_evict();
 }
 
 task<void> executor::join(const step& s, launch_result& launched) {
@@ -119,7 +151,7 @@ executor::step_writes executor::apply_entries(
         const std::size_t end_position = start + accepted_count;
         const bool ends_cycle = launched.reaches_cycle_end(index);
         assert(e.start_position >= start && (!ends_cycle || e.ends_cycle));
-        assert(ends_cycle == (end_position >= req.cycle_end_position()));
+        assert(ends_cycle == (end_position >= req.find_cycle_end(start)));
         assert(verifies || e.start_position != start || ends_cycle == e.ends_cycle);
         std::span<const std::int64_t> step_drafts;
         if (auto found = drafted.find(&req); found != drafted.end()) {
@@ -276,28 +308,21 @@ task<void> executor::write_pages_and_states(launch_result& launched, step_writes
     }
 }
 
-task<void> executor::refresh_views(const step& s, const launch_result& launched, const step_writes& writes) {
-    for (std::size_t index = 0; index < s.entries.size(); index++) {
-        const step_entry& e = s.entries[index];
+// The step that wrote the detached lines has completed, and the copy of a stored one has been synced.
+void executor::refresh_views(const step& s, const step_writes& writes) {
+    for (const step_entry& e : s.entries) {
         request_state& req = get_state(e.request_id);
+        const std::vector<std::vector<std::uint32_t>> detached = req.take_detached_lines();
+        for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
+            cache.release(layer, detached[layer]);
+        }
         req.finish_step();
         if (req.has_exit_cause()) {
             continue;
         }
-        const bool ends_cycle = launched.reaches_cycle_end(index);
-        bool views_changed = release_passed_pages(req);
-        if (ends_cycle) {
-            req.sample_pages();
-            views_changed = evict(req) || views_changed;
-        }
+        const bool views_changed = release_passed_pages(req);
         if (views_changed) {
             update_views(req);
-        }
-        if (ends_cycle) {
-            co_await write_cycle_end(req, *requests[e.request_id].callbacks);
-            req.start_next_cycle();
-        }
-        if (views_changed || ends_cycle) {
             assert(req.unfinished_step_count() == 0);
             stale_requests.push_back(e.request_id);
         }
@@ -319,7 +344,7 @@ task<void> executor::async_write_back(
 }
 
 // The step that last used the evicted lines has completed, so they are released right away.
-bool executor::evict(request_state& req) {
+bool executor::evict_request(request_state& req) {
     if (!req.eviction_policy_in_pages().can_evict()) {
         return false;
     }

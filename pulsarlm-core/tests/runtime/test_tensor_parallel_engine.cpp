@@ -1242,6 +1242,7 @@ task<void> run_stepped(
                 continue;
             }
             co_await exec.write_back(unfinished.front().first, unfinished.front().second);
+            co_await exec.evict(unfinished.front().first, unfinished.front().second);
             unfinished.pop_front();
         }
         co_await exec.stop(id);
@@ -1297,6 +1298,41 @@ stepped_run serve_stepped(
 }
 
 }  // namespace
+
+// Under a policy that cannot evict, no step waits at a cycle end: the prompt's prefill chunks of 2 pages each end a
+// cycle of 2 pages, and each chunk after the first runs over the one before it, writing the recurrent layers' state at
+// the end of its second page into the line of the parity whose state the chunk before stores at its cycle end. The
+// decode steps after the prompt overlap across their cycle ends too.
+TEST_CASE(
+    "Qwen3.5 under a policy that cannot evict stores the cycle-end states of steps that do not overlap",
+    "[runtime][cuda]"
+) {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const c10::Dict<std::string, at::Tensor> weights = full_weights(n_kv_heads);
+    const auto request = [&] {
+        return pulsarlm::request{
+            .tokens = random_tokens(prompt_tokens, 11),
+            .max_tokens = decode_tokens,
+            .eviction = {.n_sink = page_size, .n_working = 2 * page_size, .cycle_tokens = 2 * page_size},
+        };
+    };
+    const stepped_run sequential = serve_stepped(weights, {}, 0, false, request());
+    const stepped_run overlapped = serve_stepped(weights, {}, 0, true, request());
+
+    REQUIRE(sequential.overlapped_steps == 0);
+    REQUIRE(overlapped.overlapped_steps > 10);
+    REQUIRE(overlapped.results.tokens == sequential.results.tokens);
+    REQUIRE(sequential.results.cycle_states.size() >= 5);
+    REQUIRE(overlapped.results.cycle_states.size() == sequential.results.cycle_states.size());
+    for (std::size_t cycle = 0; cycle < sequential.results.cycle_states.size(); cycle++) {
+        INFO("cycle " << cycle);
+        check_same_state(*overlapped.results.cycle_states[cycle], *sequential.results.cycle_states[cycle]);
+    }
+    const store_comparison stores = compare_stores(*overlapped.contents, *sequential.contents);
+    CHECK(stores.identical_pages == sequential.contents->pages.size());
+}
 
 // The drafts' acceptance is known only at each verify step's write-back, after the next step is prepared; the request
 // still emits exactly max_tokens tokens.

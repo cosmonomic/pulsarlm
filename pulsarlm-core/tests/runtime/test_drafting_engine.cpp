@@ -408,6 +408,7 @@ struct request_results {
     std::condition_variable end_condition;
     token_list tokens;
     std::vector<pulsarlm::decode_statistics> decodes;
+    std::vector<pulsarlm::state> cycle_states;
     pulsarlm::request_statistics statistics{};
     std::optional<std::expected<pulsarlm::state, pulsarlm::request_error>> end;
 };
@@ -427,7 +428,10 @@ class recording_callbacks final : public pulsarlm::request_callbacks {
         recorded_results->decodes.push_back(statistics);
     }
 
-    void on_cycle(pulsarlm::cycle_end&&) noexcept override {}
+    void on_cycle(pulsarlm::cycle_end&& ended) noexcept override {
+        std::lock_guard lock(recorded_results->mutex);
+        recorded_results->cycle_states.push_back(*ended.state);
+    }
 
     void on_end(
         std::expected<std::shared_ptr<const pulsarlm::state>, pulsarlm::request_error>&& result,
@@ -452,6 +456,7 @@ struct served {
     token_list tokens;
     pulsarlm::state end_state;
     std::vector<pulsarlm::decode_statistics> decodes;
+    std::vector<pulsarlm::state> cycle_states;
     pulsarlm::request_statistics statistics;
 };
 
@@ -473,6 +478,7 @@ served await_end(pulsarlm::engine& e, const std::shared_ptr<request_results>& re
         .tokens = recorded_results->tokens,
         .end_state = std::move(**recorded_results->end),
         .decodes = recorded_results->decodes,
+        .cycle_states = recorded_results->cycle_states,
         .statistics = recorded_results->statistics,
     };
 }
@@ -501,6 +507,7 @@ std::vector<served> serve_all(pulsarlm::engine& e, std::vector<pulsarlm::request
                 .tokens = results->tokens,
                 .end_state = std::move(**results->end),
                 .decodes = results->decodes,
+                .cycle_states = results->cycle_states,
                 .statistics = results->statistics,
             }
         );
@@ -1358,5 +1365,41 @@ TEST_CASE("Qwen4-Exp split over two ranks gathers equal inputs from both ranks' 
                 CHECK(at::equal(first.*input, second.*input));
             }
         }
+    }
+}
+
+// Under a policy that cannot evict, no step waits at a cycle end, and a decode near a cycle end runs over the verify step
+// before it, whose acceptance is known only on the GPU. The cycle ends at the multiples of cycle_tokens.
+TEST_CASE(
+    "Qwen4-Exp drafting under a policy that cannot evict reaches its cycle ends as without drafts",
+    "[runtime][cuda]"
+) {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const weights w(at::kFloat, base_dims, /*drafts=*/true);
+    for (const std::size_t cycle_tokens : {page_size, page_size + 8, 2 * page_size, 3 * page_size}) {
+        INFO("cycles of " << cycle_tokens << " tokens");
+        const auto request = [&] {
+            return pulsarlm::request{
+                .tokens = random_tokens(prompt_tokens, 3),
+                .sampling = pulsarlm::sampling_params{.temperature = 0.8, .seed = 9},
+                .max_tokens = decode_tokens,
+                .eviction = {.n_sink = page_size, .n_working = 2 * page_size, .cycle_tokens = cycle_tokens},
+            };
+        };
+        drafting_engine plain = make_engine(w, 0, {}, false);
+        drafting_engine drafting = make_engine(w, 2, {}, false);
+        const served expected = serve(*plain.engine, request());
+        const served got = serve(*drafting.engine, request());
+
+        REQUIRE(expected.tokens.size() == decode_tokens);
+        CHECK(got.tokens == expected.tokens);
+        REQUIRE(got.cycle_states.size() == expected.cycle_states.size());
+        for (std::size_t cycle = 0; cycle < expected.cycle_states.size(); cycle++) {
+            INFO("cycle " << cycle);
+            check_same_state(got.cycle_states[cycle], expected.cycle_states[cycle]);
+        }
+        check_same_state(got.end_state, expected.end_state);
     }
 }

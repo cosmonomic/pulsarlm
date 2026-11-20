@@ -198,6 +198,8 @@ void executor::step::write_tables(request_table& table) const {
                  &request_table::tokens,
                  &request_table::cycle_end_positions,
                  &request_table::mass_start_positions,
+                 &request_table::cycle_tokens,
+                 &request_table::mass_tokens,
                  &request_table::attention_mass_decays,
                  &request_table::remaining_tokens,
                  &request_table::seeds,

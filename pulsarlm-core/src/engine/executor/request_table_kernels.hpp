@@ -33,7 +33,8 @@ void gather_step_inputs(
 // history position's offset in its page, sets its rejected tokens to rejected_token_counts (int64 [entries]), its next
 // token and drafts to its row of next_tokens (int64 [entries, table.tokens.size(1)]), subtracts the samples it keeps,
 // sample_counts (int64 [entries]), from its remaining tokens, and writes into ends_cycle (bool [entries]) whether its
-// history position reached its cycle end. The requests at request_slots (int64) are distinct.
+// history position reached its cycle end, which then moves cycle_tokens on, its mass start mass_tokens before it. The
+// requests at request_slots (int64) are distinct.
 void advance_requests(
     request_table& table,
     const at::Tensor& request_slots,

@@ -29,6 +29,10 @@ struct request_table {
     // queries weigh in the page mass.
     at::Tensor cycle_end_positions;
     at::Tensor mass_start_positions;
+    // int64 [slots]: the tokens of the request's eviction cycles, and of the window at the end of each whose queries
+    // weigh in the page mass.
+    at::Tensor cycle_tokens;
+    at::Tensor mass_tokens;
     // fp64 [slots]: the request's attention_mass_decay.
     at::Tensor attention_mass_decays;
     // int64 [slots]: the tokens the request may still emit, below 0 once steps past its end were advanced, and the

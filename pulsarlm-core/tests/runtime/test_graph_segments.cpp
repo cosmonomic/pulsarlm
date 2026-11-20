@@ -234,6 +234,8 @@ make_table(std::span<const pulsarlm::kv_layer> layers, std::int64_t slots, std::
         .tokens = at::zeros({slots, slot_count}, cuda(at::kLong)),
         .cycle_end_positions = at::zeros({slots}, cuda(at::kLong)),
         .mass_start_positions = at::zeros({slots}, cuda(at::kLong)),
+        .cycle_tokens = at::zeros({slots}, cuda(at::kLong)),
+        .mass_tokens = at::zeros({slots}, cuda(at::kLong)),
         .attention_mass_decays = at::zeros({slots}, cuda(at::kDouble)),
         .remaining_tokens = at::full({slots}, std::numeric_limits<std::int64_t>::max(), cuda(at::kLong)),
         .seeds = at::zeros({slots}, cuda(at::kLong)),

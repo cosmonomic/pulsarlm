@@ -2764,6 +2764,7 @@ task<void> run_request_steps(
             continue;
         }
         co_await exec.write_back(unfinished.front().first, unfinished.front().second);
+        co_await exec.evict(unfinished.front().first, unfinished.front().second);
         unfinished.pop_front();
     }
     co_await exec.stop(id);
@@ -2880,6 +2881,7 @@ task<void> compare_key_counts_between_steps(
             continue;
         }
         co_await exec.write_back(unfinished.front().first, unfinished.front().second);
+        co_await exec.evict(unfinished.front().first, unfinished.front().second);
         unfinished.pop_front();
         if (unfinished.empty() && !exec.has_exited(id)) {
             const pulsarlm::request_state& req = pulsarlm::executor_inspection::get_state(exec, id);
@@ -2956,17 +2958,19 @@ task<void> take_around_steps(
     pulsarlm::executor::launch_result prefill_launched = co_await exec.launch(prefill);
     observations.push_back(queue.next().empty());
     co_await exec.write_back(prefill, prefill_launched);
+    co_await exec.evict(prefill, prefill_launched);
     observations.push_back(schedules_one(queue.next(), id, 1));
     event_loop::current()->stop();
 }
 
-// The request's prefill ends its 4-token cycle, so the request is not schedulable until that step's write-back.
-TEST_CASE("a request queue schedules a request once pushed and while it awaits no write-back") {
+// The request's prefill ends its 4-token cycle under a policy that evicts, so the request is not schedulable until
+// that step's eviction.
+TEST_CASE("a request queue schedules a request once pushed and while it awaits no eviction") {
     fixture f(16);
     pulsarlm::request_queue queue(f.exec, 64);
     std::optional<pulsarlm::executor::request_id_type> id = start_request(
         f.exec,
-        request{.tokens = {1, 2, 3, 4}, .max_tokens = 4, .eviction = {.cycle_tokens = 4}},
+        request{.tokens = {1, 2, 3, 4}, .max_tokens = 4, .eviction = {.cycle_tokens = 4, .eviction_threshold = 0.5}},
         std::make_shared<request_results>()
     );
     REQUIRE(id.has_value());
@@ -2990,6 +2994,7 @@ task<void> run_one_step(
     exited_at_prepare = exec.take_exited_requests();
     pulsarlm::executor::launch_result launched = co_await exec.launch(prepared);
     co_await exec.write_back(prepared, launched);
+    co_await exec.evict(prepared, launched);
     for (const pulsarlm::executor::scheduled_request& s : scheduled) {
         exited.push_back(exec.has_exited(s.request_id));
     }
@@ -3071,6 +3076,7 @@ task<void> step_requests(
             continue;
         }
         co_await exec.write_back(unfinished.front().first, unfinished.front().second);
+        co_await exec.evict(unfinished.front().first, unfinished.front().second);
         unfinished.pop_front();
     }
     for (pulsarlm::executor::request_id_type id : ids) {
@@ -3104,6 +3110,7 @@ task<void> step_requests_over_a_cycle_end(
     unfinished.emplace_back(std::move(second_prepared), std::move(second_launched));
     overlapped_steps++;
     co_await exec.write_back(unfinished.front().first, unfinished.front().second);
+    co_await exec.evict(unfinished.front().first, unfinished.front().second);
     unfinished.pop_front();
     first_schedulable.push_back(exec.is_schedulable(ids[0]));
     co_await step_requests(exec, ids, true, prefill_tokens_per_step, unfinished, overlapped_steps);
@@ -3121,9 +3128,9 @@ task<void> step_requests_in_turn(
     event_loop::current()->stop();
 }
 
-// The first request's prefill fills its 4-token cycle, so it waits for that step's write-back while the second
-// request's steps overlap; both produce the tokens and states of steps that never overlap.
-TEST_CASE("a request awaits the write-back of a step that may end its cycle while another request's steps overlap") {
+// The first request's prefill fills its 4-token cycle under a policy that evicts, so it waits for that step's
+// eviction while the second request's steps overlap; both produce the tokens and states of steps that never overlap.
+TEST_CASE("an evicting request awaits the eviction of a step that may end its cycle while another request's overlap") {
     const std::size_t prefill_tokens_per_step = 64;
     const token_list first{1, 2, 3, 4};
     const token_list second{5, 6, 7};
@@ -3133,7 +3140,7 @@ TEST_CASE("a request awaits the write-back of a step that may end its cycle whil
         auto second_results = std::make_shared<request_results>();
         std::optional<pulsarlm::executor::request_id_type> first_id = start_request(
             f.exec,
-            request{.tokens = first, .max_tokens = 12, .eviction = {.cycle_tokens = 4}},
+            request{.tokens = first, .max_tokens = 12, .eviction = {.cycle_tokens = 4, .eviction_threshold = 0.5}},
             first_results
         );
         std::optional<pulsarlm::executor::request_id_type> second_id = start_request(

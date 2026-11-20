@@ -37,9 +37,9 @@ class executor {
     struct running_request {
         std::unique_ptr<request_callbacks> callbacks;
         request_state state;
-        // Whether a step of the request that is not written back may end its cycle or, in a model with sliding layers,
-        // completes a page (step_entry::awaits_write_back), so that no later step of it is prepared before that
-        // step's write-back.
+        // Whether a step of the request that is not written back may end its cycle under a policy that evicts or, in a
+        // model with sliding layers, completes a page (step_entry::awaits_write_back), so that no later step of it is
+        // prepared before that step's eviction (evict), or its write-back for a page.
         bool awaits_write_back = false;
     };
 
@@ -208,7 +208,13 @@ class executor {
     step_writes
     apply_entries(const step& s, const launch_result& launched, std::chrono::steady_clock::duration step_duration);
     task<void> write_pages_and_states(launch_result& launched, step_writes& writes);
-    task<void> refresh_views(const step& s, const launch_result& launched, const step_writes& writes);
+    // After the step's pages and states are written: releases the detached lines of its requests
+    // (request_state::take_detached_lines), finishes the step in each request, and releases the pages a sliding layer
+    // passed.
+    void refresh_views(const step& s, const step_writes& writes);
+    // Whether the request of e awaits the eviction of e's step (evict) rather than its write-back: the step may end
+    // its cycle under a policy that evicts.
+    bool waits_for_eviction(const step_entry& e) const;
     // Whether the request's callbacks are cancelled.
     bool is_cancelled(request_id_type id) const;
     // Cancels a request that has not exited, which exits right away when no step of it is unfinished.
@@ -224,7 +230,7 @@ class executor {
     );
     task<void> synchronize_shards();
     // Evicts at the end of req's cycle and returns whether a view changed.
-    bool evict(request_state& req);
+    bool evict_request(request_state& req);
     // Writes the state req reached to the store and passes it to callbacks, those of req's request.
     task<void> write_cycle_end(request_state& req, request_callbacks& callbacks);
 
@@ -300,15 +306,19 @@ class executor {
     task<launch_result> launch(const step& s);
     // Writes back s, after the steps prepared before it, from launched, its launch's result: waits for it, then applies
     // the tokens it forwarded and sampled, delivers them, completes the pages its tokens filled, writes the completed
-    // pages, and evicts and writes the state at a cycle end, which the GPU reports. The pages of a request writing no
-    // state are written by a spawned task; a request writing its state waits for its pages' writes first, and a failed
-    // write is found at a later write-back. Records on each request a stop token or max_tokens it reached or a failed
-    // store write, and sets the exit reason (request_state::exit) of each request with an exit cause that has no
-    // unfinished step left. The entry of a request that reached the end or whose store write failed at an earlier
+    // pages, and the state of a request at a cycle end, which the GPU reports, or at its end. The pages of a request
+    // writing no state are written by a spawned task; a request writing its state waits for its pages' writes first,
+    // and a failed write is found at a later write-back. Records on each request a stop token or max_tokens it reached
+    // or a failed store write. The entry of a request that reached the end or whose store write failed at an earlier
     // write-back applies nothing, so a step prepared after the one that reached the end changes no state the request
-    // stores. Then cancels each request of the step that has not exited and whose callbacks are cancelled (cancel).
-    // An empty step writes back nothing.
+    // stores. An empty step writes back nothing.
     task<void> write_back(const step& s, launch_result& launched);
+    // After s's write-back, from launched, its launch's result: at the cycle end of each of s's requests that reached
+    // one (launch_result's cycle end flags) and has no exit cause, samples its pages, evicts under a policy that
+    // evicts, writes the state it reached to the store and passes it to its callbacks. Then sets the exit reason
+    // (request_state::exit) of each request of s with an exit cause that has no unfinished step left, and cancels each
+    // that has not exited and whose callbacks are cancelled (cancel). An empty step evicts nothing.
+    task<void> evict(const step& s, const launch_result& launched);
     // Ends the request of id, whose request state exited and has no unfinished step: releases its lines, writes its end
     // state when it finished, releases its lease, delivers the state or the error and the statistics through on_end,
     // and erases it.
@@ -317,7 +327,7 @@ class executor {
     // on_end, and erases the request. Called when the loop has exited.
     void end_requests(request_error error) noexcept;
     // Whether a step of the request can be prepared now: it has no exit cause (request_state::has_exit_cause), no
-    // prepared step forwards its last tokens, and it awaits the write-back of none
+    // prepared step forwards its last tokens, and it awaits no step's eviction or write-back
     // (running_request::awaits_write_back). At most one step of the request is unfinished, as at most two steps are
     // unfinished when one is prepared.
     bool is_schedulable(request_id_type id) const;

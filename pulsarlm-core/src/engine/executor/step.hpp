@@ -45,9 +45,9 @@ struct executor::step_entry {
     // Whether the entry may end its request's cycle (request_state::ends_cycle of its query tokens); the write-back
     // takes whether it did from the GPU (launch_result::cycle_end_flags).
     bool ends_cycle;
-    // Whether no later step of the request is prepared before the step's write-back
-    // (running_request::awaits_write_back): the entry may end its request's cycle or, in a model with sliding layers,
-    // completes a page.
+    // Whether no later step of the request is prepared before the step's eviction or write-back
+    // (running_request::awaits_write_back): the entry may end its request's cycle under a policy that evicts or, in a
+    // model with sliding layers, completes a page.
     bool awaits_write_back;
     // Whether the step forwards the request's last tokens.
     bool ends_request = false;

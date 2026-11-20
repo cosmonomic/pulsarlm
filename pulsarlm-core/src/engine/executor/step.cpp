@@ -35,7 +35,8 @@ executor::step::step(executor& owner, std::span<const scheduled_request> schedul
                 .query_token_count = query_token_count,
                 .first_sample_index = std::nullopt,
                 .ends_cycle = ends_cycle,
-                .awaits_write_back = ends_cycle || (slides && owner.completes_page(req, query_token_count)),
+                .awaits_write_back = (ends_cycle && req.eviction_policy_in_pages().can_evict()) ||
+                    (slides && owner.completes_page(req, query_token_count)),
                 .table_width = req.table_width(),
             }
         );

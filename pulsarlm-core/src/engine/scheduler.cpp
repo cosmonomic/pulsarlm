@@ -70,11 +70,13 @@ task<void> scheduler::run() {
             executor::launch_result launched = co_await exec.launch(prepared);
             if (unwritten) {
                 co_await exec.write_back(unwritten->first, unwritten->second);
+                co_await exec.evict(unwritten->first, unwritten->second);
                 release_exited();
             }
             unwritten.emplace(std::move(prepared), std::move(launched));
         } else if (unwritten) {
             co_await exec.write_back(unwritten->first, unwritten->second);
+            co_await exec.evict(unwritten->first, unwritten->second);
             release_exited();
             unwritten.reset();
         } else {

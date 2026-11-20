@@ -180,6 +180,8 @@ executor::executor(
         s.table.tokens = at::zeros({slots, static_cast<std::int64_t>(draft_state_slots)}, options.dtype(at::kLong));
         s.table.cycle_end_positions = at::zeros({slots}, options.dtype(at::kLong));
         s.table.mass_start_positions = at::zeros({slots}, options.dtype(at::kLong));
+        s.table.cycle_tokens = at::zeros({slots}, options.dtype(at::kLong));
+        s.table.mass_tokens = at::zeros({slots}, options.dtype(at::kLong));
         s.table.attention_mass_decays = at::zeros({slots}, options.dtype(at::kDouble));
         std::vector<std::uint8_t> recurrent_layers;
         for (const view_layout::layer& layer : layout.layers) {
@@ -339,6 +341,8 @@ void executor::move_stale_requests(step& s) {
     std::vector<std::int64_t> tokens;
     std::vector<std::int64_t> cycle_end_positions;
     std::vector<std::int64_t> mass_start_positions;
+    std::vector<std::int64_t> cycle_tokens;
+    std::vector<std::int64_t> mass_tokens;
     std::vector<double> attention_mass_decays;
     std::vector<std::int64_t> remaining_tokens;
     std::vector<std::int64_t> seeds;
@@ -367,6 +371,8 @@ void executor::move_stale_requests(step& s) {
         tokens.resize(slots.size() * token_width, 0);
         cycle_end_positions.push_back(static_cast<std::int64_t>(req.cycle_end_position()));
         mass_start_positions.push_back(static_cast<std::int64_t>(req.mass_start_position()));
+        cycle_tokens.push_back(static_cast<std::int64_t>(req.eviction_policy_in_pages().cycle_tokens));
+        mass_tokens.push_back(static_cast<std::int64_t>(req.eviction_policy_in_pages().mass_tokens));
         attention_mass_decays.push_back(req.eviction_policy_in_pages().attention_mass_decay);
         const std::optional<std::size_t>& token_limit = req.token_limit();
         remaining_tokens.push_back(
@@ -395,6 +401,8 @@ void executor::move_stale_requests(step& s) {
         .tokens = pinned_values(tokens).view({count, static_cast<std::int64_t>(token_width)}),
         .cycle_end_positions = pinned_values(cycle_end_positions),
         .mass_start_positions = pinned_values(mass_start_positions),
+        .cycle_tokens = pinned_values(cycle_tokens),
+        .mass_tokens = pinned_values(mass_tokens),
         .attention_mass_decays = pinned_values(attention_mass_decays),
         .remaining_tokens = pinned_values(remaining_tokens),
         .seeds = pinned_values(seeds),
@@ -572,11 +580,9 @@ bool executor::add_step_lines(const scheduled_request& scheduled) {
     }
     std::optional<std::size_t> first_stale_column;
     for (std::size_t layer = 0; layer < layout.layers.size(); layer++) {
-        const std::vector<std::uint32_t>& lines = req.views()[layer].lines;
         if (missing_counts[layer] > 0) {
-            const auto first_added = static_cast<std::size_t>(
-                std::ranges::find(lines, layer_view::no_line) - lines.begin()
-            );
+            const std::size_t first_added = layout.layers[layer].is_recurrent ? layout.layers[layer].state_slots
+                                                                              : req.views()[layer].lines.size();
             first_stale_column = std::min(first_stale_column.value_or(first_added), first_added);
         }
     }

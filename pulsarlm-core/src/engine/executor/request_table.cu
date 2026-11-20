@@ -131,7 +131,10 @@ __global__ void advance_requests_kernel(
     std::int64_t* tokens,
     std::int64_t token_width,
     std::int64_t* remaining_tokens,
-    const std::int64_t* __restrict__ cycle_end_positions,
+    std::int64_t* cycle_end_positions,
+    std::int64_t* mass_start_positions,
+    const std::int64_t* __restrict__ cycle_tokens,
+    const std::int64_t* __restrict__ mass_tokens,
     bool* __restrict__ ends_cycle
 ) {
     const std::int64_t e = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -153,7 +156,12 @@ __global__ void advance_requests_kernel(
         tokens[slot * token_width + column] = next_tokens[e * token_width + column];
     }
     remaining_tokens[slot] -= sample_counts[e];
-    ends_cycle[e] = history_position >= cycle_end_positions[slot];
+    const bool reaches_cycle_end = history_position >= cycle_end_positions[slot];
+    ends_cycle[e] = reaches_cycle_end;
+    if (reaches_cycle_end) {
+        cycle_end_positions[slot] += cycle_tokens[slot];
+        mass_start_positions[slot] = cycle_end_positions[slot] - mass_tokens[slot];
+    }
 }
 
 }  // namespace
@@ -282,7 +290,10 @@ void advance_requests(
         table.tokens.mutable_data_ptr<std::int64_t>(),
         table.tokens.size(1),
         table.remaining_tokens.mutable_data_ptr<std::int64_t>(),
-        table.cycle_end_positions.const_data_ptr<std::int64_t>(),
+        table.cycle_end_positions.mutable_data_ptr<std::int64_t>(),
+        table.mass_start_positions.mutable_data_ptr<std::int64_t>(),
+        table.cycle_tokens.const_data_ptr<std::int64_t>(),
+        table.mass_tokens.const_data_ptr<std::int64_t>(),
         ends_cycle.mutable_data_ptr<bool>()
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
