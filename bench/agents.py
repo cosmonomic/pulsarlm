@@ -170,31 +170,34 @@ class Setting:
 SETTINGS = {
     "vllm": Setting("vllm"),
     "full_kv": Setting("pulsarlm"),
-    "cap_4k_mass_0.5": Setting(
-        "pulsarlm", max_context_window=4096, eviction_threshold=0.5, n_working=1024
-    ),
-    "cap_16k_mass_0.5": Setting(
-        "pulsarlm", max_context_window=16384, eviction_threshold=0.5
-    ),
     "cap_64k_mass_0.5": Setting(
         "pulsarlm", max_context_window=65536, eviction_threshold=0.5
     ),
-    "cap_16k": Setting("pulsarlm", max_context_window=16384),
+    "cap_128k_mass_0.5": Setting(
+        "pulsarlm", max_context_window=131072, eviction_threshold=0.5
+    ),
+    "cap_256k_mass_0.5": Setting(
+        "pulsarlm", max_context_window=262144, eviction_threshold=0.5
+    ),
+    "cap_128k": Setting("pulsarlm", max_context_window=131072),
     "mass_0.5": Setting("pulsarlm", eviction_threshold=0.5),
-    "cap_16k_mass_0.25": Setting(
-        "pulsarlm", max_context_window=16384, eviction_threshold=0.25
+    "cap_128k_mass_0.25": Setting(
+        "pulsarlm", max_context_window=131072, eviction_threshold=0.25
     ),
-    "cap_16k_mass_0.75": Setting(
-        "pulsarlm", max_context_window=16384, eviction_threshold=0.75
+    "cap_128k_mass_0.75": Setting(
+        "pulsarlm", max_context_window=131072, eviction_threshold=0.75
     ),
-    "cap_16k_mass_0.5_working_1k": Setting(
-        "pulsarlm", max_context_window=16384, eviction_threshold=0.5, n_working=1024
+    "cap_128k_mass_0.5_working_1k": Setting(
+        "pulsarlm", max_context_window=131072, eviction_threshold=0.5, n_working=1024
     ),
-    "cap_16k_mass_0.5_mass_tokens_128": Setting(
-        "pulsarlm", max_context_window=16384, eviction_threshold=0.5, mass_tokens=128
+    "cap_128k_mass_0.5_mass_tokens_128": Setting(
+        "pulsarlm", max_context_window=131072, eviction_threshold=0.5, mass_tokens=128
     ),
-    "cap_16k_mass_0.5_no_prefix_cache": Setting(
-        "pulsarlm", max_context_window=16384, eviction_threshold=0.5, prefix_cache=False
+    "cap_128k_mass_0.5_no_prefix_cache": Setting(
+        "pulsarlm",
+        max_context_window=131072,
+        eviction_threshold=0.5,
+        prefix_cache=False,
     ),
 }
 
@@ -245,6 +248,7 @@ def run_pulsarlm_server(
     *,
     kv_cache_gib: float,
     store_gib: float,
+    cycle_tokens: int,
     n_working: int,
     prefill_tokens_per_step: int,
     max_context: int,
@@ -256,6 +260,7 @@ def run_pulsarlm_server(
     command += ["--tensor_parallel_size", str(tensor_parallel_size)]
     command += ["--kv_cache_gib", str(kv_cache_gib), "--store_gib", str(store_gib)]
     command += ["--prefill_tokens_per_step", str(prefill_tokens_per_step)]
+    command += ["--cycle_tokens", str(cycle_tokens)]
     command += ["--eviction_threshold", str(setting.eviction_threshold)]
     working = n_working if setting.n_working is None else setting.n_working
     command += ["--n_working", str(working)]
@@ -548,8 +553,9 @@ def run(
     max_context: int = 262144,
     kv_cache_gib: float = 18.0,
     store_gib: float = 8.0,
+    cycle_tokens: int = 8192,
     n_working: int = 8192,
-    prefill_tokens_per_step: int = 512,
+    prefill_tokens_per_step: int = 8192,
     vllm: str = "vllm==0.31.0",
     tensor_parallel_size: int = 4,
     container_executable: str = "docker",
@@ -597,6 +603,7 @@ def run(
                         otlp_url,
                         kv_cache_gib=kv_cache_gib,
                         store_gib=store_gib,
+                        cycle_tokens=cycle_tokens,
                         n_working=n_working,
                         prefill_tokens_per_step=prefill_tokens_per_step,
                         max_context=max_context,

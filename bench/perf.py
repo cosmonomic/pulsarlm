@@ -41,14 +41,14 @@ class Setting:
 SETTINGS = {
     "full_kv": Setting("pulsarlm"),
     "full_kv_no_prefix_cache": Setting("pulsarlm", prefix_cache=False),
-    "cap_4k": Setting("pulsarlm", max_context_window=4096),
-    "cap_8k": Setting("pulsarlm", max_context_window=8192),
-    "cap_16k": Setting("pulsarlm", max_context_window=16384),
-    "cap_16k_no_prefix_cache": Setting(
-        "pulsarlm", max_context_window=16384, prefix_cache=False
+    "cap_64k": Setting("pulsarlm", max_context_window=65536),
+    "cap_128k": Setting("pulsarlm", max_context_window=131072),
+    "cap_256k": Setting("pulsarlm", max_context_window=262144),
+    "cap_128k_no_prefix_cache": Setting(
+        "pulsarlm", max_context_window=131072, prefix_cache=False
     ),
-    "cap_16k_mass_0.5": Setting(
-        "pulsarlm", max_context_window=16384, eviction_threshold=0.5
+    "cap_128k_mass_0.5": Setting(
+        "pulsarlm", max_context_window=131072, eviction_threshold=0.5
     ),
     "vllm": Setting("vllm"),
     "vllm_no_prefix_cache": Setting("vllm", prefix_cache=False),
@@ -111,6 +111,7 @@ def run_pulsarlm_server(
     *,
     kv_cache_gib: float,
     store_gib: float,
+    cycle_tokens: int,
     n_working: int,
     prefill_tokens_per_step: int,
     max_context: int,
@@ -122,20 +123,16 @@ def run_pulsarlm_server(
     command += ["--tensor_parallel_size", str(tensor_parallel_size)]
     command += ["--kv_cache_gib", str(kv_cache_gib), "--store_gib", str(store_gib)]
     command += ["--prefill_tokens_per_step", str(prefill_tokens_per_step)]
+    command += ["--cycle_tokens", str(cycle_tokens)]
+    command += ["--n_working", str(n_working)]
+    command += ["--eviction_threshold", str(setting.eviction_threshold)]
     if not setting.prefix_cache:
         command += ["--no_prefix_cache"]
     if setting.max_context_window is None:
         # The view would otherwise be capped at the model's trained context.
-        command += [
-            "--eviction_threshold",
-            "0",
-            "--max_context_window",
-            str(max_context),
-        ]
+        command += ["--max_context_window", str(max_context)]
     else:
         command += ["--max_context_window", str(setting.max_context_window)]
-        command += ["--n_working", str(n_working)]
-        command += ["--eviction_threshold", str(setting.eviction_threshold)]
     root = f"http://127.0.0.1:{port}"
     base_url = f"{root}/api/openai/v1"
     with run_server(command, base_url, data_dir / "serve.log"):
@@ -382,6 +379,7 @@ def run_server_for(
     *,
     kv_cache_gib: float,
     store_gib: float,
+    cycle_tokens: int,
     n_working: int,
     prefill_tokens_per_step: int,
     max_context: int,
@@ -410,6 +408,7 @@ def run_server_for(
             port,
             kv_cache_gib=kv_cache_gib,
             store_gib=store_gib,
+            cycle_tokens=cycle_tokens,
             n_working=n_working,
             prefill_tokens_per_step=prefill_tokens_per_step,
             max_context=max_context,
@@ -441,8 +440,9 @@ def run(
     seed: int = 0,
     kv_cache_gib: float = 4.0,
     store_gib: float = 8.0,
-    n_working: int = 1024,
-    prefill_tokens_per_step: int = 512,
+    cycle_tokens: int = 8192,
+    n_working: int = 8192,
+    prefill_tokens_per_step: int = 8192,
     vllm: str = "vllm==0.31.0",
     port: int = 18091,
     tensor_parallel_size: int = 1,
@@ -489,6 +489,7 @@ def run(
             port,
             kv_cache_gib=kv_cache_gib,
             store_gib=store_gib,
+            cycle_tokens=cycle_tokens,
             n_working=n_working,
             prefill_tokens_per_step=prefill_tokens_per_step,
             max_context=max_context,
@@ -676,13 +677,13 @@ SERIES = {
     "full_kv_no_prefix_cache": Series(
         "Full KV, no prefix cache", "#52514e", filled=False
     ),
-    "cap_4k": Series("Capped @ 4k", "#86b6ef"),
-    "cap_8k": Series("Capped @ 8k", "#2a78d6"),
-    "cap_16k": Series("Capped @ 16k", "#104281"),
-    "cap_16k_no_prefix_cache": Series(
-        "Capped @ 16k, no prefix cache", "#104281", filled=False
+    "cap_64k": Series("Capped @ 64k", "#86b6ef"),
+    "cap_128k": Series("Capped @ 128k", "#2a78d6"),
+    "cap_256k": Series("Capped @ 256k", "#104281"),
+    "cap_128k_no_prefix_cache": Series(
+        "Capped @ 128k, no prefix cache", "#2a78d6", filled=False
     ),
-    "cap_16k_mass_0.5": Series("Capped @ 16k, mass eviction 0.5", "#1f8a70"),
+    "cap_128k_mass_0.5": Series("Capped @ 128k, mass eviction 0.5", "#1f8a70"),
     "vllm": Series("vLLM", "#d95926"),
     "vllm_no_prefix_cache": Series("vLLM, no prefix cache", "#d95926", filled=False),
 }

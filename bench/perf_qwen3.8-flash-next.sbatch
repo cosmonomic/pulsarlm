@@ -15,12 +15,12 @@ bench_revision=d9212b07ceaacc8e4b9345666e92f3aab68f208c
 uv_version=0.13.7
 model=qwen3.8-flash-next
 checkpoint_revision=812d96e10a0dd82b69d749e68693698cf6c36daa
-settings=(full_kv cap_16k_mass_0.5)
+settings=(full_kv cap_128k_mass_0.5)
 tensor_parallel_sizes=(4)
 concurrencies=(1 4)
 runs=5
 kv_cache_gib=18
-max_context=131072
+max_context=262144
 
 work=${WORK_DIR:-${SLURM_SUBMIT_DIR:-$PWD}/perf-$model}
 venv=$work/venv
