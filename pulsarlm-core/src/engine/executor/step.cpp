@@ -300,20 +300,23 @@ at::Tensor executor::step::select_tables(const at::Tensor& slots, const at::Tens
 }
 
 void executor::step::plan_draft_rows(
-    step_entry& e,
+    std::size_t index,
     const request_state& req,
-    bool verifies,
+    std::size_t first_query_token,
     std::size_t first_hidden_row,
     std::optional<std::size_t> prior_hidden_index,
     bool next_row,
     bool drafts
 ) {
-    const auto sampled = static_cast<std::int64_t>(e.first_sample_index.value_or(0));
+    step_entry& e = entries[index];
+    const std::size_t token_count = count_tokens();
+    const std::size_t sample_count = static_cast<std::size_t>(sample_slots.size(0));
+    const std::size_t first_sample_token = token_count + e.first_sample_index.value_or(0);
     const std::size_t first_draft_row = draft_tokens.size();
-    if (verifies) {
+    if (verifies(index)) {
         assert(!prior_hidden_index && e.first_sample_index);
         for (std::size_t j = 0; j < e.query_token_count; j++) {
-            draft_tokens.push_back(-(sampled + static_cast<std::int64_t>(j)) - 1);
+            draft_tokens.push_back(static_cast<std::int64_t>(first_sample_token + j));
             draft_position_offsets.push_back(static_cast<std::int64_t>(j + 1));
             draft_sources.push_back(static_cast<std::int64_t>(first_hidden_row + j));
         }
@@ -330,20 +333,13 @@ void executor::step::plan_draft_rows(
     const std::size_t next = start + e.query_token_count;
     const std::size_t end = next_row ? next + 1 : next;
     assert(next_row || !drafts);
-    // The token at offset i from the step's first, a prompt token or the sample of a step written back.
-    auto token_at = [&](std::size_t i) {
-        const std::size_t prompt_index = req.prepared_prompt_token_count() + i;
-        if (prompt_index < req.prompt_token_count()) {
-            return req.prompt_tokens()[prompt_index];
-        }
-        assert(i == 0 && req.unfinished_step_count() == 0 && start == req.history_position());
-        return *req.pending_token();
-    };
     for (std::size_t t = first; t < end; t++) {
         if (t < next) {
-            draft_tokens.push_back(token_at(t - start));
+            draft_tokens.push_back(static_cast<std::int64_t>(first_query_token + t - start));
+        } else if (e.first_sample_index) {
+            draft_tokens.push_back(static_cast<std::int64_t>(first_sample_token));
         } else {
-            draft_tokens.push_back(e.first_sample_index ? -sampled - 1 : token_at(e.query_token_count));
+            draft_tokens.push_back(static_cast<std::int64_t>(token_count + sample_count + index));
         }
         draft_position_offsets.push_back(static_cast<std::int64_t>(t - start));
         if (t == 0) {

@@ -164,7 +164,18 @@ void executor::step::enqueue(
         }
     }
     if (draft_layer && !draft_tokens.empty()) {
-        enqueue_drafts(shard_model, lines, samples, stop_tokens, shard, counters, table, *draft_layer, launched);
+        enqueue_drafts(
+            shard_model,
+            lines,
+            on_device.tokens.narrow(0, 0, token_count),
+            samples,
+            stop_tokens,
+            shard,
+            counters,
+            table,
+            *draft_layer,
+            launched
+        );
     }
     advance_draw_counts(table, launched, shard);
     advance_table(table, samples, shard, device, launched);
@@ -386,6 +397,7 @@ void executor::step::enqueue_decode_step(
 void executor::step::enqueue_drafts(
     model& shard_model,
     std::span<const kv> lines,
+    const at::Tensor& query_tokens,
     const at::Tensor& samples,
     const at::Tensor& stop_tokens,
     std::size_t shard,
@@ -400,6 +412,7 @@ void executor::step::enqueue_drafts(
     const std::optional<first_draft> first = enqueue_first_draft_pass(
         shard_model,
         lines,
+        query_tokens,
         samples,
         accepted_counts,
         shard,
@@ -468,6 +481,7 @@ at::Tensor executor::step::count_accepted_tokens(
 std::optional<executor::step::first_draft> executor::step::enqueue_first_draft_pass(
     model& shard_model,
     std::span<const kv> lines,
+    const at::Tensor& query_tokens,
     const at::Tensor& samples,
     const at::Tensor& accepted_counts,
     std::size_t shard,
@@ -532,8 +546,13 @@ std::optional<executor::step::first_draft> executor::step::enqueue_first_draft_p
         ? at::where(is_verify, accepted_counts.index_select(0, verify_index.clamp_min(0)) - 1, 0)
         : at::zeros({draft_count_of_entries}, at::device(device).dtype(at::kLong));
     const at::Tensor query_starts = tensor_on_device(starts, ints, device);
+    std::vector<at::Tensor> token_sources{query_tokens};
+    if (samples.defined()) {
+        token_sources.push_back(samples);
+    }
+    token_sources.push_back(resolve_tokens(get_on_device(next_token_sources, launched, shard), samples));
     model::batch rows{
-        .tokens = resolve_tokens(tensor_on_device(draft_tokens, longs, device), samples),
+        .tokens = at::cat(token_sources).index_select(0, tensor_on_device(draft_tokens, longs, device)),
         .pos = at::repeat_interleave(
                    positions,
                    tensor_on_device(entry_rows, longs, device),

@@ -126,7 +126,8 @@ class executor::step {
     // token.
     std::vector<std::int64_t> prior_hidden_slots;
     // The draft head's pass, queued after the step's sampling, over the entries with draft rows in entry order: per
-    // row, its token, -(r + 1) for the step's sample r, its RoPE position less its request's at the step's start,
+    // row, its token as an index into the step's query tokens, then its samples, then its entries' next tokens
+    // (next_token_sources), its RoPE position less its request's at the step's start,
     // and its hidden row (draft_head::draft) as an index into a zeros row, then the prior hidden rows, then the hidden
     // rows of the step's query tokens. The rows of an entry of the second run are the state_slots positions after its
     // pending token's, the row after its accepted tokens drafting: its first row's index plus its accepted count - 1.
@@ -225,27 +226,29 @@ class executor::step {
         request_table& table,
         launch_result& launched
     ) const;
-    // Adds to the draft head's pass the rows of e's request req, at its preparation before it advances: those of an
-    // entry of the second run, with verifies, its state_slots rows, another's from its first position without one
-    // through its tokens and, with next_row, its next token, the request drafting draft_count tokens after them with
-    // drafts. The entry's hidden rows start at first_hidden_row of the pass's hidden rows. An entry whose first draft
-    // row reads the last_hidden of the position before its first token reads the prior hidden vector at
-    // prior_hidden_index.
+    // Adds to the draft head's pass the rows of the entry at index, of request req, at its preparation before it
+    // advances: those of an entry of the second run, its state_slots rows, another's from its first position without
+    // one through its tokens and, with next_row, its next token, the request drafting draft_count tokens after them
+    // with drafts. The entry's query tokens start at first_query_token of the step's, and its hidden rows at
+    // first_hidden_row of the pass's hidden rows. An entry whose first draft row reads the last_hidden of the position
+    // before its first token reads the prior hidden vector at prior_hidden_index.
     void plan_draft_rows(
-        step_entry& e,
+        std::size_t index,
         const request_state& req,
-        bool verifies,
+        std::size_t first_query_token,
         std::size_t first_hidden_row,
         std::optional<std::size_t> prior_hidden_index,
         bool next_row,
         bool drafts
     );
     // Queues on stream shard, after the step's sampling into samples, the second-run entries' acceptance of their
-    // samples, stop_tokens ending a run (int64), and the draft head's pass over draft_layer's view in table; shard 0
-    // also queues the copies of the accepted counts and next tokens to the host, into launched.
+    // samples, stop_tokens ending a run (int64), and the draft head's pass over draft_layer's view in table, its rows'
+    // tokens taken from query_tokens, the step's unpadded query tokens on the device, and samples; shard 0 also queues
+    // the copies of the accepted counts and next tokens to the host, into launched.
     void enqueue_drafts(
         model& shard_model,
         std::span<const kv> lines,
+        const at::Tensor& query_tokens,
         const at::Tensor& samples,
         const at::Tensor& stop_tokens,
         std::size_t shard,
@@ -276,6 +279,7 @@ class executor::step {
     std::optional<first_draft> enqueue_first_draft_pass(
         model& shard_model,
         std::span<const kv> lines,
+        const at::Tensor& query_tokens,
         const at::Tensor& samples,
         const at::Tensor& accepted_counts,
         std::size_t shard,

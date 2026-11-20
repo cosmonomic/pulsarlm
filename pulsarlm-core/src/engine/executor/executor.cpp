@@ -501,6 +501,7 @@ void executor::advance(step& s) {
         }
     }
     std::size_t first_hidden_row = 1 + prior_hidden_count;
+    std::size_t first_query_token = 0;
     for (std::size_t index = 0; index < s.entries.size(); index++) {
         step_entry& e = s.entries[index];
         request_state& req = get_state(e.request_id);
@@ -517,8 +518,9 @@ void executor::advance(step& s) {
                 s.prior_hidden_slots.push_back(static_cast<std::int64_t>(get_slot(e.request_id)));
             }
             std::tie(next_row, drafts) = plan_drafting(req, token_count);
-            s.plan_draft_rows(e, req, verifies, first_hidden_row, prior_hidden_index, next_row, drafts);
+            s.plan_draft_rows(index, req, first_query_token, first_hidden_row, prior_hidden_index, next_row, drafts);
             first_hidden_row += e.query_token_count;
+            first_query_token += e.query_token_count;
         }
         if (verifies) {
             req.prepare_verify_step(drafts ? draft_count : 0);
