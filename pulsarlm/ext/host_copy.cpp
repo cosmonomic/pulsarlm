@@ -1,6 +1,6 @@
 #include "host_copy.hpp"
 
-#include "pulsarlm/kernels.hpp"
+#include "pulsarlm/ops.hpp"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAException.h>

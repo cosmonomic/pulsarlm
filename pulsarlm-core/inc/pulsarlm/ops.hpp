@@ -6,6 +6,8 @@
 #include "pulsarlm/kernels/hyper_connection.hpp"
 #include "pulsarlm/kernels/indexed_attention.hpp"
 #include "pulsarlm/kernels/normalization.hpp"
+#include "pulsarlm/kernels/p2p_collectives.hpp"
+#include "pulsarlm/kernels/page_copy.hpp"
 #include "pulsarlm/kernels/page_tables.hpp"
 #include "pulsarlm/kernels/paged_attention.hpp"
 #include "pulsarlm/kernels/rope.hpp"
