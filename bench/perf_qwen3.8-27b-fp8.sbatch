@@ -20,7 +20,7 @@ tensor_parallel_sizes=(2)
 concurrencies=(1 4)
 runs=5
 kv_cache_gib=18
-max_context=131072
+max_context=262144
 
 work=${WORK_DIR:-${SLURM_SUBMIT_DIR:-$PWD}/perf-$model}
 venv=$work/venv

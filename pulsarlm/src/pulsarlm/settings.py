@@ -23,4 +23,5 @@ class Settings:
     eviction_threshold: float
     eviction_warmup: int
     max_context_window: int | None
+    max_context_capacity: int
     num_draft_tokens: int

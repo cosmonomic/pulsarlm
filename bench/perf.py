@@ -33,7 +33,7 @@ METRICS_INTERVAL_S = 0.05
 @dataclass(frozen=True)
 class Setting:
     engine: Literal["pulsarlm", "vllm"]
-    max_context_window: int | None = None
+    max_context_capacity: int = 0
     eviction_threshold: float = 0.0
     prefix_cache: bool = True
 
@@ -41,14 +41,14 @@ class Setting:
 SETTINGS = {
     "full_kv": Setting("pulsarlm"),
     "full_kv_no_prefix_cache": Setting("pulsarlm", prefix_cache=False),
-    "cap_64k": Setting("pulsarlm", max_context_window=65536),
-    "cap_128k": Setting("pulsarlm", max_context_window=131072),
-    "cap_256k": Setting("pulsarlm", max_context_window=262144),
+    "cap_64k": Setting("pulsarlm", max_context_capacity=65536),
+    "cap_128k": Setting("pulsarlm", max_context_capacity=131072),
+    "cap_256k": Setting("pulsarlm", max_context_capacity=262144),
     "cap_128k_no_prefix_cache": Setting(
-        "pulsarlm", max_context_window=131072, prefix_cache=False
+        "pulsarlm", max_context_capacity=131072, prefix_cache=False
     ),
     "cap_128k_mass_0.5": Setting(
-        "pulsarlm", max_context_window=131072, eviction_threshold=0.5
+        "pulsarlm", max_context_capacity=131072, eviction_threshold=0.5
     ),
     "vllm": Setting("vllm"),
     "vllm_no_prefix_cache": Setting("vllm", prefix_cache=False),
@@ -128,11 +128,8 @@ def run_pulsarlm_server(
     command += ["--eviction_threshold", str(setting.eviction_threshold)]
     if not setting.prefix_cache:
         command += ["--no_prefix_cache"]
-    if setting.max_context_window is None:
-        # The view would otherwise be capped at the model's trained context.
-        command += ["--max_context_window", str(max_context)]
-    else:
-        command += ["--max_context_window", str(setting.max_context_window)]
+    command += ["--max_context_window", str(max_context)]
+    command += ["--max_context_capacity", str(setting.max_context_capacity)]
     root = f"http://127.0.0.1:{port}"
     base_url = f"{root}/api/openai/v1"
     with run_server(command, base_url, data_dir / "serve.log"):

@@ -177,6 +177,15 @@ MaxContextWindow = Annotated[
         rich_help_panel="Eviction",
     ),
 ]
+MaxContextCapacity = Annotated[
+    int,
+    typer.Option(
+        "--max_context_capacity",
+        help="Tokens a request's view may hold before eviction by capacity: 0 turns "
+        "it off, a negative value uses --max_context_window.",
+        rich_help_panel="Eviction",
+    ),
+]
 
 
 def _positive(value: float) -> float:
@@ -233,6 +242,7 @@ def serve(
     eviction_threshold: EvictionThreshold = 0.0,
     eviction_warmup: EvictionWarmup = 1,
     max_context_window: MaxContextWindow = None,
+    max_context_capacity: MaxContextCapacity = -1,
     eviction_log: Annotated[
         Path | None,
         typer.Option(
@@ -268,6 +278,7 @@ def serve(
                 eviction_threshold=eviction_threshold,
                 eviction_warmup=eviction_warmup,
                 max_context_window=max_context_window,
+                max_context_capacity=max_context_capacity,
                 num_draft_tokens=num_draft_tokens,
             ),
             host=host,
@@ -346,6 +357,7 @@ def chat(
     eviction_threshold: EvictionThreshold = 0.0,
     eviction_warmup: EvictionWarmup = 1,
     max_context_window: MaxContextWindow = None,
+    max_context_capacity: MaxContextCapacity = -1,
 ) -> None:
     """Chat with a model in the terminal. End input to quit."""
     # Imported here: torch takes seconds to load, which --help does not need.
@@ -372,6 +384,7 @@ def chat(
                 eviction_threshold=eviction_threshold,
                 eviction_warmup=eviction_warmup,
                 max_context_window=max_context_window,
+                max_context_capacity=max_context_capacity,
                 num_draft_tokens=num_draft_tokens,
             ),
             system=system,

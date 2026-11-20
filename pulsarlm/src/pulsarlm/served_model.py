@@ -33,7 +33,7 @@ class ServedModel:
 def load_served_model(
     settings: Settings, path: Path, loop: asyncio.AbstractEventLoop
 ) -> ServedModel:
-    """eviction is the settings' policy, its n_sink left at the default. Above one
+    """eviction is eviction_policy's. Above one
     tensor-parallel GPU, the model is split across cuda:0 on, one GPU's part loaded
     and on its GPU before the next is read. The store's reads run on loop. Without
     the prefix cache, the store keeps nothing."""
@@ -67,6 +67,7 @@ def load_served_model(
         raise checkpoint.PulsarLMModelLoadingError(
             f"{settings.model} states no trained context length; set --max_context_window"
         )
+    eviction = eviction_policy(settings, max_context_window)
     stops = stop_ids(tokenizer, cfg.eos_ids)
     store = (
         LocalStore(
@@ -107,12 +108,28 @@ def load_served_model(
         stop_ids=stops,
         tool_call_syntax=cfg.tool_call_syntax,
         think_syntax=cfg.think_syntax,
-        eviction=EvictionPolicy(
-            n_working=settings.n_working,
-            cycle_tokens=settings.cycle_tokens,
-            mass_tokens=settings.mass_tokens,
-            max_context_capacity=-1,
-            eviction_threshold=settings.eviction_threshold,
-            eviction_warmup=settings.eviction_warmup,
-        ),
+        eviction=eviction,
+    )
+
+
+def eviction_policy(settings: Settings, max_context_window: int) -> EvictionPolicy:
+    """The settings' policy, its n_sink left at the default and a negative
+    max_context_capacity taken as max_context_window. Raises
+    PulsarLMModelLoadingError for a capacity above the window, which the engine
+    rejects every request for."""
+    capacity = settings.max_context_capacity
+    if capacity < 0:
+        capacity = max_context_window
+    if capacity > max_context_window:
+        raise checkpoint.PulsarLMModelLoadingError(
+            f"--max_context_capacity {capacity} exceeds --max_context_window "
+            f"{max_context_window}, which every request would fail on"
+        )
+    return EvictionPolicy(
+        n_working=settings.n_working,
+        cycle_tokens=settings.cycle_tokens,
+        mass_tokens=settings.mass_tokens,
+        max_context_capacity=capacity,
+        eviction_threshold=settings.eviction_threshold,
+        eviction_warmup=settings.eviction_warmup,
     )
