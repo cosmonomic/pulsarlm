@@ -461,7 +461,7 @@ engine_config(std::size_t shard_count, bool decode_graphs = false, std::size_t d
         .stop_ids = {},
         .prefill_tokens_per_step = 32,
         .decode_graphs = decode_graphs,
-        .max_context_window = decode_graphs ? std::optional<std::size_t>(1024) : std::nullopt,
+        .max_context_window = 1024,
         .draft_tokens = draft_tokens,
     };
 }

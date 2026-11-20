@@ -1,11 +1,5 @@
 #include "pulsarlm/engine/request_state.hpp"
 
-#include "pinned_tensor.hpp"
-
-#include <ATen/ATen.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
-
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -68,8 +62,7 @@ request_state::request_state(
     state::lease_id_type lease_id,
     std::vector<digest>&& digests,
     const digest& root,
-    const view_layout& layout,
-    std::span<const at::Device> devices
+    const view_layout& layout
 )
 : held_lease_id(lease_id),
   sampling(r.sampling),
@@ -81,12 +74,6 @@ request_state::request_state(
   layout(layout),
   layers(layout.layers.size()),
   eviction(to_pages(r.eviction, layout.page_size)) {
-    for (const at::Device& device : devices) {
-        tables.push_back(
-            at::zeros({static_cast<std::int64_t>(layers.size()), 0}, at::TensorOptions().dtype(at::kInt).device(device))
-        );
-        position_tables.push_back(at::zeros_like(tables.back()));
-    }
     std::size_t resumed_page_count = 0;
     if (head) {
         auto head_digest = std::ranges::find(prompt_digests, *head);
@@ -342,46 +329,6 @@ std::size_t request_state::table_width() const noexcept {
     return width;
 }
 
-void request_state::upload_table(std::size_t first_page, std::span<const cudaStream_t> streams) {
-    auto n_layers = static_cast<std::int64_t>(layers.size());
-    auto width = static_cast<std::int64_t>(table_width());
-    if (tables.front().size(1) < width) {
-        std::int64_t capacity = std::max<std::int64_t>(width, 2 * tables.front().size(1));
-        for (std::size_t shard = 0; shard < tables.size(); shard++) {
-            tables[shard] = at::empty({n_layers, capacity}, tables[shard].options());
-            position_tables[shard] = at::empty_like(tables[shard]);
-        }
-        first_page = 0;
-    }
-    auto page_count = width;
-    auto first = static_cast<std::int64_t>(first_page);
-    if (first == page_count) {
-        return;
-    }
-    at::Tensor host_lines = pinned({n_layers, page_count - first}, at::kInt);
-    at::Tensor host_positions = pinned({n_layers, page_count - first}, at::kInt);
-    auto* line_entries = host_lines.mutable_data_ptr<std::int32_t>();
-    auto* position_entries = host_positions.mutable_data_ptr<std::int32_t>();
-    for (std::size_t layer = 0; layer < layers.size(); layer++) {
-        const layer_view& view = layers[layer];
-        for (std::int64_t page = first; page < page_count; page++) {
-            auto index = static_cast<std::size_t>(page);
-            bool used = index < view.lines.size();
-            *line_entries++ = used ? static_cast<std::int32_t>(view.lines[index]) : 0;
-            *position_entries++ = used && !layout.layers[layer].is_recurrent
-                ? static_cast<std::int32_t>(page_position(layer, index))
-                : 0;
-        }
-    }
-    for (std::size_t shard = 0; shard < tables.size(); shard++) {
-        c10::cuda::CUDAStreamGuard guard(
-            c10::cuda::getStreamFromExternal(streams[shard], tables[shard].device().index())
-        );
-        tables[shard].narrow(1, first, page_count - first).copy_(host_lines, /*non_blocking=*/true);
-        position_tables[shard].narrow(1, first, page_count - first).copy_(host_positions, /*non_blocking=*/true);
-    }
-}
-
 std::size_t request_state::cycle_lines() const noexcept {
     assert(tail.empty());
     return ceil_div(cycle_tokens_left(), layout.page_size);
@@ -495,14 +442,6 @@ const std::shared_ptr<pending_writes>& request_state::pending_page_writes() cons
     return page_writes;
 }
 
-const at::Tensor& request_state::line_table(std::size_t shard) const {
-    return tables[shard];
-}
-
-const at::Tensor& request_state::position_table(std::size_t shard) const {
-    return position_tables[shard];
-}
-
 bool request_state::has_exited() const noexcept {
     return end_reason.has_value();
 }
@@ -512,7 +451,7 @@ std::optional<request_state::exit_reason> request_state::reason_of_exit() const 
 }
 
 bool request_state::has_exit_cause() const noexcept {
-    return has_reached_end || has_failed_write || is_out_of_lines || is_cancelled;
+    return has_reached_end || has_failed_write || has_exceeded_context || is_out_of_lines || is_cancelled;
 }
 
 bool request_state::discards_steps() const noexcept {
@@ -638,6 +577,10 @@ void request_state::run_out_of_lines() noexcept {
     is_out_of_lines = true;
 }
 
+void request_state::exceed_context() noexcept {
+    has_exceeded_context = true;
+}
+
 void request_state::cancel() noexcept {
     is_cancelled = true;
 }
@@ -729,6 +672,8 @@ void request_state::exit() noexcept {
         end_reason = exit_reason::oom;
     } else if (has_reached_end) {
         end_reason = exit_reason::finished;
+    } else if (has_exceeded_context) {
+        end_reason = exit_reason::context_exceeded;
     } else if (is_out_of_lines) {
         end_reason = exit_reason::oom;
     } else {

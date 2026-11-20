@@ -82,6 +82,16 @@ PrefillTokensPerStep = Annotated[
         rich_help_panel="Memory",
     ),
 ]
+MaxRunningRequests = Annotated[
+    int,
+    typer.Option(
+        "--max_running_requests",
+        min=1,
+        help="Requests the engine runs at once; a request beyond them waits until "
+        "one ends.",
+        rich_help_panel="Memory",
+    ),
+]
 DecodeGraphs = Annotated[
     bool,
     typer.Option(
@@ -211,6 +221,7 @@ def serve(
     dtype: WeightDType = DType.bfloat16,
     kv_cache_gib: KvCacheGib = 4.0,
     prefill_tokens_per_step: PrefillTokensPerStep = 512,
+    max_running_requests: MaxRunningRequests = 64,
     decode_graphs: DecodeGraphs = True,
     num_draft_tokens: NumDraftTokens = 0,
     store_gib: StoreGib = 4.0,
@@ -246,6 +257,7 @@ def serve(
                 dtype=dtype,
                 kv_cache_gib=kv_cache_gib,
                 prefill_tokens_per_step=prefill_tokens_per_step,
+                max_running_requests=max_running_requests,
                 decode_graphs=decode_graphs,
                 store_gib=store_gib,
                 persist=persist,
@@ -322,6 +334,7 @@ def chat(
     dtype: WeightDType = DType.bfloat16,
     kv_cache_gib: KvCacheGib = 4.0,
     prefill_tokens_per_step: PrefillTokensPerStep = 512,
+    max_running_requests: MaxRunningRequests = 64,
     decode_graphs: DecodeGraphs = True,
     num_draft_tokens: NumDraftTokens = 0,
     store_gib: StoreGib = 4.0,
@@ -348,6 +361,7 @@ def chat(
                 dtype=dtype,
                 kv_cache_gib=kv_cache_gib,
                 prefill_tokens_per_step=prefill_tokens_per_step,
+                max_running_requests=max_running_requests,
                 decode_graphs=decode_graphs,
                 store_gib=store_gib,
                 persist=persist,

@@ -1,9 +1,5 @@
 #pragma once
 
-#include <ATen/core/Tensor.h>
-#include <c10/core/Device.h>
-#include <cuda_runtime_api.h>
-
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -61,7 +57,7 @@ class layer_view {
 // write-back completes the pages they fill; a token it samples is awaited_token until the step is written back.
 class request_state {
   public:
-    enum class exit_reason { finished, cancelled, oom };
+    enum class exit_reason { finished, cancelled, oom, context_exceeded };
     static constexpr std::int64_t awaited_token = -1;
 
   private:
@@ -96,10 +92,6 @@ class request_state {
     bool state_pending = false;
     // The writes of the request's pages to the store not waited for; shared with the tasks writing them.
     std::shared_ptr<pending_writes> page_writes = std::make_shared<pending_writes>();
-    // Per shard, int32 [n_kv_layers, capacity] on its device: each view page's line, and the RoPE position of its
-    // first key. Columns past those of a layer's lines are unused.
-    std::vector<at::Tensor> tables;
-    std::vector<at::Tensor> position_tables;
     // Set by exit only, once no step of the request is unfinished.
     std::optional<exit_reason> end_reason;
     // Whether a step written back sampled a stop token or reached the end that max_tokens or the prompt sets.
@@ -108,6 +100,8 @@ class request_state {
     bool has_failed_write = false;
     // Whether a line allocation for the request's next tokens failed.
     bool is_out_of_lines = false;
+    // Whether the request's view would grow past the columns of its page tables.
+    bool has_exceeded_context = false;
     bool is_cancelled = false;
     // The steps of the request launched, and those of them written back.
     std::size_t prepared_step_count = 0;
@@ -151,8 +145,6 @@ class request_state {
 
     // The view index of recurrent KV layer layer's line holding the state at the end of head's page.
     std::size_t head_state_line_index(std::size_t layer) const;
-    // The RoPE position of the first key of view page page in KV layer layer.
-    std::size_t page_position(std::size_t layer, std::size_t page) const;
     // Sets held_pages from the layers' indices.
     void update_held();
     // Moves the first count pending tokens to tail.
@@ -173,8 +165,7 @@ class request_state {
         state::lease_id_type lease_id,
         std::vector<digest>&& digests,
         const digest& root,
-        const view_layout& layout,
-        std::span<const at::Device> devices
+        const view_layout& layout
     );
 
     // One per KV layer.
@@ -205,13 +196,10 @@ class request_state {
     std::span<const std::size_t> held_page_indices() const noexcept;
     bool has_pending_state() const noexcept;
     const std::shared_ptr<pending_writes>& pending_page_writes() const noexcept;
-    // Shard shard's table of lines, and of RoPE positions.
-    const at::Tensor& line_table(std::size_t shard) const;
-    const at::Tensor& position_table(std::size_t shard) const;
     bool has_exited() const noexcept;
     std::optional<exit_reason> reason_of_exit() const noexcept;
     // Whether the request exits once no step of it is unfinished: a step written back reached the end, a store write
-    // failed, it ran out of lines or it was cancelled.
+    // failed, its view would grow past its page tables, it ran out of lines or it was cancelled.
     bool has_exit_cause() const noexcept;
     // Whether the write-back of a later step of the request applies nothing: a step written back reached the end or a
     // store write failed.
@@ -249,8 +237,10 @@ class request_state {
     bool ends_cycle(std::size_t token_count) const noexcept;
     // The tokens the cycle can still forward: no more than its length allows, nor than the request will forward.
     std::size_t cycle_tokens_left() const noexcept;
-    // The columns of table the lines take.
+    // The columns of a page table the lines take: the most lines of a KV layer.
     std::size_t table_width() const noexcept;
+    // The RoPE position of the first key of view page page in KV layer layer, which has pages.
+    std::size_t page_position(std::size_t layer, std::size_t page) const;
     // One line per page the cycle's tokens fill, in each KV layer with pages. Called at the start of a cycle, with an
     // empty tail.
     std::size_t cycle_lines() const noexcept;
@@ -285,6 +275,7 @@ class request_state {
     void reach_end() noexcept;
     void fail_store_write() noexcept;
     void run_out_of_lines() noexcept;
+    void exceed_context() noexcept;
     void cancel() noexcept;
     // Adds a step written back, which took duration from its launch to its write-back, to the prefill's steps until
     // end_prefill and to the summed duration.
@@ -322,12 +313,9 @@ class request_state {
     void sample_pages();
     void start_next_cycle() noexcept;
     // Sets the exit reason of a request with an exit cause and no unfinished step: oom when a store write failed,
-    // otherwise finished when a step written back reached the end, otherwise oom when it ran out of lines, otherwise
-    // cancelled.
+    // otherwise finished when a step written back reached the end, otherwise context_exceeded when its view would grow
+    // past its page tables, otherwise oom when it ran out of lines, otherwise cancelled.
     void exit() noexcept;
-    // Queues on each shard's stream the upload of the lines and positions from column first_page on into its tables,
-    // all of them when the tables grow.
-    void upload_table(std::size_t first_page, std::span<const cudaStream_t> streams);
     void record_device_cached_tokens(std::size_t count) noexcept;
     // Raises the peak of the bytes of each device's pool the lines take to bytes.
     void record_device_memory(std::size_t bytes) noexcept;

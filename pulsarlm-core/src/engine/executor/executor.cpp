@@ -47,20 +47,26 @@ executor::executor(
     std::vector<event_loop*>&& worker_loops,
     digest root,
     std::vector<std::int64_t>&& stop_ids,
+    std::size_t view_page_capacity,
     std::optional<std::size_t> graph_pages,
     std::size_t draft_tokens,
-    std::size_t sampled_row_limit
+    std::size_t sampled_row_limit,
+    std::size_t max_running_requests
 )
 : cache(std::move(cache)),
   store(store),
   layout{.layers = {}, .page_size = 0},
   root(root),
   stop_ids(std::move(stop_ids)),
+  view_page_capacity(view_page_capacity),
   graph_pages(graph_pages),
+  max_running_requests(max_running_requests),
   draft_state_slots(draft_tokens + 1),
   sampled_row_capacity(sampled_row_limit) {
     assert(sampled_row_limit >= 1);
     assert(sampled_row_limit >= draft_tokens + 1);
+    assert(max_running_requests >= 1 && view_page_capacity >= 1);
+    assert(!graph_pages || *graph_pages == view_page_capacity);
     assert(
         !models.empty() && models.size() == this->cache.shard_count() && streams.size() == models.size() &&
         copy_streams.size() == models.size() && worker_loops.size() + 1 == models.size()
@@ -78,6 +84,8 @@ executor::executor(
                 .graphs = nullptr,
                 .samples = {},
                 .arrival_counters = {},
+                .page_tables = {},
+                .page_positions = {},
             }
         );
     }
@@ -128,6 +136,13 @@ executor::executor(
             s.lines.front().k.options().dtype(at::kLong)
         );
         s.stop_tokens = at::tensor(this->stop_ids, at::TensorOptions().dtype(at::kLong)).to(s.lines.front().k.device());
+        s.page_tables = at::zeros(
+            {static_cast<std::int64_t>(max_running_requests),
+             static_cast<std::int64_t>(layout.layers.size()),
+             static_cast<std::int64_t>(view_page_capacity)},
+            s.lines.front().k.options().dtype(at::kInt)
+        );
+        s.page_positions = at::zeros_like(s.page_tables);
     }
     if (this->graph_pages) {
         for (shard& s : shards) {
@@ -173,6 +188,86 @@ request_state& executor::state_of(request_id_type id) {
 
 const request_state& executor::state_of(request_id_type id) const {
     return requests[id].state;
+}
+
+std::size_t executor::slot_of(request_id_type id) noexcept {
+    return static_cast<std::uint32_t>(id);
+}
+
+std::size_t executor::max_running_request_count() const noexcept {
+    return max_running_requests;
+}
+
+std::size_t executor::request_count() const noexcept {
+    return requests.size();
+}
+
+void executor::mark_stale_tables(request_id_type id, std::size_t first_column) {
+    auto [stale, inserted] = stale_tables.try_emplace(id, first_column);
+    if (!inserted) {
+        stale->second = std::min(stale->second, first_column);
+    }
+}
+
+std::size_t executor::table_width_after(const request_state& req, std::span<const std::size_t> line_counts) const {
+    std::size_t width = 0;
+    for (std::size_t layer = 0; layer < layout.layers.size(); layer++) {
+        width = std::max(width, req.views()[layer].lines.size() + line_counts[layer]);
+    }
+    return width;
+}
+
+std::vector<std::size_t> executor::start_line_counts(const request_state& req) const {
+    std::vector<std::size_t> counts;
+    for (std::size_t layer = 0; layer < layout.layers.size(); layer++) {
+        counts.push_back(
+            layout.layers[layer].is_recurrent ? layout.layers[layer].state_slots + 2
+                                              : req.views()[layer].pages.size() + req.cycle_lines()
+        );
+    }
+    return counts;
+}
+
+// The requests erased since they were marked are passed over; a request in a reused slot was marked from column 0 at
+// its start.
+void executor::move_stale_tables(batch& b) {
+    const std::size_t n_layers = layout.layers.size();
+    std::vector<std::int64_t> cells;
+    std::vector<std::int32_t> lines;
+    std::vector<std::int32_t> positions;
+    for (const auto& [id, first_column] : stale_tables) {
+        const running_request* running = requests.find(id);
+        if (running == nullptr) {
+            continue;
+        }
+        const request_state& req = running->state;
+        const std::size_t width = req.table_width();
+        for (std::size_t layer = 0; layer < n_layers; layer++) {
+            const layer_view& view = req.views()[layer];
+            const std::size_t row_start = (slot_of(id) * n_layers + layer) * view_page_capacity;
+            for (std::size_t column = first_column; column < width; column++) {
+                const bool used = column < view.lines.size();
+                cells.push_back(static_cast<std::int64_t>(row_start + column));
+                lines.push_back(used ? static_cast<std::int32_t>(view.lines[column]) : 0);
+                positions.push_back(
+                    used && !layout.layers[layer].is_recurrent
+                        ? static_cast<std::int32_t>(req.page_position(layer, column))
+                        : 0
+                );
+            }
+        }
+    }
+    stale_tables.clear();
+    if (cells.empty()) {
+        return;
+    }
+    const auto count = static_cast<std::int64_t>(cells.size());
+    b.table_cells = pinned({count}, at::kLong);
+    b.table_lines = pinned({count}, at::kInt);
+    b.table_positions = pinned({count}, at::kInt);
+    std::ranges::copy(cells, b.table_cells.mutable_data_ptr<std::int64_t>());
+    std::ranges::copy(lines, b.table_lines.mutable_data_ptr<std::int32_t>());
+    std::ranges::copy(positions, b.table_positions.mutable_data_ptr<std::int32_t>());
 }
 
 bool executor::is_steppable(request_id_type id) const {
@@ -347,6 +442,7 @@ task<void> executor::launch(std::span<const scheduled_request> scheduled) {
     b->launch_time = launch_time;
     assert(b->sample_params.size() <= sampled_row_capacity);
     b->allows_overlap = entries_allow_overlap(scheduled);
+    move_stale_tables(*b);
     link_previous(*b);
     advance(*b);
     for (batch::group* g : b->groups()) {
@@ -411,7 +507,9 @@ task<void> executor::enqueue_on_shard(batch& b, std::size_t shard) {
         shard,
         shards[shard].graphs.get(),
         shards[shard].samples,
-        shards[shard].arrival_counters
+        shards[shard].arrival_counters,
+        shards[shard].page_tables,
+        shards[shard].page_positions
     );
     co_return;
 }

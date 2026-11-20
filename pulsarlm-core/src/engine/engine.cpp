@@ -56,7 +56,7 @@ void check_attention(const engine_config& config, std::span<const kv_layer> laye
     }
 }
 
-void validate(const request& r, std::size_t vocab_size) {
+void validate(const request& r, std::size_t vocab_size, std::size_t max_context_window) {
     if (r.tokens.empty()) {
         throw std::invalid_argument("the request has no token to forward");
     }
@@ -84,6 +84,15 @@ void validate(const request& r, std::size_t vocab_size) {
     if (!(r.eviction.eviction_threshold >= 0.0 && r.eviction.eviction_threshold <= 1.0)) {
         throw std::invalid_argument(
             std::format("eviction.eviction_threshold {} is outside [0, 1]", r.eviction.eviction_threshold)
+        );
+    }
+    if (r.eviction.max_context_window && *r.eviction.max_context_window > max_context_window) {
+        throw std::invalid_argument(
+            std::format(
+                "eviction.max_context_window {} exceeds the engine's max_context_window {}",
+                *r.eviction.max_context_window,
+                max_context_window
+            )
         );
     }
 }
@@ -141,6 +150,44 @@ std::size_t checked_prefill_tokens_per_step(const engine_config& config) {
         throw std::invalid_argument("prefill_tokens_per_step must be at least 1");
     }
     return config.prefill_tokens_per_step;
+}
+
+std::size_t checked_max_running_requests(const engine_config& config) {
+    if (config.max_running_requests < 1) {
+        throw std::invalid_argument("max_running_requests must be at least 1");
+    }
+    return config.max_running_requests;
+}
+
+// The pages of a view of max_context_window tokens, its last page partly filled.
+std::size_t view_page_capacity(const engine_config& config) {
+    return (config.max_context_window + config.page_size - 1) / config.page_size + 1;
+}
+
+// A recurrent layer's lines are its state slots, draft_tokens + 1 for a state and 1 for a window, and two lines
+// holding the states at page ends.
+std::size_t checked_view_page_capacity(const engine_config& config, const model& shard) {
+    if (config.max_context_window < 1) {
+        throw std::invalid_argument("max_context_window must be at least 1");
+    }
+    const std::size_t capacity = view_page_capacity(config);
+    for (const kv_layer& layer : shard.kv_layers()) {
+        if (!layer.state) {
+            continue;
+        }
+        const std::size_t state_lines = (layer.state->input_window ? 1 : config.draft_tokens + 1) + 2;
+        if (state_lines > capacity) {
+            throw std::invalid_argument(
+                std::format(
+                    "a recurrent layer takes {} lines, more than the {} pages of a view of max_context_window {}",
+                    state_lines,
+                    capacity,
+                    config.max_context_window
+                )
+            );
+        }
+    }
+    return capacity;
 }
 
 const any_model_config& checked_model_config(const any_model_config& model_config, const engine_config& config) {
@@ -225,12 +272,11 @@ std::vector<communicator> make_communicators(std::span<const at::Device> devices
     return communicator::make(devices);
 }
 
-// The pages of a view of max_context_window tokens, its last page partly filled, when decode graphs are on.
 std::optional<std::size_t> graph_pages(const engine_config& config) {
-    if (!config.decode_graphs || !config.max_context_window) {
+    if (!config.decode_graphs) {
         return std::nullopt;
     }
-    return (*config.max_context_window + config.page_size - 1) / config.page_size + 1;
+    return view_page_capacity(config);
 }
 
 std::size_t largest_line(const engine_config& config, const model& shard) {
@@ -341,6 +387,7 @@ engine::engine(
   worker_loops(make_worker_loops(devices.size())),
   page_size(config.page_size),
   vocab_size(vocab_size),
+  max_context_window(config.max_context_window),
   max_page_bytes(largest_line(config, *this->shards.front())),
   store(std::move(store)),
   exec(
@@ -352,9 +399,11 @@ engine::engine(
       loop_pointers(worker_loops),
       make_root_digest(config.model_name, config.model_hash, page_shapes(config, full_layers(*this->shards.front()))),
       std::vector<std::int64_t>(config.stop_ids),
+      checked_view_page_capacity(config, *this->shards.front()),
       graph_pages(config),
       checked_draft_tokens(config, this->shards),
-      sampled_row_limit
+      sampled_row_limit,
+      checked_max_running_requests(config)
   ),
   sched(exec, checked_prefill_tokens_per_step(config)) {
     for (std::size_t shard = 1; shard < devices.size(); shard++) {
@@ -442,7 +491,7 @@ void engine::run_worker_loop(std::size_t shard) {
 // A submit racing the loop's exit finds loop null; the task is then destroyed without running, and the
 // executor::unstarted_callbacks in its frame ends the callbacks with loop_exited.
 void engine::submit(request&& r, std::unique_ptr<request_callbacks> callbacks) {
-    validate(r, vocab_size);
+    validate(r, vocab_size, max_context_window);
     task<void> serving = sched.submit(std::move(r), std::move(callbacks));
     std::lock_guard lock(mutex);
     if (loop != nullptr) {

@@ -183,6 +183,7 @@ class RequestError(enum.Enum):
     MISSING_STATE = ...
     INVALID_STATE = ...
     OOM = ...
+    CONTEXT_EXCEEDED = ...
     CANCELLED = ...
     LOOP_EXITED = ...
 
@@ -445,18 +446,21 @@ class Engine:
         stop_ids: list[int],
         prefill_tokens_per_step: int,
         decode_graphs: bool,
-        max_context_window: int | None,
+        max_context_window: int,
         draft_tokens: int,
+        max_running_requests: int = 64,
     ) -> None:
         """Runs the model of config split over devices: load_model_shard(rank,
         len(devices)) gives rank's weights on devices[rank], each rank loaded
-        before the next. Each device's KV cache takes kv_cache_gib. With
-        decode_graphs, decode and verify steps whose views hold at most
-        max_context_window tokens replay from CUDA graphs captured before
-        serving. A step drafts draft_tokens tokens per sequence with the model's
-        multi-token prediction layer. Raises ValueError for a model the engine
-        does not split over devices, or that drafts no tokens with draft_tokens
-        above 0."""
+        before the next. Each device's KV cache takes kv_cache_gib. A request's
+        view holds at most max_context_window tokens, and a request whose view
+        would hold more ends with CONTEXT_EXCEEDED. With decode_graphs, decode
+        and verify steps replay from CUDA graphs captured before serving. A step
+        drafts draft_tokens tokens per sequence with the model's multi-token
+        prediction layer. At most max_running_requests requests run at once; a
+        request submitted beyond them waits until one ends. Raises ValueError for
+        a model the engine does not split over devices, or that drafts no tokens
+        with draft_tokens above 0."""
     def submit(
         self,
         tokens: list[int],
@@ -472,7 +476,8 @@ class Engine:
         """Serves tokens, a history chained from initial_digest or from the engine's
         root without it, from the newest state the store holds for a prefix of
         them, and writes every state the request reaches to the store. Raises
-        ValueError for a request the engine cannot serve. Request.take calls
+        ValueError for a request the engine cannot serve, such as one whose
+        eviction.max_context_window exceeds the engine's. Request.take calls
         on_prefill, on_cycle and on_end on its caller's thread."""
     def eviction_report_of(
         self, state: State, eviction: EvictionPolicy

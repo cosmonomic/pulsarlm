@@ -62,7 +62,11 @@ def load_served_model(
             drafts=draft_tokens > 0,
         ).weights
 
-    max_context = cfg.max_position_embeddings or None
+    max_context_window = settings.max_context_window or cfg.max_position_embeddings
+    if not max_context_window:
+        raise checkpoint.PulsarLMModelLoadingError(
+            f"{settings.model} states no trained context length; set --max_context_window"
+        )
     stops = stop_ids(tokenizer, cfg.eos_ids)
     store = (
         LocalStore(
@@ -89,8 +93,9 @@ def load_served_model(
             stop_ids=stops,
             prefill_tokens_per_step=settings.prefill_tokens_per_step,
             decode_graphs=settings.decode_graphs,
-            max_context_window=settings.max_context_window or max_context,
+            max_context_window=max_context_window,
             draft_tokens=draft_tokens,
+            max_running_requests=settings.max_running_requests,
         )
     except ValueError as error:
         raise checkpoint.PulsarLMModelLoadingError(str(error)) from error
@@ -106,7 +111,7 @@ def load_served_model(
             n_working=settings.n_working,
             cycle_tokens=settings.cycle_tokens,
             mass_tokens=settings.mass_tokens,
-            max_context_window=settings.max_context_window or max_context,
+            max_context_window=max_context_window,
             eviction_threshold=settings.eviction_threshold,
             eviction_warmup=settings.eviction_warmup,
         ),

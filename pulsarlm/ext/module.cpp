@@ -81,7 +81,8 @@ gate_activation activation(const std::string& name) {
 }
 
 // Shard r of the model runs on devices[r] with the weights load_model_shard(r, len(devices)) returns; kv_cache_gib
-// sizes each device's KV cache. A step drafts draft_tokens tokens per sequence (engine_config::draft_tokens).
+// sizes each device's KV cache. A step drafts draft_tokens tokens per sequence (engine_config::draft_tokens), and at
+// most max_running_requests requests run at once (engine_config::max_running_requests).
 std::unique_ptr<python_engine> make_engine(
     py::object store,
     py::object loop,
@@ -97,8 +98,9 @@ std::unique_ptr<python_engine> make_engine(
     std::vector<std::int64_t> stop_ids,
     std::size_t prefill_tokens_per_step,
     bool decode_graphs,
-    std::optional<std::size_t> max_context_window,
-    std::size_t draft_tokens
+    std::size_t max_context_window,
+    std::size_t draft_tokens,
+    std::size_t max_running_requests
 ) {
     if (!(kv_cache_gib > 0.0) || !(store_gib >= 0.0)) {
         throw std::invalid_argument("kv_cache_gib must be positive and store_gib not negative");
@@ -115,6 +117,7 @@ std::unique_ptr<python_engine> make_engine(
         .decode_graphs = decode_graphs,
         .max_context_window = max_context_window,
         .draft_tokens = draft_tokens,
+        .max_running_requests = max_running_requests,
     };
     auto adapter = std::make_unique<python_store>(
         std::move(store),
@@ -259,6 +262,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
         .value("MISSING_STATE", request_error::missing_state)
         .value("INVALID_STATE", request_error::invalid_state)
         .value("OOM", request_error::oom)
+        .value("CONTEXT_EXCEEDED", request_error::context_exceeded)
         .value("CANCELLED", request_error::cancelled)
         .value("LOOP_EXITED", request_error::loop_exited)
         .finalize();
@@ -738,7 +742,8 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "prefill_tokens_per_step"_a,
             "decode_graphs"_a,
             "max_context_window"_a,
-            "draft_tokens"_a
+            "draft_tokens"_a,
+            "max_running_requests"_a = engine_config{}.max_running_requests
         )
         .def(
             "submit",

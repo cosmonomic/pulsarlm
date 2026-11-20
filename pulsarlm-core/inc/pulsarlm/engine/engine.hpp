@@ -60,6 +60,7 @@ class engine {
     std::vector<std::unique_ptr<event_loop>> worker_loops;
     std::size_t page_size;
     std::size_t vocab_size;
+    std::size_t max_context_window;
     std::size_t max_page_bytes;
     std::unique_ptr<page_store> store;
     executor exec;
@@ -113,7 +114,8 @@ class engine {
     ~engine();
 
     // Serves r, passing its results to callbacks. Safe to call from any thread. Throws std::invalid_argument, without
-    // calling callbacks, when r breaks a precondition of scheduler::submit or holds a token outside [0, vocab_size).
+    // calling callbacks, when r breaks a precondition of scheduler::submit, holds a token outside [0, vocab_size) or
+    // its eviction.max_context_window exceeds the engine's.
     void submit(request&& r, std::unique_ptr<request_callbacks> callbacks);
     // The exception that panicked the loop; null while the loop runs or when it was stopped.
     std::exception_ptr exception() const;

@@ -321,6 +321,10 @@ task<void> executor::refresh_views(batch& b) {
                 first_stale_page = 0;
             }
             std::vector<std::size_t> missing_counts = req.missing_lines();
+            if (table_width_after(req, missing_counts) > view_page_capacity) {
+                req.exceed_context();
+                continue;
+            }
             if (std::ranges::any_of(missing_counts, [](std::size_t count) { return count > 0; })) {
                 std::expected<std::vector<std::vector<std::uint32_t>>, page_error> allocation = cache.allocate(
                     missing_counts
@@ -339,7 +343,7 @@ task<void> executor::refresh_views(batch& b) {
                 record_device_memory(req);
             }
             if (first_stale_page) {
-                req.upload_table(*first_stale_page, streams_of(&shard::compute_stream));
+                mark_stale_tables(e.req.key(), *first_stale_page);
             }
         }
     }

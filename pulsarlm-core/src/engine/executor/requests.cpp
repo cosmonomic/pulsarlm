@@ -82,20 +82,14 @@ task<std::optional<executor::request_id_type>> executor::start(request&& r, unst
         co_return std::nullopt;
     }
     std::shared_ptr<const state> initial_state = extend_with_hot_pages(std::move(stored_state), r, digests);
-    std::vector<at::Device> devices;
-    for (const shard& s : shards) {
-        devices.push_back(s.lines.front().k.device());
+    request_state started(std::move(r), std::move(initial_state), lease_id, std::move(digests), chain_root, layout);
+    if (table_width_after(started, start_line_counts(started)) > view_page_capacity) {
+        store.release(lease_id);
+        callbacks.release()->on_end(std::unexpected(request_error::context_exceeded), request_statistics{});
+        co_return std::nullopt;
     }
-    request_state started(
-        std::move(r),
-        std::move(initial_state),
-        lease_id,
-        std::move(digests),
-        chain_root,
-        layout,
-        std::span<const at::Device>(devices)
-    );
     const request_id_type id = requests.emplace(callbacks.release(), std::move(started));
+    assert(slot_of(id) < max_running_requests);
     request_state& req = requests[id].state;
     // take_lines holds the resident pages before it first suspends, so they are the ones counted here.
     req.record_device_cached_tokens(device_cached_tokens(req));
@@ -118,7 +112,7 @@ task<std::optional<executor::request_id_type>> executor::start(request&& r, unst
         end_request(id, std::unexpected(request_error::oom), request_statistics{});
         co_return std::nullopt;
     }
-    req.upload_table(0, streams_of(&shard::compute_stream));
+    mark_stale_tables(id, 0);
     co_return id;
 }
 
@@ -236,6 +230,9 @@ task<void> executor::stop(request_id_type id) {
         break;
     case request_state::exit_reason::oom:
         result = std::unexpected(request_error::oom);
+        break;
+    case request_state::exit_reason::context_exceeded:
+        result = std::unexpected(request_error::context_exceeded);
         break;
     }
     store.release(req.lease_id());

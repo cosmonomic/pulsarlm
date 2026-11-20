@@ -66,6 +66,8 @@ enum class request_error {
     // The stored state breaks a rule of a state.
     invalid_state,
     oom,
+    // The request's view would exceed max_context_window tokens.
+    context_exceeded,
     cancelled,
     loop_exited,
 };

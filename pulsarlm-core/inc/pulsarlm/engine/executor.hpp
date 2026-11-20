@@ -11,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -90,6 +91,10 @@ class executor {
         at::Tensor samples;
         // The arrival counters of the steps that run without a graph, grown to the largest step's.
         at::Tensor arrival_counters;
+        // int32 [max_running_requests, n_kv_layers, view_page_capacity]: per running request, slot-indexed, per view page
+        // its line and the RoPE position of its first key.
+        at::Tensor page_tables;
+        at::Tensor page_positions;
     };
 
     // One layer per KV layer, in the models' KV layer order.
@@ -97,8 +102,14 @@ class executor {
     page_store& store;
     // One per shard of the cache.
     std::vector<shard> shards;
+    // The columns of a shard's page_tables, the pages of the widest view a request holds.
+    std::size_t view_page_capacity;
     // The page-table width of the graphs, the pages of the longest view they cover.
     std::optional<std::size_t> graph_pages;
+    // The most requests with a record at once, which bounds their slots.
+    std::size_t max_running_requests;
+    // Per request, the first column of its page tables that the shards' page_tables and page_positions do not hold yet.
+    std::unordered_map<request_id_type, std::size_t> stale_tables;
     // A recurrent layer's state_slots are draft_state_slots for a state and 1 for a window. A layer's mass_heads are
     // the query heads it measures mass and evicts pages in, those of every attention layer reading a full-attention
     // layer, and 0 for other layers.
@@ -122,6 +133,16 @@ class executor {
     // The most rows of sampled tokens a batch has.
     std::size_t sampled_row_capacity;
 
+    // The slot of id's request, its row of a shard's page_tables.
+    static std::size_t slot_of(request_id_type id) noexcept;
+    // Marks the columns of id's page tables from first_column on as stale (stale_tables).
+    void mark_stale_tables(request_id_type id, std::size_t first_column);
+    // The columns of req's page tables once each KV layer holds line_counts[layer] more lines.
+    std::size_t table_width_after(const request_state& req, std::span<const std::size_t> line_counts) const;
+    // Per KV layer, the lines take_lines gives req for its first cycle.
+    std::vector<std::size_t> start_line_counts(const request_state& req) const;
+    // Moves stale_tables into b: the cells of each request's stale columns, from its view, that b's enqueue sets.
+    void move_stale_tables(batch& b);
     // The tokens of req's full history pages that every KV layer reading the page holds resident.
     std::size_t device_cached_tokens(const request_state& req) const;
     // Per KV layer with pages, lines for its pages, then line_count empty lines; per recurrent layer, a copy of the
@@ -204,10 +225,11 @@ class executor {
     // models[s] runs on cache shard s with streams[s], for s above 0 on worker_loops[s - 1], and its write-backs' copies
     // to the store on copy_streams[s], which the caller synchronizes before freeing what the copies read; the cache holds one layer
     // per entry of each model's kv_layers(), and the shards agree on which layers are recurrent or sliding. store is the
-    // cache's. root is the engine's root digest (make_root_digest). With graph_pages, a decode group whose requests'
-    // tables fit graph_pages pages replays a step_graphs graph over tables that wide, and so does a verify group. A step drafts
-    // draft_tokens tokens per request with the shards' draft heads, which they have when draft_tokens is above 0, and
-    // the cache's recurrent layers are laid out for them (recurrent_state).
+    // cache's. root is the engine's root digest (make_root_digest). A request's view takes at most view_page_capacity
+    // pages, and one that would take more ends with context_exceeded. With graph_pages, a decode group's forward replays a step_graphs
+    // graph over tables graph_pages wide, and so does a verify group's. A step drafts draft_tokens tokens per request
+    // with the shards' draft heads, which they have when draft_tokens is above 0, and the cache's recurrent layers are
+    // laid out for them (recurrent_state). At most max_running_requests requests hold a record at once (start).
     executor(
         std::vector<model*>&& models,
         kv_cache cache,
@@ -217,9 +239,11 @@ class executor {
         std::vector<event_loop*>&& worker_loops,
         digest root,
         std::vector<std::int64_t>&& stop_ids,
+        std::size_t view_page_capacity,
         std::optional<std::size_t> graph_pages,
         std::size_t draft_tokens,
-        std::size_t sampled_row_limit
+        std::size_t sampled_row_limit,
+        std::size_t max_running_requests
     );
     ~executor();
 
@@ -236,8 +260,12 @@ class executor {
     // start, before the store is read, with missing_state when the lookup or a page read fails, with invalid_state when
     // the stored state's head is not a digest of r's full pages, its tail is not a proper prefix of r's tokens after
     // its head, or one of its layers lists a page hash twice, and with oom when the free lines do not cover the state's
-    // pages and one cycle's tokens. The lease of a request that fails is released before on_end.
+    // pages and one cycle's tokens, and with context_exceeded, before it takes lines, when its view with them would take
+    // more than view_page_capacity pages. The lease of a request that fails is released before on_end. Fewer than max_running_request_count() requests hold a record at the call.
     task<std::optional<request_id_type>> start(request&& r, unstarted_callbacks callbacks);
+    std::size_t max_running_request_count() const noexcept;
+    // The requests with a record, from the creation of their request state until their end.
+    std::size_t request_count() const noexcept;
     // Whether a step of the requests in scheduled can be launched now, before any write-back: no step is launched or the last launched
     // step allows overlap, and so does a step of the requests in scheduled. A step allows overlap when it ends no cycle and, in a model
     // with sliding layers, completes no page, or in an executor whose steps draft, when every entry verifies drafts.
@@ -259,7 +287,7 @@ class executor {
     // completed pages, evicts and writes the state at a cycle end, and takes lines for the next tokens. The pages of a
     // request writing no state are written by a spawned task; a request writing its state waits for its pages' writes
     // first, and a failed write is found at a later write-back. Records on each request a stop token or max_tokens it
-    // reached, a failed store write, or a line allocation that failed, and sets the exit reason (request_state::exit) of
+    // reached, a failed store write, or a line allocation that failed or a view that would grow past view_page_capacity pages, and sets the exit reason (request_state::exit) of
     // each request with an exit cause that the step leaves in no launched step. A request stopped by a token while in a
     // later launched step withdraws that step's token (request_state::withdraw_latest_step); entries of requests that
     // reached the end or whose store write failed before are skipped. Returns the requests of the step's entries, in

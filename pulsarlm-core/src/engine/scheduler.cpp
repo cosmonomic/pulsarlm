@@ -35,9 +35,34 @@ task<void> scheduler::submit(request&& r, std::unique_ptr<request_callbacks>&& c
     return serve(std::move(r), executor::unstarted_callbacks(std::move(callbacks), end_with_loop_exited));
 }
 
+// A request waiting when the loop exits is destroyed with its task, and its event leaves waiting_requests unread.
+task<void> scheduler::admit() {
+    if (admitted_count < exec.max_running_request_count()) {
+        admitted_count++;
+        co_return;
+    }
+    event admission;
+    waiting_requests.push_back(&admission);
+    co_await admission;
+}
+
+// The first waiting request takes the place, so a request arriving between the hand-off and its resumption waits
+// behind it.
+void scheduler::pass_admission() noexcept {
+    if (waiting_requests.empty()) {
+        admitted_count--;
+        return;
+    }
+    event* first = waiting_requests.front();
+    waiting_requests.pop_front();
+    first->set();
+}
+
 task<void> scheduler::serve(request r, executor::unstarted_callbacks callbacks) {
+    co_await admit();
     const std::optional<executor::request_id_type> id = co_await exec.start(std::move(r), std::move(callbacks));
     if (!id) {
+        pass_admission();
         co_return;
     }
     event& exit_event = exit_events.try_emplace(*id).first->second;
@@ -46,6 +71,7 @@ task<void> scheduler::serve(request r, executor::unstarted_callbacks callbacks) 
     co_await exit_event;
     exit_events.erase(*id);
     co_await exec.stop(*id);
+    pass_admission();
 }
 
 task<void> scheduler::run() {

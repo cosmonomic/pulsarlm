@@ -1,7 +1,6 @@
 #include "batch.hpp"
 
 #include "pulsarlm/engine/executor.hpp"
-#include "pulsarlm/kernels/page_tables.hpp"
 
 #include <ATen/ATen.h>
 
@@ -41,8 +40,10 @@ executor::batch::batch(executor& owner, std::span<const scheduled_request> sched
             continue;
         }
         g->inputs = make_group(g->entries, owner.layout.page_size, owner.draft_state_slots, g->inputs.kind);
+        g->slots = request_slots(g->entries);
         g->table_width = table_width(g->entries);
-        if (g != &prefill_group && owner.graph_pages && g->table_width <= *owner.graph_pages) {
+        assert(g->table_width <= owner.view_page_capacity);
+        if (g != &prefill_group && owner.graph_pages) {
             g->is_replayed = true;
             g->table_width = *owner.graph_pages;
         }
@@ -208,25 +209,17 @@ bool executor::batch::measures_mass(const entry& e) noexcept {
         e.req->history_position() + forwarded(e) + lag > e.req->mass_start_position();
 }
 
-at::Tensor executor::batch::page_tables(
-    std::span<const entry> group,
-    std::size_t n_kv_layers,
-    bool positions,
-    std::size_t shard,
-    std::size_t width
-) {
-    std::vector<at::Tensor> tables;
-    std::vector<std::size_t> page_counts;
-    for (const entry& e : group) {
-        tables.push_back(positions ? e.req->position_table(shard) : e.req->line_table(shard));
-        page_counts.push_back(e.req->table_width());
+at::Tensor executor::batch::request_slots(std::span<const entry> group) {
+    at::Tensor slots = pinned({static_cast<std::int64_t>(group.size())}, at::kInt);
+    auto* slot = slots.mutable_data_ptr<std::int32_t>();
+    for (std::size_t s = 0; s < group.size(); s++) {
+        slot[s] = static_cast<std::int32_t>(slot_of(group[s].req.key()));
     }
-    return gather_page_tables_cuda(
-        tables,
-        page_counts,
-        static_cast<std::int64_t>(n_kv_layers),
-        static_cast<std::int64_t>(width)
-    );
+    return slots;
+}
+
+at::Tensor executor::batch::select_tables(const at::Tensor& slots, const at::Tensor& tables, std::size_t width) {
+    return tables.narrow(2, 0, static_cast<std::int64_t>(width)).index_select(0, slots).transpose(0, 1).contiguous();
 }
 
 void executor::batch::plan_draft_rows(

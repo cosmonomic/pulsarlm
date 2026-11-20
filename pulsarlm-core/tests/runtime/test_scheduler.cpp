@@ -629,7 +629,9 @@ struct fixture {
         memory_store backing_store = {},
         std::vector<pulsarlm::kv_layer> layers = two_full_layers,
         std::optional<std::size_t> pool_bytes = std::nullopt,
-        std::size_t sampled_row_limit = 4096
+        std::size_t sampled_row_limit = 4096,
+        std::size_t max_running_requests = 64,
+        std::size_t view_page_capacity = 4096 / page_size + 1
     )
     : backing(std::move(backing_store)),
       store(backing.contents),
@@ -643,9 +645,11 @@ struct fixture {
           {},
           root(),
           std::move(stop_ids),
+          view_page_capacity,
           std::nullopt,
           draft_tokens,
-          sampled_row_limit
+          sampled_row_limit,
+          max_running_requests
       ),
       sched(exec, prefill_tokens_per_step) {}
 
@@ -809,6 +813,37 @@ std::vector<request_results> serve_submissions(pulsarlm::scheduler& sched, std::
     loop.spawn(sched.run());
     for (submission& s : submissions) {
         loop.spawn(serve(sched, std::move(s.r), std::move(s.callbacks), remaining));
+    }
+    REQUIRE(loop.run() == nullptr);
+    std::vector<request_results> results;
+    for (submission& s : submissions) {
+        results.push_back(*s.recorded_results);
+    }
+    return results;
+}
+
+// Runs sched once count requests hold a record in exec and their starts have resumed from their line allocation's
+// synchronization, so that its first step finds them all.
+task<void> run_once_started(pulsarlm::scheduler& sched, const pulsarlm::executor& exec, std::size_t count) {
+    const cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    while (exec.request_count() < count) {
+        co_await pulsarlm::synchronize(stream);
+    }
+    co_await pulsarlm::synchronize(stream);
+    co_await sched.run();
+}
+
+// Serves requests as serve_all does, its first step taking them all.
+std::vector<request_results> serve_all_at_once(fixture& f, std::vector<request> requests) {
+    std::size_t remaining = requests.size();
+    std::vector<submission> submissions;
+    for (request& r : requests) {
+        submissions.push_back(make_submission(std::move(r)));
+    }
+    event_loop loop;
+    loop.spawn(run_once_started(f.sched, f.exec, submissions.size()));
+    for (submission& s : submissions) {
+        loop.spawn(serve(f.sched, std::move(s.r), std::move(s.callbacks), remaining));
     }
     REQUIRE(loop.run() == nullptr);
     std::vector<request_results> results;
@@ -1425,8 +1460,8 @@ TEST_CASE("a running request that finds too few free lines for its next cycle en
     fixture f(5);
     token_list first{1, 2, 3, 4};
     token_list second{5, 6, 7, 8};
-    std::vector<request_results> results = serve_all(
-        f.sched,
+    std::vector<request_results> results = serve_all_at_once(
+        f,
         {request{.tokens = first, .max_tokens = 10, .eviction = {.cycle_tokens = 4}},
          request{.tokens = second, .max_tokens = 10, .eviction = {.cycle_tokens = 4}}}
     );
@@ -1863,8 +1898,8 @@ TEST_CASE("running requests are forwarded in one step") {
     fixture f(16);
     token_list first{1, 2, 3};
     token_list second{4, 5, 6};
-    std::vector<request_results> results = serve_all(
-        f.sched,
+    std::vector<request_results> results = serve_all_at_once(
+        f,
         {request{.tokens = first, .max_tokens = 3}, request{.tokens = second, .max_tokens = 3}}
     );
 
@@ -1900,8 +1935,8 @@ TEST_CASE("a stop token sampled while the next step runs ends the request with t
     token_list second{5, 0, 0};
     REQUIRE(continuation(first, 3) == token_list{6, 12, 24});
     fixture f(16, 64, {24});
-    std::vector<request_results> results = serve_all(
-        f.sched,
+    std::vector<request_results> results = serve_all_at_once(
+        f,
         {request{.tokens = first, .max_tokens = 10}, request{.tokens = second, .max_tokens = 6}}
     );
 
@@ -1946,8 +1981,8 @@ TEST_CASE("a sliding layer holds only the pages its window reaches") {
     std::iota(first.begin(), first.end(), 1);
     token_list second(20);
     std::iota(second.begin(), second.end(), 100);
-    std::vector<request_results> results = serve_all(
-        f.sched,
+    std::vector<request_results> results = serve_all_at_once(
+        f,
         {request{.tokens = first, .max_tokens = 6, .eviction = {.cycle_tokens = 8}},
          request{.tokens = second, .max_tokens = 6, .eviction = {.cycle_tokens = 8}}}
     );
@@ -2362,7 +2397,7 @@ limited_run serve_three_under_row_limit(std::size_t sampled_row_limit) {
     for (const token_list& prompt : three_decode_prompts) {
         requests.push_back(request{.tokens = prompt, .max_tokens = three_decode_max_tokens});
     }
-    std::vector<request_results> results = serve_all(f.sched, std::move(requests));
+    std::vector<request_results> results = serve_all_at_once(f, std::move(requests));
     return limited_run{
         .results = std::move(results),
         .decode_sizes = f.model.decode_sizes,
@@ -2446,13 +2481,110 @@ TEST_CASE("a prefilling request left out by the row limit leaves its prefill tok
     for (const token_list& prompt : prompts) {
         requests.push_back(request{.tokens = prompt, .max_tokens = 2});
     }
-    std::vector<request_results> results = serve_all(f.sched, std::move(requests));
+    std::vector<request_results> results = serve_all_at_once(f, std::move(requests));
 
     for (std::size_t i = 0; i < prompts.size(); i++) {
         REQUIRE(results[i].tokens == continuation(prompts[i], 2));
     }
     REQUIRE(!f.model.prefill_chunks.empty());
     REQUIRE(f.model.prefill_chunks.front() == token_list{2, 2, 2});
+}
+
+TEST_CASE("a request beyond max_running_requests waits until one ends, and each produces its tokens alone") {
+    fixture f(16, 64, {}, {}, two_full_layers, std::nullopt, 4096, 1);
+    token_list first{1, 2, 3};
+    token_list second{4, 5, 6};
+    std::vector<request_results> results = serve_all(
+        f.sched,
+        {request{.tokens = first, .max_tokens = 3}, request{.tokens = second, .max_tokens = 3}}
+    );
+
+    REQUIRE(results[0].tokens == continuation(first, 3));
+    REQUIRE(results[1].tokens == continuation(second, 3));
+    REQUIRE(results[0].end->has_value());
+    REQUIRE(results[1].end->has_value());
+    REQUIRE(f.model.prefill_chunks == std::vector<token_list>{{3}, {3}});
+    REQUIRE(f.model.decode_sizes == std::vector<std::int64_t>(4, 1));
+}
+
+TEST_CASE("a request waiting for a record when the loop exits ends with loop_exited once") {
+    auto first_results = std::make_shared<request_results>();
+    auto waiting_results = std::make_shared<request_results>();
+    std::shared_ptr<store_contents> store;
+    {
+        fixture f(16, 64, {}, {}, two_full_layers, std::nullopt, 4096, 1);
+        store = f.store;
+        store->lookup_stops_loop = true;
+        {
+            event_loop loop;
+            loop.spawn(f.sched.submit(request{.tokens = {1, 2, 3}, .max_tokens = 10}, make_callbacks(first_results)));
+            loop.spawn(f.sched.submit(request{.tokens = {4, 5, 6}, .max_tokens = 10}, make_callbacks(waiting_results)));
+            REQUIRE(loop.run() == nullptr);
+            REQUIRE(store->state_reads.size() == 1);
+            REQUIRE(waiting_results->end_count == 0);
+        }
+        REQUIRE(waiting_results->end_count == 1);
+    }
+    REQUIRE(waiting_results->end_count == 1);
+    REQUIRE(ended_error(*waiting_results) == request_error::loop_exited);
+    REQUIRE(ended_error(*first_results) == request_error::loop_exited);
+    REQUIRE(store->state_reads.size() == 1);
+}
+
+TEST_CASE("a waiting request whose callbacks are cancelled ends with cancelled at its turn without a lease") {
+    fixture f(16, 64, {}, {}, two_full_layers, std::nullopt, 4096, 1);
+    token_list first{1, 2, 3};
+    std::vector<submission> submissions;
+    submissions.push_back(make_submission(request{.tokens = first, .max_tokens = 3}));
+    submissions.push_back(make_submission(request{.tokens = {4, 5, 6}, .max_tokens = 3}));
+    submissions.back().recorded_results->cancelled = true;
+    std::vector<request_results> results = serve_submissions(f.sched, std::move(submissions));
+
+    REQUIRE(results[0].tokens == continuation(first, 3));
+    REQUIRE(results[1].tokens.empty());
+    REQUIRE(ended_error(results[1]) == request_error::cancelled);
+    REQUIRE(f.store->state_reads.size() == 1);
+    REQUIRE(f.store->leases.size() == 1);
+    REQUIRE(f.store->releases == f.store->leases);
+}
+
+// Each cycle of 8 tokens adds 2 lines to the views, which hold at most 5 pages: the lines for the cycle ending at 24
+// would make 6, so the request ends at the write-back of the step that reaches 16, having sampled 14 tokens.
+TEST_CASE("a request whose view would grow past the page tables ends with context_exceeded and its tokens") {
+    fixture f(64, 64, {}, {}, two_full_layers, std::nullopt, 4096, 64, 5);
+    token_list prompt{1, 2, 3};
+    std::vector<request_results> results = serve_all(
+        f.sched,
+        {request{.tokens = prompt, .max_tokens = 100, .eviction = {.cycle_tokens = 8}}}
+    );
+
+    REQUIRE(results[0].tokens == continuation(prompt, 14));
+    REQUIRE(ended_error(results[0]) == request_error::context_exceeded);
+    REQUIRE(f.store->releases == f.store->leases);
+    REQUIRE(f.exec.kv_cache_bytes() == 0);
+}
+
+// The stored state's 5 pages and the cycle's line make 6 columns, more than the 3 of the page tables.
+TEST_CASE("a stored state whose view is wider than the page tables ends the request with context_exceeded") {
+    fixture f(16, 64, {}, {}, two_full_layers, std::nullopt, 4096, 64, 3);
+    token_list prompt(21);
+    std::iota(prompt.begin(), prompt.end(), 1);
+    f.backing.keep_state(
+        std::make_shared<const pulsarlm::state>(
+            full_layers_state(pulsarlm::make_page_digests(root(), prompt, page_size), 2)
+        )
+    );
+    std::vector<request_results> results = serve_all(
+        f.sched,
+        {request{.tokens = prompt, .max_tokens = 1, .eviction = {.cycle_tokens = 4}}}
+    );
+
+    REQUIRE(results[0].tokens.empty());
+    REQUIRE(ended_error(results[0]) == request_error::context_exceeded);
+    REQUIRE(results[0].statistics.peak_device_memory == 0);
+    REQUIRE(f.model.forward_count == 0);
+    REQUIRE(f.store->fetches.empty());
+    REQUIRE(f.store->releases == f.store->leases);
 }
 
 }  // namespace

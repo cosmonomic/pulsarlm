@@ -5,8 +5,6 @@
 #include "pulsarlm/engine/request.hpp"
 #include "pulsarlm/engine/state.hpp"
 
-#include <ATen/ATen.h>
-
 #undef CHECK
 #include <catch2/catch_test_macros.hpp>
 
@@ -62,7 +60,6 @@ view_layout make_layout(std::size_t page_size, bool has_recurrent_layer) {
 // The request state of a request that resumes the empty state, with what it refers to.
 class started_request {
     view_layout layout;
-    std::vector<at::Device> devices{at::Device(at::kCUDA, 0)};
 
   public:
     request_state req;
@@ -74,8 +71,7 @@ class started_request {
           lease_id,
           pulsarlm::make_page_digests(root, tokens, this->layout.page_size),
           root,
-          this->layout,
-          devices) {}
+          this->layout) {}
 };
 
 token_list to_list(std::span<const std::int64_t> tokens) {

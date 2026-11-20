@@ -12,6 +12,7 @@ class Settings:
     dtype: str
     kv_cache_gib: float
     prefill_tokens_per_step: int
+    max_running_requests: int
     decode_graphs: bool
     store_gib: float
     persist: bool

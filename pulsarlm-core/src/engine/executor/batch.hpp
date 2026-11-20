@@ -78,6 +78,8 @@ class executor::batch {
         std::vector<entry> entries;
         // Pinned host tensors.
         model::batch inputs;
+        // Pinned host int32, the slot of each entry's request (executor::slot_of).
+        at::Tensor slots;
         // The page-table width, and whether the group's forward replays a graph.
         std::size_t table_width = 0;
         bool is_replayed = false;
@@ -103,6 +105,12 @@ class executor::batch {
     bool awaits_tokens = false;
     // executor::entries_allow_overlap of the step's entries at its launch.
     bool allows_overlap = false;
+    // Pinned host tensors, undefined when the step sets none: the cells of each shard's page_tables and page_positions
+    // that the step sets before its forward, as indices into them flattened (int64), and their lines and RoPE
+    // positions (int32).
+    at::Tensor table_cells;
+    at::Tensor table_lines;
+    at::Tensor table_positions;
     // Per row sampled, in entry order: a row of each entry that samples but a verify entry's verify_rows, the params
     // and draw.
     std::vector<sampling_params> sample_params;
@@ -141,8 +149,8 @@ class executor::batch {
     at::Tensor next_tokens;
 
     // scheduled with their requests found in owner, each recorded with whether it samples after its tokens and
-    // whether they end its eviction cycle. With owner's graph_pages, a decode or verify group whose tables fit
-    // graph_pages pages takes tables that wide and replays a graph.
+    // whether they end its eviction cycle. With owner's graph_pages, a decode or verify group takes tables
+    // graph_pages wide and replays a graph.
     batch(executor& owner, std::span<const scheduled_request> scheduled);
 
     // The groups in entry order: decode, verify, prefill.
@@ -161,30 +169,40 @@ class executor::batch {
     static bool measures_mass(std::span<const entry> group) noexcept;
     // Whether e forwards a query that adds mass.
     static bool measures_mass(const entry& e) noexcept;
-    // The group's tables of lines, or of positions with positions, on shard's device, as model::batch lays them out.
-    static at::Tensor page_tables(
+    // Pinned host int32, the slot of each entry's request.
+    static at::Tensor request_slots(std::span<const entry> group);
+    // int32 [n_kv_layers, slots, width] on tables' device: the first width columns of the rows of tables, a shard's
+    // page_tables or page_positions, at slots, which are on that device.
+    static at::Tensor select_tables(const at::Tensor& slots, const at::Tensor& tables, std::size_t width);
+    // Sets g's page tables and positions to group's rows of a shard's page_tables and page_positions, as wide as the
+    // widest table among its requests.
+    static void set_page_tables(
         std::span<const entry> group,
-        std::size_t n_kv_layers,
-        bool positions,
-        std::size_t shard,
-        std::size_t width
+        model::batch& g,
+        const at::Tensor& page_tables,
+        const at::Tensor& page_positions
     );
-    static void set_page_tables(std::span<const entry> group, model::batch& g, std::size_t n_layers, std::size_t shard);
-    // Queues on the current stream, shard's, the copies of g's inputs to its device, with its tables, the filling of a
-    // decode group's awaited tokens from samples and a verify group's tokens of the previous step. Returns the inputs
-    // on the device and their zeroed page mass, undefined for a group that measures none. mass_heads is the shard's
-    // part of the executor's.
+    // Queues on the current stream the copy of the step's table cells to the device of page_tables and page_positions,
+    // a shard's, and their writes.
+    void write_tables(at::Tensor& page_tables, at::Tensor& page_positions) const;
+    // Queues on the current stream, shard's, the copies of g's inputs to its device, with its rows of page_tables and
+    // page_positions, the filling of a decode group's awaited tokens from samples and a verify group's tokens of the
+    // previous step. Returns the inputs on the device and their zeroed page mass, undefined for a group that measures
+    // none. mass_heads is the shard's part of the executor's.
     std::pair<model::batch, at::Tensor> upload_inputs(
         const group& g,
         std::span<const kv> lines,
         const std::vector<std::size_t>& mass_heads,
         std::size_t shard,
-        const at::Tensor& samples
+        const at::Tensor& samples,
+        const at::Tensor& page_tables,
+        const at::Tensor& page_positions
     );
-    // Queues on stream shard's copy of the prior hidden rows from draft_layer's lines, then per group its inputs
-    // (upload_inputs), its forward and the copy of its page mass to the host, then the sampling into samples; shard 0
-    // also queues the copy of the sampled tokens to the host. mass_heads is the shard's part of the executor's. graphs
-    // is the shard's when a group is replayed. Every shard's call may run at once, each on its own thread.
+    // Queues on stream shard's writes of the step's table cells into page_tables and page_positions (write_tables),
+    // then the copy of the prior hidden rows from draft_layer's lines, then per group its inputs (upload_inputs), its
+    // forward and the copy of its page mass to the host, then the sampling into samples; shard 0 also queues the copy
+    // of the sampled tokens to the host. mass_heads is the shard's part of the executor's. graphs is the shard's when a
+    // group is replayed. Every shard's call may run at once, each on its own thread.
     void enqueue(
         model& shard_model,
         std::span<const kv> lines,
@@ -195,7 +213,9 @@ class executor::batch {
         std::size_t shard,
         step_graphs* graphs,
         const at::Tensor& samples,
-        at::Tensor& counters
+        at::Tensor& counters,
+        at::Tensor& page_tables,
+        at::Tensor& page_positions
     );
     // Adds to the draft head's pass the rows of e's request, at launch before it advances: those of an entry of the
     // verify group, with verifies, its verify_rows rows, another's from its first position without one through its
@@ -211,15 +231,17 @@ class executor::batch {
         std::size_t draft_count
     );
     // Queues on stream shard, after the step's sampling into samples, the verify entries' acceptance of their samples,
-    // stop_tokens ending a run (int64), and the draft head's pass; shard 0 also queues the copies of the accepted
-    // counts and next tokens to the host.
+    // stop_tokens ending a run (int64), and the draft head's pass over the shard's page_tables and page_positions;
+    // shard 0 also queues the copies of the accepted counts and next tokens to the host.
     void enqueue_drafts(
         model& shard_model,
         std::span<const kv> lines,
         const at::Tensor& samples,
         const at::Tensor& stop_tokens,
         std::size_t shard,
-        at::Tensor& counters
+        at::Tensor& counters,
+        const at::Tensor& page_tables,
+        const at::Tensor& page_positions
     );
     // Of the requests that draft, in entry order, after the draft head's first pass: each one's next token then its
     // first draft, the hidden rows its second draft reads, and the shift of its later positions and key counts.
@@ -243,14 +265,18 @@ class executor::batch {
         const at::Tensor& accepted_counts,
         const at::Tensor& shift,
         std::size_t shard,
-        at::Tensor& counters
+        at::Tensor& counters,
+        const at::Tensor& page_tables,
+        const at::Tensor& page_positions
     );
     void enqueue_later_draft_passes(
         model& shard_model,
         std::span<const kv> lines,
         const first_draft& first,
         std::size_t shard,
-        at::Tensor& counters
+        at::Tensor& counters,
+        const at::Tensor& page_tables,
+        const at::Tensor& page_positions
     );
     // Whether the step replays a step_graphs verify step: every entry verifies and drafts, and the verify group
     // replays.

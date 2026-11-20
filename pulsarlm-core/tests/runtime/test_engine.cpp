@@ -216,6 +216,7 @@ pulsarlm::engine_config config(std::size_t n_lines) {
         .devices = {at::Device(at::kCUDA, 0)},
         .stop_ids = {},
         .prefill_tokens_per_step = 64,
+        .max_context_window = 4096,
     };
 }
 
@@ -258,6 +259,24 @@ TEST_CASE("an engine that prefills no token per step is rejected") {
     idle.prefill_tokens_per_step = 0;
     REQUIRE_THROWS_AS(
         pulsarlm::engine(std::make_unique<successor_model>(), vocab, idle, std::make_unique<stalling_store>()),
+        std::invalid_argument
+    );
+}
+
+TEST_CASE("an engine that runs no request at once is rejected") {
+    pulsarlm::engine_config idle = config(16);
+    idle.max_running_requests = 0;
+    REQUIRE_THROWS_AS(
+        pulsarlm::engine(std::make_unique<successor_model>(), vocab, idle, std::make_unique<stalling_store>()),
+        std::invalid_argument
+    );
+}
+
+TEST_CASE("an engine whose context window holds no token is rejected") {
+    pulsarlm::engine_config empty = config(16);
+    empty.max_context_window = 0;
+    REQUIRE_THROWS_AS(
+        pulsarlm::engine(std::make_unique<successor_model>(), vocab, empty, std::make_unique<stalling_store>()),
         std::invalid_argument
     );
 }
@@ -384,6 +403,32 @@ TEST_CASE("submit rejects an invalid request without calling its callbacks") {
     );
     REQUIRE(recorded_results->tokens.empty());
     REQUIRE(!recorded_results->end);
+}
+
+TEST_CASE("submit rejects a request whose context window exceeds the engine's without calling its callbacks") {
+    pulsarlm::engine e(std::make_unique<successor_model>(), vocab, config(16), std::make_unique<stalling_store>());
+    auto recorded_results = std::make_shared<request_results>();
+
+    REQUIRE_THROWS_AS(
+        e.submit(request{.tokens = {1}, .eviction = {.max_context_window = 4097}}, record_into(recorded_results)),
+        std::invalid_argument
+    );
+    REQUIRE(recorded_results->tokens.empty());
+    REQUIRE(!recorded_results->end);
+}
+
+TEST_CASE("a request whose context window is the engine's is served") {
+    pulsarlm::engine e(std::make_unique<successor_model>(), vocab, config(16), std::make_unique<stalling_store>());
+    auto recorded_results = std::make_shared<request_results>();
+    e.submit(
+        request{.tokens = {1, 2, 3}, .max_tokens = 4, .eviction = {.max_context_window = 4096}},
+        record_into(recorded_results)
+    );
+    wait_for_end(*recorded_results);
+
+    REQUIRE(recorded_results->tokens == token_list{4, 5, 6, 7});
+    REQUIRE(recorded_results->end->has_value());
+    REQUIRE(e.exception() == nullptr);
 }
 
 TEST_CASE("destroying the engine ends the requests it serves with loop_exited and releases their leases") {

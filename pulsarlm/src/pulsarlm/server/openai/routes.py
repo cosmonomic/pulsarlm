@@ -280,6 +280,11 @@ def _http_error(error: EngineStopped | CompletionError) -> HTTPException:
         return HTTPException(503, f"engine stopped: {error}")
     if isinstance(error, CompletionError) and error.error == RequestError.OOM:
         return HTTPException(400, "out of device memory")
+    if (
+        isinstance(error, CompletionError)
+        and error.error == RequestError.CONTEXT_EXCEEDED
+    ):
+        return HTTPException(400, "the context exceeds the maximum context window")
     return HTTPException(500, f"request failed: {error}")
 
 

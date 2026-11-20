@@ -437,6 +437,7 @@ def test_request_error_names_a_missing_and_an_invalid_state():
         "MISSING_STATE",
         "INVALID_STATE",
         "OOM",
+        "CONTEXT_EXCEEDED",
         "CANCELLED",
         "LOOP_EXITED",
     ]
