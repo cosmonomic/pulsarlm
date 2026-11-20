@@ -15,6 +15,7 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -80,6 +81,13 @@ executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clo
             std::span(b.next_tokens.const_data_ptr<std::int64_t>() + d * row, row)
         );
     }
+    assert(
+        std::ranges::equal(
+            std::span(b.cycle_end_flags.const_data_ptr<bool>(), static_cast<std::size_t>(b.cycle_end_flags.numel())),
+            b.groups() | std::views::transform([](const batch::group* g) { return std::span(g->entries); }) |
+                std::views::join | std::views::transform(&batch::entry::ends_cycle)
+        )
+    );
     for (batch::group* g : b.groups()) {
         const bool verifies = g == &b.verify_group;
         for (std::size_t position = 0; position < g->entries.size(); position++) {
@@ -98,8 +106,9 @@ executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clo
                 req.fail_store_write();
                 continue;
             }
-            // The tokens the step accepts, and of its samples those it emits. A step launched after this one took its next
-            // tokens on the GPU and lags its accepted count - 1.
+            // The tokens the step accepts, and of its samples those it emits. Each later unfinished step of a request
+            // whose verify step is written back is a verify step, which moved its history position by one token at
+            // its launch.
             const bool next_launched = req.unfinished_step_count() > 1;
             std::size_t accepted_count = batch::forwarded(e);
             std::span<const std::int64_t> emitted = samples;
@@ -108,7 +117,8 @@ executor::batch_writes executor::apply_entries(batch& b, std::chrono::steady_clo
                     b.accepted_token_counts.const_data_ptr<std::int64_t>()[position]
                 );
                 emitted = samples.first(accepted_count);
-                const std::size_t start = e.start_position + req.unapplied_position_shift();
+                const std::size_t start = req.history_position() - req.unfinished_step_count();
+                assert(start >= e.start_position);
                 req.apply_accepted_tokens(start, emitted, b.verify_rows);
                 drafted_tokens.fetch_add(b.verify_rows - 1, std::memory_order_relaxed);
                 accepted_drafts.fetch_add(accepted_count - 1, std::memory_order_relaxed);
@@ -315,6 +325,10 @@ task<void> executor::refresh_views(batch& b) {
             if (e.ends_cycle) {
                 co_await write_cycle_end(req, *requests[e.req.key()].callbacks);
                 req.start_next_cycle();
+            }
+            if (views_changed || e.ends_cycle) {
+                assert(req.unfinished_step_count() == 0);
+                stale_requests.push_back(e.req.key());
             }
             std::optional<std::size_t> first_stale_page;
             if (views_changed || e.stores_head_state) {

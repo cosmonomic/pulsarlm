@@ -1,7 +1,5 @@
 #include "pulsarlm/engine/step_graphs.hpp"
 
-#include "pulsarlm/kernels/sampling.hpp"
-
 #include <ATen/ATen.h>
 
 #include <algorithm>
@@ -63,12 +61,10 @@ step_graphs::step_graphs(
     std::size_t page_size,
     std::size_t state_slots,
     std::vector<std::size_t> mass_heads,
-    at::Tensor samples,
     at::Tensor stop_tokens
 )
 : shard_model(shard_model),
   lines(lines.begin(), lines.end()),
-  samples(std::move(samples)),
   width(static_cast<std::int64_t>(width)),
   page_size(static_cast<std::int64_t>(page_size)),
   state_slots(static_cast<std::int64_t>(state_slots)),
@@ -204,7 +200,6 @@ std::unique_ptr<step_graphs::captured_forward> step_graphs::capture_decode(std::
     captured->inputs = make_group_inputs(sequences, measures_mass, model::batch_kind::decode);
     // Thread-local capture leaves the other GPUs' threads free to launch while this one captures.
     captured->graph.capture_begin({0, 0}, cudaStreamCaptureModeThreadLocal);
-    fill_awaited_tokens_cuda(captured->inputs.tokens, samples);
     record_forward(*captured);
     captured->graph.capture_end();
     return captured;

@@ -120,7 +120,6 @@ request_state::request_state(
     std::size_t window_start = next_cycle_end - eviction.mass_tokens;
     mass_end_position = resumed_end > window_start ? resumed_end : next_cycle_end - eviction.cycle_tokens;
     prompt_count = r.tokens.size();
-    draft_rows_end = cached_count;
     update_held();
 }
 
@@ -230,7 +229,6 @@ void request_state::withdraw_latest_verify_step() {
     pending_tokens.assign(1, tail.back());
     tail.pop_back();
     drafts.clear();
-    unapplied_shift = 0;
     last_step_launched = false;
 }
 
@@ -290,6 +288,10 @@ state request_state::to_state() const {
 
 std::size_t request_state::history_position() const noexcept {
     return history_pages * layout.page_size + tail.size();
+}
+
+std::size_t request_state::cycle_end_position() const noexcept {
+    return next_cycle_end;
 }
 
 void request_state::start_next_cycle() noexcept {
@@ -469,20 +471,12 @@ bool request_state::has_launched_last_step() const noexcept {
     return last_step_launched;
 }
 
-std::size_t request_state::awaited_sample_row() const noexcept {
-    return awaited_row;
-}
-
 std::size_t request_state::rejected_token_count() const noexcept {
     return rejected_tokens;
 }
 
-std::size_t request_state::end_of_draft_rows() const noexcept {
-    return draft_rows_end;
-}
-
-std::size_t request_state::unapplied_position_shift() const noexcept {
-    return unapplied_shift;
+bool request_state::reads_last_hidden() const noexcept {
+    return next_step_reads_last_hidden;
 }
 
 const page_eviction_policy& request_state::eviction_policy_in_pages() const noexcept {
@@ -509,19 +503,18 @@ std::vector<std::size_t> request_state::pages_to_evict(std::size_t layer) const 
 
 void request_state::launch_step(
     std::size_t token_count,
-    const std::optional<std::size_t>& sample_row,
-    std::size_t draft_row_count,
-    std::size_t draft_count
+    bool samples,
+    std::size_t draft_count,
+    bool continues_drafting
 ) {
     rejected_tokens = 0;
     advance(token_count);
-    if (sample_row) {
+    if (samples) {
         pending_tokens.push_back(awaited_token);
-        awaited_row = *sample_row;
         prepared_samples++;
     }
-    last_step_launched = sample_row ? !may_sample() : pending_tokens.empty();
-    draft_rows_end += draft_row_count;
+    last_step_launched = samples ? !may_sample() : pending_tokens.empty();
+    next_step_reads_last_hidden = !continues_drafting;
     drafts.assign(draft_count, awaited_token);
     prepared_step_count++;
 }
@@ -530,6 +523,7 @@ void request_state::launch_verify_step(std::size_t token_count, std::size_t draf
     advance(token_count);
     pending_tokens.push_back(awaited_token);
     rejected_tokens = drafts.size();
+    next_step_reads_last_hidden = false;
     drafts.assign(draft_count, awaited_token);
     prepared_step_count++;
 }
@@ -551,10 +545,8 @@ void request_state::apply_accepted_tokens(
     delivered_tokens += accepted_count;
     drafted_tokens += verified_count - 1;
     accepted_drafts += accepted_count - 1;
-    unapplied_shift = has_later_step ? accepted_count - 1 : 0;
     if (!has_later_step) {
         rejected_tokens = verified_count - accepted_count;
-        draft_rows_end = start + accepted_count + 1;
     }
 }
 

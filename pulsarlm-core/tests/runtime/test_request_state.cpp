@@ -86,10 +86,9 @@ TEST_CASE("a prefill step and a decode step move their tokens to the tail and ap
     REQUIRE(req.history_position() == 0);
     REQUIRE(req.prompt_token_count() == 6);
 
-    req.launch_step(6, 0, 0, 0);
+    req.launch_step(6, true, 0, false);
     REQUIRE(to_list(req.tail_tokens()) == prompt);
     REQUIRE(to_list(req.pending_token_list()) == token_list{request_state::awaited_token});
-    REQUIRE(req.awaited_sample_row() == 0);
     REQUIRE(req.history_position() == 6);
     REQUIRE(req.prepared_sample_count() == 1);
     REQUIRE(req.next_draw().count == 0);
@@ -102,10 +101,9 @@ TEST_CASE("a prefill step and a decode step move their tokens to the tail and ap
     REQUIRE(to_list(req.pending_token_list()) == token_list{20});
     REQUIRE(req.unfinished_step_count() == 0);
 
-    req.launch_step(1, 5, 0, 0);
+    req.launch_step(1, true, 0, false);
     REQUIRE(to_list(req.tail_tokens()) == token_list{10, 11, 12, 13, 14, 15, 20});
     REQUIRE(to_list(req.pending_token_list()) == token_list{request_state::awaited_token});
-    REQUIRE(req.awaited_sample_row() == 5);
     REQUIRE(req.prepared_sample_count() == 2);
     REQUIRE_FALSE(req.has_launched_last_step());
 
@@ -113,7 +111,7 @@ TEST_CASE("a prefill step and a decode step move their tokens to the tail and ap
     req.finish_step();
     REQUIRE(to_list(req.pending_token_list()) == token_list{21});
 
-    req.launch_step(1, 0, 0, 0);
+    req.launch_step(1, true, 0, false);
     REQUIRE(req.prepared_sample_count() == 3);
     REQUIRE(req.delivered_token_count() == 2);
     REQUIRE_FALSE(req.may_sample());
@@ -124,7 +122,7 @@ TEST_CASE("a prefill step that samples no token leaves no awaited token") {
     started_request started({1, 2, 3, 4, 5}, std::nullopt, make_layout(4, false));
     request_state& req = started.req;
 
-    req.launch_step(4, std::nullopt, 0, 0);
+    req.launch_step(4, false, 0, false);
     REQUIRE(to_list(req.tail_tokens()) == token_list{1, 2, 3, 4});
     REQUIRE(to_list(req.pending_token_list()) == token_list{5});
     REQUIRE(req.prepared_sample_count() == 0);
@@ -136,7 +134,7 @@ TEST_CASE("completing pages moves the full pages of the tail to the views") {
     const token_list prompt{1, 2, 3, 4, 5, 6, 7};
     started_request started(prompt, std::nullopt, make_layout(4, false));
     request_state& req = started.req;
-    req.launch_step(7, 0, 0, 0);
+    req.launch_step(7, true, 0, false);
     REQUIRE(req.complete_pages(3) == 0);
     REQUIRE(req.complete_pages(7) == 1);
 
@@ -153,7 +151,7 @@ TEST_CASE("completing pages moves the full pages of the tail to the views") {
 
     req.apply_sample(7, 8);
     req.finish_step();
-    req.launch_step(1, 0, 0, 0);
+    req.launch_step(1, true, 0, false);
     REQUIRE(req.complete_pages(8) == 1);
     const token_list second_page{5, 6, 7, 8};
     REQUIRE((req.head_digest() == pulsarlm::make_digest(prompt_digests.front(), second_page)));
@@ -165,7 +163,7 @@ TEST_CASE("completing pages moves the full pages of the tail to the views") {
 TEST_CASE("completing a page leaves the state of a recurrent layer pending until the store has it") {
     started_request started({1, 2, 3, 4, 5}, std::nullopt, make_layout(4, true));
     request_state& req = started.req;
-    req.launch_step(4, std::nullopt, 0, 0);
+    req.launch_step(4, false, 0, false);
     REQUIRE_FALSE(req.has_pending_state());
 
     REQUIRE(req.complete_pages(4) == 1);
@@ -180,7 +178,9 @@ TEST_CASE("completing a page leaves the state of a recurrent layer pending until
 TEST_CASE("a verify step inserts the tokens it accepts and counts the drafts it rejects") {
     started_request started({1, 2, 3}, std::nullopt, make_layout(8, false));
     request_state& req = started.req;
-    req.launch_step(3, 0, 0, 2);
+    REQUIRE(req.reads_last_hidden());
+    req.launch_step(3, true, 2, true);
+    REQUIRE_FALSE(req.reads_last_hidden());
     REQUIRE(to_list(req.draft_tokens()) == token_list{request_state::awaited_token, request_state::awaited_token});
     req.apply_sample(3, 30);
     const token_list drafts{31, 32};
@@ -201,8 +201,7 @@ TEST_CASE("a verify step inserts the tokens it accepts and counts the drafts it 
     REQUIRE(to_list(req.tail_tokens()) == token_list{1, 2, 3, 30, 31});
     REQUIRE(to_list(req.pending_token_list()) == token_list{40});
     REQUIRE(req.rejected_token_count() == 1);
-    REQUIRE(req.end_of_draft_rows() == 6);
-    REQUIRE(req.unapplied_position_shift() == 0);
+    REQUIRE_FALSE(req.reads_last_hidden());
     REQUIRE(req.prepared_sample_count() == 3);
     REQUIRE(req.next_draw().count == 3);
     REQUIRE(req.drafted_token_count() == 2);
@@ -225,10 +224,10 @@ TEST_CASE("a recorded step counts as a prefill step until the prefill ends") {
     REQUIRE(req.step_duration() == std::chrono::milliseconds(12));
 }
 
-TEST_CASE("a verify step written back before a later one leaves its accepted count for that step") {
+TEST_CASE("a verify step written back before a later one inserts its tokens before the later one's") {
     started_request started({1, 2, 3}, std::nullopt, make_layout(8, false));
     request_state& req = started.req;
-    req.launch_step(3, 0, 0, 2);
+    req.launch_step(3, true, 2, true);
     req.apply_sample(3, 30);
     const token_list drafts{31, 32};
     req.set_drafts(drafts);
@@ -241,7 +240,6 @@ TEST_CASE("a verify step written back before a later one leaves its accepted cou
     req.apply_accepted_tokens(3, accepted_tokens, 3);
     req.finish_step();
     REQUIRE(to_list(req.tail_tokens()) == token_list{1, 2, 3, 30, 31, 32, 33});
-    REQUIRE(req.unapplied_position_shift() == 2);
     REQUIRE(req.rejected_token_count() == 2);
 
     req.reach_end();
@@ -249,14 +247,13 @@ TEST_CASE("a verify step written back before a later one leaves its accepted cou
     REQUIRE(to_list(req.tail_tokens()) == token_list{1, 2, 3, 30, 31, 32});
     REQUIRE(to_list(req.pending_token_list()) == token_list{33});
     REQUIRE(req.draft_tokens().empty());
-    REQUIRE(req.unapplied_position_shift() == 0);
 }
 
 TEST_CASE("a stop token withdraws the step launched after the one that sampled it") {
     started_request started({1, 2}, std::nullopt, make_layout(4, false));
     request_state& req = started.req;
-    req.launch_step(2, 0, 0, 0);
-    req.launch_step(1, 0, 0, 0);
+    req.launch_step(2, true, 0, false);
+    req.launch_step(1, true, 0, false);
     REQUIRE(to_list(req.tail_tokens()) == token_list{1, 2, request_state::awaited_token});
     REQUIRE(req.prepared_sample_count() == 2);
     REQUIRE(req.unfinished_step_count() == 2);
@@ -292,7 +289,7 @@ TEST_CASE("a request state cancelled in no launched step exits as cancelled and 
 TEST_CASE("a request state that reached its end exits as finished whether it ran out of lines or was cancelled") {
     started_request started({1, 2}, std::nullopt, make_layout(4, false));
     request_state& req = started.req;
-    req.launch_step(2, 0, 0, 0);
+    req.launch_step(2, true, 0, false);
     req.cancel();
     req.run_out_of_lines();
     req.apply_sample(2, 9);

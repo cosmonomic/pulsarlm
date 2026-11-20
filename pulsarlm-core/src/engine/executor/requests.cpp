@@ -113,7 +113,7 @@ task<std::optional<executor::request_id_type>> executor::start(request&& r, unst
         co_return std::nullopt;
     }
     mark_stale_tables(id, 0);
-    stale_sampling.push_back(id);
+    stale_requests.push_back(id);
     co_return id;
 }
 

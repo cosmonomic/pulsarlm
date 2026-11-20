@@ -672,8 +672,8 @@ pulsarlm::request sampled_request() {
 }
 
 // Most decode steps complete no page, so each is launched before the previous one is written back and every rank reads
-// its awaited tokens from its own samples: a rank sampling differently would forward another token and change the
-// logits of every rank.
+// its next tokens from its own request table, which its own samples advanced: a rank sampling differently would
+// forward another token and change the logits of every rank.
 TEST_CASE("an engine split over two ranks samples as the whole model while its steps overlap", "[runtime][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
@@ -695,7 +695,7 @@ TEST_CASE("an engine split over two ranks samples as the whole model while its s
 }
 
 // The ranks of a communicator on one device cannot capture graphs at once, so the graphs run on one rank: each replay
-// fills its awaited tokens from the previous step's samples.
+// copies the tokens gathered from the request table that the previous step advanced.
 TEST_CASE("decode graphs sample as the eager forward while steps overlap", "[runtime][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");

@@ -231,8 +231,6 @@ void check_against_dense(at::ScalarType dtype, double tolerance, bool graphs) {
         );
     }
 
-    // The graphs read each decode step's token from row 2 of samples.
-    at::Tensor samples = at::zeros({4}, cuda(at::kLong));
     pulsarlm::step_graphs decode(
         model,
         kv,
@@ -240,7 +238,6 @@ void check_against_dense(at::ScalarType dtype, double tolerance, bool graphs) {
         page_size,
         /*state_slots=*/1,
         std::vector<std::size_t>(n_layers, static_cast<std::size_t>(n_heads)),
-        samples,
         at::empty({0}, cuda(at::kLong))
     );
 
@@ -259,8 +256,6 @@ void check_against_dense(at::ScalarType dtype, double tolerance, bool graphs) {
         pulsarlm::model::batch batch = step(tokens, c.first, c.last, c.prefill);
         pulsarlm::model::output output;
         if (graphs && !c.prefill) {
-            samples[2] = tokens[c.first];
-            batch.tokens.fill_(-3);
             output = decode.decode(batch);
         } else {
             output = model.forward(batch, kv);

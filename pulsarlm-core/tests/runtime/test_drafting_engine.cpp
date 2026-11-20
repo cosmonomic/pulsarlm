@@ -688,6 +688,31 @@ pulsarlm::engine_config engine_config(
     };
 }
 
+// Keeps a copy, on the device, of the inputs of each batch it forwards that a request table gives.
+class recording_model final : public pulsarlm::qwen4_exp_model {
+  public:
+    std::shared_ptr<std::vector<batch>> forwarded = std::make_shared<std::vector<batch>>();
+
+    using pulsarlm::qwen4_exp_model::qwen4_exp_model;
+
+    output forward(const batch& b, std::span<const pulsarlm::kv> lines) override {
+        forwarded->push_back(
+            batch{
+                .kind = b.kind,
+                .tokens = b.tokens.clone(),
+                .pos = b.pos.clone(),
+                .page_tables = b.page_tables.clone(),
+                .history_positions = b.history_positions.clone(),
+                .rejected_tokens = b.rejected_tokens.clone(),
+                .key_counts = b.key_counts.clone(),
+                .page_positions = b.page_positions.clone(),
+                .query_weights = b.query_weights.defined() ? b.query_weights.clone() : at::Tensor(),
+            }
+        );
+        return pulsarlm::qwen4_exp_model::forward(b, lines);
+    }
+};
+
 struct drafting_engine {
     std::unique_ptr<pulsarlm::engine> engine;
     std::shared_ptr<std::size_t> verify_steps;
@@ -1090,4 +1115,141 @@ TEST_CASE("Qwen4-Exp drafting in bf16 emits the greedy token after each prefix",
     }
     INFO("a run without drafts agrees for " << same_prefix << " of " << got.tokens.size() << " tokens");
     CHECK(disagreements == 0);
+}
+
+// The resumed request's first step drafts from the hidden vector its stored head page keeps of the position before its
+// first token, as the uninterrupted run drafts from the hidden vector its own step computed there; the drafts each
+// verify step accepts then match, and so do the pages both runs store, the draft head's KV layer's rows among them. The
+// first request ends at a page's end, so the resumed request's first step forwards the tokens after its stored pages.
+TEST_CASE("Qwen4-Exp drafts a resumed request as an uninterrupted run of its tokens", "[runtime][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const std::size_t draft_tokens = GENERATE(1, 2);
+    const bool decode_graphs = GENERATE(false, true);
+    const std::size_t continuation_tokens = GENERATE(1, 20);
+    INFO(
+        draft_tokens << " drafts" << (decode_graphs ? " with" : " without") << " graphs, " << continuation_tokens
+                     << " tokens after the stored state"
+    );
+    const weights w(at::kFloat, base_dims, /*drafts=*/true);
+    const token_list prompt = random_tokens(2 * page_size, 40);
+    const token_list continuation = random_tokens(continuation_tokens, 41);
+    auto contents = std::make_shared<store_contents>();
+    served first = serve(
+        *make_engine(w, draft_tokens, {}, decode_graphs, contents).engine,
+        pulsarlm::request{.tokens = prompt, .max_tokens = 1}
+    );
+    token_list history = prompt;
+    history.insert(history.end(), continuation.begin(), continuation.end());
+    const auto request = [&] { return pulsarlm::request{.tokens = history, .max_tokens = 32}; };
+    served resumed = serve(*make_engine(w, draft_tokens, {}, decode_graphs, contents).engine, request());
+    auto uninterrupted_contents = std::make_shared<store_contents>();
+    served uninterrupted = serve(
+        *make_engine(w, draft_tokens, {}, decode_graphs, uninterrupted_contents).engine,
+        request()
+    );
+
+    REQUIRE(first.tokens.size() == 1);
+    REQUIRE(resumed.statistics.cached_token_count == prompt.size());
+    REQUIRE(uninterrupted.statistics.cached_token_count == 0);
+    REQUIRE(uninterrupted.tokens.size() == 32);
+    CHECK(resumed.tokens == uninterrupted.tokens);
+    REQUIRE(resumed.decodes.size() == uninterrupted.decodes.size());
+    for (std::size_t i = 0; i < resumed.decodes.size(); i++) {
+        INFO("token " << i);
+        CHECK(resumed.decodes[i].drafted_token_count == uninterrupted.decodes[i].drafted_token_count);
+        CHECK(resumed.decodes[i].accepted_draft_count == uninterrupted.decodes[i].accepted_draft_count);
+    }
+    CHECK(resumed.statistics.accepted_draft_count > 0);
+    check_same_state(resumed.end_state, uninterrupted.end_state);
+    REQUIRE(!uninterrupted_contents->pages.empty());
+    for (const auto& [key, expected_page] : uninterrupted_contents->pages) {
+        auto stored = contents->pages.find(key);
+        REQUIRE(stored != contents->pages.end());
+        const at::Tensor got = stored->second.bytes.view(at::kFloat);
+        const at::Tensor expected = expected_page.bytes.view(at::kFloat);
+        CHECK(
+            relative_error(
+                std::span(got.const_data_ptr<float>(), static_cast<std::size_t>(got.numel())),
+                std::span(expected.const_data_ptr<float>(), static_cast<std::size_t>(expected.numel()))
+            ) < tolerance
+        );
+    }
+}
+
+// Each rank gathers a step's inputs from its own request table and advances it by the tokens it samples and drafts
+// itself, so equal inputs at every forward show equal tables. Graphs are not captured: two ranks' captures on one
+// device would merge.
+TEST_CASE("Qwen4-Exp split over two ranks gathers equal inputs from both ranks' request tables", "[runtime][cuda]") {
+    if (c10::cuda::device_count() == 0) {
+        SKIP("no CUDA device");
+    }
+    const std::size_t draft_tokens = GENERATE(0, 2);
+    INFO(draft_tokens << " drafts");
+    const weights w(at::kFloat, base_dims, /*drafts=*/true);
+    const std::size_t shard_count = 2;
+    std::vector<pulsarlm::communicator> comms = pulsarlm::communicator::make_on_one_device(
+        at::Device(at::kCUDA, 0),
+        shard_count
+    );
+    std::vector<std::shared_ptr<std::vector<pulsarlm::model::batch>>> forwarded;
+    std::vector<std::unique_ptr<pulsarlm::model>> shards;
+    for (std::size_t rank = 0; rank < shard_count; rank++) {
+        auto model = std::make_unique<recording_model>(
+            model_config(w.dims, 2, 8),
+            rank_weights(w, rank, shard_count, false),
+            comms[rank]
+        );
+        forwarded.push_back(model->forwarded);
+        shards.push_back(std::move(model));
+    }
+    auto store = std::make_unique<memory_store>();
+    store->contents = std::make_shared<store_contents>();
+    pulsarlm::engine e(
+        std::move(shards),
+        vocab,
+        engine_config(draft_tokens, {}, /*decode_graphs=*/false, shard_count, w.dtype),
+        std::move(store)
+    );
+    std::vector<pulsarlm::request> requests;
+    for (std::uint32_t r = 0; r < 3; r++) {
+        requests.push_back(
+            pulsarlm::request{
+                .tokens = random_tokens(prompt_tokens / 2 + 7 * r, 50 + r),
+                .sampling = pulsarlm::sampling_params{.temperature = 0.8, .seed = 51 + r},
+                .max_tokens = decode_tokens,
+                .eviction = eviction,
+            }
+        );
+    }
+    std::vector<served> all = serve_all(e, std::move(requests));
+    c10::cuda::device_synchronize();
+
+    for (const served& one : all) {
+        REQUIRE(one.tokens.size() == decode_tokens);
+    }
+    REQUIRE(!forwarded[0]->empty());
+    REQUIRE(forwarded[0]->size() == forwarded[1]->size());
+    for (std::size_t step = 0; step < forwarded[0]->size(); step++) {
+        INFO("forward " << step);
+        const pulsarlm::model::batch& first = (*forwarded[0])[step];
+        const pulsarlm::model::batch& second = (*forwarded[1])[step];
+        REQUIRE(first.kind == second.kind);
+        for (auto input : {
+                 &pulsarlm::model::batch::tokens,
+                 &pulsarlm::model::batch::pos,
+                 &pulsarlm::model::batch::page_tables,
+                 &pulsarlm::model::batch::history_positions,
+                 &pulsarlm::model::batch::rejected_tokens,
+                 &pulsarlm::model::batch::key_counts,
+                 &pulsarlm::model::batch::page_positions,
+                 &pulsarlm::model::batch::query_weights,
+             }) {
+            REQUIRE((first.*input).defined() == (second.*input).defined());
+            if ((first.*input).defined()) {
+                CHECK(at::equal(first.*input, second.*input));
+            }
+        }
+    }
 }

@@ -20,8 +20,7 @@ namespace pulsarlm {
 // a graph per number of sequences and per whether the step measures mass. A verify group holds state_slots tokens per
 // sequence. A verify step is the forward of a verify group, its sampling, its acceptance of the drafts and the draft
 // head's passes after it. The model's decode and verify forwards read nothing back to the host and launch the same
-// kernels for every group of one such shape. A decode group's graph first fills the group's awaited tokens from samples
-// (fill_awaited_tokens_cuda).
+// kernels for every group of one such shape.
 class step_graphs {
     struct captured_forward {
         at::cuda::CUDAGraph graph;
@@ -55,7 +54,6 @@ class step_graphs {
 
     model& shard_model;
     std::vector<kv> lines;
-    at::Tensor samples;
     std::int64_t width;
     std::int64_t page_size;
     std::int64_t state_slots;
@@ -116,8 +114,7 @@ class step_graphs {
     // Graphs over page tables width pages wide, of pages page_size tokens long, a verify step's run of accepted drafts
     // ending at stop_tokens (int64 on the lines' device), with state_slots slots
     // (model::batch::state_slots). mass_heads holds, per entry of the model's kv_layers(), the query heads
-    // whose mass this GPU measures. lines is on the current device, and so is samples, int64, which holds the previous
-    // step's sampled tokens at each replay.
+    // whose mass this GPU measures. lines is on the current device.
     step_graphs(
         model& shard_model,
         std::span<const kv> lines,
@@ -125,7 +122,6 @@ class step_graphs {
         std::size_t page_size,
         std::size_t state_slots,
         std::vector<std::size_t> mass_heads,
-        at::Tensor samples,
         at::Tensor stop_tokens
     );
 
@@ -136,12 +132,11 @@ class step_graphs {
     // line 0 of each layer and writes into it. Every GPU of the model runs it at once, before any request holds a
     // line.
     void capture_startup();
-    // model::forward's decode logits and hidden rows of g, its awaited tokens filled from samples, on the current
-    // stream, valid until the next call, with g's page mass written as model::forward writes it. g's page tables are
-    // page_width() wide; a shape not captured yet is captured first.
+    // model::forward's decode logits and hidden rows of g on the current stream, valid until the next call, with g's
+    // page mass written as model::forward writes it. g's page tables are page_width() wide; a shape not captured yet is
+    // captured first.
     model::output decode(const model::batch& g);
-    // decode's verify logits and hidden rows of g, a verify group of state_slots tokens per sequence, whose tokens are
-    // not filled from samples.
+    // decode's verify logits and hidden rows of g, a verify group of state_slots tokens per sequence.
     model::output verify(const model::batch& g);
     // The verify step of g, a verify group of state_slots tokens per sequence whose sequences all draft, sampled by
     // sampling, each sequence accepting at most max_accepted_token_counts (int64 [sequences]) tokens. The outputs are

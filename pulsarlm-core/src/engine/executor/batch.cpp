@@ -48,9 +48,6 @@ executor::batch::batch(executor& owner, std::span<const scheduled_request> sched
             g->table_width = *owner.graph_pages;
         }
     }
-    awaits_tokens = std::ranges::any_of(decode_group.entries, [](const entry& e) {
-        return e.req->pending_token_list().front() == request_state::awaited_token;
-    });
     std::vector<std::int64_t> slots;
     std::vector<std::int64_t> offsets;
     std::vector<std::int64_t> single_draws;
@@ -71,12 +68,27 @@ executor::batch::batch(executor& owner, std::span<const scheduled_request> sched
             }
         }
     }
-    sample_slots = pinned({static_cast<std::int64_t>(slots.size())}, at::kLong);
-    sample_offsets = pinned({static_cast<std::int64_t>(offsets.size())}, at::kLong);
-    single_draw_slots = pinned({static_cast<std::int64_t>(single_draws.size())}, at::kLong);
-    std::ranges::copy(slots, sample_slots.mutable_data_ptr<std::int64_t>());
-    std::ranges::copy(offsets, sample_offsets.mutable_data_ptr<std::int64_t>());
-    std::ranges::copy(single_draws, single_draw_slots.mutable_data_ptr<std::int64_t>());
+    sample_slots = pinned_values(slots);
+    sample_offsets = pinned_values(offsets);
+    single_draw_slots = pinned_values(single_draws);
+    std::vector<std::int64_t> entry_request_slots;
+    std::vector<std::int64_t> computed_counts;
+    std::vector<std::int64_t> next_sources;
+    for (const group* g : groups()) {
+        for (const entry& e : g->entries) {
+            const std::span<const std::int64_t> pending = e.req->pending_token_list();
+            entry_request_slots.push_back(static_cast<std::int64_t>(slot_of(e.req.key())));
+            computed_counts.push_back(g == &verify_group ? 0 : static_cast<std::int64_t>(e.token_count));
+            if (e.is_sampling) {
+                next_sources.push_back(-static_cast<std::int64_t>(e.first_sample_row) - 1);
+            } else {
+                next_sources.push_back(e.token_count < pending.size() ? pending[e.token_count] : 0);
+            }
+        }
+    }
+    entry_slots = pinned_values(entry_request_slots);
+    computed_token_counts = pinned_values(computed_counts);
+    next_token_sources = pinned_values(next_sources);
 }
 
 std::array<executor::batch::group*, 3> executor::batch::groups() noexcept {
@@ -119,59 +131,31 @@ model::batch executor::batch::make_group(
     auto n_kv_layers = static_cast<std::int64_t>(n_layers);
     model::batch g{
         .kind = kind,
-        .tokens = pinned({n_tokens}, at::kLong),
-        .pos = pinned({n_tokens}, at::kLong),
+        .page_size = static_cast<std::int64_t>(page_size),
+        .state_slots = static_cast<std::int64_t>(state_slots),
     };
-    at::Tensor key_counts = pinned({n_kv_layers, n_seqs}, at::kInt);
-    at::Tensor query_starts = pinned({n_seqs + 1}, at::kInt);
-
-    auto* tokens = g.tokens.mutable_data_ptr<std::int64_t>();
-    auto* positions = g.pos.mutable_data_ptr<std::int64_t>();
-    auto* key_count = key_counts.mutable_data_ptr<std::int32_t>();
-    auto* query_start = query_starts.mutable_data_ptr<std::int32_t>();
-    std::size_t first_row = 0;
-    query_start[0] = 0;
-    for (std::size_t s = 0; s < group.size(); s++) {
-        const request_state& req = *group[s].req;
-        std::size_t first_position = req.next_position();
-        const std::size_t count = forwarded(group[s]);
-        for (std::size_t i = 0; i < count; i++) {
-            const std::int64_t token = i < group[s].token_count ? req.pending_token_list()[i]
-                                                                : req.draft_tokens()[i - group[s].token_count];
-            tokens[first_row + i] = token == request_state::awaited_token
-                ? -static_cast<std::int64_t>(req.awaited_sample_row()) - 1
-                : token;
-            positions[first_row + i] = static_cast<std::int64_t>(first_position + i);
+    if (kind == model::batch_kind::prefill) {
+        g.tokens = pinned({n_tokens}, at::kLong);
+        auto* tokens = g.tokens.mutable_data_ptr<std::int64_t>();
+        for (const entry& e : group) {
+            const std::span<const std::int64_t> pending = e.req->pending_token_list().first(e.token_count);
+            assert(!std::ranges::contains(pending, request_state::awaited_token));
+            tokens = std::ranges::copy(pending, tokens).out;
         }
-        for (std::size_t layer = 0; layer < n_layers; layer++) {
-            std::size_t start = req.next_index(layer);
-            key_count[layer * group.size() + s] = static_cast<std::int32_t>(start + count);
-        }
-        first_row += count;
-        query_start[s + 1] = static_cast<std::int32_t>(first_row);
     }
-    g.key_counts = key_counts;
     if (kind != model::batch_kind::decode) {
-        g.cu_seqlens_q = query_starts;
+        g.cu_seqlens_q = pinned({n_seqs + 1}, at::kInt);
+        auto* query_start = g.cu_seqlens_q.mutable_data_ptr<std::int32_t>();
+        query_start[0] = 0;
+        for (std::size_t s = 0; s < group.size(); s++) {
+            query_start[s + 1] = query_start[s] + static_cast<std::int32_t>(forwarded(group[s]));
+        }
     }
-    g.history_positions = pinned({n_seqs}, at::kLong);
-    auto* history_position = g.history_positions.mutable_data_ptr<std::int64_t>();
-    for (std::size_t s = 0; s < group.size(); s++) {
-        history_position[s] = static_cast<std::int64_t>(group[s].req->history_position());
-    }
-    g.rejected_tokens = pinned({n_seqs}, at::kInt);
-    auto* rejected = g.rejected_tokens.mutable_data_ptr<std::int32_t>();
-    for (std::size_t s = 0; s < group.size(); s++) {
-        rejected[s] = static_cast<std::int32_t>(group[s].req->rejected_token_count());
-    }
-    g.page_size = static_cast<std::int64_t>(page_size);
-    g.state_slots = static_cast<std::int64_t>(state_slots);
     if (measures_mass(group)) {
         // A verify group's views are its rows'.
         const bool per_row = kind == model::batch_kind::verify;
         const std::int64_t views = per_row ? n_tokens : n_seqs;
         g.cu_view_pages = pinned({n_kv_layers, views + 1}, at::kInt);
-        g.query_weights = pinned({n_tokens}, at::kFloat);
         auto* cu_view_pages = g.cu_view_pages.mutable_data_ptr<std::int32_t>();
         for (std::size_t layer = 0; layer < n_layers; layer++) {
             std::int32_t* row = cu_view_pages + layer * static_cast<std::size_t>(views + 1);
@@ -183,20 +167,6 @@ model::batch executor::batch::make_group(
                     row[view + 1] = row[view] + pages;
                 }
             }
-        }
-        std::span<float> weights(g.query_weights.mutable_data_ptr<float>(), token_count);
-        std::size_t first = 0;
-        for (const entry& e : group) {
-            const std::size_t count = forwarded(e);
-            const std::size_t start = e.req->history_position();
-            if (per_row) {
-                for (std::size_t i = 0; i < count; i++) {
-                    weights[first + i] = start + i >= e.req->mass_start_position() ? 1.0f : 0.0f;
-                }
-            } else {
-                e.req->fill_query_weights(start, weights.subspan(first, count));
-            }
-            first += count;
         }
     }
     return g;
@@ -222,12 +192,11 @@ bool executor::batch::measures_mass(const entry& e) noexcept {
 }
 
 at::Tensor executor::batch::request_slots(std::span<const entry> group) {
-    at::Tensor slots = pinned({static_cast<std::int64_t>(group.size())}, at::kInt);
-    auto* slot = slots.mutable_data_ptr<std::int32_t>();
-    for (std::size_t s = 0; s < group.size(); s++) {
-        slot[s] = static_cast<std::int32_t>(slot_of(group[s].req.key()));
+    std::vector<std::int64_t> slots;
+    for (const entry& e : group) {
+        slots.push_back(static_cast<std::int64_t>(slot_of(e.req.key())));
     }
-    return slots;
+    return pinned_values(slots);
 }
 
 at::Tensor executor::batch::select_tables(const at::Tensor& slots, const at::Tensor& tables, std::size_t width) {
@@ -239,70 +208,56 @@ void executor::batch::plan_draft_rows(
     bool verifies,
     std::size_t first_hidden_row,
     bool next_row,
-    bool drafts,
-    std::size_t draft_layer,
-    std::size_t draft_count
+    bool drafts
 ) {
     const request_state& req = *e.req;
-    const std::size_t start = req.history_position();
-    const std::size_t next_index = req.next_index(draft_layer);
-    const std::size_t next_position = req.next_position();
     const auto sampled = static_cast<std::int64_t>(e.first_sample_row);
     const std::size_t first_draft_row = draft_tokens.size();
-    // The position after the row that drafts, before a verify entry's accepted count is added.
-    std::size_t drafted_after = 0;
     if (verifies) {
+        assert(!e.prior_hidden_index);
         for (std::size_t j = 0; j < verify_rows; j++) {
             draft_tokens.push_back(-(sampled + static_cast<std::int64_t>(j)) - 1);
-            draft_positions.push_back(static_cast<std::int64_t>(next_position + j + 1));
+            draft_position_offsets.push_back(static_cast<std::int64_t>(j + 1));
             draft_sources.push_back(static_cast<std::int64_t>(first_hidden_row + j));
         }
         e.draft = entry::draft_rows{
             .row_count = verify_rows,
             .logit_row = first_draft_row,
-            .key_count = next_index + verify_rows + 1,
+            .key_count_offset = verify_rows + 1,
             .is_drafting = drafts,
         };
-    } else {
-        const std::size_t first = req.end_of_draft_rows();
-        const std::size_t next = start + e.token_count;
-        const std::size_t end = next_row ? next + 1 : next;
-        assert((first == start || first == start + 1) && (next_row || !drafts));
-        for (std::size_t t = first; t < end; t++) {
-            if (t < next) {
-                draft_tokens.push_back(req.pending_token_list()[t - start]);
-            } else {
-                draft_tokens.push_back(e.is_sampling ? -sampled - 1 : req.pending_token_list()[e.token_count]);
-            }
-            draft_positions.push_back(static_cast<std::int64_t>(next_position + t - start));
-            if (t == 0) {
-                draft_sources.push_back(0);
-            } else if (t == start) {
-                assert(e.prior_row);
-                draft_sources.push_back(static_cast<std::int64_t>(1 + *e.prior_row));
-            } else {
-                draft_sources.push_back(static_cast<std::int64_t>(first_hidden_row + t - 1 - start));
-            }
-        }
-        if (end == first) {
-            return;
-        }
-        e.draft = entry::draft_rows{
-            .row_count = end - first,
-            .logit_row = first_draft_row + end - first - 1,
-            .key_count = next_index + end - start,
-            .is_drafting = drafts,
-        };
-        drafted_after = e.token_count;
+        return;
     }
-    if (drafts) {
-        later_positions.resize(draft_count - 1);
-        later_key_counts.resize(draft_count - 1);
-        for (std::size_t j = 1; j < draft_count; j++) {
-            later_positions[j - 1].push_back(static_cast<std::int64_t>(next_position + drafted_after + j));
-            later_key_counts[j - 1].push_back(static_cast<std::int32_t>(next_index + drafted_after + j + 1));
+    const std::size_t start = req.history_position();
+    const std::size_t first = req.reads_last_hidden() ? start : start + 1;
+    const std::size_t next = start + e.token_count;
+    const std::size_t end = next_row ? next + 1 : next;
+    assert(next_row || !drafts);
+    for (std::size_t t = first; t < end; t++) {
+        if (t < next) {
+            draft_tokens.push_back(req.pending_token_list()[t - start]);
+        } else {
+            draft_tokens.push_back(e.is_sampling ? -sampled - 1 : req.pending_token_list()[e.token_count]);
+        }
+        draft_position_offsets.push_back(static_cast<std::int64_t>(t - start));
+        if (t == 0) {
+            draft_sources.push_back(0);
+        } else if (t == start) {
+            assert(e.prior_hidden_index);
+            draft_sources.push_back(static_cast<std::int64_t>(1 + *e.prior_hidden_index));
+        } else {
+            draft_sources.push_back(static_cast<std::int64_t>(first_hidden_row + t - 1 - start));
         }
     }
+    if (end == first) {
+        return;
+    }
+    e.draft = entry::draft_rows{
+        .row_count = end - first,
+        .logit_row = first_draft_row + end - first - 1,
+        .key_count_offset = end - start,
+        .is_drafting = drafts,
+    };
 }
 
 }  // namespace pulsarlm

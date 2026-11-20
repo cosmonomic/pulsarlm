@@ -54,7 +54,8 @@ class layer_view {
 
 // A request being served. Its tokens move from pending to tail as steps forward them, and the pages the tail fills
 // join every layer's view, the last of them head. A step moves its tokens to tail when it is launched, and its
-// write-back completes the pages they fill; a token it samples is awaited_token until the step is written back.
+// write-back completes the pages they fill; a token it samples is awaited_token on the host until the step is written
+// back.
 class request_state {
   public:
     enum class exit_reason { finished, cancelled, oom, context_exceeded };
@@ -107,17 +108,13 @@ class request_state {
     // Whether a launched step forwards the request's last tokens: it samples the last token max_tokens allows, or it
     // forwards the last pending tokens and does not sample.
     bool last_step_launched = false;
-    // While a pending token is awaited_token: the row of its step's sampled tokens that holds it.
-    std::size_t awaited_row = 0;
     // The tokens the draft head drafted after the pending token, which the next step verifies; empty when it does not.
     std::vector<std::int64_t> drafts;
     // The tokens the last step forwarded and did not accept (model::batch::rejected_tokens).
     std::size_t rejected_tokens = 0;
-    // The history position before which the draft head's KV layer holds a row for every position.
-    std::size_t draft_rows_end = 0;
-    // While a verify step written back has a later step launched: its accepted count - 1, which the later step's recorded
-    // positions lag.
-    std::size_t unapplied_shift = 0;
+    // Whether the draft head's KV layer holds no row for the next step's first token, whose row then reads the
+    // last_hidden of the position before it.
+    bool next_step_reads_last_hidden = true;
     page_eviction_policy eviction;
     // The history position, in tokens, at which the eviction cycle ends: a multiple of cycle_tokens, and past the end of
     // the resumed state, so that forwarding its tail again never reaches a cycle end that state already passed.
@@ -207,10 +204,8 @@ class request_state {
     // The launched steps of the request not written back yet.
     std::size_t unfinished_step_count() const noexcept;
     bool has_launched_last_step() const noexcept;
-    std::size_t awaited_sample_row() const noexcept;
     std::size_t rejected_token_count() const noexcept;
-    std::size_t end_of_draft_rows() const noexcept;
-    std::size_t unapplied_position_shift() const noexcept;
+    bool reads_last_hidden() const noexcept;
     const page_eviction_policy& eviction_policy_in_pages() const noexcept;
     state::lease_id_type lease_id() const noexcept;
     // Recurrent KV layer layer's line holding the state at the end of head's page.
@@ -226,6 +221,8 @@ class request_state {
     bool may_sample() const noexcept;
     // The tokens of the history up to the next token: its full pages, then tail.
     std::size_t history_position() const noexcept;
+    // The history position at which the eviction cycle ends.
+    std::size_t cycle_end_position() const noexcept;
     // The history position from which the cycle's queries add mass: the cycle's last mass_tokens tokens, less those
     // the masses already hold.
     std::size_t mass_start_position() const noexcept;
@@ -248,18 +245,14 @@ class request_state {
     // The view indices of the full pages a cycle's end evicts from KV layer layer, which measures mass, ascending.
     std::vector<std::size_t> pages_to_evict(std::size_t layer) const;
 
-    // Launches a step forwarding the first token_count pending tokens, which move to tail. With sample_row, the step
-    // samples a token, awaited_token in pending until apply_sample, into that row of its sampled tokens. The step adds
-    // draft_row_count rows to the draft head's KV layer and drafts draft_count tokens, awaited until set_drafts.
-    void launch_step(
-        std::size_t token_count,
-        const std::optional<std::size_t>& sample_row,
-        std::size_t draft_row_count,
-        std::size_t draft_count
-    );
+    // Launches a step forwarding the first token_count pending tokens, which move to tail. With samples, the step
+    // samples a token, awaited_token in pending until apply_sample. The step drafts draft_count tokens, awaited until
+    // set_drafts, and with continues_drafting adds the row of the token after its own to the draft head's KV layer.
+    void launch_step(std::size_t token_count, bool samples, std::size_t draft_count, bool continues_drafting);
     // Launches a step verifying the drafts after the first token_count pending tokens, which move to tail. The token
     // after those it accepts is awaited_token in pending until apply_accepted_tokens, as if it accepted only its
-    // pending token. The step drafts draft_count tokens, awaited until set_drafts.
+    // pending token. The step drafts draft_count tokens, awaited until set_drafts, and adds the row of the token after
+    // those it accepts to the draft head's KV layer.
     void launch_verify_step(std::size_t token_count, std::size_t draft_count);
     // Sets the awaited token at history position position to token, which a step written back sampled.
     void apply_sample(std::size_t position, std::int64_t token);

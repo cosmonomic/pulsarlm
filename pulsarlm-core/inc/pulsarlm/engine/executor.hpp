@@ -24,6 +24,7 @@
 #include "pulsarlm/engine/request.hpp"
 #include "pulsarlm/engine/request_callbacks.hpp"
 #include "pulsarlm/engine/request_state.hpp"
+#include "pulsarlm/engine/request_table.hpp"
 #include "pulsarlm/engine/step_graphs.hpp"
 #include "pulsarlm/resource.hpp"
 #include "pulsarlm/slot_map.hpp"
@@ -67,21 +68,6 @@ class executor {
     // Each request from the creation of its request state until its end.
     slot_map<running_request> requests;
 
-    // Per running request, at the slot of its id (slot_of), the state its next step reads, on one GPU.
-    struct request_table {
-        // int32 [max_running_requests, n_kv_layers, view_page_capacity]: per view page its line and the RoPE position
-        // of its first key.
-        at::Tensor page_tables;
-        at::Tensor page_positions;
-        // int64 [max_running_requests]: the seed, and the tokens sampled so far.
-        at::Tensor seeds;
-        at::Tensor draw_counts;
-        // [max_running_requests]: the sampling parameters as sampling_inputs holds them.
-        at::Tensor temperatures;
-        at::Tensor top_k;
-        at::Tensor top_p;
-    };
-
     // Everything the executor keeps on one GPU across steps.
     class shard {
       public:
@@ -101,11 +87,9 @@ class executor {
         event_loop* worker_loop;
         // None when decode and verify groups forward without graphs.
         std::unique_ptr<step_graphs> graphs;
-        // int64 [sampled_row_capacity] on the shard's device: the tokens the latest launched step sampled, every shard
-        // sampling them alike.
-        at::Tensor samples;
         // The arrival counters of the steps that run without a graph, grown to the largest step's.
         at::Tensor arrival_counters;
+        // Indexed by slot_of. Every shard's steps advance it alike.
         request_table table;
     };
 
@@ -122,8 +106,9 @@ class executor {
     std::size_t max_running_requests;
     // Per request, the first column of its page tables that the shards' page_tables and page_positions do not hold yet.
     std::unordered_map<request_id_type, std::size_t> stale_tables;
-    // The requests whose seeds, draw counts and sampling parameters the shards' request tables do not hold yet.
-    std::vector<request_id_type> stale_sampling;
+    // The requests whose request_table entries, page tables aside, the shards do not hold as their request states
+    // set them, and which no unfinished step holds.
+    std::vector<request_id_type> stale_requests;
     // A recurrent layer's state_slots are draft_state_slots for a state and 1 for a window. A layer's mass_heads are
     // the query heads it measures mass and evicts pages in, those of every attention layer reading a full-attention
     // layer, and 0 for other layers.
@@ -157,9 +142,9 @@ class executor {
     std::vector<std::size_t> start_line_counts(const request_state& req) const;
     // Moves stale_tables into b: the cells of each request's stale columns, from its view, that b's enqueue sets.
     void move_stale_tables(batch& b);
-    // Moves stale_sampling into b: the seed, draw count and sampling parameters of each request, which b's enqueue
+    // Moves stale_requests into b: each request's request_table entries from its request state, which b's enqueue
     // sets.
-    void move_stale_sampling(batch& b);
+    void move_stale_requests(batch& b);
     // The tokens of req's full history pages that every KV layer reading the page holds resident.
     std::size_t device_cached_tokens(const request_state& req) const;
     // Per KV layer with pages, lines for its pages, then line_count empty lines; per recurrent layer, a copy of the
@@ -203,14 +188,10 @@ class executor {
         std::expected<std::shared_ptr<const state>, request_error>&& result,
         const request_statistics& statistics
     ) noexcept;
-    // Moves each entry's tokens to its request's tail (request_state::launch_step, request_state::launch_verify_step), switches
-    // the boundary lines of the requests whose pages it fills, and appends each token the step samples to pending as
-    // awaited_token.
+    // Moves each entry's tokens to its request's tail (request_state::launch_step, request_state::launch_verify_step),
+    // appends each token the step samples to pending as awaited_token, and plans the draft head's pass.
     void advance(batch& b);
     task<void> enqueue_on_shard(batch& b, std::size_t shard);
-    // Points b's verify entries whose requests' previous step is launched to that step, of which each such request
-    // is a verify entry and a drafting entry.
-    void link_previous(batch& b) const;
     // Whether a step of the requests in scheduled ends no cycle and, in a model with sliding layers, completes no page, or in an executor
     // whose steps draft, whether every entry verifies drafts: its write-back then changes no view or table that the
     // next step reads, and copies to the store only lines the next step does not write.
@@ -281,6 +262,9 @@ class executor {
     // more than view_page_capacity pages. The lease of a request that fails is released before on_end. Fewer than max_running_request_count() requests hold a record at the call.
     task<std::optional<request_id_type>> start(request&& r, unstarted_callbacks callbacks);
     std::size_t max_running_request_count() const noexcept;
+    // For tests: the request state of id's request, and shard's request table.
+    const request_state& request_state_of(request_id_type id) const;
+    const request_table& request_table_of(std::size_t shard) const;
     // The requests with a record, from the creation of their request state until their end.
     std::size_t request_count() const noexcept;
     // Whether a step of the requests in scheduled can be launched now, before any write-back: no step is launched or the last launched
@@ -294,8 +278,9 @@ class executor {
     // The rows of a batch's sampled tokens that the request takes when it computes token_count tokens.
     std::size_t sampled_row_count(request_id_type id, std::size_t token_count) const;
     // Launches one step of the requests in scheduled, decoding requests first, after the launched steps: advances each request by its
-    // tokens, then queues the forward and the sampling on every shard without waiting for them. A decoding entry whose token is awaited reads
-    // it from the previous launched step's samples on the GPUs, which needs both steps to allow overlap.
+    // tokens, then queues the forward and the sampling on every shard without waiting for them. Each shard's step reads
+    // its inputs from the shard's request_table and advances it, so a step reads the tokens and positions the launched
+    // steps before it leave.
     // scheduled is not empty and names no request twice, each token count is above 0 and at most the request's pending
     // tokens, each request is steppable (is_steppable), fewer than two steps are launched, no step is launched or
     // allows_overlap(scheduled), and the step samples at most sampled_row_limit() rows.

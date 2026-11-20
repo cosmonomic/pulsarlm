@@ -83,7 +83,6 @@ executor::executor(
                 .copy_stream = copy_streams[s],
                 .worker_loop = s == 0 ? nullptr : worker_loops[s - 1],
                 .graphs = nullptr,
-                .samples = {},
                 .arrival_counters = {},
                 .table = {},
             }
@@ -131,10 +130,6 @@ executor::executor(
     }
     require(layout.page_size > 0, "executor: the model must have a KV layer with pages");
     for (shard& s : shards) {
-        s.samples = at::zeros(
-            {static_cast<std::int64_t>(sampled_row_capacity)},
-            s.lines.front().k.options().dtype(at::kLong)
-        );
         s.stop_tokens = at::tensor(this->stop_ids, at::TensorOptions().dtype(at::kLong)).to(s.lines.front().k.device());
         const at::TensorOptions options = s.lines.front().k.options();
         const auto slots = static_cast<std::int64_t>(max_running_requests);
@@ -143,6 +138,25 @@ executor::executor(
             options.dtype(at::kInt)
         );
         s.table.page_positions = at::zeros_like(s.table.page_tables);
+        s.table.history_positions = at::zeros({slots}, options.dtype(at::kLong));
+        s.table.rope_positions = at::zeros({slots}, options.dtype(at::kLong));
+        s.table.key_counts = at::zeros(
+            {slots, static_cast<std::int64_t>(layout.layers.size())},
+            options.dtype(at::kInt)
+        );
+        s.table.rejected_tokens = at::zeros({slots}, options.dtype(at::kInt));
+        s.table.tokens = at::zeros({slots, static_cast<std::int64_t>(draft_state_slots)}, options.dtype(at::kLong));
+        s.table.cycle_end_positions = at::zeros({slots}, options.dtype(at::kLong));
+        s.table.mass_start_positions = at::zeros({slots}, options.dtype(at::kLong));
+        s.table.attention_mass_decays = at::zeros({slots}, options.dtype(at::kDouble));
+        std::vector<std::uint8_t> recurrent_layers;
+        for (const view_layout::layer& layer : layout.layers) {
+            recurrent_layers.push_back(layer.is_recurrent ? 1 : 0);
+        }
+        s.table.recurrent_layers = at::tensor(recurrent_layers, at::TensorOptions().dtype(at::kByte))
+                                       .to(options.device())
+                                       .to(at::kBool);
+        s.table.page_size = static_cast<std::int64_t>(layout.page_size);
         s.table.seeds = at::zeros({slots}, options.dtype(at::kLong));
         s.table.draw_counts = at::zeros({slots}, options.dtype(at::kLong));
         s.table.temperatures = at::zeros({slots}, options.dtype(at::kFloat));
@@ -159,7 +173,6 @@ executor::executor(
                 layout.page_size,
                 draft_state_slots,
                 s.mass_heads,
-                s.samples,
                 s.stop_tokens
             );
         }
@@ -202,6 +215,14 @@ const request_state& executor::state_of(request_id_type id) const {
 
 std::size_t executor::slot_of(request_id_type id) noexcept {
     return static_cast<std::uint32_t>(id);
+}
+
+const request_state& executor::request_state_of(request_id_type id) const {
+    return state_of(id);
+}
+
+const request_table& executor::request_table_of(std::size_t shard) const {
+    return shards[shard].table;
 }
 
 std::size_t executor::max_running_request_count() const noexcept {
@@ -281,44 +302,76 @@ void executor::move_stale_tables(batch& b) {
 }
 
 // The requests erased since they were marked are passed over.
-void executor::move_stale_sampling(batch& b) {
+void executor::move_stale_requests(batch& b) {
+    const std::size_t n_layers = layout.layers.size();
+    const std::size_t token_width = draft_state_slots;
     std::vector<std::int64_t> slots;
+    std::vector<std::int64_t> history_positions;
+    std::vector<std::int64_t> rope_positions;
+    std::vector<std::int32_t> key_counts;
+    std::vector<std::int32_t> rejected_tokens;
+    std::vector<std::int64_t> tokens;
+    std::vector<std::int64_t> cycle_end_positions;
+    std::vector<std::int64_t> mass_start_positions;
+    std::vector<double> attention_mass_decays;
     std::vector<std::int64_t> seeds;
     std::vector<std::int64_t> draw_counts;
     std::vector<float> temperatures;
     std::vector<std::int64_t> top_k;
     std::vector<float> top_p;
-    for (const request_id_type id : stale_sampling) {
+    for (const request_id_type id : stale_requests) {
         const running_request* running = requests.find(id);
         if (running == nullptr) {
             continue;
         }
-        const sampling_draw draw = running->state.next_draw();
-        const sampling_params& params = running->state.sampling_parameters();
+        const request_state& req = running->state;
+        assert(req.unfinished_step_count() == 0);
         slots.push_back(static_cast<std::int64_t>(slot_of(id)));
+        history_positions.push_back(static_cast<std::int64_t>(req.history_position()));
+        rope_positions.push_back(static_cast<std::int64_t>(req.next_position()));
+        for (std::size_t layer = 0; layer < n_layers; layer++) {
+            key_counts.push_back(static_cast<std::int32_t>(req.next_index(layer)));
+        }
+        rejected_tokens.push_back(static_cast<std::int32_t>(req.rejected_token_count()));
+        const std::span<const std::int64_t> pending = req.pending_token_list();
+        const std::span<const std::int64_t> drafts = req.draft_tokens();
+        assert(pending.empty() || pending.front() != request_state::awaited_token);
+        assert(drafts.size() < token_width);
+        tokens.push_back(pending.empty() ? 0 : pending.front());
+        tokens.insert(tokens.end(), drafts.begin(), drafts.end());
+        tokens.resize(slots.size() * token_width, 0);
+        cycle_end_positions.push_back(static_cast<std::int64_t>(req.cycle_end_position()));
+        mass_start_positions.push_back(static_cast<std::int64_t>(req.mass_start_position()));
+        attention_mass_decays.push_back(req.eviction_policy_in_pages().attention_mass_decay);
+        const sampling_draw draw = req.next_draw();
+        const sampling_params& params = req.sampling_parameters();
         seeds.push_back(static_cast<std::int64_t>(draw.seed));
         draw_counts.push_back(static_cast<std::int64_t>(draw.count));
         temperatures.push_back(input_temperature(params));
         top_k.push_back(input_top_k(params));
         top_p.push_back(input_top_p(params));
     }
-    stale_sampling.clear();
+    stale_requests.clear();
     if (slots.empty()) {
         return;
     }
     const auto count = static_cast<std::int64_t>(slots.size());
-    b.sampling_slots = pinned({count}, at::kLong);
-    b.seeds = pinned({count}, at::kLong);
-    b.draw_counts = pinned({count}, at::kLong);
-    b.temperatures = pinned({count}, at::kFloat);
-    b.top_k = pinned({count}, at::kLong);
-    b.top_p = pinned({count}, at::kFloat);
-    std::ranges::copy(slots, b.sampling_slots.mutable_data_ptr<std::int64_t>());
-    std::ranges::copy(seeds, b.seeds.mutable_data_ptr<std::int64_t>());
-    std::ranges::copy(draw_counts, b.draw_counts.mutable_data_ptr<std::int64_t>());
-    std::ranges::copy(temperatures, b.temperatures.mutable_data_ptr<float>());
-    std::ranges::copy(top_k, b.top_k.mutable_data_ptr<std::int64_t>());
-    std::ranges::copy(top_p, b.top_p.mutable_data_ptr<float>());
+    b.stale_slots = pinned_values(slots);
+    b.stale_entries = request_table{
+        .history_positions = pinned_values(history_positions),
+        .rope_positions = pinned_values(rope_positions),
+        .key_counts = pinned_values(key_counts).view({count, static_cast<std::int64_t>(n_layers)}),
+        .rejected_tokens = pinned_values(rejected_tokens),
+        .tokens = pinned_values(tokens).view({count, static_cast<std::int64_t>(token_width)}),
+        .cycle_end_positions = pinned_values(cycle_end_positions),
+        .mass_start_positions = pinned_values(mass_start_positions),
+        .attention_mass_decays = pinned_values(attention_mass_decays),
+        .seeds = pinned_values(seeds),
+        .draw_counts = pinned_values(draw_counts),
+        .temperatures = pinned_values(temperatures),
+        .top_k = pinned_values(top_k),
+        .top_p = pinned_values(top_p),
+    };
 }
 
 bool executor::is_steppable(request_id_type id) const {
@@ -426,20 +479,22 @@ bool executor::is_launchable(std::span<const scheduled_request> scheduled) const
 }
 
 // A verify entry's tokens are accepted, and its samples taken, at its write-back. Its pending token and drafts are
-// awaited_token until then, and a request whose previous step is launched lags it by up to that step's drafts.
+// awaited_token until then, and a request whose previous step is launched lags it by up to that step's drafts. An
+// entry whose request reads its last hidden vector is outside the verify group and lags no step.
 void executor::advance(batch& b) {
     const std::size_t draft_count = draft_state_slots - 1;
-    for (batch::group* g : b.groups()) {
-        for (batch::entry& e : g->entries) {
-            request_state& req = *e.req;
-            if (draft_layer && req.end_of_draft_rows() == req.history_position() && req.history_position() > 0) {
-                const layer_view& view = req.views()[*draft_layer];
-                e.prior_row = b.prior_lines.size();
-                b.prior_lines.push_back(view.lines[(req.next_index(*draft_layer) - 1) / layout.page_size]);
+    if (draft_layer) {
+        b.draft_count = draft_count;
+        for (batch::group* g : b.groups()) {
+            for (batch::entry& e : g->entries) {
+                if (e.req->reads_last_hidden() && e.req->history_position() > 0) {
+                    e.prior_hidden_index = b.prior_hidden_slots.size();
+                    b.prior_hidden_slots.push_back(static_cast<std::int64_t>(slot_of(e.req.key())));
+                }
             }
         }
     }
-    std::size_t first_hidden_row = 1 + b.prior_lines.size();
+    std::size_t first_hidden_row = 1 + b.prior_hidden_slots.size();
     for (batch::group* g : b.groups()) {
         const bool verifies = g == &b.verify_group;
         for (batch::entry& e : g->entries) {
@@ -448,21 +503,21 @@ void executor::advance(batch& b) {
             e.is_measured = batch::measures_mass(e);
             e.start_position = req.history_position();
             bool drafts = false;
+            bool next_row = false;
             if (draft_layer) {
                 const std::optional<std::size_t>& token_limit = req.token_limit();
                 const bool ends_request = e.is_sampling ? token_limit && req.prepared_sample_count() + 1 >= *token_limit
                                                         : req.pending_token_list().size() == e.token_count;
-                const bool next_row = verifies || (!e.ends_cycle && !ends_request);
+                next_row = verifies || (!e.ends_cycle && !ends_request);
                 // The next step's verify group then ends neither the cycle nor max_tokens, whatever this one accepts.
                 drafts = next_row && (verifies || e.is_sampling) &&
                     req.cycle_tokens_left() >= batch::forwarded(e) + lag + draft_count + 2;
-                b.plan_draft_rows(e, verifies, first_hidden_row, next_row, drafts, *draft_layer, draft_count);
+                b.plan_draft_rows(e, verifies, first_hidden_row, next_row, drafts);
                 first_hidden_row += batch::forwarded(e);
                 if (verifies) {
                     const std::size_t remaining = token_limit ? *token_limit - req.prepared_sample_count()
                                                               : b.verify_rows;
                     e.max_accepted_token_count = std::clamp<std::size_t>(remaining, 1, b.verify_rows);
-                    e.mass_start_position = req.mass_start_position();
                 }
             }
             if (verifies) {
@@ -472,12 +527,7 @@ void executor::advance(batch& b) {
             } else {
                 e.end_position = req.history_position() + e.token_count;
                 e.sampled_position = req.history_position() + req.pending_token_list().size();
-                req.launch_step(
-                    e.token_count,
-                    e.is_sampling ? std::optional(e.first_sample_row) : std::nullopt,
-                    e.draft ? e.draft->row_count : 0,
-                    drafts ? draft_count : 0
-                );
+                req.launch_step(e.token_count, e.is_sampling, drafts ? draft_count : 0, next_row);
             }
             e.ends_request = !verifies && req.has_launched_last_step();
         }
@@ -494,8 +544,7 @@ task<void> executor::launch(std::span<const scheduled_request> scheduled) {
     assert(static_cast<std::size_t>(b->sample_slots.size(0)) <= sampled_row_capacity);
     b->allows_overlap = entries_allow_overlap(scheduled);
     move_stale_tables(*b);
-    move_stale_sampling(*b);
-    link_previous(*b);
+    move_stale_requests(*b);
     advance(*b);
     for (batch::group* g : b->groups()) {
         g->mass_by_shard.assign(shards.size(), at::Tensor());
@@ -522,31 +571,6 @@ task<void> executor::launch(std::span<const scheduled_request> scheduled) {
     launched_batches.push_back(std::move(b));
 }
 
-void executor::link_previous(batch& b) const {
-    if (launched_batches.empty() || b.verify_group.entries.empty()) {
-        return;
-    }
-    const batch& previous = *launched_batches.back();
-    b.previous_batch = &previous;
-    const std::vector<batch::entry> previous_drafting_entries = previous.drafting_entries();
-    for (batch::entry& e : b.verify_group.entries) {
-        if (e.req->unfinished_step_count() == 0) {
-            continue;
-        }
-        for (std::size_t pv = 0; pv < previous.verify_group.entries.size(); pv++) {
-            if (previous.verify_group.entries[pv].req == e.req) {
-                e.previous_verify_row = pv;
-            }
-        }
-        for (std::size_t d = 0; d < previous_drafting_entries.size(); d++) {
-            if (previous_drafting_entries[d].req == e.req) {
-                e.previous_drafting_row = d;
-            }
-        }
-        assert(e.previous_verify_row && e.previous_drafting_row);
-    }
-}
-
 task<void> executor::enqueue_on_shard(batch& b, std::size_t shard) {
     c10::cuda::CUDAGuard device_guard(shards[shard].lines.front().k.device());
     b.enqueue(
@@ -558,7 +582,6 @@ task<void> executor::enqueue_on_shard(batch& b, std::size_t shard) {
         shards[shard].compute_stream,
         shard,
         shards[shard].graphs.get(),
-        shards[shard].samples,
         shards[shard].arrival_counters,
         shards[shard].table
     );
