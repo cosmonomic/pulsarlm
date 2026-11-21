@@ -97,8 +97,9 @@ class executor {
     std::size_t view_page_capacity;
     // The most requests with a record at once, which bounds their slots.
     std::size_t max_running_requests;
-    // Per request, the first column of its page tables that the shards' page_tables and page_positions do not hold yet.
-    std::unordered_map<request_id_type, std::size_t> stale_tables;
+    // Per request and KV layer, the first column of its page tables that the shards' page_tables and page_positions do
+    // not hold yet, none when they hold every column.
+    std::unordered_map<request_id_type, std::vector<std::optional<std::size_t>>> stale_tables;
     // The requests whose request_table entries, page tables aside, the shards do not hold as their request states
     // set them, and which no unfinished step holds.
     std::vector<request_id_type> stale_requests;
@@ -107,6 +108,11 @@ class executor {
     using key_count_cell = std::int64_t;
     using key_count_shift = std::int32_t;
     std::vector<std::pair<key_count_cell, key_count_shift>> key_count_shifts;
+    // Per request table slot, the tokens of the pages a prologue's passes took out of every layer's view
+    // (compact_sliding_views), negative, by which its RoPE positions move down; not moved into a step yet.
+    using table_slot = std::int64_t;
+    using rope_position_shift = std::int64_t;
+    std::vector<std::pair<table_slot, rope_position_shift>> rope_position_shifts;
     // A recurrent layer's state_slots are draft_state_slots for a state and 1 for a window. A layer's mass_heads are
     // the query heads it measures mass and evicts pages in, those of every attention layer reading a full-attention
     // layer, and 0 for other layers.
@@ -135,8 +141,10 @@ class executor {
     static std::size_t get_slot(request_id_type id) noexcept;
     // The smallest of token_buckets that holds token_count query tokens.
     std::size_t find_token_bucket(std::size_t token_count) const;
-    // Marks the columns of id's page tables from first_column on as stale (stale_tables).
+    // Marks the columns of id's page tables of every KV layer from first_column on as stale (stale_tables).
     void mark_stale_tables(request_id_type id, std::size_t first_column);
+    // Marks the columns of id's page table of KV layer layer from first_column on as stale.
+    void mark_stale_layer_table(request_id_type id, std::size_t layer, std::size_t first_column);
     // The columns of req's page tables once each KV layer holds line_counts[layer] more lines.
     std::size_t table_width_after(const request_state& req, std::span<const std::size_t> line_counts) const;
     // Per KV layer, the lines take_lines gives req.
@@ -147,11 +155,13 @@ class executor {
     // sets.
     void move_stale_requests(step& s);
     // Marks the pages each sliding layer of id's request has passed at its lower bound
-    // (request_state::prepared_position_lower_bound) as passed, takes them out of its page tables from column 0
-    // (mark_stale_tables) and queues the shift of its key counts (key_count_shifts).
+    // (request_state::prepared_position_lower_bound) as passed, takes them out of that layer's page table from column 0
+    // (mark_stale_layer_table), and queues the shift of its key counts (key_count_shifts). When the passed pages leave
+    // every layer's view, so that the held pages shrink, it also marks every layer's page table stale from column 0
+    // for their RoPE positions and queues the shift of its RoPE position (rope_position_shifts).
     void compact_sliding_views(request_id_type id);
-    // Moves key_count_shifts into s, whose enqueue applies them.
-    void move_key_count_shifts(step& s);
+    // Moves key_count_shifts and rope_position_shifts into s, whose enqueue applies them.
+    void move_table_shifts(step& s);
     // The tokens of req's full history pages that every KV layer reading the page holds resident.
     std::size_t device_cached_tokens(const request_state& req) const;
     // Per KV layer with pages, lines for its pages; per recurrent layer, a copy of the state at head, or zeros without
@@ -240,8 +250,8 @@ class executor {
     // models[s] runs on cache shard s with streams[s], for s above 0 on worker_loops[s - 1], and its write-backs'
     // copies to the store on copy_streams[s], which the caller synchronizes before freeing what the copies read; the
     // cache holds one layer per entry of each model's kv_layers(), and the shards agree on which layers are recurrent
-    // or sliding; a model with a sliding layer has a full-attention layer holding every page, and its draft head's KV
-    // layer is not sliding. store is the cache's. root is the engine's root digest (make_root_digest). A request's view
+    // or sliding, the draft head's KV layer is not sliding, and a model with a sliding layer has no layer mirroring
+    // held pages. store is the cache's. root is the engine's root digest (make_root_digest). A request's view
     // takes at most view_page_capacity pages, and one that would take more ends with context_exceeded. With
     // graph_pages, a step_graphs graph over tables graph_pages wide replays a step of decoding entries alone that all
     // sample and draft nothing (a decode step), and a step of verifying entries alone that all draft (a verify step).

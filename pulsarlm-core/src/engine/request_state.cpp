@@ -146,7 +146,10 @@ std::size_t request_state::next_position() const noexcept {
 std::size_t request_state::page_position(std::size_t layer, std::size_t page) const {
     const layer_view& view = layers[layer];
     if (page >= view.pages.size()) {
-        return (held_pages.size() + page - view.pages.size()) * layout.page_size;
+        const std::size_t index = history_pages + page - view.pages.size();
+        const std::size_t first = find_held_incomplete_pages().first;
+        assert(first <= index);
+        return (held_pages.size() + index - first) * layout.page_size;
     }
     auto rank = std::ranges::lower_bound(held_pages, view.indices[page]) - held_pages.begin();
     return static_cast<std::size_t>(rank) * layout.page_size;
@@ -156,11 +159,35 @@ void request_state::update_held() {
     held_pages.clear();
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
         if (!layout.layers[layer].is_recurrent && !layout.layers[layer].mirrors_held_pages) {
-            held_pages.insert(held_pages.end(), layers[layer].indices.begin(), layers[layer].indices.end());
+            const layer_view& view = layers[layer];
+            const auto passed = static_cast<std::ptrdiff_t>(std::min(view.passed_count, view.indices.size()));
+            held_pages.insert(held_pages.end(), view.indices.begin() + passed, view.indices.end());
         }
     }
     std::ranges::sort(held_pages);
     held_pages.erase(std::ranges::unique(held_pages).begin(), held_pages.end());
+}
+
+// Each layer's lines after its full pages hold the history pages from history_pages on, one each, and the layers'
+// ranges of them overlap at their ends.
+std::pair<std::size_t, std::size_t> request_state::find_held_incomplete_pages() const {
+    std::size_t first = std::numeric_limits<std::size_t>::max();
+    std::size_t end = 0;
+    for (std::size_t layer = 0; layer < layers.size(); layer++) {
+        const layer_view& view = layers[layer];
+        if (layout.layers[layer].is_recurrent || layout.layers[layer].mirrors_held_pages ||
+            view.lines.size() <= std::max(view.passed_count, view.pages.size())) {
+            continue;
+        }
+        first = std::min(first, history_pages + std::max(view.passed_count, view.pages.size()) - view.pages.size());
+        end = std::max(end, history_pages + view.lines.size() - view.pages.size());
+    }
+    return first < end ? std::pair{first, end} : std::pair{history_pages, history_pages};
+}
+
+std::size_t request_state::count_held_pages() const noexcept {
+    const auto [first, end] = find_held_incomplete_pages();
+    return held_pages.size() + end - first;
 }
 
 bool request_state::has_exact_prepared_counts() const noexcept {
@@ -195,12 +222,8 @@ std::size_t request_state::complete_pages() {
             }
         }
     }
-    if (std::ranges::contains(layout.layers, false, &view_layout::layer::is_recurrent)) {
-        for (std::size_t i = 0; i < full_page_count; i++) {
-            held_pages.push_back(history_pages + i);
-        }
-    }
     history_pages += full_page_count;
+    update_held();
     head = full_page_digests.back();
     tail.erase(tail.begin(), tail.begin() + full_page_count * layout.page_size);
     if (std::ranges::contains(layout.layers, true, &view_layout::layer::is_recurrent)) {
@@ -732,7 +755,9 @@ std::size_t request_state::pass_pages(std::size_t layer, std::size_t position) {
     if (passed <= view.passed_count) {
         return 0;
     }
-    return passed - std::exchange(view.passed_count, passed);
+    const std::size_t newly_passed = passed - std::exchange(view.passed_count, passed);
+    update_held();
+    return newly_passed;
 }
 
 std::vector<std::uint32_t> request_state::drop_passed_pages(std::size_t layer) {
@@ -743,7 +768,10 @@ std::vector<std::uint32_t> request_state::drop_passed_pages(std::size_t layer) {
     }
     std::iota(dropped.begin(), dropped.end(), 0);
     view.passed_count -= dropped.size();
-    return remove_pages(layer, dropped);
+    [[maybe_unused]] const std::size_t held_count = held_pages.size();
+    std::vector<std::uint32_t> lines = remove_pages(layer, dropped);
+    assert(held_pages.size() == held_count);
+    return lines;
 }
 
 std::vector<std::uint32_t> request_state::remove_pages(std::size_t layer, std::span<const std::size_t> view_indices) {

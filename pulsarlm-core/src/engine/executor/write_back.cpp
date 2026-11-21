@@ -313,7 +313,11 @@ void executor::refresh_views(const step& s, const step_writes& writes) {
         }
         req.finish_step();
         if (!req.has_exit_cause() && std::ranges::contains(writes.state_writers, &req)) {
-            mark_stale_tables(e.request_id, 0);
+            for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
+                if (layout.layers[layer].is_recurrent) {
+                    mark_stale_layer_table(e.request_id, layer, layout.layers[layer].state_slots);
+                }
+            }
         }
     }
 }

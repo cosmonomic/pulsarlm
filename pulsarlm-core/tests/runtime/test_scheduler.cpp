@@ -427,7 +427,7 @@ class sum_model final : public pulsarlm::model {
         std::size_t n_seqs = static_cast<std::size_t>(all_tables.size(1));
 
         std::size_t view = 0;
-        while (layers[view].state || layers[view].sliding_window) {
+        while (view < layers.size() && (layers[view].state || layers[view].sliding_window)) {
             view++;
         }
         std::optional<std::vector<double>> state_sums;
@@ -475,6 +475,13 @@ class sum_model final : public pulsarlm::model {
 
         at::Tensor logits = at::zeros({n_tokens, vocab});
         auto logit = logits.accessor<float, 2>();
+        if (view == layers.size()) {
+            REQUIRE(state_sums.has_value());
+            for (std::int64_t row = 0; row < n_tokens; row++) {
+                logit[row][static_cast<std::int64_t>((*state_sums)[static_cast<std::size_t>(row)]) % vocab] = 1.0f;
+            }
+            return pulsarlm::logit_inputs(logits.to(g.tokens.device()), g);
+        }
         auto key = keys[view].accessor<float, 2>();
         auto value = values[view].accessor<float, 2>();
         auto table = tables[view].accessor<std::int32_t, 2>();
@@ -3320,6 +3327,186 @@ TEST_CASE("with a sliding layer, steps overlapping page completions reach the st
             }
         }
     }
+}
+
+const std::vector<pulsarlm::kv_layer> recurrent_and_sliding{
+    pulsarlm::kv_layer{
+        .n_kv_heads = 1,
+        .head_dim = 2,
+        .state = pulsarlm::recurrent_state{.sizes = {1}, .dtype = at::kFloat},
+    },
+    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .sliding_window = 5},
+};
+
+// Serves first and second on a fresh fixture of layers, stepping them with overlap or in turn, prefill chunks of
+// prefill_tokens_per_step tokens; adds the steps prepared over an unfinished one to overlapped_steps.
+std::pair<request_results, request_results> serve_two_stepped(
+    const std::vector<pulsarlm::kv_layer>& layers,
+    request first,
+    request second,
+    std::size_t prefill_tokens_per_step,
+    bool overlaps,
+    std::size_t& overlapped_steps
+) {
+    fixture f(64, prefill_tokens_per_step, {}, {}, layers);
+    f.model.is_important = [](std::size_t, std::int64_t token) { return token % 3 == 0; };
+    auto first_results = std::make_shared<request_results>();
+    auto second_results = std::make_shared<request_results>();
+    std::optional<pulsarlm::executor::request_id_type> first_id = start_request(
+        f.exec,
+        std::move(first),
+        first_results
+    );
+    std::optional<pulsarlm::executor::request_id_type> second_id = start_request(
+        f.exec,
+        std::move(second),
+        second_results
+    );
+    REQUIRE(first_id.has_value());
+    REQUIRE(second_id.has_value());
+    event_loop loop;
+    if (overlaps) {
+        loop.spawn(
+            step_requests_overlapping(f.exec, {*first_id, *second_id}, prefill_tokens_per_step, overlapped_steps)
+        );
+    } else {
+        loop.spawn(step_requests_in_turn(f.exec, {*first_id, *second_id}, prefill_tokens_per_step, overlapped_steps));
+    }
+    REQUIRE(loop.run() == nullptr);
+    REQUIRE(f.exec.kv_cache_bytes() == 0);
+    return std::pair{*first_results, *second_results};
+}
+
+// overlapped's tokens, and the tail, page digests and page mass of each of its cycle-end states and its end state, are
+// sequential's.
+void require_same_results(const request_results& overlapped, const request_results& sequential) {
+    REQUIRE(overlapped.tokens == sequential.tokens);
+    REQUIRE(overlapped.cycle_ends.size() == sequential.cycle_ends.size());
+    std::vector<state_pointer> overlapped_states;
+    std::vector<state_pointer> sequential_states;
+    for (std::size_t c = 0; c < sequential.cycle_ends.size(); c++) {
+        overlapped_states.push_back(overlapped.cycle_ends[c].state);
+        sequential_states.push_back(sequential.cycle_ends[c].state);
+    }
+    overlapped_states.push_back(overlapped.end_state);
+    sequential_states.push_back(sequential.end_state);
+    for (std::size_t c = 0; c < sequential_states.size(); c++) {
+        INFO("state " << c);
+        const pulsarlm::state& got = *overlapped_states[c];
+        const pulsarlm::state& expected = *sequential_states[c];
+        REQUIRE(got.tail == expected.tail);
+        REQUIRE(got.layers.size() == expected.layers.size());
+        for (std::size_t layer = 0; layer < expected.layers.size(); layer++) {
+            INFO("KV layer " << layer);
+            REQUIRE((hashes_of(got, layer) == hashes_of(expected, layer)));
+            for (std::size_t page = 0; page < expected.layers[layer].pages.size(); page++) {
+                REQUIRE((got.layers[layer].pages[page].mass_sum == expected.layers[layer].pages[page].mass_sum));
+                REQUIRE(got.layers[layer].pages[page].weight_sum == expected.layers[layer].pages[page].weight_sum);
+            }
+        }
+    }
+}
+
+// The sliding layer is the only one holding pages, so each pass of its window takes the passed pages out of the held
+// pages and moves the RoPE positions of the later pages and of the queries down by them; sum_model requires each
+// query's position to be its key's under the page positions. The recurrent layer predicts. A window of 64 tokens
+// passes no page, which compacts nothing and predicts the same tokens.
+TEST_CASE("with sliding layers alone, steps overlapping window passes reach the states of steps that do not overlap") {
+    const std::size_t prefill_tokens_per_step = 3;
+    token_list first(18);
+    std::iota(first.begin(), first.end(), 1);
+    token_list second(9);
+    std::iota(second.begin(), second.end(), 40);
+    const pulsarlm::eviction_policy policy{.cycle_tokens = 8};
+    std::size_t overlapped_steps = 0;
+    std::size_t sequential_overlapped_steps = 0;
+    const auto [first_overlapped, second_overlapped] = serve_two_stepped(
+        recurrent_and_sliding,
+        request{.tokens = first, .max_tokens = 14, .eviction = policy},
+        request{.tokens = second, .max_tokens = 18, .eviction = policy},
+        prefill_tokens_per_step,
+        true,
+        overlapped_steps
+    );
+    const auto [first_sequential, second_sequential] = serve_two_stepped(
+        recurrent_and_sliding,
+        request{.tokens = first, .max_tokens = 14, .eviction = policy},
+        request{.tokens = second, .max_tokens = 18, .eviction = policy},
+        prefill_tokens_per_step,
+        false,
+        sequential_overlapped_steps
+    );
+    std::vector<pulsarlm::kv_layer> uncompacted = recurrent_and_sliding;
+    uncompacted[1].sliding_window = 64;
+    std::size_t uncompacted_overlapped_steps = 0;
+    const auto [first_uncompacted, second_uncompacted] = serve_two_stepped(
+        uncompacted,
+        request{.tokens = first, .max_tokens = 14, .eviction = policy},
+        request{.tokens = second, .max_tokens = 18, .eviction = policy},
+        prefill_tokens_per_step,
+        true,
+        uncompacted_overlapped_steps
+    );
+
+    REQUIRE(overlapped_steps > 5);
+    REQUIRE(sequential_overlapped_steps == 0);
+    REQUIRE(first_sequential.tokens == continuation(first, 14));
+    REQUIRE(second_sequential.tokens == continuation(second, 18));
+    REQUIRE(first_sequential.cycle_ends.size() >= 2);
+    require_same_results(first_overlapped, first_sequential);
+    require_same_results(second_overlapped, second_sequential);
+    REQUIRE(first_uncompacted.tokens == first_sequential.tokens);
+    REQUIRE(second_uncompacted.tokens == second_sequential.tokens);
+}
+
+const std::vector<pulsarlm::kv_layer> full_and_long_sliding{
+    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .n_q_heads = 1},
+    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .sliding_window = 9},
+};
+
+// A capacity of 12 tokens keeps one full page at a cycle's end, so the end evicts the page before the newest, which the
+// sliding layer's window of 9 tokens still holds. The window passes that page at a step 4 tokens after the end, which
+// runs over the step before it; the page then leaves the held pages and the RoPE positions move down. The step's
+// prefill tokens cover both prompts, so each request's prefill chunks end at its cycle ends in either run, and its page
+// mass, which depends on the chunks, is the same.
+TEST_CASE("pages a cycle end evicted and a sliding window later passes leave the held pages over overlapping steps") {
+    const std::size_t prefill_tokens_per_step = 64;
+    token_list first(20);
+    std::iota(first.begin(), first.end(), 1);
+    token_list second(10);
+    std::iota(second.begin(), second.end(), 40);
+    const pulsarlm::eviction_policy policy{
+        .n_sink = 0,
+        .n_working = 1,
+        .cycle_tokens = 8,
+        .max_context_capacity = 12,
+    };
+    std::size_t overlapped_steps = 0;
+    std::size_t sequential_overlapped_steps = 0;
+    const auto [first_overlapped, second_overlapped] = serve_two_stepped(
+        full_and_long_sliding,
+        request{.tokens = first, .max_tokens = 16, .eviction = policy},
+        request{.tokens = second, .max_tokens = 20, .eviction = policy},
+        prefill_tokens_per_step,
+        true,
+        overlapped_steps
+    );
+    const auto [first_sequential, second_sequential] = serve_two_stepped(
+        full_and_long_sliding,
+        request{.tokens = first, .max_tokens = 16, .eviction = policy},
+        request{.tokens = second, .max_tokens = 20, .eviction = policy},
+        prefill_tokens_per_step,
+        false,
+        sequential_overlapped_steps
+    );
+
+    REQUIRE(overlapped_steps > 5);
+    REQUIRE(sequential_overlapped_steps == 0);
+    REQUIRE(first_sequential.tokens.size() == 16);
+    REQUIRE(first_sequential.cycle_ends.size() >= 3);
+    REQUIRE(hashes_of(*first_sequential.end_state, 0).size() < (first.size() + 15) / page_size);
+    require_same_results(first_overlapped, first_sequential);
+    require_same_results(second_overlapped, second_sequential);
 }
 
 }  // namespace

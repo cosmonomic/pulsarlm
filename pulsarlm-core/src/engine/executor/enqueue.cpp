@@ -188,6 +188,20 @@ void executor::step::write_tables(request_table& table) const {
         table.page_tables.view({-1}).index_copy_(0, cells, table_lines.to(device, /*non_blocking=*/true));
         table.page_positions.view({-1}).index_copy_(0, cells, table_positions.to(device, /*non_blocking=*/true));
     }
+    if (key_count_cells.defined()) {
+        table.key_counts.view({-1}).index_add_(
+            0,
+            key_count_cells.to(device, /*non_blocking=*/true),
+            key_count_shifts.to(device, /*non_blocking=*/true)
+        );
+    }
+    if (rope_position_slots.defined()) {
+        table.rope_positions.index_add_(
+            0,
+            rope_position_slots.to(device, /*non_blocking=*/true),
+            rope_position_shifts.to(device, /*non_blocking=*/true)
+        );
+    }
     if (stale_slots.defined()) {
         const at::Tensor slots = stale_slots.to(device, /*non_blocking=*/true);
         for (at::Tensor request_table::* column : {
@@ -210,13 +224,6 @@ void executor::step::write_tables(request_table& table) const {
              }) {
             (table.*column).index_copy_(0, slots, (stale_entries.*column).to(device, /*non_blocking=*/true));
         }
-    }
-    if (key_count_cells.defined()) {
-        table.key_counts.view({-1}).index_add_(
-            0,
-            key_count_cells.to(device, /*non_blocking=*/true),
-            key_count_shifts.to(device, /*non_blocking=*/true)
-        );
     }
 }
 

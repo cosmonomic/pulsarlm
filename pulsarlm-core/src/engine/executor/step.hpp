@@ -107,6 +107,11 @@ class executor::step {
     // passed (request_state::pass_pages), and those shifts (int32, negative).
     at::Tensor key_count_cells;
     at::Tensor key_count_shifts;
+    // Pinned host int64, undefined when the step shifts none: the slots of each shard's request_table whose RoPE
+    // positions the step lowers before its forward by the tokens of the pages its prologue's passes took out of every
+    // layer's view (request_state::count_held_pages), and those shifts, negative.
+    at::Tensor rope_position_slots;
+    at::Tensor rope_position_shifts;
     // Pinned host int64, per sample in entry order (one of each entry that samples, but one per query token of an
     // entry of the second run): the slot of its request, its offset among its request's samples, which it adds to the
     // request's draw count, and its index among the logit tokens.
@@ -176,8 +181,8 @@ class executor::step {
     // Sets g's page tables and positions to the rows of table's page_tables and page_positions of the requests'
     // entries, as wide as the widest table among them.
     static void set_page_tables(std::span<const step_entry> requests, model::batch& g, const request_table& table);
-    // Queues on the current stream the copies of the step's table cells, stale entries and key count shifts to the
-    // device of table, a shard's, and their writes, the shifts after the stale entries.
+    // Queues on the current stream the copies of the step's table cells, stale entries, key count shifts and RoPE
+    // position shifts to the device of table, a shard's, and their writes, the stale entries after the shifts.
     void write_tables(request_table& table) const;
     // On shard's device, table's, the inputs of the step's sampling: per sample, its request's columns of table, its
     // draw count moved by the sample's offset.

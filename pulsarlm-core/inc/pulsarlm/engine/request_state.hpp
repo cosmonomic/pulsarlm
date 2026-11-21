@@ -10,6 +10,7 @@
 #include <optional>
 #include <span>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "pulsarlm/digest.hpp"
@@ -103,8 +104,9 @@ class request_state {
     const view_layout& layout;
     // One per KV layer.
     std::vector<layer_view> layers;
-    // The ascending history indices of the full pages some layer with pages, other than a mirroring one, holds. A full
-    // page's RoPE position is its rank here times the page size, in every layer; the pages of tail follow the last.
+    // The ascending history indices of the full pages some layer with pages, other than a mirroring one, holds in its
+    // request table view, its passed pages aside. A full page's RoPE position is its rank here times the page size, in
+    // every layer; the held pages after the full ones follow the last (find_held_incomplete_pages).
     std::vector<std::size_t> held_pages;
     // Whether the recurrent layers' head_state_line hold the state at head, which the store does not have yet.
     bool state_pending = false;
@@ -175,8 +177,12 @@ class request_state {
 
     // The view index of recurrent KV layer layer's line holding the state at the end of head's page.
     std::size_t head_state_line_index(std::size_t layer) const;
-    // Sets held_pages from the layers' indices.
+    // Sets held_pages from the layers' indices, the passed ones aside (layer_view::passed_count).
     void update_held();
+    // The history indices [first, end) of the pages after the full pages that some layer with pages, other than a
+    // mirroring one, holds in its request table view. A mirroring layer may hold lines past end, for the keys of
+    // drafts.
+    std::pair<std::size_t, std::size_t> find_held_incomplete_pages() const;
     // The view indices of recurrent KV layer layer's lines that the next key_count keys after the prepared steps write
     // the state at the end of a page into and that hold no line, or hold a line that the unfinished step's write-back
     // may copy as the state at the cycle end it may reach (detached_head_state_lines).
@@ -235,6 +241,9 @@ class request_state {
     std::size_t history_page_count() const noexcept;
     const std::optional<digest>& head_digest() const noexcept;
     std::span<const std::size_t> held_page_indices() const noexcept;
+    // The history pages some layer with pages, other than a mirroring one, holds in its request table view: the full
+    // pages of held_page_indices and the held pages after them.
+    std::size_t count_held_pages() const noexcept;
     bool has_pending_state() const noexcept;
     const std::shared_ptr<pending_writes>& pending_page_writes() const noexcept;
     bool has_exited() const noexcept;
