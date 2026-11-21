@@ -3,7 +3,7 @@
 #include "pulsarlm/engine/model/interface.hpp"
 #include "pulsarlm/engine/model/qwen3_5_moe_config.hpp"
 #include "pulsarlm/engine/model/qwen3_5.hpp"
-#include "pulsarlm/kernels/rope.hpp"
+#include "pulsarlm/ops/rope.hpp"
 
 #include <ATen/core/Dict.h>
 #include <ATen/core/Tensor.h>
@@ -73,7 +73,7 @@ class qwen3_5_moe_model : public model {
 
     qwen3_5_moe_config config;
     std::int64_t n_layers;
-    rope_parameters rope;
+    ops::rope_parameters rope;
     std::vector<kv_layer> kv_specs;
     at::Tensor embed_tokens;
     at::Tensor lm_head;

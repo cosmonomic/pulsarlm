@@ -2,10 +2,10 @@
 
 #include "pulsarlm/engine/model/paged_forward.hpp"
 #include "pulsarlm/engine/model/partial_rope.hpp"
-#include "pulsarlm/kernels/gated_deltanet.hpp"
-#include "pulsarlm/kernels/gating.hpp"
-#include "pulsarlm/kernels/normalization.hpp"
-#include "pulsarlm/kernels/routed_experts.hpp"
+#include "pulsarlm/ops/gated_deltanet.hpp"
+#include "pulsarlm/ops/gating.hpp"
+#include "pulsarlm/ops/normalization.hpp"
+#include "pulsarlm/ops/routed_experts.hpp"
 #include "weights.hpp"
 
 #include <ATen/ATen.h>
@@ -65,7 +65,7 @@ qwen3_5_moe_model::qwen3_5_moe_model(qwen3_5_moe_config config, const c10::Dict<
     if (c.linear_n_value_heads % c.linear_n_key_heads != 0) {
         throw std::invalid_argument("qwen3_5_moe_model: the value heads must be a multiple of the key heads");
     }
-    rope = rope_parameters{
+    rope = ops::rope_parameters{
         .theta = std::pow(c.rope_theta, static_cast<double>(c.head_dim) / static_cast<double>(rotary_dim)),
         .partial_rotary_factor = static_cast<double>(rotary_dim) / static_cast<double>(c.head_dim),
     };
@@ -222,10 +222,10 @@ at::Tensor qwen3_5_moe_model::attention(
     const std::size_t kv_index = layers[layer].kv_layer;
 
     at::Tensor query_gate = at::linear(h, w.q_proj).view({ntok, c.n_heads, 2 * c.head_dim});
-    at::Tensor q = rmsnorm_cuda(query_gate.narrow(-1, 0, c.head_dim), w.q_norm, c.rms_norm_eps);
+    at::Tensor q = ops::cuda::rmsnorm(query_gate.narrow(-1, 0, c.head_dim), w.q_norm, c.rms_norm_eps);
     at::Tensor gate = query_gate.narrow(-1, c.head_dim, c.head_dim).reshape({ntok, c.n_heads * c.head_dim});
     q = rope_q(q.view({ntok, c.n_heads * c.head_dim}), g.pos, c.n_heads, c.head_dim, rope);
-    at::Tensor k = rmsnorm_cuda(
+    at::Tensor k = ops::cuda::rmsnorm(
         at::linear(h, w.k_proj).view({ntok, c.n_kv_heads, c.head_dim}),
         w.k_norm,
         c.rms_norm_eps
@@ -293,7 +293,7 @@ at::Tensor qwen3_5_moe_model::deltanet(
                 conv_layer,
                 config.linear_n_key_heads,
                 config.rms_norm_eps,
-                gate_activation::silu,
+                ops::gate_activation::silu,
                 out
             );
         },
@@ -312,17 +312,17 @@ at::Tensor qwen3_5_moe_model::moe(const at::Tensor& h, std::int64_t layer, const
         at::silu(at::linear(h, m.shared_gate_proj)) * at::linear(h, m.shared_up_proj),
         m.shared_down_proj
     );
-    at::Tensor routed = routed_experts_cuda(
+    at::Tensor routed = ops::cuda::routed_experts(
         h,
         at::linear(h, m.router),
         config.num_experts_per_tok,
         0,
         m.experts_gate_up_proj,
         m.experts_down_proj,
-        expert_activation::silu,
+        ops::expert_activation::silu,
         counters
     );
-    return sigmoid_gated_add_cuda(routed, at::linear(h, m.shared_expert_gate), shared);
+    return ops::cuda::sigmoid_gated_add(routed, at::linear(h, m.shared_expert_gate), shared);
 }
 
 model::output qwen3_5_moe_model::forward(const batch& b, std::span<const kv> lines, graph_segments& segments) {
@@ -332,10 +332,10 @@ model::output qwen3_5_moe_model::forward(const batch& b, std::span<const kv> lin
     at::Tensor x = embed_tokens.index_select(0, b.tokens);
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
         const layer_weights& w = layers[layer];
-        at::Tensor h = rmsnorm_cuda(x, w.input_layernorm, eps);
+        at::Tensor h = ops::cuda::rmsnorm(x, w.input_layernorm, eps);
         x = x +
             (full_attention(layer) ? attention(h, layer, b, lines, segments) : deltanet(h, layer, b, lines, segments));
-        x = x + moe(rmsnorm_cuda(x, w.post_attention_layernorm, eps), layer, b.arrival_counters);
+        x = x + moe(ops::cuda::rmsnorm(x, w.post_attention_layernorm, eps), layer, b.arrival_counters);
     }
     at::Tensor logits = at::empty({b.logit_tokens.size(0), lm_head.size(0)}, x.options());
     segments.run_between_segments(
@@ -343,7 +343,7 @@ model::output qwen3_5_moe_model::forward(const batch& b, std::span<const kv> lin
             at::Tensor written = out.narrow(0, 0, b.logit_tokens.size(0));
             at::matmul_out(
                 written,
-                rmsnorm_cuda(logit_inputs(hidden_states, b), norm, config.rms_norm_eps),
+                ops::cuda::rmsnorm(logit_inputs(hidden_states, b), norm, config.rms_norm_eps),
                 lm_head.t()
             );
         },
@@ -356,8 +356,8 @@ model::output qwen3_5_moe_model::forward(const batch& b, std::span<const kv> lin
 std::int64_t qwen3_5_moe_model::arrival_counter_count(std::int64_t sequences, std::int64_t tokens) const {
     const moe_weights& m = layers.front().moe;
     return std::max(
-        gated_delta_rule_counters(sequences, config.linear_n_value_heads),
-        routed_experts_counters(
+        ops::cuda::gated_delta_rule_counters(sequences, config.linear_n_value_heads),
+        ops::cuda::routed_experts_counters(
             tokens,
             config.num_experts_per_tok,
             m.experts_gate_up_proj.size(0),

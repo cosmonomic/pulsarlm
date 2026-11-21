@@ -1,4 +1,4 @@
-#include "pulsarlm/kernels/gated_deltanet.hpp"
+#include "pulsarlm/ops/gated_deltanet.hpp"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAFunctions.h>
@@ -97,7 +97,7 @@ struct ragged_case {
     }
 
     // Each sequence's lines, then a column the ops do not read.
-    pulsarlm::state_rows rows(int64_t slots) const {
+    pulsarlm::ops::state_rows rows(int64_t slots) const {
         std::vector<int32_t> ids;
         for (size_t s = 0; s < counts.size(); s++) {
             for (int64_t j = 0; j < slots + 2; j++) {
@@ -105,7 +105,7 @@ struct ragged_case {
             }
             ids.push_back(-1);
         }
-        return pulsarlm::state_rows{
+        return pulsarlm::ops::state_rows{
             .lines = int32_cuda(ids).view({num_seqs(), slots + 3}),
             .slots = slots,
             .history_positions = at::tensor(history_positions, at::dtype(at::kLong)).to(at::kCUDA),
@@ -116,8 +116,8 @@ struct ragged_case {
 };
 
 // Sequences [first, first + count) of layout.
-pulsarlm::state_rows sequence_range(const pulsarlm::state_rows& layout, int64_t first, int64_t count) {
-    return pulsarlm::state_rows{
+pulsarlm::ops::state_rows sequence_range(const pulsarlm::ops::state_rows& layout, int64_t first, int64_t count) {
+    return pulsarlm::ops::state_rows{
         .lines = layout.lines.narrow(0, first, count),
         .slots = layout.slots,
         .history_positions = layout.history_positions.narrow(0, first, count),
@@ -274,12 +274,13 @@ at::Tensor reference_output_gate(
     const at::Tensor& z,
     const at::Tensor& norm_weight,
     double eps,
-    pulsarlm::gate_activation activation
+    pulsarlm::ops::gate_activation activation
 ) {
     at::Tensor normed = o.to(at::kFloat);
     normed = normed * at::rsqrt(normed.pow(2).mean(-1, true) + eps);
     at::Tensor gate_input = z.to(at::kFloat).view(o.sizes());
-    at::Tensor gate = activation == pulsarlm::gate_activation::silu ? at::silu(gate_input) : at::sigmoid(gate_input);
+    at::Tensor gate = activation == pulsarlm::ops::gate_activation::silu ? at::silu(gate_input)
+                                                                         : at::sigmoid(gate_input);
     return ((norm_weight * normed.to(o.scalar_type())).to(at::kFloat) * gate).to(o.scalar_type()).flatten(1);
 }
 
@@ -293,12 +294,35 @@ at::Tensor convolve(
     const at::Tensor& x,
     const at::Tensor& weight,
     const at::Tensor& pool,
-    const pulsarlm::state_rows& rows,
+    const pulsarlm::ops::state_rows& rows,
     int64_t dilation
 ) {
-    return batch.kind == case_kind::prefill
-        ? pulsarlm::causal_conv_chunked_cuda(x, weight, pool, rows, batch.cu_seqlens_q(), dilation, std::nullopt)
-        : pulsarlm::causal_conv_step_cuda(x, weight, pool, rows, batch.cu_seqlens_q(), dilation, std::nullopt);
+    return batch.kind == case_kind::prefill ? pulsarlm::ops::cuda::causal_conv_chunked(
+                                                  x,
+                                                  weight,
+                                                  pool,
+                                                  rows.lines,
+                                                  rows.slots,
+                                                  rows.history_positions,
+                                                  rows.rejected_tokens,
+                                                  rows.page_size,
+                                                  batch.cu_seqlens_q(),
+                                                  dilation,
+                                                  std::nullopt
+                                              )
+                                            : pulsarlm::ops::cuda::causal_conv_step(
+                                                  x,
+                                                  weight,
+                                                  pool,
+                                                  rows.lines,
+                                                  rows.slots,
+                                                  rows.history_positions,
+                                                  rows.rejected_tokens,
+                                                  rows.page_size,
+                                                  batch.cu_seqlens_q(),
+                                                  dilation,
+                                                  std::nullopt
+                                              );
 }
 
 // The gated delta rule's inputs other than the state pool and its rows.
@@ -312,7 +336,7 @@ struct delta_inputs {
     at::Tensor norm_weight;
     int64_t key_heads;
     double eps;
-    pulsarlm::gate_activation activation;
+    pulsarlm::ops::gate_activation activation;
 };
 
 // The delta rule a model runs on batch: chunked for prefill chunks, by step otherwise, keeping the states
@@ -321,18 +345,22 @@ at::Tensor run_delta_rule(
     const ragged_case& batch,
     const delta_inputs& in,
     const at::Tensor& pool,
-    const pulsarlm::state_rows& rows,
+    const pulsarlm::ops::state_rows& rows,
     const at::Tensor& counters
 ) {
     if (batch.kind == case_kind::prefill) {
-        return pulsarlm::gated_delta_rule_chunked_cuda(
+        return pulsarlm::ops::cuda::gated_delta_rule_chunked(
             in.x,
             in.a,
             in.b,
             in.dt_bias,
             in.neg_a,
             pool,
-            rows,
+            rows.lines,
+            rows.slots,
+            rows.history_positions,
+            rows.rejected_tokens,
+            rows.page_size,
             batch.cu_seqlens_q(),
             in.key_heads,
             in.z,
@@ -343,14 +371,18 @@ at::Tensor run_delta_rule(
             std::nullopt
         );
     }
-    return pulsarlm::gated_delta_rule_step_cuda(
+    return pulsarlm::ops::cuda::gated_delta_rule_step(
         in.x,
         in.a,
         in.b,
         in.dt_bias,
         in.neg_a,
         pool,
-        rows,
+        rows.lines,
+        rows.slots,
+        rows.history_positions,
+        rows.rejected_tokens,
+        rows.page_size,
         batch.cu_seqlens_q(),
         batch.kept_state_counts(),
         in.key_heads,
@@ -379,7 +411,7 @@ TEST_CASE("causal_conv continues each sequence's valid inputs and keeps its wind
     at::Tensor weight = at::randn({channels, 1, kernel}, opts);
     at::Tensor pool = spaced_pool({channels, (kernel - 1) * dilation + extra_inputs}, dtype);
     at::Tensor before = pool.clone();
-    const pulsarlm::state_rows rows = batch.rows(1);
+    const pulsarlm::ops::state_rows rows = batch.rows(1);
 
     at::Tensor out = convolve(batch, x, weight, pool, rows, dilation);
 
@@ -422,7 +454,7 @@ TEST_CASE(
     const auto dtype = GENERATE(at::kFloat, at::kBFloat16);
     const int64_t key_dim = GENERATE(32, 128, 256);
     const ragged_case batch = GENERATE(prefill_case(), decode_case(), verify_case(), short_verify_case());
-    const auto activation = GENERATE(pulsarlm::gate_activation::silu, pulsarlm::gate_activation::sigmoid);
+    const auto activation = GENERATE(pulsarlm::ops::gate_activation::silu, pulsarlm::ops::gate_activation::sigmoid);
     const int64_t key_heads = 2;
     const int64_t value_heads = 4;
     // Four CTAs per value head.
@@ -438,11 +470,11 @@ TEST_CASE(
     at::Tensor neg_a = -(at::randn({value_heads}, fp32) * 0.5).exp();
     at::Tensor pool = spaced_pool({value_heads, key_dim, value_dim}, at::kFloat);
     at::Tensor before = pool.clone();
-    const pulsarlm::state_rows rows = batch.rows(slot_count);
+    const pulsarlm::ops::state_rows rows = batch.rows(slot_count);
     at::Tensor z = at::randn({batch.total(), value_heads * value_dim}, opts);
     at::Tensor norm_weight = at::randn({value_dim}, opts);
     at::Tensor counters = at::zeros(
-        {pulsarlm::gated_delta_rule_counters(batch.num_seqs(), value_heads)},
+        {pulsarlm::ops::cuda::gated_delta_rule_counters(batch.num_seqs(), value_heads)},
         at::device(at::kCUDA).dtype(at::kInt)
     );
 
@@ -517,7 +549,7 @@ TEST_CASE("causal_conv reads x's rows wherever they lie", "[ops][cuda]") {
     at::Tensor weight = at::randn({channels, 1, kernel}, opts);
     at::Tensor strided_pool = spaced_pool({channels, kernel - 1 + extra_inputs}, at::kBFloat16);
     at::Tensor packed_pool = strided_pool.clone();
-    const pulsarlm::state_rows rows = batch.rows(1);
+    const pulsarlm::ops::state_rows rows = batch.rows(1);
 
     at::Tensor strided = convolve(batch, x, weight, strided_pool, rows, 1);
     at::Tensor packed = convolve(batch, x.contiguous(), weight, packed_pool, rows, 1);
@@ -537,25 +569,29 @@ TEST_CASE("gated_delta_rule refuses fewer arrival counters than a step needs", "
     const int64_t value_dim = 32;
     auto opts = at::device(at::kCUDA).dtype(at::kBFloat16);
     auto fp32 = at::device(at::kCUDA).dtype(at::kFloat);
-    const int64_t needed = pulsarlm::gated_delta_rule_counters(batch.num_seqs(), value_heads);
+    const int64_t needed = pulsarlm::ops::cuda::gated_delta_rule_counters(batch.num_seqs(), value_heads);
     REQUIRE(needed > 0);
 
     REQUIRE_THROWS(
-        pulsarlm::gated_delta_rule_step_cuda(
+        pulsarlm::ops::cuda::gated_delta_rule_step(
             at::randn({batch.total(), 2 * key_heads * key_dim + value_heads * value_dim}, opts),
             at::randn({batch.total(), value_heads}, opts),
             at::randn({batch.total(), value_heads}, opts),
             at::randn({value_heads}, fp32),
             -at::ones({value_heads}, fp32),
             spaced_pool({value_heads, key_dim, value_dim}, at::kFloat),
-            batch.rows(slot_count),
+            batch.rows(slot_count).lines,
+            batch.rows(slot_count).slots,
+            batch.rows(slot_count).history_positions,
+            batch.rows(slot_count).rejected_tokens,
+            batch.rows(slot_count).page_size,
             batch.cu_seqlens_q(),
             batch.kept_state_counts(),
             key_heads,
             at::randn({batch.total(), value_heads * value_dim}, opts),
             at::randn({value_dim}, opts),
             1e-6,
-            pulsarlm::gate_activation::silu,
+            pulsarlm::ops::gate_activation::silu,
             at::zeros({needed - 1}, at::device(at::kCUDA).dtype(at::kInt)),
             std::nullopt
         )
@@ -579,15 +615,15 @@ TEST_CASE("gated_delta_rule reads a's, b's and z's rows wherever they lie", "[op
     at::Tensor b = gates.narrow(1, value_heads, value_heads);
     at::Tensor z = gates.narrow(1, 2 * value_heads, value_heads * value_dim);
     at::Tensor norm_weight = at::randn({value_dim}, opts);
-    const auto activation = pulsarlm::gate_activation::sigmoid;
+    const auto activation = pulsarlm::ops::gate_activation::sigmoid;
     at::Tensor dt_bias = at::randn({value_heads}, fp32);
     at::Tensor neg_a = -(at::randn({value_heads}, fp32) * 0.5).exp();
     at::Tensor strided_pool = spaced_pool({value_heads, key_dim, value_dim}, at::kFloat);
     at::Tensor packed_pool = strided_pool.clone();
-    const pulsarlm::state_rows rows = batch.rows(slot_count);
+    const pulsarlm::ops::state_rows rows = batch.rows(slot_count);
     auto counters = [&] {
         return at::zeros(
-            {pulsarlm::gated_delta_rule_counters(batch.num_seqs(), value_heads)},
+            {pulsarlm::ops::cuda::gated_delta_rule_counters(batch.num_seqs(), value_heads)},
             at::device(at::kCUDA).dtype(at::kInt)
         );
     };
@@ -615,7 +651,7 @@ TEST_CASE("gated_delta_rule reads a's, b's and z's rows wherever they lie", "[op
     CHECK(at::equal(strided_pool, packed_pool));
 }
 
-TEST_CASE("causal_conv_step_cuda gives causal_conv_chunked_cuda's outputs and windows", "[ops][cuda]") {
+TEST_CASE("ops::cuda::causal_conv_step gives ops::cuda::causal_conv_chunked's outputs and windows", "[ops][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
@@ -628,24 +664,32 @@ TEST_CASE("causal_conv_step_cuda gives causal_conv_chunked_cuda's outputs and wi
     at::Tensor x = at::randn({batch.total(), channels}, opts);
     at::Tensor weight = at::randn({channels, 1, kernel}, opts);
     at::Tensor before = spaced_pool({channels, (kernel - 1) * dilation + extra_inputs}, dtype);
-    const pulsarlm::state_rows rows = batch.rows(1);
+    const pulsarlm::ops::state_rows rows = batch.rows(1);
 
     at::Tensor step_pool = before.clone();
-    at::Tensor step = pulsarlm::causal_conv_step_cuda(
+    at::Tensor step = pulsarlm::ops::cuda::causal_conv_step(
         x,
         weight,
         step_pool,
-        rows,
+        rows.lines,
+        rows.slots,
+        rows.history_positions,
+        rows.rejected_tokens,
+        rows.page_size,
         batch.cu_seqlens_q(),
         dilation,
         std::nullopt
     );
     at::Tensor chunked_pool = before.clone();
-    at::Tensor chunked = pulsarlm::causal_conv_chunked_cuda(
+    at::Tensor chunked = pulsarlm::ops::cuda::causal_conv_chunked(
         x,
         weight,
         chunked_pool,
-        rows,
+        rows.lines,
+        rows.slots,
+        rows.history_positions,
+        rows.rejected_tokens,
+        rows.page_size,
         batch.cu_seqlens_q(),
         dilation,
         std::nullopt
@@ -656,7 +700,7 @@ TEST_CASE("causal_conv_step_cuda gives causal_conv_chunked_cuda's outputs and wi
 }
 
 TEST_CASE(
-    "causal_conv_step_cuda over decode and verify sequences together equals the calls on each part",
+    "ops::cuda::causal_conv_step over decode and verify sequences together equals the calls on each part",
     "[ops][cuda]"
 ) {
     if (c10::cuda::device_count() == 0) {
@@ -671,34 +715,46 @@ TEST_CASE(
     at::Tensor x = at::randn({batch.total(), channels}, opts);
     at::Tensor weight = at::randn({channels, 1, kernel}, opts);
     at::Tensor before = spaced_pool({channels, (kernel - 1) * dilation + extra_inputs}, dtype);
-    const pulsarlm::state_rows rows = batch.rows(1);
+    const pulsarlm::ops::state_rows rows = batch.rows(1);
 
     at::Tensor together_pool = before.clone();
-    at::Tensor together = pulsarlm::causal_conv_step_cuda(
+    at::Tensor together = pulsarlm::ops::cuda::causal_conv_step(
         x,
         weight,
         together_pool,
-        rows,
+        rows.lines,
+        rows.slots,
+        rows.history_positions,
+        rows.rejected_tokens,
+        rows.page_size,
         batch.cu_seqlens_q(),
         dilation,
         std::nullopt
     );
     at::Tensor apart_pool = before.clone();
     const int64_t verify_sequences = batch.num_seqs() - decode_sequences;
-    at::Tensor decoded = pulsarlm::causal_conv_step_cuda(
+    at::Tensor decoded = pulsarlm::ops::cuda::causal_conv_step(
         x.narrow(0, 0, decode_tokens),
         weight,
         apart_pool,
-        sequence_range(rows, 0, decode_sequences),
+        sequence_range(rows, 0, decode_sequences).lines,
+        sequence_range(rows, 0, decode_sequences).slots,
+        sequence_range(rows, 0, decode_sequences).history_positions,
+        sequence_range(rows, 0, decode_sequences).rejected_tokens,
+        sequence_range(rows, 0, decode_sequences).page_size,
         int32_cuda({0, 1, 2, 3}),
         dilation,
         std::nullopt
     );
-    at::Tensor verified = pulsarlm::causal_conv_chunked_cuda(
+    at::Tensor verified = pulsarlm::ops::cuda::causal_conv_chunked(
         x.narrow(0, decode_tokens, verify_tokens),
         weight,
         apart_pool,
-        sequence_range(rows, decode_sequences, verify_sequences),
+        sequence_range(rows, decode_sequences, verify_sequences).lines,
+        sequence_range(rows, decode_sequences, verify_sequences).slots,
+        sequence_range(rows, decode_sequences, verify_sequences).history_positions,
+        sequence_range(rows, decode_sequences, verify_sequences).rejected_tokens,
+        sequence_range(rows, decode_sequences, verify_sequences).page_size,
         int32_cuda({0, 3, 6, 8}),
         dilation,
         std::nullopt
@@ -710,7 +766,8 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "gated_delta_rule_step_cuda over decode and verify sequences together keeps the states the calls on each part keep",
+    "ops::cuda::gated_delta_rule_step over decode and verify sequences together keeps the states the calls on each "
+    "part keep",
     "[ops][cuda]"
 ) {
     if (c10::cuda::device_count() == 0) {
@@ -735,25 +792,29 @@ TEST_CASE(
         .norm_weight = at::randn({value_dim}, opts),
         .key_heads = key_heads,
         .eps = 1e-6,
-        .activation = pulsarlm::gate_activation::silu,
+        .activation = pulsarlm::ops::gate_activation::silu,
     };
     at::Tensor before = spaced_pool({value_heads, key_dim, value_dim}, at::kFloat);
-    const pulsarlm::state_rows rows = batch.rows(slot_count);
+    const pulsarlm::ops::state_rows rows = batch.rows(slot_count);
     auto step = [&](int64_t first_token,
                     int64_t tokens,
                     const at::Tensor& pool,
-                    const pulsarlm::state_rows& part,
+                    const pulsarlm::ops::state_rows& part,
                     const at::Tensor& cu_seqlens_q,
                     const at::Tensor& kept_state_counts) {
         const int64_t sequences = part.lines.size(0);
-        return pulsarlm::gated_delta_rule_step_cuda(
+        return pulsarlm::ops::cuda::gated_delta_rule_step(
             in.x.narrow(0, first_token, tokens),
             in.a.narrow(0, first_token, tokens),
             in.b.narrow(0, first_token, tokens),
             in.dt_bias,
             in.neg_a,
             pool,
-            part,
+            part.lines,
+            part.slots,
+            part.history_positions,
+            part.rejected_tokens,
+            part.page_size,
             cu_seqlens_q,
             kept_state_counts,
             in.key_heads,
@@ -762,7 +823,7 @@ TEST_CASE(
             in.eps,
             in.activation,
             at::zeros(
-                {pulsarlm::gated_delta_rule_counters(sequences, value_heads)},
+                {pulsarlm::ops::cuda::gated_delta_rule_counters(sequences, value_heads)},
                 at::device(at::kCUDA).dtype(at::kInt)
             ),
             std::nullopt
@@ -818,14 +879,14 @@ TEST_CASE("the Gated DeltaNet ops write into a given out, a slice of a larger te
         .norm_weight = at::randn({value_dim}, opts),
         .key_heads = key_heads,
         .eps = 1e-6,
-        .activation = pulsarlm::gate_activation::sigmoid,
+        .activation = pulsarlm::ops::gate_activation::sigmoid,
     };
     at::Tensor weight = at::randn({channels, 1, kernel}, opts);
     at::Tensor conv_before = spaced_pool({channels, kernel - 1 + extra_inputs}, at::kBFloat16);
     at::Tensor state_before = spaced_pool({value_heads, key_dim, value_dim}, at::kFloat);
     auto counters = [&] {
         return at::zeros(
-            {pulsarlm::gated_delta_rule_counters(batch.num_seqs(), value_heads)},
+            {pulsarlm::ops::cuda::gated_delta_rule_counters(batch.num_seqs(), value_heads)},
             at::device(at::kCUDA).dtype(at::kInt)
         );
     };
@@ -846,23 +907,51 @@ TEST_CASE("the Gated DeltaNet ops write into a given out, a slice of a larger te
         CHECK(at::equal(into_pool, alone_pool));
         CHECK_THROWS(run(larger.narrow(0, 0, batch.total() + 1), before.clone()));
     };
-    const pulsarlm::state_rows window_layout = batch.rows(1);
-    const pulsarlm::state_rows state_layout = batch.rows(slot_count);
+    const pulsarlm::ops::state_rows window_layout = batch.rows(1);
+    const pulsarlm::ops::state_rows state_layout = batch.rows(slot_count);
     const op conv_step = [&](const std::optional<at::Tensor>& out, const at::Tensor& pool) {
-        return pulsarlm::causal_conv_step_cuda(in.x, weight, pool, window_layout, batch.cu_seqlens_q(), 1, out);
+        return pulsarlm::ops::cuda::causal_conv_step(
+            in.x,
+            weight,
+            pool,
+            window_layout.lines,
+            window_layout.slots,
+            window_layout.history_positions,
+            window_layout.rejected_tokens,
+            window_layout.page_size,
+            batch.cu_seqlens_q(),
+            1,
+            out
+        );
     };
     const op conv_chunked = [&](const std::optional<at::Tensor>& out, const at::Tensor& pool) {
-        return pulsarlm::causal_conv_chunked_cuda(in.x, weight, pool, window_layout, batch.cu_seqlens_q(), 1, out);
+        return pulsarlm::ops::cuda::causal_conv_chunked(
+            in.x,
+            weight,
+            pool,
+            window_layout.lines,
+            window_layout.slots,
+            window_layout.history_positions,
+            window_layout.rejected_tokens,
+            window_layout.page_size,
+            batch.cu_seqlens_q(),
+            1,
+            out
+        );
     };
     const op delta_step = [&](const std::optional<at::Tensor>& out, const at::Tensor& pool) {
-        return pulsarlm::gated_delta_rule_step_cuda(
+        return pulsarlm::ops::cuda::gated_delta_rule_step(
             in.x,
             in.a,
             in.b,
             in.dt_bias,
             in.neg_a,
             pool,
-            state_layout,
+            state_layout.lines,
+            state_layout.slots,
+            state_layout.history_positions,
+            state_layout.rejected_tokens,
+            state_layout.page_size,
             batch.cu_seqlens_q(),
             batch.kept_state_counts(),
             in.key_heads,
@@ -875,14 +964,18 @@ TEST_CASE("the Gated DeltaNet ops write into a given out, a slice of a larger te
         );
     };
     const op delta_chunked = [&](const std::optional<at::Tensor>& out, const at::Tensor& pool) {
-        return pulsarlm::gated_delta_rule_chunked_cuda(
+        return pulsarlm::ops::cuda::gated_delta_rule_chunked(
             in.x,
             in.a,
             in.b,
             in.dt_bias,
             in.neg_a,
             pool,
-            state_layout,
+            state_layout.lines,
+            state_layout.slots,
+            state_layout.history_positions,
+            state_layout.rejected_tokens,
+            state_layout.page_size,
             batch.cu_seqlens_q(),
             in.key_heads,
             in.z,

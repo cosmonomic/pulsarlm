@@ -3,8 +3,8 @@
 #include "pulsarlm/engine/communicator.hpp"
 #include "pulsarlm/engine/model/interface.hpp"
 #include "pulsarlm/engine/model/qwen4_exp_config.hpp"
-#include "pulsarlm/kernels/paged_attention.hpp"
-#include "pulsarlm/kernels/rope.hpp"
+#include "pulsarlm/ops/paged_attention.hpp"
+#include "pulsarlm/ops/rope.hpp"
 
 #include <ATen/core/Dict.h>
 #include <ATen/core/Tensor.h>
@@ -35,15 +35,14 @@
 
 namespace pulsarlm {
 
-// An indexed attention layer's KV layer also keeps each token's raw index key. A Gated DeltaNet layer keeps Qwen3.5's two
-// recurrent KV layers. A PLE layer then keeps two more: its convolution's
-// last (kernel - 1) * ngram_size inputs, [hc_count * hidden, (kernel - 1) * ngram_size] in the weights' dtype, and the
-// last ngram_size - 1 tokens, int64, each XOR eos_token_id so that a zeroed line holds EOS.
-// With the checkpoint's mtp.* weights, the model drafts with its MTP layer, vLLM v0.31.0's Qwen4ExpMultiTokenPredictor
-// with each MTP row a position later: the row at position t reads the streams after the last layer at t - 1, normed
-// over all streams and projected by fc_hidden on each, and the token at t, normed and projected by fc_embedding and
-// injected into every stream at weight 1; then one indexed attention layer with its MoE block and hyper connections,
-// without PLE, and hyper_connection_mixer before lm_head.
+// An indexed attention layer's KV layer also keeps each token's raw index key. A Gated DeltaNet layer keeps Qwen3.5's
+// two recurrent KV layers. A PLE layer then keeps two more: its convolution's last (kernel - 1) * ngram_size inputs,
+// [hc_count * hidden, (kernel - 1) * ngram_size] in the weights' dtype, and the last ngram_size - 1 tokens, int64, each
+// XOR eos_token_id so that a zeroed line holds EOS. With the checkpoint's mtp.* weights, the model drafts with its MTP
+// layer, vLLM v0.31.0's Qwen4ExpMultiTokenPredictor with each MTP row a position later: the row at position t reads the
+// streams after the last layer at t - 1, normed over all streams and projected by fc_hidden on each, and the token at
+// t, normed and projected by fc_embedding and injected into every stream at weight 1; then one indexed attention layer
+// with its MoE block and hyper connections, without PLE, and hyper_connection_mixer before lm_head.
 class qwen4_exp_model : public model, public draft_head {
     // Query and key heads are stored with their dims permuted as qwen3_5_model stores them.
     struct attention_weights {
@@ -147,7 +146,7 @@ class qwen4_exp_model : public model, public draft_head {
     communicator comm;
     shard_heads heads;
     std::int64_t n_layers;
-    rope_parameters rope;
+    ops::rope_parameters rope;
     // fp32 [rotary_dim / 2]: Hugging Face's RoPE frequencies, which the indexer rotates its queries and blocks by.
     at::Tensor index_inv_freq;
     std::vector<kv_layer> kv_specs;
@@ -169,12 +168,12 @@ class qwen4_exp_model : public model, public draft_head {
     // Writes into the first rows of logits (make_logits) the logits of the final mix x [logits, hidden], from every
     // GPU's part of lm_head.
     void write_logits(const at::Tensor& x, const at::Tensor& logits) const;
-    // int32 [ntok, words]: each query's selected blocks, as attn_indexed_cuda reads them.
+    // int32 [ntok, words]: each query's selected blocks, as ops::cuda::attn_indexed reads them.
     at::Tensor selected_blocks(
         const attention_weights& w,
         const at::Tensor& queries,
         const kv& lines,
-        const page_views& views,
+        const ops::page_views& views,
         const at::Tensor& cu_seqlens_q
     ) const;
     at::Tensor stream_norm(const at::Tensor& x, const at::Tensor& weight) const;

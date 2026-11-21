@@ -25,9 +25,9 @@
 
 // qwen4_exp_model's paged forward against a dense ATen Qwen4-Exp written from Hugging Face's code, with the delta rule
 // run token by token, the experts one by one, QSA's blocks selected query by query and the n-gram ids hashed on the
-// host: chunked prefill then decode, checking the logits and the lines of every recurrent KV layer at the end and at the
-// newest page end. The same forward split across GPUs, ranks of a communicator on one device, against it and against
-// the lines of the forward on one GPU.
+// host: chunked prefill then decode, checking the logits and the lines of every recurrent KV layer at the end and at
+// the newest page end. The same forward split across GPUs, ranks of a communicator on one device, against it and
+// against the lines of the forward on one GPU.
 
 namespace {
 
@@ -607,7 +607,7 @@ pulsarlm::qwen4_exp_config model_config(const split_dims& dims, std::int64_t exp
         .linear_key_head_dim = key_head_dim,
         .linear_value_head_dim = value_head_dim,
         .linear_conv_kernel = conv_kernel,
-        .linear_output_gate = pulsarlm::gate_activation::sigmoid,
+        .linear_output_gate = pulsarlm::ops::gate_activation::sigmoid,
         .rms_norm_eps = rms_eps,
         .num_experts_per_tok = experts_per_token,
         .hc_count = hc,

@@ -2,7 +2,7 @@
 #include "pulsarlm/engine/eviction.hpp"
 #include "pulsarlm/engine/model/make_model.hpp"
 
-#include "pulsarlm/kernels/paged_attention.hpp"
+#include "pulsarlm/ops/paged_attention.hpp"
 
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -43,7 +43,7 @@ void check_attention(const engine_config& config, std::span<const kv_layer> laye
         if (layers[layer].state) {
             continue;
         }
-        std::optional<std::string> unsupported = attention_unsupported_reason(
+        std::optional<std::string> unsupported = ops::cuda::attention_unsupported_reason(
             config.kv_dtype,
             static_cast<std::int64_t>(config.page_size),
             static_cast<std::int64_t>(layers[layer].head_dim),

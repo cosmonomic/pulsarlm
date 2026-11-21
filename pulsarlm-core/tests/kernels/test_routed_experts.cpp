@@ -1,4 +1,4 @@
-#include "pulsarlm/kernels/routed_experts.hpp"
+#include "pulsarlm/ops/routed_experts.hpp"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAGraph.h>
@@ -13,8 +13,8 @@
 #include <cstdint>
 #include <tuple>
 
-// Checks routed_experts_cuda against a dense ATen reference that rounds where the op rounds. Gate, up, the activation,
-// the product and each expert's output are rounded to the dtype, and the weighted sum is rounded once.
+// Checks ops::cuda::routed_experts against a dense ATen reference that rounds where the op rounds. Gate, up, the
+// activation, the product and each expert's output are rounded to the dtype, and the weighted sum is rounded once.
 
 namespace {
 
@@ -26,8 +26,8 @@ at::TensorOptions cuda(at::ScalarType dtype) {
     return at::device(at::kCUDA).dtype(dtype);
 }
 
-at::Tensor activated(const at::Tensor& x, pulsarlm::expert_activation activation) {
-    return activation == pulsarlm::expert_activation::silu ? at::silu(x) : at::gelu(x, "tanh");
+at::Tensor activated(const at::Tensor& x, pulsarlm::ops::expert_activation activation) {
+    return activation == pulsarlm::ops::expert_activation::silu ? at::silu(x) : at::gelu(x, "tanh");
 }
 
 at::Tensor reference(
@@ -36,7 +36,7 @@ at::Tensor reference(
     const at::Tensor& top_weights,
     const at::Tensor& gate_up_proj,
     const at::Tensor& down_proj,
-    pulsarlm::expert_activation activation
+    pulsarlm::ops::expert_activation activation
 ) {
     const at::ScalarType dtype = h.scalar_type();
     const int64_t tokens = h.size(0);
@@ -60,11 +60,17 @@ std::tuple<at::Tensor, at::Tensor> routing(int64_t tokens, int64_t top_k) {
     return {top_experts, top_weights};
 }
 
-// The zeroed arrival counters routed_experts_cuda needs for h routed to top_k of gate_up_proj's experts.
+// The zeroed arrival counters ops::cuda::routed_experts needs for h routed to top_k of gate_up_proj's experts.
 at::Tensor
 counters_for(const at::Tensor& h, int64_t top_k, const at::Tensor& gate_up_proj, const at::Tensor& down_proj) {
     return at::zeros(
-        {pulsarlm::routed_experts_counters(h.size(0), top_k, gate_up_proj.size(0), down_proj.size(2), h.size(1))},
+        {pulsarlm::ops::cuda::routed_experts_counters(
+            h.size(0),
+            top_k,
+            gate_up_proj.size(0),
+            down_proj.size(2),
+            h.size(1)
+        )},
         cuda(at::kInt)
     );
 }
@@ -81,7 +87,10 @@ TEST_CASE("routed_experts matches a dense reference", "[ops][cuda]") {
         SKIP("no CUDA device");
     }
     const auto dtype = GENERATE(at::kFloat, at::kBFloat16, at::kHalf);
-    const auto activation = GENERATE(pulsarlm::expert_activation::silu, pulsarlm::expert_activation::gelu_tanh);
+    const auto activation = GENERATE(
+        pulsarlm::ops::expert_activation::silu,
+        pulsarlm::ops::expert_activation::gelu_tanh
+    );
     const int64_t tokens = GENERATE(1, 4, 300);
     const int64_t top_k = GENERATE(1, 8);
     const auto [hidden, intermediate] = GENERATE(
@@ -95,7 +104,7 @@ TEST_CASE("routed_experts matches a dense reference", "[ops][cuda]") {
     at::Tensor down_proj = at::randn({expert_count, hidden, intermediate}, cuda(dtype)) / std::sqrt(intermediate);
     auto [top_experts, top_weights] = routing(tokens, top_k);
 
-    at::Tensor got = pulsarlm::routed_experts_cuda(
+    at::Tensor got = pulsarlm::ops::cuda::routed_experts(
         h,
         top_experts,
         top_weights,
@@ -125,9 +134,9 @@ TEST_CASE("routed_experts routes each token to its most probable experts by its 
     at::Tensor down_proj = at::randn({expert_count, hidden, intermediate}, cuda(dtype)) / std::sqrt(intermediate);
     // Router logits whose rows lie apart.
     at::Tensor router_logits = at::randn({tokens, expert_count + 3}, cuda(dtype)).narrow(1, 0, expert_count);
-    const auto activation = pulsarlm::expert_activation::silu;
+    const auto activation = pulsarlm::ops::expert_activation::silu;
 
-    at::Tensor got = pulsarlm::routed_experts_cuda(
+    at::Tensor got = pulsarlm::ops::cuda::routed_experts(
         h,
         router_logits,
         top_k,
@@ -164,9 +173,9 @@ TEST_CASE("routed_experts takes the lower expert among tied router logits", "[op
     at::Tensor gate_up_proj = at::randn({experts, 2 * intermediate, hidden}, cuda(at::kFloat)) / std::sqrt(hidden);
     at::Tensor down_proj = at::randn({experts, hidden, intermediate}, cuda(at::kFloat)) / std::sqrt(intermediate);
     at::Tensor router_logits = at::floor(at::rand({tokens, experts}, cuda(at::kFloat)) * 4.0);
-    const auto activation = pulsarlm::expert_activation::silu;
+    const auto activation = pulsarlm::ops::expert_activation::silu;
 
-    at::Tensor got = pulsarlm::routed_experts_cuda(
+    at::Tensor got = pulsarlm::ops::cuda::routed_experts(
         h,
         router_logits,
         top_k,
@@ -182,7 +191,7 @@ TEST_CASE("routed_experts takes the lower expert among tied router logits", "[op
     at::Tensor top_experts = order.narrow(1, 0, top_k).contiguous();
     at::Tensor top_probabilities = sorted.narrow(1, 0, top_k);
     at::Tensor top_weights = (top_probabilities / top_probabilities.sum(-1, true)).contiguous();
-    at::Tensor expected = pulsarlm::routed_experts_cuda(
+    at::Tensor expected = pulsarlm::ops::cuda::routed_experts(
         h,
         top_experts,
         top_weights,
@@ -211,9 +220,9 @@ TEST_CASE("routed_experts over each GPU's held experts sums to routed_experts ov
     at::Tensor gate_up_proj = at::randn({expert_count, 2 * intermediate, hidden}, cuda(dtype)) / std::sqrt(hidden);
     at::Tensor down_proj = at::randn({expert_count, hidden, intermediate}, cuda(dtype)) / std::sqrt(intermediate);
     at::Tensor router_logits = at::randn({tokens, expert_count}, cuda(dtype));
-    const auto activation = pulsarlm::expert_activation::silu;
+    const auto activation = pulsarlm::ops::expert_activation::silu;
 
-    at::Tensor whole = pulsarlm::routed_experts_cuda(
+    at::Tensor whole = pulsarlm::ops::cuda::routed_experts(
         h,
         router_logits,
         top_k,
@@ -225,7 +234,7 @@ TEST_CASE("routed_experts over each GPU's held experts sums to routed_experts ov
     );
     at::Tensor summed = at::zeros({tokens, hidden}, cuda(at::kFloat));
     for (int64_t gpu = 0; gpu < gpus; gpu++) {
-        summed += pulsarlm::routed_experts_cuda(
+        summed += pulsarlm::ops::cuda::routed_experts(
                       h,
                       router_logits,
                       top_k,
@@ -249,7 +258,7 @@ TEST_CASE("routed_experts replays from a CUDA graph with new inputs", "[ops][cud
     const int64_t top_k = 8;
     const int64_t hidden = 256;
     const int64_t intermediate = 128;
-    const auto activation = pulsarlm::expert_activation::silu;
+    const auto activation = pulsarlm::ops::expert_activation::silu;
     at::manual_seed(5);
     at::Tensor gate_up_proj = at::randn({expert_count, 2 * intermediate, hidden}, cuda(at::kBFloat16)) / 16.0;
     at::Tensor down_proj = at::randn({expert_count, hidden, intermediate}, cuda(at::kBFloat16)) / 16.0;
@@ -257,7 +266,7 @@ TEST_CASE("routed_experts replays from a CUDA graph with new inputs", "[ops][cud
     auto [top_experts, top_weights] = routing(tokens, top_k);
 
     c10::cuda::CUDAStreamGuard guard(c10::cuda::getStreamFromPool());
-    pulsarlm::routed_experts_cuda(
+    pulsarlm::ops::cuda::routed_experts(
         h,
         top_experts,
         top_weights,
@@ -269,7 +278,7 @@ TEST_CASE("routed_experts replays from a CUDA graph with new inputs", "[ops][cud
     at::cuda::CUDAGraph graph;
     at::Tensor graph_counters = counters_for(h, top_k, gate_up_proj, down_proj);
     graph.capture_begin();
-    at::Tensor captured = pulsarlm::routed_experts_cuda(
+    at::Tensor captured = pulsarlm::ops::cuda::routed_experts(
         h,
         top_experts,
         top_weights,
@@ -286,7 +295,7 @@ TEST_CASE("routed_experts replays from a CUDA graph with new inputs", "[ops][cud
     top_experts.copy_(next_experts);
     top_weights.copy_(next_weights);
     graph.replay();
-    at::Tensor eager = pulsarlm::routed_experts_cuda(
+    at::Tensor eager = pulsarlm::ops::cuda::routed_experts(
         next_h,
         next_experts,
         next_weights,

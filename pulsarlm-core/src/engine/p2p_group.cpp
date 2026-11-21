@@ -1,6 +1,6 @@
 #include "pulsarlm/engine/p2p_group.hpp"
 
-#include "pulsarlm/kernels/p2p_collectives.hpp"
+#include "pulsarlm/ops/p2p_collectives.hpp"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAException.h>
@@ -15,7 +15,7 @@ namespace pulsarlm {
 namespace {
 
 std::size_t flag_count(std::size_t ranks) {
-    return 2 * p2p_max_blocks * ranks;
+    return 2 * ops::cuda::p2p_max_blocks * ranks;
 }
 
 // Enables access from device to peer unless they are one device; false when it is impossible.
@@ -53,10 +53,10 @@ p2p_group::p2p_group(std::span<const at::Device> devices, std::size_t max_bytes)
             buffers.push_back(static_cast<std::byte*>(buffer));
             C10_CUDA_CHECK(cudaMalloc(&rank_flags, flag_count(devices.size()) * sizeof(std::uint64_t)));
             flags.push_back(static_cast<std::uint64_t*>(rank_flags));
-            C10_CUDA_CHECK(cudaMalloc(&rank_counters, p2p_max_blocks * sizeof(std::uint64_t)));
+            C10_CUDA_CHECK(cudaMalloc(&rank_counters, ops::cuda::p2p_max_blocks * sizeof(std::uint64_t)));
             counters.push_back(static_cast<std::uint64_t*>(rank_counters));
             C10_CUDA_CHECK(cudaMemset(rank_flags, 0, flag_count(devices.size()) * sizeof(std::uint64_t)));
-            C10_CUDA_CHECK(cudaMemset(rank_counters, 0, p2p_max_blocks * sizeof(std::uint64_t)));
+            C10_CUDA_CHECK(cudaMemset(rank_counters, 0, ops::cuda::p2p_max_blocks * sizeof(std::uint64_t)));
             C10_CUDA_CHECK(cudaDeviceSynchronize());
         }
     } catch (...) {
@@ -75,7 +75,7 @@ p2p_group::p2p_group(std::span<const at::Device> devices, std::size_t max_bytes)
 }
 
 std::unique_ptr<p2p_group> p2p_group::make(std::span<const at::Device> devices, std::size_t max_bytes) {
-    if (devices.empty() || devices.size() > p2p_max_ranks) {
+    if (devices.empty() || devices.size() > ops::cuda::p2p_max_ranks) {
         return nullptr;
     }
     for (const at::Device& device : devices) {
@@ -109,7 +109,7 @@ bool p2p_group::fits(const at::Tensor& x) const noexcept {
 }
 
 void p2p_group::all_reduce(std::size_t rank, at::Tensor& x) {
-    p2p_all_reduce_cuda(x, rank, buffers, flags, counters);
+    ops::cuda::p2p_all_reduce(x, rank, buffers, flags, counters);
 }
 
 bool p2p_group::fits_gather(const at::Tensor& x) const noexcept {
@@ -121,7 +121,7 @@ at::Tensor p2p_group::all_gather(std::size_t rank, const at::Tensor& x) {
     std::vector<std::int64_t> sizes = x.sizes().vec();
     sizes.front() *= static_cast<std::int64_t>(devices.size());
     at::Tensor gathered = at::empty(sizes, x.options());
-    p2p_all_gather_cuda(x, gathered, rank, buffers, flags, counters);
+    ops::cuda::p2p_all_gather(x, gathered, rank, buffers, flags, counters);
     return gathered;
 }
 

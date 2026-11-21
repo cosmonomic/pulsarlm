@@ -2,8 +2,8 @@
 
 #include "pulsarlm/engine/model/paged_forward.hpp"
 #include "pulsarlm/engine/model/partial_rope.hpp"
-#include "pulsarlm/kernels/gated_deltanet.hpp"
-#include "pulsarlm/kernels/normalization.hpp"
+#include "pulsarlm/ops/gated_deltanet.hpp"
+#include "pulsarlm/ops/normalization.hpp"
 #include "weights.hpp"
 
 #include <ATen/ATen.h>
@@ -39,8 +39,8 @@ const fp8_block& require_block(const std::optional<fp8_block>& block, const std:
     return *block;
 }
 
-// name is a linear's full prefix, such as model.language_model.layers.0.mlp.gate_proj. An fp8 linear may be on the host;
-// it is copied to device only for its repack.
+// name is a linear's full prefix, such as model.language_model.layers.0.mlp.gate_proj. An fp8 linear may be on the
+// host; it is copied to device only for its repack.
 linear need_linear(
     const c10::Dict<std::string, at::Tensor>& weights,
     const std::string& name,
@@ -155,7 +155,7 @@ qwen3_5_model::qwen3_5_model(
         first_kv_head = rank / (ranks / c.n_kv_heads);
     }
     check_size(embed_tokens, 0, vocab_rows(c.vocab_size, ranks), "embed_tokens.weight");
-    rope = rope_parameters{
+    rope = ops::rope_parameters{
         .theta = std::pow(c.rope_theta, static_cast<double>(c.head_dim) / static_cast<double>(rotary_dim)),
         .partial_rotary_factor = static_cast<double>(rotary_dim) / static_cast<double>(c.head_dim),
     };
@@ -403,10 +403,10 @@ at::Tensor qwen3_5_model::attention(
     const std::size_t kv_index = layer.kv_layer;
 
     at::Tensor query_gate = w.q_proj.apply(h).view({ntok, n_heads, 2 * c.head_dim});
-    at::Tensor q = rmsnorm_cuda(query_gate.narrow(-1, 0, c.head_dim), w.q_norm, c.rms_norm_eps);
+    at::Tensor q = ops::cuda::rmsnorm(query_gate.narrow(-1, 0, c.head_dim), w.q_norm, c.rms_norm_eps);
     at::Tensor gate = query_gate.narrow(-1, c.head_dim, c.head_dim).reshape({ntok, n_heads * c.head_dim});
     q = rope_q(q.view({ntok, n_heads * c.head_dim}), g.pos, n_heads, c.head_dim, rope);
-    at::Tensor k = rmsnorm_cuda(w.k_proj.apply(h).view({ntok, n_kv_heads, c.head_dim}), w.k_norm, c.rms_norm_eps);
+    at::Tensor k = ops::cuda::rmsnorm(w.k_proj.apply(h).view({ntok, n_kv_heads, c.head_dim}), w.k_norm, c.rms_norm_eps);
     at::Tensor v = w.v_proj.apply(h).view({ntok, n_kv_heads, c.head_dim}).contiguous();
     const double scale = 1.0 / std::sqrt(static_cast<double>(c.head_dim));
     at::Tensor o = at::empty_like(q);
@@ -464,7 +464,7 @@ at::Tensor qwen3_5_model::deltanet(
                 layer.conv_kv_layer,
                 linear_n_key_heads,
                 config.rms_norm_eps,
-                gate_activation::silu,
+                ops::gate_activation::silu,
                 out
             );
         },
@@ -497,9 +497,9 @@ at::Tensor qwen3_5_model::decoder_layer(
     graph_segments& segments
 ) const {
     const double eps = config.rms_norm_eps;
-    at::Tensor h = rmsnorm_cuda(x, w.input_layernorm, eps);
+    at::Tensor h = ops::cuda::rmsnorm(x, w.input_layernorm, eps);
     at::Tensor mixed = x + (w.attention ? attention(h, w, g, lines, segments) : deltanet(h, w, g, lines, segments));
-    at::Tensor h2 = rmsnorm_cuda(mixed, w.post_attention_layernorm, eps);
+    at::Tensor h2 = ops::cuda::rmsnorm(mixed, w.post_attention_layernorm, eps);
     at::Tensor mlp = w.down_proj.apply(at::silu(w.gate_proj.apply(h2)) * w.up_proj.apply(h2));
     comm.all_reduce(mlp);
     return mixed + mlp;
@@ -530,7 +530,7 @@ model::output qwen3_5_model::forward(const batch& b, std::span<const kv> lines, 
     for (std::int64_t layer = 0; layer < n_layers; layer++) {
         x = decoder_layer(x, layers[layer], b, lines, segments);
     }
-    at::Tensor normed = rmsnorm_cuda(x, norm, config.rms_norm_eps);
+    at::Tensor normed = ops::cuda::rmsnorm(x, norm, config.rms_norm_eps);
     at::Tensor logits = make_logits(b.logit_tokens.size(0), normed);
     segments.run_between_segments(
         [this, &b, lines](const at::Tensor& hidden, const at::Tensor& out) {
@@ -554,7 +554,7 @@ bool qwen3_5_model::allows_segment_capture(std::int64_t token_count) const {
 }
 
 std::int64_t qwen3_5_model::arrival_counter_count(std::int64_t sequences, std::int64_t) const {
-    return gated_delta_rule_counters(sequences, linear_n_value_heads);
+    return ops::cuda::gated_delta_rule_counters(sequences, linear_n_value_heads);
 }
 
 draft_head* qwen3_5_model::drafter() {
@@ -570,11 +570,11 @@ model::output
 qwen3_5_model::draft(const batch& b, const at::Tensor& hidden, std::span<const kv> lines, graph_segments& segments) {
     const mtp_weights& m = *mtp;
     const double eps = config.rms_norm_eps;
-    at::Tensor embedded = rmsnorm_cuda(embed(b.tokens), m.pre_fc_norm_embedding, eps);
-    at::Tensor previous = rmsnorm_cuda(hidden.contiguous(), m.pre_fc_norm_hidden, eps);
+    at::Tensor embedded = ops::cuda::rmsnorm(embed(b.tokens), m.pre_fc_norm_embedding, eps);
+    at::Tensor previous = ops::cuda::rmsnorm(hidden.contiguous(), m.pre_fc_norm_hidden, eps);
     at::Tensor x = at::linear(at::cat({embedded, previous}, -1), m.fc);
     x = decoder_layer(x, m.layer, b, lines, segments);
-    at::Tensor normed = rmsnorm_cuda(x, m.norm, eps);
+    at::Tensor normed = ops::cuda::rmsnorm(x, m.norm, eps);
     at::Tensor logits = make_logits(b.logit_tokens.size(0), normed);
     segments.run_between_segments(
         [this, &b](const at::Tensor& hidden_states, const at::Tensor& out) {

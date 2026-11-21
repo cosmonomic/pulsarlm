@@ -1,6 +1,6 @@
 #include "request_table_kernels.hpp"
 
-#include "pulsarlm/kernels/device.hpp"
+#include "pulsarlm/ops/cuda/device.hpp"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -273,7 +273,11 @@ void advance_requests(
     if (entries == 0) {
         return;
     }
-    advance_requests_kernel<<<cta_count(entries, cta_threads), cta_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+    advance_requests_kernel<<<
+        ops::cuda::cta_count(entries, cta_threads),
+        cta_threads,
+        0,
+        at::cuda::getCurrentCUDAStream()>>>(
         request_slots.const_data_ptr<std::int64_t>(),
         entries,
         computed_token_counts.const_data_ptr<std::int64_t>(),

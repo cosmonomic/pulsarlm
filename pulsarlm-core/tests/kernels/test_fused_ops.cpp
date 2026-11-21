@@ -1,7 +1,7 @@
-#include "pulsarlm/kernels/gating.hpp"
-#include "pulsarlm/kernels/hyper_connection.hpp"
-#include "pulsarlm/kernels/normalization.hpp"
-#include "pulsarlm/kernels/small_batch_linear.hpp"
+#include "pulsarlm/ops/gating.hpp"
+#include "pulsarlm/ops/hyper_connection.hpp"
+#include "pulsarlm/ops/normalization.hpp"
+#include "pulsarlm/ops/small_batch_linear.hpp"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAFunctions.h>
@@ -35,7 +35,7 @@ TEST_CASE("stream_rmsnorm normalizes each stream over its hidden entries", "[ops
     at::Tensor x = at::randn({token_count, stream_count * hidden_size}, at::device(at::kCUDA).dtype(dtype));
     at::Tensor weight = (1.0 + 0.1 * at::randn({stream_count * hidden_size})).to(at::kCUDA);
 
-    at::Tensor got = pulsarlm::stream_rmsnorm_cuda(x, weight, stream_count, eps);
+    at::Tensor got = pulsarlm::ops::cuda::stream_rmsnorm(x, weight, stream_count, eps);
 
     at::Tensor streams = x.to(at::kFloat).view({token_count, stream_count, hidden_size});
     at::Tensor normed = streams * at::rsqrt(streams.pow(2).mean(-1, true) + eps);
@@ -56,9 +56,9 @@ TEST_CASE("stream_rmsnorm_linear normalizes the streams and projects them", "[op
     at::Tensor norm_weight = (1.0 + 0.1 * at::randn({stream_count * hidden_size})).to(at::kCUDA);
     at::Tensor weight = at::randn({68, stream_count * hidden_size}, opts) / 20.0;
 
-    auto [normed, projected] = pulsarlm::stream_rmsnorm_linear_cuda(x, norm_weight, stream_count, eps, weight);
+    auto [normed, projected] = pulsarlm::ops::cuda::stream_rmsnorm_linear(x, norm_weight, stream_count, eps, weight);
 
-    at::Tensor expected_normed = pulsarlm::stream_rmsnorm_cuda(x, norm_weight, stream_count, eps);
+    at::Tensor expected_normed = pulsarlm::ops::cuda::stream_rmsnorm(x, norm_weight, stream_count, eps);
     CHECK(at::allclose(normed.to(at::kFloat), expected_normed.to(at::kFloat), tolerance(dtype), tolerance(dtype)));
     at::Tensor expected = at::linear(expected_normed.to(at::kFloat), weight.to(at::kFloat));
     CHECK(at::allclose(projected.to(at::kFloat), expected, tolerance(dtype), tolerance(dtype)));
@@ -77,7 +77,7 @@ TEST_CASE("hyper_connection_mix gates and averages the streams and weighs the in
     at::Tensor projected = at::randn({tokens, rank + stream_count}, opts);
     at::Tensor up_weight = at::randn({stream_count * hidden_size, rank}, opts) / 4.0;
 
-    auto [input, injection_weights] = pulsarlm::hyper_connection_mix_cuda(
+    auto [input, injection_weights] = pulsarlm::ops::cuda::hyper_connection_mix(
         normed,
         projected.narrow(1, 0, rank),
         up_weight,
@@ -104,7 +104,7 @@ TEST_CASE("sigmoid_gated_add and sigmoid_gated round as the ATen ops do", "[ops]
     at::Tensor logits = at::randn({token_count, 3}, opts);
     CHECK(
         at::equal(
-            pulsarlm::sigmoid_gated_add_cuda(x, logits.narrow(1, 2, 1), y),
+            pulsarlm::ops::cuda::sigmoid_gated_add(x, logits.narrow(1, 2, 1), y),
             x + at::sigmoid(logits.narrow(1, 2, 1)) * y
         )
     );
@@ -112,10 +112,10 @@ TEST_CASE("sigmoid_gated_add and sigmoid_gated round as the ATen ops do", "[ops]
     at::Tensor heads = at::randn({token_count, 3, 2 * hidden_size}, opts);
     at::Tensor o = at::randn({token_count, 3, hidden_size}, opts);
     at::Tensor gate = heads.narrow(-1, hidden_size, hidden_size);
-    CHECK(at::equal(pulsarlm::sigmoid_gated_cuda(o, gate), o * at::sigmoid(gate)));
+    CHECK(at::equal(pulsarlm::ops::cuda::sigmoid_gated(o, gate), o * at::sigmoid(gate)));
     CHECK(
         at::equal(
-            pulsarlm::sigmoid_gated_cuda(o.view({token_count, -1}), gate.reshape({token_count, -1})),
+            pulsarlm::ops::cuda::sigmoid_gated(o.view({token_count, -1}), gate.reshape({token_count, -1})),
             o.view({token_count, -1}) * at::sigmoid(gate.reshape({token_count, -1}))
         )
     );
@@ -131,7 +131,7 @@ TEST_CASE("hyper_connection_inject adds the block output to each stream by its w
     at::Tensor out = at::randn({token_count, hidden_size}, opts);
     at::Tensor injection_weights = at::randn({token_count, stream_count}, opts);
 
-    at::Tensor got = pulsarlm::hyper_connection_inject_cuda(x, out, injection_weights);
+    at::Tensor got = pulsarlm::ops::cuda::hyper_connection_inject(x, out, injection_weights);
 
     at::Tensor expected = x + (out.unsqueeze(1) * injection_weights.unsqueeze(-1)).flatten(1);
     CHECK(at::equal(got, expected));
@@ -144,7 +144,7 @@ TEST_CASE("silu_mul multiplies silu of the gate half by the up half", "[ops][cud
     const auto dtype = GENERATE(at::kFloat, at::kBFloat16);
     at::Tensor x = at::randn({token_count, 2 * hidden_size}, at::device(at::kCUDA).dtype(dtype));
 
-    at::Tensor got = pulsarlm::silu_mul_cuda(x);
+    at::Tensor got = pulsarlm::ops::cuda::silu_mul(x);
 
     at::Tensor expected = at::silu(x.narrow(1, 0, hidden_size)) * x.narrow(1, hidden_size, hidden_size);
     CHECK(at::allclose(got.to(at::kFloat), expected.to(at::kFloat), tolerance(dtype), tolerance(dtype)));
@@ -166,7 +166,7 @@ TEST_CASE("small_batch_linear and small_batch_gated_linear match at::linear", "[
     at::Tensor expected = at::linear(x.to(at::kFloat), weight.to(at::kFloat));
     CHECK(
         at::allclose(
-            pulsarlm::small_batch_linear_cuda(x, weight).to(at::kFloat),
+            pulsarlm::ops::cuda::small_batch_linear(x, weight).to(at::kFloat),
             expected,
             tolerance(dtype),
             tolerance(dtype)
@@ -175,8 +175,8 @@ TEST_CASE("small_batch_linear and small_batch_gated_linear match at::linear", "[
     at::Tensor projected = at::linear(x.to(at::kFloat), gate_up.to(at::kFloat)).to(dtype);
     CHECK(
         at::allclose(
-            pulsarlm::small_batch_gated_linear_cuda(x, gate_up).to(at::kFloat),
-            pulsarlm::silu_mul_cuda(projected).to(at::kFloat),
+            pulsarlm::ops::cuda::small_batch_gated_linear(x, gate_up).to(at::kFloat),
+            pulsarlm::ops::cuda::silu_mul(projected).to(at::kFloat),
             tolerance(dtype),
             tolerance(dtype)
         )
@@ -198,7 +198,7 @@ TEST_CASE("injected_stream_rmsnorm_linear injects, normalizes and projects the s
     at::Tensor norm_weight = (1.0 + 0.1 * at::randn({stream_count * hidden_size})).to(at::kCUDA);
     at::Tensor weight = at::randn({68, stream_count * hidden_size}, opts) / 20.0;
 
-    auto [summed, normed, projected] = pulsarlm::injected_stream_rmsnorm_linear_cuda(
+    auto [summed, normed, projected] = pulsarlm::ops::cuda::injected_stream_rmsnorm_linear(
         x,
         out,
         injection_weights,
@@ -208,9 +208,9 @@ TEST_CASE("injected_stream_rmsnorm_linear injects, normalizes and projects the s
         weight
     );
 
-    at::Tensor expected_summed = pulsarlm::hyper_connection_inject_cuda(x, out, injection_weights);
+    at::Tensor expected_summed = pulsarlm::ops::cuda::hyper_connection_inject(x, out, injection_weights);
     CHECK(at::equal(summed, expected_summed));
-    at::Tensor expected_normed = pulsarlm::stream_rmsnorm_cuda(expected_summed, norm_weight, stream_count, eps);
+    at::Tensor expected_normed = pulsarlm::ops::cuda::stream_rmsnorm(expected_summed, norm_weight, stream_count, eps);
     CHECK(at::allclose(normed.to(at::kFloat), expected_normed.to(at::kFloat), tolerance(dtype), tolerance(dtype)));
     at::Tensor expected = at::linear(expected_normed.to(at::kFloat), weight.to(at::kFloat));
     CHECK(at::allclose(projected.to(at::kFloat), expected, tolerance(dtype), tolerance(dtype)));

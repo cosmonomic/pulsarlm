@@ -4,7 +4,7 @@
 #include "pulsarlm/engine/model/interface.hpp"
 #include "pulsarlm/engine/model/qwen3_5_config.hpp"
 #include "pulsarlm/engine/model/linear.hpp"
-#include "pulsarlm/kernels/rope.hpp"
+#include "pulsarlm/ops/rope.hpp"
 
 #include <ATen/core/Dict.h>
 #include <ATen/core/Tensor.h>
@@ -82,7 +82,7 @@ class qwen3_5_model : public model, public draft_head {
     std::int64_t linear_n_key_heads;
     std::int64_t linear_n_value_heads;
     std::int64_t n_layers;
-    rope_parameters rope;
+    ops::rope_parameters rope;
     std::vector<kv_layer_shard> kv_shards;
     at::Tensor embed_tokens;
     at::Tensor lm_head;

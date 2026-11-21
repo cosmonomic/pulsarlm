@@ -206,7 +206,7 @@ at::Tensor rms_norm(const at::Tensor& x, double eps, const std::optional<at::Ten
 }
 
 // Hugging Face's rotate_half RoPE with "proportional" partial rotation, angles in fp64. x is [tokens, heads, dim].
-at::Tensor rope(const at::Tensor& x, const pulsarlm::rope_parameters& parameters) {
+at::Tensor rope(const at::Tensor& x, const pulsarlm::ops::rope_parameters& parameters) {
     const std::int64_t dim = x.size(-1), half = dim / 2;
     const auto rotated_pairs = static_cast<std::int64_t>(std::floor(parameters.partial_rotary_factor * dim / 2));
     auto pairs = at::arange(half, cuda(at::kDouble));
@@ -259,7 +259,7 @@ dense_output dense_forward(const gemma4_config& c, const weights& w, const at::T
         }
         kv_of.push_back(source);
         const std::int64_t dim = head_dim(c, layer), heads = kv_heads(c, layer);
-        const pulsarlm::rope_parameters& parameters = is_sliding(c, layer) ? c.sliding_rope : c.full_rope;
+        const pulsarlm::ops::rope_parameters& parameters = is_sliding(c, layer) ? c.sliding_rope : c.full_rope;
 
         auto h = rms_norm(x, eps, w.layer(layer, "input_layernorm.weight"));
         auto q = rms_norm(

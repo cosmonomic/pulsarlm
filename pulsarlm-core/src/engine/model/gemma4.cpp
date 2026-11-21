@@ -1,8 +1,8 @@
 #include "pulsarlm/engine/model/gemma4.hpp"
 
 #include "pulsarlm/engine/model/paged_forward.hpp"
-#include "pulsarlm/kernels/normalization.hpp"
-#include "pulsarlm/kernels/routed_experts.hpp"
+#include "pulsarlm/ops/normalization.hpp"
+#include "pulsarlm/ops/routed_experts.hpp"
 #include "weights.hpp"
 
 #include <ATen/ATen.h>
@@ -196,7 +196,7 @@ at::Tensor gemma4_model::per_layer_inputs(const at::Tensor& tokens, const at::Te
     at::Tensor projected = (at::linear(embedded, per_layer_model_projection) *
                             std::pow(static_cast<double>(config.hidden_size), -0.5))
                                .view({ntok, n_layers, width});
-    projected = rmsnorm_cuda(projected, per_layer_projection_norm, config.rms_norm_eps);
+    projected = ops::cuda::rmsnorm(projected, per_layer_projection_norm, config.rms_norm_eps);
     return (projected + by_token) * std::pow(2.0, -0.5);
 }
 
@@ -214,10 +214,10 @@ at::Tensor gemma4_model::attention(
     const bool full = !sliding(layer);
     const auto heads = static_cast<std::int64_t>(spec.n_kv_heads);
     const auto head_dim = static_cast<std::int64_t>(spec.head_dim);
-    const rope_parameters& rope = full ? config.full_rope : config.sliding_rope;
+    const ops::rope_parameters& rope = full ? config.full_rope : config.sliding_rope;
     const at::Tensor& ones = full ? full_ones : sliding_ones;
 
-    at::Tensor q = rmsnorm_cuda(
+    at::Tensor q = ops::cuda::rmsnorm(
         at::linear(h, w.q_proj).view({ntok, config.n_heads, head_dim}),
         w.q_norm,
         config.rms_norm_eps
@@ -229,11 +229,11 @@ at::Tensor gemma4_model::attention(
     if (w.k_proj.defined()) {
         at::Tensor raw_k = at::linear(h, w.k_proj).view({ntok, heads, head_dim});
         if (spec.values_only) {
-            v = rmsnorm_cuda(raw_k, ones, config.rms_norm_eps);
+            v = ops::cuda::rmsnorm(raw_k, ones, config.rms_norm_eps);
             k = v;
         } else {
-            k = rmsnorm_cuda(raw_k, w.k_norm, config.rms_norm_eps);
-            v = rmsnorm_cuda(at::linear(h, w.v_proj).view({ntok, heads, head_dim}), ones, config.rms_norm_eps);
+            k = ops::cuda::rmsnorm(raw_k, w.k_norm, config.rms_norm_eps);
+            v = ops::cuda::rmsnorm(at::linear(h, w.v_proj).view({ntok, heads, head_dim}), ones, config.rms_norm_eps);
         }
     }
     if (spec.values_only) {
@@ -278,20 +278,20 @@ at::Tensor gemma4_model::experts(const at::Tensor& x, std::int64_t layer, const 
     const layer_weights& w = layers[layer];
     const double eps = config.rms_norm_eps;
 
-    at::Tensor routed = rmsnorm_cuda(x, hidden_ones, eps) * w.router_scale *
+    at::Tensor routed = ops::cuda::rmsnorm(x, hidden_ones, eps) * w.router_scale *
         std::pow(static_cast<double>(config.hidden_size), -0.5);
     at::Tensor probabilities = at::softmax(at::linear(routed, w.router_proj), -1, at::kFloat);
     auto [top_weights, top_experts] = at::topk(probabilities, config.top_k_experts, -1);
     at::Tensor expert_scale = w.router_per_expert_scale.index_select(0, top_experts.flatten())
                                   .view(top_experts.sizes());
     top_weights = top_weights / top_weights.sum(-1, true) * expert_scale.to(at::kFloat);
-    return routed_experts_cuda(
-        rmsnorm_cuda(x, w.pre_feedforward_layernorm_2, eps),
+    return ops::cuda::routed_experts(
+        ops::cuda::rmsnorm(x, w.pre_feedforward_layernorm_2, eps),
         top_experts,
         top_weights,
         w.experts_gate_up_proj,
         w.experts_down_proj,
-        expert_activation::gelu_tanh,
+        ops::expert_activation::gelu_tanh,
         counters
     );
 }
@@ -306,26 +306,26 @@ at::Tensor gemma4_model::block(
 ) const {
     const layer_weights& w = layers[layer];
     const double eps = config.rms_norm_eps;
-    at::Tensor attended = attention(rmsnorm_cuda(x, w.input_layernorm, eps), layer, g, lines, segments);
-    x = x + rmsnorm_cuda(attended, w.post_attention_layernorm, eps);
+    at::Tensor attended = attention(ops::cuda::rmsnorm(x, w.input_layernorm, eps), layer, g, lines, segments);
+    x = x + ops::cuda::rmsnorm(attended, w.post_attention_layernorm, eps);
 
-    at::Tensor h = rmsnorm_cuda(x, w.pre_feedforward_layernorm, eps);
+    at::Tensor h = ops::cuda::rmsnorm(x, w.pre_feedforward_layernorm, eps);
     at::Tensor mlp = at::linear(gelu_tanh(at::linear(h, w.gate_proj)) * at::linear(h, w.up_proj), w.down_proj);
     if (config.enable_moe_block) {
-        mlp = rmsnorm_cuda(mlp, w.post_feedforward_layernorm_1, eps) +
-            rmsnorm_cuda(experts(x, layer, g.arrival_counters), w.post_feedforward_layernorm_2, eps);
+        mlp = ops::cuda::rmsnorm(mlp, w.post_feedforward_layernorm_1, eps) +
+            ops::cuda::rmsnorm(experts(x, layer, g.arrival_counters), w.post_feedforward_layernorm_2, eps);
     }
-    x = x + rmsnorm_cuda(mlp, w.post_feedforward_layernorm, eps);
+    x = x + ops::cuda::rmsnorm(mlp, w.post_feedforward_layernorm, eps);
 
     if (per_layer_input.defined()) {
         at::Tensor gated = gelu_tanh(at::linear(x, w.per_layer_input_gate)) * per_layer_input;
-        x = x + rmsnorm_cuda(at::linear(gated, w.per_layer_projection), w.post_per_layer_input_norm, eps);
+        x = x + ops::cuda::rmsnorm(at::linear(gated, w.per_layer_projection), w.post_per_layer_input_norm, eps);
     }
     return x * w.layer_scalar;
 }
 
 void gemma4_model::write_logits(const at::Tensor& x, at::Tensor logits) const {
-    at::matmul_out(logits, rmsnorm_cuda(x, norm, config.rms_norm_eps), embed_tokens.t());
+    at::matmul_out(logits, ops::cuda::rmsnorm(x, norm, config.rms_norm_eps), embed_tokens.t());
     if (config.final_logit_softcapping) {
         logits.div_(*config.final_logit_softcapping).tanh_().mul_(*config.final_logit_softcapping);
     }
@@ -358,7 +358,7 @@ std::int64_t gemma4_model::arrival_counter_count(std::int64_t, std::int64_t toke
         return 0;
     }
     const layer_weights& w = layers.front();
-    return routed_experts_counters(
+    return ops::cuda::routed_experts_counters(
         tokens,
         config.top_k_experts,
         w.experts_gate_up_proj.size(0),

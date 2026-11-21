@@ -70,12 +70,12 @@ qwen4_exp_layer_type qwen4_exp_layer(const std::string& name) {
     throw std::invalid_argument("unknown Qwen4-Exp layer type " + name);
 }
 
-gate_activation activation(const std::string& name) {
+ops::gate_activation activation(const std::string& name) {
     if (name == "silu") {
-        return gate_activation::silu;
+        return ops::gate_activation::silu;
     }
     if (name == "sigmoid") {
-        return gate_activation::sigmoid;
+        return ops::gate_activation::sigmoid;
     }
     throw std::invalid_argument("unknown gate activation " + name);
 }
@@ -344,7 +344,7 @@ PYBIND11_MODULE(pulsarlm_core, m) {
                         std::int64_t n_heads,
                         std::int64_t n_kv_heads,
                         std::int64_t head_dim,
-                        const rope_parameters& rope,
+                        const ops::rope_parameters& rope,
                         double rms_norm_eps) {
                 return model_config{
                     .architecture = std::move(architecture),
@@ -371,13 +371,18 @@ PYBIND11_MODULE(pulsarlm_core, m) {
         )
         .def_property_readonly("rope", [](const model_config& c) { return c.dense_model.rope; });
 
-    py::class_<llama3_rope_scaling>(m, "Llama3RopeScaling")
+    py::class_<ops::llama3_rope_scaling>(m, "Llama3RopeScaling")
         .def(
             py::init([](double factor,
                         double low_freq_factor,
                         double high_freq_factor,
                         double original_max_position_embeddings) {
-                return llama3_rope_scaling{factor, low_freq_factor, high_freq_factor, original_max_position_embeddings};
+                return ops::llama3_rope_scaling{
+                    factor,
+                    low_freq_factor,
+                    high_freq_factor,
+                    original_max_position_embeddings
+                };
             }),
             py::kw_only(),
             "factor"_a,
@@ -385,24 +390,26 @@ PYBIND11_MODULE(pulsarlm_core, m) {
             "high_freq_factor"_a,
             "original_max_position_embeddings"_a
         )
-        .def_readonly("factor", &llama3_rope_scaling::factor)
-        .def_readonly("low_freq_factor", &llama3_rope_scaling::low_freq_factor)
-        .def_readonly("high_freq_factor", &llama3_rope_scaling::high_freq_factor)
-        .def_readonly("original_max_position_embeddings", &llama3_rope_scaling::original_max_position_embeddings);
+        .def_readonly("factor", &ops::llama3_rope_scaling::factor)
+        .def_readonly("low_freq_factor", &ops::llama3_rope_scaling::low_freq_factor)
+        .def_readonly("high_freq_factor", &ops::llama3_rope_scaling::high_freq_factor)
+        .def_readonly("original_max_position_embeddings", &ops::llama3_rope_scaling::original_max_position_embeddings);
 
-    py::class_<rope_parameters>(m, "RopeParameters")
+    py::class_<ops::rope_parameters>(m, "RopeParameters")
         .def(
-            py::init([](double theta, double partial_rotary_factor, std::optional<llama3_rope_scaling> llama3_scaling) {
-                return rope_parameters{theta, partial_rotary_factor, llama3_scaling};
-            }),
+            py::init(
+                [](double theta, double partial_rotary_factor, std::optional<ops::llama3_rope_scaling> llama3_scaling) {
+                    return ops::rope_parameters{theta, partial_rotary_factor, llama3_scaling};
+                }
+            ),
             py::kw_only(),
             "theta"_a,
             "partial_rotary_factor"_a = 1.0,
             "llama3_scaling"_a = py::none()
         )
-        .def_readonly("theta", &rope_parameters::theta)
-        .def_readonly("partial_rotary_factor", &rope_parameters::partial_rotary_factor)
-        .def_readonly("llama3_scaling", &rope_parameters::llama3_scaling);
+        .def_readonly("theta", &ops::rope_parameters::theta)
+        .def_readonly("partial_rotary_factor", &ops::rope_parameters::partial_rotary_factor)
+        .def_readonly("llama3_scaling", &ops::rope_parameters::llama3_scaling);
 
     py::class_<gemma4_config>(m, "Gemma4Config")
         .def(
@@ -416,8 +423,8 @@ PYBIND11_MODULE(pulsarlm_core, m) {
                         bool attention_k_eq_v,
                         const std::vector<std::string>& layer_types,
                         std::int64_t sliding_window,
-                        const rope_parameters& sliding_rope,
-                        const rope_parameters& full_rope,
+                        const ops::rope_parameters& sliding_rope,
+                        const ops::rope_parameters& full_rope,
                         double rms_norm_eps,
                         std::optional<double> final_logit_softcapping,
                         std::int64_t num_kv_shared_layers,

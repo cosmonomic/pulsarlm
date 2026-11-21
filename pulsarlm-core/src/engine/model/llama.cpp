@@ -1,7 +1,7 @@
 #include "pulsarlm/engine/model/llama.hpp"
 
 #include "pulsarlm/engine/model/paged_forward.hpp"
-#include "pulsarlm/kernels/normalization.hpp"
+#include "pulsarlm/ops/normalization.hpp"
 #include "weights.hpp"
 
 #include <ATen/ATen.h>
@@ -146,8 +146,8 @@ model::output llama_model::forward(const batch& b, std::span<const kv> lines, gr
     at::Tensor x = embed_tokens.index_select(0, b.tokens);
     for (std::int64_t layer = 0; layer < config.n_layers; layer++) {
         const layer_weights& w = layers[layer];
-        x = x + attention(rmsnorm_cuda(x, w.input_layernorm, eps), layer, b, lines, segments);
-        at::Tensor h = rmsnorm_cuda(x, w.post_attention_layernorm, eps);
+        x = x + attention(ops::cuda::rmsnorm(x, w.input_layernorm, eps), layer, b, lines, segments);
+        at::Tensor h = ops::cuda::rmsnorm(x, w.post_attention_layernorm, eps);
         x = x + at::linear(at::silu(at::linear(h, w.gate_proj)) * at::linear(h, w.up_proj), w.down_proj);
     }
     at::Tensor logits = at::empty({b.logit_tokens.size(0), lm_head.size(0)}, x.options());
@@ -156,7 +156,7 @@ model::output llama_model::forward(const batch& b, std::span<const kv> lines, gr
             at::Tensor written = out.narrow(0, 0, b.logit_tokens.size(0));
             at::matmul_out(
                 written,
-                rmsnorm_cuda(logit_inputs(hidden_states, b), norm, config.rms_norm_eps),
+                ops::cuda::rmsnorm(logit_inputs(hidden_states, b), norm, config.rms_norm_eps),
                 lm_head.t()
             );
         },

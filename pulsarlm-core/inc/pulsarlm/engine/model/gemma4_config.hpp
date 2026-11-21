@@ -4,7 +4,7 @@
 #include <optional>
 #include <vector>
 
-#include "pulsarlm/kernels/rope_parameters.hpp"
+#include "pulsarlm/ops/rope_parameters.hpp"
 
 namespace pulsarlm {
 
@@ -25,8 +25,8 @@ struct gemma4_config {
     bool attention_k_eq_v;
     std::vector<gemma4_layer_type> layer_types;
     std::int64_t sliding_window;
-    rope_parameters sliding_rope;
-    rope_parameters full_rope;
+    ops::rope_parameters sliding_rope;
+    ops::rope_parameters full_rope;
     double rms_norm_eps;
     std::optional<double> final_logit_softcapping;
     std::int64_t num_kv_shared_layers;

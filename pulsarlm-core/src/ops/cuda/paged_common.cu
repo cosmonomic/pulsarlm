@@ -1,0 +1,426 @@
+#include "pulsarlm/ops/cuda/dependent_launch.cuh"
+#include "pulsarlm/ops/cuda/attn_common.cuh"
+
+#include "pulsarlm/ops/cuda/device.hpp"
+#include "pulsarlm/ops/paged_attention.hpp"
+#include "pulsarlm/ops/rope_tables.hpp"
+
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+
+#include <math_constants.h>
+
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <string>
+
+// The argument contract the paged attention ops share, and the scalar kernel float32
+// runs on. Decode is the case of one query per sequence at the context's last
+// position, so one kernel serves both.
+
+namespace pulsarlm::ops::cuda {
+namespace attn {
+namespace kernel {
+
+// One CTA per (query token, query head). Threads stride over the view pages the query
+// attends, each running an online softmax over its pages' keys and adding weight times
+// each page's max score into the page's mass_sum; the softmaxes combine with the flash
+// rescale.
+template <typename scalar_t, int page_size> __global__ void attn_scalar(const paged_attn_params<scalar_t> p) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
+    const int tid = threadIdx.x;
+    const int blk = blockIdx.x;
+    const int qtok = blk / p.n_q_heads;
+    const int h = blk % p.n_q_heads;
+    const int g = h / p.group;
+    const int head_dim = p.head_dim;
+    const int half = head_dim / 2;
+
+    int s = qtok;
+    if (p.cu_seqlens_q) {
+        int lo = 0, hi = p.num_seqs;
+        while (hi - lo > 1) {
+            const int mid = (lo + hi) >> 1;
+            if (p.cu_seqlens_q[mid] <= qtok) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        s = lo;
+    }
+    const int q0 = p.cu_seqlens_q ? p.cu_seqlens_q[s] : s;
+    const int seq_q = p.cu_seqlens_q ? p.cu_seqlens_q[s + 1] - q0 : 1;
+    const int key_count = p.key_counts[s];
+    const int query_pos = key_count - seq_q + (qtok - q0);
+    const int first = first_key(p, query_pos);
+    const int first_page = first / page_size;
+    const int last_page = query_pos / page_size;
+    const key_positions layout = sequence_key_positions(p, s, page_size);
+    const int32_t* seq_table = p.page_tables + static_cast<int64_t>(s) * p.max_pages;
+    const float weight = p.mass_sum ? p.query_weights[qtok] : 0.0f;
+
+    // Dynamic shared: [ qsh(head_dim) | out_acc(head_dim) | red(cta_threads) ]
+    extern __shared__ float smem[];
+    float* qsh = smem;
+    float* out_acc = qsh + head_dim;
+    float* red = out_acc + head_dim;
+
+    const scalar_t* qrow = p.q + (static_cast<int64_t>(qtok) * p.n_q_heads + h) * head_dim;
+    for (int d = tid; d < head_dim; d += cta_threads) {
+        qsh[d] = static_cast<float>(qrow[d]);
+    }
+    __syncthreads();
+
+    auto key_offset = [&](int j) {
+        const int line = seq_table[j / page_size];
+        return static_cast<int64_t>(line) * p.page_stride + (j % page_size) * p.token_stride + g * p.head_stride;
+    };
+    auto score = [&](int j, int64_t offset) {
+        const scalar_t* krow = p.k_pool + offset;
+        const int pos = layout.position(j);
+        float sc = 0.0f;
+        for (int i = 0; i < half; ++i) {
+            float cos_a, sin_a, lo, hi;
+            rope_sincos_turns(pos, p.rope_turns[i], cos_a, sin_a);
+            stored_key_pair(p, krow, i, half, lo, hi);
+            const auto k = rope_rotate<scalar_t>(lo, hi, cos_a, sin_a);
+            sc += qsh[i] * static_cast<float>(k.lo) + qsh[i + half] * static_cast<float>(k.hi);
+        }
+        return sc * p.scale;
+    };
+
+    float m = -CUDART_INF_F;
+    float l = 0.0f;
+    float acc[max_head_dim];
+    for (int d = 0; d < head_dim; ++d) {
+        acc[d] = 0.0f;
+    }
+    for (int page = first_page + tid; page <= last_page; page += cta_threads) {
+        float page_max = -CUDART_INF_F;
+        const int end = min((page + 1) * page_size, query_pos + 1);
+        for (int j = max(page * page_size, first); j < end; ++j) {
+            const int64_t offset = key_offset(j);
+            const float sc = score(j, offset);
+            const float new_m = fmaxf(m, sc);
+            const float corr = __expf(m - new_m);  // 0 when m == -inf
+            const float pw = __expf(sc - new_m);
+            l = l * corr + pw;
+            const scalar_t* vrow = p.v_pool + offset;
+            for (int d = 0; d < head_dim; ++d) {
+                acc[d] = acc[d] * corr + pw * static_cast<float>(vrow[d]);
+            }
+            m = new_m;
+            page_max = fmaxf(page_max, sc);
+        }
+        if (p.mass_sum) {
+            const int64_t row = mass_row(p, mass_view(p, s, qtok), page);
+            atomicAdd(&p.mass_sum[row * p.n_q_heads + h], weight * page_max);
+            if (h == 0) {
+                atomicAdd(&p.weight_sum[row], weight);
+            }
+        }
+    }
+
+    const float block_max = block_reduce_max<cta_threads>(red, tid, m);
+    const float w = __expf(m - block_max);  // 0 when this thread saw no keys
+    for (int d = tid; d < head_dim; d += cta_threads) {
+        out_acc[d] = 0.0f;
+    }
+    __syncthreads();
+    for (int d = 0; d < head_dim; ++d) {
+        atomicAdd(&out_acc[d], acc[d] * w);
+    }
+    const float denom = block_reduce_sum<cta_threads>(red, tid, l * w);
+
+    scalar_t* orow = p.o + (static_cast<int64_t>(qtok) * p.n_q_heads + h) * head_dim;
+    const float inv_denom = 1.0f / denom;
+    for (int d = tid; d < head_dim; d += cta_threads) {
+        orow[d] = static_cast<scalar_t>(out_acc[d] * inv_denom);
+    }
+}
+
+}  // namespace kernel
+
+namespace {
+
+// Checks the mass of b's op, its views as b.per_query_mass_request_count lays them out, and sets it on b.
+void attach_mass(
+    paged_attn_batch& b,
+    const char* op,
+    const at::Tensor& mass_sum,
+    const at::Tensor& weight_sum,
+    const at::Tensor& cu_view_pages,
+    const at::Tensor& query_weights
+) {
+    auto on_cuda = [](const at::Tensor& t) { return t.is_cuda(); };
+    auto int32_dims = [](const at::Tensor& t, int64_t dims) { return t.scalar_type() == at::kInt && t.dim() == dims; };
+    TORCH_CHECK(
+        on_cuda(mass_sum) && on_cuda(weight_sum) && on_cuda(cu_view_pages) && on_cuda(query_weights),
+        op,
+        ": all inputs must be CUDA tensors"
+    );
+    check_on_current_device(op, {mass_sum, weight_sum, cu_view_pages, query_weights});
+    TORCH_CHECK(
+        mass_sum.scalar_type() == at::kFloat && mass_sum.dim() == 2 && mass_sum.size(1) == b.n_q_heads &&
+            mass_sum.is_contiguous(),
+        op,
+        ": mass_sum must be contiguous fp32 [total_view_pages, n_q_heads]"
+    );
+    TORCH_CHECK(
+        mass_sum.size(0) <= std::numeric_limits<int>::max(),
+        op,
+        ": mass_sum must have at most ",
+        std::numeric_limits<int>::max(),
+        " rows"
+    );
+    TORCH_CHECK(
+        weight_sum.scalar_type() == at::kFloat && weight_sum.dim() == 1 && weight_sum.size(0) == mass_sum.size(0) &&
+            weight_sum.is_contiguous(),
+        op,
+        ": weight_sum must be contiguous fp32 [total_view_pages]"
+    );
+    TORCH_CHECK(int32_dims(cu_view_pages, 1), op, ": cu_view_pages must be int32 [mass views + 1]");
+    const int64_t per_query = b.per_query_mass_request_count;
+    const int64_t query_views = cu_view_pages.size(0) - 1 - (b.num_seqs - per_query);
+    const bool views_fit = per_query == 0 ? query_views == 0
+        : per_query == b.num_seqs         ? query_views == b.total_q
+                                          : query_views >= 0 && query_views <= b.total_q;
+    TORCH_CHECK(
+        views_fit,
+        op,
+        ": cu_view_pages must hold a view per query row of the first per_query_mass_request_count sequences, then one "
+        "per later sequence"
+    );
+    TORCH_CHECK(
+        query_weights.scalar_type() == at::kFloat && query_weights.dim() == 1 && query_weights.size(0) == b.total_q,
+        op,
+        ": query_weights must be fp32 [total_q]"
+    );
+    b.mass_sum = mass_sum;
+    b.weight_sum = weight_sum;
+    b.cu_view_pages = cu_view_pages.contiguous();
+    b.query_weights = query_weights.contiguous();
+}
+
+}  // namespace
+
+void check_pools(const char* op, const at::Tensor& k_pool, const at::Tensor& v_pool) {
+    TORCH_CHECK(
+        k_pool.dim() == 4 && k_pool.sizes() == v_pool.sizes() && k_pool.strides() == v_pool.strides(),
+        op,
+        ": k_pool and v_pool must be 4-D [num_pages, page_size, n_kv_heads, head_dim] of one shape and stride"
+    );
+    TORCH_CHECK(k_pool.stride(3) == 1, op, ": a pool's head_dim must be contiguous");
+    auto aligned = [](const at::Tensor& pool) { return reinterpret_cast<std::uintptr_t>(pool.data_ptr()) % 16 == 0; };
+    auto aligned_stride = [&](int64_t dim) { return k_pool.stride(dim) * k_pool.element_size() % 16 == 0; };
+    TORCH_CHECK(
+        aligned(k_pool) && aligned(v_pool) && aligned_stride(0) && aligned_stride(1) && aligned_stride(2),
+        op,
+        ": pool pages, tokens and heads must start at multiples of 16 bytes"
+    );
+}
+
+paged_attn_batch make_paged_attn_batch(
+    const char* op,
+    const at::Tensor& q,
+    const at::Tensor& keys,
+    const at::Tensor& values,
+    const at::Tensor& page_tables,
+    const at::Tensor& page_positions,
+    const at::Tensor& key_counts,
+    const std::optional<at::Tensor>& cu_seqlens_q,
+    const rope_parameters& rope,
+    double scale,
+    const std::optional<int64_t>& sliding_window,
+    const std::optional<at::Tensor>& k_norm_weight,
+    const std::optional<at::Tensor>& mass_sum,
+    const std::optional<at::Tensor>& weight_sum,
+    const std::optional<at::Tensor>& cu_view_pages,
+    const std::optional<at::Tensor>& query_weights,
+    int64_t per_query_mass_request_count,
+    const std::optional<at::Tensor>& out
+) {
+    const at::Tensor& k_pool = keys;
+    const at::Tensor& v_pool = values;
+    auto on_cuda = [](const at::Tensor& t) { return t.is_cuda(); };
+    auto int32_dims = [](const at::Tensor& t, int64_t dims) { return t.scalar_type() == at::kInt && t.dim() == dims; };
+
+    TORCH_CHECK(
+        on_cuda(q) && on_cuda(k_pool) && on_cuda(v_pool) && on_cuda(page_tables) && on_cuda(key_counts) &&
+            on_cuda(page_positions),
+        op,
+        ": all inputs must be CUDA tensors"
+    );
+    check_on_current_device(
+        op,
+        {q,
+         k_pool,
+         v_pool,
+         page_tables,
+         key_counts,
+         page_positions,
+         cu_seqlens_q.value_or(at::Tensor()),
+         k_norm_weight.value_or(at::Tensor())}
+    );
+    TORCH_CHECK(
+        q.scalar_type() == k_pool.scalar_type() && k_pool.scalar_type() == v_pool.scalar_type(),
+        op,
+        ": q, k_pool, v_pool must share a dtype"
+    );
+    TORCH_CHECK(q.dim() == 3, op, ": q must be 3-D [total_q, n_q_heads, head_dim]");
+    check_pools(op, k_pool, v_pool);
+
+    paged_attn_batch b;
+    b.total_q = q.size(0);
+    b.n_q_heads = q.size(1);
+    b.head_dim = q.size(2);
+    b.page_size = k_pool.size(1);
+    b.n_kv_heads = k_pool.size(2);
+    b.num_seqs = key_counts.size(0);
+    b.scale = scale;
+    TORCH_CHECK(!sliding_window || *sliding_window >= 1, op, ": sliding_window must be at least 1");
+    b.sliding_window = sliding_window.value_or(0);
+
+    TORCH_CHECK(k_pool.size(3) == b.head_dim, op, ": pool head_dim must match q");
+    TORCH_CHECK(b.head_dim % 2 == 0 && b.head_dim <= max_head_dim, op, ": head_dim must be even and <= ", max_head_dim);
+    TORCH_CHECK(
+        b.n_kv_heads > 0 && b.n_q_heads % b.n_kv_heads == 0,
+        op,
+        ": n_q_heads must be a multiple of n_kv_heads"
+    );
+    TORCH_CHECK(int32_dims(key_counts, 1), op, ": key_counts must be int32 [num_seqs]");
+    TORCH_CHECK(
+        int32_dims(page_tables, 2) && page_tables.size(0) == b.num_seqs,
+        op,
+        ": page_tables must be int32 [num_seqs, max_pages]"
+    );
+    TORCH_CHECK(
+        int32_dims(page_positions, 2) && page_positions.sizes() == page_tables.sizes(),
+        op,
+        ": page_positions must be int32 [num_seqs, max_pages], as page_tables"
+    );
+    if (cu_seqlens_q.has_value()) {
+        TORCH_CHECK(
+            on_cuda(*cu_seqlens_q) && int32_dims(*cu_seqlens_q, 1) && cu_seqlens_q->size(0) == b.num_seqs + 1,
+            op,
+            ": cu_seqlens_q must be int32 [num_seqs + 1] on CUDA"
+        );
+        b.cu_seqlens_q = cu_seqlens_q->contiguous();
+    } else {
+        TORCH_CHECK(b.total_q == b.num_seqs, op, ": one query row per sequence");
+    }
+    b.max_pages = page_tables.size(1);
+    const int64_t int_max = std::numeric_limits<int>::max();
+    TORCH_CHECK(
+        b.total_q <= int_max && b.num_seqs <= int_max && b.total_q * b.n_q_heads <= int_max &&
+            (b.total_q / 16 + b.num_seqs) * b.n_q_heads <= int_max && b.num_seqs * b.max_pages <= int_max &&
+            b.max_pages * b.page_size <= int_max && b.sliding_window <= int_max,
+        op,
+        ": the batch's query rows, view pages, keys and sliding_window must each fit a 32-bit index"
+    );
+
+    TORCH_CHECK(
+        per_query_mass_request_count >= 0 && per_query_mass_request_count <= b.num_seqs,
+        op,
+        ": per_query_mass_request_count must lie in [0, num_seqs]"
+    );
+    TORCH_CHECK(
+        mass_sum.has_value() == weight_sum.has_value() && mass_sum.has_value() == cu_view_pages.has_value() &&
+            mass_sum.has_value() == query_weights.has_value(),
+        op,
+        ": mass_sum, weight_sum, cu_view_pages and query_weights must be given together"
+    );
+    TORCH_CHECK(
+        per_query_mass_request_count == 0 || (mass_sum.has_value() && cu_seqlens_q.has_value()),
+        op,
+        ": a positive per_query_mass_request_count needs a page mass and cu_seqlens_q"
+    );
+    b.per_query_mass_request_count = per_query_mass_request_count;
+    if (mass_sum.has_value()) {
+        attach_mass(b, op, *mass_sum, *weight_sum, *cu_view_pages, *query_weights);
+    }
+    if (k_norm_weight.has_value()) {
+        TORCH_CHECK(
+            on_cuda(*k_norm_weight) && k_norm_weight->dim() == 1 && k_norm_weight->size(0) == b.head_dim,
+            op,
+            ": k_norm_weight must be a CUDA tensor of [head_dim]"
+        );
+        b.k_norm_weight = k_norm_weight->to(at::kFloat).contiguous();
+    }
+
+    b.q = q.contiguous();
+    b.k_pool = k_pool;
+    b.v_pool = v_pool;
+    b.page_tables = page_tables.contiguous();
+    b.key_counts = key_counts.contiguous();
+    b.page_positions = page_positions.contiguous();
+    b.rope_turns = rope_turns_per_position(rope, b.head_dim, q.device());
+    if (out.has_value()) {
+        TORCH_CHECK(
+            out->sizes() == q.sizes() && out->scalar_type() == q.scalar_type() && out->device() == q.device() &&
+                out->is_contiguous(),
+            op,
+            ": out must be contiguous [total_q, n_q_heads, head_dim] in q's dtype on q's device"
+        );
+        b.o = *out;
+    } else {
+        b.o = at::empty_like(b.q);
+    }
+    return b;
+}
+
+void launch_attn_scalar(const paged_attn_batch& batch, cudaStream_t stream) {
+    if (batch.total_q == 0 || batch.num_seqs == 0) {
+        return;
+    }
+    const int64_t blocks = batch.total_q * batch.n_q_heads;
+    const size_t smem = static_cast<size_t>(2 * batch.head_dim + cta_threads) * sizeof(float);
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, batch.q.scalar_type(), "attn_scalar", [&] {
+        dispatch_page_size("attn_scalar", batch.page_size, [&](auto page_size_tag) {
+            constexpr int ps = decltype(page_size_tag)::value;
+            launch_dependent(
+                kernel::attn_scalar<scalar_t, ps>,
+                static_cast<int>(blocks),
+                cta_threads,
+                smem,
+                stream,
+                batch.params<scalar_t>()
+            );
+        });
+    });
+}
+
+}  // namespace attn
+
+std::optional<std::string> attention_unsupported_reason(
+    at::ScalarType dtype,
+    int64_t page_size,
+    int64_t head_dim,
+    int64_t n_q_heads,
+    int64_t n_kv_heads
+) {
+    if (dtype == at::kFloat) {
+        return std::nullopt;
+    }
+    if (dtype != at::kHalf && dtype != at::kBFloat16) {
+        return c10::str("dtype ", c10::toString(dtype), " is not float32, float16 or bfloat16");
+    }
+    if (head_dim != 64 && head_dim != 128 && head_dim != 256 && head_dim != 512) {
+        return c10::str("head dim ", head_dim, " is not 64, 128, 256 or 512");
+    }
+    if (page_size != 16 && page_size != 32) {
+        return c10::str("page size ", page_size, " is not 16 or 32");
+    }
+    if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0 || n_q_heads / n_kv_heads > 16) {
+        return c10::str(n_q_heads, " query heads over ", n_kv_heads, " KV heads is not a group of at most 16");
+    }
+    if (!attn::decode_fits(page_size, head_dim) || !attn::prefill_fits(page_size, head_dim)) {
+        return c10::str("page size ", page_size, " and head dim ", head_dim, " exceed the device's shared memory");
+    }
+    return std::nullopt;
+}
+
+}  // namespace pulsarlm::ops::cuda

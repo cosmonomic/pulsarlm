@@ -1,0 +1,202 @@
+#include "pulsarlm/ops/cuda/dependent_launch.cuh"
+#include "pulsarlm/ops/cuda/attn_common.cuh"
+
+#include "pulsarlm/ops/cuda/attn_tuning.hpp"
+#include "pulsarlm/ops/cuda/paged_prefill.cuh"
+#include "pulsarlm/ops/paged_attention.hpp"
+
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAStream.h>
+
+#include <cstdint>
+
+// Paged-KV prefill attention: many query tokens per sequence, causal over the
+// sequence's view, for a ragged (varlen) batch. Sequence i's queries
+// q[cu_seqlens_q[i] : cu_seqlens_q[i+1]] sit at view indices [ctx_start_i,
+// key_counts[i]) with ctx_start_i = key_counts[i] - seq_q_i, and the query at view
+// index p attends keys [0, p], or the window of them sliding_window leaves. The
+// tensor-core kernel is in paged_prefill.cuh.
+
+namespace pulsarlm::ops::cuda {
+namespace kernel {
+
+// Copy every key of each sequence's view into rotated_k, rotated to its view
+// position: sequence s's view page b lands at page s * max_pages + b. A page wholly
+// before the window of the sequence's first query is left unwritten. One CTA per
+// (sequence, view page); threads stride over the page's (key, kv head, frequency
+// pair) triples. The attention kernel stages a key once per (query tile, query head),
+// so rotating there would repeat each rotation that many times.
+template <typename scalar_t>
+__global__ void
+rotate_view_keys(const attn::paged_attn_params<scalar_t> p, int page_size, scalar_t* __restrict__ rotated_k) {
+    wait_for_prior_kernels();
+    allow_next_kernel();
+    const int s = blockIdx.x / p.max_pages;
+    const int view_page = blockIdx.x % p.max_pages;
+    const int key_count = p.key_counts[s];
+    const int keys = min(page_size, key_count - view_page * page_size);
+    const int first_query = key_count - (p.cu_seqlens_q[s + 1] - p.cu_seqlens_q[s]);
+    if (keys <= 0 || (view_page + 1) * page_size <= attn::first_key(p, first_query)) {
+        return;
+    }
+    const int half = p.head_dim / 2;
+    const int pairs_per_key = p.n_kv_heads * half;
+    const int64_t page_elems = static_cast<int64_t>(page_size) * p.n_kv_heads * p.head_dim;
+    const attn::key_positions layout = attn::sequence_key_positions(p, s, page_size);
+    const int line = p.page_tables[static_cast<int64_t>(s) * p.max_pages + view_page];
+    const scalar_t* src = p.k_pool + line * p.page_stride;
+    scalar_t* dst = rotated_k + blockIdx.x * page_elems;
+    for (int i = threadIdx.x; i < keys * pairs_per_key; i += blockDim.x) {
+        const int off = i / pairs_per_key;
+        const int head = (i % pairs_per_key) / half;
+        const int pair = i % half;
+        const int64_t row = (static_cast<int64_t>(off) * p.n_kv_heads + head) * p.head_dim;
+        const int64_t stored = off * p.token_stride + head * p.head_stride;
+        float cos_a, sin_a, lo, hi;
+        attn::rope_sincos_turns(layout.position(view_page * page_size + off), p.rope_turns[pair], cos_a, sin_a);
+        attn::stored_key_pair(p, src + stored, pair, half, lo, hi);
+        const auto k = attn::rope_rotate<scalar_t>(lo, hi, cos_a, sin_a);
+        dst[row + pair] = k.lo;
+        dst[row + pair + half] = k.hi;
+    }
+}
+
+}  // namespace kernel
+
+namespace {
+
+template <typename scalar_t, bool bf16> void launch_tc_prefill(const attn::paged_attn_batch& b, cudaStream_t stream) {
+    if (b.total_q == 0) {
+        return;
+    }
+    // A sequence of n queries takes ceil(n / 16) query tiles, at most n / 16 + 1; the
+    // CTAs past the last tile exit.
+    const int64_t grid = (b.total_q / 16 + b.num_seqs) * b.n_q_heads;
+
+    const auto params = b.params<scalar_t>();
+    const int64_t view_pages = b.num_seqs * b.max_pages;
+    auto rotated_k = at::empty({view_pages, b.page_size, b.n_kv_heads, b.head_dim}, b.k_pool.options());
+    launch_dependent(
+        kernel::rotate_view_keys<scalar_t>,
+        static_cast<int>(view_pages),
+        256,
+        0,
+        stream,
+        params,
+        static_cast<int>(b.page_size),
+        rotated_k.data_ptr<scalar_t>()
+    );
+
+    attn::dispatch_page_head("attn_prefill", b.page_size, b.head_dim, [&](auto bs_tag, auto hd_tag) {
+        constexpr int bs = decltype(bs_tag)::value;
+        constexpr int hd = decltype(hd_tag)::value;
+        attn::dispatch_attn_tuning([&](auto row_tag) {
+            constexpr attn::attn_tuning tuning = attn::attn_tuning_table[decltype(row_tag)::value];
+            constexpr int nwarps = tuning.prefill_warps;
+            constexpr int key_pages = attn::prefill_key_pages<scalar_t, bs, hd, tuning.prefill_key_pages>();
+            constexpr size_t smem = attn::prefill_tile_bytes<scalar_t, bs, hd, key_pages>();
+            const auto
+                kernel = kernel::attn_prefill_tc<scalar_t, bs, hd, bf16, nwarps, key_pages, tuning.prefill_ctas_per_sm>;
+            allow_shared_memory(kernel, smem);
+            launch_dependent(
+                kernel,
+                static_cast<int>(grid),
+                nwarps * 32,
+                smem,
+                stream,
+                params,
+                rotated_k.data_ptr<scalar_t>()
+            );
+        });
+    });
+}
+
+at::Tensor paged_prefill(const attn::paged_attn_batch& b) {
+    if (b.total_q == 0 || b.num_seqs == 0) {
+        return b.o;
+    }
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (b.q.scalar_type() == at::kFloat) {
+        attn::launch_attn_scalar(b, stream);
+        return b.o;
+    }
+    std::optional<std::string> unsupported = attention_unsupported_reason(
+        b.q.scalar_type(),
+        b.page_size,
+        b.head_dim,
+        b.n_q_heads,
+        b.n_kv_heads
+    );
+    TORCH_CHECK(!unsupported, "attn_prefill: ", *unsupported);
+    attn::dispatch_tensor_core_dtype(b.q.scalar_type(), [&](auto type_tag, auto bf16_tag) {
+        using scalar_t = typename decltype(type_tag)::type;
+        launch_tc_prefill<scalar_t, decltype(bf16_tag)::value>(b, stream);
+    });
+    return b.o;
+}
+
+}  // namespace
+
+bool attn::prefill_fits(int64_t page_size, int64_t head_dim) {
+    bool fits = false;
+    attn::dispatch_page_head("attn_prefill", page_size, head_dim, [&](auto bs_tag, auto hd_tag) {
+        constexpr int bs = decltype(bs_tag)::value;
+        constexpr int hd = decltype(hd_tag)::value;
+        attn::dispatch_attn_tuning([&](auto row_tag) {
+            constexpr int key_pages = attn::prefill_key_pages<
+                at::Half,
+                bs,
+                hd,
+                attn::attn_tuning_table[decltype(row_tag)::value].prefill_key_pages>();
+            fits = fits_shared_memory(attn::prefill_smem_bytes<at::Half, bs, hd, key_pages>());
+        });
+    });
+    return fits;
+}
+
+at::Tensor attn_prefill(
+    const at::Tensor& q,
+    const at::Tensor& keys,
+    const at::Tensor& values,
+    const at::Tensor& page_tables,
+    const at::Tensor& page_positions,
+    const at::Tensor& key_counts,
+    const at::Tensor& cu_seqlens_q,
+    double theta,
+    double partial_rotary_factor,
+    const std::optional<llama3_rope_scaling>& llama3_scaling,
+    double scale,
+    const std::optional<std::int64_t>& sliding_window,
+    const std::optional<at::Tensor>& k_norm_weight,
+    const std::optional<at::Tensor>& mass_sum,
+    const std::optional<at::Tensor>& weight_sum,
+    const std::optional<at::Tensor>& cu_view_pages,
+    const std::optional<at::Tensor>& query_weights,
+    std::int64_t per_query_mass_request_count,
+    const std::optional<at::Tensor>& out
+) {
+    const auto batch = attn::make_paged_attn_batch(
+        "attn_prefill",
+        q,
+        keys,
+        values,
+        page_tables,
+        page_positions,
+        key_counts,
+        cu_seqlens_q,
+        rope_parameters{theta, partial_rotary_factor, llama3_scaling},
+        scale,
+        sliding_window,
+        k_norm_weight,
+        mass_sum,
+        weight_sum,
+        cu_view_pages,
+        query_weights,
+        per_query_mass_request_count,
+        out
+    );
+    return paged_prefill(batch);
+}
+
+}  // namespace pulsarlm::ops::cuda

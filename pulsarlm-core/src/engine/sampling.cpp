@@ -1,6 +1,6 @@
 #include "pulsarlm/engine/sampling.hpp"
 
-#include "pulsarlm/kernels/sampling.hpp"
+#include "pulsarlm/ops/sampling.hpp"
 
 #include <ATen/ATen.h>
 
@@ -83,7 +83,7 @@ make_sampling_inputs(std::span<const sampling_params> params, std::span<const sa
 // drawing row and 0 for an argmax row.
 at::Tensor sample(const at::Tensor& logits, const sampling_inputs& inputs) {
     if (!inputs.filters) {
-        return gumbel_race_cuda(logits.contiguous(), inputs.temperatures, inputs.draws);
+        return ops::cuda::gumbel_race(logits.contiguous(), inputs.temperatures, inputs.draws);
     }
     const std::int64_t vocab = logits.size(1);
     at::Tensor drawing = inputs.temperatures > 0.0f;
@@ -92,7 +92,7 @@ at::Tensor sample(const at::Tensor& logits, const sampling_inputs& inputs) {
     at::Tensor ranks = at::arange(vocab, sorted.options().dtype(at::kLong)).unsqueeze(0);
     at::Tensor kept = ranks < inputs.top_k.unsqueeze(1);
     kept &= at::cumsum(sorted, -1) - sorted <= inputs.top_p.unsqueeze(1);
-    at::Tensor rank = gumbel_race_cuda(at::log(sorted * kept).contiguous(), drawing.to(at::kFloat), inputs.draws);
+    at::Tensor rank = ops::cuda::gumbel_race(at::log(sorted * kept).contiguous(), drawing.to(at::kFloat), inputs.draws);
     return order.gather(1, rank.unsqueeze(1)).squeeze(1);
 }
 

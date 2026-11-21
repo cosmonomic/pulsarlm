@@ -258,7 +258,7 @@ pulsarlm::qwen4_exp_config model_config(const split_dims& dims, std::int64_t exp
         .linear_key_head_dim = key_head_dim,
         .linear_value_head_dim = value_head_dim,
         .linear_conv_kernel = conv_kernel,
-        .linear_output_gate = pulsarlm::gate_activation::sigmoid,
+        .linear_output_gate = pulsarlm::ops::gate_activation::sigmoid,
         .rms_norm_eps = rms_eps,
         .num_experts_per_tok = experts_per_token,
         .hc_count = hc,
@@ -1368,8 +1368,8 @@ TEST_CASE("Qwen4-Exp split over two ranks gathers equal inputs from both ranks' 
     }
 }
 
-// Under a policy that cannot evict, no step waits at a cycle end, and a decode near a cycle end runs over the verify step
-// before it, whose acceptance is known only on the GPU. The cycle ends at the multiples of cycle_tokens.
+// Under a policy that cannot evict, no step waits at a cycle end, and a decode near a cycle end runs over the verify
+// step before it, whose acceptance is known only on the GPU. The cycle ends at the multiples of cycle_tokens.
 TEST_CASE(
     "Qwen4-Exp drafting under a policy that cannot evict reaches its cycle ends as without drafts",
     "[runtime][cuda]"

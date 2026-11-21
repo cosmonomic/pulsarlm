@@ -102,13 +102,14 @@ class model {
         // run's sequences, less the query tokens of the first two runs.
         at::Tensor cu_seqlens_q_from_third_run;
         // int32 [single_query_request_count + per_query_state_request_count]: the trailing query tokens whose recurrent
-        // state each request of the first two runs keeps (gated_delta_rule_step_cuda's kept_state_counts), 1 in the
-        // first run and state_slots in the second. Undefined in a draft head's batch, which reaches no recurrent layer.
+        // state each request of the first two runs keeps (ops::cuda::gated_delta_rule_step's kept_state_counts), 1 in
+        // the first run and state_slots in the second. Undefined in a draft head's batch, which reaches no recurrent
+        // layer.
         at::Tensor kept_state_counts;
         // int32 [n_kv_layers, num_seqs]: the keys in sequence s's view in KV layer l, the batch's tokens included.
         at::Tensor key_counts;
         // int32 [n_kv_layers, num_seqs, max_pages], laid out as page_tables: the RoPE position of the first key of
-        // sequence s's view pages in KV layer l (see attn_decode_cuda).
+        // sequence s's view pages in KV layer l (see ops::cuda::attn_decode).
         at::Tensor page_positions;
         // int32 [n_kv_layers, mass views + 1], defined when the forward measures attention mass: mass view v's pages
         // in KV layer l are the rows [cu_view_pages[l, v], cu_view_pages[l, v + 1]) of page_mass_sum[l] and
@@ -118,7 +119,7 @@ class model {
         // Per KV layer, fp32 [total_view_pages of the layer, n_readers * n_q_heads of the layer] and [total_view_pages
         // of the layer], zeroed by the caller, or undefined for a layer that measures no mass. The forward sets each
         // view page's mass_sum in each query head of each attention layer reading the KV layer, and its weight_sum, as
-        // attn_prefill_cuda measures them with query_weights: reader r's heads are the columns [r * n_q_heads,
+        // ops::cuda::attn_prefill measures them with query_weights: reader r's heads are the columns [r * n_q_heads,
         // (r + 1) * n_q_heads). Every reader attends the same pages, so weight_sum is the same for all of them.
         std::vector<at::Tensor> page_mass_sum;
         std::vector<at::Tensor> page_weight_sum;
@@ -127,7 +128,7 @@ class model {
         // int64 [logit tokens]: the query tokens whose logits the forward returns, in order.
         at::Tensor logit_tokens;
         // int32 zeros, at least the model's arrival_counter_count for the batch: the arrival counters of its ops
-        // (kernels/arrival_counters.cuh). The batches of one stream's steps may share them.
+        // (ops/cuda/arrival_counters.cuh). The batches of one stream's steps may share them.
         at::Tensor arrival_counters;
     };
 

@@ -1,6 +1,6 @@
 #include "pulsarlm/engine/model/linear.hpp"
 
-#include "pulsarlm/kernels/dequant_gemm.hpp"
+#include "pulsarlm/ops/dequant_gemm.hpp"
 
 #include <ATen/ATen.h>
 
@@ -17,7 +17,7 @@ linear linear::dense(at::Tensor weight) {
 }
 
 linear linear::fp8(const at::Tensor& weight, const at::Tensor& scale, std::int64_t block_n, std::int64_t group_size) {
-    auto [weight_marlin, scale_marlin] = repack_fp8_marlin_cuda(weight, scale, block_n, group_size);
+    auto [weight_marlin, scale_marlin] = ops::cuda::repack_fp8_marlin(weight, scale, block_n, group_size);
     return linear(
         fp8_weight{
             .weight_marlin = std::move(weight_marlin),
@@ -37,7 +37,7 @@ at::Tensor linear::apply(const at::Tensor& x) const {
     std::vector<std::int64_t> sizes = x.sizes().vec();
     const at::Tensor rows = x.reshape({-1, sizes.back()}).contiguous();
     sizes.back() = w.n;
-    return gemm_fp8_marlin_cuda(rows, w.weight_marlin, w.scale_marlin, w.n, w.block_n, w.group_size).view(sizes);
+    return ops::cuda::gemm_fp8_marlin(rows, w.weight_marlin, w.scale_marlin, w.n, w.block_n, w.group_size).view(sizes);
 }
 
 }  // namespace pulsarlm

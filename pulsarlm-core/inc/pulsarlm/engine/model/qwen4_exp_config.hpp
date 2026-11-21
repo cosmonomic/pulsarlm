@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "pulsarlm/kernels/gate_activation.hpp"
+#include "pulsarlm/ops/gate_activation.hpp"
 
 namespace pulsarlm {
 
@@ -24,7 +24,7 @@ struct qwen4_exp_config {
     std::int64_t linear_key_head_dim;
     std::int64_t linear_value_head_dim;
     std::int64_t linear_conv_kernel;
-    gate_activation linear_output_gate;
+    ops::gate_activation linear_output_gate;
     double rms_norm_eps;
     std::int64_t num_experts_per_tok;
     std::int64_t hc_count;

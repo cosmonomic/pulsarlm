@@ -2,14 +2,14 @@
 
 #include "pulsarlm/engine/model/paged_forward.hpp"
 #include "pulsarlm/engine/model/partial_rope.hpp"
-#include "pulsarlm/kernels/gated_deltanet.hpp"
-#include "pulsarlm/kernels/gating.hpp"
-#include "pulsarlm/kernels/hyper_connection.hpp"
-#include "pulsarlm/kernels/indexed_attention.hpp"
-#include "pulsarlm/kernels/normalization.hpp"
-#include "pulsarlm/kernels/paged_attention.hpp"
-#include "pulsarlm/kernels/routed_experts.hpp"
-#include "pulsarlm/kernels/small_batch_linear.hpp"
+#include "pulsarlm/ops/gated_deltanet.hpp"
+#include "pulsarlm/ops/gating.hpp"
+#include "pulsarlm/ops/hyper_connection.hpp"
+#include "pulsarlm/ops/indexed_attention.hpp"
+#include "pulsarlm/ops/normalization.hpp"
+#include "pulsarlm/ops/paged_attention.hpp"
+#include "pulsarlm/ops/routed_experts.hpp"
+#include "pulsarlm/ops/small_batch_linear.hpp"
 #include "weights.hpp"
 
 #include <ATen/ATen.h>
@@ -119,7 +119,7 @@ qwen4_exp_model::qwen4_exp_model(
             throw std::invalid_argument("qwen4_exp_model: a PLE layer must be a linear attention layer");
         }
     }
-    rope = rope_parameters{
+    rope = ops::rope_parameters{
         .theta = std::pow(c.rope_theta, static_cast<double>(c.head_dim) / static_cast<double>(rotary_dim)),
         .partial_rotary_factor = static_cast<double>(rotary_dim) / static_cast<double>(c.head_dim),
     };
@@ -574,13 +574,13 @@ bool qwen4_exp_model::indexed_attention(std::int64_t layer) const {
     return config.layer_types[layer] == qwen4_exp_layer_type::indexed_attention;
 }
 
-// Hugging Face takes a query's top blocks with torch.topk, whose order among equal scores is unspecified; here the lower
-// block wins.
+// Hugging Face takes a query's top blocks with torch.topk, whose order among equal scores is unspecified; here the
+// lower block wins.
 at::Tensor qwen4_exp_model::selected_blocks(
     const attention_weights& w,
     const at::Tensor& queries,
     const kv& lines,
-    const page_views& views,
+    const ops::page_views& views,
     const at::Tensor& cu_seqlens_q
 ) const {
     const qwen4_exp_config& c = config;
@@ -591,14 +591,22 @@ at::Tensor qwen4_exp_model::selected_blocks(
     const std::int64_t max_blocks = views.page_tables.size(1) * page_size / ratio;
     const std::int64_t words = max_blocks / 32 + 1;
 
-    at::Tensor
-        blocks = index_blocks_cuda(lines.index_keys, views, w.index_k_norm, index_inv_freq, ratio, c.rms_norm_eps);
+    at::Tensor blocks = ops::cuda::index_blocks(
+        lines.index_keys,
+        views.page_tables,
+        views.page_positions,
+        views.key_counts,
+        w.index_k_norm,
+        index_inv_freq,
+        ratio,
+        c.rms_norm_eps
+    );
 
     const std::int64_t chunk_rows = std::max<std::int64_t>(1, (std::int64_t{1} << 26) / max_blocks);
     std::vector<at::Tensor> selected;
     for (std::int64_t first = 0; first < ntok; first += chunk_rows) {
         const std::int64_t rows = std::min(chunk_rows, ntok - first);
-        at::Tensor scores = index_scores_cuda(
+        at::Tensor scores = ops::cuda::index_scores(
             queries.narrow(0, first, rows).contiguous(),
             blocks,
             views.key_counts,
@@ -608,14 +616,22 @@ at::Tensor qwen4_exp_model::selected_blocks(
             1.0 / std::sqrt(static_cast<double>(c.indexer_head_dim))
         );
         selected.push_back(
-            select_blocks_cuda(scores, views.key_counts, cu_seqlens_q, first, c.indexer_budget / ratio, ratio, words)
+            ops::cuda::select_blocks(
+                scores,
+                views.key_counts,
+                cu_seqlens_q,
+                first,
+                c.indexer_budget / ratio,
+                ratio,
+                words
+            )
         );
     }
     return selected.size() == 1 ? selected.front() : at::cat(selected);
 }
 
 at::Tensor qwen4_exp_model::stream_norm(const at::Tensor& x, const at::Tensor& weight) const {
-    return stream_rmsnorm_cuda(x.contiguous(), weight, x.size(1) / config.hidden_size, config.rms_norm_eps);
+    return ops::cuda::stream_rmsnorm(x.contiguous(), weight, x.size(1) / config.hidden_size, config.rms_norm_eps);
 }
 
 at::Tensor qwen4_exp_model::mixed_streams(const at::Tensor& normed, const mixer_weights& w) const {
@@ -627,7 +643,7 @@ at::Tensor qwen4_exp_model::mixed_streams(const at::Tensor& normed, const mixer_
 }
 
 qwen4_exp_model::mixed_input qwen4_exp_model::mix(const at::Tensor& x, const hyper_connection_weights& w) const {
-    auto [normed, projected] = stream_rmsnorm_linear_cuda(
+    auto [normed, projected] = ops::cuda::stream_rmsnorm_linear(
         x.contiguous(),
         w.hc_norm,
         x.size(1) / config.hidden_size,
@@ -643,7 +659,7 @@ std::pair<at::Tensor, qwen4_exp_model::mixed_input> qwen4_exp_model::injected_mi
     const at::Tensor& injection_weights,
     const hyper_connection_weights& w
 ) const {
-    auto [summed, normed, projected] = injected_stream_rmsnorm_linear_cuda(
+    auto [summed, normed, projected] = ops::cuda::injected_stream_rmsnorm_linear(
         x.contiguous(),
         out.contiguous(),
         injection_weights,
@@ -661,7 +677,7 @@ qwen4_exp_model::mixed_input qwen4_exp_model::mix_normed(
     const hyper_connection_weights& w
 ) const {
     const std::int64_t rank = w.input_mix_weight_up.size(1);
-    auto [input, injection_weights] = hyper_connection_mix_cuda(
+    auto [input, injection_weights] = ops::cuda::hyper_connection_mix(
         normed,
         projected.narrow(1, 0, rank),
         w.input_mix_weight_up,
@@ -688,12 +704,12 @@ at::Tensor qwen4_exp_model::attention(
 
     const std::int64_t query_rows = heads.n_heads * 2 * c.head_dim;
     const std::int64_t key_rows = heads.n_kv_heads * c.head_dim;
-    at::Tensor projected = small_batch_linear_cuda(h, w.projections);
+    at::Tensor projected = ops::cuda::small_batch_linear(h, w.projections);
     at::Tensor query_gate = projected.narrow(1, 0, query_rows).view({ntok, heads.n_heads, 2 * c.head_dim});
-    at::Tensor q = rmsnorm_cuda(query_gate.narrow(-1, 0, c.head_dim), w.q_norm, c.rms_norm_eps);
+    at::Tensor q = ops::cuda::rmsnorm(query_gate.narrow(-1, 0, c.head_dim), w.q_norm, c.rms_norm_eps);
     at::Tensor gate = query_gate.narrow(-1, c.head_dim, c.head_dim);
     q = rope_q(q.view({ntok, heads.n_heads * c.head_dim}), g.pos, heads.n_heads, c.head_dim, rope);
-    at::Tensor k = rmsnorm_cuda(
+    at::Tensor k = ops::cuda::rmsnorm(
         projected.narrow(1, query_rows, key_rows).view({ntok, heads.n_kv_heads, c.head_dim}),
         w.k_norm,
         c.rms_norm_eps
@@ -703,7 +719,7 @@ at::Tensor qwen4_exp_model::attention(
                        .contiguous();
 
     at::Tensor index_qk = projected.narrow(1, query_rows + 2 * key_rows, projected.size(1) - query_rows - 2 * key_rows);
-    at::Tensor index_queries = index_queries_cuda(
+    at::Tensor index_queries = ops::cuda::index_queries(
         index_qk,
         w.index_q_norm,
         index_inv_freq,
@@ -731,8 +747,9 @@ at::Tensor qwen4_exp_model::attention(
         index_keys,
         o
     );
-    at::Tensor out = small_batch_linear_cuda(
-        sigmoid_gated_cuda(o.view({ntok, heads.n_heads, c.head_dim}), gate).view({ntok, heads.n_heads * c.head_dim}),
+    at::Tensor out = ops::cuda::small_batch_linear(
+        ops::cuda::sigmoid_gated(o.view({ntok, heads.n_heads, c.head_dim}), gate)
+            .view({ntok, heads.n_heads * c.head_dim}),
         w.o_proj
     );
     comm.all_reduce(out);
@@ -755,27 +772,26 @@ void qwen4_exp_model::attend_indexed(
     const std::int64_t ntok = q.size(0);
     const kv& line = lines[kv_index];
     const auto layer_row = static_cast<std::int64_t>(kv_index);
-    const page_views views{
+    const ops::page_views views{
         .page_tables = g.page_tables.select(0, layer_row),
         .page_positions = g.page_positions.select(0, layer_row),
         .key_counts = g.key_counts.select(0, layer_row),
     };
-    const kv_pools pools{.keys = line.k, .values = line.v};
-    write_kv_cuda(pools, k, v, views, g.cu_seqlens_q);
+    ops::cuda::write_kv(line.k, line.v, k, v, views.page_tables, views.key_counts, g.cu_seqlens_q);
     at::Tensor index_pool = line.index_keys.unsqueeze(2);
-    write_kv_cuda({.keys = index_pool, .values = index_pool}, index_keys, index_keys, views, g.cu_seqlens_q);
+    ops::cuda::write_kv(
+        index_pool,
+        index_pool,
+        index_keys,
+        index_keys,
+        views.page_tables,
+        views.key_counts,
+        g.cu_seqlens_q
+    );
     const std::int64_t block_size = c.indexer_compress_ratio;
     const at::Tensor selected = selected_blocks(w, index_queries, line, views, g.cu_seqlens_q);
 
-    std::optional<page_mass> mass;
-    if (!g.page_mass_sum.empty() && g.page_mass_sum[kv_index].defined()) {
-        mass = page_mass{
-            .mass_sum = g.page_mass_sum[kv_index],
-            .weight_sum = g.page_weight_sum[kv_index],
-            .cu_view_pages = g.cu_view_pages.select(0, layer_row),
-            .query_weights = g.query_weights,
-        };
-    }
+    const bool measures_mass = !g.page_mass_sum.empty() && g.page_mass_sum[kv_index].defined();
     const double scale = 1.0 / std::sqrt(static_cast<double>(c.head_dim));
     const std::int64_t requests = views.key_counts.size(0);
     const std::int64_t single_queries = g.single_query_request_count;
@@ -791,41 +807,67 @@ void qwen4_exp_model::attend_indexed(
                           std::int64_t view_count,
                           const at::Tensor& run_cu_seqlens_q,
                           bool measures_per_query) {
-        const page_views run_views{
-            .page_tables = views.page_tables.narrow(0, first, count),
-            .page_positions = views.page_positions.narrow(0, first, count),
-            .key_counts = views.key_counts.narrow(0, first, count),
-        };
-        const block_selection selection{
-            .selected = selected.narrow(0, first_token, token_count),
-            .block_size = block_size,
-            .max_selected_blocks = c.indexer_budget / block_size + 1,
-        };
-        std::optional<page_mass> run_mass;
-        if (mass) {
-            run_mass = page_mass{
-                .mass_sum = mass->mass_sum,
-                .weight_sum = mass->weight_sum,
-                .cu_view_pages = mass->cu_view_pages.narrow(0, first_view, view_count + 1),
-                .query_weights = mass->query_weights.narrow(0, first_token, token_count),
-            };
-        }
+        const at::Tensor run_page_tables = views.page_tables.narrow(0, first, count);
+        const at::Tensor run_page_positions = views.page_positions.narrow(0, first, count);
+        const at::Tensor run_key_counts = views.key_counts.narrow(0, first, count);
+        const at::Tensor run_selected = selected.narrow(0, first_token, token_count);
+        const std::int64_t max_selected_blocks = c.indexer_budget / block_size + 1;
         const at::Tensor run_q = q.narrow(0, first_token, token_count);
         const at::Tensor run_o = o.narrow(0, first_token, token_count);
-        if (measures_per_query && run_mass) {
-            attn_indexed_verify_cuda(
+        std::optional<at::Tensor> mass_sum;
+        std::optional<at::Tensor> weight_sum;
+        std::optional<at::Tensor> run_cu_view_pages;
+        std::optional<at::Tensor> run_query_weights;
+        if (measures_mass) {
+            mass_sum = g.page_mass_sum[kv_index];
+            weight_sum = g.page_weight_sum[kv_index];
+            run_cu_view_pages = g.cu_view_pages.select(0, layer_row).narrow(0, first_view, view_count + 1);
+            run_query_weights = g.query_weights.narrow(0, first_token, token_count);
+        }
+        if (measures_per_query && measures_mass) {
+            ops::cuda::attn_indexed_verify(
                 run_q,
-                pools,
-                run_views,
+                line.k,
+                line.v,
+                run_page_tables,
+                run_page_positions,
+                run_key_counts,
                 run_cu_seqlens_q,
-                rope,
+                rope.theta,
+                rope.partial_rotary_factor,
+                rope.llama3_scaling,
                 scale,
-                selection,
-                *run_mass,
+                run_selected,
+                block_size,
+                max_selected_blocks,
+                *mass_sum,
+                *weight_sum,
+                *run_cu_view_pages,
+                *run_query_weights,
                 run_o
             );
         } else {
-            attn_indexed_cuda(run_q, pools, run_views, run_cu_seqlens_q, rope, scale, selection, run_mass, run_o);
+            ops::cuda::attn_indexed(
+                run_q,
+                line.k,
+                line.v,
+                run_page_tables,
+                run_page_positions,
+                run_key_counts,
+                run_cu_seqlens_q,
+                rope.theta,
+                rope.partial_rotary_factor,
+                rope.llama3_scaling,
+                scale,
+                run_selected,
+                block_size,
+                max_selected_blocks,
+                mass_sum,
+                weight_sum,
+                run_cu_view_pages,
+                run_query_weights,
+                run_o
+            );
         }
     };
     if (single_queries > 0) {
@@ -879,7 +921,7 @@ at::Tensor qwen4_exp_model::deltanet(
     const qwen4_exp_config& c = config;
     const std::int64_t channels = w.conv.size(0);
     const std::int64_t value_heads = heads.linear_n_value_heads;
-    at::Tensor projected = small_batch_linear_cuda(h, w.in_proj);
+    at::Tensor projected = ops::cuda::small_batch_linear(h, w.in_proj);
     const at::Tensor z = projected.narrow(1, channels + 2 * value_heads, value_heads * c.linear_value_head_dim);
     at::Tensor gated = at::empty({projected.size(0), z.size(1)}, projected.options());
     segments.run_between_segments(
@@ -916,38 +958,38 @@ at::Tensor qwen4_exp_model::deltanet(
         z,
         gated
     );
-    at::Tensor out = small_batch_linear_cuda(gated, w.out_proj);
+    at::Tensor out = ops::cuda::small_batch_linear(gated, w.out_proj);
     comm.all_reduce(out);
     return out;
 }
 
 at::Tensor qwen4_exp_model::moe(const at::Tensor& h, const moe_weights& m, const at::Tensor& counters) const {
-    at::Tensor logits = small_batch_linear_cuda(h, m.router_and_gate);
+    at::Tensor logits = ops::cuda::small_batch_linear(h, m.router_and_gate);
     const std::int64_t experts = m.router_and_gate.size(0) - 1;
-    at::Tensor routed = routed_experts_cuda(
+    at::Tensor routed = ops::cuda::routed_experts(
         h,
         logits.narrow(1, 0, experts),
         config.num_experts_per_tok,
         m.first_expert,
         m.experts_gate_up_proj,
         m.experts_down_proj,
-        expert_activation::silu,
+        ops::expert_activation::silu,
         counters
     );
-    at::Tensor shared = small_batch_linear_cuda(
-        small_batch_gated_linear_cuda(h, m.shared_gate_up_proj),
+    at::Tensor shared = ops::cuda::small_batch_linear(
+        ops::cuda::small_batch_gated_linear(h, m.shared_gate_up_proj),
         m.shared_down_proj
     );
-    at::Tensor out = sigmoid_gated_add_cuda(routed, logits.narrow(1, experts, 1), shared);
+    at::Tensor out = ops::cuda::sigmoid_gated_add(routed, logits.narrow(1, experts, 1), shared);
     comm.all_reduce(out);
     return out;
 }
 
 // Hugging Face shifts each sequence right by k with EOS in the places before the sequence's start and before a token
-// following an EOS, so a token's k-th previous token is EOS when any of its previous k is EOS.
-// A token line keeps the last window tokens before a sequence's next one, each XOR eos_token_id: the n-gram context, and
-// in an engine that drafts, the tokens a step may not accept; after a step that did not accept its last rejected tokens,
-// the valid ones end window - rejected entries in.
+// following an EOS, so a token's k-th previous token is EOS when any of its previous k is EOS. A token line keeps the
+// last window tokens before a sequence's next one, each XOR eos_token_id: the n-gram context, and in an engine that
+// drafts, the tokens a step may not accept; after a step that did not accept its last rejected tokens, the valid ones
+// end window - rejected entries in.
 void qwen4_exp_model::write_ngram_ids(
     const ple_weights& w,
     std::size_t token_layer,
@@ -1084,22 +1126,32 @@ void qwen4_exp_model::convolve_ple(
     const std::int64_t step_requests = g.single_query_request_count + g.per_query_state_request_count;
     const std::int64_t step_tokens = count_step_tokens(g);
     if (step_requests > 0) {
-        causal_conv_step_cuda(
+        const ops::state_rows rows = window_layer_rows(g, conv_layer, 0, step_requests);
+        ops::cuda::causal_conv_step(
             normed.narrow(0, 0, step_tokens),
             w.conv,
             pool,
-            window_layer_rows(g, conv_layer, 0, step_requests),
+            rows.lines,
+            rows.slots,
+            rows.history_positions,
+            rows.rejected_tokens,
+            rows.page_size,
             g.cu_seqlens_q.narrow(0, 0, step_requests + 1),
             config.ngram_size,
             convolved.narrow(0, 0, step_tokens)
         );
     }
     if (requests > step_requests) {
-        causal_conv_chunked_cuda(
+        const ops::state_rows rows = window_layer_rows(g, conv_layer, step_requests, requests - step_requests);
+        ops::cuda::causal_conv_chunked(
             normed.narrow(0, step_tokens, ntok - step_tokens),
             w.conv,
             pool,
-            window_layer_rows(g, conv_layer, step_requests, requests - step_requests),
+            rows.lines,
+            rows.slots,
+            rows.history_positions,
+            rows.rejected_tokens,
+            rows.page_size,
             g.cu_seqlens_q_from_third_run,
             config.ngram_size,
             convolved.narrow(0, step_tokens, ntok - step_tokens)
@@ -1116,7 +1168,7 @@ model::output qwen4_exp_model::forward(const batch& b, std::span<const kv> lines
     std::optional<std::pair<at::Tensor, at::Tensor>> pending;
     auto inject_pending = [&] {
         if (pending) {
-            x = hyper_connection_inject_cuda(x, pending->first, pending->second);
+            x = ops::cuda::hyper_connection_inject(x, pending->first, pending->second);
             pending.reset();
         }
     };
@@ -1176,8 +1228,8 @@ bool qwen4_exp_model::allows_segment_capture(std::int64_t token_count) const {
 std::int64_t qwen4_exp_model::arrival_counter_count(std::int64_t sequences, std::int64_t tokens) const {
     const moe_weights& m = layers.front().moe;
     return std::max(
-        gated_delta_rule_counters(sequences, heads.linear_n_value_heads),
-        routed_experts_counters(
+        ops::cuda::gated_delta_rule_counters(sequences, heads.linear_n_value_heads),
+        ops::cuda::routed_experts_counters(
             tokens,
             config.num_experts_per_tok,
             m.experts_gate_up_proj.size(0),
@@ -1202,11 +1254,11 @@ qwen4_exp_model::draft(const batch& b, const at::Tensor& hidden, std::span<const
     const layer_weights& w = m.layer;
     const std::int64_t ntok = b.tokens.size(0);
     at::Tensor embedded = at::linear(
-        rmsnorm_cuda(lookup(embed_tokens, first_vocab_row, b.tokens), m.pre_fc_norm_embedding, c.rms_norm_eps),
+        ops::cuda::rmsnorm(lookup(embed_tokens, first_vocab_row, b.tokens), m.pre_fc_norm_embedding, c.rms_norm_eps),
         m.fc_embedding
     );
     at::Tensor streams = at::linear(
-                             rmsnorm_cuda(hidden.contiguous(), m.pre_fc_norm_hidden, c.rms_norm_eps)
+                             ops::cuda::rmsnorm(hidden.contiguous(), m.pre_fc_norm_hidden, c.rms_norm_eps)
                                  .view({ntok, c.hc_count, c.hidden_size}),
                              m.fc_hidden
     )
@@ -1215,7 +1267,7 @@ qwen4_exp_model::draft(const batch& b, const at::Tensor& hidden, std::span<const
     auto [x, mixed] = injected_mix(streams, embedded, whole, w.attn_hyper_connection);
     at::Tensor attended = attention(mixed.input, w, b, lines, segments);
     auto [summed, mlp_mixed] = injected_mix(x, attended, mixed.injection_weights, w.mlp_hyper_connection);
-    x = hyper_connection_inject_cuda(
+    x = ops::cuda::hyper_connection_inject(
         summed,
         moe(mlp_mixed.input, w.moe, b.arrival_counters),
         mlp_mixed.injection_weights

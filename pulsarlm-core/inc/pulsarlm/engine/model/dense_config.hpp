@@ -1,6 +1,6 @@
 #pragma once
 
-#include "pulsarlm/kernels/rope_parameters.hpp"
+#include "pulsarlm/ops/rope_parameters.hpp"
 
 #include <cstdint>
 
@@ -13,7 +13,7 @@ struct dense_config {
     std::int64_t n_heads;
     std::int64_t n_kv_heads;
     std::int64_t head_dim;
-    rope_parameters rope;
+    ops::rope_parameters rope;
     double rms_norm_eps;
 };
 

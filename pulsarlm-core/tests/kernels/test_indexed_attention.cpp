@@ -1,6 +1,6 @@
-#include "pulsarlm/kernels/indexed_attention.hpp"
-#include "pulsarlm/kernels/paged_attention.hpp"
-#include "pulsarlm/kernels/rope.hpp"
+#include "pulsarlm/ops/indexed_attention.hpp"
+#include "pulsarlm/ops/paged_attention.hpp"
+#include "pulsarlm/ops/rope.hpp"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAFunctions.h>
@@ -14,8 +14,8 @@
 #include <optional>
 #include <vector>
 
-// attn_indexed_cuda against a dense ATen reference over each query's selected keys, and against attn_prefill_cuda when
-// every block is selected. fp32 runs the scalar kernel, bf16 the tensor-core one.
+// ops::cuda::attn_indexed against a dense ATen reference over each query's selected keys, and against
+// ops::cuda::attn_prefill when every block is selected. fp32 runs the scalar kernel, bf16 the tensor-core one.
 
 namespace {
 
@@ -113,7 +113,7 @@ void reference(
     const at::Tensor& k_pool,
     const at::Tensor& v_pool,
     const at::Tensor& selection,
-    const pulsarlm::rope_parameters& rope,
+    const pulsarlm::ops::rope_parameters& rope,
     double scale,
     at::Tensor& o,
     at::Tensor& mass_sum,
@@ -130,7 +130,9 @@ void reference(
         auto lines = at::tensor(std::vector<int64_t>(view.lines.begin(), view.lines.end())).to(at::kCUDA);
         auto k = k_pool.index_select(0, lines).view({-1, n_kv, head_dim}).slice(0, 0, view.ctx).to(at::kFloat);
         auto pos = at::arange(view.ctx, at::device(at::kCUDA).dtype(at::kLong)).view({-1, 1});
-        k = pulsarlm::rope_rotate(k, pos, rope).to(k_pool.scalar_type()).to(at::kFloat);
+        k = pulsarlm::ops::rope_rotate(k, pos, rope.theta, rope.partial_rotary_factor, rope.llama3_scaling)
+                .to(k_pool.scalar_type())
+                .to(at::kFloat);
         auto v = v_pool.index_select(0, lines).view({-1, n_kv, head_dim}).slice(0, 0, view.ctx).to(at::kFloat);
         const int64_t page_size = k_pool.size(1);
         for (int64_t r = 0; r < view.seq_q; ++r, ++row) {
@@ -181,7 +183,7 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
     const int64_t head_dim = GENERATE(64, 256);
     const int64_t page_size = GENERATE(16, 32);
     const int64_t n_q = 4, n_kv = 2, num_lines = 6;
-    const pulsarlm::rope_parameters rope{.theta = 1e4, .partial_rotary_factor = 0.25};
+    const pulsarlm::ops::rope_parameters rope{.theta = 1e4, .partial_rotary_factor = 0.25};
     const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
     at::manual_seed(7);
     // On an RTX 5090 (170 SMs) or an H200 (132 SMs), 64 queries of the first view run one split per (query token, KV
@@ -203,20 +205,25 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
 
     at::Tensor mass = mass_of();
     at::Tensor weights = weights_of();
-    at::Tensor o = pulsarlm::attn_indexed_cuda(
+    at::Tensor o = pulsarlm::ops::cuda::attn_indexed(
         q,
-        {.keys = k_pool, .values = v_pool},
-        {.page_tables = b.page_tables, .page_positions = b.page_positions, .key_counts = b.key_counts},
+        k_pool,
+        v_pool,
+        b.page_tables,
+        b.page_positions,
+        b.key_counts,
         b.cu_seqlens_q,
-        rope,
+        rope.theta,
+        rope.partial_rotary_factor,
+        rope.llama3_scaling,
         scale,
-        {.selected = selection, .block_size = block_size, .max_selected_blocks = max_pages * page_size / block_size},
-        pulsarlm::page_mass{
-            .mass_sum = mass,
-            .weight_sum = weights,
-            .cu_view_pages = b.cu_view_pages,
-            .query_weights = b.query_weights
-        },
+        selection,
+        block_size,
+        max_pages * page_size / block_size,
+        mass,
+        weights,
+        b.cu_view_pages,
+        b.query_weights,
         std::nullopt
     );
     at::Tensor expected_o = at::zeros({b.total_q, n_q, head_dim}, opts.dtype(at::kFloat));
@@ -230,37 +237,46 @@ TEST_CASE("indexed attention attends each query's selected keys", "[ops][cuda]")
 
     at::Tensor dense_mass = mass_of();
     at::Tensor dense_weights = weights_of();
-    at::Tensor dense = pulsarlm::attn_prefill_cuda(
+    at::Tensor dense = pulsarlm::ops::cuda::attn_prefill(
         q,
-        {.keys = k_pool, .values = v_pool},
-        {.page_tables = b.page_tables, .page_positions = b.page_positions, .key_counts = b.key_counts},
+        k_pool,
+        v_pool,
+        b.page_tables,
+        b.page_positions,
+        b.key_counts,
         b.cu_seqlens_q,
-        {.rope = rope, .scale = scale, .sliding_window = std::nullopt, .k_norm_weight = std::nullopt},
-        pulsarlm::page_mass{
-            .mass_sum = dense_mass,
-            .weight_sum = dense_weights,
-            .cu_view_pages = b.cu_view_pages,
-            .query_weights = b.query_weights
-        }
+        rope.theta,
+        rope.partial_rotary_factor,
+        rope.llama3_scaling,
+        scale,
+        std::nullopt,
+        std::nullopt,
+        dense_mass,
+        dense_weights,
+        b.cu_view_pages,
+        b.query_weights
     );
     at::Tensor all_mass = mass_of();
     at::Tensor all_weights = weights_of();
-    at::Tensor all = pulsarlm::attn_indexed_cuda(
+    at::Tensor all = pulsarlm::ops::cuda::attn_indexed(
         q,
-        {.keys = k_pool, .values = v_pool},
-        {.page_tables = b.page_tables, .page_positions = b.page_positions, .key_counts = b.key_counts},
+        k_pool,
+        v_pool,
+        b.page_tables,
+        b.page_positions,
+        b.key_counts,
         b.cu_seqlens_q,
-        rope,
+        rope.theta,
+        rope.partial_rotary_factor,
+        rope.llama3_scaling,
         scale,
-        {.selected = full_selection(b, words),
-         .block_size = block_size,
-         .max_selected_blocks = max_pages * page_size / block_size},
-        pulsarlm::page_mass{
-            .mass_sum = all_mass,
-            .weight_sum = all_weights,
-            .cu_view_pages = b.cu_view_pages,
-            .query_weights = b.query_weights
-        },
+        full_selection(b, words),
+        block_size,
+        max_pages * page_size / block_size,
+        all_mass,
+        all_weights,
+        b.cu_view_pages,
+        b.query_weights,
         std::nullopt
     );
     // The scalar kernel sums each output across threads with atomicAdd, and both ops add the mass with atomicAdd, in no
@@ -285,7 +301,7 @@ TEST_CASE("verify indexed attention measures each query's mass in its own view",
     const int64_t head_dim = 64;
     const int64_t page_size = 16;
     const int64_t n_q = 4, n_kv = 2, num_lines = 6;
-    const pulsarlm::rope_parameters rope{.theta = 1e4, .partial_rotary_factor = 0.25};
+    const pulsarlm::ops::rope_parameters rope{.theta = 1e4, .partial_rotary_factor = 0.25};
     const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
     at::manual_seed(11);
     view_batch b = make_batch(page_size, 3 * page_size + 5, first_queries);
@@ -299,20 +315,25 @@ TEST_CASE("verify indexed attention measures each query's mass in its own view",
     at::Tensor mass = at::zeros({b.total_q * max_pages, n_q}, opts.dtype(at::kFloat));
     at::Tensor weights = at::zeros({b.total_q * max_pages}, opts.dtype(at::kFloat));
 
-    at::Tensor o = pulsarlm::attn_indexed_verify_cuda(
+    at::Tensor o = pulsarlm::ops::cuda::attn_indexed_verify(
         q,
-        {.keys = k_pool, .values = v_pool},
-        {.page_tables = b.page_tables, .page_positions = b.page_positions, .key_counts = b.key_counts},
+        k_pool,
+        v_pool,
+        b.page_tables,
+        b.page_positions,
+        b.key_counts,
         b.cu_seqlens_q,
-        rope,
+        rope.theta,
+        rope.partial_rotary_factor,
+        rope.llama3_scaling,
         scale,
-        {.selected = selection, .block_size = block_size, .max_selected_blocks = max_pages * page_size / block_size},
-        pulsarlm::page_mass{
-            .mass_sum = mass,
-            .weight_sum = weights,
-            .cu_view_pages = cu_query_pages,
-            .query_weights = b.query_weights
-        },
+        selection,
+        block_size,
+        max_pages * page_size / block_size,
+        mass,
+        weights,
+        cu_query_pages,
+        b.query_weights,
         std::nullopt
     );
 
@@ -337,7 +358,7 @@ TEST_CASE("the indexed attention ops write into a given out, a slice of a larger
     // terms, which round alike in either order.
     const int64_t page_size = 32;
     const int64_t n_q = 4, n_kv = 2, num_lines = 6;
-    const pulsarlm::rope_parameters rope{.theta = 1e4, .partial_rotary_factor = 0.25};
+    const pulsarlm::ops::rope_parameters rope{.theta = 1e4, .partial_rotary_factor = 0.25};
     const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
     at::manual_seed(13);
     view_batch b = make_batch(page_size, page_size + 20, 2);
@@ -346,41 +367,55 @@ TEST_CASE("the indexed attention ops write into a given out, a slice of a larger
     auto v_pool = at::randn({num_lines, page_size, n_kv, head_dim}, opts);
     auto q = at::randn({b.total_q, n_q, head_dim}, opts);
     const int64_t words = (max_pages * page_size / block_size + 31) / 32;
-    const pulsarlm::block_selection selection{
-        .selected = random_selection(b, page_size, words),
-        .block_size = block_size,
-        .max_selected_blocks = max_pages * page_size / block_size,
-    };
+    const at::Tensor selected = random_selection(b, page_size, words);
+    const int64_t max_selected_blocks = max_pages * page_size / block_size;
     const int64_t views = verify ? b.total_q : static_cast<int64_t>(b.views.size());
     at::Tensor cu_view_pages = at::arange(views + 1, b.cu_view_pages.options()) * max_pages;
     auto attend = [&](const std::optional<at::Tensor>& out, at::Tensor& mass, at::Tensor& weights) {
         mass = at::zeros({views * max_pages, n_q}, opts.dtype(at::kFloat));
         weights = at::zeros({views * max_pages}, opts.dtype(at::kFloat));
-        const pulsarlm::page_mass page_mass{
-            .mass_sum = mass,
-            .weight_sum = weights,
-            .cu_view_pages = cu_view_pages,
-            .query_weights = b.query_weights,
-        };
-        const pulsarlm::kv_pools pools{.keys = k_pool, .values = v_pool};
-        const pulsarlm::page_views page_views{
-            .page_tables = b.page_tables,
-            .page_positions = b.page_positions,
-            .key_counts = b.key_counts,
-        };
-        return verify
-            ? pulsarlm::attn_indexed_verify_cuda(
-                  q,
-                  pools,
-                  page_views,
-                  b.cu_seqlens_q,
-                  rope,
-                  scale,
-                  selection,
-                  page_mass,
-                  out
-              )
-            : pulsarlm::attn_indexed_cuda(q, pools, page_views, b.cu_seqlens_q, rope, scale, selection, page_mass, out);
+        return verify ? pulsarlm::ops::cuda::attn_indexed_verify(
+                            q,
+                            k_pool,
+                            v_pool,
+                            b.page_tables,
+                            b.page_positions,
+                            b.key_counts,
+                            b.cu_seqlens_q,
+                            rope.theta,
+                            rope.partial_rotary_factor,
+                            rope.llama3_scaling,
+                            scale,
+                            selected,
+                            block_size,
+                            max_selected_blocks,
+                            mass,
+                            weights,
+                            cu_view_pages,
+                            b.query_weights,
+                            out
+                        )
+                      : pulsarlm::ops::cuda::attn_indexed(
+                            q,
+                            k_pool,
+                            v_pool,
+                            b.page_tables,
+                            b.page_positions,
+                            b.key_counts,
+                            b.cu_seqlens_q,
+                            rope.theta,
+                            rope.partial_rotary_factor,
+                            rope.llama3_scaling,
+                            scale,
+                            selected,
+                            block_size,
+                            max_selected_blocks,
+                            mass,
+                            weights,
+                            cu_view_pages,
+                            b.query_weights,
+                            out
+                        );
     };
 
     at::Tensor alone_mass, alone_weights;

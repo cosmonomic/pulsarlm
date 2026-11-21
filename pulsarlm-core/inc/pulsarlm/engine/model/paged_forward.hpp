@@ -1,8 +1,8 @@
 #pragma once
 
 #include "pulsarlm/engine/model/interface.hpp"
-#include "pulsarlm/kernels/gated_deltanet.hpp"
-#include "pulsarlm/kernels/rope.hpp"
+#include "pulsarlm/ops/gated_deltanet.hpp"
+#include "pulsarlm/ops/rope.hpp"
 
 #include <ATen/core/Tensor.h>
 
@@ -15,17 +15,23 @@
 namespace pulsarlm {
 
 // The projected queries q [ntok, n_q_heads * head_dim] rotated to their positions pos, as [ntok, n_q_heads, head_dim].
-at::Tensor
-rope_q(const at::Tensor& q, const at::Tensor& pos, int64_t n_q_heads, int64_t head_dim, const rope_parameters& rope);
+at::Tensor rope_q(
+    const at::Tensor& q,
+    const at::Tensor& pos,
+    int64_t n_q_heads,
+    int64_t head_dim,
+    const ops::rope_parameters& rope
+);
 
 // Writes the batch's new keys k and values v, [ntok, n_kv_heads, head_dim] with k unrotated, into KV layer kv_layer's
 // lines, then attends them with the rotated queries q [ntok, n_q_heads, head_dim] into o [ntok, n_q_heads, head_dim],
 // ntok the query tokens of g. Undefined k and v leave the lines as they are, for a layer reading another layer's KV.
-// sliding_window and k_norm_weight are as attention_layer holds them. When g.page_mass_sum[kv_layer] is defined, the
-// layer writes the mass_sum attn_prefill_cuda measures into reader's columns of it, reader being the layer's index
-// among those reading kv_layer, and reader 0 writes the weight_sum into g.page_weight_sum[kv_layer]. The first run
-// attends by attn_decode_cuda, the later runs together by attn_prefill_cuda, each query token of the second run
-// measuring its mass in a view of its own (per_query_mass_request_count).
+// sliding_window and k_norm_weight are as the attention ops (pulsarlm/ops/paged_attention.hpp) take them. When
+// g.page_mass_sum[kv_layer] is defined, the layer writes the mass_sum ops::cuda::attn_prefill measures into reader's
+// columns of it, reader being the layer's index among those reading kv_layer, and reader 0 writes the weight_sum into
+// g.page_weight_sum[kv_layer]. The first run attends by ops::cuda::attn_decode, the later runs together by
+// ops::cuda::attn_prefill, each query token of the second run measuring its mass in a view of its own
+// (per_query_mass_request_count).
 void paged_attention(
     const at::Tensor& q,
     const at::Tensor& k,
@@ -36,7 +42,7 @@ void paged_attention(
     std::size_t reader,
     const model::batch& g,
     double scale,
-    const rope_parameters& rope,
+    const ops::rope_parameters& rope,
     std::optional<int64_t> sliding_window = std::nullopt,
     const std::optional<at::Tensor>& k_norm_weight = std::nullopt
 );
@@ -47,10 +53,10 @@ void paged_attention(
 void keep_last_hidden(const model::batch& g, const at::Tensor& hidden, const kv& line, std::size_t kv_layer);
 
 // The state rows of g's sequences [first, first + count) of KV layer kv_layer, a recurrent layer keeping a state.
-state_rows state_layer_rows(const model::batch& g, std::size_t kv_layer, std::int64_t first, std::int64_t count);
+ops::state_rows state_layer_rows(const model::batch& g, std::size_t kv_layer, std::int64_t first, std::int64_t count);
 // The state rows of g's sequences [first, first + count) of KV layer kv_layer, a recurrent layer keeping a window of
 // inputs.
-state_rows window_layer_rows(const model::batch& g, std::size_t kv_layer, std::int64_t first, std::int64_t count);
+ops::state_rows window_layer_rows(const model::batch& g, std::size_t kv_layer, std::int64_t first, std::int64_t count);
 
 // The query tokens of g's first two runs, which the step kernels of the recurrent layers run.
 std::int64_t count_step_tokens(const model::batch& g);
@@ -84,7 +90,7 @@ void gated_deltanet(
     std::size_t conv_kv_layer,
     std::int64_t key_heads,
     double rms_norm_eps,
-    gate_activation activation,
+    ops::gate_activation activation,
     const at::Tensor& gated
 );
 

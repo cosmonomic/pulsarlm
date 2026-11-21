@@ -1,0 +1,205 @@
+#pragma once
+
+#include "pulsarlm/ops/cuda/attn_params.cuh"
+#include "pulsarlm/ops/cuda/device.hpp"
+#include "pulsarlm/ops/paged_attention.hpp"
+
+#include <ATen/core/Tensor.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <c10/util/Exception.h>
+
+#include <cuda_runtime.h>
+
+#include <optional>
+#include <type_traits>
+
+// The validated batch, launch geometry, block reduction and template-instantiation ladders shared by the paged
+// attention ops (paged_attention.cu, paged_prefill.cu, paged_common.cu, indexed_attention.cu).
+
+namespace pulsarlm::ops::cuda::attn {
+
+// One validated call of a paged attention op. cu_seqlens_q is undefined for decode,
+// where sequence s has the one query row s. mass_sum, weight_sum, cu_view_pages and
+// query_weights are all defined, with a page_mass, or all undefined. o is contiguous.
+struct paged_attn_batch {
+    at::Tensor q;
+    at::Tensor k_pool;
+    at::Tensor v_pool;
+    at::Tensor page_tables;
+    at::Tensor cu_seqlens_q;
+    at::Tensor key_counts;
+    at::Tensor page_positions;
+    at::Tensor rope_turns;
+    at::Tensor k_norm_weight;
+    at::Tensor mass_sum;
+    at::Tensor weight_sum;
+    at::Tensor cu_view_pages;
+    at::Tensor query_weights;
+    at::Tensor o;
+    int64_t per_query_mass_request_count = 0;
+    double scale;
+    int64_t sliding_window;
+    int64_t num_seqs;
+    int64_t total_q;
+    int64_t n_q_heads;
+    int64_t n_kv_heads;
+    int64_t head_dim;
+    int64_t page_size;
+    int64_t max_pages;
+
+    template <typename scalar_t> paged_attn_params<scalar_t> params() const {
+        auto data = [](const at::Tensor& t) { return t.defined() ? t.data_ptr() : nullptr; };
+        return paged_attn_params<scalar_t>{
+            static_cast<const scalar_t*>(data(this->q)),
+            static_cast<const scalar_t*>(data(this->k_pool)),
+            static_cast<const scalar_t*>(data(this->v_pool)),
+            this->k_pool.stride(0),
+            this->k_pool.stride(1),
+            this->k_pool.stride(2),
+            static_cast<const int32_t*>(data(this->page_tables)),
+            static_cast<const int32_t*>(data(this->cu_seqlens_q)),
+            static_cast<const int32_t*>(data(this->key_counts)),
+            static_cast<const int32_t*>(data(this->page_positions)),
+            static_cast<const uint64_t*>(data(this->rope_turns)),
+            static_cast<const float*>(data(this->k_norm_weight)),
+            static_cast<float*>(data(this->mass_sum)),
+            static_cast<float*>(data(this->weight_sum)),
+            static_cast<const int32_t*>(data(this->cu_view_pages)),
+            static_cast<const float*>(data(this->query_weights)),
+            static_cast<int>(this->per_query_mass_request_count),
+            static_cast<scalar_t*>(data(this->o)),
+            static_cast<int>(this->num_seqs),
+            static_cast<int>(this->n_q_heads),
+            static_cast<int>(this->n_kv_heads),
+            static_cast<int>(this->head_dim),
+            static_cast<int>(this->max_pages),
+            static_cast<int>(this->n_q_heads / this->n_kv_heads),
+            this->mass_sum.defined() ? static_cast<int>(this->mass_sum.size(0)) : 0,
+            static_cast<int>(this->sliding_window),
+            static_cast<float>(this->scale),
+        };
+    }
+};
+
+// Whether the decode and prefill kernels' tiles for a compiled page size and head dim fit in shared memory.
+bool decode_fits(int64_t page_size, int64_t head_dim);
+bool prefill_fits(int64_t page_size, int64_t head_dim);
+
+// k_pool and v_pool are [num_pages, page_size, n_kv_heads, head_dim] with one stride, head_dim contiguous, and every
+// page, token and head starting 16-byte aligned.
+void check_pools(const char* op, const at::Tensor& k_pool, const at::Tensor& v_pool);
+
+// Checks the argument contract the attention ops share (pulsarlm/ops/paged_attention.hpp), with the first
+// per_query_mass_request_count sequences measuring a mass view per query row (see ops::cuda::attn_prefill), and sets o
+// to out or allocates it. op names the caller in every error.
+paged_attn_batch make_paged_attn_batch(
+    const char* op,
+    const at::Tensor& q,
+    const at::Tensor& keys,
+    const at::Tensor& values,
+    const at::Tensor& page_tables,
+    const at::Tensor& page_positions,
+    const at::Tensor& key_counts,
+    const std::optional<at::Tensor>& cu_seqlens_q,
+    const rope_parameters& rope,
+    double scale,
+    const std::optional<int64_t>& sliding_window,
+    const std::optional<at::Tensor>& k_norm_weight,
+    const std::optional<at::Tensor>& mass_sum,
+    const std::optional<at::Tensor>& weight_sum,
+    const std::optional<at::Tensor>& cu_view_pages,
+    const std::optional<at::Tensor>& query_weights,
+    int64_t per_query_mass_request_count,
+    const std::optional<at::Tensor>& out
+);
+
+// The scalar kernel over the whole batch: the fallback for shapes the tensor-core
+// kernels are not compiled for, and the reference both are checked against.
+void launch_attn_scalar(const paged_attn_batch& batch, cudaStream_t stream);
+
+// Upper bound on head_dim; sizes the scalar kernels' per-thread output
+// accumulator, which lives in local memory.
+constexpr int max_head_dim = 512;
+
+// CTA width of the scalar kernels. Power of two: block_reduce_* requires it.
+constexpr int cta_threads = 128;
+
+// Tree reduction of one value per thread over a CTA of nthreads threads.
+// nthreads must be a power of two and every thread of the CTA must call this.
+// `scratch` is nthreads floats of shared memory, reusable once this returns; the
+// result is returned to every thread.
+template <int nthreads> __device__ __forceinline__ float block_reduce_max(float* scratch, int tid, float value) {
+    scratch[tid] = value;
+    __syncthreads();
+    for (int stride = nthreads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+        }
+        __syncthreads();
+    }
+    const float total = scratch[0];
+    __syncthreads();
+    return total;
+}
+
+template <int nthreads> __device__ __forceinline__ float block_reduce_sum(float* scratch, int tid, float value) {
+    scratch[tid] = value;
+    __syncthreads();
+    for (int stride = nthreads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float total = scratch[0];
+    __syncthreads();
+    return total;
+}
+
+// Call fn with the tensor-core kernels' (scalar_t, bf16) for a fp16 or bf16 dtype.
+template <typename Fn> void dispatch_tensor_core_dtype(at::ScalarType dtype, Fn&& fn) {
+    if (dtype == at::kBFloat16) {
+        fn(std::type_identity<at::BFloat16>{}, std::true_type{});
+    } else {
+        fn(std::type_identity<at::Half>{}, std::false_type{});
+    }
+}
+
+// Call fn with the compile-time page_size tag matching the runtime page_size.
+template <typename Fn> void dispatch_page_size(const char* op, int64_t page_size, Fn&& fn) {
+    if (page_size == 16) {
+        fn(std::integral_constant<int, 16>{});
+    } else if (page_size == 32) {
+        fn(std::integral_constant<int, 32>{});
+    } else {
+        TORCH_CHECK(false, op, ": unsupported page_size ", page_size, " (compiled for 16 and 32)");
+    }
+}
+
+// Call fn with the compile-time (page_size, head_dim) tags matching the runtime
+// values. The tensor-core kernels exist only for these pairs, so an unsupported
+// one is rejected rather than silently computed under the wrong geometry.
+template <typename Fn> void dispatch_page_head(const char* op, int64_t page_size, int64_t head_dim, Fn&& fn) {
+    dispatch_page_size(op, page_size, [&](auto page_tag) {
+        if (head_dim == 64) {
+            fn(page_tag, std::integral_constant<int, 64>{});
+        } else if (head_dim == 128) {
+            fn(page_tag, std::integral_constant<int, 128>{});
+        } else if (head_dim == 256) {
+            fn(page_tag, std::integral_constant<int, 256>{});
+        } else if (head_dim == 512) {
+            fn(page_tag, std::integral_constant<int, 512>{});
+        } else {
+            TORCH_CHECK(
+                false,
+                op,
+                ": unsupported head_dim ",
+                head_dim,
+                " (tensor-core path compiled for 64, 128, 256 and 512)"
+            );
+        }
+    });
+}
+
+}  // namespace pulsarlm::ops::cuda::attn

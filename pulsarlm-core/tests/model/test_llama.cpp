@@ -11,8 +11,9 @@
 #include <string>
 #include <vector>
 
-// llama_model's paged forward, with Llama 3 RoPE scaling and an untied lm_head, against a dense ATen Llama: chunked prefill then decode over pages scattered across the
-// lines, checking the logits, the unrotated K the lines hold, and the per-page attention mass.
+// llama_model's paged forward, with Llama 3 RoPE scaling and an untied lm_head, against a dense ATen Llama: chunked
+// prefill then decode over pages scattered across the lines, checking the logits, the unrotated K the lines hold, and
+// the per-page attention mass.
 
 namespace {
 
@@ -32,7 +33,7 @@ constexpr std::int64_t intermediate = 256;
 constexpr std::int64_t vocab = 300;
 constexpr double rope_theta = 1e4;
 // With head_dim 64 and theta 1e4, wavelengths run from 2 pi to about 4.7e4, so pairs fall in all three bands.
-const pulsarlm::llama3_rope_scaling scaling{
+const pulsarlm::ops::llama3_rope_scaling scaling{
     .factor = 8.0,
     .low_freq_factor = 1.0,
     .high_freq_factor = 4.0,

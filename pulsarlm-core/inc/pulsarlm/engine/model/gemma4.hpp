@@ -2,7 +2,7 @@
 
 #include "pulsarlm/engine/model/interface.hpp"
 #include "pulsarlm/engine/model/gemma4_config.hpp"
-#include "pulsarlm/kernels/rope.hpp"
+#include "pulsarlm/ops/rope.hpp"
 
 #include <ATen/core/Dict.h>
 #include <ATen/core/Tensor.h>

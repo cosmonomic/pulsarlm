@@ -155,7 +155,7 @@ copy_to_host(host_page_pool& pool, std::span<const sharded_page> sources, std::s
     }
     std::vector<at::Tensor> launched;
     launch_segments(by_shard, streams, launched, [&](const at::Tensor& lines, const at::Tensor& segments) {
-        copy_segments_to_host_cuda(lines, pool.buffer(), segments);
+        ops::cuda::copy_segments_to_host(lines, pool.buffer(), segments);
     });
     co_await synchronize_all(streams);
     co_return pages;
@@ -205,7 +205,7 @@ task<void> copy_from_host(
     }
     std::vector<at::Tensor> launched;
     launch_segments(by_shard, streams, launched, [&](const at::Tensor& lines, const at::Tensor& segments) {
-        copy_segments_from_host_cuda(lines, pool.buffer(), segments);
+        ops::cuda::copy_segments_from_host(lines, pool.buffer(), segments);
     });
     co_await synchronize_all(streams);
 }

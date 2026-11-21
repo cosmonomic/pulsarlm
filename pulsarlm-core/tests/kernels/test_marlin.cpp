@@ -1,4 +1,4 @@
-#include "pulsarlm/kernels/dequant_gemm.hpp"
+#include "pulsarlm/ops/dequant_gemm.hpp"
 
 #include <ATen/ATen.h>
 
@@ -56,10 +56,10 @@ TEST_CASE("fp8 marlin dequantizes every e4m3 code exactly", "[ops][cuda]") {
     const int64_t block_n = GENERATE(int64_t{1}, int64_t{128});
     const at::Tensor weight = random_fp8();
     const at::Tensor scale = random_scale(block_n);
-    const auto [weight_marlin, scale_marlin] = repack_fp8_marlin_cuda(weight, scale, block_n, group_size);
+    const auto [weight_marlin, scale_marlin] = ops::cuda::repack_fp8_marlin(weight, scale, block_n, group_size);
 
     const at::Tensor identity = at::eye(k, cuda(dtype));
-    const at::Tensor y = gemm_fp8_marlin_cuda(identity, weight_marlin, scale_marlin, n, block_n, group_size);
+    const at::Tensor y = ops::cuda::gemm_fp8_marlin(identity, weight_marlin, scale_marlin, n, block_n, group_size);
 
     REQUIRE(at::equal(y, dequantized(weight, scale, block_n, dtype).t()));
 }
@@ -69,10 +69,15 @@ TEST_CASE("int4 marlin dequantizes every int4 value exactly", "[ops][cuda]") {
     const int64_t block_n = GENERATE(int64_t{1}, int64_t{128});
     const at::Tensor values = random_int4();
     const at::Tensor scale = random_scale(block_n);
-    const auto [weight_marlin, scale_marlin] = repack_int4_marlin_cuda(packed_int4(values), scale, block_n, group_size);
+    const auto [weight_marlin, scale_marlin] = ops::cuda::repack_int4_marlin(
+        packed_int4(values),
+        scale,
+        block_n,
+        group_size
+    );
 
     const at::Tensor identity = at::eye(k, cuda(dtype));
-    const at::Tensor y = gemm_int4_marlin_cuda(identity, weight_marlin, scale_marlin, n, block_n, group_size);
+    const at::Tensor y = ops::cuda::gemm_int4_marlin(identity, weight_marlin, scale_marlin, n, block_n, group_size);
 
     REQUIRE(at::equal(y, dequantized(values, scale, block_n, dtype).t()));
 }
@@ -83,10 +88,10 @@ TEST_CASE("fp8 marlin matches a dequantize-then-matmul reference", "[ops][cuda]"
     const int64_t block_n = 128;
     const at::Tensor weight = random_fp8();
     const at::Tensor scale = random_scale(block_n);
-    const auto [weight_marlin, scale_marlin] = repack_fp8_marlin_cuda(weight, scale, block_n, group_size);
+    const auto [weight_marlin, scale_marlin] = ops::cuda::repack_fp8_marlin(weight, scale, block_n, group_size);
 
     const at::Tensor x = at::randn({m, k}, cuda(dtype));
-    const at::Tensor y = gemm_fp8_marlin_cuda(x, weight_marlin, scale_marlin, n, block_n, group_size);
+    const at::Tensor y = ops::cuda::gemm_fp8_marlin(x, weight_marlin, scale_marlin, n, block_n, group_size);
     const at::Tensor reference = at::matmul(
         x.to(at::kFloat),
         dequantized(weight, scale, block_n, dtype).to(at::kFloat).t()
@@ -101,10 +106,15 @@ TEST_CASE("int4 marlin matches a dequantize-then-matmul reference", "[ops][cuda]
     const int64_t block_n = 1;
     const at::Tensor values = random_int4();
     const at::Tensor scale = random_scale(block_n);
-    const auto [weight_marlin, scale_marlin] = repack_int4_marlin_cuda(packed_int4(values), scale, block_n, group_size);
+    const auto [weight_marlin, scale_marlin] = ops::cuda::repack_int4_marlin(
+        packed_int4(values),
+        scale,
+        block_n,
+        group_size
+    );
 
     const at::Tensor x = at::randn({m, k}, cuda(dtype));
-    const at::Tensor y = gemm_int4_marlin_cuda(x, weight_marlin, scale_marlin, n, block_n, group_size);
+    const at::Tensor y = ops::cuda::gemm_int4_marlin(x, weight_marlin, scale_marlin, n, block_n, group_size);
     const at::Tensor reference = at::matmul(
         x.to(at::kFloat),
         dequantized(values, scale, block_n, dtype).to(at::kFloat).t()

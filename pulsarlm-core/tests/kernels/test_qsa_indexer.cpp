@@ -1,5 +1,5 @@
-#include "pulsarlm/kernels/indexed_attention.hpp"
-#include "pulsarlm/kernels/normalization.hpp"
+#include "pulsarlm/ops/indexed_attention.hpp"
+#include "pulsarlm/ops/normalization.hpp"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAFunctions.h>
@@ -13,9 +13,9 @@
 #include <tuple>
 #include <vector>
 
-// QSA's indexer ops against ATen references: index_queries_cuda against rmsnorm_cuda and the reference RoPE,
-// index_blocks_cuda against the pooled, normed and roped view blocks, index_scores_cuda against the relu sums of each
-// row's heads, and select_blocks_cuda against a stable descending sort.
+// QSA's indexer ops against ATen references: ops::cuda::index_queries against ops::cuda::rmsnorm and the reference
+// RoPE, ops::cuda::index_blocks against the pooled, normed and roped view blocks, ops::cuda::index_scores against the
+// relu sums of each row's heads, and ops::cuda::select_blocks against a stable descending sort.
 
 namespace {
 
@@ -74,7 +74,7 @@ row_layout(const std::vector<int32_t>& key_counts, const std::vector<int32_t>& c
 
 }  // namespace
 
-TEST_CASE("index_blocks_cuda pools, norms and ropes each view block", "[ops][cuda]") {
+TEST_CASE("ops::cuda::index_blocks pools, norms and ropes each view block", "[ops][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
@@ -90,9 +90,11 @@ TEST_CASE("index_blocks_cuda pools, norms and ropes each view block", "[ops][cud
 
     auto key_counts = int32_cuda({max_pages * pool_page_size, max_pages * pool_page_size});
 
-    at::Tensor blocks = pulsarlm::index_blocks_cuda(
+    at::Tensor blocks = pulsarlm::ops::cuda::index_blocks(
         index_keys,
-        {.page_tables = page_tables, .page_positions = page_positions, .key_counts = key_counts},
+        page_tables,
+        page_positions,
+        key_counts,
         norm_weight,
         inv_freq(),
         ratio,
@@ -111,7 +113,7 @@ TEST_CASE("index_blocks_cuda pools, norms and ropes each view block", "[ops][cud
     CHECK(at::allclose(blocks.to(at::kFloat), expected.to(at::kFloat), tolerance, tolerance));
 }
 
-TEST_CASE("index_blocks_cuda zeros the blocks ending past a view's keys without reading them", "[ops][cuda]") {
+TEST_CASE("ops::cuda::index_blocks zeros the blocks ending past a view's keys without reading them", "[ops][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
@@ -126,9 +128,11 @@ TEST_CASE("index_blocks_cuda zeros the blocks ending past a view's keys without 
     auto key_counts = int32_cuda({max_pages * pool_page_size, complete_blocks * ratio + 2});
     auto norm_weight = (1.0 + 0.1 * at::randn({index_dim})).to(at::kCUDA);
 
-    at::Tensor blocks = pulsarlm::index_blocks_cuda(
+    at::Tensor blocks = pulsarlm::ops::cuda::index_blocks(
         index_keys,
-        {.page_tables = page_tables, .page_positions = page_positions, .key_counts = key_counts},
+        page_tables,
+        page_positions,
+        key_counts,
         norm_weight,
         inv_freq(),
         ratio,
@@ -139,7 +143,7 @@ TEST_CASE("index_blocks_cuda zeros the blocks ending past a view's keys without 
     CHECK(blocks[1].narrow(0, 0, complete_blocks).abs().sum().item<float>() > 0.0f);
 }
 
-TEST_CASE("index_scores_cuda sums the relu of each head's score over a row's complete blocks", "[ops][cuda]") {
+TEST_CASE("ops::cuda::index_scores sums the relu of each head's score over a row's complete blocks", "[ops][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
@@ -158,7 +162,7 @@ TEST_CASE("index_scores_cuda sums the relu of each head's score over a row's com
     auto longs = at::device(at::kCUDA).dtype(at::kLong);
     const double scale = 0.25;
 
-    at::Tensor scores = pulsarlm::index_scores_cuda(
+    at::Tensor scores = pulsarlm::ops::cuda::index_scores(
         queries,
         blocks,
         int32_cuda(key_counts),
@@ -177,7 +181,7 @@ TEST_CASE("index_scores_cuda sums the relu of each head's score over a row's com
     CHECK(at::allclose(at::where(visible, scores, 0.0), at::where(visible, expected, 0.0), 1e-4, 1e-4));
 }
 
-TEST_CASE("select_blocks_cuda takes a stable descending sort's top blocks and the tail block", "[ops][cuda]") {
+TEST_CASE("ops::cuda::select_blocks takes a stable descending sort's top blocks and the tail block", "[ops][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
@@ -194,8 +198,15 @@ TEST_CASE("select_blocks_cuda takes a stable descending sort's top blocks and th
     auto visible = at::arange(max_blocks, longs).unsqueeze(0) < row_blocks.unsqueeze(1);
     scores = at::where(visible, scores, -INFINITY).contiguous();
 
-    at::Tensor
-        selected = pulsarlm::select_blocks_cuda(scores, int32_cuda(key_counts), std::nullopt, 0, top, ratio, words);
+    at::Tensor selected = pulsarlm::ops::cuda::select_blocks(
+        scores,
+        int32_cuda(key_counts),
+        std::nullopt,
+        0,
+        top,
+        ratio,
+        words
+    );
 
     auto [sorted, order] = at::sort(scores, /*stable=*/true, /*dim=*/-1, /*descending=*/true);
     auto bits = at::zeros({rows, words * 32}, at::device(at::kCUDA).dtype(at::kBool));
@@ -205,7 +216,7 @@ TEST_CASE("select_blocks_cuda takes a stable descending sort's top blocks and th
     CHECK(at::equal(selected, packed(bits, words)));
 }
 
-TEST_CASE("index_queries_cuda norms and ropes each head of the index projection", "[ops][cuda]") {
+TEST_CASE("ops::cuda::index_queries norms and ropes each head of the index projection", "[ops][cuda]") {
     if (c10::cuda::device_count() == 0) {
         SKIP("no CUDA device");
     }
@@ -216,9 +227,9 @@ TEST_CASE("index_queries_cuda norms and ropes each head of the index projection"
     auto norm_weight = (1.0 + 0.1 * at::randn({index_dim})).to(at::kCUDA);
     auto positions = at::tensor(std::vector<int64_t>{0, 7, 300, 4095, 131071}).to(at::kCUDA);
 
-    at::Tensor queries = pulsarlm::index_queries_cuda(index_qk, norm_weight, inv_freq(), positions, heads, eps);
+    at::Tensor queries = pulsarlm::ops::cuda::index_queries(index_qk, norm_weight, inv_freq(), positions, heads, eps);
 
-    auto normed = pulsarlm::rmsnorm_cuda(
+    auto normed = pulsarlm::ops::cuda::rmsnorm(
         index_qk.narrow(1, 0, heads * index_dim).view({tokens, heads, index_dim}),
         norm_weight,
         eps
