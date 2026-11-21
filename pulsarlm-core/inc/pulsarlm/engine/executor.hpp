@@ -72,7 +72,7 @@ class executor {
     std::vector<request_id_type> exited_requests;
 
     // Everything the executor keeps on one GPU across steps.
-    class shard {
+    class model_shard {
       public:
         // Holds the shard's part of every layer.
         pulsarlm::model* model;
@@ -101,7 +101,7 @@ class executor {
     kv_cache cache;
     page_store& store;
     // One per shard of the cache.
-    std::vector<shard> shards;
+    std::vector<model_shard> model_shards;
     // The columns of a shard's page_tables (request_table), the pages of the widest view a request holds.
     std::size_t view_page_capacity;
     // The most requests with a record at once, which bounds their slots.
@@ -114,7 +114,8 @@ class executor {
     std::vector<request_id_type> stale_requests;
     // The requests preempted since the last take_preempted_requests, in preemption order.
     std::vector<request_id_type> preempted_requests;
-    // The requests that hold the lines allocate_lines gave them (running_request::is_loaded), in the order it gave them.
+    // The requests that hold the lines allocate_lines gave them (running_request::is_loaded), in the order it gave
+    // them.
     std::vector<request_id_type> loaded_requests;
     // The allocate_lines calls that may hold lines for a request not loaded yet.
     std::size_t loading_count = 0;
@@ -140,7 +141,7 @@ class executor {
     std::atomic<std::uint64_t> accepted_drafts{0};
     std::size_t count_slots(const kv_layer& layer) const noexcept;
     // stream of every shard, in shard order.
-    std::vector<cudaStream_t> collect_streams(cudaStream_t shard::* stream) const;
+    std::vector<cudaStream_t> collect_streams(cudaStream_t model_shard::* stream) const;
     digest root;
     std::vector<std::int64_t> stop_ids;
     // The page writes write-backs spawned, at most max_store_writes at once.

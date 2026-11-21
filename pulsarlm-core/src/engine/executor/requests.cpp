@@ -203,7 +203,7 @@ task<std::expected<void, page_error>> executor::own_pages_from(request_state& re
             }
         }
     }
-    co_return co_await cache.sync(hashes, owners, line_ids, collect_streams(&shard::compute_stream));
+    co_return co_await cache.sync(hashes, owners, line_ids, collect_streams(&model_shard::compute_stream));
 }
 
 task<void> executor::stop(request_id_type id) {
@@ -320,7 +320,7 @@ task<std::expected<void, page_error>> executor::take_view_lines(request_state& r
     // A get failing with miss releases the lines it held_hashes while it fetched.
     std::expected<std::vector<std::vector<std::uint32_t>>, page_error> page_lines = co_await cache.get(
         held_hashes,
-        collect_streams(&shard::compute_stream)
+        collect_streams(&model_shard::compute_stream)
     );
     if (!page_lines) {
         co_return std::unexpected(page_lines.error());
@@ -341,7 +341,7 @@ task<std::expected<void, page_error>> executor::take_view_lines(request_state& r
                 layer,
                 (*page_lines)[layer].front(),
                 1,
-                collect_streams(&shard::compute_stream)
+                collect_streams(&model_shard::compute_stream)
             );
             copied = state_copy.has_value();
             if (copied) {
@@ -366,14 +366,14 @@ task<std::expected<void, page_error>> executor::take_view_lines(request_state& r
             req.add_lines(layer, allocated.first(first_slots));
             allocated = allocated.subspan(first_slots);
             if (states[layer].empty()) {
-                for (std::size_t shard = 0; shard < shards.size(); shard++) {
+                for (std::size_t shard = 0; shard < model_shards.size(); shard++) {
                     c10::cuda::CUDAStreamGuard guard(
                         c10::cuda::getStreamFromExternal(
-                            shards[shard].compute_stream,
-                            shards[shard].lines[layer].k.device().index()
+                            model_shards[shard].compute_stream,
+                            model_shards[shard].lines[layer].k.device().index()
                         )
                     );
-                    shards[shard].lines[layer].k.select(0, allocated.front()).zero_();
+                    model_shards[shard].lines[layer].k.select(0, allocated.front()).zero_();
                 }
                 req.add_lines(layer, allocated.first(1));
                 allocated = allocated.subspan(1);

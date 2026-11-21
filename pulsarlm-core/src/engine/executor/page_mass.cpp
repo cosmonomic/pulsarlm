@@ -73,7 +73,7 @@ executor::step::view_mass(std::size_t view, const at::Tensor& mass, const view_l
 
 void executor::step::join_mass(
     launch_result& launched,
-    std::span<const shard> shards,
+    std::span<const model_shard> model_shards,
     const view_layout& layout
 ) const {
     const std::vector<at::Tensor>& mass_by_shard = launched.mass_by_shard;
@@ -103,7 +103,7 @@ void executor::step::join_mass(
         auto pages = static_cast<std::size_t>(cu_view_pages[layer * row_size + row_size - 1]);
         for (std::size_t page = 0; page < pages; page++) {
             for (std::size_t shard = 0; shard < in.size(); shard++) {
-                std::size_t heads = shards[shard].mass_heads[layer];
+                std::size_t heads = model_shards[shard].mass_heads[layer];
                 out = std::copy_n(in[shard], heads, out);
                 in[shard] += heads;
             }

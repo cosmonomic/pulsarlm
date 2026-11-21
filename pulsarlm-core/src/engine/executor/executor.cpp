@@ -61,9 +61,9 @@ std::size_t executor::count_slots(const kv_layer& layer) const noexcept {
     return layer.state->input_window ? 1 : draft_state_slots;
 }
 
-std::vector<cudaStream_t> executor::collect_streams(cudaStream_t shard::* stream) const {
+std::vector<cudaStream_t> executor::collect_streams(cudaStream_t model_shard::* stream) const {
     std::vector<cudaStream_t> streams;
-    for (const shard& s : shards) {
+    for (const model_shard& s : model_shards) {
         streams.push_back(s.*stream);
     }
     return streams;
@@ -105,8 +105,8 @@ executor::executor(
         copy_streams.size() == models.size() && worker_loops.size() + 1 == models.size()
     );
     for (std::size_t s = 0; s < models.size(); s++) {
-        shards.push_back(
-            shard{
+        model_shards.push_back(
+            model_shard{
                 .model = models[s],
                 .lines = {},
                 .mass_heads = {},
@@ -120,18 +120,18 @@ executor::executor(
             }
         );
     }
-    for (std::size_t shard = 0; shard < shards.size(); shard++) {
-        std::vector<kv_layer> layers = shards[shard].model->kv_layers();
+    for (std::size_t shard = 0; shard < model_shards.size(); shard++) {
+        std::vector<kv_layer> layers = model_shards[shard].model->kv_layers();
         assert(layers.size() == this->cache.layer_count());
         for (std::size_t layer = 0; layer < layers.size(); layer++) {
-            shards[shard].lines.push_back(this->cache.tensors(layer, shard));
+            model_shards[shard].lines.push_back(this->cache.tensors(layer, shard));
             bool layer_recurrent = layers[layer].state.has_value();
             bool evictable = !layers[layer].sliding_window && !layer_recurrent && !layers[layer].mirrors_held_pages;
             require(
                 !evictable || layers[layer].n_q_heads > 0,
                 "executor: a full-attention KV layer must state its query heads"
             );
-            shards[shard].mass_heads.push_back(evictable ? layers[layer].n_readers * layers[layer].n_q_heads : 0);
+            model_shards[shard].mass_heads.push_back(evictable ? layers[layer].n_readers * layers[layer].n_q_heads : 0);
             if (shard == 0) {
                 layout.layers.push_back(
                     view_layout::layer{
@@ -143,7 +143,7 @@ executor::executor(
                     }
                 );
                 if (layout.page_size == 0 && !layer_recurrent) {
-                    layout.page_size = static_cast<std::size_t>(shards[0].lines.back().k.size(1));
+                    layout.page_size = static_cast<std::size_t>(model_shards[0].lines.back().k.size(1));
                 }
             }
             view_layout::layer& layer_layout = layout.layers[layer];
@@ -152,9 +152,9 @@ executor::executor(
                     layer_layout.is_recurrent == layer_recurrent &&
                     layer_layout.mirrors_held_pages == layers[layer].mirrors_held_pages &&
                     layer_layout.state_slots == count_slots(layers[layer]),
-                "executor: the model shards must agree on the kind of each KV layer"
+                "executor: the model model_shards must agree on the kind of each KV layer"
             );
-            layer_layout.mass_heads += shards[shard].mass_heads.back();
+            layer_layout.mass_heads += model_shards[shard].mass_heads.back();
             if (shard == 0 && draft_tokens > 0 && layers[layer].last_hidden_dim > 0) {
                 draft_layer = layer;
             }
@@ -165,7 +165,7 @@ executor::executor(
         !draft_layer || !layout.layers[*draft_layer].sliding_window,
         "executor: the draft head's KV layer must not be sliding"
     );
-    for (shard& s : shards) {
+    for (model_shard& s : model_shards) {
         s.stop_tokens = at::tensor(this->stop_ids, at::TensorOptions().dtype(at::kLong)).to(s.lines.front().k.device());
         const at::TensorOptions options = s.lines.front().k.options();
         const auto slots = static_cast<std::int64_t>(max_running_requests);
@@ -203,7 +203,7 @@ executor::executor(
         s.table.top_p = at::zeros({slots}, options.dtype(at::kFloat));
     }
     if (graph_pages) {
-        for (shard& s : shards) {
+        for (model_shard& s : model_shards) {
             c10::cuda::CUDAGuard device_guard(s.lines.front().k.device());
             s.graphs = std::make_unique<step_graphs>(
                 *s.model,
@@ -223,7 +223,7 @@ executor::executor(
 
 executor::~executor() {
     end_requests(request_error::loop_exited);
-    for (shard& s : shards) {
+    for (model_shard& s : model_shards) {
         s.graphs.reset();
     }
     // The memory pools of destroyed graphs stay reserved by the caching allocator until its cache is emptied.
@@ -249,7 +249,7 @@ std::size_t executor::find_token_bucket(std::size_t token_count) const {
 }
 
 const request_table& executor::get_table(std::size_t shard) const {
-    return shards[shard].table;
+    return model_shards[shard].table;
 }
 
 std::size_t executor::max_running_request_count() const noexcept {
@@ -726,39 +726,39 @@ task<executor::launch_result> executor::launch(const step& s) {
     if (s.entries.empty()) {
         co_return launch_result();
     }
-    launch_result launched(shards.size());
+    launch_result launched(model_shards.size());
     std::vector<external_task<void>> other_shards;
-    for (std::size_t shard = 1; shard < shards.size(); shard++) {
-        other_shards.push_back(run_on(*shards[shard].worker_loop, enqueue_on_shard(s, launched, shard)));
+    for (std::size_t shard = 1; shard < model_shards.size(); shard++) {
+        other_shards.push_back(run_on(*model_shards[shard].worker_loop, enqueue_on_shard(s, launched, shard)));
     }
     co_await enqueue_on_shard(s, launched, 0);
     for (external_task<void>& other : other_shards) {
         co_await std::move(other);
     }
-    for (std::size_t shard = 0; shard < shards.size(); shard++) {
-        at::Device device = shards[shard].lines.front().k.device();
+    for (std::size_t shard = 0; shard < model_shards.size(); shard++) {
+        at::Device device = model_shards[shard].lines.front().k.device();
         c10::cuda::CUDAGuard device_guard(device);
         launched.ends.emplace_back().record(
-            c10::cuda::getStreamFromExternal(shards[shard].compute_stream, device.index())
+            c10::cuda::getStreamFromExternal(model_shards[shard].compute_stream, device.index())
         );
-        launched.completions.push_back(await_stream(shards[shard].compute_stream));
+        launched.completions.push_back(await_stream(model_shards[shard].compute_stream));
     }
     co_return launched;
 }
 
 task<void> executor::enqueue_on_shard(const step& s, launch_result& launched, std::size_t shard) {
-    c10::cuda::CUDAGuard device_guard(shards[shard].lines.front().k.device());
+    c10::cuda::CUDAGuard device_guard(model_shards[shard].lines.front().k.device());
     s.enqueue(
-        *shards[shard].model,
-        shards[shard].lines,
-        shards[shard].mass_heads,
+        *model_shards[shard].model,
+        model_shards[shard].lines,
+        model_shards[shard].mass_heads,
         draft_layer,
-        shards[shard].stop_tokens,
-        shards[shard].compute_stream,
+        model_shards[shard].stop_tokens,
+        model_shards[shard].compute_stream,
         shard,
-        shards[shard].graphs.get(),
-        shards[shard].arrival_counters,
-        shards[shard].table,
+        model_shards[shard].graphs.get(),
+        model_shards[shard].arrival_counters,
+        model_shards[shard].table,
         launched
     );
     co_return;
@@ -766,18 +766,18 @@ task<void> executor::enqueue_on_shard(const step& s, launch_result& launched, st
 
 // Each shard on its own thread, as the eager forwards' collectives need every shard at once.
 void executor::capture_step_graphs() {
-    std::vector<std::exception_ptr> failures(shards.size());
+    std::vector<std::exception_ptr> failures(model_shards.size());
     std::vector<std::thread> threads;
-    for (std::size_t shard = 0; shard < shards.size(); shard++) {
+    for (std::size_t shard = 0; shard < model_shards.size(); shard++) {
         threads.emplace_back([this, shard, &failures] {
             try {
-                at::Device device = shards[shard].lines.front().k.device();
+                at::Device device = model_shards[shard].lines.front().k.device();
                 c10::cuda::CUDAGuard device_guard(device);
                 c10::cuda::CUDAStreamGuard stream_guard(
-                    c10::cuda::getStreamFromExternal(shards[shard].compute_stream, device.index())
+                    c10::cuda::getStreamFromExternal(model_shards[shard].compute_stream, device.index())
                 );
-                shards[shard].graphs->capture_startup();
-                C10_CUDA_CHECK(cudaStreamSynchronize(shards[shard].compute_stream));
+                model_shards[shard].graphs->capture_startup();
+                C10_CUDA_CHECK(cudaStreamSynchronize(model_shards[shard].compute_stream));
             } catch (...) {
                 failures[shard] = std::current_exception();
             }

@@ -344,7 +344,7 @@ class executor::step {
     ) const;
     // Joins the shards' page mass in launched, each shard's heads after the previous shards', once their copies
     // completed.
-    void join_mass(launch_result& launched, std::span<const shard> shards, const view_layout& layout) const;
+    void join_mass(launch_result& launched, std::span<const model_shard> model_shards, const view_layout& layout) const;
     // Per KV layer, the mass_sum the step gave each page of a view, the layer's mass_heads values per page, and their
     // weight_sum; empty for a layer that measures none.
     struct layer_step_mass {

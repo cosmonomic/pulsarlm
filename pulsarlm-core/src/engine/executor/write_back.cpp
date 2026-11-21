@@ -80,7 +80,7 @@ task<void> executor::join(const step& s, launch_result& launched) {
             throw std::runtime_error(std::string("write_back: ") + cudaGetErrorString(status));
         }
     }
-    s.join_mass(launched, shards, layout);
+    s.join_mass(launched, model_shards, layout);
 }
 
 executor::step_writes executor::apply_entries(
@@ -239,9 +239,9 @@ task<void> executor::write_pages_and_states(launch_result& launched, step_writes
     std::size_t n_layers = cache.layer_count();
     // The copies wait for this step only, its draft pass included, not for the steps launched after it, which write
     // none of the copied lines.
-    for (std::size_t shard = 0; shard < shards.size(); shard++) {
-        at::Device device = shards[shard].lines.front().k.device();
-        launched.ends[shard].block(c10::cuda::getStreamFromExternal(shards[shard].copy_stream, device.index()));
+    for (std::size_t shard = 0; shard < model_shards.size(); shard++) {
+        at::Device device = model_shards[shard].lines.front().k.device();
+        launched.ends[shard].block(c10::cuda::getStreamFromExternal(model_shards[shard].copy_stream, device.index()));
     }
     if (!writes.spawned_writers.empty()) {
         while (store_writes.size() >= max_store_writes) {
@@ -257,7 +257,7 @@ task<void> executor::write_pages_and_states(launch_result& launched, step_writes
                 writes.spawned_hashes,
                 writes.spawned_owners,
                 writes.spawned_lines,
-                collect_streams(&shard::copy_stream)
+                collect_streams(&model_shard::copy_stream)
             ),
             std::move(writes.spawned_writers)
         ));
@@ -273,7 +273,7 @@ task<void> executor::write_pages_and_states(launch_result& launched, step_writes
         writes.new_hashes,
         writes.new_owners,
         writes.new_lines,
-        collect_streams(&shard::copy_stream)
+        collect_streams(&model_shard::copy_stream)
     );
     if (!sync_result) {
         for (request_state* req : writes.page_writers) {
@@ -383,7 +383,7 @@ void executor::update_views(request_state& req) {
 }
 
 task<void> executor::synchronize_shards() {
-    for (const shard& s : shards) {
+    for (const model_shard& s : model_shards) {
         co_await synchronize(s.compute_stream);
     }
 }
