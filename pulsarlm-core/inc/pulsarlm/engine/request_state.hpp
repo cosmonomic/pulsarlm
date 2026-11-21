@@ -143,6 +143,9 @@ class request_state {
     // end its cycle at, taken out of the view by the prologue of the step after it so that its write-back can copy
     // the line while that step writes the state of a later page of the same parity; no_line otherwise.
     std::vector<std::array<std::uint32_t, 2>> detached_head_state_lines;
+    // Per KV layer, the lines of pages a prologue took out of a mirroring layer's view (compact_views), which an
+    // unfinished step may still read; the write-back takes them (take_released_lines).
+    std::vector<std::vector<std::uint32_t>> released_lines;
     // The tokens the latest prepared step drafts, which the next step verifies.
     std::size_t prepared_drafts = 0;
     // The tokens the latest step written back drafted; empty when it drafted none.
@@ -271,7 +274,8 @@ class request_state {
     std::size_t next_position() const noexcept;
     // The full pages of KV layer layer's view wholly before the window of a query at view index query.
     std::size_t passed_pages(std::size_t layer, std::size_t query) const noexcept;
-    // The state the request reached: per KV layer, its view's full pages within the window of the next token.
+    // The state the request reached: per KV layer, its view's full pages within the window of the next token; a
+    // mirroring layer's are the pages of every other layer with pages.
     state to_state() const;
     // Whether the prepared sample count and position bound are exact: every step prepared while a verify step was
     // unfinished, and every verify step, is written back.
@@ -357,6 +361,12 @@ class request_state {
     std::size_t pass_pages(std::size_t layer, std::size_t position);
     // Drops the passed pages of KV layer layer's view whose pages are complete and returns their lines.
     std::vector<std::uint32_t> drop_passed_pages(std::size_t layer);
+    // Passes the pages of each sliding layer at position (pass_pages), and takes the pages that left the held pages out
+    // of each mirroring layer's view, keeping their lines for take_released_lines. Returns, per KV layer, the pages
+    // taken out of its request table view.
+    std::vector<std::size_t> compact_views(std::size_t position);
+    // Takes the lines compact_views took out of the views and returns them, per KV layer.
+    std::vector<std::vector<std::uint32_t>> take_released_lines();
     // Removes every line of every KV layer, detached ones included, and returns them, per layer.
     std::vector<std::vector<std::uint32_t>> take_lines();
     // Takes recurrent KV layer layer's line holding the state at the end of head's page, which the store has, out of

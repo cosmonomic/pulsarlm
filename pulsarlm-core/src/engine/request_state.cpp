@@ -80,6 +80,7 @@ request_state::request_state(
   layout(layout),
   layers(layout.layers.size()),
   detached_head_state_lines(layout.layers.size(), {layer_view::no_line, layer_view::no_line}),
+  released_lines(layout.layers.size()),
   eviction(to_pages(r.eviction, layout.page_size)) {
     std::size_t resumed_page_count = 0;
     if (head) {
@@ -145,6 +146,9 @@ std::size_t request_state::next_position() const noexcept {
 
 std::size_t request_state::page_position(std::size_t layer, std::size_t page) const {
     const layer_view& view = layers[layer];
+    if (page >= view.pages.size() && layout.layers[layer].mirrors_held_pages) {
+        return (held_pages.size() + page - view.pages.size()) * layout.page_size;
+    }
     if (page >= view.pages.size()) {
         const std::size_t index = history_pages + page - view.pages.size();
         const std::size_t first = find_held_incomplete_pages().first;
@@ -214,7 +218,7 @@ std::size_t request_state::complete_pages() {
         }
     }
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
-        if (!layout.layers[layer].is_recurrent) {
+        if (!layout.layers[layer].is_recurrent && !layout.layers[layer].mirrors_held_pages) {
             layer_view& view = layers[layer];
             view.pages.insert(view.pages.end(), full_page_digests.begin(), full_page_digests.end());
             for (std::size_t i = 0; i < full_page_count; i++) {
@@ -222,8 +226,20 @@ std::size_t request_state::complete_pages() {
             }
         }
     }
-    history_pages += full_page_count;
     update_held();
+    for (std::size_t layer = 0; layer < layers.size(); layer++) {
+        if (!layout.layers[layer].mirrors_held_pages) {
+            continue;
+        }
+        layer_view& view = layers[layer];
+        for (std::size_t i = 0; i < full_page_count; i++) {
+            if (std::ranges::binary_search(held_pages, history_pages + i)) {
+                view.pages.push_back(full_page_digests[i]);
+                view.indices.push_back(history_pages + i);
+            }
+        }
+    }
+    history_pages += full_page_count;
     head = full_page_digests.back();
     tail.erase(tail.begin(), tail.begin() + full_page_count * layout.page_size);
     if (std::ranges::contains(layout.layers, true, &view_layout::layer::is_recurrent)) {
@@ -300,6 +316,9 @@ state request_state::to_state() const {
             }
             continue;
         }
+        if (layout.layers[layer].mirrors_held_pages) {
+            continue;
+        }
         const layer_view& view = layers[layer];
         for (std::size_t page = passed_pages(layer, view.pages.size() * layout.page_size); page < view.pages.size();
              page++) {
@@ -315,6 +334,22 @@ state request_state::to_state() const {
         }
         s.layers[layer].density_moments = view.density_moments;
         s.layers[layer].score_moments = view.score_moments;
+    }
+    std::vector<active_page> held_state_pages;
+    for (std::size_t layer = 0; layer < layers.size(); layer++) {
+        if (!layout.layers[layer].is_recurrent && !layout.layers[layer].mirrors_held_pages) {
+            for (const active_page& page : s.layers[layer].pages) {
+                held_state_pages.push_back(active_page{.hash = page.hash, .index = page.index});
+            }
+        }
+    }
+    std::ranges::sort(held_state_pages, {}, &active_page::index);
+    const auto [duplicates, end] = std::ranges::unique(held_state_pages, {}, &active_page::index);
+    held_state_pages.erase(duplicates, end);
+    for (std::size_t layer = 0; layer < layers.size(); layer++) {
+        if (layout.layers[layer].mirrors_held_pages) {
+            s.layers[layer].pages = held_state_pages;
+        }
     }
     return s;
 }
@@ -403,6 +438,13 @@ std::vector<std::size_t> request_state::missing_lines(std::span<const std::size_
     std::vector<std::size_t> counts;
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
         const std::vector<std::uint32_t>& lines = layers[layer].lines;
+        if (layout.layers[layer].mirrors_held_pages) {
+            const std::size_t first = find_held_incomplete_pages().first;
+            const std::size_t end = ceil_div(prepared_position_bound() + key_counts[layer], layout.page_size);
+            const std::size_t needed = layers[layer].pages.size() + (end > first ? end - first : 0);
+            counts.push_back(needed > lines.size() ? needed - lines.size() : 0);
+            continue;
+        }
         if (!layout.layers[layer].is_recurrent) {
             std::size_t needed = ceil_div(
                 next_index(layer) + unwritten_back_tokens + key_counts[layer],
@@ -749,7 +791,7 @@ void request_state::add_step_lines(
 }
 
 std::size_t request_state::pass_pages(std::size_t layer, std::size_t position) {
-    assert(layout.layers[layer].sliding_window && position >= history_position());
+    assert(layout.layers[layer].sliding_window && next_index(layer) + position >= history_position());
     layer_view& view = layers[layer];
     const std::size_t passed = passed_pages(layer, next_index(layer) + position - history_position());
     if (passed <= view.passed_count) {
@@ -758,6 +800,55 @@ std::size_t request_state::pass_pages(std::size_t layer, std::size_t position) {
     const std::size_t newly_passed = passed - std::exchange(view.passed_count, passed);
     update_held();
     return newly_passed;
+}
+
+// A mirroring layer's lines after its full pages hold the held pages after the full ones in order, from the first
+// (find_held_incomplete_pages): the ones the passes took out of the held pages lead them.
+std::vector<std::size_t> request_state::compact_views(std::size_t position) {
+    std::vector<std::size_t> dropped(layers.size(), 0);
+    const std::size_t first_before = find_held_incomplete_pages().first;
+    const std::size_t held_before = held_pages.size();
+    for (std::size_t layer = 0; layer < layers.size(); layer++) {
+        if (layout.layers[layer].sliding_window) {
+            dropped[layer] = pass_pages(layer, position);
+        }
+    }
+    const std::size_t first_after = find_held_incomplete_pages().first;
+    if (held_pages.size() == held_before && first_after == first_before) {
+        return dropped;
+    }
+    for (std::size_t layer = 0; layer < layers.size(); layer++) {
+        if (!layout.layers[layer].mirrors_held_pages) {
+            continue;
+        }
+        layer_view& view = layers[layer];
+        std::vector<std::size_t> unheld;
+        for (std::size_t page = 0; page < view.pages.size(); page++) {
+            if (!std::ranges::binary_search(held_pages, view.indices[page])) {
+                unheld.push_back(page);
+            }
+        }
+        std::vector<std::uint32_t> lines = view.remove(unheld);
+        const std::size_t incomplete = std::min(first_after - first_before, view.lines.size() - view.pages.size());
+        const auto first_incomplete = static_cast<std::ptrdiff_t>(view.pages.size());
+        lines.insert(
+            lines.end(),
+            view.lines.begin() + first_incomplete,
+            view.lines.begin() + first_incomplete + incomplete
+        );
+        view.lines.erase(view.lines.begin() + first_incomplete, view.lines.begin() + first_incomplete + incomplete);
+        view.mass_sum.resize(view.lines.size() * view.mass_heads);
+        view.weight_sum.resize(view.lines.size());
+        dropped[layer] = unheld.size() + incomplete;
+        released_lines[layer].insert(released_lines[layer].end(), lines.begin(), lines.end());
+    }
+    return dropped;
+}
+
+std::vector<std::vector<std::uint32_t>> request_state::take_released_lines() {
+    std::vector<std::vector<std::uint32_t>> taken(layers.size());
+    std::swap(taken, released_lines);
+    return taken;
 }
 
 std::vector<std::uint32_t> request_state::drop_passed_pages(std::size_t layer) {
@@ -787,8 +878,10 @@ std::vector<std::vector<std::uint32_t>> request_state::take_lines() {
         std::erase(lines, layer_view::no_line);
     }
     std::vector<std::vector<std::uint32_t>> detached = take_detached_lines();
+    std::vector<std::vector<std::uint32_t>> released = take_released_lines();
     for (std::size_t layer = 0; layer < layers.size(); layer++) {
         taken_lines[layer].insert(taken_lines[layer].end(), detached[layer].begin(), detached[layer].end());
+        taken_lines[layer].insert(taken_lines[layer].end(), released[layer].begin(), released[layer].end());
     }
     return taken_lines;
 }

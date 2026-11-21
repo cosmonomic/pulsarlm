@@ -353,6 +353,79 @@ struct memory_store final : pulsarlm::page_store {
 // layer, every query token attends every view page holding a key, with mass 1 in its one query head when the page holds
 // a key important accepts for that layer, else 0. While the first full-attention layer has evicted nothing, every key a
 // sliding layer reads must equal that layer's key at the same distance from the query.
+constexpr std::int64_t draft_hidden_dim = 4;
+
+// A draft head over its KV layer, which mirrors the held pages: writes each row's token as its K and its RoPE position
+// as its V, requires each row's position to be the one its view index takes under the layer's page positions, and
+// drafts the sum of the K of every key the row attends, mod vocab.
+class sum_draft_head final : public pulsarlm::draft_head {
+  public:
+    std::size_t layer = 0;
+
+    std::int64_t hidden_dim() const override {
+        return draft_hidden_dim;
+    }
+
+    pulsarlm::model::output draft(
+        const pulsarlm::model::batch& b,
+        const at::Tensor&,
+        std::span<const pulsarlm::kv> lines,
+        pulsarlm::graph_segments&
+    ) override {
+        const auto layer_row = static_cast<std::int64_t>(layer);
+        const std::int64_t n_rows = b.tokens.size(0);
+        at::Tensor tokens = b.tokens.cpu();
+        at::Tensor positions = b.pos.cpu();
+        at::Tensor tables = b.page_tables[layer_row].cpu();
+        at::Tensor page_positions = b.page_positions[layer_row].cpu();
+        at::Tensor key_counts = b.key_counts[layer_row].cpu();
+        at::Tensor query_starts = b.cu_seqlens_q.cpu();
+        auto token = tokens.accessor<std::int64_t, 1>();
+        auto position = positions.accessor<std::int64_t, 1>();
+        auto table = tables.accessor<std::int32_t, 2>();
+        auto page_position = page_positions.accessor<std::int32_t, 2>();
+        auto key_count = key_counts.accessor<std::int32_t, 1>();
+        auto query_start = query_starts.accessor<std::int32_t, 1>();
+        const pulsarlm::kv& layer_lines = lines[layer];
+        at::Tensor keys = layer_lines.k.select(2, 0).select(2, 0).cpu();
+        at::Tensor values = layer_lines.v.select(2, 0).select(2, 0).cpu();
+        auto key = keys.accessor<float, 2>();
+        auto value = values.accessor<float, 2>();
+        std::vector<std::size_t> view_indices(static_cast<std::size_t>(n_rows));
+        std::vector<std::size_t> sequences(static_cast<std::size_t>(n_rows));
+        for (std::int64_t s = 0; s + 1 < query_starts.size(0); s++) {
+            for (std::int32_t row = query_start[s]; row < query_start[s + 1]; row++) {
+                const auto index = static_cast<std::size_t>(key_count[s] - (query_start[s + 1] - row));
+                REQUIRE(
+                    position[row] == page_position[s][index / page_size] + static_cast<std::int64_t>(index % page_size)
+                );
+                const std::int32_t line = table[s][index / page_size];
+                key[line][index % page_size] = static_cast<float>(token[row]);
+                value[line][index % page_size] = static_cast<float>(position[row]);
+                view_indices[static_cast<std::size_t>(row)] = index;
+                sequences[static_cast<std::size_t>(row)] = static_cast<std::size_t>(s);
+            }
+        }
+        layer_lines.k.select(2, 0).select(2, 0).copy_(keys);
+        layer_lines.v.select(2, 0).select(2, 0).copy_(values);
+        at::Tensor logit_rows = b.logit_tokens.cpu();
+        at::Tensor logits = at::zeros({logit_rows.size(0), vocab});
+        auto logit = logits.accessor<float, 2>();
+        for (std::int64_t r = 0; r < logit_rows.size(0); r++) {
+            const auto row = static_cast<std::size_t>(logit_rows[r].item<std::int64_t>());
+            std::int64_t sum = 0;
+            for (std::size_t j = 0; j <= view_indices[row]; j++) {
+                sum += static_cast<std::int64_t>(key[table[sequences[row]][j / page_size]][j % page_size]);
+            }
+            logit[r][sum % vocab] = 1.0f;
+        }
+        return pulsarlm::model::output{
+            .logits = logits.to(b.tokens.device()),
+            .hidden = at::zeros({n_rows, draft_hidden_dim}, b.tokens.options().dtype(at::kFloat)),
+        };
+    }
+};
+
 class sum_model final : public pulsarlm::model {
   public:
     std::vector<pulsarlm::kv_layer> layers = two_full_layers;
@@ -378,7 +451,6 @@ class sum_model final : public pulsarlm::model {
         if (on_forward) {
             on_forward();
         }
-        REQUIRE(b.per_query_state_request_count == 0);
         const std::int64_t requests = b.cu_seqlens_q.size(0) - 1;
         const std::int64_t decoding = b.single_query_request_count;
         forwarded_runs.emplace_back(decoding, requests - decoding);
@@ -400,10 +472,41 @@ class sum_model final : public pulsarlm::model {
             );
             decode_page_positions.push_back(b.page_positions.narrow(1, 0, decoding).cpu());
         }
-        return output{.logits = predict(b, lines)};
+        at::Tensor logits = predict(b, lines);
+        if (!has_draft_head()) {
+            return output{.logits = logits};
+        }
+        const std::size_t draft_layer = find_draft_layer();
+        at::Tensor hidden = at::zeros(
+            {padded.tokens.size(0), draft_hidden_dim},
+            padded.tokens.options().dtype(at::kFloat)
+        );
+        pulsarlm::keep_last_hidden(b, hidden.narrow(0, 0, b.tokens.size(0)), lines[draft_layer], draft_layer);
+        return output{.logits = logits, .hidden = hidden};
+    }
+
+    pulsarlm::draft_head* drafter() override {
+        if (!has_draft_head()) {
+            return nullptr;
+        }
+        head.layer = find_draft_layer();
+        return &head;
+    }
+
+    bool has_draft_head() const {
+        return std::ranges::any_of(layers, [](const pulsarlm::kv_layer& layer) { return layer.last_hidden_dim > 0; });
+    }
+
+    std::size_t find_draft_layer() const {
+        return static_cast<std::size_t>(
+            std::ranges::find_if(layers, [](const pulsarlm::kv_layer& layer) { return layer.last_hidden_dim > 0; }) -
+            layers.begin()
+        );
     }
 
   private:
+    sum_draft_head head;
+
     // padded with its tokens and positions those of its query tokens.
     static batch query_tokens_of(const batch& padded) {
         batch b = padded;
@@ -427,7 +530,8 @@ class sum_model final : public pulsarlm::model {
         std::size_t n_seqs = static_cast<std::size_t>(all_tables.size(1));
 
         std::size_t view = 0;
-        while (view < layers.size() && (layers[view].state || layers[view].sliding_window)) {
+        while (view < layers.size() &&
+               (layers[view].state || layers[view].sliding_window || layers[view].mirrors_held_pages)) {
             view++;
         }
         std::optional<std::vector<double>> state_sums;
@@ -541,19 +645,28 @@ class sum_model final : public pulsarlm::model {
                 at::Tensor page_weight_sum = at::zeros(g.page_weight_sum[layer].sizes());
                 auto mass_sum = page_mass_sum.accessor<float, 2>();
                 auto weight_sum = page_weight_sum.accessor<float, 1>();
+                std::size_t view = 0;
                 for (std::size_t s = 0; s < n_seqs; s++) {
-                    float sequence_weight = 0.0f;
-                    for (auto row = static_cast<std::size_t>(query_start[s]);
-                         row < static_cast<std::size_t>(query_start[s + 1]);
-                         row++) {
-                        sequence_weight += query_weight[row];
-                    }
-                    for (std::size_t j = 0; j < static_cast<std::size_t>(key_count[layer][s]); j++) {
-                        std::size_t row = first_page[layer][s] + j / page_size;
-                        auto token = static_cast<std::int64_t>(layer_key[layer_table[s][j / page_size]][j % page_size]);
-                        weight_sum[row] = sequence_weight;
-                        if (is_important(layer, token)) {
-                            mass_sum[row][0] = sequence_weight;
+                    const auto first_row = static_cast<std::size_t>(query_start[s]);
+                    const auto end_row = static_cast<std::size_t>(query_start[s + 1]);
+                    const bool verifies = static_cast<std::int64_t>(s) >= g.single_query_request_count &&
+                        static_cast<std::int64_t>(s) < g.single_query_request_count + g.per_query_state_request_count;
+                    for (std::size_t own = 0; own < (verifies ? end_row - first_row : 1); own++, view++) {
+                        float view_weight = 0.0f;
+                        for (std::size_t row = first_row; row < end_row; row++) {
+                            if (!verifies || row == first_row + own) {
+                                view_weight += query_weight[row];
+                            }
+                        }
+                        for (std::size_t j = 0; j < static_cast<std::size_t>(key_count[layer][s]); j++) {
+                            std::size_t row = first_page[layer][view] + j / page_size;
+                            auto token = static_cast<std::int64_t>(
+                                layer_key[layer_table[s][j / page_size]][j % page_size]
+                            );
+                            weight_sum[row] = view_weight;
+                            if (is_important(layer, token)) {
+                                mass_sum[row][0] = view_weight;
+                            }
                         }
                     }
                 }
@@ -580,15 +693,24 @@ class sum_model final : public pulsarlm::model {
         auto table = rows.accessor<std::int32_t, 2>();
         auto state = states.accessor<float, 2>();
         const std::int64_t last_slot = g.state_slots - 1;
+        const std::int64_t step_requests = g.single_query_request_count + g.per_query_state_request_count;
+        at::Tensor kept_state_counts = step_requests > 0 ? g.kept_state_counts.cpu() : at::zeros({1}, at::kInt);
+        auto kept_states = kept_state_counts.accessor<std::int32_t, 1>();
         std::vector<double> sums;
         for (std::int64_t s = 0; s < rows.size(0); s++) {
             double sum = state[table[s][last_slot - std::min<std::int64_t>(rejected[s], last_slot)]][0];
             const std::int64_t first = history_position[s];
             const std::int64_t end = first + query_start[s + 1] - query_start[s];
             const std::int64_t newest_page_end = end / g.page_size * g.page_size;
+            const std::int64_t count = query_start[s + 1] - query_start[s];
+            const std::int64_t kept = s < step_requests ? kept_states[s] : 1;
             for (std::int32_t row = query_start[s]; row < query_start[s + 1]; row++) {
                 sum += static_cast<double>(token[row]);
                 sums.push_back(sum);
+                const std::int64_t t = row - query_start[s];
+                if (t >= count - kept && t < count - 1) {
+                    state[table[s][g.state_slots - count + t]][0] = static_cast<float>(sum);
+                }
                 const std::int64_t position = first + row - query_start[s];
                 if (position + 1 == newest_page_end) {
                     const std::int64_t page = position / g.page_size;
@@ -622,6 +744,7 @@ std::vector<pulsarlm::page_shape> page_shapes(const std::vector<pulsarlm::kv_lay
                 .dtype = at::kFloat,
                 .values_only = layer.values_only || layer.state.has_value(),
                 .state_sizes = layer.state ? layer.state->sizes : std::vector<std::int64_t>(),
+                .last_hidden_dim = layer.last_hidden_dim,
             }
         );
     }
@@ -3507,6 +3630,112 @@ TEST_CASE("pages a cycle end evicted and a sliding window later passes leave the
     REQUIRE(hashes_of(*first_sequential.end_state, 0).size() < (first.size() + 15) / page_size);
     require_same_results(first_overlapped, first_sequential);
     require_same_results(second_overlapped, second_sequential);
+}
+
+const pulsarlm::kv_layer mirroring_draft_layer{
+    .n_kv_heads = 1,
+    .head_dim = 2,
+    .last_hidden_dim = static_cast<std::size_t>(draft_hidden_dim),
+    .mirrors_held_pages = true,
+};
+
+const std::vector<pulsarlm::kv_layer> full_long_sliding_and_draft{
+    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .n_q_heads = 1},
+    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .sliding_window = 9},
+    mirroring_draft_layer,
+};
+
+const std::vector<pulsarlm::kv_layer> recurrent_sliding_and_draft{
+    pulsarlm::kv_layer{
+        .n_kv_heads = 1,
+        .head_dim = 2,
+        .state = pulsarlm::recurrent_state{.sizes = {1}, .dtype = at::kFloat},
+    },
+    pulsarlm::kv_layer{.n_kv_heads = 1, .head_dim = 2, .sliding_window = 5},
+    mirroring_draft_layer,
+};
+
+// overlapped's tokens, and the tail and page digests of each of its cycle-end states and its end state, are
+// sequential's.
+void require_same_pages(const request_results& overlapped, const request_results& sequential) {
+    REQUIRE(overlapped.tokens == sequential.tokens);
+    REQUIRE(overlapped.cycle_ends.size() == sequential.cycle_ends.size());
+    std::vector<state_pointer> overlapped_states;
+    std::vector<state_pointer> sequential_states;
+    for (std::size_t c = 0; c < sequential.cycle_ends.size(); c++) {
+        overlapped_states.push_back(overlapped.cycle_ends[c].state);
+        sequential_states.push_back(sequential.cycle_ends[c].state);
+    }
+    overlapped_states.push_back(overlapped.end_state);
+    sequential_states.push_back(sequential.end_state);
+    for (std::size_t c = 0; c < sequential_states.size(); c++) {
+        INFO("state " << c);
+        REQUIRE(overlapped_states[c]->tail == sequential_states[c]->tail);
+        REQUIRE(overlapped_states[c]->layers.size() == sequential_states[c]->layers.size());
+        for (std::size_t layer = 0; layer < sequential_states[c]->layers.size(); layer++) {
+            INFO("KV layer " << layer);
+            REQUIRE((hashes_of(*overlapped_states[c], layer) == hashes_of(*sequential_states[c], layer)));
+        }
+    }
+}
+
+// The drafts results' verify steps verified.
+std::size_t count_drafted(const request_results& results) {
+    std::size_t drafted = 0;
+    for (const pulsarlm::decode_statistics& decode : results.decodes) {
+        drafted += decode.drafted_token_count;
+    }
+    return drafted;
+}
+
+// The draft head's KV layer mirrors the held pages. A capacity of 12 tokens keeps one full page at a cycle's end, so
+// the end evicts the page before the newest, which the sliding layer's window of 9 tokens still holds; when the window
+// passes that page over an unfinished step, the page leaves the held pages from the middle of the mirror's view, which
+// drops it, moves its key count and positions down and keeps its line until that step's write-back. The draft head
+// requires each row's position under the mirror's page positions, and drafts by the sum of the keys it attends. Which
+// steps draft depends on the bounds a step is prepared with, so the drafts of the two runs may differ, but not their
+// tokens or pages.
+TEST_CASE("a mirroring draft layer drops the pages that leave the held pages over overlapping steps") {
+    const std::size_t prefill_tokens_per_step = 64;
+    token_list first(20);
+    std::iota(first.begin(), first.end(), 1);
+    token_list second(10);
+    std::iota(second.begin(), second.end(), 40);
+    const pulsarlm::eviction_policy policy{
+        .n_sink = 0,
+        .n_working = 1,
+        .cycle_tokens = 8,
+        .max_context_capacity = 12,
+    };
+    for (const auto& layers : {full_long_sliding_and_draft, recurrent_sliding_and_draft}) {
+        INFO((layers[0].state ? "recurrent" : "full-attention") << " layer beside the sliding one");
+        std::size_t overlapped_steps = 0;
+        std::size_t sequential_overlapped_steps = 0;
+        const auto [first_overlapped, second_overlapped] = serve_two_stepped(
+            layers,
+            request{.tokens = first, .max_tokens = 16, .eviction = policy},
+            request{.tokens = second, .max_tokens = 20, .eviction = policy},
+            prefill_tokens_per_step,
+            true,
+            overlapped_steps
+        );
+        const auto [first_sequential, second_sequential] = serve_two_stepped(
+            layers,
+            request{.tokens = first, .max_tokens = 16, .eviction = policy},
+            request{.tokens = second, .max_tokens = 20, .eviction = policy},
+            prefill_tokens_per_step,
+            false,
+            sequential_overlapped_steps
+        );
+
+        REQUIRE(overlapped_steps > 5);
+        REQUIRE(sequential_overlapped_steps == 0);
+        REQUIRE(first_sequential.tokens.size() == 16);
+        REQUIRE(second_sequential.tokens.size() == 20);
+        require_same_pages(first_overlapped, first_sequential);
+        require_same_pages(second_overlapped, second_sequential);
+        REQUIRE(count_drafted(first_overlapped) > 0);
+    }
 }
 
 }  // namespace

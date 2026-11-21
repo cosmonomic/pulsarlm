@@ -165,11 +165,6 @@ executor::executor(
         !draft_layer || !layout.layers[*draft_layer].sliding_window,
         "executor: the draft head's KV layer must not be sliding"
     );
-    const bool slides = std::ranges::any_of(layout.layers, [](const view_layout::layer& layer) {
-        return layer.sliding_window.has_value();
-    });
-    const bool mirrors = std::ranges::any_of(layout.layers, &view_layout::layer::mirrors_held_pages);
-    require(!slides || !mirrors, "executor: a model with a sliding layer must not have a layer mirroring held pages");
     for (shard& s : shards) {
         s.stop_tokens = at::tensor(this->stop_ids, at::TensorOptions().dtype(at::kLong)).to(s.lines.front().k.device());
         const at::TensorOptions options = s.lines.front().k.options();
@@ -295,19 +290,20 @@ std::vector<std::size_t> executor::start_line_counts(const request_state& req) c
     return counts;
 }
 
-// A query after the prepared steps is at the lower bound or later.
+// A query after the prepared steps is at the lower bound or later. The draft head's prior hidden row reads the line
+// of the key before that, which passing at the position before keeps held.
 void executor::compact_sliding_views(request_id_type id) {
     request_state& req = get_state(id);
     const std::size_t held_before = req.count_held_pages();
+    const std::size_t lower_bound = req.prepared_position_lower_bound();
+    const std::vector<std::size_t> dropped = req.compact_views(
+        draft_layer && lower_bound > 0 ? lower_bound - 1 : lower_bound
+    );
     for (std::size_t layer = 0; layer < layout.layers.size(); layer++) {
-        if (!layout.layers[layer].sliding_window) {
-            continue;
-        }
-        const std::size_t passed = req.pass_pages(layer, req.prepared_position_lower_bound());
-        if (passed > 0) {
+        if (dropped[layer] > 0) {
             key_count_shifts.emplace_back(
                 static_cast<std::int64_t>(get_slot(id) * layout.layers.size() + layer),
-                -static_cast<std::int32_t>(passed * layout.page_size)
+                -static_cast<std::int32_t>(dropped[layer] * layout.page_size)
             );
             mark_stale_layer_table(id, layer, 0);
         }

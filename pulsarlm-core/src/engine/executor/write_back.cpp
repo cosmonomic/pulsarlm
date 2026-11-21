@@ -303,8 +303,10 @@ void executor::refresh_views(const step& s, const step_writes& writes) {
     for (const step_entry& e : s.entries) {
         request_state& req = get_state(e.request_id);
         const std::vector<std::vector<std::uint32_t>> detached = req.take_detached_lines();
+        const std::vector<std::vector<std::uint32_t>> released = req.take_released_lines();
         for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
             cache.release(layer, detached[layer]);
+            cache.release(layer, released[layer]);
         }
         for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
             if (layout.layers[layer].sliding_window) {

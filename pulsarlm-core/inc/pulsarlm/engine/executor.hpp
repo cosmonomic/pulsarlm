@@ -154,11 +154,12 @@ class executor {
     // Moves stale_requests into s: each request's request_table entries from its request state, which s's enqueue
     // sets.
     void move_stale_requests(step& s);
-    // Marks the pages each sliding layer of id's request has passed at its lower bound
-    // (request_state::prepared_position_lower_bound) as passed, takes them out of that layer's page table from column 0
-    // (mark_stale_layer_table), and queues the shift of its key counts (key_count_shifts). When the passed pages leave
-    // every layer's view, so that the held pages shrink, it also marks every layer's page table stale from column 0
-    // for their RoPE positions and queues the shift of its RoPE position (rope_position_shifts).
+    // Compacts the views of id's request (request_state::compact_views) at its lower bound
+    // (request_state::prepared_position_lower_bound), or at the position before it in an executor whose steps draft:
+    // takes the pages each sliding layer passed, and those each mirroring layer no longer mirrors, out of that layer's
+    // page table from column 0 (mark_stale_layer_table), and queues the shift of its key counts (key_count_shifts).
+    // When the held pages shrink, it also marks every layer's page table stale from column 0 for their RoPE positions
+    // and queues the shift of its RoPE position (rope_position_shifts).
     void compact_sliding_views(request_id_type id);
     // Moves key_count_shifts and rope_position_shifts into s, whose enqueue applies them.
     void move_table_shifts(step& s);
@@ -250,13 +251,12 @@ class executor {
     // models[s] runs on cache shard s with streams[s], for s above 0 on worker_loops[s - 1], and its write-backs'
     // copies to the store on copy_streams[s], which the caller synchronizes before freeing what the copies read; the
     // cache holds one layer per entry of each model's kv_layers(), and the shards agree on which layers are recurrent
-    // or sliding, the draft head's KV layer is not sliding, and a model with a sliding layer has no layer mirroring
-    // held pages. store is the cache's. root is the engine's root digest (make_root_digest). A request's view
-    // takes at most view_page_capacity pages, and one that would take more ends with context_exceeded. With
-    // graph_pages, a step_graphs graph over tables graph_pages wide replays a step of decoding entries alone that all
-    // sample and draft nothing (a decode step), and a step of verifying entries alone that all draft (a verify step).
-    // Any other step pads its query tokens to their bucket (token_buckets), with graphs or without, and with
-    // graph_pages replays the bucket's segment graphs when the model allows their capture
+    // or sliding, and the draft head's KV layer is not sliding. store is the cache's. root is the engine's root digest
+    // (make_root_digest). A request's view takes at most view_page_capacity pages, and one that would take more ends
+    // with context_exceeded. With graph_pages, a step_graphs graph over tables graph_pages wide replays a step of
+    // decoding entries alone that all sample and draft nothing (a decode step), and a step of verifying entries alone
+    // that all draft (a verify step). Any other step pads its query tokens to their bucket (token_buckets), with graphs
+    // or without, and with graph_pages replays the bucket's segment graphs when the model allows their capture
     // (model::allows_segment_capture). A step drafts draft_tokens tokens per request with the shards' draft heads,
     // which they have when draft_tokens is above 0, and the cache's recurrent layers are laid out for them
     // (recurrent_state). At most max_running_requests requests hold a record at once (start), and a step takes at most
