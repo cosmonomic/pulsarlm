@@ -1,5 +1,6 @@
 #include "pulsarlm/ops/cuda/dependent_launch.cuh"
 #include "pulsarlm/ops/cuda/device.hpp"
+#include "pulsarlm/ops/cuda/device_math.cuh"
 #include "pulsarlm/ops/gating.hpp"
 #include "pulsarlm/ops/small_batch_linear.hpp"
 
@@ -22,17 +23,6 @@ constexpr int rows = 4;
 }  // namespace
 
 namespace kernel {
-
-template <typename scalar_t> __device__ __forceinline__ float rounded(float value) {
-    return static_cast<float>(static_cast<scalar_t>(value));
-}
-
-__device__ __forceinline__ float warp_sum(float value) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        value += __shfl_xor_sync(0xffffffffu, value, offset);
-    }
-    return value;
-}
 
 // Adds to sums[t] the dot product of 8 consecutive values of row with those of token t's row of x.
 template <typename scalar_t, int tokens>

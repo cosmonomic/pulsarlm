@@ -1,5 +1,6 @@
 #include "pulsarlm/ops/cuda/dependent_launch.cuh"
 #include "pulsarlm/ops/cuda/device.hpp"
+#include "pulsarlm/ops/cuda/device_math.cuh"
 #include "pulsarlm/ops/hyper_connection.hpp"
 #include "pulsarlm/ops/normalization.hpp"
 
@@ -21,14 +22,6 @@ constexpr int cta_threads = 256;
 }  // namespace
 
 namespace kernel {
-
-template <typename scalar_t> __device__ __forceinline__ float rounded(float value) {
-    return static_cast<float>(static_cast<scalar_t>(value));
-}
-
-__device__ __forceinline__ float sigmoid(float value) {
-    return 1.0f / (1.0f + expf(-value));
-}
 
 // One CTA per (token, stream): the stream's RMSNorm over hidden in fp32, times weight, rounded once.
 template <typename scalar_t>
@@ -141,13 +134,6 @@ constexpr int linear_rows = 2;
 }  // namespace
 
 namespace kernel {
-
-__device__ __forceinline__ float warp_sum(float value) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        value += __shfl_xor_sync(0xffffffffu, value, offset);
-    }
-    return value;
-}
 
 // Adds to sums[t] the dot products of 8 consecutive values of row with those of each token's staged row.
 template <typename scalar_t, int tokens>

@@ -1,6 +1,7 @@
 #include "pulsarlm/ops/cuda/arrival_counters.cuh"
 #include "pulsarlm/ops/cuda/dependent_launch.cuh"
 #include "pulsarlm/ops/cuda/device.hpp"
+#include "pulsarlm/ops/cuda/device_math.cuh"
 #include "pulsarlm/ops/cuda/mma.cuh"
 #include "pulsarlm/ops/routed_experts.hpp"
 
@@ -39,10 +40,6 @@ constexpr int64_t split_target_per_sm = 2;
 }  // namespace
 
 namespace kernel {
-
-template <typename scalar_t> __device__ __forceinline__ float rounded(float value) {
-    return static_cast<float>(static_cast<scalar_t>(value));
-}
 
 // at::silu and at::gelu(x, "tanh") in fp32.
 __device__ __forceinline__ float activated(float x, expert_activation activation) {

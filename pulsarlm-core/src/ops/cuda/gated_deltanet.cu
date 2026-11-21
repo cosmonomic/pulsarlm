@@ -1,6 +1,7 @@
 #include "pulsarlm/ops/cuda/arrival_counters.cuh"
 #include "pulsarlm/ops/cuda/dependent_launch.cuh"
 #include "pulsarlm/ops/cuda/device.hpp"
+#include "pulsarlm/ops/cuda/device_math.cuh"
 #include "pulsarlm/ops/gated_deltanet.hpp"
 
 #include <ATen/ATen.h>
@@ -96,16 +97,8 @@ struct state_lines {
     }
 };
 
-template <typename scalar_t> __device__ __forceinline__ float rounded(float value) {
-    return static_cast<float>(static_cast<scalar_t>(value));
-}
-
 __device__ __forceinline__ float silu(float value) {
     return value / (1.0f + expf(-value));
-}
-
-__device__ __forceinline__ float sigmoid(float value) {
-    return 1.0f / (1.0f + expf(-value));
 }
 
 // Sums value over each aligned group of lanes lanes of the warp, lanes a power of two.

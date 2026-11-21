@@ -1,5 +1,6 @@
 #include "pulsarlm/ops/cuda/dependent_launch.cuh"
 #include "pulsarlm/ops/cuda/device.hpp"
+#include "pulsarlm/ops/cuda/device_math.cuh"
 #include "pulsarlm/ops/gating.hpp"
 
 #include <ATen/ATen.h>
@@ -14,10 +15,6 @@ constexpr int cta_threads = 256;
 }  // namespace
 
 namespace kernel {
-
-template <typename scalar_t> __device__ __forceinline__ float rounded(float value) {
-    return static_cast<float>(static_cast<scalar_t>(value));
-}
 
 template <typename scalar_t> __device__ __forceinline__ float rounded_sigmoid(scalar_t logit) {
     return rounded<scalar_t>(1.0f / (1.0f + expf(-static_cast<float>(logit))));
