@@ -1583,7 +1583,9 @@ TEST_CASE("a request whose loop exits while its start reads the stored state end
 }
 
 // The second request finds one free line for the 2 pages of its prefill step and ends with oom at that step's prologue.
-TEST_CASE("a request that finds too few free lines ends with oom without waiting") {
+// The second request's prefill needs two lines while the first holds two of the three and is in every step, so the
+// second sits out each step, having computed nothing, until the first ends.
+TEST_CASE("a request that finds too few free lines waits for the lines of a request that ends") {
     fixture f(3);
     token_list first{1, 2, 3, 4, 5};
     token_list second{6, 7, 8, 9, 10};
@@ -1593,14 +1595,16 @@ TEST_CASE("a request that finds too few free lines ends with oom without waiting
     );
 
     REQUIRE(results[0].tokens == continuation(first, 3));
-    REQUIRE(results[1].tokens.empty());
-    REQUIRE(ended_error(results[1]) == request_error::oom);
-    REQUIRE(f.model.forward_count == 3);
+    REQUIRE(results[1].tokens == continuation(second, 3));
+    ended_state(results[0]);
+    ended_state(results[1]);
+    REQUIRE(results[0].statistics.preemption_count == 0);
+    REQUIRE(results[1].statistics.preemption_count == 0);
     std::vector<lease_id_type> releases = f.store->releases;
     std::ranges::sort(releases);
     REQUIRE(releases == std::vector<lease_id_type>{100, 101});
+    REQUIRE(f.exec.kv_cache_bytes() == 0);
 }
-
 TEST_CASE("a request needing more lines than the cache has ends with oom") {
     fixture f(2);
     std::vector<request_results> results = serve_all(f.sched, {request{.tokens = token_list(12, 1), .max_tokens = 1}});
@@ -1624,20 +1628,141 @@ TEST_CASE("a request that outgrows the cache alone ends with oom") {
 
 // Each request takes a line at the step that first writes into a page. The second request finds none for its step
 // forwarding position 8 and ends with oom after the 5 tokens of the steps before, while the first produces all of its.
-TEST_CASE("a running request whose step finds too few free lines ends with oom after the tokens before it") {
-    fixture f(5);
+// Serves requests at once on a fixture of n_lines lines of layers whose model counts tokens divisible by 3 important.
+std::vector<request_results>
+serve_in_pool(const std::vector<pulsarlm::kv_layer>& layers, std::size_t n_lines, std::vector<request> requests) {
+    fixture f(n_lines, 64, {}, {}, layers);
+    f.model.is_important = [](std::size_t, std::int64_t token) { return token % 3 == 0; };
+    std::vector<request_results> results = serve_all_at_once(f, std::move(requests));
+    REQUIRE(f.exec.kv_cache_bytes() == 0);
+    REQUIRE(f.store->releases.size() == f.store->leases.size());
+    return results;
+}
+
+// small's tokens, and the tail and page digests of each of its cycle-end states and its end state, are large's.
+void require_same_states(const request_results& small, const request_results& large) {
+    REQUIRE(small.tokens == large.tokens);
+    REQUIRE(small.cycle_ends.size() == large.cycle_ends.size());
+    std::vector<state_pointer> small_states;
+    std::vector<state_pointer> large_states;
+    for (std::size_t c = 0; c < large.cycle_ends.size(); c++) {
+        small_states.push_back(small.cycle_ends[c].state);
+        large_states.push_back(large.cycle_ends[c].state);
+    }
+    small_states.push_back(small.end_state);
+    large_states.push_back(large.end_state);
+    for (std::size_t c = 0; c < large_states.size(); c++) {
+        INFO("state " << c);
+        REQUIRE(small_states[c]->tail == large_states[c]->tail);
+        REQUIRE(small_states[c]->layers.size() == large_states[c]->layers.size());
+        for (std::size_t layer = 0; layer < large_states[c]->layers.size(); layer++) {
+            INFO("KV layer " << layer);
+            REQUIRE((hashes_of(*small_states[c], layer) == hashes_of(*large_states[c], layer)));
+        }
+    }
+}
+
+// Each request ends at 4 pages and the pool holds 5 lines. The second, the later loaded, gives its lines at position 8
+// to a step of the first that finds too few, and resumes from its start, since its first cycle ends at position 12.
+TEST_CASE("requests that outgrow the pool together take turns and reach the tokens and states of a large pool") {
     token_list first{1, 2, 3, 4};
     token_list second{5, 6, 7, 8};
-    std::vector<request_results> results = serve_all_at_once(
-        f,
-        {request{.tokens = first, .max_tokens = 10, .eviction = {.cycle_tokens = 4}},
-         request{.tokens = second, .max_tokens = 10, .eviction = {.cycle_tokens = 4}}}
-    );
+    auto make_requests = [&] {
+        return std::vector<request>{
+            request{.tokens = first, .max_tokens = 10, .eviction = {.cycle_tokens = 12}},
+            request{.tokens = second, .max_tokens = 10, .eviction = {.cycle_tokens = 12}},
+        };
+    };
+    const std::vector<request_results> small = serve_in_pool(two_full_layers, 5, make_requests());
+    const std::vector<request_results> large = serve_in_pool(two_full_layers, 64, make_requests());
 
-    REQUIRE(results[0].tokens == continuation(first, 10));
-    REQUIRE(results[1].tokens == continuation(second, 5));
-    REQUIRE(ended_error(results[1]) == request_error::oom);
-    REQUIRE(f.model.forward_count == 10);
+    REQUIRE(large[0].tokens == continuation(first, 10));
+    REQUIRE(large[1].tokens == continuation(second, 10));
+    REQUIRE(large[1].statistics.preemption_count == 0);
+    require_same_states(small[0], large[0]);
+    require_same_states(small[1], large[1]);
+    REQUIRE(small[0].statistics.preemption_count == 0);
+    REQUIRE(small[1].statistics.preemption_count > 0);
+    REQUIRE(small[1].statistics.recomputed_token_count == 8);
+    REQUIRE(small[1].statistics.total_token_count == large[1].statistics.total_token_count);
+}
+
+// The cycles end at every page end from position 8 on, so the second request gives up its lines at a cycle end each
+// time and resumes from the state that end reached, recomputing nothing.
+TEST_CASE("a request that gives up its lines resumes from the state its last cycle end reached") {
+    token_list first{1, 2, 3, 4};
+    token_list second{5, 6, 7, 8};
+    auto make_requests = [&] {
+        return std::vector<request>{
+            request{.tokens = first, .max_tokens = 10, .eviction = {.cycle_tokens = 4}},
+            request{.tokens = second, .max_tokens = 10, .eviction = {.cycle_tokens = 4}},
+        };
+    };
+    const std::vector<request_results> small = serve_in_pool(two_full_layers, 5, make_requests());
+    const std::vector<request_results> large = serve_in_pool(two_full_layers, 64, make_requests());
+
+    require_same_states(small[0], large[0]);
+    require_same_states(small[1], large[1]);
+    REQUIRE(small[1].statistics.preemption_count > 0);
+    REQUIRE(small[1].statistics.recomputed_token_count == 0);
+}
+
+// Each request ends at 4 pages and the pool holds 4 lines, so at most one runs at a time.
+TEST_CASE("requests that each fit the pool alone all finish however many run together") {
+    std::vector<token_list> prompts{{1, 2, 3, 4, 5, 6, 7, 8}, {9, 10, 11, 12, 13, 14, 15, 16}, {17, 18, 19, 20, 21}};
+    std::vector<request> requests;
+    for (const token_list& prompt : prompts) {
+        requests.push_back(request{.tokens = prompt, .max_tokens = 16 - prompt.size()});
+    }
+    const std::vector<request_results> results = serve_in_pool(two_full_layers, 4, std::move(requests));
+
+    for (std::size_t r = 0; r < prompts.size(); r++) {
+        INFO("request " << r);
+        REQUIRE(results[r].tokens == continuation(prompts[r], 16 - prompts[r].size()));
+        ended_state(results[r]);
+    }
+}
+
+// The second request starts when the first holds at least 3 of the 4 lines, and its stored state needs 2, so it waits
+// for lines; the cancellation comes while it waits.
+TEST_CASE("a request cancelled while it holds no lines ends with cancelled and releases its lease") {
+    fixture stored_engine(16);
+    token_list stored_prompt{5, 6, 7, 8, 9, 10, 11, 12};
+    request_results stored = serve_all(stored_engine.sched, {request{.tokens = stored_prompt, .max_tokens = 1}})[0];
+    ended_state(stored);
+
+    memory_store shared_store;
+    shared_store.contents = stored_engine.store;
+    fixture f(4, 64, {}, shared_store);
+    token_list first{1, 2, 3, 4};
+    submission first_submission = make_submission(request{.tokens = first, .max_tokens = 12});
+    submission second_submission = make_submission(
+        request{.tokens = concat(concat(stored_prompt, stored.tokens), {13}), .max_tokens = 4}
+    );
+    std::shared_ptr<request_results> first_results = first_submission.recorded_results;
+    std::shared_ptr<request_results> second_results = second_submission.recorded_results;
+    std::size_t remaining = 2;
+    f.model.on_forward = [&] {
+        if (first_results->tokens.size() == 8 && second_submission.callbacks) {
+            event_loop::current()->spawn(
+                serve(f.sched, std::move(second_submission.r), std::move(second_submission.callbacks), remaining)
+            );
+        }
+        if (first_results->tokens.size() == 10) {
+            second_results->cancelled = true;
+        }
+    };
+    event_loop loop;
+    loop.spawn(f.sched.run());
+    loop.spawn(serve(f.sched, std::move(first_submission.r), std::move(first_submission.callbacks), remaining));
+    REQUIRE(loop.run() == nullptr);
+
+    REQUIRE(first_results->tokens == continuation(first, 12));
+    REQUIRE(second_results->tokens.empty());
+    REQUIRE(ended_error(*second_results) == request_error::cancelled);
+    REQUIRE(f.store->leases.size() == 3);
+    REQUIRE(f.store->releases.size() == 3);
+    REQUIRE(f.exec.kv_cache_bytes() == 0);
 }
 
 TEST_CASE("a cycle ends every cycle_tokens tokens with the state it reached") {
@@ -2575,21 +2700,27 @@ task<void> start_then_stop_loop(
     pulsarlm::executor& exec,
     request r,
     std::unique_ptr<pulsarlm::request_callbacks> callbacks,
-    std::optional<pulsarlm::executor::request_id_type>& started
+    std::optional<pulsarlm::executor::request_id_type>& started,
+    bool& loaded
 ) {
     started = co_await exec.start(
         std::move(r),
         pulsarlm::executor::unstarted_callbacks(std::move(callbacks), pulsarlm::end_with_loop_exited)
     );
+    if (started) {
+        loaded = co_await exec.allocate_lines(*started);
+    }
     event_loop::current()->stop();
 }
 
 std::optional<pulsarlm::executor::request_id_type>
 start_request(pulsarlm::executor& exec, request r, const std::shared_ptr<request_results>& recorded_results) {
     std::optional<pulsarlm::executor::request_id_type> started;
+    bool loaded = false;
     event_loop loop;
-    loop.spawn(start_then_stop_loop(exec, std::move(r), make_callbacks(recorded_results), started));
+    loop.spawn(start_then_stop_loop(exec, std::move(r), make_callbacks(recorded_results), started, loaded));
     REQUIRE(loop.run() == nullptr);
+    REQUIRE(loaded == started.has_value());
     return started;
 }
 
@@ -3736,6 +3867,116 @@ TEST_CASE("a mirroring draft layer drops the pages that leave the held pages ove
         require_same_pages(second_overlapped, second_sequential);
         REQUIRE(count_drafted(first_overlapped) > 0);
     }
+}
+
+// Each request's view outgrows the pool as the other runs, and the draft head drafts. Under a policy that evicts no
+// page the tokens and states are those of a large pool. Under eviction the page mass, and so the evicted pages and the
+// tokens, depend on the shapes of the steps, which preemption changes, so only the token counts are compared.
+TEST_CASE("requests that outgrow the pool together take turns with sliding, recurrent and mirroring draft layers") {
+    token_list first(20);
+    std::iota(first.begin(), first.end(), 1);
+    token_list second(10);
+    std::iota(second.begin(), second.end(), 40);
+    const pulsarlm::eviction_policy keeping{.cycle_tokens = 8};
+    const pulsarlm::eviction_policy evicting{
+        .n_sink = 0,
+        .n_working = 1,
+        .cycle_tokens = 8,
+        .max_context_capacity = 12,
+    };
+    auto make_requests = [&](const pulsarlm::eviction_policy& policy) {
+        return std::vector<request>{
+            request{.tokens = first, .max_tokens = 16, .eviction = policy},
+            request{.tokens = second, .max_tokens = 20, .eviction = policy},
+        };
+    };
+    for (const auto& [layers, keeping_lines, evicting_lines] :
+         {std::tuple{full_long_sliding_and_draft, std::size_t{10}, std::size_t{9}},
+          std::tuple{recurrent_sliding_and_draft, std::size_t{10}, std::size_t{10}}}) {
+        INFO((layers[0].state ? "recurrent" : "full-attention") << " layer beside the sliding one");
+        const std::vector<request_results> kept_small = serve_in_pool(layers, keeping_lines, make_requests(keeping));
+        const std::vector<request_results> kept_large = serve_in_pool(layers, 64, make_requests(keeping));
+        require_same_states(kept_small[0], kept_large[0]);
+        require_same_states(kept_small[1], kept_large[1]);
+        REQUIRE(kept_small[0].statistics.preemption_count + kept_small[1].statistics.preemption_count > 0);
+        REQUIRE(count_drafted(kept_small[0]) + count_drafted(kept_small[1]) > 0);
+
+        const std::vector<request_results> evicted = serve_in_pool(layers, evicting_lines, make_requests(evicting));
+        REQUIRE(evicted[0].tokens.size() == 16);
+        REQUIRE(evicted[1].tokens.size() == 20);
+        ended_state(evicted[0]);
+        ended_state(evicted[1]);
+        REQUIRE(evicted[0].statistics.preemption_count + evicted[1].statistics.preemption_count > 0);
+        REQUIRE(count_drafted(evicted[0]) + count_drafted(evicted[1]) > 0);
+    }
+}
+
+// At these pools the first request fits alone but not beside the second, which is preempted and then loaded again
+// while the first prepares its steps. The lines the second takes while it loads leave the first short of lines though
+// its lines fit the pool, so the first waits instead of ending with oom.
+TEST_CASE("a request whose lines fit the pool finishes beside a request being loaded") {
+    token_list first(20);
+    std::iota(first.begin(), first.end(), 1);
+    token_list second(10);
+    std::iota(second.begin(), second.end(), 40);
+    const pulsarlm::eviction_policy policy{
+        .n_sink = 0,
+        .n_working = 1,
+        .cycle_tokens = 8,
+        .max_context_capacity = 12,
+    };
+    for (const auto& [layers, n_lines] :
+         {std::pair{full_long_sliding_and_draft, std::size_t{7}},
+          std::pair{recurrent_sliding_and_draft, std::size_t{9}}}) {
+        INFO((layers[0].state ? "recurrent" : "full-attention") << " layer beside the sliding one");
+        const std::vector<request_results> alone = serve_in_pool(
+            layers,
+            n_lines,
+            {request{.tokens = first, .max_tokens = 16, .eviction = policy}}
+        );
+        const std::vector<request_results> together = serve_in_pool(
+            layers,
+            n_lines,
+            {request{.tokens = first, .max_tokens = 16, .eviction = policy},
+             request{.tokens = second, .max_tokens = 20, .eviction = policy}}
+        );
+
+        REQUIRE(alone[0].tokens.size() == 16);
+        ended_state(alone[0]);
+        REQUIRE(together[0].tokens.size() == 16);
+        REQUIRE(together[1].tokens.size() == 20);
+        ended_state(together[0]);
+        ended_state(together[1]);
+    }
+}
+
+// The pool's 7 regions of 128 bytes take one sliding line or two full-attention lines each. The evictions free
+// full-attention lines from regions whose other half stays held, so the request, alone, finds no whole free region for
+// a sliding line though its lines fit the pool; it preempts itself, and its reload packs its lines into the empty pool.
+TEST_CASE(
+    "a request alone whose free lines are split across regions preempts itself and reaches a large pool's states"
+) {
+    token_list prompt(24);
+    std::iota(prompt.begin(), prompt.end(), 1);
+    const pulsarlm::eviction_policy policy{.n_sink = 1, .n_working = 1, .cycle_tokens = 8, .max_context_capacity = 12};
+    auto serve_in = [&](std::size_t pool_bytes) {
+        fixture f(0, 64, {}, {}, full_and_wide_sliding, pool_bytes);
+        f.model.is_important = [](std::size_t, std::int64_t token) { return token % 3 == 0; };
+        request_results served = serve_all(
+            f.sched,
+            {request{.tokens = prompt, .max_tokens = 24, .eviction = policy}}
+        )[0];
+        REQUIRE(f.exec.kv_cache_bytes() == 0);
+        REQUIRE(f.store->releases.size() == f.store->leases.size());
+        return served;
+    };
+    const request_results fragmented = serve_in(7 * 128);
+    const request_results large = serve_in(64 * 128);
+
+    REQUIRE(large.statistics.preemption_count == 0);
+    REQUIRE(fragmented.statistics.preemption_count == 1);
+    ended_state(fragmented);
+    require_same_states(fragmented, large);
 }
 
 }  // namespace

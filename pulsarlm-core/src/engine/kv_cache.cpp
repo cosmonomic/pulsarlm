@@ -864,6 +864,16 @@ std::size_t kv_cache::used_bytes() const noexcept {
     return std::atomic_ref(used_line_bytes).load(std::memory_order_relaxed);
 }
 
+// The block sizes are powers of two and a region holds a block of the largest, so lines taken larger blocks first fill
+// the whole regions of an empty pool without a gap.
+bool kv_cache::can_hold(std::span<const std::size_t> counts) const noexcept {
+    std::size_t bytes = 0;
+    for (std::size_t layer = 0; layer < layers.size(); layer++) {
+        bytes += counts[layer] * line_block_bytes(layer);
+    }
+    return bytes <= allocator.line_count(0) * classes.front().block_bytes;
+}
+
 std::size_t kv_cache::line_block_bytes(std::size_t layer) const noexcept {
     return classes[layers[layer].block_class].block_bytes;
 }

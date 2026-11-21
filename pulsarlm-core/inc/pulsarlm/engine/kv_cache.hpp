@@ -216,6 +216,8 @@ class kv_cache {
 
     // The largest count for which allocate gives count lines of every layer now.
     std::size_t free_count();
+    // Whether allocate gives counts[layer] lines of each layer when no line is held.
+    bool can_hold(std::span<const std::size_t> counts) const noexcept;
     // The bytes of each shard's pool that lines in use take: lines get, allocate or clone gave and release has not
     // taken back, not lines only caching a page. Safe to call from any thread.
     std::size_t used_bytes() const noexcept;

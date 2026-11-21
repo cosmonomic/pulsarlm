@@ -251,7 +251,9 @@ PYBIND11_MODULE(pulsarlm_core, m) {
         .def_readonly("peak_device_memory", &request_statistics::peak_device_memory)
         .def_readonly("drafted_token_count", &request_statistics::drafted_token_count)
         .def_readonly("accepted_draft_count", &request_statistics::accepted_draft_count)
-        .def_readonly("step_duration", &request_statistics::step_duration);
+        .def_readonly("step_duration", &request_statistics::step_duration)
+        .def_readonly("preemption_count", &request_statistics::preemption_count)
+        .def_readonly("recomputed_token_count", &request_statistics::recomputed_token_count);
 
     py::class_<engine_stat>(m, "EngineStat")
         .def_readonly("kv_cache_bytes", &engine_stat::kv_cache_bytes)

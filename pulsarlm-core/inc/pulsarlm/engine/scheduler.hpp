@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <span>
 #include <unordered_map>
 
@@ -26,9 +27,27 @@ class scheduler {
     std::size_t admitted_count = 0;
     // The events of the requests waiting for a record, in arrival order; each in its request's task.
     std::deque<event*> waiting_requests;
+    // The started and the preempted requests that hold no lines, the preempted ones first, in the order they get lines.
+    std::deque<executor::request_id_type> unloaded_requests;
+    // The releases of lines so far: write-backs, stops, preemptions, failed allocations, and page writes that ended
+    // while run had no step to launch.
+    std::size_t line_release_count = 0;
+    // Awaited by load_requests while no unloaded request is left, and after the first did not fit; set when one is
+    // added, and when lines are released.
+    std::optional<event> unloaded_request_added;
+    std::optional<event> lines_released;
+    // Awaited by run while it has no step to launch or write back; set when a request is pushed to the queue and when
+    // lines are released.
+    std::optional<event> run_woken;
 
-    // Drops the requests that exited since the last call from the queue, and sets the exit event of each.
+    // Drops the requests that exited since the last call from the queue, and sets the exit event of each; moves the
+    // requests preempted since the last call from the queue to the front of unloaded_requests.
     void release_exited();
+    // Counts a release of lines, and wakes load_requests and run.
+    void count_line_release();
+    // Gives the unloaded requests their lines in order (executor::allocate_lines) and pushes each to the queue; ends
+    // never.
+    task<void> load_requests();
     // Waits, behind the requests that arrived before, until fewer than executor::max_running_request_count() requests
     // are admitted, and admits the request.
     task<void> admit();

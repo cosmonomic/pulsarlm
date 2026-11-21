@@ -72,19 +72,22 @@ class layer_view {
 // computed: the tokens it forwarded join tail and the pages they fill join every layer's view, the last of them head.
 class request_state {
   public:
-    enum class exit_reason { finished, cancelled, oom, context_exceeded };
+    enum class exit_reason { finished, cancelled, oom, context_exceeded, missing_state };
 
   private:
     state::lease_id_type held_lease_id;
     sampling_params sampling;
     std::uint64_t seed;
     std::optional<std::size_t> max_tokens;
-    // The request's tokens, each at its history position.
+    // The request's tokens, each at its history position; after a preemption, also the tokens it sampled before.
     std::vector<std::int64_t> prompt;
+    std::size_t submitted_prompt_tokens;
     // The tokens the prepared steps sampled, each verify step counted as accepting every token it verifies, and the
     // sampled tokens the steps written back applied.
     std::size_t prepared_samples = 0;
     std::size_t delivered_tokens = 0;
+    // The sampled tokens that steps written back applied since the request started or resumed, in order.
+    std::vector<std::int64_t> emitted_tokens;
     // The prompt tokens before the first one no prepared step forwards: those of the resumed state's full pages and
     // those the prepared steps forwarded.
     std::size_t prepared_prompt_tokens = 0;
@@ -122,6 +125,8 @@ class request_state {
     bool is_out_of_lines = false;
     // Whether the request's view would grow past the columns of its page tables.
     bool has_exceeded_context = false;
+    // Whether a page of the state the request's lines were given for was in neither the cache nor the store.
+    bool has_missing_page = false;
     bool is_cancelled = false;
     // The steps of the request prepared, and those of them written back.
     std::size_t prepared_step_count = 0;
@@ -177,7 +182,24 @@ class request_state {
     // The drafts the verify steps written back verified, and those of them they accepted.
     std::size_t drafted_tokens = 0;
     std::size_t accepted_drafts = 0;
+    // The times the request was preempted, and the tokens it forwarded before a preemption after the state it resumed
+    // from.
+    std::size_t preemptions = 0;
+    std::size_t recomputed_tokens = 0;
 
+    request_state(
+        std::vector<std::int64_t>&& tokens,
+        const sampling_params& sampling,
+        const std::optional<std::size_t>& max_tokens,
+        const page_eviction_policy& eviction,
+        std::shared_ptr<const state>&& initial_state,
+        state::lease_id_type lease_id,
+        std::vector<digest>&& digests,
+        const digest& root,
+        const view_layout& layout
+    );
+    // The request's tokens, then every token it sampled.
+    std::vector<std::int64_t> list_resumed_tokens() const;
     // The view index of recurrent KV layer layer's line holding the state at the end of head's page.
     std::size_t head_state_line_index(std::size_t layer) const;
     // Sets held_pages from the layers' indices, the passed ones aside (layer_view::passed_count).
@@ -203,8 +225,17 @@ class request_state {
         const view_layout& layout
     );
 
+    // Resumes preempted, a request state with no unfinished step, from resumed_state, a state it stored: its tokens are
+    // its request's then every token it sampled, which it forwards as known tokens, and it keeps its lease, sampling,
+    // delivered and sampled counts, statistics and whether its prefill ended. It holds no lines.
+    request_state(const request_state& preempted, std::shared_ptr<const state>&& resumed_state);
+
     // One per KV layer.
     std::span<const layer_view> views() const noexcept;
+    // Whether a KV layer holds a line.
+    bool has_lines() const noexcept;
+    std::size_t preemption_count() const noexcept;
+    std::size_t recomputed_token_count() const noexcept;
     std::span<const std::int64_t> prompt_tokens() const noexcept;
     std::span<const std::int64_t> tail_tokens() const noexcept;
     // The token at the history position, which no step written back forwarded: a prompt token or the last sample.
@@ -231,6 +262,8 @@ class request_state {
     // prepared step samples.
     std::size_t unprepared_token_count() const noexcept;
     std::size_t prompt_token_count() const noexcept;
+    // The prompt tokens the request was submitted with.
+    std::size_t submitted_prompt_token_count() const noexcept;
     std::size_t cached_token_count() const noexcept;
     std::size_t device_cached_token_count() const noexcept;
     std::size_t device_memory_peak() const noexcept;
@@ -252,7 +285,7 @@ class request_state {
     bool has_exited() const noexcept;
     std::optional<exit_reason> reason_of_exit() const noexcept;
     // Whether the request exits once no step of it is unfinished: a step written back reached the end, a store write
-    // failed, its view would grow past its page tables, it ran out of lines or it was cancelled.
+    // failed, its view would grow past its page tables, a page was missing, it ran out of lines or it was cancelled.
     bool has_exit_cause() const noexcept;
     // Whether the write-back of a later step of the request applies nothing: a step written back reached the end or a
     // store write failed.
@@ -309,6 +342,8 @@ class request_state {
     // Per KV layer, the lines the request lacks for the next key_counts[layer] keys after the prepared steps in that
     // layer; in a recurrent layer, for its state slots and for the state at the end of each page those keys fill.
     std::vector<std::size_t> missing_lines(std::span<const std::size_t> key_counts) const;
+    // Per KV layer, the lines the request holds once it has the lines missing_lines(key_counts) counts.
+    std::vector<std::size_t> count_step_lines(std::span<const std::size_t> key_counts) const;
     // The view indices of the full pages a cycle's end evicts from KV layer layer, which measures mass, ascending.
     std::vector<std::size_t> pages_to_evict(std::size_t layer) const;
 
@@ -337,6 +372,8 @@ class request_state {
     void fail_store_write() noexcept;
     void run_out_of_lines() noexcept;
     void exceed_context() noexcept;
+    // A page of the state the request's lines were given for was in neither the cache nor the store.
+    void miss_page() noexcept;
     void cancel() noexcept;
     // Adds a step written back, which took duration from its launch to its write-back, to the prefill's steps until
     // end_prefill and to the summed duration.
@@ -387,7 +424,8 @@ class request_state {
     void sample_pages();
     // Sets the exit reason of a request with an exit cause and no unfinished step: oom when a store write failed,
     // otherwise finished when a step written back reached the end, otherwise context_exceeded when its view would grow
-    // past its page tables, otherwise oom when it ran out of lines, otherwise cancelled.
+    // past its page tables, otherwise missing_state when a page was missing, otherwise oom when it ran out of lines,
+    // otherwise cancelled.
     void exit() noexcept;
     void record_device_cached_tokens(std::size_t count) noexcept;
     // Raises the peak of the bytes of each device's pool the lines take to bytes.

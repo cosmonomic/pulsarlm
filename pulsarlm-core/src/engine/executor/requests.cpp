@@ -30,14 +30,26 @@ bool lists_page_twice(const layer_sequence& layer) {
 
 request_statistics make_statistics(const request_state& req) {
     return request_statistics{
-        .total_token_count = req.prompt_token_count() + req.delivered_token_count(),
+        .total_token_count = req.submitted_prompt_token_count() + req.delivered_token_count(),
         .cached_token_count = req.cached_token_count(),
         .device_cached_token_count = req.device_cached_token_count(),
         .peak_device_memory = req.device_memory_peak(),
         .drafted_token_count = req.drafted_token_count(),
         .accepted_draft_count = req.accepted_draft_count(),
         .step_duration = req.step_duration(),
+        .preemption_count = req.preemption_count(),
+        .recomputed_token_count = req.recomputed_token_count(),
     };
+}
+
+std::size_t count_state_pages(const state& s) {
+    std::size_t pages = 0;
+    for (const layer_sequence& sequence : s.layers) {
+        if (!sequence.pages.empty()) {
+            pages = std::max(pages, sequence.pages.back().index + 1);
+        }
+    }
+    return pages;
 }
 
 }  // namespace
@@ -81,6 +93,7 @@ task<std::optional<executor::request_id_type>> executor::start(request&& r, unst
         callbacks.release()->on_end(std::unexpected(request_error::invalid_state), request_statistics{});
         co_return std::nullopt;
     }
+    std::shared_ptr<const state> resumed_state = stored_state;
     std::shared_ptr<const state> initial_state = extend_with_hot_pages(std::move(stored_state), r, digests);
     request_state started(std::move(r), std::move(initial_state), lease_id, std::move(digests), chain_root, layout);
     if (table_width_after(started, start_line_counts(started)) > view_page_capacity) {
@@ -90,30 +103,7 @@ task<std::optional<executor::request_id_type>> executor::start(request&& r, unst
     }
     const request_id_type id = requests.emplace(callbacks.release(), std::move(started));
     assert(get_slot(id) < max_running_requests);
-    request_state& req = requests[id].state;
-    // take_lines holds the resident pages before it first suspends, so they are the ones counted here.
-    req.record_device_cached_tokens(device_cached_tokens(req));
-    std::expected<void, page_error> line_allocation = co_await take_lines(req);
-    if (!line_allocation) {
-        release_lines(req);
-        store.release(req.lease_id());
-        end_request(
-            id,
-            std::unexpected(
-                line_allocation.error() == page_error::miss ? request_error::missing_state : request_error::oom
-            ),
-            request_statistics{}
-        );
-        co_return std::nullopt;
-    }
-    if (req.history_page_count() > stored_pages && !co_await own_pages_from(req, stored_pages)) {
-        release_lines(req);
-        store.release(req.lease_id());
-        end_request(id, std::unexpected(request_error::oom), request_statistics{});
-        co_return std::nullopt;
-    }
-    mark_stale_tables(id, 0);
-    stale_requests.push_back(id);
+    requests[id].last_state = std::move(resumed_state);
     co_return id;
 }
 
@@ -134,6 +124,7 @@ void executor::end_request(
     if (running_request* running = requests.find(id)) {
         deliver_end(*running, std::move(result), statistics);
         requests.erase(id);
+        std::erase(loaded_requests, id);
     }
 }
 
@@ -144,6 +135,7 @@ void executor::end_requests(request_error error) noexcept {
         deliver_end(running, std::unexpected(error), make_statistics(running.state));
     }
     requests.clear();
+    loaded_requests.clear();
 }
 
 std::shared_ptr<const state> executor::extend_with_hot_pages(
@@ -218,6 +210,7 @@ task<void> executor::stop(request_id_type id) {
     request_state& req = get_state(id);
     assert(req.has_exited() && req.unfinished_step_count() == 0);
     release_lines(req);
+    end_line_waits();
     std::expected<std::shared_ptr<const state>, request_error> result = std::unexpected(request_error::cancelled);
     switch (*req.reason_of_exit()) {
     case request_state::exit_reason::finished: {
@@ -234,6 +227,9 @@ task<void> executor::stop(request_id_type id) {
         break;
     case request_state::exit_reason::context_exceeded:
         result = std::unexpected(request_error::context_exceeded);
+        break;
+    case request_state::exit_reason::missing_state:
+        result = std::unexpected(request_error::missing_state);
         break;
     }
     store.release(req.lease_id());
@@ -260,7 +256,59 @@ std::size_t executor::device_cached_tokens(const request_state& req) const {
         layout.page_size;
 }
 
-task<std::expected<void, page_error>> executor::take_lines(request_state& req) {
+// The resident pages are held before the first suspension, so they are the ones a first allocation counts. A state's
+// pages past the stored one, which the start took hot from the cache, are written to the store under the request's
+// lease.
+task<bool> executor::allocate_lines(request_id_type id) {
+    running_request& running = requests[id];
+    request_state& req = running.state;
+    assert(!running.is_loaded && !req.has_lines());
+    if (running.callbacks->cancelled()) {
+        req.cancel();
+        exit_request(id);
+        co_return false;
+    }
+    if (!running.was_loaded) {
+        req.record_device_cached_tokens(device_cached_tokens(req));
+    }
+    loading_count++;
+    std::expected<void, page_error> taken = co_await take_view_lines(req);
+    if (!taken && taken.error() == page_error::oom && store_writes.size() > 0) {
+        co_await wait_for_page_writes();
+        taken = co_await take_view_lines(req);
+    }
+    if (!taken) {
+        if (taken.error() == page_error::miss) {
+            req.miss_page();
+            exit_request(id);
+        } else if (!cache.can_hold(count_view_lines(req))) {
+            req.run_out_of_lines();
+            exit_request(id);
+        } else {
+            end_line_waits();
+        }
+        loading_count--;
+        co_return false;
+    }
+    const std::size_t stored_pages = count_state_pages(*running.last_state);
+    if (req.history_page_count() > stored_pages && !co_await own_pages_from(req, stored_pages)) {
+        release_lines(req);
+        req.fail_store_write();
+        exit_request(id);
+        loading_count--;
+        co_return false;
+    }
+    loading_count--;
+    running.is_loaded = true;
+    running.was_loaded = true;
+    loaded_requests.push_back(id);
+    record_device_memory(req);
+    mark_stale_tables(id, 0);
+    stale_requests.push_back(id);
+    co_return true;
+}
+
+task<std::expected<void, page_error>> executor::take_view_lines(request_state& req) {
     std::vector<std::span<const digest>> held_hashes(cache.layer_count());
     for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
         if (!layout.layers[layer].is_recurrent) {
@@ -338,7 +386,9 @@ task<std::expected<void, page_error>> executor::take_lines(request_state& req) {
         req.add_lines(layer, allocated);
     }
     // The copies of the states at head read the fetched lines.
-    co_await synchronize_shards();
+    if (std::ranges::any_of(states, [](const std::vector<std::uint32_t>& copy) { return !copy.empty(); })) {
+        co_await synchronize_shards();
+    }
     for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
         if (layout.layers[layer].is_recurrent) {
             cache.release(layer, (*page_lines)[layer]);
@@ -365,6 +415,70 @@ void executor::release_lines(request_state& req) noexcept {
     for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
         cache.release(layer, taken_lines[layer]);
     }
+}
+
+std::vector<executor::request_id_type> executor::take_preempted_requests() {
+    return std::exchange(preempted_requests, {});
+}
+
+bool executor::holds_lines_alone(request_id_type id) const noexcept {
+    return loading_count == 0 && store_writes.size() == 0 &&
+        std::ranges::all_of(loaded_requests, [&](request_id_type loaded) { return loaded == id; });
+}
+
+void executor::end_line_waits() noexcept {
+    for (running_request& running : requests) {
+        running.awaits_released_lines = false;
+    }
+}
+
+std::vector<std::size_t> executor::count_view_lines(const request_state& req) const {
+    std::vector<std::size_t> counts(cache.layer_count());
+    for (std::size_t layer = 0; layer < cache.layer_count(); layer++) {
+        counts[layer] = layout.layers[layer].is_recurrent
+            ? layout.layers[layer].state_slots + (req.head_digest() ? 3 : 2)
+            : req.views()[layer].pages.size();
+    }
+    return counts;
+}
+
+bool executor::has_page_writes() const noexcept {
+    return store_writes.size() > 0;
+}
+
+task<void> executor::wait_for_page_writes() {
+    while (store_writes.size() > 0) {
+        co_await store_writes.wait();
+    }
+}
+
+std::optional<executor::request_id_type>
+executor::find_preemption_victim(request_id_type requester, std::span<const scheduled_request> lined) const {
+    for (const request_id_type id : std::views::reverse(loaded_requests)) {
+        const request_state& req = get_state(id);
+        const bool in_step = std::ranges::contains(lined, id, &scheduled_request::request_id);
+        if (id != requester && req.unfinished_step_count() == 0 && !req.has_exit_cause() && !in_step) {
+            return id;
+        }
+    }
+    return std::nullopt;
+}
+
+// The request has no unfinished step, so no table shift or released line is pending for it, its sliding layers passed
+// no page that a write-back has to drop, and its position bounds are its history position.
+void executor::preempt(request_id_type id) {
+    running_request& running = requests[id];
+    release_lines(running.state);
+    stale_tables.erase(id);
+    std::erase(stale_requests, id);
+    request_state resumed(running.state, std::shared_ptr<const state>(running.last_state));
+    std::destroy_at(&running.state);
+    std::construct_at(&running.state, std::move(resumed));
+    running.is_loaded = false;
+    std::erase(loaded_requests, id);
+    running.awaits_write_back = false;
+    end_line_waits();
+    preempted_requests.push_back(id);
 }
 
 }  // namespace pulsarlm

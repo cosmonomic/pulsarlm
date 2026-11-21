@@ -1228,6 +1228,8 @@ task<void> run_stepped(
     );
     if (started) {
         const pulsarlm::executor::request_id_type id = *started;
+        const bool loaded = co_await exec.allocate_lines(id);
+        REQUIRE(loaded);
         std::deque<std::pair<pulsarlm::executor::step, pulsarlm::executor::launch_result>> unfinished;
         while (!exec.has_exited(id)) {
             if ((unfinished.empty() || (overlaps && unfinished.size() == 1)) && exec.is_schedulable(id)) {

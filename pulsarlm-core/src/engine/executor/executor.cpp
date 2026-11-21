@@ -484,7 +484,8 @@ bool executor::is_schedulable(request_id_type id) const {
     const running_request& running = requests[id];
     const request_state& req = running.state;
     assert(req.unfinished_step_count() <= 1);
-    return !req.has_exit_cause() && !req.has_prepared_last_step() && !running.awaits_write_back;
+    return running.is_loaded && !req.has_exit_cause() && !req.has_prepared_last_step() && !running.awaits_write_back &&
+        !running.awaits_released_lines;
 }
 
 std::size_t executor::pending_token_count(request_id_type id) const {
@@ -619,6 +620,31 @@ std::pair<bool, bool> executor::plan_drafting(const request_state& req, std::siz
 
 // The draft head's KV layer takes the key of the token after the step's tokens, and the keys of the drafts after it
 // but the last.
+// A request preempted for the lines holds none. A request short of lines that it alone holds, though they fit the pool
+// (add_step_lines gave it no exit cause), lacks them because its free blocks are split across regions; it preempts
+// itself, and its reload takes its lines larger first in an empty pool.
+bool executor::prepare_lines(const scheduled_request& scheduled, std::span<const scheduled_request> lined) {
+    const request_id_type id = scheduled.request_id;
+    while (!add_step_lines(scheduled)) {
+        running_request& running = requests[id];
+        if (running.state.has_exit_cause()) {
+            return false;
+        }
+        const std::optional<request_id_type> victim = find_preemption_victim(id, lined);
+        if (victim) {
+            preempt(*victim);
+            continue;
+        }
+        if (running.state.unfinished_step_count() == 0 && holds_lines_alone(id)) {
+            preempt(id);
+        } else {
+            running.awaits_released_lines = true;
+        }
+        return false;
+    }
+    return true;
+}
+
 bool executor::add_step_lines(const scheduled_request& scheduled) {
     request_state& req = get_state(scheduled.request_id);
     const std::size_t query_token_count = scheduled.token_count + req.prepared_draft_count();
@@ -637,7 +663,9 @@ bool executor::add_step_lines(const scheduled_request& scheduled) {
     }
     std::expected<std::vector<std::vector<std::uint32_t>>, page_error> allocation = cache.allocate(missing_counts);
     if (!allocation) {
-        req.run_out_of_lines();
+        if (req.unfinished_step_count() == 0 && !cache.can_hold(req.count_step_lines(key_counts))) {
+            req.run_out_of_lines();
+        }
         return false;
     }
     for (std::size_t layer = 0; layer < layout.layers.size(); layer++) {
@@ -658,10 +686,16 @@ executor::step executor::prepare(std::span<const scheduled_request> scheduled) {
     assert(is_preparable(scheduled));
     std::vector<scheduled_request> lined;
     for (const scheduled_request& requested : scheduled) {
-        if (add_step_lines(requested)) {
+        if (!requests[requested.request_id].is_loaded) {
+            continue;
+        }
+        if (prepare_lines(requested, lined)) {
             compact_sliding_views(requested.request_id);
             lined.push_back(requested);
-        } else if (get_state(requested.request_id).unfinished_step_count() == 0) {
+        } else if (
+            get_state(requested.request_id).has_exit_cause() &&
+            get_state(requested.request_id).unfinished_step_count() == 0
+        ) {
             exit_request(requested.request_id);
         }
     }

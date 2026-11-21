@@ -178,6 +178,12 @@ class RequestStatistics:
     @property
     def step_duration(self) -> datetime.timedelta:
         """Launch to write-back of every step of the request, summed."""
+    @property
+    def preemption_count(self) -> int:
+        """The times the request gave up its lines to let other requests run."""
+    @property
+    def recomputed_token_count(self) -> int:
+        """The tokens the request forwarded again after its preemptions."""
 
 class RequestError(enum.Enum):
     MISSING_STATE = ...

@@ -69,11 +69,35 @@ request_state::request_state(
     const digest& root,
     const view_layout& layout
 )
+: request_state(
+      std::move(r.tokens),
+      r.sampling,
+      r.max_tokens,
+      to_pages(r.eviction, layout.page_size),
+      std::move(initial_state),
+      lease_id,
+      std::move(digests),
+      root,
+      layout
+  ) {}
+
+request_state::request_state(
+    std::vector<std::int64_t>&& tokens,
+    const sampling_params& sampling,
+    const std::optional<std::size_t>& max_tokens,
+    const page_eviction_policy& eviction,
+    std::shared_ptr<const state>&& initial_state,
+    state::lease_id_type lease_id,
+    std::vector<digest>&& digests,
+    const digest& root,
+    const view_layout& layout
+)
 : held_lease_id(lease_id),
-  sampling(r.sampling),
-  seed(sampling_seed(r.sampling.seed)),
-  max_tokens(r.max_tokens),
-  prompt(std::move(r.tokens)),
+  sampling(sampling),
+  seed(sampling_seed(sampling.seed)),
+  max_tokens(max_tokens),
+  prompt(std::move(tokens)),
+  submitted_prompt_tokens(prompt.size()),
   root(root),
   head(initial_state->head),
   prompt_digests(std::move(digests)),
@@ -81,7 +105,7 @@ request_state::request_state(
   layers(layout.layers.size()),
   detached_head_state_lines(layout.layers.size(), {layer_view::no_line, layer_view::no_line}),
   released_lines(layout.layers.size()),
-  eviction(to_pages(r.eviction, layout.page_size)) {
+  eviction(eviction) {
     std::size_t resumed_page_count = 0;
     if (head) {
         auto head_digest = std::ranges::find(prompt_digests, *head);
@@ -134,6 +158,54 @@ request_state::request_state(
                                                             : first_cycle_end - eviction.cycle_tokens;
     resumed_mass_end_position = mass_end_position;
     update_held();
+}
+
+// The digests of the full pages of the preempted request's tokens are chained from its root again.
+request_state::request_state(const request_state& preempted, std::shared_ptr<const state>&& resumed_state)
+: request_state(
+      preempted.list_resumed_tokens(),
+      preempted.sampling,
+      preempted.max_tokens,
+      preempted.eviction,
+      std::move(resumed_state),
+      preempted.held_lease_id,
+      make_page_digests(preempted.root, preempted.list_resumed_tokens(), preempted.layout.page_size),
+      preempted.root,
+      preempted.layout
+  ) {
+    assert(preempted.unfinished_step_count() == 0 && !preempted.has_exit_cause());
+    submitted_prompt_tokens = preempted.submitted_prompt_tokens;
+    delivered_tokens = preempted.delivered_tokens;
+    prepared_samples = preempted.delivered_tokens;
+    cached_count = preempted.cached_count;
+    device_cached_count = preempted.device_cached_count;
+    peak_device_memory = preempted.peak_device_memory;
+    has_prefill_ended = preempted.has_prefill_ended;
+    prefill_steps = preempted.prefill_steps;
+    prefill_duration = preempted.prefill_duration;
+    total_step_duration = preempted.total_step_duration;
+    drafted_tokens = preempted.drafted_tokens;
+    accepted_drafts = preempted.accepted_drafts;
+    preemptions = preempted.preemptions + 1;
+    recomputed_tokens = preempted.recomputed_tokens + preempted.history_position() - history_position();
+}
+
+std::vector<std::int64_t> request_state::list_resumed_tokens() const {
+    std::vector<std::int64_t> tokens = prompt;
+    tokens.insert(tokens.end(), emitted_tokens.begin(), emitted_tokens.end());
+    return tokens;
+}
+
+bool request_state::has_lines() const noexcept {
+    return std::ranges::any_of(layers, [](const layer_view& view) { return view.count_held_lines() > 0; });
+}
+
+std::size_t request_state::preemption_count() const noexcept {
+    return preemptions;
+}
+
+std::size_t request_state::recomputed_token_count() const noexcept {
+    return recomputed_tokens;
 }
 
 std::size_t request_state::next_index(std::size_t layer) const noexcept {
@@ -458,6 +530,17 @@ std::vector<std::size_t> request_state::missing_lines(std::span<const std::size_
     return counts;
 }
 
+std::vector<std::size_t> request_state::count_step_lines(std::span<const std::size_t> key_counts) const {
+    std::vector<std::size_t> counts = missing_lines(key_counts);
+    for (std::size_t layer = 0; layer < layers.size(); layer++) {
+        counts[layer] += layers[layer].count_held_lines() + released_lines[layer].size() +
+            static_cast<std::size_t>(std::ranges::count_if(detached_head_state_lines[layer], [](std::uint32_t line) {
+                             return line != layer_view::no_line;
+                         }));
+    }
+    return counts;
+}
+
 std::span<const layer_view> request_state::views() const noexcept {
     return layers;
 }
@@ -532,6 +615,10 @@ std::size_t request_state::prompt_token_count() const noexcept {
     return prompt.size();
 }
 
+std::size_t request_state::submitted_prompt_token_count() const noexcept {
+    return submitted_prompt_tokens;
+}
+
 std::size_t request_state::cached_token_count() const noexcept {
     return cached_count;
 }
@@ -597,7 +684,8 @@ std::optional<request_state::exit_reason> request_state::reason_of_exit() const 
 }
 
 bool request_state::has_exit_cause() const noexcept {
-    return has_reached_end || has_failed_write || has_exceeded_context || is_out_of_lines || is_cancelled;
+    return has_reached_end || has_failed_write || has_exceeded_context || is_out_of_lines || is_cancelled ||
+        has_missing_page;
 }
 
 bool request_state::discards_steps() const noexcept {
@@ -715,6 +803,7 @@ void request_state::apply_step(
         pending_sample = emitted.back();
     }
     delivered_tokens += emitted.size();
+    emitted_tokens.insert(emitted_tokens.end(), emitted.begin(), emitted.end());
     drafts.assign(step_drafts.begin(), step_drafts.end());
     rejected_tokens = rejected_count;
 }
@@ -744,6 +833,10 @@ void request_state::run_out_of_lines() noexcept {
 
 void request_state::exceed_context() noexcept {
     has_exceeded_context = true;
+}
+
+void request_state::miss_page() noexcept {
+    has_missing_page = true;
 }
 
 void request_state::cancel() noexcept {
@@ -943,6 +1036,8 @@ void request_state::exit() noexcept {
         end_reason = exit_reason::finished;
     } else if (has_exceeded_context) {
         end_reason = exit_reason::context_exceeded;
+    } else if (has_missing_page) {
+        end_reason = exit_reason::missing_state;
     } else if (is_out_of_lines) {
         end_reason = exit_reason::oom;
     } else {

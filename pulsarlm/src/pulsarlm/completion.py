@@ -28,6 +28,8 @@ class CompletionUsage:
     pages the engine had resident, not fetched from the store.
     peak_device_memory: the most bytes of each device's KV cache pool the
     request's lines took at once, lines shared with other requests included.
+    preemptions: the times the request gave up its lines to let other requests
+    run; recomputed_tokens: the tokens it forwarded again after them.
     time_to_first_token_s runs from the submission to the first token, None
     without one; decode_time_s from the first token to the last."""
 
@@ -35,6 +37,8 @@ class CompletionUsage:
     cached_tokens: int
     device_cached_tokens: int
     peak_device_memory: int
+    preemptions: int
+    recomputed_tokens: int
     completion_tokens: int
     time_to_first_token_s: float | None
     decode_time_s: float
@@ -98,6 +102,8 @@ async def complete(
                 cached_tokens=statistics.cached_token_count,
                 device_cached_tokens=statistics.device_cached_token_count,
                 peak_device_memory=statistics.peak_device_memory,
+                preemptions=statistics.preemption_count,
+                recomputed_tokens=statistics.recomputed_token_count,
                 completion_tokens=completion_tokens,
                 time_to_first_token_s=None
                 if first_token_at is None

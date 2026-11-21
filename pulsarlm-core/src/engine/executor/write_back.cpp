@@ -28,6 +28,7 @@ namespace pulsarlm {
 // that last read the lines of pages that left a view has completed, so they are released right after the sync. A
 // recurrent layer's state at head reaches the store at the resume points, cycle ends and the end, that find it pending.
 task<void> executor::write_back(const step& s, launch_result& launched) {
+    end_line_waits();
     if (s.entries.empty()) {
         co_return;
     }
@@ -35,6 +36,7 @@ task<void> executor::write_back(const step& s, launch_result& launched) {
     step_writes writes = apply_entries(s, launched, std::chrono::steady_clock::now() - s.prepare_time);
     co_await write_pages_and_states(launched, writes);
     refresh_views(s, writes);
+    end_line_waits();
 }
 
 // The step's write-back came before, so every page it completed is in the views and its pages and states are written.
@@ -50,7 +52,7 @@ task<void> executor::evict(const step& s, const launch_result& launched) {
         if (views_changed) {
             update_views(req);
         }
-        co_await write_cycle_end(req, *requests[e.request_id].callbacks);
+        co_await write_cycle_end(requests[e.request_id]);
         if (views_changed) {
             assert(req.unfinished_step_count() == 0);
             stale_requests.push_back(e.request_id);
@@ -333,6 +335,7 @@ task<void> executor::async_write_back(
         writer->finish(written.has_value());
     }
     store_writes.finish(written.has_value());
+    end_line_waits();
 }
 
 // The step that last used the evicted lines has completed, so they are released right away.
@@ -354,10 +357,11 @@ bool executor::evict_request(request_state& req) {
     return evicted;
 }
 
-task<void> executor::write_cycle_end(request_state& req, request_callbacks& callbacks) {
-    auto cycle_end_state = std::make_shared<const state>(req.to_state());
-    co_await store.write_state(req.lease_id(), std::shared_ptr<const state>(cycle_end_state));
-    callbacks.on_cycle(cycle_end{.state = std::move(cycle_end_state)});
+task<void> executor::write_cycle_end(running_request& running) {
+    auto cycle_end_state = std::make_shared<const state>(running.state.to_state());
+    co_await store.write_state(running.state.lease_id(), std::shared_ptr<const state>(cycle_end_state));
+    running.last_state = cycle_end_state;
+    running.callbacks->on_cycle(cycle_end{.state = std::move(cycle_end_state)});
 }
 
 void executor::update_views(request_state& req) {

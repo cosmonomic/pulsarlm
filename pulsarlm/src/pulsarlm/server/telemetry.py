@@ -30,6 +30,8 @@ INPUT_TOKENS = "pulsarlm.engine.usage.input_tokens"
 OUTPUT_TOKENS = "pulsarlm.engine.usage.output_tokens"
 INPUT_TOKENS_ON_DEVICE = "pulsarlm.engine.usage.input_tokens_on_device"
 INPUT_TOKENS_IN_STORE = "pulsarlm.engine.usage.input_tokens_in_store"
+PREEMPTIONS = "pulsarlm.engine.usage.preemptions"
+RECOMPUTED_TOKENS = "pulsarlm.engine.usage.recomputed_tokens"
 # The GenAI semantic conventions' bounds for token histograms.
 TOKEN_BUCKETS = tuple(float(4**exponent) for exponent in range(14))
 BUCKET_BOUNDARIES = {
@@ -87,6 +89,7 @@ BUCKET_BOUNDARIES = {
     OUTPUT_TOKENS: TOKEN_BUCKETS,
     INPUT_TOKENS_ON_DEVICE: TOKEN_BUCKETS,
     INPUT_TOKENS_IN_STORE: TOKEN_BUCKETS,
+    RECOMPUTED_TOKENS: TOKEN_BUCKETS,
 }
 
 
@@ -112,6 +115,8 @@ class Telemetry:
     output_tokens: Histogram
     input_tokens_on_device: Histogram
     input_tokens_in_store: Histogram
+    preemptions: Histogram
+    recomputed_tokens: Histogram
     store_stat: Callable[[], StoreStat]
 
     def shutdown(self) -> None:
@@ -265,6 +270,16 @@ def start_telemetry(
             unit="{token}",
             description="Prompt tokens of the resumed state fetched from the store.",
         ),
+        preemptions=meter.create_histogram(
+            PREEMPTIONS,
+            unit="{preemption}",
+            description="Times a request gave up its lines to let other requests run.",
+        ),
+        recomputed_tokens=meter.create_histogram(
+            RECOMPUTED_TOKENS,
+            unit="{token}",
+            description="Tokens a request forwarded again after its preemptions.",
+        ),
         store_stat=store_stat,
     )
 
@@ -311,6 +326,8 @@ class RequestTelemetry:
         telemetry.output_tokens.record(usage.completion_tokens, attributes)
         telemetry.input_tokens_on_device.record(usage.device_cached_tokens, attributes)
         telemetry.input_tokens_in_store.record(store_tokens, attributes)
+        telemetry.preemptions.record(usage.preemptions, attributes)
+        telemetry.recomputed_tokens.record(usage.recomputed_tokens, attributes)
         span_attributes: dict[str, AttributeValue] = (
             attributes
             | self._request_attributes
@@ -323,6 +340,8 @@ class RequestTelemetry:
                 "pulsarlm.engine.usage.input_tokens_on_device": usage.device_cached_tokens,
                 "pulsarlm.engine.usage.input_tokens_in_store": store_tokens,
                 "pulsarlm.engine.usage.peak_device_memory": usage.peak_device_memory,
+                PREEMPTIONS: usage.preemptions,
+                RECOMPUTED_TOKENS: usage.recomputed_tokens,
                 "pulsarlm.store.usage": store.page_bytes,
                 "pulsarlm.store.utilization": utilization(store),
             }

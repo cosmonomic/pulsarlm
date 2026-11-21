@@ -40,6 +40,15 @@ class executor {
         // Whether a step of the request that is not evicted yet may end its cycle under a policy that evicts
         // (step_entry::awaits_write_back), so that no later step of it is prepared before that step's eviction (evict).
         bool awaits_write_back = false;
+        // The state the request last stored, which a preemption resumes it from.
+        std::shared_ptr<const pulsarlm::state> last_state;
+        // Whether the request holds the lines allocate_lines gave it, from then until a preemption takes them.
+        bool is_loaded = false;
+        // Whether a step's prologue found no lines for the request and nothing to preempt, so that no step of it is
+        // prepared before lines are released (end_line_waits).
+        bool awaits_released_lines = false;
+        // Whether allocate_lines gave the request lines before.
+        bool was_loaded = false;
     };
 
   public:
@@ -103,6 +112,12 @@ class executor {
     // The requests whose request_table entries, page tables aside, the shards do not hold as their request states
     // set them, and which no unfinished step holds.
     std::vector<request_id_type> stale_requests;
+    // The requests preempted since the last take_preempted_requests, in preemption order.
+    std::vector<request_id_type> preempted_requests;
+    // The requests that hold the lines allocate_lines gave them (running_request::is_loaded), in the order it gave them.
+    std::vector<request_id_type> loaded_requests;
+    // The allocate_lines calls that may hold lines for a request not loaded yet.
+    std::size_t loading_count = 0;
     // Per request table key_counts cell, as an index into them flattened, the keys a prologue took out of its sliding
     // layer's page tables (compact_sliding_views), negative; not moved into a step yet.
     using key_count_cell = std::int64_t;
@@ -147,7 +162,7 @@ class executor {
     void mark_stale_layer_table(request_id_type id, std::size_t layer, std::size_t first_column);
     // The columns of req's page tables once each KV layer holds line_counts[layer] more lines.
     std::size_t table_width_after(const request_state& req, std::span<const std::size_t> line_counts) const;
-    // Per KV layer, the lines take_lines gives req.
+    // Per KV layer, the lines allocate_lines gives req.
     std::vector<std::size_t> start_line_counts(const request_state& req) const;
     // Moves stale_tables into s: the cells of each request's stale columns, from its view, that s's enqueue sets.
     void move_stale_tables(step& s);
@@ -165,15 +180,15 @@ class executor {
     void move_table_shifts(step& s);
     // The tokens of req's full history pages that every KV layer reading the page holds resident.
     std::size_t device_cached_tokens(const request_state& req) const;
-    // Per KV layer with pages, lines for its pages; per recurrent layer, a copy of the state at head, or zeros without
-    // head, and two empty lines. Holds nothing on failure.
-    task<std::expected<void, page_error>> take_lines(request_state& req);
     // s, the state the store returned for r, extended by the full pages of r's tokens after its head that every layer
     // with pages caches, up to its cycle's mass window and leaving a token to forward: no query between them adds mass,
     // so it is the state the request reaches there. s itself when it ends inside the window or the model has recurrent
     // layers. digests are the digests of r's full pages.
     std::shared_ptr<const state>
     extend_with_hot_pages(std::shared_ptr<const state>&& s, const request& r, std::span<const digest> digests) const;
+    // Per KV layer with pages, lines for its pages; per recurrent layer, a copy of the state at head, or zeros without
+    // head, and two empty lines. Holds nothing on failure.
+    task<std::expected<void, page_error>> take_view_lines(request_state& req);
     // Makes the store keep, for req's lease, the pages its views hold from history index first_index on, which the
     // state the store returned does not reference.
     task<std::expected<void, page_error>> own_pages_from(request_state& req, std::size_t first_index);
@@ -209,11 +224,34 @@ class executor {
     // of the token after them to the draft head's KV layer, and whether it drafts.
     std::pair<bool, bool> plan_drafting(const request_state& req, std::size_t token_count) const;
     // Gives the request of scheduled the lines it lacks for the keys its step writes, after its prepared steps, and
-    // marks their columns stale. Returns false, holding none, when its view would grow past view_page_capacity pages
-    // or the lines run out, which the request records (request_state::exceed_context,
-    // request_state::run_out_of_lines).
+    // marks their columns stale. Returns false, holding none, when its view would grow past view_page_capacity pages,
+    // which the request records (request_state::exceed_context), or the lines run out; the request then runs out of
+    // lines (request_state::run_out_of_lines) when it has no unfinished step and its lines with the step's would not
+    // fit the pool with no line held (kv_cache::can_hold).
     bool add_step_lines(const scheduled_request& scheduled);
+    // Gives the request of scheduled its step's lines (add_step_lines), preempting the requests find_preemption_victim
+    // names while the lines run out. Returns false when the request leaves the step: add_step_lines gave it an exit
+    // cause, or nothing was left to preempt, when it keeps its lines and awaits released lines
+    // (running_request::awaits_released_lines) unless it has no unfinished step and alone holds lines
+    // (holds_lines_alone), when it preempts itself. lined holds the requests already in the step.
+    bool prepare_lines(const scheduled_request& scheduled, std::span<const scheduled_request> lined);
     task<void> enqueue_on_shard(const step& s, launch_result& launched, std::size_t shard);
+    // The request to preempt for the lines of the step of the request at requester, when the lines run out: the most
+    // recently loaded request (loaded_requests) other than the requester that holds lines, has no unfinished step and
+    // no exit cause, and is none of the requests in lined, those already in the step. None when no request qualifies.
+    std::optional<request_id_type>
+    find_preemption_victim(request_id_type requester, std::span<const scheduled_request> lined) const;
+    // Takes the lines of the request at id, which has no unfinished step, rebuilds its request state from its last
+    // stored state with every token it sampled as known tokens, and adds it to preempted_requests.
+    void preempt(request_id_type id);
+    // Clears running_request::awaits_released_lines of every request: at each write-back, preemption, stop, page write
+    // end and allocate_lines that fails without an exit, all of which may release lines.
+    void end_line_waits() noexcept;
+    // Whether no request but the one at id is loaded, no allocate_lines holds lines and no page write is pending.
+    bool holds_lines_alone(request_id_type id) const noexcept;
+    // Per KV layer, the lines allocate_lines holds at once for req: those of its view's pages, and per recurrent
+    // layer its state slots, two empty lines and, with head, the fetched state at head beside its copy.
+    std::vector<std::size_t> count_view_lines(const request_state& req) const;
     // Whether prepare can prepare a step of the requests in scheduled, the limit sampled_row_limit() aside: scheduled
     // names no request twice, each token count is above 0 and at most the request's pending tokens, and each request
     // is schedulable (is_schedulable).
@@ -244,8 +282,9 @@ class executor {
     task<void> synchronize_shards();
     // Evicts at the end of req's cycle and returns whether a view changed.
     bool evict_request(request_state& req);
-    // Writes the state req reached to the store and passes it to callbacks, those of req's request.
-    task<void> write_cycle_end(request_state& req, request_callbacks& callbacks);
+    // Writes the state running's request reached to the store, keeps it as its last stored state, and passes it to its
+    // callbacks.
+    task<void> write_cycle_end(running_request& running);
 
   public:
     // models[s] runs on cache shard s with streams[s], for s above 0 on worker_loops[s - 1], and its write-backs'
@@ -287,16 +326,30 @@ class executor {
 
     // Serves r with callbacks, which stay in the guard until r's request state exists, so a start destroyed while it
     // is suspended before then ends them with loop_exited. Returns the request id of r, resuming the newest state the
-    // store holds for a prefix of its tokens, with lines for its pages and recurrent states; each step takes the lines
-    // for its tokens when it is prepared. Returns std::nullopt after it ended the
-    // request through on_end, with value-initialized statistics: with cancelled when the callbacks are cancelled at the
-    // start, before the store is read, with missing_state when the lookup or a page read fails, with invalid_state when
-    // the stored state's head is not a digest of r's full pages, its tail is not a proper prefix of r's tokens after
-    // its head, or one of its layers lists a page hash twice, and with oom when the free lines do not cover the state's
-    // pages and recurrent states, and with context_exceeded, before it takes lines, when its view with them would take
-    // more than view_page_capacity pages. The lease of a request that fails is released before on_end. Fewer than
-    // max_running_request_count() requests hold a record at the call.
+    // store holds for a prefix of its tokens, without lines (allocate_lines); each step takes the lines for its tokens
+    // when it is prepared. Returns std::nullopt after it ended the request through on_end, with value-initialized
+    // statistics: with cancelled when the callbacks are cancelled at the start, before the store is read, with
+    // missing_state when the lookup fails, with invalid_state when the stored state's head is not a digest of r's full
+    // pages, its tail is not a proper prefix of r's tokens after its head, or one of its layers lists a page hash
+    // twice, and with context_exceeded when its view of the state would take more than view_page_capacity pages. The
+    // lease of a request that fails is released before on_end. Fewer than max_running_request_count() requests hold a
+    // record at the call.
     task<std::optional<request_id_type>> start(request&& r, unstarted_callbacks callbacks);
+    // Gives the request of id, which holds no lines (started or preempted), lines for its pages and recurrent states:
+    // per KV layer with pages, lines for its view's pages, fetched from the store when not hot; per recurrent layer, a
+    // copy of the state at head, or zeros without head, and two empty lines. Returns false holding none when the lines
+    // do not fit once no page write is pending; the request then exits with oom (request_state::run_out_of_lines) when
+    // they would not fit with no line held (kv_cache::can_hold). A page the store no longer has exits it with
+    // missing_state, a store that does not keep the hot pages its view adds to the stored state exits it with oom, and
+    // a request whose callbacks are cancelled exits with cancelled.
+    task<bool> allocate_lines(request_id_type id);
+    // Whether a page write a write-back spawned is pending; a pending one holds the lines of its pages.
+    bool has_page_writes() const noexcept;
+    // Waits until no page write is pending.
+    task<void> wait_for_page_writes();
+    // The requests that prologues preempted since the last call, in preemption order; each holds no lines until
+    // allocate_lines.
+    std::vector<request_id_type> take_preempted_requests();
     std::size_t max_running_request_count() const noexcept;
     // The requests with a record, from the creation of their request state until their end.
     std::size_t request_count() const noexcept;

@@ -58,6 +58,9 @@ struct request_statistics {
     std::size_t accepted_draft_count;
     // Launch to write-back of every step of the request, summed.
     std::chrono::steady_clock::duration step_duration;
+    // The times a step's prologue preempted the request for its lines, and the tokens it forwarded again after them.
+    std::size_t preemption_count = 0;
+    std::size_t recomputed_token_count = 0;
 };
 
 enum class request_error {
