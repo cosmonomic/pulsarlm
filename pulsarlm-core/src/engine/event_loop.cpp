@@ -84,15 +84,15 @@ semaphore::~semaphore() {
     }
 }
 
-// The permit passes to the first waiter without going through count.
+// The permit passes to the first waiter without going through count. Outside run, the loop is being destroyed and a
+// semaphore_guard in one of its frames releases; the waiters' frames are destroyed too, so the permit goes to count.
 void semaphore::release() noexcept {
     awaiter* waiter = head;
-    if (waiter == nullptr) {
+    event_loop* loop = event_loop::current();
+    if (waiter == nullptr || loop == nullptr) {
         count++;
         return;
     }
-    event_loop* loop = event_loop::current();
-    assert(loop != nullptr);
     head = waiter->next;
     if (head == nullptr) {
         tail = nullptr;

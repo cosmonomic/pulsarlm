@@ -298,6 +298,13 @@ task<void> await_published_semaphore(semaphore** published) {
     co_await **published;
 }
 
+shared_task<void> hold_guard(semaphore* target) {
+    co_await *target;
+    semaphore_guard guard(*target);
+    auto [never, unused_resolver] = external_task<void>::make();
+    co_await std::move(never);
+}
+
 task<void> release_then_acquire(semaphore* target, bool* acquired) {
     target->release();
     co_await *target;
@@ -631,4 +638,24 @@ TEST_CASE("destroying the loop destroys a semaphore in a frame and its awaiter i
     loop.spawn(await_published_semaphore(&published));
     loop.spawn(stopper());
     CHECK(loop.run() == nullptr);
+}
+
+TEST_CASE("a semaphore_guard destroyed after its loop, while an awaiter still waits, schedules nothing") {
+    semaphore target(1);
+    std::optional<shared_task<void>> holding;
+    std::optional<shared_task<void>> waiting;
+    {
+        event_loop loop;
+        holding = loop.spawn(hold_guard(&target));
+        waiting = loop.spawn(acquire_and_flag(&target, nullptr));
+        loop.spawn(stopper());
+        CHECK(loop.run() == nullptr);
+    }
+    holding.reset();
+    waiting.reset();
+    event_loop loop;
+    bool acquired = false;
+    loop.spawn(release_then_acquire(&target, &acquired));
+    CHECK(loop.run() == nullptr);
+    CHECK(acquired);
 }
