@@ -21,6 +21,8 @@ namespace {
 using pulsarlm::event;
 using pulsarlm::event_loop;
 using pulsarlm::external_task;
+using pulsarlm::semaphore;
+using pulsarlm::semaphore_guard;
 using pulsarlm::shared_task;
 using pulsarlm::task;
 
@@ -28,6 +30,8 @@ constexpr std::size_t root_count = 1000;
 constexpr std::size_t chain_depth = 1000;
 constexpr std::size_t event_waiter_count = 4;
 constexpr std::size_t shared_waiter_count = 4;
+constexpr std::size_t semaphore_count = 2;
+constexpr std::size_t semaphore_waiter_count = 5;
 constexpr std::chrono::milliseconds other_thread_delay(50);
 
 void stop_current() {
@@ -242,6 +246,62 @@ task<void> await_ready_tasks(shared_task<void> made_outside, bool* resumed) {
     co_await made_outside;
     co_await pulsarlm::make_ready_task();
     *resumed = true;
+    stop_current();
+}
+
+task<void> acquire_and_record(semaphore* target, std::size_t index, std::vector<std::size_t>* acquired) {
+    co_await *target;
+    acquired->push_back(index);
+}
+
+task<void> release_and_record(semaphore* target, const std::vector<std::size_t>* acquired,
+                              std::vector<std::vector<std::size_t>>* snapshots) {
+    snapshots->push_back(*acquired);
+    for (std::size_t i = 0; i < semaphore_waiter_count - semaphore_count; i++) {
+        target->release();
+        co_await pulsarlm::yield();
+        snapshots->push_back(*acquired);
+    }
+    stop_current();
+}
+
+task<void> acquire_and_flag(semaphore* target, bool* acquired) {
+    co_await *target;
+    *acquired = true;
+}
+
+task<void> release_through_guards(semaphore* target, const bool* waiter_acquired, std::vector<bool>* observed) {
+    co_await *target;
+    {
+        semaphore_guard guard(*target);
+        semaphore_guard moved(std::move(guard));
+    }
+    co_await *target;
+    co_await pulsarlm::yield();
+    observed->push_back(*waiter_acquired);
+    semaphore_guard emptied(*target);
+    semaphore_guard holding(std::move(emptied));
+    holding = std::move(emptied);
+    co_await pulsarlm::yield();
+    observed->push_back(*waiter_acquired);
+    stop_current();
+}
+
+task<void> own_semaphore(semaphore** published) {
+    semaphore owned(0);
+    *published = &owned;
+    auto [never, unused_resolver] = external_task<void>::make();
+    co_await std::move(never);
+}
+
+task<void> await_published_semaphore(semaphore** published) {
+    co_await **published;
+}
+
+task<void> release_then_acquire(semaphore* target, bool* acquired) {
+    target->release();
+    co_await *target;
+    *acquired = true;
     stop_current();
 }
 
@@ -513,4 +573,62 @@ TEST_CASE("a panic in a shared task ends run with the thrown exception") {
     } catch (const std::runtime_error& error) {
         CHECK(std::string(error.what()) == "shared boom");
     }
+}
+
+TEST_CASE("a semaphore admits count awaiters at once and wakes one more per release, in the order they waited") {
+    semaphore target(semaphore_count);
+    event_loop loop;
+    std::vector<std::size_t> acquired;
+    std::vector<std::vector<std::size_t>> snapshots;
+    for (std::size_t i = 0; i < semaphore_waiter_count; i++) {
+        loop.spawn(acquire_and_record(&target, i, &acquired));
+    }
+    loop.spawn(release_and_record(&target, &acquired, &snapshots));
+    CHECK(loop.run() == nullptr);
+    std::vector<std::vector<std::size_t>> expected;
+    for (std::size_t admitted = semaphore_count; admitted <= semaphore_waiter_count; admitted++) {
+        std::vector<std::size_t> in_order;
+        for (std::size_t i = 0; i < admitted; i++) {
+            in_order.push_back(i);
+        }
+        expected.push_back(in_order);
+    }
+    CHECK(snapshots == expected);
+}
+
+TEST_CASE("a semaphore_guard releases one permit when destroyed or assigned over, and a moved-from guard none") {
+    semaphore target(1);
+    event_loop loop;
+    bool waiter_acquired = false;
+    std::vector<bool> observed;
+    loop.spawn(release_through_guards(&target, &waiter_acquired, &observed));
+    loop.spawn(acquire_and_flag(&target, &waiter_acquired));
+    CHECK(loop.run() == nullptr);
+    CHECK(observed == std::vector<bool>{false, true});
+}
+
+TEST_CASE("destroying the loop unlinks the awaiters of a semaphore, which then admits a new awaiter at once") {
+    semaphore target(0);
+    {
+        event_loop loop;
+        for (std::size_t i = 0; i < semaphore_waiter_count; i++) {
+            loop.spawn(acquire_and_flag(&target, nullptr));
+        }
+        loop.spawn(stopper());
+        CHECK(loop.run() == nullptr);
+    }
+    event_loop loop;
+    bool acquired = false;
+    loop.spawn(release_then_acquire(&target, &acquired));
+    CHECK(loop.run() == nullptr);
+    CHECK(acquired);
+}
+
+TEST_CASE("destroying the loop destroys a semaphore in a frame and its awaiter in either order") {
+    semaphore* published = nullptr;
+    event_loop loop;
+    loop.spawn(own_semaphore(&published));
+    loop.spawn(await_published_semaphore(&published));
+    loop.spawn(stopper());
+    CHECK(loop.run() == nullptr);
 }

@@ -72,6 +72,90 @@ void event::awaiter::await_suspend(std::coroutine_handle<> awaiting) noexcept {
     next = std::exchange(target.waiters, this);
 }
 
+semaphore::semaphore(std::size_t count) noexcept
+: count(count) {}
+
+// Outside run, the loop is being destroyed and frames are destroyed in any order, so a semaphore can die before its
+// awaiters; it detaches them.
+semaphore::~semaphore() {
+    assert(head == nullptr || event_loop::current() == nullptr);
+    for (awaiter* waiter = head; waiter != nullptr; waiter = waiter->next) {
+        waiter->linked = false;
+    }
+}
+
+// The permit passes to the first waiter without going through count.
+void semaphore::release() noexcept {
+    awaiter* waiter = head;
+    if (waiter == nullptr) {
+        count++;
+        return;
+    }
+    event_loop* loop = event_loop::current();
+    assert(loop != nullptr);
+    head = waiter->next;
+    if (head == nullptr) {
+        tail = nullptr;
+    }
+    waiter->linked = false;
+    loop->schedule(waiter->queue_node);
+}
+
+bool semaphore::awaiter::await_suspend(std::coroutine_handle<> awaiting) noexcept {
+    if (target.count > 0) {
+        target.count--;
+        return false;
+    }
+    queue_node.handle = awaiting;
+    linked = true;
+    if (target.tail == nullptr) {
+        target.head = this;
+    } else {
+        target.tail->next = this;
+    }
+    target.tail = this;
+    return true;
+}
+
+// A frame destroyed while awaiting, after a panic or with its loop, unlinks its awaiter.
+semaphore::awaiter::~awaiter() {
+    if (!linked) {
+        return;
+    }
+    awaiter* previous = nullptr;
+    awaiter** link = &target.head;
+    while (*link != this) {
+        previous = *link;
+        link = &(*link)->next;
+    }
+    *link = next;
+    if (target.tail == this) {
+        target.tail = previous;
+    }
+}
+
+semaphore_guard::semaphore_guard(semaphore& target) noexcept
+: target(&target) {}
+
+semaphore_guard::semaphore_guard(semaphore_guard&& other) noexcept
+: target(std::exchange(other.target, nullptr)) {}
+
+semaphore_guard& semaphore_guard::operator=(semaphore_guard&& other) noexcept {
+    if (this != &other) {
+        if (target != nullptr) {
+            target->release();
+        }
+        target = std::exchange(other.target, nullptr);
+    }
+    return *this;
+}
+
+semaphore_guard::~semaphore_guard() {
+    if (target != nullptr) {
+        target->release();
+    }
+}
+
 void shared_task_state::remove_reference() noexcept {
     if (reference_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         std::coroutine_handle<> frame = handle;

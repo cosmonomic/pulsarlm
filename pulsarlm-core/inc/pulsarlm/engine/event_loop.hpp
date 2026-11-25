@@ -108,6 +108,39 @@ class event {
     awaiter operator co_await() noexcept;
 };
 
+// Awaiting it takes one of its count permits, or waits until release hands one over; waiters take permits in the order
+// they started waiting. Release and await it on the loop thread. Awaiters link into the semaphore, so it does not move,
+// and it must not be destroyed while awaited during run.
+class semaphore {
+    class awaiter;
+
+    awaiter* head = nullptr;
+    awaiter* tail = nullptr;
+    std::size_t count;
+
+  public:
+    explicit semaphore(std::size_t count) noexcept;
+    semaphore(const semaphore&) = delete;
+    semaphore& operator=(const semaphore&) = delete;
+    ~semaphore();
+
+    void release() noexcept;
+    awaiter operator co_await() noexcept;
+};
+
+// Releases a permit of a semaphore when destroyed; the caller acquires the permit before constructing it.
+class semaphore_guard {
+    semaphore* target;
+
+  public:
+    explicit semaphore_guard(semaphore& target) noexcept;
+    semaphore_guard(const semaphore_guard&) = delete;
+    semaphore_guard& operator=(const semaphore_guard&) = delete;
+    semaphore_guard(semaphore_guard&& other) noexcept;
+    semaphore_guard& operator=(semaphore_guard&& other) noexcept;
+    ~semaphore_guard();
+};
+
 // task with a resolve callback that can set the result outside the event loop.
 template <typename value_type> class [[nodiscard]] external_task {
     using stored_type = std::conditional_t<std::is_void_v<value_type>, std::monostate, value_type>;
@@ -185,6 +218,7 @@ class event_loop {
     template <typename> friend class shared_task;
     template <typename> friend class external_task;
     friend class event;
+    friend class semaphore;
     friend class shared_task_state;
     friend task<void> yield();
 
@@ -569,6 +603,36 @@ class event::awaiter {
 };
 
 inline event::awaiter event::operator co_await() noexcept {
+    return awaiter(*this);
+}
+
+class semaphore::awaiter {
+    semaphore& target;
+    event_loop::ready_node queue_node;
+    awaiter* next = nullptr;
+    bool linked = false;
+
+    friend class semaphore;
+
+  public:
+    explicit awaiter(semaphore& target) noexcept
+    : target(target) {}
+
+    awaiter(const awaiter&) = delete;
+    awaiter& operator=(const awaiter&) = delete;
+    ~awaiter();
+
+    bool await_ready() const noexcept {
+        return false;
+    }
+
+    // Returns false, resuming the caller at once, when it takes a permit from count.
+    bool await_suspend(std::coroutine_handle<> awaiting) noexcept;
+
+    void await_resume() const noexcept {}
+};
+
+inline semaphore::awaiter semaphore::operator co_await() noexcept {
     return awaiter(*this);
 }
 
