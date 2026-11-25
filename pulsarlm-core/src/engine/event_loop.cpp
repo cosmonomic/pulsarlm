@@ -135,25 +135,10 @@ semaphore::awaiter::~awaiter() {
 }
 
 semaphore_guard::semaphore_guard(semaphore& target) noexcept
-: target(&target) {}
-
-semaphore_guard::semaphore_guard(semaphore_guard&& other) noexcept
-: target(std::exchange(other.target, nullptr)) {}
-
-semaphore_guard& semaphore_guard::operator=(semaphore_guard&& other) noexcept {
-    if (this != &other) {
-        if (target != nullptr) {
-            target->release();
-        }
-        target = std::exchange(other.target, nullptr);
-    }
-    return *this;
-}
+: target(target) {}
 
 semaphore_guard::~semaphore_guard() {
-    if (target != nullptr) {
-        target->release();
-    }
+    target.release();
 }
 
 void shared_task_state::remove_reference() noexcept {

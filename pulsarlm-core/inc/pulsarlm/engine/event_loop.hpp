@@ -130,14 +130,12 @@ class semaphore {
 
 // Releases a permit of a semaphore when destroyed; the caller acquires the permit before constructing it.
 class semaphore_guard {
-    semaphore* target;
+    semaphore& target;
 
   public:
     explicit semaphore_guard(semaphore& target) noexcept;
     semaphore_guard(const semaphore_guard&) = delete;
     semaphore_guard& operator=(const semaphore_guard&) = delete;
-    semaphore_guard(semaphore_guard&& other) noexcept;
-    semaphore_guard& operator=(semaphore_guard&& other) noexcept;
     ~semaphore_guard();
 };
 

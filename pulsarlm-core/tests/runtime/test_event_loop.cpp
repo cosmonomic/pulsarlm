@@ -274,14 +274,13 @@ task<void> release_through_guards(semaphore* target, const bool* waiter_acquired
     co_await *target;
     {
         semaphore_guard guard(*target);
-        semaphore_guard moved(std::move(guard));
     }
     co_await *target;
     co_await pulsarlm::yield();
     observed->push_back(*waiter_acquired);
-    semaphore_guard emptied(*target);
-    semaphore_guard holding(std::move(emptied));
-    holding = std::move(emptied);
+    {
+        semaphore_guard guard(*target);
+    }
     co_await pulsarlm::yield();
     observed->push_back(*waiter_acquired);
     stop_current();
@@ -603,7 +602,7 @@ TEST_CASE("a semaphore admits count awaiters at once and wakes one more per rele
     CHECK(snapshots == expected);
 }
 
-TEST_CASE("a semaphore_guard releases one permit when destroyed or assigned over, and a moved-from guard none") {
+TEST_CASE("a semaphore_guard releases one permit when destroyed") {
     semaphore target(1);
     event_loop loop;
     bool waiter_acquired = false;
